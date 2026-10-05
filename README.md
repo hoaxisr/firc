@@ -5,7 +5,7 @@
 <p align="center">
   <strong>Маршрутизация по доменам, а не по адресам.</strong>
   <br/>
-  <sub>Entware / Keenetic · aarch64, mipsel, mips (экспериментально)</sub>
+  <sub>Entware / Keenetic · aarch64, mipsel, mips</sub>
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@ firc перехватывает DNS-запросы клиентов. Домен�
 |---|---|
 | Keenetic, aarch64 | `firc_<версия>-<ревизия>_entware_aarch64-3.10_kn.ipk` |
 | Keenetic, mipsel | `firc_<версия>-<ревизия>_entware_mipsel-3.4_kn.ipk` |
-| Keenetic, mips (big-endian) | `firc_<версия>-<ревизия>_entware_mips-3.4_kn.ipk` — экспериментально: на железе не проверялось |
+| Keenetic, mips (big-endian) | `firc_<версия>-<ревизия>_entware_mips-3.4_kn.ipk` |
 
 Все пакеты — сборки под Keenetic (`_kn`): разбор имён интерфейсов через RCI, хук `netfilter.d`, зависимость от `socat`.
 
@@ -62,7 +62,7 @@ opkg install ./firc_<версия>-<ревизия>_entware_<таргет>.ipk
 
 Обновление — тем же способом, с `restart` вместо `start`.
 
-Нужен роутер Keenetic с Entware, aarch64, mipsel или mips (экспериментально). Памяти демону нужно немного: около 5 МБ без правил и около 21 МБ при 300 000 правил в списках; во время синхронизации большого списка — до 48 МБ (замеры ниже). OpenWrt не поддерживается. Сборка из исходников описана в [BUILDING.md](BUILDING.md).
+Нужен роутер Keenetic с Entware, aarch64, mipsel или mips. Памяти демону нужно немного: около 5 МБ без правил и около 21 МБ при 300 000 правил в списках; во время синхронизации большого списка — до 48 МБ (замеры ниже). OpenWrt не поддерживается. Сборка из исходников описана в [BUILDING.md](BUILDING.md).
 
 ## Типы правил
 
