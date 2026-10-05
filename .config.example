@@ -1,0 +1,4 @@
+PLATFORM=entware
+TARGET=mipsel-3.4_kn
+CROSS_COMPILE=
+SYSROOT=

@@ -1,0 +1,32 @@
+name: Guard
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  internal_docs:
+    name: No internal docs in the tree
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: No internal docs in the tree
+        run: |
+          set -e
+          d=docs
+          for p in AGENTS CLAUDE CONTEXT; do
+            if [ -e "$p.md" ]; then echo "internal path present: $p.md"; exit 1; fi
+          done
+          for p in "$d/adr" "$d/super""powers"; do
+            if [ -e "$p" ]; then echo "internal path present: $p"; exit 1; fi
+          done
+          if git grep -niE 'AD[R]-0[0-9]|docs/ad[r]\b' -- . ; then exit 1; fi

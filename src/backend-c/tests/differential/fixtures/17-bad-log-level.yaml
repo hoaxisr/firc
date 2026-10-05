@@ -1,0 +1,4 @@
+# A log level the daemon does not have: refused at load, where the operator can see the key.
+configVersion: 0.7.0
+app:
+  logLevel: loud

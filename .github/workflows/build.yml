@@ -1,0 +1,319 @@
+name: Build Entware packages
+
+# A push of more than 1000 commits gets no diff, so path filters run nothing: dispatch by hand.
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Existing release tag to rebuild and populate. Leave empty to
+          attach the packages to the run as artifacts instead.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.collect.outputs.configs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build config matrix
+        id: collect
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          configs = sorted(Path("config").glob("*/*.config"))
+
+          if not configs:
+              raise SystemExit("No build configs found")
+
+          matrix = [
+              {"config": c.as_posix(), "name": c.stem, "label": c.stem}
+              for c in configs
+          ]
+
+          print(f"configs={json.dumps(matrix, separators=(',', ':'))}")
+          PY
+
+  build:
+    name: Build packages (${{ matrix.label }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # Feed repositories rate-limit a burst of clones.
+      max-parallel: 12
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.configs) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Check cross-toolchain availability
+        id: toolchain
+        run: |
+          cp "${{ matrix.config }}" .config
+          . ./.config
+          case "$PLATFORM/$TARGET" in
+            entware/*_kn)
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "entware_config=${TARGET%_kn}" >> "$GITHUB_OUTPUT"
+              ;;
+            # A config without an SDK mapping fails the run rather than being dropped.
+            *)
+              echo "No Entware SDK mapping for PLATFORM=$PLATFORM TARGET=$TARGET, so no package can be built for it. Add one to the case above." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Node.JS
+        if: steps.toolchain.outputs.ready == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Prepare Entware package feed
+        id: entware_feed
+        if: steps.toolchain.outputs.entware_config != ''
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          mkdir -p .build
+          eval export $(make _return_export_dynamic_env);
+          case "$PKG_VERSION" in
+            *~git*)
+              if [ -n "$RELEASE_TAG" ]; then
+                echo "::error title=Release ${RELEASE_TAG}::version $PKG_VERSION is not from a version tag" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          cp "${{ matrix.config }}" .config
+          make build_frontend
+          make _return_export_dynamic_env > .build/entware-package.env
+
+          feed_dir="${RUNNER_TEMP}/firc-feed-${{ matrix.name }}"
+          artifacts_dir="${RUNNER_TEMP}/firc-artifacts-${{ matrix.name }}"
+          mkdir -p "$feed_dir/firc" "$artifacts_dir"
+          cp tools/ci/entware-package/Makefile "$feed_dir/firc/Makefile"
+          {
+            printf 'FIRC_VERSION:=%s\n' "$PKG_VERSION"
+            printf 'FIRC_RELEASE:=%s\n' "$PKG_REVISION"
+            printf 'FIRC_TARGET:=%s\n' "${{ matrix.name }}"
+          } > "$feed_dir/firc/version.mk"
+          tar -czf "$feed_dir/firc/firc-source.tar.gz" \
+            --transform "s,^,firc-${PKG_VERSION}/," \
+            LICENSE files src/backend-c src/frontend/dist
+
+          echo "feed_dir=$feed_dir" >> "$GITHUB_OUTPUT"
+          echo "artifacts_dir=$artifacts_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Build with prebuilt Entware SDK
+        id: entware_sdk
+        if: steps.toolchain.outputs.entware_config != ''
+        continue-on-error: true
+        # v1, pinned to a commit
+        uses: ownik/gh-action-entware-sdk@003ddc33bb3b12a2f96e0c4689c56351614cf01a
+        env:
+          ARCH: ${{ steps.toolchain.outputs.entware_config }}
+          ARTIFACTS_DIR: ${{ steps.entware_feed.outputs.artifacts_dir }}
+          BUILD_LOG: 1
+          FEED_DIR: ${{ steps.entware_feed.outputs.feed_dir }}
+          PACKAGES: firc
+          V: s
+
+      - name: Report Entware SDK build failure
+        if: steps.entware_sdk.outcome == 'failure'
+        run: |
+          log_root="${{ steps.entware_feed.outputs.artifacts_dir }}/logs"
+          if [ -d "$log_root" ]; then
+            {
+              echo "Entware package build failed. Relevant log lines:"
+              while IFS= read -r -d '' log; do
+                matches=$(
+                  grep -E \
+                    'make\[[0-9]+\]: \*\*\*|(^|: )(fatal )?error:|undefined reference|No rule to make target|collect2: error|ld returned [0-9]+ exit status' \
+                    "$log" || true
+                )
+                if [ -n "$matches" ]; then
+                  echo "==> $log <=="
+                  printf '%s\n' "$matches" | tail -n 80
+                  echo "Last 20 lines:"
+                  tail -n 20 "$log"
+                fi
+              done < <(find "$log_root" -type f -print0 | sort -z)
+            } | tee "${RUNNER_TEMP}/entware-sdk-failure.txt"
+          else
+            echo "Entware package build failed and produced no BUILD_LOG files." |
+              tee "${RUNNER_TEMP}/entware-sdk-failure.txt"
+          fi
+
+          message=$(
+            tail -n 200 "${RUNNER_TEMP}/entware-sdk-failure.txt" |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' |
+              awk 'BEGIN { ORS="%0A" } { print }'
+          )
+          echo "::error title=Entware SDK ${{ matrix.name }}::$message"
+          exit 1
+
+      - name: Collect and verify package
+        id: package_outputs
+        if: steps.toolchain.outputs.ready == 'true'
+        run: |
+          set -eu
+          if [ -n "${{ steps.toolchain.outputs.entware_config }}" ]; then
+            mapfile -t packages < <(
+              find "${{ steps.entware_feed.outputs.artifacts_dir }}" \
+                -type f -name 'firc_*.ipk' | sort
+            )
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "Expected exactly one firc IPK, found ${#packages[@]}" >&2
+              printf '%s\n' "${packages[@]}" >&2
+              exit 1
+            fi
+
+            . .build/entware-package.env
+            package=".build/firc_${PKG_VERSION}-${PKG_REVISION}_entware_${{ matrix.name }}.ipk"
+            cp "${packages[0]}" "$package"
+
+            # an ipk is an ar archive or a tar.gz (ipkg-build, make package)
+            ipk_member() {
+              if ar t "$1" >/dev/null 2>&1; then
+                ar p "$1" "$2"
+              else
+                member=$(tar -tf "$1" | awk -v m="$2" '$0 == m || $0 == "./" m { print; exit }')
+                if [ -z "$member" ]; then
+                  echo "No $2 member in $1" >&2
+                  return 1
+                fi
+                tar -xOf "$1" "$member"
+              fi
+            }
+            data_archive=$(mktemp)
+            binary=$(mktemp)
+            ipk_member "$package" data.tar.gz > "$data_archive"
+            binary_member=$(
+              tar -tzf "$data_archive" |
+                awk '$0 == "opt/bin/fircd" || $0 == "./opt/bin/fircd" { print; exit }'
+            )
+            if [ -z "$binary_member" ]; then
+              echo "No /opt/bin/fircd in $package" >&2
+              exit 1
+            fi
+            tar -xzOf "$data_archive" "$binary_member" > "$binary"
+
+            readelf -h "$binary"
+            readelf -l "$binary"
+            case "${{ matrix.name }}" in
+              aarch64-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
+                ;;
+              mipsel-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                ;;
+              *)
+                # a target without an ELF check must not ship unchecked
+                echo "no ELF check for ${{ matrix.name }}: add one before adding the target" >&2
+                exit 1
+                ;;
+            esac
+
+            # a build without -DFIRC_ENTWARE_KN lacks the Keenetic code and nothing else would notice
+            strings "$binary" | grep -q 'firc-flavour=entware_kn' \
+              || { echo "the binary is not the Keenetic flavour (no firc-flavour=entware_kn in it)" >&2; exit 1; }
+            control_archive=$(mktemp)
+            ipk_member "$package" control.tar.gz > "$control_archive"
+            control_list=$(tar -tzf "$control_archive")
+            # an SDK that wraps the scripts writes ours as <script>-pkg behind a generated stub
+            for script in prerm postinst; do
+              member=""
+              echo "$control_list" | grep -Eq "(^|/)$script\$" && member="$script"
+              echo "$control_list" | grep -Eq "(^|/)$script-pkg\$" && member="$script-pkg"
+              [ -n "$member" ] || { echo "control.tar.gz has neither $script nor $script-pkg" >&2; exit 1; }
+              if [ "$member" = "$script-pkg" ]; then
+                # opkg runs $script, never $script-pkg: without a stub ours never runs
+                echo "$control_list" | grep -Eq "(^|/)$script\$" \
+                  || { echo "control.tar.gz has $script-pkg but no $script to run it" >&2; exit 1; }
+                # the SDK's stub must hand over to ours, or ours never runs
+                tar -xzOf "$control_archive" --wildcards "*$script" | grep -v '^[[:space:]]*#' | grep -Eq "$script-pkg|default_$script" \
+                  || { echo "the $script stub does not chain to $script-pkg" >&2; exit 1; }
+              fi
+              tar -tvzf "$control_archive" | grep -Eq "^-rwx.*[ /]$member\$" \
+                || { echo "$member is not executable in the package" >&2; exit 1; }
+              text=$(tar -xzOf "$control_archive" --wildcards "*$member")
+              printf '%s\n' "$text" | grep -qF '$$' && { echo "$member shipped with an unexpanded \$\$" >&2; exit 1; }
+              printf '%s\n' "$text" | sh -n || { echo "$member is not valid sh" >&2; exit 1; }
+              case "$script" in
+                prerm)
+                  printf '%s\n' "$text" | grep -q 'fircd --purge' || { echo "$member does not purge" >&2; exit 1; }
+                  printf '%s\n' "$text" | grep -qF 'case "$ACTION" in' || { echo "$member lost its action guard" >&2; exit 1; }
+                  ;;
+                postinst)
+                  printf '%s\n' "$text" | grep -q 'S99firc restart' || { echo "$member does not restart the daemon" >&2; exit 1; }
+                  ;;
+              esac
+            done
+            # the payload must carry the init script, the hook and the configs
+            payload_list=$(tar -tzf "$data_archive")
+            for f in opt/etc/init.d/S99firc opt/etc/ndm/netfilter.d/100-firc \
+                     opt/etc/firc/firc.conf opt/etc/firc/groups.yaml; do
+              echo "$payload_list" | grep -Eq "^(\./)?$f\$" || { echo "data.tar.gz has no $f" >&2; exit 1; }
+            done
+
+            echo "package_1_path=$package" >> "$GITHUB_OUTPUT"
+            echo "package_1_name=$(basename "$package")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload package artifact 1
+        if: ${{ github.event.release.tag_name == '' && inputs.release_tag == '' && steps.package_outputs.outputs.package_1_path != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package_outputs.outputs.package_1_name }}
+          path: ${{ steps.package_outputs.outputs.package_1_path }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload package assets to release
+        if: ${{ github.event.release.tag_name != '' || inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          PACKAGE_1: ${{ steps.package_outputs.outputs.package_1_path }}
+        run: |
+          for package in "$PACKAGE_1"; do
+            if [ -n "$package" ]; then
+              gh release upload "$RELEASE_TAG" "$package" \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber
+            fi
+          done

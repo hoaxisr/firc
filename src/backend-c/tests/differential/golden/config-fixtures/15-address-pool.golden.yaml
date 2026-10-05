@@ -1,0 +1,41 @@
+configVersion: 0.99.0
+app:
+  httpWeb:
+    enabled: true
+    host:
+      address: '[::]'
+      port: 8080
+  dnsProxy:
+    host:
+      address: '[::]'
+      port: 3553
+    upstream:
+      address: 127.0.0.1
+      port: 53
+    disableRemap53: false
+    disableDropAAAA: false
+    unmatchedTtl: 1m0s
+    maxIdleConns: 10
+    maxConcurrent: 100
+    timeout: 5s
+  netfilter:
+    iptables:
+      chainPrefix: FIRC_
+    disableIPv4: false
+    disableIPv6: false
+    startMarkTableIndex: 1718186595
+  addressPool:
+    v4:
+      pool: 100.64.0.0/10
+      chunk: 26
+    v6:
+      pool: fd7a:115c:a1e0::/48
+      chunk: 60
+    ttlClamp: 2m0s
+    idleWindow: 36h0m0s
+    maxNames: 4096
+  link:
+  - br0
+  showAllInterfaces: false
+  logLevel: info
+groups: []

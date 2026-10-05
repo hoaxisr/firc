@@ -1,0 +1,348 @@
+#include "firc/nfcommit.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include "firc/log.h"
+
+/* Folds a firmware burst (one event per table) into one pass. */
+#define FIRC_NFCOMMIT_DELAY_MS 150u
+/* Backoff ceiling for hard failures; races never back off. */
+#define FIRC_NFCOMMIT_MAX_DELAY_MS 5000u
+/* Hard refusals in a row before ERR; a lost COMMIT race is one and its retry usually fixes it. */
+#define FIRC_NFCOMMIT_ESCALATE_AFTER 3u
+
+struct firc_nfcommit {
+    firc_nfcommit_rebuild_fn rebuild;
+    void *ud;
+
+    firc_cancel_t *cancel;
+
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t thread;
+
+    bool started;
+    bool stopping;
+    bool pending;
+    bool full_owed;
+    size_t n_requests;
+    bool running;
+    uint64_t passes;
+    uint64_t last_ok;
+
+    unsigned delay_ms;
+    unsigned max_delay_ms;
+
+    /* 0: no failing run. Guarded by mu. */
+    uint64_t fail_mono_ms;
+    int64_t fail_wall;
+    unsigned hard_run;
+    int64_t hard_wall;
+    firc_err_t fail_err;
+    unsigned failing_after_ms;
+};
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* +1: a run that starts at 0 ms must not read as no run */
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + 1u;
+}
+
+static bool is_race(firc_err_t err) { return err == FIRC_ERR_CANCELED || err == FIRC_ERR_AGAIN; }
+
+typedef enum { NOTE_QUIET, NOTE_ESCALATE, NOTE_RECOVERED } note_say_t;
+
+static note_say_t note_result(firc_nfcommit_t *c, firc_err_t err, unsigned *hard_run, int64_t *hard_wall) {
+    *hard_run = c->hard_run;
+    *hard_wall = c->hard_wall;
+    if (err == FIRC_OK) {
+        bool escalated = c->hard_run >= FIRC_NFCOMMIT_ESCALATE_AFTER;
+        c->fail_mono_ms = 0;
+        c->hard_run = 0;
+        c->fail_err = FIRC_OK;
+        return escalated ? NOTE_RECOVERED : NOTE_QUIET;
+    }
+    if (c->fail_mono_ms == 0) {
+        c->fail_mono_ms = mono_ms();
+        c->fail_wall = (int64_t)time(NULL);
+    }
+    if (is_race(err)) {
+        if (c->hard_run == 0) { c->fail_err = err; }
+        return NOTE_QUIET;
+    }
+    if (c->hard_run == 0) { c->hard_wall = (int64_t)time(NULL); }
+    c->hard_run++;
+    c->fail_err = err;
+    *hard_run = c->hard_run;
+    *hard_wall = c->hard_wall;
+    return c->hard_run == FIRC_NFCOMMIT_ESCALATE_AFTER ? NOTE_ESCALATE : NOTE_QUIET;
+}
+
+/* Said outside `mu`: the log is a write(2) that may block on a pipe. */
+static void say_note(note_say_t say, firc_err_t err, unsigned hard_run, int64_t hard_wall) {
+    if (say == NOTE_QUIET) { return; }
+    char when[32] = "?";
+    struct tm tm;
+    time_t t = (time_t)hard_wall;
+    if (gmtime_r(&t, &tm) != NULL) { (void)strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tm); }
+    if (say == NOTE_ESCALATE) {
+        FIRC_ERROR("netfilter pass keeps failing (%u in a row since %s): %s", hard_run, when,
+                   firc_err_str(err));
+    } else {
+        FIRC_INFO("netfilter pass completed again after %u failed in a row since %s", hard_run, when);
+    }
+}
+
+firc_nfcommit_t *firc_nfcommit_new(firc_nfcommit_rebuild_fn fn, void *ud) {
+    if (!fn) { return NULL; }
+
+    firc_nfcommit_t *c = calloc(1, sizeof(*c));
+    if (!c) { return NULL; }
+
+    c->cancel = firc_cancel_new();
+    if (!c->cancel) {
+        free(c);
+        return NULL;
+    }
+    if (pthread_mutex_init(&c->mu, NULL) != 0) {
+        firc_cancel_free(c->cancel);
+        free(c);
+        return NULL;
+    }
+
+    pthread_condattr_t attr;
+    int attr_rc = pthread_condattr_init(&attr);
+    bool cv_ok = false;
+    if (attr_rc == 0) {
+        cv_ok = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
+                pthread_cond_init(&c->cv, &attr) == 0;
+        pthread_condattr_destroy(&attr);
+    }
+    if (!cv_ok) {
+        pthread_mutex_destroy(&c->mu);
+        firc_cancel_free(c->cancel);
+        free(c);
+        return NULL;
+    }
+
+    c->rebuild = fn;
+    c->ud = ud;
+    c->full_owed = true;
+    c->delay_ms = FIRC_NFCOMMIT_DELAY_MS;
+    c->max_delay_ms = FIRC_NFCOMMIT_MAX_DELAY_MS;
+    c->failing_after_ms = FIRC_NFCOMMIT_FAILING_AFTER_MS;
+    return c;
+}
+
+size_t firc_nfcommit_requests_for_test(firc_nfcommit_t *c) {
+    if (!c) { return 0; }
+    pthread_mutex_lock(&c->mu);
+    size_t n = c->n_requests;
+    pthread_mutex_unlock(&c->mu);
+    return n;
+}
+
+void firc_nfcommit_set_delays_for_test(firc_nfcommit_t *c, unsigned delay_ms, unsigned max_delay_ms) {
+    if (!c) { return; }
+    c->delay_ms = delay_ms;
+    c->max_delay_ms = max_delay_ms;
+}
+
+void firc_nfcommit_set_failing_after_for_test(firc_nfcommit_t *c, unsigned ms) {
+    if (c == NULL) { return; }
+    pthread_mutex_lock(&c->mu);
+    c->failing_after_ms = ms;
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* Judged at read time, so a pass hung after failures still trips the bound. */
+void firc_nfcommit_health(const firc_nfcommit_t *c, firc_nfcommit_health_t *out) {
+    *out = (firc_nfcommit_health_t){.first_pending = false, .failing = false, .err = FIRC_OK, .since = 0};
+    if (c == NULL) { return; }
+    firc_nfcommit_t *m = (firc_nfcommit_t *)c;
+    pthread_mutex_lock(&m->mu);
+    out->first_pending = m->last_ok == 0;
+    if (m->fail_mono_ms != 0 && mono_ms() - m->fail_mono_ms >= (uint64_t)m->failing_after_ms) {
+        out->failing = true;
+        out->err = m->fail_err;
+        out->since = m->fail_wall;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+firc_cancel_t *firc_nfcommit_cancel(const firc_nfcommit_t *c) {
+    return c ? c->cancel : NULL;
+}
+
+uint64_t firc_nfcommit_passes(const firc_nfcommit_t *c) {
+    if (!c) { return 0; }
+    firc_nfcommit_t *m = (firc_nfcommit_t *)c;
+    pthread_mutex_lock(&m->mu);
+    uint64_t n = m->passes;
+    pthread_mutex_unlock(&m->mu);
+    return n;
+}
+
+uint64_t firc_nfcommit_last_completed_pass(const firc_nfcommit_t *c) {
+    if (!c) { return 0; }
+    firc_nfcommit_t *m = (firc_nfcommit_t *)c;
+    pthread_mutex_lock(&m->mu);
+    uint64_t n = m->last_ok;
+    pthread_mutex_unlock(&m->mu);
+    return n;
+}
+
+void firc_nfcommit_request(firc_nfcommit_t *c) {
+    if (!c) { return; }
+
+    pthread_mutex_lock(&c->mu);
+    c->n_requests++;
+    c->pending = true;
+    c->full_owed = true;
+    /* Raised under the lock so decide-and-raise is one step. */
+    if (c->running) { firc_cancel_raise(c->cancel); }
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+void firc_nfcommit_request_more(firc_nfcommit_t *c) {
+    if (!c) { return; }
+
+    pthread_mutex_lock(&c->mu);
+    c->pending = true;
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    /* No raise: the pass in flight finishes and `pending` makes another follow. */
+}
+
+void firc_nfcommit_interrupt(firc_nfcommit_t *c) {
+    if (!c) { return; }
+
+    /* No pending flag: an aborted pass re-arms itself. */
+    pthread_mutex_lock(&c->mu);
+    if (c->running) { firc_cancel_raise(c->cancel); }
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* Returns false on exit; a new request does not cut the wait short. */
+static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += (time_t)(delay_ms / 1000u);
+    deadline.tv_nsec += (long)(delay_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&c->mu);
+    while (!c->stopping) {
+        int rc = pthread_cond_timedwait(&c->cv, &c->mu, &deadline);
+        if (rc == ETIMEDOUT) { break; }
+    }
+    bool go_on = !c->stopping;
+    pthread_mutex_unlock(&c->mu);
+    return go_on;
+}
+
+static void *committer_main(void *arg) {
+    firc_nfcommit_t *c = arg;
+    unsigned delay_ms = c->delay_ms;
+
+    for (;;) {
+        pthread_mutex_lock(&c->mu);
+        while (!c->pending && !c->stopping) { pthread_cond_wait(&c->cv, &c->mu); }
+        bool stopping = c->stopping;
+        pthread_mutex_unlock(&c->mu);
+        if (stopping) { break; }
+
+        if (!settle(c, delay_ms)) { break; }
+
+        pthread_mutex_lock(&c->mu);
+        if (c->stopping) {
+            pthread_mutex_unlock(&c->mu);
+            break;
+        }
+        c->pending = false;
+        bool full = c->full_owed;
+        c->full_owed = false;
+        /* Cleared before `running` is published, under mu, or a raise in the gap is lost. */
+        firc_cancel_clear(c->cancel);
+        c->running = true;
+        uint64_t ordinal = ++c->passes;
+        pthread_mutex_unlock(&c->mu);
+
+        firc_err_t err = c->rebuild(c->ud, c->cancel, full);
+
+        pthread_mutex_lock(&c->mu);
+        c->running = false;
+        if (err == FIRC_OK) { c->last_ok = ordinal; }
+        unsigned hard_run = 0;
+        int64_t hard_wall = 0;
+        note_say_t say = note_result(c, err, &hard_run, &hard_wall);
+        stopping = c->stopping;
+        pthread_mutex_unlock(&c->mu);
+        say_note(say, err, hard_run, hard_wall);
+        if (stopping) { break; }
+
+        if (err == FIRC_OK) {
+            delay_ms = c->delay_ms;
+            continue;
+        }
+
+        if (err == FIRC_ERR_CANCELED) {
+            FIRC_DEBUG("netfilter table rebuild interrupted, starting over");
+            delay_ms = c->delay_ms;
+        } else if (err == FIRC_ERR_AGAIN) {
+            FIRC_DEBUG("netfilter table changed during rebuild, starting over");
+            delay_ms = c->delay_ms;
+        } else {
+            FIRC_WARN("failed to rebuild netfilter table (%s), starting over", firc_err_str(err));
+            delay_ms = delay_ms * 2 < c->max_delay_ms ? delay_ms * 2 : c->max_delay_ms;
+        }
+
+        pthread_mutex_lock(&c->mu);
+        c->pending = true;
+        c->full_owed = c->full_owed || full;
+        pthread_mutex_unlock(&c->mu);
+    }
+
+    return NULL;
+}
+
+firc_err_t firc_nfcommit_start(firc_nfcommit_t *c) {
+    if (!c) { return FIRC_ERR_INVAL; }
+    if (c->started) { return FIRC_ERR_STATE; }
+
+    if (pthread_create(&c->thread, NULL, committer_main, c) != 0) { return FIRC_ERR_SYS; }
+    c->started = true;
+    return FIRC_OK;
+}
+
+void firc_nfcommit_stop(firc_nfcommit_t *c) {
+    if (!c || !c->started) { return; }
+
+    pthread_mutex_lock(&c->mu);
+    c->stopping = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+
+    /* Unblocks a rebuild parked in poll() on an iptables child. */
+    firc_cancel_raise(c->cancel);
+
+    pthread_join(c->thread, NULL);
+    c->started = false;
+}
+
+void firc_nfcommit_free(firc_nfcommit_t *c) {
+    if (!c) { return; }
+    firc_nfcommit_stop(c);
+    pthread_cond_destroy(&c->cv);
+    pthread_mutex_destroy(&c->mu);
+    firc_cancel_free(c->cancel);
+    free(c);
+}

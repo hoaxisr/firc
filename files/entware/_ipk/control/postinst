@@ -1,0 +1,78 @@
+#!/bin/sh
+
+# Strip fetched list rules from an old groups.yaml before start: a huge file OOM-kills fircd on load.
+GROUPS=/opt/etc/firc/groups.yaml
+
+# Smaller files load fine and are left to the daemon.
+MIGRATE_MIN_BYTES=${MIGRATE_MIN_BYTES:-262144}
+
+migrate_groups() {
+    f=$1
+    [ -f "$f" ] || return 0
+    if [ "${FIRC_MIGRATE_FORCE:-0}" != 1 ]; then
+        size=$(wc -c < "$f" 2>/dev/null) || return 0
+        [ "$size" -ge "$MIGRATE_MIN_BYTES" ] || return 0
+    fi
+    # A YAML sequence may sit at its key's own indent, so the skip also runs over `-` items at that indent.
+    awk -v countfile="$f.off" '
+        /^[^ \t#-]/ { in_subs = ($0 ~ /^subscriptions:[[:space:]]*$/); skip = 0 }
+        {
+            if (skip) {
+                if ($0 ~ /^[[:space:]]*$/) { next }
+                match($0, /^[ \t]*/)
+                if (RLENGTH > skip_indent) {
+                    if ($0 ~ /^[ \t]*enable:[[:space:]]*false[[:space:]]*$/) { off++ }
+                    next
+                }
+                if (RLENGTH == skip_indent && substr($0, RLENGTH + 1, 1) == "-") { next }
+                skip = 0
+            }
+            if (in_subs && $0 ~ /^[ \t]*rules:/) {
+                match($0, /^[ \t]*/)
+                skip_indent = RLENGTH
+                skip = 1
+                next
+            }
+            print
+        }
+        END { print off + 0 > countfile }
+    ' "$f" > "$f.new" || return 1
+
+    if [ ! -s "$f.new" ]; then
+        rm -f "$f.new" "$f.off"
+        return 1
+    fi
+    if cmp -s "$f" "$f.new"; then
+        rm -f "$f.new" "$f.off"
+        return 0
+    fi
+    cp "$f" "$f.pre-0027.bak" || { rm -f "$f.new"; return 1; }
+    mv "$f.new" "$f" || return 1
+
+    off=$(cat "$f.off" 2>/dev/null) || off=0
+    rm -f "$f.off"
+    if [ "${off:-0}" -gt 0 ]; then
+        echo "firc: $f was too large to load, so its subscriptions' rules were" >&2
+        echo "firc: dropped and will be refetched. $off rule(s) you had switched off" >&2
+        echo "firc: could not be carried over; the old file is at $f.pre-0027.bak" >&2
+    fi
+    return 0
+}
+
+# Used by the differential tests; opkg never passes it.
+if [ "${1:-}" = "--migrate-only" ]; then
+    migrate_groups "${2:-$GROUPS}"
+    exit $?
+fi
+
+migrate_groups "$GROUPS" || {
+    echo "firc: could not rewrite $GROUPS; the original is at $GROUPS.pre-0027.bak" >&2
+}
+
+# A failed start must fail the configure step so opkg leaves the package unpacked.
+/opt/etc/init.d/S99firc restart || {
+    echo "firc: the daemon did not start; see logread and /opt/etc/firc/firc.conf" >&2
+    exit 1
+}
+
+exit 0

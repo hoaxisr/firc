@@ -1,0 +1,84 @@
+configVersion: 0.99.0
+app:
+  httpWeb:
+    enabled: true
+    host:
+      address: '[::]'
+      port: 8080
+  dnsProxy:
+    host:
+      address: '[::]'
+      port: 3553
+    upstream:
+      address: 127.0.0.1
+      port: 53
+    disableRemap53: false
+    disableDropAAAA: false
+    unmatchedTtl: 1m0s
+    maxIdleConns: 10
+    maxConcurrent: 100
+    timeout: 5s
+  netfilter:
+    iptables:
+      chainPrefix: FIRC_
+    disableIPv4: false
+    disableIPv6: false
+    startMarkTableIndex: 1718186595
+  addressPool:
+    v4:
+      pool: 198.18.0.0/15
+      chunk: 24
+    v6:
+      pool: ""
+      chunk: 64
+    ttlClamp: 5m0s
+    idleWindow: 24h0m0s
+    maxNames: 65536
+  link:
+  - br0
+  showAllInterfaces: false
+  logLevel: info
+groups:
+- id: 0a0b0c0d
+  name: "123"
+  interface: "y"
+  enable: true
+  rules:
+  - id: "01020304"
+    type: domain
+    rule: "true"
+    enable: true
+  - id: "01020305"
+    type: domain
+    rule: "12:30:45"
+    enable: false
+  - id: "01020306"
+    type: wildcard
+    rule: '*star'
+    enable: true
+  - id: "01020307"
+    type: domain
+    rule: -dash
+    enable: true
+- id: 0a0b0c0e
+  name: 'has: colon'
+  interface: "y"
+  enable: false
+  rules: []
+- id: 0a0b0c0f
+  name: ' leading space'
+  interface: "y"
+  enable: false
+  rules: []
+- id: 0a0b0c10
+  name: |-
+    line1
+    line2
+  interface: "y"
+  enable: false
+  rules: []
+- id: 0a0b0c11
+  name: "null"
+  interface: "y"
+  enable: false
+  rules: []

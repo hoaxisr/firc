@@ -1,0 +1,16 @@
+# Exercises the addressPool load path end to end: every value differs from its
+# default, so a loader that dropped the block would show up in the golden as
+# the defaults rather than as these. The v6 pool is pinned explicitly, which is
+# the non-default case - left empty it is generated at first start.
+configVersion: 0.7.0
+app:
+  addressPool:
+    v4:
+      pool: 100.64.0.0/10
+      chunk: 26
+    v6:
+      pool: fd7a:115c:a1e0::/48
+      chunk: 60
+    ttlClamp: 2m
+    idleWindow: 36h
+    maxNames: 4096

@@ -1,0 +1,9 @@
+/.build
+/.config
+.DS_Store
+private-key.pem
+public-key.pem
+# differential-suite scratch, written by the root-only http suite
+src/backend-c/tests/differential/out.root-owned/
+src/backend-c/tests/differential/out/
+__pycache__/

@@ -1,0 +1,346 @@
+name: Checking C backend
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '**'
+    paths:
+      - 'src/backend-c/**'
+      - 'files/**'
+      - 'tools/ci/entware-package/**'
+      - '.github/workflows/check-c.yml'
+  # A push of more than 1000 commits gets no diff, so path filters run nothing: dispatch by hand.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MAKEFLAGS: -j6
+
+jobs:
+  build_test:
+    name: Build, test, sanitize (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy cppcheck busybox-static libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev
+
+      - name: Build (warnings as errors)
+        working-directory: src/backend-c
+        run: make CFLAGS_EXTRA=-Werror
+
+      - name: The Keenetic build is the one that ships
+        working-directory: src/backend-c
+        run: |
+          # every shipped binary is built with ENTWARE_KN=1; own build dir keeps build/host intact
+          make -s BUILD=kn ENTWARE_KN=1 CFLAGS_EXTRA=-Werror all
+
+      - name: The netfilter.d hook posts to the daemon's socket path
+        run: |
+          set -eu
+          run_dir=$(sed -n 's|^#define FIRC_APP_RUN_DIR "\(.*\)"|\1|p' src/backend-c/include/firc/paths.h | head -1)
+          hook=$(sed -n 's|^SOCKET_PATH="\(.*\)"|\1|p' files/entware_kn/etc/ndm/netfilter.d/100-firc)
+          test "$hook" = "$run_dir/firc.sock" || { echo "100-firc posts to $hook, the daemon listens at $run_dir/firc.sock" >&2; exit 1; }
+          for f in files/entware_kn/etc/init.d/S99firc files/entware_kn/etc/ndm/netfilter.d/100-firc; do
+            if grep -nE '^[[:space:]]*(RUNDIR|SOCK|INITDIR|PROBE|SOCKET_PATH)=' "$f" | grep -qF '${'; then
+              echo "$f: spell it \$RUNDIR, not \${RUNDIR}: this gate resolves the simple form only" >&2; exit 1
+            fi
+            # these lines are eval'd below: allow-list their shape, a blacklist misses redirections
+            if grep -E '^[[:space:]]*(RUNDIR|SOCK|INITDIR|PROBE|SOCKET_PATH)=' "$f" \
+                 | sed 's|^[[:space:]]*||' \
+                 | grep -qvE '^(RUNDIR|SOCK|INITDIR|PROBE|SOCKET_PATH)="?(\$(RUNDIR|INITDIR))?[A-Za-z0-9_./-]*"?$'; then
+              echo "$f: a path assignment may only be a literal and \$RUNDIR/\$INITDIR, with nothing after it (a trailing comment included)" >&2
+              exit 1
+            fi
+          done
+          take_paths() {
+            sed -n -E 's@^(RUNDIR|SOCK|INITDIR|PROBE|SOCKET_PATH)=@p_\1=@p' "$1" \
+              | sed -e 's@\$RUNDIR@${p_RUNDIR}@g' -e 's@\$INITDIR@${p_INITDIR}@g'
+          }
+          eval "$(take_paths files/entware_kn/etc/init.d/S99firc)"
+          init_RUNDIR="${p_RUNDIR:-}"; init_SOCK="${p_SOCK:-}"; init_INITDIR="${p_INITDIR:-}"
+          unset p_RUNDIR p_SOCK p_INITDIR p_PROBE p_SOCKET_PATH
+          eval "$(take_paths files/entware_kn/etc/ndm/netfilter.d/100-firc)"
+          hook_PROBE="${p_PROBE:-}"; hook_INITDIR="${p_INITDIR:-}"
+          test "${init_SOCK:-}" = "$run_dir/firc.sock" || { echo "S99firc probes ${init_SOCK:-(none)}, the daemon listens at $run_dir/firc.sock" >&2; exit 1; }
+          test "${init_RUNDIR:-}" = "$run_dir" || { echo "S99firc's RUNDIR is ${init_RUNDIR:-(none)}, the daemon's run dir is $run_dir" >&2; exit 1; }
+          initdir="${init_INITDIR:-}"
+          test -n "$initdir" || { echo "S99firc has no INITDIR" >&2; exit 1; }
+          # the hook's cache lives under INITDIR: `fircd --purge` removes the run dir whole
+          case "${hook_PROBE:-}" in
+            "$initdir"/*) ;;
+            *) echo "100-firc caches at '${hook_PROBE:-(none)}'; it must be under S99firc's INITDIR $initdir" >&2; exit 1 ;;
+          esac
+          test "${hook_INITDIR:-}" = "$initdir" \
+            || { echo "100-firc's INITDIR is '${hook_INITDIR:-(none)}', S99firc's is $initdir" >&2; exit 1; }
+          # the init script's own state lives under INITDIR too
+          for v in LOOPPID STOPPED FIRSTRUN; do
+            val=$(sed -n "s|^$v=\"\{0,1\}\(.*\)|\1|p" files/entware_kn/etc/init.d/S99firc | head -1)
+            case "$val" in
+              '$INITDIR/'*) ;;
+              *) echo "S99firc's $v is '$val'; it must live under \$INITDIR" >&2; exit 1 ;;
+            esac
+          done
+          grep -q 'INITDIR/\.socat-warned' files/entware_kn/etc/init.d/S99firc \
+            || { echo "S99firc's socat warning marker must live under \$INITDIR" >&2; exit 1; }
+          # the package's removal takes INITDIR with it
+          grep -qE "rm -rf +\"?$initdir\"?( |$)" files/entware/_ipk/control/prerm \
+            || { echo "prerm does not remove S99firc's INITDIR $initdir" >&2; exit 1; }
+          # every path the hook names is under one of the two ("HTTP/1.1" is not a path)
+          for named in $(sed 's|#.*||' files/entware_kn/etc/ndm/netfilter.d/100-firc \
+                           | grep -oE '/[A-Za-z_][A-Za-z0-9._/-]*' | sort -u); do
+            case "$named" in
+              /tmp|/tmp/*|/opt|/opt/*|/etc|/etc/*|/var|/var/*|/usr|/usr/*|/dev|/dev/*|/run|/run/*|/proc|/proc/*|/sys|/sys/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/root|/root/*|/mnt|/mnt/*|/nonexistent|/nonexistent/*) ;;
+              *) continue ;;
+            esac
+            case "$named" in
+              /dev/null|/nonexistent/*) ;;  # the socat probe and its sink
+              "$run_dir"|"$run_dir"/*) ;;
+              "$initdir"|"$initdir"/*) ;;
+              *) echo "100-firc names '$named'; it may only name the daemon's run dir $run_dir and S99firc's INITDIR $initdir" >&2; exit 1 ;;
+            esac
+          done
+          test "$initdir" != "$run_dir" && case "$initdir" in "$run_dir"/*) false ;; *) true ;; esac \
+            || { echo "INITDIR $initdir must not be the daemon's run dir $run_dir or inside it: a purge removes that" >&2; exit 1; }
+
+      - name: Signals are blocked before the daemon starts a thread
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          def code(text):
+              # strip comments and string literals: a name in either must not count
+              out, i, n, incomment = [], 0, len(text), False
+              while i < n:
+                  if incomment:
+                      j = text.find("*/", i)
+                      if j < 0:
+                          out.append("\n" * text.count("\n", i)); break
+                      out.append("\n" * text.count("\n", i, j)); i = j + 2; incomment = False
+                  elif text.startswith("/*", i):
+                      incomment = True; i += 2
+                  elif text.startswith("//", i):
+                      j = text.find("\n", i); i = n if j < 0 else j
+                  elif text[i] in "\"'":
+                      q = text[i]; i += 1
+                      while i < n and text[i] != q:
+                          i += 2 if text[i] == "\\" else 1
+                      i += 1
+                  else:
+                      out.append(text[i]); i += 1
+              return "".join(out)
+
+          src = pathlib.Path("src/backend-c/src")
+          inc = pathlib.Path("src/backend-c/include")
+          # headers too: a static inline can start a thread
+          bodies = {f: code(f.read_text()).splitlines()
+                    for f in list(src.rglob("*.c")) + list(src.rglob("*.h")) + list(inc.rglob("*.h"))}
+          main = bodies[src / "main/main.c"]
+
+          def enclosing(lines):
+              fn = None
+              for line in lines:
+                  m = (re.match(r"^[A-Za-z_][A-Za-z0-9_ *]*\b([a-z_][a-z0-9_]*)\(", line)
+                       or re.match(r"^([a-z_][a-z0-9_]*)\(", line))   # return type on its own line
+                  if m:
+                      # a prototype names nothing: the body is elsewhere
+                      fn = None if line.rstrip().endswith(";") else m.group(1)
+                  yield fn, line
+
+          # the functions that create a thread and, to a fixpoint, their callers
+          starters = {fn for lines in bodies.values() for fn, line in enclosing(lines)
+                      if fn and "pthread_create" in line}
+          if not starters:
+              sys.exit("no thread-starting function found: this check has stopped checking anything")
+          while True:
+              more = {fn for lines in bodies.values() for fn, line in enclosing(lines)
+                      if fn and any(re.search(r"\b" + s + r"\s*\(", line) for s in starters)}
+              if more <= starters:
+                  break
+              starters |= more
+          starters.discard("main")
+
+          # a call, not a declaration at column 0
+          block = next((i + 1 for i, l in enumerate(main)
+                        if "firc_loop_block_signals(" in l and not re.match(r"^[A-Za-z_]", l)), None)
+          if block is None:
+              sys.exit("main.c does not block the signals it subscribes to")
+          first = None
+          for i, l in enumerate(main):
+              if re.match(r"^[A-Za-z_]", l):   # a definition, not a call
+                  continue
+              if any(re.search(r"\b" + s + r"\s*\(", l) for s in starters) or "pthread_create" in l:
+                  first = i + 1
+                  break
+          if first is None:
+              sys.exit("main.c starts no thread at all: this check has stopped checking anything")
+          # an unblocked thread would take the signal's default action and kill the daemon
+          if block > first:
+              sys.exit(f"main.c:{first} starts a thread before main.c:{block} blocks the signals")
+          print(f"signals blocked at main.c:{block}, first thread start at main.c:{first}")
+          PY
+
+      - name: The SDK feed's maintainer scripts mirror the ipk control files
+        run: |
+          set -eu
+          # compare escaped: every $ of a control file must be $$ in the define, or make eats it
+          tmp=$(mktemp -d)
+          for s in files/entware/_ipk/control/*; do
+            s=${s##*/}
+            awk -v s="$s" '$0 == "define Package/firc/" s { on = 1; next } on && $0 == "endef" { exit } on { print }' \
+              tools/ci/entware-package/Makefile > "$tmp/define.$s"
+            sed 's/\$/$$/g' "files/entware/_ipk/control/$s" > "$tmp/escaped.$s"
+            diff -u "$tmp/escaped.$s" "$tmp/define.$s" \
+              || { echo "tools/ci/entware-package/Makefile's $s drifted from files/entware/_ipk/control/$s (every \$ must be \$\$ there)" >&2; exit 1; }
+          done
+          for d in $(sed -n 's|^define Package/firc/\([a-z-]*\)$|\1|p' tools/ci/entware-package/Makefile | grep -vE '^(description|install)$'); do
+            test -f "files/entware/_ipk/control/$d" || { echo "tools/ci/entware-package/Makefile defines $d that files/entware/_ipk/control/ lacks" >&2; exit 1; }
+          done
+          # the scripts must parse under Entware's busybox ash
+          for f in files/entware_kn/etc/init.d/S99firc files/entware_kn/etc/ndm/netfilter.d/100-firc files/entware/_ipk/control/prerm files/entware/_ipk/control/postinst; do
+            sh -n "$f" || { echo "$f does not parse" >&2; exit 1; }
+            command -v busybox > /dev/null \
+              || { echo "busybox is not installed: the target shell is not being checked" >&2; exit 1; }
+            busybox sh -n "$f" || { echo "$f does not parse under busybox ash" >&2; exit 1; }
+          done
+
+      - name: Routing code calls no capture reader
+        working-directory: src/backend-c
+        run: |
+          # routing must never depend on what the capture reads; nm output goes to files so a failure is not hidden
+          set -o pipefail
+
+          # both builds: reader code under FIRC_ENTWARE_KN is invisible without it
+          for build in host kn; do
+            [ "$build" = kn ] && kn=ENTWARE_KN=1 || kn=
+
+            nm "build/$build/fircd" > "$RUNNER_TEMP/syms.$build"
+            grep -q ' T firc_tap_rules_install' "$RUNNER_TEMP/syms.$build" || {
+              echo "build/$build/fircd does not carry the tap's rules"; exit 1;
+            }
+            # the readers must be linked, or an absent symbol would pass the check
+            grep -q ' T firc_tls_client_hello_sni' "$RUNNER_TEMP/syms.$build" || {
+              echo "build/$build/fircd does not carry the tap's readers"; exit 1;
+            }
+            grep -q ' T firc_tap_drain$' "$RUNNER_TEMP/syms.$build" || {
+              echo "build/$build/fircd does not carry the capture's drain"; exit 1;
+            }
+
+            # reader symbols come from the build (TAP_SRCS, TAP_CFG_SRCS), so a new reader is covered
+            objs=$(make -s BUILD=$build $kn print-TAP_OBJS)
+            nm --defined-only $objs > "$RUNNER_TEMP/readers.$build"
+            readers=$(awk '$2 == "T" { print $3 }' "$RUNNER_TEMP/readers.$build" | sort -u)
+            test -n "$readers" || { echo "no reader symbols found: the check is empty"; exit 1; }
+
+            # the routing layers, found recursively; src/tap/ is excluded (taprules.c is the daemon's)
+            routing=$(find build/$build/src/dns build/$build/src/netfilter \
+                           build/$build/src/rules build/$build/src/fakeip -name '*.o')
+            test -n "$routing" || { echo "no routing objects found: the check is empty"; exit 1; }
+            nm --undefined-only $routing > "$RUNNER_TEMP/routing.$build"
+            # one space-separated line: the case match below needs " $sym "
+            called=$(awk '$1 == "U" { print $2 }' "$RUNNER_TEMP/routing.$build" | sort -u | tr '\n' ' ')
+            test -n "$called" || { echo "no undefined symbols found: the check is empty"; exit 1; }
+
+            for sym in $readers; do
+              case " $called " in
+                *" $sym "*)
+                  echo "a routing layer calls $sym: routing must not depend on what the capture reads"
+                  exit 1
+                  ;;
+              esac
+            done
+          done
+          # not covered: decisions outside these four dirs, static inline readers, data passed instead of calls
+
+      - name: Unit tests
+        working-directory: src/backend-c
+        # -Werror for the test binaries too
+        run: make CFLAGS_EXTRA=-Werror test
+
+      - name: A group's mark and a group's selector route as they should (user namespace)
+        working-directory: src/backend-c
+        # suites run in user namespaces: AppArmor must allow them, and xt modules are loaded here
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe -a nf_conntrack nf_nat iptable_nat xt_mac xt_mark xt_connmark xt_conntrack xt_nat xt_MASQUERADE || true
+          sudo modprobe nft_chain_nat || true # the nat chain type, when iptables is the nft backend
+          make CFLAGS_EXTRA=-Werror routing
+
+      - name: Sanitizers (ASan+UBSan)
+        working-directory: src/backend-c
+        run: make sanitize
+
+      - name: ThreadSanitizer (threaded suites)
+        working-directory: src/backend-c
+        # TSan's shadow layout needs mmap randomisation of 28 bits at most
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make tsan
+
+      - name: Static analysis
+        working-directory: src/backend-c
+        run: make static_analysis
+
+      - name: Fuzz smoke (libFuzzer, short)
+        working-directory: src/backend-c
+        run: |
+          sudo apt-get install -y clang libclang-rt-18-dev || \
+            sudo apt-get install -y clang
+          make fuzz FUZZ_RUNS=200000
+
+  api_reference:
+    name: The API reference names every route the daemon serves
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # docs/swagger.yaml is written by hand; this keeps it complete
+      - name: Compare swagger.yaml against the route registrations
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tools/ci/check_swagger_routes.py
+
+  differential:
+    name: Differential/regression suites (vs golden snapshots)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev
+
+      - name: Run differential/regression suites
+        working-directory: src/backend-c
+        # sudo: the HTTP contract suite needs real iptables and the real run directory
+        run: sudo -E env "PATH=$PATH" sh tests/differential/run_diff.sh
+
+  cross_build:
+    name: Cross-build skeleton (mipsel)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu
+
+      - name: Cross build
+        working-directory: src/backend-c
+        run: |
+          make CROSS_COMPILE=mipsel-linux-gnu- CFLAGS_EXTRA=-Werror
+          # no feed sysroot here, so only the dependency-free firc-dnstool is built
+          file build/cross-mipsel-linux-gnu/firc-dnstool | grep -q MIPS

@@ -1,0 +1,65 @@
+name: Checking
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '**'
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test_frontend:
+    name: Frontend testing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.JS
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # npm ci: the lockfile pins prettier, so CI formats like a developer does.
+      - name: Install frontend dependencies
+        working-directory: ./src/frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: ./src/frontend
+        run: npx playwright install --with-deps
+
+      - name: Frontend formatting
+        working-directory: src/frontend
+        run: npm run format:check
+
+      - name: Frontend type check
+        working-directory: src/frontend
+        run: npm run check
+
+      # A t() key with no locale entry silently falls back to English.
+      - name: Frontend translations
+        working-directory: ./src/frontend
+        run: npm run check:i18n
+
+      - name: Frontend unit tests
+        working-directory: ./src/frontend
+        run: npm run test:unit
+
+      - name: Frontend e2e tests
+        working-directory: ./src/frontend
+        run: npm run test:e2e

@@ -1,0 +1,28 @@
+# /logs, not logs: a bare pattern matches a directory of that name at ANY
+# depth, and it silently swallowed src/modules/logs/ -- a source directory
+# that existed locally, built locally, and would have reached no one else.
+/logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+.vscode/*
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+dev/groups*.json
+# written by the import-export e2e case on every run
+/tests/e2e/fixtures/

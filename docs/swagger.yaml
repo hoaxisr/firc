@@ -1,0 +1,1857 @@
+definitions:
+  types.AuthRes:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+    type: object
+  types.Host:
+    properties:
+      active:
+        description: 'The firmware sees the device now'
+        example: true
+        type: boolean
+      ip:
+        description: 'The device''s IPv4 address; an empty string if it has none'
+        example: 192.168.1.5
+        type: string
+      ip6:
+        items:
+          example: fd00::5
+          type: string
+        type: array
+      mac:
+        description: 'MAC in lower case with colons -- exactly what goes into mac:<MAC>'
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+      name:
+        description: 'The firmware''s name, else the hostname, else an empty string'
+        example: TV
+        type: string
+      policy:
+        description: >-
+          The internal name of the device's policy: its own, else the policy
+          of the segment its address falls in; empty if neither
+        example: Policy0
+        type: string
+      registered:
+        description: 'The device is registered in the firmware'
+        example: true
+        type: boolean
+    type: object
+  types.HostsRes:
+    properties:
+      hosts:
+        items:
+          $ref: '#/definitions/types.Host'
+        type: array
+    type: object
+  types.Policy:
+    properties:
+      description:
+        description: 'The policy''s human name from the router''s interface; absent if the firmware does not give one'
+        example: Kids
+        type: string
+      devices:
+        description: 'How many devices (hotspot table hosts) are in this policy; a device may have several addresses and is counted once'
+        example: 2
+        type: integer
+      name:
+        description: 'The internal name -- the one the device selector understands'
+        example: Policy0
+        type: string
+    type: object
+  types.PoliciesRes:
+    properties:
+      policies:
+        items:
+          $ref: '#/definitions/types.Policy'
+        type: array
+    type: object
+  types.SettingsRes:
+    properties:
+      settings:
+        additionalProperties: {}
+        description: >-
+          YAML path -> saved value. Numbers as numbers; timeout in
+          milliseconds, ttlClamp in seconds, idleWindow in hours; link is an
+          array of strings; startMarkTableIndex is a string like 0x66697263
+        example:
+          app.dnsProxy.upstream.address: 127.0.0.1
+          app.dnsProxy.upstream.port: 53
+          app.dnsProxy.timeout: 5000
+        type: object
+      classes:
+        additionalProperties:
+          enum:
+          - live
+          - restart
+          type: string
+        type: object
+      pendingRestart:
+        description: 'Restart settings whose saved value is not in effect yet'
+        items:
+          type: string
+        type: array
+      boot:
+        description: >-
+          Identity of this daemon run, the journal's boot id. It changes with
+          every start, so a client that saw it before a restart knows the
+          daemon that answers now is a new one.
+        type: string
+      restarting:
+        description: >-
+          True while a restart asked for through POST /system/restart is under
+          way. It drops to false when the restart script could not start or
+          the daemon was not stopped within the restart timeout.
+        type: boolean
+    type: object
+  types.SettingsPutReq:
+    properties:
+      settings:
+        additionalProperties: {}
+        description: 'Only the changed settings, YAML path -> value'
+        type: object
+    type: object
+  types.SettingsPutRes:
+    properties:
+      applied:
+        description: 'Live settings applied by this save'
+        items:
+          type: string
+        type: array
+      pendingRestart:
+        description: 'The full list of settings waiting for a restart after this save'
+        items:
+          type: string
+        type: array
+    type: object
+  types.SettingsErrorRes:
+    properties:
+      error:
+        example: not an IPv4 or IPv6 address
+        type: string
+      field:
+        description: 'YAML path of the rejected setting'
+        example: app.dnsProxy.upstream.address
+        type: string
+    type: object
+  types.RestartRes:
+    properties:
+      restarting:
+        example: true
+        type: boolean
+    type: object
+  types.Event:
+    properties:
+      at:
+        description: 'Unix time of the event, seconds'
+        example: 1789647292
+        type: integer
+      kind:
+        enum:
+        - log
+        - dns
+        - bypass
+        type: string
+      level:
+        enum:
+        - trace
+        - debug
+        - info
+        - warn
+        - error
+        - fatal
+        - panic
+        - nolevel
+        example: warn
+        type: string
+      message:
+        example: 'group Example routes nothing: "" is not an interface name'
+        type: string
+      seq:
+        description: 'Event number; grows by one and is never reused'
+        example: 1041
+        type: integer
+      client:
+        description: 'Client IP address (present only when kind=dns or kind=bypass and the client address is known)'
+        example: 192.168.1.42
+        type: string
+      dst:
+        description: 'Destination IP address of the flow (present only when kind=bypass)'
+        example: 142.250.1.1
+        type: string
+      port:
+        description: 'Destination TCP/UDP port (present only when kind=bypass and the protocol has ports)'
+        example: 443
+        type: integer
+      proto:
+        description: 'IP protocol -- tcp, udp, icmp, icmpv6, else the protocol number (present only when kind=bypass)'
+        example: udp
+        type: string
+      how:
+        description: 'How the flow was recognised -- addr (by destination address) or sni (by the SNI from the ClientHello, only when the address was not recognised) (present only when kind=bypass)'
+        enum:
+        - addr
+        - sni
+        example: addr
+        type: string
+      name:
+        description: >-
+          Host name (present only when kind=dns or kind=bypass). For
+          kind=bypass recognised by address (how=addr), it is the last name
+          firc recorded behind that address -- not necessarily the one this
+          client asked for, if the address is shared (a CDN, for example).
+        example: youtube.com
+        type: string
+      qtype:
+        description: 'DNS query type -- A, AAAA, CNAME, MX, TXT, SRV, SVCB, HTTPS, PTR, NS, SOA, else TYPE<n> (present only when kind=dns)'
+        example: AAAA
+        type: string
+      rcode:
+        description: 'DNS response code -- NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, else RCODE<n> (present only when kind=dns)'
+        example: NOERROR
+        type: string
+      decision:
+        description: 'The daemon''s decision on this query (present only when kind=dns)'
+        enum:
+        - issued
+        - not-covered
+        - no-match
+        - pool-refused
+        - passed
+        type: string
+      resolver:
+        description: >-
+          Where the answer came from (present only when kind=dns): upstream --
+          the common upstream; group -- the group's DNS through its tunnel;
+          fallback_* -- the group's DNS failed and the common upstream
+          answered (unreachable -- the tunnel is down, timeout -- no answer in
+          time, servfail/refused -- it answered SERVFAIL/REFUSED or garbage,
+          sink -- it answered with a sink address or an address from firc's
+          pool); health_skip -- the group's DNS is resting after three
+          failures in a row and the common upstream was asked.
+        enum:
+        - upstream
+        - group
+        - fallback_unreachable
+        - fallback_timeout
+        - fallback_servfail
+        - fallback_refused
+        - fallback_sink
+        - health_skip
+        type: string
+      group:
+        description: >-
+          Routing group. For kind=dns -- the group that was applied, if any
+          (present only then). For kind=bypass -- the group that owns the
+          name, if one does (present only then). firc did not route the flow:
+          the capture rules in the kernel pass only a flow whose original
+          (pre-DNAT) destination is outside the pool (`! --ctorigdst`, which
+          drops everything sent to an issued address) and whose packet mark
+          lacks the firc bit (`-m mark ! --mark 0x40000000/0x40000000`, which
+          drops everything a subnet/subnet6 rule routed -- it marks the real
+          address, and the first condition cannot see it). Not the group
+          field: its bits are taken by the Keenetic connection policy
+          (`0x0ffffaaa`) of every device in a policy. The first condition
+          rests on the address, not on a mark someone further down the chain
+          could rewrite; the second is needed because a subnet route never
+          reaches the pool.
+        properties:
+          id:
+            description: 'Group ID'
+            example: d663876a
+            type: string
+          name:
+            description: 'Group name'
+            example: media
+            type: string
+        type: object
+      fake:
+        description: 'Fake address from the pool, if one was issued (present only when kind=dns and an address was issued)'
+        example: fd00::1:5
+        type: string
+      reals:
+        description: 'The real addresses the name resolved to -- always present when kind=dns, may be empty'
+        items:
+          type: string
+        type: array
+      last:
+        description: >-
+          The last answer firc gave this client for this name in the
+          destination address's family -- the answer to A for an IPv4 flow, to
+          AAAA for an IPv6 flow (present only when kind=bypass and firc
+          remembers such an answer). It remembers for at most 30 minutes and
+          at most 8192 (address, name, family) pairs -- older ones are
+          evicted, so sooner on a busy network. A missing `last` means firc
+          does not remember a query from this address, not that there was
+          none: the device may have asked from another of its addresses.
+        properties:
+          decision:
+            description: 'firc''s decision that time'
+            enum:
+            - issued
+            - not-covered
+            - no-match
+            - pool-refused
+            - passed
+            type: string
+          at:
+            description: 'Unix time of that answer, seconds'
+            example: 1789647200
+            type: integer
+          fake:
+            description: >-
+              The fake address of this family from that answer (absent if it
+              had none -- for example, decision=issued with a NODATA answer to
+              AAAA for a name without IPv6)
+            example: 198.18.0.5
+            type: string
+        type: object
+      repeats:
+        description: >-
+          How many more flows for (client, name) were folded into this event
+          since the previous one -- a 60-second deduplication window (present
+          only when kind=bypass)
+        example: 0
+        type: integer
+    type: object
+  types.EventsRes:
+    properties:
+      boot:
+        description: >-
+          The name of this daemon run. After a restart event numbers start
+          again at 1 and a cursor from the previous run means nothing: a
+          client that sees a different `boot` drops its events and cursor and
+          asks from 0.
+        example: 68d2a1f0-9c3e51a7
+        type: string
+      dropped:
+        description: >-
+          How many events between `since` and the last one returned no ring
+          holds any more. Always 0 when `since=0`: the client has asked for
+          nothing yet and missed nothing.
+        example: 0
+        type: integer
+      events:
+        items:
+          $ref: '#/definitions/types.Event'
+        type: array
+      level:
+        description: 'The level the daemon runs at -- there are no events below it (log events only)'
+        example: info
+        type: string
+      next:
+        description: 'Cursor for the next request'
+        example: 1041
+        type: integer
+    type: object
+  types.CaptureRes:
+    properties:
+      endsAt:
+        description: >-
+          Unix time the capture ends (wall clock; see secondsLeft). Only while
+          a capture runs
+        example: 1789591553
+        type: integer
+      running:
+        description: 'Whether a capture is running'
+        example: true
+        type: boolean
+      secondsLeft:
+        description: >-
+          How many seconds the capture really has left, by the monotonic
+          clock; never below 0. Only while a capture runs
+        example: 300
+        type: integer
+      token:
+        description: 'Only in the answer to POST -- the same token stops the capture'
+        example: 3f2a1c0b5d6e7f80
+        type: string
+    type: object
+  types.ErrorRes:
+    properties:
+      error:
+        example: something went wrong
+        type: string
+    type: object
+  types.GroupErrorRes:
+    properties:
+      error:
+        example: resolve.server "127.0.0.1" is a sink address
+        type: string
+      field:
+        description: 'The group field that was rejected'
+        example: resolve.server
+        type: string
+      group:
+        description: 'ID of the group whose field was rejected'
+        example: 0a1b2c3d
+        type: string
+    type: object
+  types.GroupList:
+    description: 'The list a group takes rules from in addition to its own. The rules themselves are not here -- they are read a page at a time through GET /api/v1/groups/{groupID}/list/rules.'
+    properties:
+      interval:
+        description: 'How often to check the list, in seconds. 0 -- no timer.'
+        example: 86400
+        type: integer
+      lastUpdate:
+        description: 'When the list last changed (unix time). The daemon sets this itself; it is never read from a request body.'
+        example: 1700000000
+        type: integer
+      rulesTotal:
+        description: 'How many rules the list has now. rulesTotal: 0 with sync.state "fetching" means "no rules yet", not "an empty list".'
+        example: 313000
+        type: integer
+      sync:
+        description: Where the list is between a request and its arrival.
+        properties:
+          error:
+            description: 'Text of the last failure; empty in every other state.'
+            example: ''
+            type: string
+          lastCheck:
+            description: 'When the list was last checked (unix time); 0 -- never since the daemon started.'
+            example: 1700000000
+            type: integer
+          progress:
+            description: 'null outside queued/fetching; otherwise one of {"stage":"fetch","bytes":...,"total":...}, {"stage":"parse","lines":...}, {"stage":"apply"}.'
+            type: object
+          state:
+            description: 'idle | queued | fetching | error'
+            enum:
+            - idle
+            - queued
+            - fetching
+            - error
+            example: fetching
+            type: string
+        type: object
+      url:
+        example: https://example.com/list.txt
+        type: string
+    type: object
+  types.GroupReq:
+    properties:
+      devices:
+        $ref: '#/definitions/types.DeviceSelector'
+        description: Which client devices the group applies to (decided at the DNS answer). Absent on PUT keeps the current selector; null or {} clears it (every device).
+      enable:
+        example: true
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      interface:
+        example: nwg0
+        type: string
+      list:
+        $ref: '#/definitions/types.GroupList'
+        description: 'The group''s list. Absent -- the list stays as it is, like devices and rules; null removes the list and keeps the manual rules; an object sets a new list or updates the current one -- url is required and must be http/https with a host, an absent interval keeps the current list''s (0 for a new one, no timer); lastUpdate and sync are never read from the body.'
+      name:
+        example: Routing
+        type: string
+      resolve:
+        $ref: '#/definitions/types.GroupResolve'
+        description: >-
+          Where to resolve the group's names. Absent on PUT -- stays as it
+          was; null -- the default; an object replaces it whole, a missing key
+          takes the default.
+      rules:
+        items:
+          $ref: '#/definitions/types.RuleReq'
+        type: array
+    type: object
+  types.GroupRes:
+    properties:
+      devices:
+        $ref: '#/definitions/types.DeviceSelector'
+      enable:
+        example: true
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      interface:
+        example: nwg0
+        type: string
+      list:
+        $ref: '#/definitions/types.GroupList'
+        description: 'Present only on a group with a list; the group''s manual rules ("rules") are its own too.'
+      live:
+        description: 'The group is routed -- it is in the DNS view, its interface''s routes and rules are in the kernel, and its chains are written or awaiting a committer pass while passes succeed.'
+        example: true
+        type: boolean
+      liveReason:
+        description: 'Present only when live is false. Checked in this order. disabled -- the group is turned off; not-enabled -- enabling it failed, and the daemon retries by itself (after 1 s, then less often, up to once a minute); no-interface -- it is in the DNS view but its interface does not exist, is down, or its name is invalid; its addresses lead nowhere; not-written -- the committer''s first pass after start has not completed, or its passes have failed for five seconds in a row, and its chains may be missing from the kernel (GET /api/v1/system/netfilter says what exactly and since when).'
+        enum:
+        - disabled
+        - not-enabled
+        - no-interface
+        - not-written
+        type: string
+      name:
+        example: Routing
+        type: string
+      resolve:
+        $ref: '#/definitions/types.GroupResolve'
+      resolver:
+        $ref: '#/definitions/types.GroupResolver'
+      rules:
+        items:
+          $ref: '#/definitions/types.RuleRes'
+        type: array
+    type: object
+  types.GroupResolve:
+    properties:
+      server:
+        description: >-
+          The group's own DNS -- address[:port] (IPv6 with a port in
+          brackets). Empty -- the DNS servers the firmware bound to the
+          group's interface. Not 0.0.0.0, ::, 127.0.0.0/8, ::1, or an address
+          from firc's pool. The query goes through the group's tunnel, so a
+          DNS server on the local network will not work this way.
+        example: 9.9.9.9
+        type: string
+      tunnel:
+        description: 'Resolve the group''s names through its tunnel; true by default'
+        example: true
+        type: boolean
+    type: object
+  types.GroupResolver:
+    properties:
+      fallbacks:
+        description: 'How many queries since the daemon started went to the common upstream instead of the group''s DNS'
+        example: 0
+        type: integer
+      servers:
+        description: >-
+          The group's DNS servers, in query order (IPv4 first). An empty list
+          with source "group" or "firmware" does not mean the group has no
+          DNS: it means none is usable right now (the group is off or not yet
+          in the kernel, or the group has only an IPv6 address and no IPv6
+          route), and its names go to the common upstream.
+        items:
+          type: string
+        type: array
+      source:
+        description: >-
+          Where the group's DNS comes from: group -- resolve.server, firmware
+          -- those the firmware bound to the interface, none -- there are none
+          (or the group is a blackhole) and the common upstream is asked, off
+          -- resolve.tunnel is off
+        enum:
+        - group
+        - firmware
+        - none
+        - off
+        type: string
+    type: object
+  types.DeviceSelector:
+    description: 'Which client devices the group rewrites answers for -- for its manual rules and its list alike. An entry is an address, a CIDR prefix, policy:<Keenetic policy name> or mac:<device MAC> (the hotspot table host with that MAC, any of its addresses; : and - are accepted, any case; stored and returned lower-case with :). An address means the device the router knows behind it (all its addresses, up to 63 others). A MAC not in the table matches nobody -- in deny too. deny is checked before allow; an empty allow means every device. A bad entry is 400 with field devices.allow or devices.deny and group.'
+    properties:
+      allow:
+        items:
+          example: 192.168.1.0/24
+          type: string
+        type: array
+      deny:
+        items:
+          example: 192.168.1.5
+          type: string
+        type: array
+    type: object
+  types.GroupsReq:
+    properties:
+      groups:
+        items:
+          $ref: '#/definitions/types.GroupReq'
+        type: array
+    type: object
+  types.GroupsRes:
+    properties:
+      groups:
+        items:
+          $ref: '#/definitions/types.GroupRes'
+        type: array
+    type: object
+  types.InterfaceRes:
+    properties:
+      id:
+        example: nwg0
+        type: string
+    type: object
+  types.InterfaceResolvers:
+    properties:
+      interface:
+        description: 'Interface name in the kernel'
+        example: nwg0
+        type: string
+      servers:
+        items:
+          type: string
+        type: array
+    type: object
+  types.InterfacesRes:
+    properties:
+      interfaces:
+        items:
+          $ref: '#/definitions/types.InterfaceRes'
+        type: array
+    type: object
+  types.ResolversRes:
+    properties:
+      resolvers:
+        items:
+          $ref: '#/definitions/types.InterfaceResolvers'
+        type: array
+    type: object
+  types.NetfilterRes:
+    properties:
+      ok:
+        description: 'false while the committer''s first pass after start has not completed, or while its passes have failed for five seconds in a row with none completed; then every group that would be live answers live false and liveReason not-written.'
+        example: true
+        type: boolean
+      firstWritePending:
+        description: 'Present (and true) only while the committer''s first pass after start has not completed -- the chains of the groups brought up at start are not written yet. This is not an error; if those passes are also failing, error and since are present too.'
+        example: true
+        type: boolean
+      error:
+        description: 'Present only while passes are failing. The pass error -- the last one that is not a race with the firmware, else the last race.'
+        example: i/o error
+        type: string
+      since:
+        description: 'Present only while passes are failing. Unix time in seconds by the router''s clock when the first pass after the last successful one failed; it may be wrong before the clock is synced by NTP.'
+        example: 1790000000
+        type: integer
+    required:
+    - ok
+    type: object
+  types.LoginReq:
+    properties:
+      login:
+        example: admin
+        type: string
+      password:
+        example: hunter2
+        type: string
+    required:
+    - login
+    - password
+    type: object
+  types.LoginRes:
+    properties:
+      token:
+        example: eyJhbGciOiJIUzI1NiJ9...
+        type: string
+    type: object
+  types.NetfilterDHookReq:
+    properties:
+      table:
+        example: nat
+        type: string
+      type:
+        example: iptables
+        type: string
+    type: object
+  types.RuleReq:
+    description: 'A rule the daemon can actually route with. `type` is one of domain, namespace, wildcard, regex, subnet, subnet6; `rule` must be usable for that type -- a prefix for subnet/subnet6, a regex that compiles, never empty. Anything else is 400: a rule that matches nothing would otherwise be stored, listed and shown enabled while doing nothing.'
+    properties:
+      enable:
+        example: true
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      ports:
+        description: 'subnet/subnet6 only, and only with `proto`: a comma-separated list of ports or ranges, `N` or `N-M`, 1..65535, at most 15 ports where a range counts as two. Absent or empty means every port. Anything else is 400.'
+        example: 53,1000-2000
+        type: string
+      proto:
+        description: 'subnet/subnet6 only: `tcp` or `udp`, the one protocol the prefix is routed for; the other keeps the main table. Absent or empty means both. Set on any other rule type it is 400.'
+        example: udp
+        type: string
+      rule:
+        example: example.com
+        type: string
+      type:
+        example: domain
+        type: string
+    type: object
+  types.RuleRes:
+    properties:
+      enable:
+        example: true
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      ports:
+        description: Present only when set.
+        example: 53,1000-2000
+        type: string
+      proto:
+        description: Present only when set.
+        example: udp
+        type: string
+      rule:
+        example: example.com
+        type: string
+      type:
+        example: domain
+        type: string
+    type: object
+  types.RulesRes:
+    properties:
+      rules:
+        items:
+          $ref: '#/definitions/types.RuleRes'
+        type: array
+    type: object
+  types.SubRuleReq:
+    description: 'Edits one rule of a group''s list. Only `type` and `enable` can change: the pattern itself comes from the list, and the next sync would overwrite an edit, so a request with `rule` is 400 rather than a silent no-op. `type` is checked as everywhere else: a type the daemon cannot use for this pattern is 400 with the rule''s name.'
+    properties:
+      enable:
+        example: false
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      type:
+        example: namespace
+        type: string
+    type: object
+  types.SubRulesPatchReq:
+    description: The rules that CHANGED, and only those. The body does not grow with the list.
+    properties:
+      rules:
+        items:
+          $ref: '#/definitions/types.SubRuleReq'
+        type: array
+    type: object
+  types.SubRulesPageRes:
+    description: 'One page of the group''s list rules. `total` counts the whole list, `matched` every rule matching `q`; `rules` is a slice of the matching ones, no longer than `limit`.'
+    properties:
+      matched:
+        example: 1
+        type: integer
+      offset:
+        example: 0
+        type: integer
+      rules:
+        items:
+          $ref: '#/definitions/types.SubRuleRes'
+        type: array
+      total:
+        example: 1
+        type: integer
+    type: object
+  types.SubRuleRes:
+    properties:
+      enable:
+        example: true
+        type: boolean
+      id:
+        example: 0a1b2c3d
+        type: string
+      rule:
+        example: example.com
+        type: string
+      type:
+        example: namespace
+        type: string
+    type: object
+  types.SubPreviewRes:
+    description: 'What a list contains, without the list. `total` and `byType` are counted over all of it; `rules` is a bounded SAMPLE (100), because serialising every rule of a real blocklist costs the router about eight times the response in cJSON tree. `dropped` is the number of LINES the parser could make nothing of -- a hosts-format or AdBlock list yields nothing routable, and an empty preview with no reason reads as an empty file, a wrong URL, or a bug.'
+    properties:
+      byType:
+        additionalProperties:
+          type: integer
+        type: object
+      dropped:
+        example: 0
+        type: integer
+      rules:
+        items:
+          $ref: '#/definitions/types.SubRuleRes'
+        type: array
+      total:
+        example: 1
+        type: integer
+    type: object
+info:
+  contact: {}
+  title: firc API
+  version: "0.1"
+# The route registrations in src/backend-c/src/api/*.c are the source of
+# truth; this file is written from them by hand and can fall behind
+# (tools/ci/check_swagger_routes.py checks the paths) -- if something here
+# disagrees with them, they are right.
+paths:
+  /api/v1/auth:
+    get:
+      description: >-
+        Always answers `enabled: true`: authentication is required and cannot
+        be turned off. Answers without a token.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.AuthRes'
+      security: []
+      summary: 'Authentication state'
+      tags:
+      - auth
+    post:
+      consumes:
+      - application/json
+      description: >-
+        Checks the login and password and issues a JWT. No token is needed or
+        checked here: this is the only way to get one.
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.LoginReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.LoginRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "429":
+          description: >-
+            Too many failed attempts in a row. The answer comes at once, but
+            the password is not checked -- wait a second and retry
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      security: []
+      summary: 'Log in'
+      tags:
+      - auth
+  /api/v1/groups:
+    get:
+      description: 'Returns the list of groups'
+      parameters:
+      - description: 'Return the groups with their rules'
+        in: query
+        name: with_rules
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.GroupsRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get the list of groups'
+      tags:
+      - groups
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a group. A rejection of a group field names the field and the group. A group that failed to come up is 500 with the text group "<name>": <step>: <error>.'
+      parameters:
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.GroupReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.GroupRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.GroupErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Create a group'
+      tags:
+      - groups
+    put:
+      consumes:
+      - application/json
+      description: 'Updates the list of groups. A rejection of a group field names the field and the group.'
+      parameters:
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.GroupsReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.GroupsRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.GroupErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Update the list of groups'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}:
+    delete:
+      description: 'Deletes the requested group. A kernel error while taking the group down does not stop the deletion: the answer is 200. An invalid group ID: the answer is 400.'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Delete a group'
+      tags:
+      - groups
+    get:
+      description: 'Returns the requested group'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Return the group with its rules'
+        in: query
+        name: with_rules
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.GroupRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get a group'
+      tags:
+      - groups
+    put:
+      consumes:
+      - application/json
+      description: 'Updates the requested group. A rejection of a group field names the field and the group.'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.GroupReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.GroupRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.GroupErrorRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Update a group'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}/rules:
+    get:
+      description: 'Returns the list of rules'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.RulesRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get the list of rules'
+      tags:
+      - rules
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a rule'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.RuleReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.RuleRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Create a rule'
+      tags:
+      - rules
+    put:
+      consumes:
+      - application/json
+      description: 'Updates the list of rules'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.RulesRes'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.RulesRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Update the list of rules'
+      tags:
+      - rules
+  /api/v1/groups/{groupID}/rules/{ruleID}:
+    delete:
+      description: 'Deletes the requested rule'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Rule ID'
+        in: path
+        name: ruleID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Delete a rule'
+      tags:
+      - rules
+    get:
+      description: 'Returns the requested rule'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Rule ID'
+        in: path
+        name: ruleID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.RuleRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get a rule'
+      tags:
+      - rules
+    put:
+      consumes:
+      - application/json
+      description: 'Updates the requested rule'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Rule ID'
+        in: path
+        name: ruleID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.RuleReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.RuleRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Update a rule'
+      tags:
+      - rules
+  /api/v1/groups/list/preview:
+    get:
+      description: 'Downloads and parses a list by URL without saving anything: the preview for the "List by URL" block in the group dialog. Returns counters over the whole list (`total`, `byType`, `dropped` -- lines that yielded no rule) and at most the first 100 rules. The download and parse run on a separate thread: the answer comes when the list is downloaded, while DNS and other requests are served meanwhile. At most two previews run at once; the next one gets 503 until one of them finishes. A client that closes the connection before the answer cancels the download.'
+      parameters:
+      - description: 'List URL'
+        in: query
+        name: url
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.SubPreviewRes'
+        "400":
+          description: 'Bad Request -- no `url`'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: 'Internal Server Error -- the list downloaded but did not parse (out of memory)'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "502":
+          description: 'Bad Gateway -- the list did not download'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: 'Service Unavailable -- two previews are already running (`too many list previews at once`)'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Preview a list by URL'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}/list/rules:
+    get:
+      description: 'A page of the group''s list rules. The answer never holds the whole list: `total` -- how many rules the list has, `matched` -- how many of them match `q` (equal to `total` without `q`), `rules` -- at most `limit` matching rules starting at matched position `offset`. `q` is a case-insensitive substring of the rule text. An `offset` past the end is an empty page, not an error. The group''s manual rules are at /api/v1/groups/{groupID}/rules. A group without a list is 404 `group has no list`.'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Position of the first rule among the matching ones (default 0). A non-negative integer only: a negative or non-numeric value is 400 `invalid offset`.'
+        in: query
+        name: offset
+        type: integer
+      - description: 'Page size (default 50, at most 500). `limit=0` is the default size, not an empty page. A negative or non-numeric value is 400 `invalid limit`.'
+        in: query
+        name: limit
+        type: integer
+      - description: 'Substring to search for in the rule text, case-insensitive. At most 511 bytes after percent-decoding: the server silently truncates a longer value (src/backend-c/include/firc/httpd.h).'
+        in: query
+        name: q
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.SubRulesPageRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- no such group, or the group has no list'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'A page of the group''s list rules'
+      tags:
+      - groups
+    patch:
+      consumes:
+      - application/json
+      description: 'Changes `type` and/or `enable` of the named rules of the group''s list, and only theirs: in place, without copying the list and without touching other groups. Any rejection (an unknown rule ID, a pattern in the request) changes nothing; if memory runs out midway, edits already applied may stay, and the answer is 500. A `rule` field in the request is 400: the pattern comes from the list. An edit is remembered in the file under the rule text; a type equal to what the list parser guesses removes the type edit. The file is written only with `save=true`. The answer is `{"status":"ok"}`.'
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'Save the changes to the config file'
+        in: query
+        name: save
+        type: boolean
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.SubRulesPatchReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- no such group, the group has no list, or the list has no rule with that id'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Change rules of the group''s list'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}/list/sync:
+    post:
+      consumes:
+      - application/json
+      description: >-
+        Queues the group's list for download and answers 202 at once with the
+        group record, whose `list.sync.state` is `queued`. The result arrives
+        as events on GET /api/v1/groups/{groupID}/list/sync/events or shows in
+        the group's `list.sync` field. The body is optional; `{"url": "..."}`
+        is saved on the list BEFORE queueing (and written to the file if the
+        address really changed); the body hash is kept -- it is the list's
+        hash, not the address's. There is no `save` parameter: the file is
+        written when the list changed.
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.GroupRes'
+        "400":
+          description: 'Bad Request -- invalid id or unsupported address'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- no such group, or the group has no list'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: 'Internal Server Error -- the new address could not be saved'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: 'Service Unavailable -- the worker is not running or the queue is full'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Sync the group''s list'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}/list/sync/events:
+    get:
+      description: >-
+        The group's list sync events, `text/event-stream`. The stream always
+        starts by repeating the current state. Three events, each with one
+        JSON line in `data:`:
+
+
+        `progress` -- work is under way.
+        `{"stage":"fetch","bytes":N,"total":N}` (`total` is 0 if the server
+        did not give a length), `{"stage":"parse","lines":N}`,
+        `{"stage":"apply"}`.
+
+
+        `done` -- the work finished, `data` holds the group record with its
+        list (types.GroupRes, without `rules`). The stream closes after it.
+
+
+        `error` -- the work failed, `data` holds `{"error": "text"}`. The
+        stream also ends this way when the group was deleted (`group
+        removed`), the list was removed (`list removed`) or its address
+        changed (`list url changed`). The stream closes after it.
+
+
+        A list in state `idle` or `error` gets one event and the close.
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "401":
+          description: 'Unauthorized -- the route sits behind the same authentication as the rest'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- no such group, or the group has no list'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Group list sync events'
+      tags:
+      - groups
+  /api/v1/system/config/save:
+    post:
+      description: 'Saves the current configuration to persistent storage'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Save the configuration'
+      tags:
+      - config
+  /api/v1/system/settings:
+    get:
+      description: >-
+        The daemon's settings from firc.conf: each one's saved value, its
+        class -- applied at once (live) or after a restart (restart) -- and
+        the restart settings whose saved value is not in effect yet.
+        `app.httpWeb.enabled` is not here: turning the web interface off from
+        itself would lock you out of it.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.SettingsRes'
+        "500":
+          description: 'Internal Server Error -- not enough memory for the answer'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Daemon settings'
+      tags:
+      - config
+    put:
+      consumes:
+      - application/json
+      description: >-
+        Changes the listed settings. Each is checked before writing by the
+        same rules as when firc.conf is loaded; the first error is 400 with
+        the setting's path in `field`, and then neither the file nor the
+        daemon changes. A value equal to the saved one is not a change.
+        Otherwise firc.conf is written whole (groups.yaml is not), live
+        settings apply at once, and `pendingRestart` is the full list of
+        settings waiting for a restart after this save.
+      parameters:
+      - description: 'Only the changed settings'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.SettingsPutReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.SettingsPutRes'
+        "400":
+          description: >-
+            Bad Request -- an unknown setting or a value that fails the check;
+            also a WebUI or DNS proxy address that cannot be taken: the port
+            is already in use on the router (`field` is `.port`) or the
+            address is not on the router (`field` is `.address`). Nothing is
+            written.
+          schema:
+            $ref: '#/definitions/types.SettingsErrorRes'
+        "500":
+          description: >-
+            Internal Server Error -- firc.conf may have been written. Either
+            it was not written and nothing changed. Or it was written but a
+            live setting could not be applied (`error` says so): it is saved
+            and takes effect after a restart; or it was written but there was
+            not enough memory for the answer. So after a 500, read GET
+            /system/settings again.
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Change daemon settings'
+      tags:
+      - config
+  /api/v1/system/restart:
+    post:
+      description: >-
+        Restarts the daemon: answers 202 and, once the answer is sent, runs
+        `/opt/etc/init.d/S99firc restart` detached from itself. The script
+        stops the daemon (SIGTERM; the pool is saved) and starts it again --
+        DNS does not answer for those seconds. While a restart is in progress
+        (at most 90 s), a repeated request is 409. If the script did not start
+        or did not stop the daemon, the journal says so and the request can be
+        repeated.
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.RestartRes'
+        "409":
+          description: 'Conflict -- a restart is already in progress'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: >-
+            Internal Server Error -- not enough memory for the answer; the
+            restart was not started, the request can be repeated
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Restart the daemon'
+      tags:
+      - config
+  /api/v1/system/hooks/netfilterd:
+    post:
+      consumes:
+      - application/json
+      description: 'Emulates the netfilter.d event hook'
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.NetfilterDHookReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'netfilter.d event hook'
+      tags:
+      - hooks
+  /api/v1/system/hosts:
+    get:
+      description: >-
+        Devices from the router's hotspot table, for choosing a group's
+        devices. The answer comes from the daemon's last read of the table,
+        made every 30 seconds, not from a live request to the firmware. A
+        device without a MAC is left out: a mac: entry could not name it. name
+        is the firmware's name, else the hostname, else an empty string;
+        policy is the internal name of the device's policy (as name in
+        /system/policies): its own, else the policy of the segment (interface)
+        its address falls in -- by the same rule /system/policies counts
+        devices by; empty if neither. An empty list is an answer: before the
+        first read of the table it is empty.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.HostsRes'
+      summary: 'Router devices'
+      tags:
+      - system
+  /api/v1/system/policies:
+    get:
+      description: >-
+        The policies this router has -- so the device selector offers a choice
+        instead of taking `policy:<name>` blind: a name the firmware does not
+        have matches nobody. A policy without devices is listed too. An empty
+        list is an answer, not an error: the router may have no policies, and
+        before the first firmware read the list is empty.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.PoliciesRes'
+      summary: 'Router policies'
+      tags:
+      - system
+  /api/v1/system/resolvers:
+    get:
+      description: >-
+        The DNS servers the firmware bound to interfaces (`ip name-server ...
+        on <interface>`), by kernel interface name -- hints for a group's own
+        DNS. An empty list is an answer: before the first firmware read it is
+        empty, and interfaces may have no DNS of their own.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.ResolversRes'
+      summary: 'Interface DNS from the firmware'
+      tags:
+      - system
+  /api/v1/system/netfilter:
+    get:
+      description: >-
+        Whether the committer is writing what the groups say. When its passes
+        have failed for five seconds in a row with none completed in that time
+        -- whatever the error, a race with the firmware or a refusal -- the
+        answer is ok false with the error (the last one that is not a race,
+        else the last race) and the time of the first failed pass. A refusal
+        the next pass fixes is not visible. Then every group that would be
+        live also answers live false and liveReason not-written: a failed full
+        pass first removes everything of ours from the kernel. A pass that is
+        only awaited (150 ms after a save) does not count as a failure. Until
+        the first pass after start completes -- the one that writes the chains
+        of the groups brought up at start -- the answer is also ok false, with
+        firstWritePending true, and the groups also answer not-written. A
+        successful pass (and the first successful one after start) returns ok
+        true.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.NetfilterRes'
+      summary: 'Netfilter write state'
+      tags:
+      - system
+  /api/v1/system/events:
+    get:
+      description: >-
+        The journal of what the daemon said and what it answered. Two rings
+        under one numbering, in memory only: 512 lines from the daemon itself
+        and 4096 kind=dns/kind=bypass events together, so DNS traffic and the
+        capture do not push out the daemon's lines; the answer merges both by
+        number. A restart does not keep the journal, and `boot` in the answer
+        changes. `since` is the cursor from the previous answer; 0 or absent
+        means everything the ring still holds. The ring can hold names a
+        client asked for, so the route is available only after a WebUI login.
+      parameters:
+      - description: 'Cursor from the next field of the previous answer'
+        in: query
+        name: since
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.EventsRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Daemon journal'
+      tags:
+      - system
+  /api/v1/system/capture:
+    delete:
+      description: >-
+        Stops the capture. `token` is required and must be the one POST
+        returned: another is rejected, so a second client cannot cut someone
+        else's capture short. Stopping what is not running is not an error.
+        The daemon writes the capture's result to the journal
+        (/api/v1/system/events) and keeps nothing else.
+      parameters:
+      - description: 'The token POST returned'
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.CaptureRes'
+        "400":
+          description: 'No `token`'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'The token is not from the running capture'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Stop the capture'
+      tags:
+      - system
+    get:
+      description: >-
+        Whether a capture is running and how long it has left. What it found
+        are kind=bypass events in the journal (/api/v1/system/events), not
+        here.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.CaptureRes'
+      summary: 'Capture state'
+      tags:
+      - system
+    post:
+      description: >-
+        Starts a capture for five minutes (one fixed length) on the LAN
+        interfaces of the `link` setting: the daemon installs the capture
+        rules, binds two NFLOG groups -- new connections and ClientHellos --
+        and reads them itself, writing the bypasses it finds to the journal as
+        kind=bypass events. The request body is not read. Only one capture can
+        run at a time; it always ends on its own. Start, stop and the result
+        reach the journal at any log level.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.CaptureRes'
+        "400":
+          description: >-
+            `link` has no LAN interface, or holds something that is not an
+            interface name
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'A capture is already running'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "501":
+          description: >-
+            The kernel refused the capture rules -- the daemon first loads the
+            modules needed, then test-writes the rules into a separate chain
+            nothing references and deletes it at once; on a refusal the
+            capture does not start. The answer names the modules the rules
+            need. Routing is not affected.
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: >-
+            No address pool; or the capture readers did not come up -- the
+            NFLOG group could not be bound (another tool holds it, or the
+            kernel has no nfnetlink_log) or the daemon's event loop did not
+            take its socket (one answer for both cases; the daemon log says
+            which); or random bytes for the token could not be read
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Start a capture'
+      tags:
+      - system
+  /api/v1/system/interfaces:
+    get:
+      description: 'Returns the list of interfaces'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.InterfacesRes'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get the list of interfaces'
+      tags:
+      - config
+securityDefinitions:
+  bearer:
+    description: >-
+      A JWT from POST /api/v1/auth, in the Authorization header as `Bearer
+      <token>`. Required for all /api/v1/** on the web interface except
+      /api/v1/auth itself: authentication cannot be turned off. The Unix
+      socket needs no token -- its directory is 0700, so the caller is root on
+      this router.
+    in: header
+    name: Authorization
+    type: apiKey
+security:
+- bearer: []
+swagger: "2.0"

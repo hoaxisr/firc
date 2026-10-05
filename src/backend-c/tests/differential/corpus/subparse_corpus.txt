@@ -1,0 +1,36 @@
+# subscription list corpus
+example.com
+sub.example.net
+*.wild.example.org
+10.0.0.0/8
+192.168.1.1
+fd00::/8
+2001:db8::1
+^regex\.example\.com$
+example.com
+# duplicate above must collapse
+  padded.example.com  
+a.com,b.com,c.com
+300.1.2.3
+weird**pattern
+plain?mark
+# a repetition count carries a comma of its own: the line is a rule whole,
+# so it is not cut on it
+^ads[0-9]{1,3}\.example\.com$
+# a control verb ends a match where it stands, so the anchoring wrap does
+# not hold and the line is refused -- including behind an inline comment,
+# which a cleverer detector used to walk straight past
+^vk(*ACCEPT)$
+^ads(?#[)(*ACCEPT)$
+# every three-label name there is: a catch-all the sampled controls missed
+^\w+\.\w+\.\w+$
+# the dominant format in the blocklists this audience imports, and the line
+# that needs it most: PCRE2 reads `||...` as an alternation with
+# two EMPTY branches, which matches at offset 0 on every name
+||example.com^
+||ads.example.com^$third-party
+# the wrap is not total: an open \Q or a (?x) with a comment swallows the
+# closing `)\z`, so the pattern compiles as written and not as stored --
+# which is why the usability check runs on the wrapped text
+^abc\Q\Z
+^(?x)abc #$

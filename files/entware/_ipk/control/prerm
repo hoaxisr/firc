@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# A daemon left running from an unlinked binary keeps its rules until reboot, so refuse if it will not stop.
+ACTION="${1:-}"
+if [ -x /opt/etc/init.d/S99firc ]; then
+  /opt/etc/init.d/S99firc stop || {
+    if [ "$ACTION" = upgrade ]; then
+      MSG="firc: the running daemon would not stop; the upgrade is refused while it still routes. Reboot, then upgrade."
+    else
+      MSG="firc: the daemon would not stop; its files are not removed while it still routes. Reboot, then remove (or opkg remove --force-remove)."
+    fi
+    echo "$MSG" >&2
+    logger -t firc "$MSG" 2>/dev/null
+    exit 1
+  }
+fi
+
+# A stop keeps the pool's barrier and reject routes for the next daemon; purge them only on "remove".
+case "$ACTION" in
+  remove)
+    try_purge() {
+      # fircd's status goes out on fd 3: a pipeline reports logger's status, not the purge's.
+      rc=`{ { /opt/bin/fircd --purge; echo $? >&3; } | logger -t fircd 2>/dev/null; } 3>&1`
+      return ${rc:-1}
+    }
+    if [ -x /opt/bin/fircd ]; then
+      try_purge || try_purge ||
+        logger -t firc "purge did not finish; some rules or routes may be left until the next reboot"
+    fi
+    rm -rf /tmp/firc-init
+    ;;
+  upgrade) ;;
+  *) logger -t firc "prerm: action '$ACTION' unknown; the pool's routes and barrier are left for the next daemon" 2>/dev/null ;;
+esac
+
+exit 0

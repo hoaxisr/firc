@@ -1,0 +1,14 @@
+{"version":2,"rules":[
+{"unknown_field":"x"},
+{"domain":["a.com"],"domain":["b.com"]},
+{"type":"logical","domain":["c.com"]},
+{"invert":true,"domain":["d.com"]},
+{"network":"sctp","ip_cidr":"10.0.0.0/8"},
+{"port":70000,"ip_cidr":"10.0.0.0/8"},
+{"port_range":["abc"],"ip_cidr":"10.0.0.0/8"},
+{"network":"udp"},
+{"domain":[123,"ok.com"]},
+{"domain_keyword":["a*b","good"]},
+{"ip_cidr":[123,"10.0.0.0/8"]},
+{"port_range":["50000:"],"ip_cidr":"10.0.0.0/8"}
+]}

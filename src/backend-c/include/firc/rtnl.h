@@ -1,0 +1,98 @@
+#ifndef FIRC_RTNL_H
+#define FIRC_RTNL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <linux/netlink.h>
+
+#include "firc/err.h"
+
+typedef struct firc_rtnl firc_rtnl_t;
+
+firc_rtnl_t *firc_rtnl_open(void);
+/* Test seam: wraps a socket the caller holds; takes ownership of fd. */
+firc_rtnl_t *firc_rtnl_open_fd(int fd);
+void firc_rtnl_close(firc_rtnl_t *r);
+
+/* ip rule fwmark mark/mask at priority; both are required. Deleting a missing rule is FIRC_OK. */
+firc_err_t firc_rtnl_rule_add(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask,
+                              uint32_t table, uint32_t priority);
+firc_err_t firc_rtnl_rule_del(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask,
+                              uint32_t table, uint32_t priority);
+/* Kernel ABI value; the SDK uapi headers predate the attribute (3.12). */
+#define FIRC_FRA_SUPPRESS_PREFIXLEN 14
+
+/* Rule for packets in on iif, with suppress_prefixlength 0; firc_rtnl_rule_del removes it too. */
+firc_err_t firc_rtnl_rule_add_reply(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask,
+                                    const char *iif, uint32_t table, uint32_t priority);
+
+/* Builds the rule request without sending it (for tests). */
+struct nlmsghdr *firc_rtnl_build_rule(void *buf, bool add, uint32_t seq, int family, uint32_t mark,
+                                      uint32_t mask, uint32_t table, uint32_t priority);
+
+/* Blackhole default route; written with NLM_F_REPLACE. EEXIST/ESRCH are FIRC_OK. */
+firc_err_t firc_rtnl_route_add_blackhole(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority);
+firc_err_t firc_rtnl_route_del_blackhole(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority);
+
+/* Default route via oif and optional gw; *enodev reports an interface not ready for the family. */
+firc_err_t firc_rtnl_route_add_iface(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
+                                 int oif, const uint8_t *gw, uint8_t gw_len, bool *enodev);
+firc_err_t firc_rtnl_route_del_iface(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
+                                 int oif, const uint8_t *gw, uint8_t gw_len);
+
+/* rtm_protocol on every route firc writes; removal touches only routes carrying it. */
+#define FIRC_RTPROT 102
+/* Unreachable route to a pool prefix (dst in wire order); FIRC_ERR_EXIST if a foreign route holds it. */
+firc_err_t firc_rtnl_route_add_unreachable(firc_rtnl_t *r, int family, uint32_t table,
+                                           uint32_t priority, const uint8_t *dst,
+                                           uint8_t prefix_len);
+firc_err_t firc_rtnl_route_del_unreachable(firc_rtnl_t *r, int family, uint32_t table,
+                                           uint32_t priority, const uint8_t *dst,
+                                           uint8_t prefix_len);
+
+#define FIRC_RTNL_REQBUF 1024
+
+/* Builds the unreachable-route request into a zeroed FIRC_RTNL_REQBUF buf, unsent; NULL on bad args. */
+struct nlmsghdr *firc_rtnl_build_unreachable(void *buf, bool add, uint32_t seq, int family,
+                                             uint32_t table, uint32_t priority,
+                                             const uint8_t *dst, uint8_t prefix_len);
+
+typedef struct firc_link_info {
+    int ifindex;
+    bool up;
+    bool point_to_point;
+} firc_link_info_t;
+
+/* *found=false with FIRC_OK when the interface does not exist yet. */
+firc_err_t firc_rtnl_link_by_name(firc_rtnl_t *r, const char *name, firc_link_info_t *out, bool *found);
+
+/* First gateway of the interface's default route; *found=false with FIRC_OK when none. */
+firc_err_t firc_rtnl_gateway_for_iface(firc_rtnl_t *r, int family, int ifindex, bool *found, uint8_t *gw,
+                                   uint8_t *gw_len);
+
+/* Also sets *gatewayless when the default route on the interface has no next hop. */
+firc_err_t firc_rtnl_gateway_for_iface2(firc_rtnl_t *r, int family, int ifindex, bool *found, uint8_t *gw,
+                                        uint8_t *gw_len, bool *gatewayless);
+
+/* Lowest unused mark/table index from start_idx; tables 0/253/254/255 count as used. */
+#define FIRC_RTNL_TABLE_END 0x7ffffffeu
+firc_err_t firc_rtnl_alloc_mark_table(firc_rtnl_t *r, uint32_t start_idx, uint32_t *out_idx);
+
+/* Lowest group field no ip rule uses; FIRC_ERR_LIMIT when all are taken. */
+firc_err_t firc_rtnl_alloc_mark_field(firc_rtnl_t *r, uint32_t *out_field);
+
+/* Same, but an owner gets back the field it had while that field is free; process memory only. */
+firc_err_t firc_rtnl_alloc_mark_field_for(firc_rtnl_t *r, const char *owner, uint32_t *out_field);
+
+/* Call only when the owner leaves the config, not on a teardown before re-enable. */
+void firc_rtnl_forget_mark_field(firc_rtnl_t *r, const char *owner);
+
+/* Removes ip rules a previous instance left (firc's mask at firc's priority); call at startup. */
+firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed);
+
+/* Removes every route carrying FIRC_RTPROT; *left is what a second dump still shows. */
+firc_err_t firc_rtnl_purge_tagged_routes(firc_rtnl_t *r, size_t *removed, size_t *left);
+
+#endif /* FIRC_RTNL_H */

@@ -1,0 +1,4 @@
+build/
+tests/differential/*/out/
+tests/differential/out/
+tests/fuzz/corpus/

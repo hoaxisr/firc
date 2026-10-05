@@ -1,0 +1,11 @@
+configVersion: 0.7.0
+app:
+  httpWeb: null
+  dnsProxy:
+    upstream:
+      address: ~
+      port: null
+  netfilter:
+    iptables:
+      chainPrefix: 123
+groups: ~

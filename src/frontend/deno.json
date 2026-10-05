@@ -1,0 +1,15 @@
+{
+  "lock": false,
+  "lint": {
+    "include": ["src/**/*.ts"],
+    "rules": {
+      "exclude": ["no-explicit-any", "no-sloppy-imports"]
+    }
+  },
+  "compilerOptions": {
+    "strict": false,
+    "checkJs": true,
+    "lib": ["deno.ns", "ESNext", "DOM"]
+  },
+  "nodeModulesDir": "auto"
+}

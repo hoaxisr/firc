@@ -1,0 +1,8 @@
+# A chunk wider than the pool it slices. Refused at load, where the operator
+# can still see the block - not at daemon start.
+configVersion: 0.7.0
+app:
+  addressPool:
+    v4:
+      pool: 198.18.0.0/15
+      chunk: 12
