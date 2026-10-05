@@ -8,9 +8,6 @@
 #include "firc/mark.h"
 #include "firc/rtnl.h"
 
-#include <linux/fib_rules.h>
-_Static_assert(FIRC_FRA_SUPPRESS_PREFIXLEN == FRA_SUPPRESS_PREFIXLEN, "the kernel ABI value");
-
 typedef struct {
     fake_rtnl_t *kernel;
     firc_rtnl_t *rtnl;

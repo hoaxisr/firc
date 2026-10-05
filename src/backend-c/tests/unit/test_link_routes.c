@@ -1,11 +1,11 @@
 #include "greatest.h"
 
+#include <sys/socket.h>
 #include <linux/if.h>
 #include <errno.h>
 #include <linux/rtnetlink.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 
 #include "fake_conntrack.h"
 #include "fake_iptables.h"

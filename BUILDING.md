@@ -1,8 +1,8 @@
 # Building firc
 
 firc ships as an `.ipk` for Keenetic routers running Entware. The supported
-targets are the files in `config/entware/`: `aarch64-3.10_kn` and
-`mipsel-3.4_kn`.
+targets are the files in `config/entware/`: `aarch64-3.10_kn`,
+`mipsel-3.4_kn` and `mips-3.4_kn` (big-endian, experimental).
 
 ## Configure
 

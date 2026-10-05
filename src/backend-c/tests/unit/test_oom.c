@@ -1,5 +1,6 @@
 #include "greatest.h"
 
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -435,7 +436,7 @@ TEST a_start_is_always_followed_by_an_end(void) {
 
     job_sink_t warm = {0};
     firc_sub_job_t probe = {.group_id = {{5, 6, 7, 8}}, .url = strdup(url), .seq = 0};
-    arm(1L << 40);
+    arm(LONG_MAX);
     firc_sub_job_run(&probe, NULL, job_sink_emit, &warm);
     long total = intercepted();
     disarm();
@@ -474,7 +475,7 @@ TEST a_job_that_ran_out_of_memory_says_so(void) {
 
     job_sink_t warm = {0};
     firc_sub_job_t probe = {.group_id = {{1, 2, 3, 4}}, .url = strdup(url), .seq = 0};
-    arm(1L << 40);
+    arm(LONG_MAX);
     firc_sub_job_run(&probe, NULL, job_sink_emit, &warm);
     long total = intercepted();
     disarm();

@@ -5,8 +5,11 @@
 #include <libmnl/libmnl.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
+#include "firc/mark.h"
 #include "firc/rtnl.h"
+#include "wire_bytes.h"
 
 typedef struct {
     bool seen_fwmark, seen_fwmask;
@@ -242,6 +245,186 @@ TEST deleting_a_policy_rule_names_the_same_rule(void) {
 
 GREATEST_MAIN_DEFS();
 
+static void put_rule_hdr(wb_t *w, uint8_t family, uint8_t action) {
+    wb_bytes(w, (const uint8_t[]){family, 0, 0, 0, 0, 0, 0, action}, 8);
+    wb_h32(w, 0);
+}
+
+static void put_rule_attrs(wb_t *w, uint32_t mark, uint32_t mask, uint32_t priority, uint32_t table) {
+    wb_attr_h32(w, 10, mark);
+    wb_attr_h32(w, 16, mask);
+    wb_attr_h32(w, 6, priority);
+    wb_attr_h32(w, 15, table);
+}
+
+static bool same_bytes(const wb_t *want, const wb_t *got) {
+    return want->n == got->n && memcmp(want->b, got->b, want->n) == 0;
+}
+
+TEST the_reply_rule_carries_host_order_values_iifname_and_suppress_prefixlength_14(void) {
+    int sv[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+    firc_rtnl_t *r = firc_rtnl_open_fd(sv[0]);
+    ASSERT(r != NULL);
+    wb_t ack = {0};
+    wb_ack(&ack, 1, 0);
+    ASSERT(wb_send(sv[1], &ack));
+
+    ASSERT_EQ(FIRC_OK, firc_rtnl_rule_add_reply(r, AF_INET, 0x00070000u, 0x00ff0000u, "nwg0",
+                                                0x66697263u, 49));
+
+    wb_t want = {0};
+    size_t at = wb_nlmsg(&want, 32, 0x0605, 1);
+    put_rule_hdr(&want, 2, 1);
+    put_rule_attrs(&want, 0x00070000u, 0x00ff0000u, 49, 0x66697263u);
+    wb_attr_bytes(&want, 3, "nwg0", 5);
+    wb_attr_h32(&want, 14, 0);
+    wb_nlmsg_end(&want, at);
+    wb_t got = {0};
+    ASSERT(wb_recv(sv[1], &got));
+    ASSERT(same_bytes(&want, &got));
+
+    firc_rtnl_close(r);
+    close(sv[1]);
+    PASS();
+}
+
+TEST a_stale_rule_read_from_a_dump_is_deleted_with_the_values_it_carried(void) {
+    int sv[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+    firc_rtnl_t *r = firc_rtnl_open_fd(sv[0]);
+    ASSERT(r != NULL);
+
+    wb_t rule = {0};
+    size_t at = wb_nlmsg(&rule, 32, 0x0002, 1);
+    put_rule_hdr(&rule, 2, 1);
+    wb_attr_h32(&rule, 15, 0x66697263u);
+    wb_attr_h32(&rule, 6, FIRC_RULE_PRIORITY);
+    wb_attr_h32(&rule, 10, 0x40070000u);
+    wb_attr_h32(&rule, 16, FIRC_MARK_GROUP_MASK);
+    wb_nlmsg_end(&rule, at);
+    ASSERT(wb_send(sv[1], &rule));
+    wb_t done1 = {0};
+    wb_done(&done1, 1);
+    ASSERT(wb_send(sv[1], &done1));
+    wb_t done2 = {0};
+    wb_done(&done2, 2);
+    ASSERT(wb_send(sv[1], &done2));
+    wb_t ack3 = {0};
+    wb_ack(&ack3, 3, 0);
+    ASSERT(wb_send(sv[1], &ack3));
+
+    size_t removed = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_clean_stale_rules(r, &removed));
+    ASSERT_EQ_FMT((size_t)1, removed, "%zu");
+
+    wb_t want = {0};
+    wb_t got = {0};
+    at = wb_nlmsg(&want, 34, 0x0305, 1);
+    put_rule_hdr(&want, 2, 0);
+    wb_nlmsg_end(&want, at);
+    ASSERT(wb_recv(sv[1], &got));
+    ASSERT(same_bytes(&want, &got));
+    memset(&want, 0, sizeof(want));
+    at = wb_nlmsg(&want, 34, 0x0305, 2);
+    put_rule_hdr(&want, 10, 0);
+    wb_nlmsg_end(&want, at);
+    ASSERT(wb_recv(sv[1], &got));
+    ASSERT(same_bytes(&want, &got));
+    memset(&want, 0, sizeof(want));
+    at = wb_nlmsg(&want, 33, 0x0005, 3);
+    put_rule_hdr(&want, 2, 0);
+    put_rule_attrs(&want, 0x40070000u, FIRC_MARK_GROUP_MASK, FIRC_RULE_PRIORITY, 0x66697263u);
+    wb_nlmsg_end(&want, at);
+    ASSERT(wb_recv(sv[1], &got));
+    ASSERT(same_bytes(&want, &got));
+
+    firc_rtnl_close(r);
+    close(sv[1]);
+    PASS();
+}
+
+static void put_default_route(wb_t *w) {
+    wb_bytes(w, (const uint8_t[]){2, 0, 0, 0, 254, 3, 0, 1}, 8);
+    wb_h32(w, 0);
+    wb_attr_h32(w, 15, 254);
+    wb_attr_h32(w, 6, 0x01020304u);
+}
+
+TEST a_default_route_is_found_by_its_host_order_oif(void) {
+    int sv[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+    firc_rtnl_t *r = firc_rtnl_open_fd(sv[0]);
+    ASSERT(r != NULL);
+
+    wb_t route = {0};
+    size_t at = wb_nlmsg(&route, 24, 0x0002, 1);
+    put_default_route(&route);
+    wb_attr_bytes(&route, 5, (const uint8_t[]){192, 168, 1, 1}, 4);
+    wb_attr_h32(&route, 4, 0x0107);
+    wb_nlmsg_end(&route, at);
+    ASSERT(wb_send(sv[1], &route));
+    wb_t done = {0};
+    wb_done(&done, 1);
+    ASSERT(wb_send(sv[1], &done));
+
+    bool found = false, gatewayless = true;
+    uint8_t gw[16] = {0};
+    uint8_t gw_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_gateway_for_iface2(r, AF_INET, 0x0107, &found, gw, &gw_len, &gatewayless));
+    ASSERT(found);
+    ASSERT_EQ(4, gw_len);
+    ASSERT_MEM_EQ(((const uint8_t[]){192, 168, 1, 1}), gw, 4);
+
+    wb_t want = {0};
+    at = wb_nlmsg(&want, 26, 0x0305, 1);
+    wb_bytes(&want, (const uint8_t[]){2, 0, 0, 0, 0, 0, 0, 0}, 8);
+    wb_h32(&want, 0);
+    wb_nlmsg_end(&want, at);
+    wb_t got = {0};
+    ASSERT(wb_recv(sv[1], &got));
+    ASSERT(same_bytes(&want, &got));
+
+    firc_rtnl_close(r);
+    close(sv[1]);
+    PASS();
+}
+
+TEST a_multipath_next_hop_is_found_by_its_host_order_ifindex(void) {
+    int sv[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+    firc_rtnl_t *r = firc_rtnl_open_fd(sv[0]);
+    ASSERT(r != NULL);
+
+    wb_t route = {0};
+    size_t at = wb_nlmsg(&route, 24, 0x0002, 1);
+    put_default_route(&route);
+    size_t mp = wb_attr(&route, 9);
+    wb_h16(&route, 16);
+    wb_u8(&route, 0);
+    wb_u8(&route, 0);
+    wb_h32(&route, 0x0203);
+    wb_attr_bytes(&route, 5, (const uint8_t[]){10, 9, 8, 7}, 4);
+    wb_attr_end(&route, mp);
+    wb_nlmsg_end(&route, at);
+    ASSERT(wb_send(sv[1], &route));
+    wb_t done = {0};
+    wb_done(&done, 1);
+    ASSERT(wb_send(sv[1], &done));
+
+    bool found = false, gatewayless = true;
+    uint8_t gw[16] = {0};
+    uint8_t gw_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_gateway_for_iface2(r, AF_INET, 0x0203, &found, gw, &gw_len, &gatewayless));
+    ASSERT(found);
+    ASSERT_EQ(4, gw_len);
+    ASSERT_MEM_EQ(((const uint8_t[]){10, 9, 8, 7}), gw, 4);
+
+    firc_rtnl_close(r);
+    close(sv[1]);
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
@@ -252,5 +435,9 @@ int main(int argc, char **argv)
     RUN_TEST(arguments_that_are_not_a_prefix_are_refused);
     RUN_TEST(a_policy_rule_carries_a_mask_and_a_priority);
     RUN_TEST(deleting_a_policy_rule_names_the_same_rule);
+    RUN_TEST(the_reply_rule_carries_host_order_values_iifname_and_suppress_prefixlength_14);
+    RUN_TEST(a_stale_rule_read_from_a_dump_is_deleted_with_the_values_it_carried);
+    RUN_TEST(a_default_route_is_found_by_its_host_order_oif);
+    RUN_TEST(a_multipath_next_hop_is_found_by_its_host_order_ifindex);
     GREATEST_MAIN_END();
 }

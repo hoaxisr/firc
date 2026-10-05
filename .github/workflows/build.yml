@@ -241,6 +241,11 @@ jobs:
                 readelf -h "$binary" | grep -Eq 'Data:.*little endian'
                 readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
                 ;;
+              mips-*)
+                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                ;;
               *)
                 # a target without an ELF check must not ship unchecked
                 echo "no ELF check for ${{ matrix.name }}: add one before adding the target" >&2

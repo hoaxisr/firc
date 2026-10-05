@@ -18,6 +18,7 @@
 #include "firc/listen.h"
 #include "firc/log.h"
 #include "firc/resolver_addr.h"
+#include "pktinfo.h"
 
 #define TCP_MAX_MSG 65535
 
@@ -197,10 +198,7 @@ typedef struct exchange {
 
     struct sockaddr_storage client;
     socklen_t client_len;
-    int ifindex;
-    int dst_family;
-    struct in_addr dst4;
-    struct in6_addr dst6;
+    firc_pktinfo_t dst;
     bool have_dst;
 
     int client_fd;
@@ -496,12 +494,8 @@ static void udp_reply(firc_dnsproxy_t *p, exchange_t *ex, const uint8_t *data,
 {
     struct msghdr msg;
     struct iovec iov;
-    union {
-        char v4[CMSG_SPACE(sizeof(struct in_pktinfo))];
-        char v6[CMSG_SPACE(sizeof(struct in6_pktinfo))];
-    } cbuf;
+    firc_pktinfo_cmsg_t cbuf;
     memset(&msg, 0, sizeof(msg));
-    memset(&cbuf, 0, sizeof(cbuf));
 
     /* sendmsg does not modify the payload. NOLINTNEXTLINE(performance-no-int-to-ptr) */
     memcpy(&iov.iov_base, &data, sizeof(iov.iov_base));
@@ -512,31 +506,8 @@ static void udp_reply(firc_dnsproxy_t *p, exchange_t *ex, const uint8_t *data,
     msg.msg_iovlen = 1;
 
     if (ex->have_dst) {
-        if (ex->dst_family == AF_INET) {
-            msg.msg_control = cbuf.v4;
-            msg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
-            struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
-            cm->cmsg_level = IPPROTO_IP;
-            cm->cmsg_type = IP_PKTINFO;
-            cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
-            struct in_pktinfo pi;
-            memset(&pi, 0, sizeof(pi));
-            pi.ipi_spec_dst = ex->dst4;
-            pi.ipi_ifindex = ex->ifindex;
-            memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-        } else {
-            msg.msg_control = cbuf.v6;
-            msg.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
-            struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
-            cm->cmsg_level = IPPROTO_IPV6;
-            cm->cmsg_type = IPV6_PKTINFO;
-            cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
-            struct in6_pktinfo pi;
-            memset(&pi, 0, sizeof(pi));
-            pi.ipi6_addr = ex->dst6;
-            pi.ipi6_ifindex = (unsigned)ex->ifindex;
-            memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-        }
+        msg.msg_control = &cbuf;
+        msg.msg_controllen = firc_pktinfo_write(&ex->dst, &cbuf);
     }
     ssize_t rc = sendmsg(p->udp_fd, &msg, 0);
     if (rc < 0) {
@@ -1279,23 +1250,7 @@ static void on_udp_readable(firc_loop_t *loop, int fd, uint32_t events,
 
         for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != NULL;
              cm = CMSG_NXTHDR(&msg, cm)) {
-            if (cm->cmsg_level == IPPROTO_IP &&
-                cm->cmsg_type == IP_PKTINFO) {
-                struct in_pktinfo pi;
-                memcpy(&pi, CMSG_DATA(cm), sizeof(pi));
-                ex->dst_family = AF_INET;
-                ex->dst4 = pi.ipi_addr;
-                ex->ifindex = pi.ipi_ifindex;
-                ex->have_dst = true;
-            } else if (cm->cmsg_level == IPPROTO_IPV6 &&
-                       cm->cmsg_type == IPV6_PKTINFO) {
-                struct in6_pktinfo pi;
-                memcpy(&pi, CMSG_DATA(cm), sizeof(pi));
-                ex->dst_family = AF_INET6;
-                ex->dst6 = pi.ipi6_addr;
-                ex->ifindex = (int)pi.ipi6_ifindex;
-                ex->have_dst = true;
-            }
+            if (firc_pktinfo_read(cm, &ex->dst)) { ex->have_dst = true; }
         }
 
         atomic_fetch_add(&p->inflight, 1);

@@ -705,6 +705,40 @@ TEST durations_and_the_mark_index_round_trip_in_their_units(void) {
     PASS();
 }
 
+TEST numeric_settings_round_trip_whole_through_the_api_and_the_file(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/system/settings",
+                              "{\"settings\":{\"app.addressPool.maxNames\":16909060,"
+                              "\"app.dnsProxy.maxConcurrent\":16909061,"
+                              "\"app.dnsProxy.maxIdleConns\":16909062,"
+                              "\"app.dnsProxy.upstream.port\":258,"
+                              "\"app.addressPool.v4.chunk\":26,"
+                              "\"app.netfilter.startMarkTableIndex\":\"0x1020304\"}}",
+                              NULL));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
+    const cJSON *s = item(out, "settings");
+    ASSERT_EQ(16909060.0, item(s, "app.addressPool.maxNames")->valuedouble);
+    ASSERT_EQ(16909061.0, item(s, "app.dnsProxy.maxConcurrent")->valuedouble);
+    ASSERT_EQ(16909062.0, item(s, "app.dnsProxy.maxIdleConns")->valuedouble);
+    ASSERT_EQ(258.0, item(s, "app.dnsProxy.upstream.port")->valuedouble);
+    ASSERT_EQ(26.0, item(s, "app.addressPool.v4.chunk")->valuedouble);
+    ASSERT_STR_EQ("0x1020304", item(s, "app.netfilter.startMarkTableIndex")->valuestring);
+    cJSON_Delete(out);
+    char *text = slurp(h->conf);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "maxNames: 16909060\n") != NULL);
+    ASSERT(strstr(text, "maxConcurrent: 16909061\n") != NULL);
+    ASSERT(strstr(text, "maxIdleConns: 16909062\n") != NULL);
+    ASSERT(strstr(text, "port: 258\n") != NULL);
+    ASSERT(strstr(text, "chunk: 26\n") != NULL);
+    ASSERT(strstr(text, "startMarkTableIndex: 16909060\n") != NULL);
+    free(text);
+    harness_stop(h);
+    PASS();
+}
+
 /* Installs `body` as a stand-in for S99firc, the script the restart route runs. */
 static void stand_in(harness_t *h, char *script, size_t cap, const char *body) {
     snprintf(script, cap, "%s/S99stand-in", h->dir);
@@ -895,6 +929,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_dns_move_on_its_own_port_that_another_program_holds_is_refused);
     RUN_TEST(a_move_on_the_running_web_port_is_not_refused_as_busy);
     RUN_TEST(durations_and_the_mark_index_round_trip_in_their_units);
+    RUN_TEST(numeric_settings_round_trip_whole_through_the_api_and_the_file);
     RUN_TEST(restart_answers_202_then_runs_the_script);
     RUN_TEST(a_second_restart_is_refused_while_one_is_under_way);
     RUN_TEST(a_restart_that_could_not_start_can_be_asked_again);

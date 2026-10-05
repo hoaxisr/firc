@@ -1,5 +1,6 @@
 #include "greatest.h"
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -292,6 +293,72 @@ TEST each_row_has_the_specs_class_and_apply(void) {
     PASS();
 }
 
+typedef struct {
+    const char *path;
+    size_t off;
+    size_t size;
+} field_t;
+
+#define FIELD(p, f) {p, offsetof(firc_app_config_t, f), sizeof(((firc_app_config_t *)0)->f)}
+
+static const field_t NUMERIC[] = {
+    FIELD("app.dnsProxy.upstream.port", dns_proxy.upstream.port),
+    FIELD("app.dnsProxy.disableDropAAAA", dns_proxy.disable_drop_aaaa),
+    FIELD("app.dnsProxy.unmatchedTtl", dns_proxy.unmatched_ttl),
+    FIELD("app.dnsProxy.timeout", dns_proxy.timeout),
+    FIELD("app.dnsProxy.maxConcurrent", dns_proxy.max_concurrent),
+    FIELD("app.dnsProxy.maxIdleConns", dns_proxy.max_idle_conns),
+    FIELD("app.dnsProxy.host.port", dns_proxy.host.port),
+    FIELD("app.dnsProxy.disableRemap53", dns_proxy.disable_remap53),
+    FIELD("app.addressPool.ttlClamp", fakeip.ttl_clamp),
+    FIELD("app.addressPool.idleWindow", fakeip.idle_window),
+    FIELD("app.addressPool.maxNames", fakeip.max_names),
+    FIELD("app.addressPool.v4.chunk", fakeip.v4.chunk),
+    FIELD("app.addressPool.v6.chunk", fakeip.v6.chunk),
+    FIELD("app.netfilter.disableIPv4", netfilter.disable_ipv4),
+    FIELD("app.netfilter.disableIPv6", netfilter.disable_ipv6),
+    FIELD("app.netfilter.startMarkTableIndex", netfilter.start_mark_table_index),
+    FIELD("app.showAllInterfaces", show_all_interfaces),
+    FIELD("app.httpWeb.host.port", http_web.host.port),
+};
+
+static bool is_numeric(firc_setting_kind_t k) {
+    return k != FIRC_SK_ADDR && k != FIRC_SK_STRING && k != FIRC_SK_LIST;
+}
+
+TEST every_numeric_setting_copies_exactly_the_bytes_of_its_field(void) {
+    size_t numeric_rows = 0;
+    for (size_t i = 0; i < FIRC_SETTINGS_COUNT; i++) { numeric_rows += is_numeric(firc_settings[i].kind); }
+    ASSERT_EQ_FMT(sizeof(NUMERIC) / sizeof(NUMERIC[0]), numeric_rows, "%zu");
+
+    for (size_t i = 0; i < sizeof(NUMERIC) / sizeof(NUMERIC[0]); i++) {
+        const field_t *f = &NUMERIC[i];
+        const firc_setting_t *row = firc_setting_find(f->path);
+        ASSERT(row != NULL);
+        ASSERT(is_numeric(row->kind));
+        ASSERT_EQ_FMTm(f->path, f->off, row->off, "%zu");
+
+        static firc_app_config_t src, dst, want;
+        memset(&src, 0xa5, sizeof(src));
+        unsigned char *field = (unsigned char *)&src + f->off;
+        if (row->kind == FIRC_SK_BOOL) {
+            field[0] = 1;
+        } else {
+            for (size_t b = 0; b < f->size; b++) { field[b] = (unsigned char)(0x11u * (b + 1)); }
+        }
+        memset(&dst, 0, sizeof(dst));
+        memset(&want, 0, sizeof(want));
+        memcpy((unsigned char *)&want + f->off, field, f->size);
+
+        ASSERT_EQ(FIRC_OK, firc_setting_copy(row, &dst, &src));
+        ASSERTm(f->path, memcmp(&want, &dst, sizeof(dst)) == 0);
+        ASSERTm(f->path, firc_setting_equal(row, &dst, &src));
+        field[f->size - 1] ^= 0x01;
+        ASSERTm(f->path, !firc_setting_equal(row, &dst, &src));
+    }
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -301,5 +368,6 @@ int main(int argc, char **argv) {
     RUN_TEST(the_check_passes_what_the_daemon_accepts);
     RUN_TEST(a_disabled_webui_host_is_not_checked);
     RUN_TEST(each_row_has_the_specs_class_and_apply);
+    RUN_TEST(every_numeric_setting_copies_exactly_the_bytes_of_its_field);
     GREATEST_MAIN_END();
 }

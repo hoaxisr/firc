@@ -10,6 +10,7 @@
 
 #include "firc/log.h"
 
+#include <sys/socket.h>
 #include <linux/if.h>
 #include <netinet/in.h>
 #include <stdio.h>

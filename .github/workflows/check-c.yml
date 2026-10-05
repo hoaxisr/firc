@@ -10,6 +10,7 @@ on:
       - 'src/backend-c/**'
       - 'files/**'
       - 'tools/ci/entware-package/**'
+      - 'tools/ci/**'
       - '.github/workflows/check-c.yml'
   # A push of more than 1000 commits gets no diff, so path filters run nothing: dispatch by hand.
   workflow_dispatch:
@@ -344,3 +345,78 @@ jobs:
           make CROSS_COMPILE=mipsel-linux-gnu- CFLAGS_EXTRA=-Werror
           # no feed sysroot here, so only the dependency-free firc-dnstool is built
           file build/cross-mipsel-linux-gnu/firc-dnstool | grep -q MIPS
+
+  mips_be_tests:
+    name: Unit tests (big-endian mips, qemu-user)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SDK_ASSET: entware-sdk-mips-3.4_gcc-8.4.0_glibc-2.27.Linux-x86_64
+      SDK_TAG: v2026.07.04
+      SDK_SHA256: 48e6d2712841d62d98e34b25888159254b84c7cf86bc00fdb258a4b97ac8445a
+      SDK_HOME: ${{ github.workspace }}/../mips-sdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static zstd rsync gawk unzip libncurses-dev
+
+      - name: Restore SDK with built dependencies
+        id: sdk_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.SDK_HOME }}
+          key: mips-sdk-${{ env.SDK_ASSET }}-${{ env.SDK_TAG }}-${{ hashFiles('tools/ci/entware-package/Makefile') }}-1
+
+      - name: Fetch SDK
+        if: steps.sdk_cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$SDK_HOME"
+          cd "$SDK_HOME"
+          gh release download "$SDK_TAG" -R ownik/entware-sdk -p "$SDK_ASSET.tar.zst"
+          echo "$SDK_SHA256  $SDK_ASSET.tar.zst" | sha256sum -c -
+          tar --zstd -xf "$SDK_ASSET.tar.zst"
+          rm "$SDK_ASSET.tar.zst"
+
+      - name: Build library dependencies
+        if: steps.sdk_cache.outputs.cache-hit != 'true'
+        run: |
+          feed="$SDK_HOME/feed"
+          mkdir -p "$feed/firc" "$SDK_HOME/shim"
+          cp tools/ci/entware-package/Makefile "$feed/firc/Makefile"
+          printf 'FIRC_VERSION:=0.0.0\nFIRC_RELEASE:=1\nFIRC_TARGET:=mips-3.4_kn\n' > "$feed/firc/version.mk"
+          mkdir -p src/frontend/dist
+          tar -czf "$feed/firc/firc-source.tar.gz" --transform "s,^,firc-0.0.0/," LICENSE files src/backend-c src/frontend/dist
+          printf '#!/bin/sh\ncase "$1" in -V|--version) echo "Python 2.7.18" >&2; exit 0 ;; esac\nexit 127\n' > "$SDK_HOME/shim/python2"
+          cp "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
+          chmod +x "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
+          cd "$SDK_HOME/$SDK_ASSET"
+          cp feeds.conf.default feeds.conf
+          echo "src-link action $feed/" >> feeds.conf
+          export PATH="$SDK_HOME/shim:$PATH"
+          ./scripts/feeds update -a
+          make defconfig
+          ./scripts/feeds install -p action -f firc
+          for p in yaml pcre2 libmnl cjson curl; do
+            make "package/$p/compile" -j"$(nproc)"
+          done
+
+      - name: Save SDK with built dependencies
+        if: steps.sdk_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.SDK_HOME }}
+          key: ${{ steps.sdk_cache.outputs.cache-primary-key }}
+
+      - name: Build and run unit tests under qemu
+        run: |
+          sdk="$SDK_HOME/$SDK_ASSET"
+          tc=$(echo "$sdk"/staging_dir/toolchain-mips_*)
+          export CROSS_COMPILE="$tc/bin/mips-openwrt-linux-gnu-"
+          export SYSROOT=$(echo "$sdk"/staging_dir/target-mips_*)
+          sh tools/ci/mips-qemu-tests.sh
