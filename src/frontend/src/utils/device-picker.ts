@@ -385,13 +385,26 @@ export function coverageLabel(
       hosts,
       policies,
     ).size;
-    const say = (n: number, one: string, few: string, many: string) =>
-      counted(n, locale, t(one), t(few), t(many));
     if (p === 0)
-      return say(d, "All but {n} device", "All but {n} devices (2-4)", "All but {n} devices");
-    const head = say(p, "All but {n} policy", "All but {n} policies (2-4)", "All but {n} policies");
+      return counted(
+        d,
+        locale,
+        t("All but {n} device"),
+        t("All but {n} devices (2-4)"),
+        t("All but {n} devices"),
+      );
+    const head = counted(
+      p,
+      locale,
+      t("All but {n} policy"),
+      t("All but {n} policies (2-4)"),
+      t("All but {n} policies"),
+    );
     if (d === 0) return head;
-    return head + say(d, " and {n} device", " and {n} devices (2-4)", " and {n} devices");
+    return (
+      head +
+      counted(d, locale, t(" and {n} device"), t(" and {n} devices (2-4)"), t(" and {n} devices"))
+    );
   }
   let n = 0;
   for (const k of coveredKeys(allowEntries, hosts, policies)) if (!deny.has(k)) n++;
