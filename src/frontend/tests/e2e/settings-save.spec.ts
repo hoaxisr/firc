@@ -245,9 +245,9 @@ test("save and restart follows the restart until the daemon is back", async ({ p
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Save and restart" }).click();
 
+  await expect.poll(() => wentDown, { timeout: 10_000 }).toBe(true);
   await expect(page.getByTestId("restart-overlay")).toHaveCount(0, { timeout: 10_000 });
   await expect(page.getByTestId("settings-banner")).toHaveCount(0);
-  expect(wentDown).toBe(true);
   expect(order).toEqual(["PUT", "RESTART"]);
   await expect(page.getByRole("spinbutton", { name: "Domains in the pool, at most" })).toHaveValue(
     "4096",
