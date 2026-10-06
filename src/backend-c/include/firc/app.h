@@ -215,6 +215,10 @@ firc_err_t firc_app_put_settings(firc_app_t *app, firc_app_config_t *next, const
                                  const char *version, bool applied[FIRC_SETTINGS_COUNT],
                                  firc_err_t *live_err);
 
+/* the WebUI took port instead of the saved one: running and saved both say port, even when rewriting firc.conf fails */
+firc_err_t firc_app_move_web_port(firc_app_t *app, uint16_t port, const char *conf_path,
+                                  const char *version);
+
 /* SIGHUP: the re-read app block becomes the saved copy, live settings apply as in a PUT; writes nothing */
 firc_err_t firc_app_reload_settings(firc_app_t *app, const firc_app_config_t *from_file,
                                     bool applied[FIRC_SETTINGS_COUNT]);

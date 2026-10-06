@@ -114,9 +114,44 @@ migrate_groups() {
     return 0
 }
 
-# Used by the differential tests; opkg never passes it.
+CONF=$${FIRC_CONF:-/opt/etc/firc/firc.conf}
+SOCK=$${FIRC_SOCK:-/tmp/firc/firc.sock}
+
+conf_web_port() {
+    awk '/^  httpWeb:/ { w = 1; next } /^  [^ ]/ { w = 0 } w && /^ +port:/ { p = $$2; exit } END { print (p == "" ? 666 : p) }' "$$CONF" 2>/dev/null
+}
+
+report_web() {
+    ans=$$(printf 'GET /api/v1/system/settings HTTP/1.0\r\n\r\n' |
+        socat -t10 - UNIX-CONNECT:"$$SOCK" 2>/dev/null)
+    web=$$(printf '%s' "$$ans" |
+        sed -n 's/.*"webUi":{"port":\([0-9]*\),"movedFrom":\([0-9]*\),"lanAddress":"\([^"]*\)".*/\1 \2 \3/p')
+    if [ -z "$$web" ]; then
+        echo "firc: could not ask the daemon where the WebUI is; firc.conf sets port $$(conf_web_port)" >&2
+        return 0
+    fi
+    set -- $$web
+    port=$$1 moved=$$2 addr=$${3:-}
+    if [ "$$port" = 0 ]; then
+        echo "firc: the WebUI is not listening (turned off, or every port tried is in use);" >&2
+        echo "firc: set app.httpWeb.host.port in $$CONF and run /opt/etc/init.d/S99firc restart" >&2
+        return 0
+    fi
+    [ "$$moved" = 0 ] || echo "firc: port $$moved is in use; the WebUI moved to $$port"
+    case "$$addr" in
+        "") addr="<router address>" ;;
+        *:*) addr="[$$addr]" ;;
+    esac
+    echo "firc: WebUI at http://$$addr:$$port"
+}
+
+# Used by the differential tests; opkg never passes them.
 if [ "$${1:-}" = "--migrate-only" ]; then
     migrate_groups "$${2:-$$GROUPS}"
+    exit $$?
+fi
+if [ "$${1:-}" = "--report-web" ]; then
+    report_web
     exit $$?
 fi
 
@@ -130,6 +165,7 @@ migrate_groups "$$GROUPS" || {
     exit 1
 }
 
+report_web
 exit 0
 endef
 

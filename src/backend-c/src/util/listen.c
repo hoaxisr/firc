@@ -66,3 +66,13 @@ int firc_listen_open(int type, const struct sockaddr_storage *sa, socklen_t sa_l
     }
     return fd;
 }
+
+size_t firc_web_ports(uint16_t configured, uint16_t skip, uint16_t out[FIRC_WEB_PORTS_MAX]) {
+    static const uint16_t fallback[] = {666, 999, 1666, 2666, 9999};
+    size_t n = 0;
+    out[n++] = configured;
+    for (size_t i = 0; i < sizeof(fallback) / sizeof(fallback[0]); i++) {
+        if (fallback[i] != configured && fallback[i] != skip) { out[n++] = fallback[i]; }
+    }
+    return n;
+}

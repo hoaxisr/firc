@@ -28,7 +28,7 @@ export const DEFAULTS: Record<string, unknown> = {
   "app.netfilter.startMarkTableIndex": "0x66697263",
   "app.showAllInterfaces": false,
   "app.httpWeb.host.address": "[::]",
-  "app.httpWeb.host.port": 8080,
+  "app.httpWeb.host.port": 666,
   "app.logLevel": "info",
 };
 

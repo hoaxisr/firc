@@ -17,6 +17,7 @@
 #include "firc/dnspipeline.h"
 #include "firc/dnsproxy.h"
 #include "firc/events.h"
+#include "firc/listen.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/system.h"
@@ -54,8 +55,9 @@ static firc_dns_verdict_t pass_hook(firc_dns_msg_t *msg, const firc_ip_t *client
     return FIRC_DNS_PASS;
 }
 
-/* A harness whose DNS proxy listens on `dns_addr`:`dns_port`; NULL keeps [::]:3553. */
-static harness_t *harness_start_dns(const char *dns_addr, uint16_t dns_port) {
+/* A harness whose DNS proxy listens on `dns_addr`:`dns_port` (NULL keeps [::]:3553) and whose WebUI asks for `web_port` first. */
+static harness_t *harness_start_full(const char *dns_addr, uint16_t dns_port, const char *web_addr,
+                                     uint16_t web_port, bool conf_writable) {
     harness_t *h = calloc(1, sizeof(*h));
     if (h == NULL) { return NULL; }
     firc_log_set_level(FIRC_LOG_INFO);
@@ -69,8 +71,9 @@ static harness_t *harness_start_dns(const char *dns_addr, uint16_t dns_port) {
                                    .upstream_addr = "127.0.0.1", .upstream_port = 53,
                                    .timeout_ms = 1000, .max_concurrent = 4, .max_idle_conns = 2};
     if (firc_dnsproxy_create(&pcfg, h->loop, pass_hook, NULL, &h->proxy) != FIRC_OK) { return NULL; }
-    if (firc_strset(&h->cfg.app.http_web.host.address, "127.0.0.1") != FIRC_OK) { return NULL; }
-    h->cfg.app.http_web.host.port = TEST_PORT;
+    if (firc_strset(&h->cfg.app.http_web.host.address, web_addr) != FIRC_OK) { return NULL; }
+    if (strcmp(web_addr, "127.0.0.1") != 0 && firc_strset(&h->cfg.app.link[0], "lo") != FIRC_OK) { return NULL; }
+    h->cfg.app.http_web.host.port = web_port;
     if (dns_addr != NULL) {
         if (firc_strset(&h->cfg.app.dns_proxy.host.address, dns_addr) != FIRC_OK) { return NULL; }
         h->cfg.app.dns_proxy.host.port = dns_port;
@@ -81,13 +84,19 @@ static harness_t *harness_start_dns(const char *dns_addr, uint16_t dns_port) {
     h->app = firc_app_create(&deps);
     if (h->app == NULL) { return NULL; }
     h->ctx.app = h->app;
-    h->ctx.config_path = h->conf;
+    h->ctx.config_path = conf_writable ? h->conf : "/nonexistent/firc.conf";
     h->ctx.config_version = "0.7.0";
     if (firc_httpd_create(h->loop, &h->tcp) != FIRC_OK) { return NULL; }
     firc_system_register_routes(h->tcp, &h->ctx);
-    if (firc_httpd_listen_tcp(h->tcp, "127.0.0.1", TEST_PORT) != FIRC_OK) { return NULL; }
+    const uint16_t ports[] = {web_port, TEST_PORT};
+    size_t n_ports = web_port == TEST_PORT ? 1 : 2;
+    if (firc_system_listen_web(&h->ctx, h->tcp, ports, n_ports) != FIRC_OK) { return NULL; }
     pthread_create(&h->thread, NULL, loop_thread, h);
     return h;
+}
+
+static harness_t *harness_start_dns(const char *dns_addr, uint16_t dns_port) {
+    return harness_start_full(dns_addr, dns_port, "127.0.0.1", TEST_PORT, true);
 }
 
 static harness_t *harness_start(void) { return harness_start_dns(NULL, 0); }
@@ -922,11 +931,136 @@ TEST get_drops_restart_pending_when_the_timeout_lapses(void) {
     PASS();
 }
 
+
+/* Catches: a candidate list that drops the configured port, keeps the DNS proxy's, or loses the order. */
+TEST web_ports_start_with_the_configured_one_and_skip_the_dns_port(void) {
+    uint16_t out[FIRC_WEB_PORTS_MAX];
+    const uint16_t a[] = {8080, 666, 1666, 2666, 9999};
+    ASSERT_EQ(5, firc_web_ports(8080, 999, out));
+    ASSERT_MEM_EQ(a, out, sizeof(a));
+    const uint16_t b[] = {999, 666, 1666, 2666, 9999};
+    ASSERT_EQ(5, firc_web_ports(999, 3553, out));
+    ASSERT_MEM_EQ(b, out, sizeof(b));
+    const uint16_t c[] = {8443, 666, 999, 1666, 2666, 9999};
+    ASSERT_EQ(6, firc_web_ports(8443, 3553, out));
+    ASSERT_MEM_EQ(c, out, sizeof(c));
+    PASS();
+}
+
+static bool has_line(const char *text, const char *line) {
+    return text != NULL && strstr(text, line) != NULL;
+}
+
+/* Catches: a busy WebUI port left without a WebUI, the new port not saved, or saved but reported pending. */
+TEST a_busy_web_port_moves_to_the_next_and_is_saved(void) {
+    uint16_t busy = 0;
+    int held = hold(SOCK_STREAM, &busy);
+    ASSERT(held >= 0);
+    harness_t *h = harness_start_full(NULL, 0, "127.0.0.1", busy, true);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
+    const cJSON *web = item(out, "webUi");
+    ASSERT_EQ(TEST_PORT, item(web, "port")->valueint);
+    ASSERT_EQ(busy, item(web, "movedFrom")->valueint);
+    ASSERT_STR_EQ("127.0.0.1", item(web, "lanAddress")->valuestring);
+    ASSERT_EQ(TEST_PORT, item(item(out, "settings"), "app.httpWeb.host.port")->valueint);
+    ASSERT(strings_are(item(out, "pendingRestart"), NONE, 0));
+    cJSON_Delete(out);
+    char *text = slurp(h->conf);
+    ASSERT(has_line(text, "port: 18087\n"));
+    free(text);
+    harness_stop(h);
+    close(held);
+    PASS();
+}
+
+/* Catches: a free port rewritten into firc.conf, or a move reported where there was none. */
+TEST a_free_web_port_stays_and_writes_nothing(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
+    const cJSON *web = item(out, "webUi");
+    ASSERT_EQ(TEST_PORT, item(web, "port")->valueint);
+    ASSERT_EQ(0, item(web, "movedFrom")->valueint);
+    cJSON_Delete(out);
+    ASSERT(access(h->conf, F_OK) != 0);
+    harness_stop(h);
+    PASS();
+}
+
+static enum greatest_test_res any_address_reports_the_lan_interface(const char *addr) {
+    harness_t *h = harness_start_full(NULL, 0, addr, TEST_PORT, true);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
+    ASSERT_STR_EQ("127.0.0.1", item(item(out, "webUi"), "lanAddress")->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a WebUI on every address reported as that address instead of the LAN interface's. */
+TEST a_web_ui_on_any_address_reports_the_lan_interface(void) {
+    CHECK_CALL(any_address_reports_the_lan_interface("[::]"));
+    CHECK_CALL(any_address_reports_the_lan_interface("0.0.0.0"));
+    CHECK_CALL(any_address_reports_the_lan_interface("[::ffff:0.0.0.0]"));
+    PASS();
+}
+
+/* Catches: a move whose firc.conf write failed left saved on the busy port, so every later PUT is refused. */
+TEST a_move_that_could_not_be_saved_still_counts_as_saved(void) {
+    uint16_t busy = 0;
+    int held = hold(SOCK_STREAM, &busy);
+    ASSERT(held >= 0);
+    harness_t *h = harness_start_full(NULL, 0, "127.0.0.1", busy, false);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
+    ASSERT_EQ(TEST_PORT, item(item(out, "settings"), "app.httpWeb.host.port")->valueint);
+    ASSERT(strings_are(item(out, "pendingRestart"), NONE, 0));
+    cJSON_Delete(out);
+    harness_stop(h);
+    close(held);
+    PASS();
+}
+
+/* Catches: every candidate busy reported as listening, or a port saved that nothing listens on. */
+TEST every_web_port_busy_leaves_no_web_ui_and_writes_nothing(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    uint16_t busy = 0;
+    int held = hold(SOCK_STREAM, &busy);
+    ASSERT(held >= 0);
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    firc_httpd_t *other = NULL;
+    ASSERT_EQ(FIRC_OK, firc_httpd_create(loop, &other));
+    firc_system_ctx_t ctx = h->ctx;
+    const uint16_t ports[] = {busy, TEST_PORT};
+    ASSERT(firc_system_listen_web(&ctx, other, ports, 2) != FIRC_OK);
+    ASSERT_EQ(0, ctx.web_port);
+    ASSERT_EQ(0, ctx.web_moved_from);
+    ASSERT(access(h->conf, F_OK) != 0);
+    firc_httpd_destroy(other);
+    firc_loop_destroy(loop);
+    close(held);
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(get_answers_every_setting_typed);
+    RUN_TEST(web_ports_start_with_the_configured_one_and_skip_the_dns_port);
+    RUN_TEST(a_busy_web_port_moves_to_the_next_and_is_saved);
+    RUN_TEST(a_free_web_port_stays_and_writes_nothing);
+    RUN_TEST(a_web_ui_on_any_address_reports_the_lan_interface);
+    RUN_TEST(a_move_that_could_not_be_saved_still_counts_as_saved);
+    RUN_TEST(every_web_port_busy_leaves_no_web_ui_and_writes_nothing);
     RUN_TEST(get_carries_the_boot_of_this_run);
     RUN_TEST(a_put_with_one_bad_key_writes_nothing);
     RUN_TEST(an_unknown_key_is_refused);

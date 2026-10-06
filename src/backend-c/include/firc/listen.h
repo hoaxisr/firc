@@ -2,6 +2,7 @@
 #define FIRC_LISTEN_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/socket.h>
 
@@ -22,5 +23,10 @@ enum {
 
 /* Nonblocking close-on-exec socket bound to sa (SO_REUSEADDR, backlog 128 for streams); fd or -errno. */
 int firc_listen_open(int type, const struct sockaddr_storage *sa, socklen_t sa_len, unsigned opts);
+
+#define FIRC_WEB_PORTS_MAX 6
+
+/* WebUI ports to try in order: configured first, then the fallbacks other than it and skip; returns the count */
+size_t firc_web_ports(uint16_t configured, uint16_t skip, uint16_t out[FIRC_WEB_PORTS_MAX]);
 
 #endif

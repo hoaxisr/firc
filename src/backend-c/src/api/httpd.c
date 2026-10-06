@@ -1116,6 +1116,21 @@ firc_err_t firc_httpd_listen_tcp(firc_httpd_t *h, const char *addr, uint16_t por
     return FIRC_OK;
 }
 
+firc_err_t firc_httpd_listen_tcp_first(firc_httpd_t *h, const char *addr, const uint16_t *ports,
+                                       size_t n, uint16_t *bound) {
+    firc_err_t err = FIRC_ERR_INVAL;
+    errno = 0;
+    for (size_t i = 0; i < n; i++) {
+        err = firc_httpd_listen_tcp(h, addr, ports[i]);
+        if (err == FIRC_OK) {
+            *bound = ports[i];
+            return FIRC_OK;
+        }
+        if (errno != EADDRINUSE && errno != EACCES) { return err; }
+    }
+    return err;
+}
+
 firc_err_t firc_httpd_listen_unix(firc_httpd_t *h, const char *path) {
     if (unlink(path) != 0 && errno != ENOENT) { return firc_err_from_errno(errno); }
 

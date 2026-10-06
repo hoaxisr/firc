@@ -105,6 +105,28 @@ definitions:
           way. It drops to false when the restart script could not start or
           the daemon was not stopped within the restart timeout.
         type: boolean
+      webUi:
+        description: >-
+          The WebUI as this run listens. When the configured port was in use
+          at start, the next free of 666, 999, 1666, 2666, 9999 was taken and
+          saved to firc.conf.
+        properties:
+          port:
+            description: 'The port listened on; 0 when the WebUI is not listening'
+            example: 666
+            type: integer
+          movedFrom:
+            description: 'The configured port that was in use at start; 0 when none was'
+            example: 8080
+            type: integer
+          lanAddress:
+            description: >-
+              The address to open it on: the configured one, or for an
+              any-address the first IPv4 of the first link interface; empty
+              when there is none
+            example: 192.168.1.1
+            type: string
+        type: object
     type: object
   types.SettingsPutReq:
     properties:

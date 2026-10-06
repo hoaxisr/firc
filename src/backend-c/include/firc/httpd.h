@@ -34,6 +34,9 @@ void firc_httpd_destroy(firc_httpd_t *h);
 
 /* on failure errno is the socket call's (0 if addr is not an address at all) */
 firc_err_t firc_httpd_listen_tcp(firc_httpd_t *h, const char *addr, uint16_t port);
+/* tries ports in order, moving on only past EADDRINUSE and EACCES; *bound is the port taken; errno as above */
+firc_err_t firc_httpd_listen_tcp_first(firc_httpd_t *h, const char *addr, const uint16_t *ports,
+                                       size_t n, uint16_t *bound);
 /* removes any existing socket file at path first */
 firc_err_t firc_httpd_listen_unix(firc_httpd_t *h, const char *path);
 

@@ -1,5 +1,9 @@
+#include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <inttypes.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +297,85 @@ firc_err_t firc_settings_probe_listeners(const firc_app_config_t *next,
 
 static bool restart_under_way(firc_system_ctx_t *ctx);
 
+static void link_ipv4(const char *name, char *out, size_t cap) {
+    struct ifaddrs *list = NULL;
+    if (name == NULL || getifaddrs(&list) != 0) { return; }
+    for (const struct ifaddrs *a = list; a != NULL; a = a->ifa_next) {
+        if (a->ifa_addr != NULL && a->ifa_addr->sa_family == AF_INET && strcmp(a->ifa_name, name) == 0) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)(const void *)a->ifa_addr)->sin_addr, out,
+                      (socklen_t)cap);
+            break;
+        }
+    }
+    freeifaddrs(list);
+}
+
+static void lan_address(const firc_app_config_t *running, char *out, size_t cap) {
+    out[0] = '\0';
+    struct sockaddr_storage sa;
+    socklen_t len = 0;
+    if (!firc_listen_addr(running->http_web.host.address, 0, true, &sa, &len)) { return; }
+    if (sa.ss_family == AF_INET) {
+        const struct in_addr *a = &((const struct sockaddr_in *)(const void *)&sa)->sin_addr;
+        if (a->s_addr != htonl(INADDR_ANY)) {
+            inet_ntop(AF_INET, a, out, (socklen_t)cap);
+            return;
+        }
+    } else {
+        const struct in6_addr *a = &((const struct sockaddr_in6 *)(const void *)&sa)->sin6_addr;
+        bool any4 = IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 0 && a->s6_addr[13] == 0 &&
+                    a->s6_addr[14] == 0 && a->s6_addr[15] == 0;
+        if (!IN6_IS_ADDR_UNSPECIFIED(a) && !any4) {
+            inet_ntop(AF_INET6, a, out, (socklen_t)cap);
+            return;
+        }
+    }
+    link_ipv4(running->n_link > 0 ? running->link[0] : NULL, out, cap);
+}
+
+static cJSON *web_ui_json(const firc_system_ctx_t *ctx) {
+    char lan[INET6_ADDRSTRLEN] = "";
+    lan_address(firc_app_running_settings(ctx->app), lan, sizeof(lan));
+    cJSON *web = cJSON_CreateObject();
+    if (web == NULL || cJSON_AddNumberToObject(web, "port", ctx->web_port) == NULL ||
+        cJSON_AddNumberToObject(web, "movedFrom", ctx->web_moved_from) == NULL ||
+        cJSON_AddStringToObject(web, "lanAddress", lan) == NULL) {
+        cJSON_Delete(web);
+        return NULL;
+    }
+    return web;
+}
+
+firc_err_t firc_system_listen_web(firc_system_ctx_t *ctx, firc_httpd_t *h, const uint16_t *ports,
+                                  size_t n) {
+    const firc_app_config_t *running = firc_app_running_settings(ctx->app);
+    const char *addr = running->http_web.host.address;
+    uint16_t bound = 0;
+    ctx->web_port = 0;
+    ctx->web_moved_from = 0;
+    firc_err_t err = firc_httpd_listen_tcp_first(h, addr, ports, n, &bound);
+    int e = errno;
+    if (err != FIRC_OK) {
+        const char *why = e != 0 ? strerror(e) : err == FIRC_ERR_INVAL ? "not an address" : firc_err_str(err);
+        FIRC_ERROR("failed to listen HTTP %s on any of %zu port(s) from %u: %s; running on without the WebUI",
+                   addr, n, n > 0 ? ports[0] : 0, why);
+        return err;
+    }
+    ctx->web_port = bound;
+    if (bound != ports[0]) {
+        ctx->web_moved_from = ports[0];
+        firc_err_t serr = firc_app_move_web_port(ctx->app, bound, ctx->config_path, ctx->config_version);
+        if (serr != FIRC_OK) {
+            FIRC_WARN("HTTP WebUI port %u is in use; listening on %u, but saving it failed: %s", ports[0],
+                      bound, firc_err_str(serr));
+        } else {
+            FIRC_WARN("HTTP WebUI port %u is in use; moved to %u and saved", ports[0], bound);
+        }
+    }
+    FIRC_INFO("HTTP WebUI listening on %s:%u", addr, bound);
+    return FIRC_OK;
+}
+
 static void handle_get_settings(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     (void)req;
     firc_system_ctx_t *ctx = ud;
@@ -303,7 +386,8 @@ static void handle_get_settings(firc_http_req_t *req, firc_http_res_t *res, void
     if (values == NULL || classes == NULL ||
         cJSON_AddStringToObject(out, "boot", firc_event_boot()) == NULL ||
         cJSON_AddBoolToObject(out, "restarting", restart_under_way(ctx)) == NULL ||
-        !cJSON_AddItemToObject(out, "pendingRestart", pending_json(ctx->app))) {
+        !cJSON_AddItemToObject(out, "pendingRestart", pending_json(ctx->app)) ||
+        !cJSON_AddItemToObject(out, "webUi", web_ui_json(ctx))) {
         cJSON_Delete(out);
         firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
         return;

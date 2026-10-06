@@ -2197,6 +2197,23 @@ firc_err_t firc_app_put_settings(firc_app_t *app, firc_app_config_t *next, const
     return FIRC_OK;
 }
 
+firc_err_t firc_app_move_web_port(firc_app_t *app, uint16_t port, const char *conf_path,
+                                  const char *version) {
+    app->cfg->app.http_web.host.port = port;
+    firc_app_config_t next;
+    memset(&next, 0, sizeof(next));
+    firc_err_t err = firc_app_config_copy(&next, &app->saved);
+    if (err == FIRC_OK) {
+        next.http_web.host.port = port;
+        err = firc_app_put_settings(app, &next, conf_path, version, NULL, NULL);
+    }
+    if (err != FIRC_OK) {
+        firc_app_config_clear(&next);
+        app->saved.http_web.host.port = port;
+    }
+    return err;
+}
+
 firc_err_t firc_app_reload_settings(firc_app_t *app, const firc_app_config_t *from_file,
                                     bool applied[FIRC_SETTINGS_COUNT]) {
     firc_app_config_t next;

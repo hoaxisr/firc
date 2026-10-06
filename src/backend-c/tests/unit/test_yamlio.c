@@ -416,7 +416,7 @@ TEST save_shape_matches_committed_fixture(void)
         "    enabled: true\n"
         "    host:\n"
         "      address: '[::]'\n"
-        "      port: 8080\n"
+        "      port: 666\n"
         "  dnsProxy:\n"
         "    host:\n"
         "      address: '[::]'\n"

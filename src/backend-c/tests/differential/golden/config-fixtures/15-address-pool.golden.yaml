@@ -4,7 +4,7 @@ app:
     enabled: true
     host:
       address: '[::]'
-      port: 8080
+      port: 666
   dnsProxy:
     host:
       address: '[::]'

@@ -561,7 +561,7 @@ firc_err_t firc_app_config_init_defaults(firc_app_config_t *c)
 {
     memset(c, 0, sizeof(*c));
     c->http_web.enabled = true;
-    c->http_web.host.port = 8080;
+    c->http_web.host.port = 666;
     c->dns_proxy.host.port = 3553;
     c->dns_proxy.upstream.port = 53;
     c->dns_proxy.disable_remap53 = false;

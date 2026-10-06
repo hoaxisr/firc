@@ -690,7 +690,7 @@ const SETTINGS_DEFAULTS: Record<string, unknown> = {
   "app.netfilter.startMarkTableIndex": "0x66697263",
   "app.showAllInterfaces": false,
   "app.httpWeb.host.address": "[::]",
-  "app.httpWeb.host.port": 8080,
+  "app.httpWeb.host.port": 666,
   "app.logLevel": "info",
 };
 const SETTINGS_LIVE = new Set([
@@ -718,6 +718,7 @@ app.get(`${API_BASE}/system/settings`, (c) =>
     pendingRestart: pendingRestart(),
     boot: BOOT,
     restarting: RESTARTING,
+    webUi: { port: RUNNING["app.httpWeb.host.port"], movedFrom: 0, lanAddress: "192.168.1.1" },
   }),
 );
 

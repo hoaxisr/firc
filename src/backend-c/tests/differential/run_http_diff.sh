@@ -82,12 +82,18 @@ if ! wait_for_port; then
 fi
 python3 "$DIR/http_contract/contract.py" 127.0.0.1 "$PORT" "$SOCK" > "$OUT/c.trace" 2> "$OUT/c_contract.err"
 CONTRACT_STATUS=$?
+REPORTED=$(FIRC_SOCK="$SOCK" FIRC_CONF="$SCRATCH_CONFIG" sh "$BACKEND_C_DIR/../../files/entware/_ipk/control/postinst" --report-web 2>&1)
 kill "$C_PID" 2>/dev/null || true
 wait "$C_PID" 2>/dev/null || true
 C_PID=
 if [ "$CONTRACT_STATUS" -ne 0 ]; then
     echo "contract run against C failed:"; cat "$OUT/c_contract.err"; exit 1
 fi
+
+if [ "$REPORTED" != "firc: WebUI at http://127.0.0.1:$PORT" ]; then
+    echo "postinst reported the WebUI wrongly: $REPORTED"; exit 1
+fi
+echo "   postinst's WebUI address from the running daemon: OK"
 
 echo "== diffing against golden trace"
 if diff -u "$GOLDEN" "$OUT/c.trace" > "$OUT/http_contract.diff"; then

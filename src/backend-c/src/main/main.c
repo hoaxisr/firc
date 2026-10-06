@@ -36,6 +36,7 @@
 #include "firc/iptables.h"
 #include "firc/events.h"
 #include "firc/log.h"
+#include "firc/listen.h"
 #include "firc/loop.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/netlink_watcher.h"
@@ -1349,21 +1350,13 @@ int main(int argc, char **argv)
         firc_httpd_route(d.http_tcp, "POST", "/api/v1/auth", firc_auth_login_handler, &auth_ctx);
         firc_httpd_set_middleware(d.http_tcp, firc_auth_middleware, &auth_ctx);
         firc_httpd_set_not_found(d.http_tcp, firc_static_handler, &static_ctx);
-        err = firc_httpd_listen_tcp(d.http_tcp, cfg.app.http_web.host.address,
-                                  cfg.app.http_web.host.port);
-        int listen_errno = errno;
-        if (err != FIRC_OK) {
+        uint16_t web_ports[FIRC_WEB_PORTS_MAX];
+        size_t n_web_ports = firc_web_ports(cfg.app.http_web.host.port, cfg.app.dns_proxy.host.port,
+                                            web_ports);
+        if (firc_system_listen_web(&system_ctx, d.http_tcp, web_ports, n_web_ports) != FIRC_OK) {
             /* A WebUI bind failure is not fatal: DNS and routing must survive a port conflict. */
-            const char *why = listen_errno != 0          ? strerror(listen_errno)
-                              : err == FIRC_ERR_INVAL ? "not an address"
-                                                      : firc_err_str(err);
-            FIRC_ERROR("failed to listen HTTP %s:%u: %s; running on without the WebUI",
-                       cfg.app.http_web.host.address, cfg.app.http_web.host.port, why);
             firc_httpd_destroy(d.http_tcp);
             d.http_tcp = NULL;
-        } else {
-            FIRC_INFO("HTTP WebUI listening on %s:%u", cfg.app.http_web.host.address,
-                      cfg.app.http_web.host.port);
         }
         /* Logged on every start: an operator who cannot log in has no other message to read. */
         FIRC_INFO("the WebUI requires a login from %s, or %s for an account that one does "

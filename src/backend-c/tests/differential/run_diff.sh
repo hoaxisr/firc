@@ -102,6 +102,11 @@ if ! sh "$DIR/run_migrate_groups_diff.sh"; then
     fail=1
 fi
 
+echo "== differential: the WebUI address the package's postinst reports"
+if ! sh "$DIR/run_postinst_web_diff.sh"; then
+    fail=1
+fi
+
 echo "== differential: HTTP API contract (vs golden)"
 if ! sh "$DIR/run_http_diff.sh"; then
     fail=1
