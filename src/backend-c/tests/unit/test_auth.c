@@ -530,7 +530,7 @@ TEST protected_route_requires_bearer_token(void) {
 static int get_hosts_with(const char *headers, char *body, size_t cap) {
     int fd = connect_tcp(AUTH_TEST_PORT);
     if (fd < 0) { return -1; }
-    char req[1024];
+    char req[4096];
     snprintf(req, sizeof(req), "GET /api/v1/system/hosts HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n",
              headers != NULL ? headers : "");
     send(fd, req, strlen(req), 0);
@@ -544,7 +544,7 @@ static int get_hosts_with(const char *headers, char *body, size_t cap) {
 
 static int get_hosts(const char *token, char *body, size_t cap) {
     if (token == NULL) { return get_hosts_with(NULL, body, cap); }
-    char line[768];
+    char line[FIRC_JWT_MAX_TOKEN + 64];
     snprintf(line, sizeof(line), "Authorization: Bearer %s\r\n", token);
     return get_hosts_with(line, body, cap);
 }
@@ -602,7 +602,7 @@ TEST the_token_header_signs_in_beside_a_proxy_basic_auth(void) {
     ASSERT_EQ(FIRC_OK, firc_auth_authenticate_from(SHADOW_FIXTURE, PASSWD_FIXTURE, h->state.state_dir, "admin",
                                                    "hunter2", token, sizeof(token)));
 
-    char headers[1024];
+    char headers[FIRC_JWT_MAX_TOKEN + 128];
     char body[1024];
     snprintf(headers, sizeof(headers), "Authorization: Basic YWRtaW46eA==\r\nX-Firc-Token: %s\r\n", token);
     ASSERT_EQm("token header beside basic auth", 200, get_hosts_with(headers, body, sizeof(body)));
