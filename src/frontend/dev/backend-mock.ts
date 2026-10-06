@@ -315,8 +315,8 @@ app.use(`${API_BASE}/*`, async (c, next) => {
     return;
   }
 
-  const authHeader = c.req.header("Authorization");
-  if (authHeader !== `Bearer ${STATIC_TOKEN}` && authHeader !== `Bearer disabled`) {
+  const authHeader = c.req.header("X-Firc-Token");
+  if (authHeader !== STATIC_TOKEN && authHeader !== "disabled") {
     return c.json({ error: "Unauthorized" }, 401);
   }
 

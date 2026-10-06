@@ -521,7 +521,7 @@ export class ListsController {
     if (this.#stopped || abort.signal.aborted) return true;
 
     const headers: Record<string, string> = {};
-    if (token.current) headers.Authorization = `Bearer ${token.current}`;
+    if (token.current) headers["X-Firc-Token"] = token.current;
 
     return await this.#readSyncEvents(groupId, headers, abort.signal);
   }

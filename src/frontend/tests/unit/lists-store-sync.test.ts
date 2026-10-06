@@ -664,7 +664,7 @@ describe("a group's list, synced over its event stream", () => {
         await follow;
 
         const at = stub.calls.indexOf(`/groups/${id}/list/sync/events`);
-        assert.deepStrictEqual(stub.headers[at], { Authorization: "Bearer session-token" });
+        assert.deepStrictEqual(stub.headers[at], { "X-Firc-Token": "session-token" });
       });
     } finally {
       token.reset();

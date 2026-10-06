@@ -1842,16 +1842,25 @@ paths:
       tags:
       - config
 securityDefinitions:
+  token:
+    description: >-
+      A JWT from POST /api/v1/auth, in the X-Firc-Token header. Required for
+      all /api/v1/** on the web interface except /api/v1/auth itself:
+      authentication cannot be turned off. The WebUI uses this header, so a
+      reverse proxy keeps Authorization for its own basic auth. When both are
+      sent, X-Firc-Token decides. The Unix socket needs no token -- its
+      directory is 0700, so the caller is root on this router.
+    in: header
+    name: X-Firc-Token
+    type: apiKey
   bearer:
     description: >-
-      A JWT from POST /api/v1/auth, in the Authorization header as `Bearer
-      <token>`. Required for all /api/v1/** on the web interface except
-      /api/v1/auth itself: authentication cannot be turned off. The Unix
-      socket needs no token -- its directory is 0700, so the caller is root on
-      this router.
+      The same JWT in the Authorization header as `Bearer <token>`, for
+      scripts.
     in: header
     name: Authorization
     type: apiKey
 security:
+- token: []
 - bearer: []
 swagger: "2.0"

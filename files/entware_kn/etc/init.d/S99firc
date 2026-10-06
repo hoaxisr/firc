@@ -4,7 +4,7 @@ ENABLED=yes
 PROCS=fircd
 ARGS=""
 PREARGS=""
-DESC="firc Daemon"
+DESC="firc"
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 UPTIME_MAX_BORDER=300
 # The daemon's run dir and socket; CI checks these match paths.h and the netfilter.d hook.
@@ -299,7 +299,7 @@ mark_stopped() {
 }
 
 stop() {
-  echo -e -n "$ansi_white Shutting down $PROC... $ansi_std"
+  echo -e -n "$ansi_white Shutting down $DESC... $ansi_std"
   mark_stopped
   # Kill the boot loop first, or it brings the daemon back; trust its pid only if the dir is ours.
   LOOP_KILLED=
@@ -351,7 +351,7 @@ check() {
 
 reconfigure() {
   SIGNAL=SIGHUP
-  echo -e "$ansi_white Sending $SIGNAL to $PROC... $ansi_std"
+  echo -e "$ansi_white Sending $SIGNAL to $DESC... $ansi_std"
   killall -$SIGNAL $PROC 2>/dev/null
 }
 

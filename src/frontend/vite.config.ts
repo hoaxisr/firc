@@ -15,6 +15,7 @@ export default defineConfig(() => ({
     }),
     ViteMinifyPlugin(),
   ],
+  publicDir: "static",
   build: {
     cssTarget: "firefox115",
     emptyOutDir: true,

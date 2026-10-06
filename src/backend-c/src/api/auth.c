@@ -477,18 +477,21 @@ bool firc_auth_middleware(firc_http_req_t *req, firc_http_res_t *res, void *ud) 
     if (strncmp(path, "/api/", 5) != 0) { return true; }
     if (strcmp(path, "/api/v1/auth") == 0) { return true; }
 
-    const char *authz = firc_http_req_header(req, "Authorization");
-    if (!authz) {
-        firc_http_res_write_error(res, 401, "Unauthorized");
-        return false;
+    const char *token = firc_http_req_header(req, "X-Firc-Token");
+    if (!token) {
+        const char *authz = firc_http_req_header(req, "Authorization");
+        if (!authz) {
+            firc_http_res_write_error(res, 401, "Unauthorized");
+            return false;
+        }
+        while (*authz == ' ' || *authz == '\t') { authz++; }
+        static const char prefix[] = "Bearer ";
+        if (strncmp(authz, prefix, sizeof(prefix) - 1) != 0) {
+            firc_http_res_write_error(res, 401, "Unauthorized");
+            return false;
+        }
+        token = authz + sizeof(prefix) - 1;
     }
-    while (*authz == ' ' || *authz == '\t') { authz++; }
-    static const char prefix[] = "Bearer ";
-    if (strncmp(authz, prefix, sizeof(prefix) - 1) != 0) {
-        firc_http_res_write_error(res, 401, "Unauthorized");
-        return false;
-    }
-    const char *token = authz + sizeof(prefix) - 1;
     if (*token == '\0') {
         firc_http_res_write_error(res, 401, "Unauthorized");
         return false;

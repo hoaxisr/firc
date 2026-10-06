@@ -526,19 +526,13 @@ TEST protected_route_requires_bearer_token(void) {
     PASS();
 }
 
-/* One request, with or without a bearer token; returns the status and copies the body into `body`. */
-static int get_hosts(const char *token, char *body, size_t cap) {
+/* One request carrying `headers` (CRLF-terminated lines, or NULL); returns the status and copies the body into `body`. */
+static int get_hosts_with(const char *headers, char *body, size_t cap) {
     int fd = connect_tcp(AUTH_TEST_PORT);
     if (fd < 0) { return -1; }
     char req[1024];
-    if (token != NULL) {
-        snprintf(req, sizeof(req),
-                 "GET /api/v1/system/hosts HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
-                 "Connection: close\r\n\r\n",
-                 token);
-    } else {
-        snprintf(req, sizeof(req), "GET /api/v1/system/hosts HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    }
+    snprintf(req, sizeof(req), "GET /api/v1/system/hosts HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n",
+             headers != NULL ? headers : "");
     send(fd, req, strlen(req), 0);
     char resp[4096];
     ssize_t n = recv_response(fd, resp, sizeof(resp));
@@ -546,6 +540,13 @@ static int get_hosts(const char *token, char *body, size_t cap) {
     if (n <= 0) { return -1; }
     snprintf(body, cap, "%s", body_of(resp));
     return status_code_of(resp);
+}
+
+static int get_hosts(const char *token, char *body, size_t cap) {
+    if (token == NULL) { return get_hosts_with(NULL, body, cap); }
+    char line[768];
+    snprintf(line, sizeof(line), "Authorization: Bearer %s\r\n", token);
+    return get_hosts_with(line, body, cap);
 }
 
 /* Catches: the host list missing, exempt from auth, or answered without a token. */
@@ -574,6 +575,43 @@ TEST the_host_list_answers_a_signed_in_caller_and_nobody_else(void) {
     ASSERT_EQm("signed in: the handler answers", 200, get_hosts(token, body, sizeof(body)));
     ASSERT_STR_EQ("{\"hosts\":[]}", body);
     ASSERT_EQm("no token: the middleware refuses", 401, get_hosts(NULL, body, sizeof(body)));
+    harness_stop(h);
+    unlink(SHADOW_FIXTURE);
+    PASS();
+}
+
+/* Catches: the token read only from Authorization, which a reverse proxy's basic auth owns. */
+TEST the_token_header_signs_in_beside_a_proxy_basic_auth(void) {
+    write_file(SHADOW_FIXTURE,
+               "admin:$6$abcdefghijklmnop$EC.xeLW9zNWcX0r23FSpQaV7PG.Ibd4QnLe3w6UC47i3/"
+               "vkPQouEDwvUpGtqFiad5mzQG96cD/LywQiXv9WfH/:19000:0:99999:7:::\n");
+    firc_auth_forget_cached_hash();
+    g_shadow_path = SHADOW_FIXTURE;
+    g_passwd_path = PASSWD_FIXTURE;
+    harness_t *h = harness_start();
+    g_shadow_path = NULL;
+    g_passwd_path = NULL;
+    ASSERT(h != NULL);
+    firc_system_ctx_t sys;
+    memset(&sys, 0, sizeof(sys));
+    firc_system_register_routes(h->tcp, &sys);
+
+    firc_auth_forget_secret_for_test();
+    firc_auth_reset_throttle_for_test();
+    char token[FIRC_JWT_MAX_TOKEN];
+    ASSERT_EQ(FIRC_OK, firc_auth_authenticate_from(SHADOW_FIXTURE, PASSWD_FIXTURE, h->state.state_dir, "admin",
+                                                   "hunter2", token, sizeof(token)));
+
+    char headers[1024];
+    char body[1024];
+    snprintf(headers, sizeof(headers), "Authorization: Basic YWRtaW46eA==\r\nX-Firc-Token: %s\r\n", token);
+    ASSERT_EQm("token header beside basic auth", 200, get_hosts_with(headers, body, sizeof(body)));
+    ASSERT_STR_EQ("{\"hosts\":[]}", body);
+    ASSERT_EQm("basic auth alone", 401,
+               get_hosts_with("Authorization: Basic YWRtaW46eA==\r\n", body, sizeof(body)));
+    snprintf(headers, sizeof(headers), "Authorization: Bearer %s\r\nX-Firc-Token: forged\r\n", token);
+    ASSERT_EQm("a bad token header is not rescued by Authorization", 401,
+               get_hosts_with(headers, body, sizeof(body)));
     harness_stop(h);
     unlink(SHADOW_FIXTURE);
     PASS();
@@ -695,6 +733,7 @@ int main(int argc, char **argv) {
     RUN_TEST(login_with_no_such_user_is_refused);
     RUN_TEST(protected_route_requires_bearer_token);
     RUN_TEST(the_host_list_answers_a_signed_in_caller_and_nobody_else);
+    RUN_TEST(the_token_header_signs_in_beside_a_proxy_basic_auth);
     RUN_TEST(auth_path_itself_is_exempt_even_when_enabled);
     RUN_TEST(bare_lf_request_line_endings_are_accepted);
     GREATEST_MAIN_END();

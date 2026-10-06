@@ -480,11 +480,12 @@ TEST a_value_equal_to_the_saved_one_is_not_a_change(void) {
 }
 
 /* Holds a socket of `type` on 127.0.0.1 at a kernel-picked port (listening for a stream); -1 on failure. */
-static int hold(int type, uint16_t *port) {
+static int bind_loopback(int type, uint16_t port, uint16_t *bound) {
     int fd = socket(AF_INET, type, 0);
     if (fd < 0) { return -1; }
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
     socklen_t len = sizeof(sa);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
@@ -493,8 +494,24 @@ static int hold(int type, uint16_t *port) {
         close(fd);
         return -1;
     }
-    *port = ntohs(sa.sin_port);
+    *bound = ntohs(sa.sin_port);
     return fd;
+}
+
+static int hold(int type, uint16_t *port) {
+    int other = type == SOCK_STREAM ? SOCK_DGRAM : SOCK_STREAM;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        int fd = bind_loopback(type, 0, port);
+        if (fd < 0) { return -1; }
+        uint16_t same = 0;
+        int probe = bind_loopback(other, *port, &same);
+        if (probe >= 0) {
+            close(probe);
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
 }
 
 static const char BEFORE[] = "configVersion: 0.7.0\n# written by hand\n";

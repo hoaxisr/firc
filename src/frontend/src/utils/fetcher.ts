@@ -25,7 +25,7 @@ export async function fetcher<T>(...args: any[]): Promise<T> {
   if (token.current) {
     options.headers = {
       ...options.headers,
-      Authorization: `Bearer ${token.current}`,
+      "X-Firc-Token": token.current,
     };
   }
 
