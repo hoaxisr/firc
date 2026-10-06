@@ -83,6 +83,7 @@ export class ListsController {
 
   #acknowledgeListSaved: (id: string) => void;
   #isSaved: (id: string) => boolean;
+  #pageLoaded: () => void;
 
   constructor(
     getGroup: (id: string) => Group | undefined,
@@ -92,6 +93,7 @@ export class ListsController {
       query: () => string;
       acknowledgeListSaved: (id: string) => void;
       isSaved: (id: string) => boolean;
+      pageLoaded: () => void;
     },
   ) {
     this.#getGroup = getGroup;
@@ -100,6 +102,7 @@ export class ListsController {
     this.#query = deps.query;
     this.#acknowledgeListSaved = deps.acknowledgeListSaved;
     this.#isSaved = deps.isSaved;
+    this.#pageLoaded = deps.pageLoaded;
   }
 
   destroy() {
@@ -256,6 +259,7 @@ export class ListsController {
       failed: false,
       rules: page,
     };
+    this.#pageLoaded();
     return true;
   }
 

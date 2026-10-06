@@ -41,7 +41,9 @@
         <div class="selected-text">
           <div class="selected-value">{selected_label}</div>
           {#if selected_description}
-            <div class="selected-description">{selected_description}</div>
+            <div class="selected-description" title={selected_description}>
+              {selected_description}
+            </div>
           {/if}
         </div>
         <div class="selected-open" aria-hidden="true">
@@ -154,8 +156,8 @@
     min-width: 0;
     max-width: 100%;
     flex-direction: column;
-    align-items: end;
-    gap: 0.08rem;
+    align-items: start;
+    gap: 0.1rem;
   }
   .selected-value {
     flex: 0 1 auto;
@@ -168,14 +170,17 @@
     text-overflow: ellipsis;
   }
   .selected-description {
-    max-width: 10rem;
+    max-width: 8rem;
     padding-left: 0.3rem;
     color: var(--text-2);
-    font-size: 0.55em;
-    font-style: italic;
-    white-space: nowrap;
+    font-size: 0.7em;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     overflow: hidden;
-    text-overflow: ellipsis;
   }
   .selected-open {
     width: 16px;
@@ -235,11 +240,5 @@
     display: flex;
     align-items: center;
     justify-content: center;
-  }
-
-  @media (max-width: 700px) {
-    .selected-text {
-      align-items: start;
-    }
   }
 </style>

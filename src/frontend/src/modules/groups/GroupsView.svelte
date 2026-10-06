@@ -22,8 +22,9 @@
   } from "./groups.svelte";
 
   import { droppable } from "../../lib/dnd";
-  import { parseConfig, type Group, type Rule } from "../../types";
+  import { type Group, type Rule } from "../../types";
   import { toast } from "../../utils/events";
+  import { groupsFromFile } from "./groups-data";
 
   type Props = {
     onRenderComplete?: () => void;
@@ -167,7 +168,7 @@
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
-        const { groups } = parseConfig(event.target?.result as string);
+        const groups = groupsFromFile(file.name, event.target?.result as string);
         if (!groups?.length) {
           toast.error(t("Invalid config file"));
           return;
@@ -282,6 +283,7 @@
     canSave={store.canSave}
     exportLabel={t("Export Config")}
     importLabel={t("Import Config")}
+    importAccept=".firc,.mtrickle"
     onAdd={openGroupDialog}
     onExport={exportConfig}
     onImport={importConfig}

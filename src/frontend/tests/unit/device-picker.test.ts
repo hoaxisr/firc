@@ -539,10 +539,44 @@ describe("the card's label", () => {
     strictEqual(say({ allow: [], deny: [] }), "Every device");
     strictEqual(say({ allow: ["policy:Kids", "mac:aa:00:00:00:00:01"], deny: [] }), "2 devices");
     strictEqual(say({ allow: ["policy:Kids"], deny: ["mac:aa:00:00:00:00:03"] }), "1 device");
-    strictEqual(say({ allow: [], deny: ["mac:aa:00:00:00:00:02", "192.168.1.0/30"] }), "All but 2");
+    strictEqual(
+      say({ allow: [], deny: ["mac:aa:00:00:00:00:02", "192.168.1.0/30"] }),
+      "All but 2 devices",
+    );
     strictEqual(say({ allow: ["192.168.1.4/30"], deny: [] }, "ru"), "3 devices (2-4)");
     strictEqual(say({ allow: ["policy:Gone"], deny: [] }), "0 devices");
     strictEqual(say({ allow: ["policy:Kids"], deny: [] }, "en", []), "2 devices");
+  });
+});
+
+describe("the card's label for a deny-only selection", () => {
+  const say = (deny: string[], locale = "en") =>
+    coverageLabel({ allow: [], deny }, HOSTS, POLICIES, t, locale);
+
+  // Catches a denied policy counted by its devices (a policy of none read "All but 0").
+  it("names denied policies as policies", () => {
+    strictEqual(say(["policy:Kids"]), "All but 1 policy");
+    strictEqual(say(["policy:Kids", "policy:Policy1"]), "All but 2 policies");
+    strictEqual(
+      coverageLabel(
+        { allow: [], deny: ["policy:Empty"] },
+        HOSTS,
+        [{ name: "Empty", devices: 0 }],
+        t,
+        "en",
+      ),
+      "All but 1 policy",
+    );
+  });
+
+  // Catches the devices part dropped, or a policy's hosts added to it.
+  it("names policies and devices apart", () => {
+    strictEqual(say(["policy:Kids", "mac:aa:00:00:00:00:02"]), "All but 1 policy and 1 device");
+    strictEqual(
+      say(["policy:Kids", "mac:aa:00:00:00:00:02", "mac:aa:00:00:00:00:03"], "ru"),
+      "All but 1 policy and 2 devices (2-4)",
+    );
+    strictEqual(say(["mac:aa:00:00:00:00:02"]), "All but 1 device");
   });
 });
 

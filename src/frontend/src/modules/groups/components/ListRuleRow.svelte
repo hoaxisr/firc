@@ -7,6 +7,7 @@
   import { t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
 
+  import { TriangleAlert } from "../../../components/ui/icons";
   import { RULE_TYPES, type ListRule } from "../../../types";
   import { VALIDATOP_MAP } from "../../../utils/rule-validators";
 
@@ -29,6 +30,9 @@
     );
   }
 
+  let isDuplicate = $derived(store.isRuleDuplicate(rule.id));
+  let isHighlighted = $derived(store.isRuleHighlighted(rule.id));
+
   let baseline = $derived(store.lists.baselineOf(group_id, rule.id));
   let isChanged = $derived(
     Boolean(baseline) && (rule.type !== baseline!.type || rule.enable !== baseline!.enable),
@@ -46,6 +50,8 @@
   data-index={rule_index}
   data-group-id={group_id}
   data-uuid={rule.id}
+  data-group-uuid={group_id}
+  data-duplicate-highlighted={isHighlighted ? "true" : undefined}
   {...rest}
 >
   <div class="list-rule-row">
@@ -66,6 +72,11 @@
       </div>
       {#if rule.proto || rule.ports}
         <span class="list-rule-spec">{[rule.proto, rule.ports].filter(Boolean).join(" ")}</span>
+      {/if}
+      {#if isDuplicate}
+        <Tooltip value={t("Duplicate rule")}>
+          <span class="duplicate-indicator"><TriangleAlert size={18} /></span>
+        </Tooltip>
       {/if}
       {#if isChanged}
         <span class="changed-tag">{t("changed")}</span>
@@ -130,6 +141,18 @@
     overflow: hidden;
     text-overflow: ellipsis;
     flex: 1 1 auto;
+  }
+
+  .duplicate-indicator {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: var(--yellow);
+    cursor: help;
+  }
+
+  .list-rule[data-duplicate-highlighted="true"] .list-rule-row {
+    background-color: color-mix(in oklab, var(--yellow) 10%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--yellow) 56%, transparent);
   }
 
   .list-rule-spec {

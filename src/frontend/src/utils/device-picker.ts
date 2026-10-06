@@ -378,7 +378,20 @@ export function coverageLabel(
   const deny = coveredKeys(denyEntries, hosts, policies);
   if (allowEntries.length === 0) {
     if (denyEntries.length === 0) return t("Every device");
-    return t("All but {n}").replace("{n}", String(deny.size));
+    const isPolicy = (e: string) => e.startsWith(POLICY_PREFIX);
+    const p = denyEntries.filter(isPolicy).length;
+    const d = coveredKeys(
+      denyEntries.filter((e) => !isPolicy(e)),
+      hosts,
+      policies,
+    ).size;
+    const say = (n: number, one: string, few: string, many: string) =>
+      counted(n, locale, t(one), t(few), t(many));
+    if (p === 0)
+      return say(d, "All but {n} device", "All but {n} devices (2-4)", "All but {n} devices");
+    const head = say(p, "All but {n} policy", "All but {n} policies (2-4)", "All but {n} policies");
+    if (d === 0) return head;
+    return head + say(d, " and {n} device", " and {n} devices (2-4)", " and {n} devices");
   }
   let n = 0;
   for (const k of coveredKeys(allowEntries, hosts, policies)) if (!deny.has(k)) n++;

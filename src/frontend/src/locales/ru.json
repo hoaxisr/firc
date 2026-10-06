@@ -5,7 +5,6 @@
   "Add Group": "Добавить группу",
   "Add Rule": "Добавить правило",
   "All": "Всё",
-  "All but {n}": "Все, кроме {n}",
   "Allow also": "Разрешить ещё",
   "Any": "Любой",
   "Append": "Добавить",
@@ -363,5 +362,15 @@
   "excluded from {name}": "исключено из {name}",
   "off by a manual entry": "выключено ручной записью",
   "Switch on at least one device or policy, or choose “For every device”. To make the group work for nobody, switch the group off on the main page.": "Включите хотя бы одно устройство или политику либо выберите «Для всех устройств». Чтобы группа не работала ни для кого, выключите её на главной странице.",
-  "unreachable: its name is taken by the description of policy {name}": "недоступна: её имя занято описанием политики {name}"
+  "unreachable: its name is taken by the description of policy {name}": "недоступна: её имя занято описанием политики {name}",
+  "All but {n} device": "Все, кроме {n} устройства",
+  "All but {n} devices (2-4)": "Все, кроме {n} устройств",
+  "All but {n} devices": "Все, кроме {n} устройств",
+  "All but {n} policy": "Все, кроме {n} политики",
+  "All but {n} policies (2-4)": "Все, кроме {n} политик",
+  "All but {n} policies": "Все, кроме {n} политик",
+  " and {n} device": " и {n} устройства",
+  " and {n} devices (2-4)": " и {n} устройств",
+  " and {n} devices": " и {n} устройств",
+  "Showing the first {n}": "Показаны первые {n}"
 }

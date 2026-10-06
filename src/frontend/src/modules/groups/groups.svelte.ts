@@ -172,6 +172,7 @@ export class GroupsStore {
     isOpen: (id) => Boolean(this.open_state[id]),
     query: () => this.searchValue.trim().toLowerCase(),
     isSaved: (id) => this.listSaved(id),
+    pageLoaded: () => this.refreshDuplicateRuleIds(),
     acknowledgeListSaved: (id) => {
       const group = this.data.find((g) => g.id === id);
       if (!group?.list) return;
@@ -1151,7 +1152,8 @@ export class GroupsStore {
     const rulesByKey = new Map<string, { rule: Rule; groupId: string; groupName: string }[]>();
 
     for (const group of this.data) {
-      for (const rule of group.rules) {
+      const listed = (group.list ? (this.lists.pageState[group.id]?.rules ?? []) : []) as Rule[];
+      for (const rule of [...group.rules, ...listed]) {
         const normalizedPattern = rule.rule.trim();
         if (!normalizedPattern) continue;
 

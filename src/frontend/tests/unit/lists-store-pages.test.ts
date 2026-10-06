@@ -1254,3 +1254,39 @@ describe("a group's list, paged and searched", () => {
     }
   });
 });
+
+describe("a list rule repeating a group's own rule", () => {
+  // Catches list rules left out of the duplicate check, or a loaded page not rechecked.
+  it("marks both once the list page is loaded", async () => {
+    const stub = installFetchStub({
+      "/groups/a1b2c3d4/list/rules?offset=0&limit=50": rulesPage(0, 50),
+    });
+
+    try {
+      const store = new GroupsStore();
+      const own = {
+        ...makeGroup("e5e5e5e5", 0),
+        list: undefined,
+        rules: [{ id: "own00001", enable: true, rule: "7.example.com", type: "domain" }],
+      };
+      seed(store, [makeGroup("a1b2c3d4", 120), own]);
+      store.refreshDuplicateRuleIds();
+      assert.strictEqual(store.isRuleDuplicate("own00001"), false);
+
+      await store.lists.loadRules("a1b2c3d4", 0);
+
+      assert.strictEqual(store.isRuleDuplicate("own00001"), true);
+      assert.strictEqual(store.isRuleDuplicate("rule0007"), true);
+      assert.strictEqual(store.isRuleDuplicate("rule0008"), false);
+      assert.deepStrictEqual(
+        store.getDuplicateConflictsForGroup("e5e5e5e5").map((c) => [c.groupId, c.ruleId]),
+        [
+          ["a1b2c3d4", "rule0007"],
+          ["e5e5e5e5", "own00001"],
+        ],
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+});

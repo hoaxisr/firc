@@ -93,7 +93,7 @@
 
   let nameMirrorWidth = $state(0);
   let nameFieldWidth = $derived(
-    Math.min(420, Math.max(64, nameMirrorWidth + 20 + (duplicateConflicts.length > 0 ? 36 : 0))),
+    Math.max(64, nameMirrorWidth + 20 + (duplicateConflicts.length > 0 ? 36 : 0)),
   );
   let anyList = $derived(store.data.some((g) => Boolean(g.list)));
   let listPage = $derived(group ? store.lists.pageState[group.id] : undefined);
@@ -289,7 +289,7 @@
       if (typeof window !== "undefined") {
         requestAnimationFrame(() => {
           const row = document.querySelector<HTMLElement>(
-            `.rule[data-group-uuid="${group.id}"][data-uuid="${request.ruleId}"]`,
+            `[data-group-uuid="${group.id}"][data-uuid="${request.ruleId}"]`,
           );
           if (row) {
             const rect = row.getBoundingClientRect();
@@ -416,6 +416,8 @@
                   />
                 {/if}
               </div>
+            </div>
+            <div class="group-badges">
               {#if hasList}
                 <span class="list-badge"><RSS size={12} />{t("list")}</span>
               {/if}
@@ -796,11 +798,21 @@
     gap: 0.15rem;
   }
 
-  .group-name-row {
+  .group-name-row,
+  .group-badges {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     min-width: 0;
+  }
+
+  .group-badges {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .group-badges:empty {
+    display: none;
   }
 
   .list-badge {

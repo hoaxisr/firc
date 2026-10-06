@@ -1,8 +1,13 @@
-import { DEFAULT_RESOLVE, syncIdle, type Group, type Rule } from "../../types";
+import { DEFAULT_RESOLVE, parseConfig, syncIdle, type Group, type Rule } from "../../types";
 import { randomId } from "../../utils/random-id";
 import { sortRules, type SortDirection } from "../../utils/rule-sorter";
 
 export type YieldToMain = () => Promise<void>;
+
+export function groupsFromFile(fileName: string, text: string): Group[] {
+  const groups = parseConfig(text).groups ?? [];
+  return fileName.toLowerCase().endsWith(".mtrickle") ? groups.reverse() : groups;
+}
 
 export function cloneGroupWithNewIds(group: Group): Group {
   return {

@@ -98,7 +98,7 @@ test.describe("Device dialog", () => {
     await stub(page, { allow: [], deny: ["mac:aa:00:00:00:00:02"] });
     await groupsPage.goto();
     const button = page.locator("button", { has: page.locator(".devices-icon") }).first();
-    await expect(button).toHaveAttribute("aria-label", "All but 1");
+    await expect(button).toHaveAttribute("aria-label", "All but 1 device");
   });
 
   test.beforeEach(async ({ page }) => {

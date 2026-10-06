@@ -388,8 +388,13 @@
               </div>
             {/if}
             {#if previewRules.length > 0}
+              {#if previewTotal > previewRules.length}
+                <div class="preview-shown">
+                  {t("Showing the first {n}").replace("{n}", String(previewRules.length))}
+                </div>
+              {/if}
               <div class="preview-rules">
-                {#each previewRules.slice(0, 3) as rule (rule.id)}
+                {#each previewRules as rule (rule.id)}
                   <div class="preview-rule-row">
                     <span class="preview-rule-type">{ruleTypeLabel(rule.type)}</span>
                     <span class="preview-rule-pattern">{rule.rule}</span>
@@ -647,7 +652,8 @@
     font-style: italic;
   }
 
-  .preview-note {
+  .preview-note,
+  .preview-shown {
     color: var(--text-2);
     font-size: 0.85rem;
   }

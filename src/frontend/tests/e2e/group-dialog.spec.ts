@@ -46,6 +46,7 @@ test.describe("Group dialog: list preview", () => {
     await expect(dialog.locator(".preview-counts")).toContainText("4000");
     await expect(dialog.locator(".breakdown")).toContainText("3990 Namespace");
     await expect(dialog.locator(".preview-note")).toHaveText("Lines that are not rules: 3");
+    await expect(dialog.locator(".preview-shown")).toHaveText("Showing the first 1");
     await expect(dialog).not.toContainText("format firc does not route");
   });
 

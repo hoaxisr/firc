@@ -393,9 +393,15 @@
     min-width: 0;
   }
 
+  .block + .block {
+    border-top: 1px solid var(--border-light);
+    padding-top: 0.9rem;
+  }
+
   .label {
-    font-size: 0.85em;
-    color: var(--text-2);
+    font-size: 0.95em;
+    font-weight: 600;
+    color: var(--text);
   }
 
   .label-row {
