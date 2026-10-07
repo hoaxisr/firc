@@ -281,8 +281,12 @@ void firc_app_set_device_lookup(firc_app_t *app, firc_devsel_mark_fn mark, firc_
                                 firc_devsel_policy_hosts_fn policy_hosts, firc_devsel_policy_nets_fn policy_nets,
                                 void *ud);
 
+/* Until read(ud) holds (ud as given to set_device_lookup; NULL read: always), a chain naming a policy marks nobody. */
+void firc_app_set_policies_read(firc_app_t *app, bool (*read)(void *ud));
+
 /* the firmware's host table changed: every routed group with a selector is re-rendered and compared before the
- * lock is taken, which is taken only if something moved; a narrowed chain flushes chunk flows after the pass. */
+ * lock is taken, which is taken only if something moved; a narrowed chain flushes the group's flows by mark after
+ * the pass. */
 void firc_app_devices_changed(firc_app_t *app);
 
 /* stages the capture's chain when one runs; every pass does this */

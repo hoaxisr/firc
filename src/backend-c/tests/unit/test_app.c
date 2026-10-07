@@ -4389,6 +4389,66 @@ TEST a_selector_group_s_chunk_jumps_to_its_devices_chain(void) {
     PASS();
 }
 
+/* Catches: the enable leaving a selector group's subnet rule in its MARK form, or the committer path writing the pair. */
+TEST a_subnet_rule_of_a_selector_group_jumps_to_its_devices_chain(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    char dev[] = "10.0.0.1";
+    char *allow[] = {dev};
+    firc_group_t *g = selector_group(1, allow, 1, NULL, 0);
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, "10.0.0.0/8")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT(first_pass_done(&l));
+    char chain[64], dchain[64], jump[160];
+    chain_of(&l, gid, chain, sizeof(chain));
+    devices_chain_of(&l, gid, dchain, sizeof(dchain));
+    snprintf(jump, sizeof(jump), "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j %s",
+             dchain);
+    ASSERT(mangle_has(&l, chain, jump));
+    ASSERT_FALSE(mangle_has(&l, chain,
+                            "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK"));
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: a selector emptied still jumping its subnet rule to the devices chain the same pass deletes. */
+TEST a_selector_emptied_returns_its_subnet_rule_to_a_mark(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    char dev[] = "10.0.0.1";
+    char *allow[] = {dev};
+    firc_group_t *g = selector_group(1, allow, 1, NULL, 0);
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, "10.0.0.0/8")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT(first_pass_done(&l));
+    char chain[64], dchain[64];
+    chain_of(&l, gid, chain, sizeof(chain));
+    devices_chain_of(&l, gid, dchain, sizeof(dchain));
+    ASSERTm("fixture: the devices chain is there", mangle_chain_there(&l, dchain));
+
+    firc_group_t *emptied = selector_group(1, NULL, 0, NULL, 0);
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(emptied, edit_rule(FIRC_RULE_SUBNET, "10.0.0.0/8")));
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, emptied));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT_FALSE(mangle_chain_there(&l, dchain));
+    ASSERT(mangle_has(&l, chain,
+                      "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK "
+                      "--set-xmark"));
+    ASSERT(mangle_has(&l, chain,
+                      "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -j CONNMARK --save-mark --nfmask 0x40ff0000 "
+                      "--ctmask 0x40ff0000"));
+    ASSERT_FALSE(mangle_has(&l, chain, dchain));
+    locked_app_down(&l);
+    PASS();
+}
+
 /* Binds the policy "Guests" to the segment 10.99.0.0/24. */
 static firc_err_t stub_policy_nets(const char *policy, bool deny, firc_devsel_net_fn cb, void *cb_ud, void *ud) {
     (void)ud;
@@ -4572,16 +4632,26 @@ TEST without_a_committer_the_devices_chain_is_written_at_once(void) {
 static const uint8_t k_chunk_reply[4] = {93, 184, 216, 34};
 static const uint8_t k_subnet_dst[4] = {10, 1, 2, 3};
 
+static const uint8_t k_other_field_reply[4] = {10, 1, 2, 4};
+static const uint8_t k_unhandled_reply[4] = {10, 1, 2, 5};
+
 static void plant_group_flows(locked_app_t *l, uint8_t tag) {
     uint32_t mark = field_of(l, tag) | FIRC_MARK_HANDLED;
     fake_ct_add(l->ctk, AF_INET, k_flow_src, k_flow_dst, k_chunk_reply, mark);
     fake_ct_add(l->ctk, AF_INET, k_flow_src, k_subnet_dst, k_subnet_dst, mark);
+    fake_ct_add(l->ctk, AF_INET, k_flow_src, k_other_field_reply, k_other_field_reply,
+                firc_mark_group_value(200) | FIRC_MARK_HANDLED);
+    fake_ct_add(l->ctk, AF_INET, k_flow_src, k_unhandled_reply, k_unhandled_reply, field_of(l, tag));
+}
+
+static bool strangers_kept(locked_app_t *l) {
+    return !fake_ct_deleted(l->ctk, k_other_field_reply, 4) && !fake_ct_deleted(l->ctk, k_unhandled_reply, 4);
 }
 
 static char k_dev_a[] = "10.0.0.1", k_dev_b[] = "10.0.0.2";
 
-/* Catches: a narrowing that flushes nothing, flushes subnet flows too, or flushes before the pass. */
-TEST a_narrowed_selector_resets_its_chunk_flows_after_the_pass(void) {
+/* Catches: a narrowing that flushes nothing, only the chunk flows, another field or an unhandled flow, or before the pass. */
+TEST a_narrowed_selector_resets_its_flows_after_the_pass(void) {
     locked_app_t l;
     ASSERT(locked_app_up(&l));
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
@@ -4600,13 +4670,15 @@ TEST a_narrowed_selector_resets_its_chunk_flows_after_the_pass(void) {
     ASSERT_EQ_FMTm("nothing before the pass", (size_t)0, early, "%zu");
     ASSERT(wait_written_after(&l, started));
     ASSERTm("the chunk flow went", fake_ct_deleted(l.ctk, k_chunk_reply, 4));
-    ASSERT_FALSEm("the subnet flow stayed", fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERTm("the subnet flow went", fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_deletes(l.ctk), "%zu");
+    ASSERTm("another field's flow and an unhandled one stayed", strangers_kept(&l));
     ASSERT_STR_EQ("live", live_reason(&l, 1));
     locked_app_down(&l);
     PASS();
 }
 
-/* Catches: a later edit's merge clearing a narrowing still queued for the same group. */
+/* Catches: a later edit's merge clearing a narrowing still queued for the same group, or the flush taking only the chunk flows. */
 TEST a_later_edit_before_the_pass_keeps_a_narrowing_queued(void) {
     locked_app_t l;
     ASSERT(locked_app_up(&l));
@@ -4630,7 +4702,9 @@ TEST a_later_edit_before_the_pass_keeps_a_narrowing_queued(void) {
     ASSERT_EQ_FMTm("nothing before the pass", (size_t)0, early, "%zu");
     ASSERT(wait_written_after(&l, started));
     ASSERTm("the chunk flow went", fake_ct_deleted(l.ctk, k_chunk_reply, 4));
-    ASSERT_FALSEm("the subnet flow stayed", fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERTm("the subnet flow went", fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_deletes(l.ctk), "%zu");
+    ASSERTm("another field's flow and an unhandled one stayed", strangers_kept(&l));
     locked_app_down(&l);
     PASS();
 }
@@ -4650,13 +4724,13 @@ TEST a_widened_selector_resets_nothing(void) {
     ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, selector_group(1, two, 2, NULL, 0)));
     ASSERT(wait_written_after(&l, started));
     ASSERT_EQ_FMT((size_t)0, fake_ct_deletes(l.ctk), "%zu");
-    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(l.ctk), "%zu");
+    ASSERT_EQ_FMT((size_t)4, fake_ct_remaining(l.ctk), "%zu");
     locked_app_down(&l);
     PASS();
 }
 
-/* Catches: a Save not comparing the old selector with the new, so its narrowing flushes nothing. */
-TEST a_save_that_narrows_a_selector_resets_its_chunk_flows(void) {
+/* Catches: a Save not comparing the old selector with the new, so its narrowing flushes nothing or only the chunk flows. */
+TEST a_save_that_narrows_a_selector_resets_its_flows(void) {
     locked_app_t l;
     ASSERT(locked_app_up(&l));
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
@@ -4672,12 +4746,14 @@ TEST a_save_that_narrows_a_selector_resets_its_chunk_flows(void) {
     ASSERT_EQ(FIRC_OK, firc_app_replace_groups(l.app, arr, 1));
     ASSERT(wait_written_after(&l, started));
     ASSERT(fake_ct_deleted(l.ctk, k_chunk_reply, 4));
-    ASSERT_FALSE(fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT(fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_deletes(l.ctk), "%zu");
+    ASSERTm("another field's flow and an unhandled one stayed", strangers_kept(&l));
     locked_app_down(&l);
     PASS();
 }
 
-/* Catches: the no-committer path queueing a narrowing flush nothing pays, or skipping it. */
+/* Catches: the no-committer path queueing a narrowing flush nothing pays, skipping it, or taking only the chunk flows. */
 TEST without_a_committer_a_narrowing_edit_resets_at_once(void) {
     locked_app_t l;
     ASSERT(locked_app_up_no_committer(&l));
@@ -4689,7 +4765,9 @@ TEST without_a_committer_a_narrowing_edit_resets_at_once(void) {
     plant_group_flows(&l, 1);
     ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, selector_group(1, one, 1, NULL, 0)));
     ASSERT(fake_ct_deleted(l.ctk, k_chunk_reply, 4));
-    ASSERT_FALSE(fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT(fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_deletes(l.ctk), "%zu");
+    ASSERTm("another field's flow and an unhandled one stayed", strangers_kept(&l));
     locked_app_down(&l);
     PASS();
 }
@@ -4714,6 +4792,7 @@ TEST a_narrowing_edit_that_moves_the_interface_resets_every_flow(void) {
     ASSERTm("routed through the new name", group_routed(&l, 1));
     ASSERT(fake_ct_deleted(l.ctk, k_chunk_reply, 4));
     ASSERT(fake_ct_deleted(l.ctk, k_subnet_dst, 4));
+    ASSERT(strangers_kept(&l));
     locked_app_down(&l);
     PASS();
 }
@@ -4890,13 +4969,13 @@ TEST a_startup_after_the_lookup_writes_a_deny_policy_on_its_first_pass(void) {
     PASS();
 }
 
-/* Whether the chunk flow went and the subnet flow stayed once the re-render's pass has run. */
-static bool chunk_reset_subnet_kept(locked_app_t *l) {
-    return fake_ct_deleted(l->ctk, k_chunk_reply, 4) && !fake_ct_deleted(l->ctk, k_subnet_dst, 4);
+static bool both_flows_reset(locked_app_t *l) {
+    return fake_ct_deleted(l->ctk, k_chunk_reply, 4) && fake_ct_deleted(l->ctk, k_subnet_dst, 4) &&
+           fake_ct_deletes(l->ctk) == 2 && strangers_kept(l);
 }
 
-/* Catches: a host joining a denied policy keeping its chunk flows, or losing its subnet flows too. */
-TEST a_host_joining_a_denied_policy_resets_the_chunk_flows(void) {
+/* Catches: a host joining a denied policy keeping its chunk flows or its subnet flows. */
+TEST a_host_joining_a_denied_policy_resets_its_flows(void) {
     locked_app_t l;
     ASSERT(locked_app_up(&l));
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
@@ -4919,7 +4998,7 @@ TEST a_host_joining_a_denied_policy_resets_the_chunk_flows(void) {
     firc_app_devices_changed(l.app);
     ASSERT(wait_written_after(&l, started));
     ASSERTm("the host is denied", mangle_has(&l, dchain, "-s 192.168.1.40/32 -j RETURN"));
-    ASSERTm("chunk flow reset, subnet flow kept", chunk_reset_subnet_kept(&l));
+    ASSERTm("the chunk flow and the subnet flow reset", both_flows_reset(&l));
     g_kids_host = false;
     locked_app_down(&l);
     PASS();
@@ -4949,7 +5028,7 @@ TEST a_host_joining_an_allowed_policy_resets_nothing(void) {
     devices_chain_of(&l, gid, dchain, sizeof(dchain));
     ASSERTm("the pass wrote the host", mangle_has(&l, dchain, "-s 192.168.1.40/32 -j MARK"));
     ASSERT_EQ_FMT((size_t)0, fake_ct_deletes(l.ctk), "%zu");
-    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(l.ctk), "%zu");
+    ASSERT_EQ_FMT((size_t)4, fake_ct_remaining(l.ctk), "%zu");
     g_stub_mark = 0;
     g_kids_host = false;
     locked_app_down(&l);
@@ -4963,31 +5042,66 @@ static bool boot_mark(const char *policy, uint32_t *mark, void *ud) {
     return false;
 }
 
-TEST the_first_map_after_start_resets_the_chunk_flows_of_a_deny(void) {
-    locked_app_t l;
-    ASSERT(locked_app_up_no_committer(&l));
-    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+static bool boot_read(void *ud) {
+    (void)ud;
+    return g_map_in;
+}
+
+static bool boot_deny_guests(locked_app_t *l, char *dchain, size_t cap) {
     g_map_in = false;
-    firc_id_t gid = {{1, 1, 1, 1}};
+    if (!locked_app_up_no_committer(l)) { return false; }
+    fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
     char guests[] = "policy:Guests";
     char *deny[] = {guests};
-    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, selector_group(1, NULL, 0, deny, 1)));
-    firc_app_set_device_lookup(l.app, boot_mark, stub_hosts, stub_policy_hosts, NULL, NULL);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
-    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
-    firc_app_pool_changed(l.app);
-    ASSERT(first_pass_done(&l));
+    firc_group_t *g = selector_group(1, NULL, 0, deny, 1);
+    if (firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, "10.0.0.0/8")) != FIRC_OK ||
+        firc_app_add_group(l->app, g) != FIRC_OK) {
+        return false;
+    }
+    firc_app_set_device_lookup(l->app, boot_mark, stub_hosts, stub_policy_hosts, NULL, NULL);
+    firc_app_set_policies_read(l->app, boot_read);
+    if (firc_app_start_groups(l->app) != FIRC_OK || firc_app_start_netfilter_committer(l->app) != FIRC_OK) {
+        return false;
+    }
+    firc_app_pool_changed(l->app);
+    devices_chain_of(l, (firc_id_t){{1, 1, 1, 1}}, dchain, cap);
+    return first_pass_done(l);
+}
+
+/* Catches: a deny-policy group marking every device before the first map is read, in its chunk or subnet path. */
+TEST before_the_first_map_a_deny_policy_group_marks_nobody(void) {
+    locked_app_t l;
     char dchain[64];
-    devices_chain_of(&l, gid, dchain, sizeof(dchain));
-    ASSERT_FALSEm("fixture: no map, no RETURN", mangle_has(&l, dchain, "-j RETURN"));
-    plant_group_flows(&l, 1);
+    ASSERT(boot_deny_guests(&l, dchain, sizeof(dchain)));
+    ASSERTm("the chain is there", mangle_has(&l, dchain, "-j CONNMARK --save-mark"));
+    ASSERT_FALSEm("no unconditional MARK before the map", mangle_has(&l, dchain, "-j MARK"));
 
     g_map_in = true;
     uint64_t started = firc_app_nf_passes_for_test(l.app);
     firc_app_devices_changed(l.app);
     ASSERT(wait_written_after(&l, started));
     ASSERTm("the deny's mark", mangle_has(&l, dchain, "-m mark --mark 0xf00faad/0xbf00ffff -j RETURN"));
-    ASSERTm("chunk flow reset, subnet flow kept", chunk_reset_subnet_kept(&l));
+    ASSERTm("everyone else is marked", mangle_has(&l, dchain, "-j MARK --set-xmark"));
+    g_map_in = false;
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the first map after a start counted as a narrowing, resetting every chunk and subnet flow at each start. */
+TEST the_first_map_after_start_resets_no_flows(void) {
+    locked_app_t l;
+    char dchain[64];
+    ASSERT(boot_deny_guests(&l, dchain, sizeof(dchain)));
+    plant_group_flows(&l, 1);
+
+    g_map_in = true;
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    firc_app_devices_changed(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERTm("fixture: the map reached the chain",
+            mangle_has(&l, dchain, "-m mark --mark 0xf00faad/0xbf00ffff -j RETURN"));
+    ASSERT_EQ_FMT((size_t)0, fake_ct_deletes(l.ctk), "%zu");
+    ASSERT_EQ_FMT((size_t)4, fake_ct_remaining(l.ctk), "%zu");
     g_map_in = false;
     locked_app_down(&l);
     PASS();
@@ -5026,14 +5140,14 @@ static bool narrowed_by(unsigned how) {
         char dchain[64];
         devices_chain_of(&l, gid, dchain, sizeof(dchain));
         ok = ok && wait_written_after(&l, started) && mangle_has(&l, dchain, "-s 192.168.1.40/32 -j RETURN") &&
-             chunk_reset_subnet_kept(&l);
+             both_flows_reset(&l);
     }
     g_kids_host = false;
     locked_app_down(&l);
     return ok;
 }
 
-TEST a_sync_an_update_and_a_save_that_render_narrower_reset_the_chunk_flows(void) {
+TEST a_sync_an_update_and_a_save_that_render_narrower_reset_its_flows(void) {
     ASSERTm("a sync", narrowed_by(0));
     ASSERTm("an update", narrowed_by(1));
     ASSERTm("a Save", narrowed_by(2));
@@ -5063,7 +5177,7 @@ TEST a_sync_of_an_unchanged_selector_keeps_its_chunk_flows(void) {
     devices_chain_of(&l, gid, dchain, sizeof(dchain));
     ASSERTm("the host is still denied", mangle_has(&l, dchain, "-s 192.168.1.40/32 -j RETURN"));
     ASSERT_EQ_FMT((size_t)0, fake_ct_deletes(l.ctk), "%zu");
-    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(l.ctk), "%zu");
+    ASSERT_EQ_FMT((size_t)4, fake_ct_remaining(l.ctk), "%zu");
     g_kids_host = false;
     locked_app_down(&l);
     PASS();
@@ -5224,16 +5338,18 @@ int main(int argc, char **argv) {
     RUN_TEST(stopping_pays_the_flushes_still_queued);
     RUN_TEST(a_report_on_the_loop_pays_the_flushes_it_carried);
     RUN_TEST(a_selector_group_s_chunk_jumps_to_its_devices_chain);
+    RUN_TEST(a_subnet_rule_of_a_selector_group_jumps_to_its_devices_chain);
     RUN_TEST(a_policy_s_segment_reaches_the_devices_chain);
     RUN_TEST(a_changed_policy_mark_is_rewritten_by_the_next_pass);
     RUN_TEST(a_table_change_that_renders_the_same_asks_for_no_pass);
     RUN_TEST(a_selector_emptied_loses_its_devices_chain);
+    RUN_TEST(a_selector_emptied_returns_its_subnet_rule_to_a_mark);
     RUN_TEST(a_deleted_selector_group_leaves_no_devices_chain);
     RUN_TEST(without_a_committer_the_devices_chain_is_written_at_once);
-    RUN_TEST(a_narrowed_selector_resets_its_chunk_flows_after_the_pass);
+    RUN_TEST(a_narrowed_selector_resets_its_flows_after_the_pass);
     RUN_TEST(a_later_edit_before_the_pass_keeps_a_narrowing_queued);
     RUN_TEST(a_widened_selector_resets_nothing);
-    RUN_TEST(a_save_that_narrows_a_selector_resets_its_chunk_flows);
+    RUN_TEST(a_save_that_narrows_a_selector_resets_its_flows);
     RUN_TEST(without_a_committer_a_narrowing_edit_resets_at_once);
     RUN_TEST(a_narrowing_edit_that_moves_the_interface_resets_every_flow);
     RUN_TEST(a_host_that_leaves_a_policy_leaves_the_chain_after_the_next_map);
@@ -5241,10 +5357,11 @@ int main(int argc, char **argv) {
     RUN_TEST(a_save_that_empties_a_selector_loses_its_devices_chain);
     RUN_TEST(a_group_given_a_selector_and_then_deleted_leaves_nothing);
     RUN_TEST(a_startup_after_the_lookup_writes_a_deny_policy_on_its_first_pass);
-    RUN_TEST(a_host_joining_a_denied_policy_resets_the_chunk_flows);
+    RUN_TEST(a_host_joining_a_denied_policy_resets_its_flows);
     RUN_TEST(a_host_joining_an_allowed_policy_resets_nothing);
-    RUN_TEST(the_first_map_after_start_resets_the_chunk_flows_of_a_deny);
-    RUN_TEST(a_sync_an_update_and_a_save_that_render_narrower_reset_the_chunk_flows);
+    RUN_TEST(before_the_first_map_a_deny_policy_group_marks_nobody);
+    RUN_TEST(the_first_map_after_start_resets_no_flows);
+    RUN_TEST(a_sync_an_update_and_a_save_that_render_narrower_reset_its_flows);
     RUN_TEST(a_sync_of_an_unchanged_selector_keeps_its_chunk_flows);
     RUN_TEST(a_sync_whose_devices_render_fails_still_writes_its_subnets);
     GREATEST_MAIN_END();

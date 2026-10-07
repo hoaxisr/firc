@@ -12,6 +12,7 @@
 #include "firc/fakeip.h"
 #include "firc/ipset_to_link.h"
 #include "firc/mark.h"
+#include "firc/match.h"
 #include "firc/models.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/ruleset.h"
@@ -112,6 +113,8 @@ typedef struct {
 } seg_t;
 static seg_t g_seg[8];
 static size_t g_nseg;
+static firc_ipv4_subnet_t g_sub[8];
+static size_t g_nsub;
 
 static firc_err_t arg_nets(const char *policy, bool deny, firc_devsel_net_fn cb, void *cb_ud, void *ud)
 {
@@ -173,7 +176,7 @@ static int do_devchain(int argc, char **argv)
     uint32_t field = (uint32_t)strtoul(argv[2], &end, 10), mark = 0;
     if (end == argv[2] || *end != '\0' || !firc_mark_for_field(field, &mark) || (argc - 3) % 2 != 0) {
         fprintf(stderr,
-                "usage: devchain <field 1-255> [policy NAME=HEX | segment NAME=CIDR | allow ENTRY | deny ENTRY]...\n");
+                "usage: devchain <field 1-255> [policy NAME=HEX | segment NAME=CIDR | subnet CIDR | allow ENTRY | deny ENTRY]...\n");
         return 64;
     }
     firc_group_t *g = firc_group_new();
@@ -203,6 +206,13 @@ static int do_devchain(int argc, char **argv)
             }
             *eq = '\0';
             g_seg[g_nseg++].name = argv[i + 1];
+        } else if (strcmp(argv[i], "subnet") == 0) {
+            if (g_nsub == sizeof(g_sub) / sizeof(g_sub[0]) || !firc_rule_parse_subnet4(argv[i + 1], &g_sub[g_nsub])) {
+                fprintf(stderr, "devchain: subnet wants CIDR (at most %zu), got \"%s\"\n",
+                        sizeof(g_sub) / sizeof(g_sub[0]), argv[i + 1]);
+                return 64;
+            }
+            g_nsub++;
         } else if (strcmp(argv[i], "allow") == 0) {
             if (push_entry(&g->devices.allow, &g->devices.n_allow, argv[i + 1]) != 0) { return 3; }
         } else if (strcmp(argv[i], "deny") == 0) {
@@ -212,7 +222,7 @@ static int do_devchain(int argc, char **argv)
             return 64;
         }
     }
-    firc_ruleset_lookup_t lk = {arg_mark, NULL, NULL, arg_nets, NULL};
+    firc_ruleset_lookup_t lk = {arg_mark, NULL, NULL, arg_nets, NULL, NULL};
     firc_nf_devices_t dev;
     if (firc_ruleset_render_devices(g, &lk, &dev) != FIRC_OK) { return 3; }
 
@@ -247,6 +257,9 @@ static int do_devchain(int argc, char **argv)
     printf("# fake %s\n", fake);
     firc_err_t err = firc_netfilter_register_base_chains(ipt, NULL);
     if (err == FIRC_OK) { err = firc_ipset_to_link_build_rules_dev(ipt, "FIRCSEL", "tun0", mark, field, snap, "g", &dev); }
+    if (err == FIRC_OK) {
+        err = firc_ipset_to_link_build_subnet_rules_dev(ipt, "FIRCSEL", mark, g_sub, g_nsub, NULL, 0, &dev);
+    }
     if (err == FIRC_OK) { err = firc_ipt_commit(ipt); }
     fflush(stdout);
     firc_ipt_free(ipt);

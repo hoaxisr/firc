@@ -1218,6 +1218,11 @@ size_t firc_kn_policies_device(const firc_ip_t *client, firc_ip_t *out, size_t c
     return host_others(m, h, client, out, cap);
 }
 
+bool firc_kn_policies_read(void *ud) {
+    firc_kn_policies_t *p = ud;
+    return p == NULL || current(p) != NULL;
+}
+
 bool firc_kn_policies_mark(const char *policy, uint32_t *mark, void *ud) {
     firc_kn_policies_t *p = ud;
     if (p == NULL || policy == NULL || policy[0] == '\0') { return false; }

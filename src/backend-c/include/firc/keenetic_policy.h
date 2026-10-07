@@ -106,6 +106,8 @@ cJSON *firc_kn_policies_hosts_json(firc_kn_policies_t *p);
 bool firc_kn_policies_resolve(const char *policy, const firc_ip_t *client, void *ud);
 /* A firc_devsel_device_fn over the live map: the host's other addresses and its MAC. */
 size_t firc_kn_policies_device(const firc_ip_t *client, firc_ip_t *out, size_t cap, firc_mac_t *mac, void *ud);
+/* Whether a map has been read since start; true for NULL ud (no policies to wait for). */
+bool firc_kn_policies_read(void *ud);
 /* A firc_devsel_mark_fn over the live map; false before the first map. */
 bool firc_kn_policies_mark(const char *policy, uint32_t *mark, void *ud);
 firc_err_t firc_kn_policies_hosts_in(const firc_ip_t *net, uint8_t prefix, bool deny, firc_devsel_addr_fn fn,

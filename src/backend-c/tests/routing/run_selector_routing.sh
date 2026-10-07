@@ -121,8 +121,8 @@ firc() { # firc's chains for a selector, from the real builder, and the DNAT
     iptables-restore --noflush < "$T/devchain" || fail "iptables-restore refused the builder's chains for: $*"
     iptables -t nat -A PREROUTING -d "$FAKE" -j DNAT --to-destination 9.9.9.9
 }
-ask() { # <label> <client pid> <which far end must answer>
-    got=$(in_ns "$2" "$HELPER" ask "$FAKE" 53)
+ask() { # <label> <client pid> <which far end must answer> [address asked, default the fake]
+    got=$(in_ns "$2" "$HELPER" ask "${4:-$FAKE}" 53)
     [ "$got" = "from=$3" ] || fail "$1: got \"$got\", want \"from=$3\""
     echo "ok: $1"
 }
@@ -180,5 +180,20 @@ reset
 firc policy Guests=0ffffaad segment Guests=10.10.2.0/24 allow policy:Guests
 ask "allow by policy, B unlisted on its segment and unmarked: B goes through the tunnel" "$CB" tunnel
 ask "allow by policy, B unlisted on its segment and unmarked: A goes through the WAN" "$CA" wan
+
+reset
+firc subnet 9.9.9.9/32
+ask "subnet, no selector: A goes through the tunnel" "$CA" tunnel 9.9.9.9
+ask "subnet, no selector: B goes through the tunnel" "$CB" tunnel 9.9.9.9
+
+reset
+firc subnet 9.9.9.9/32 allow 10.10.1.2
+ask "subnet, allow by address: A, selected, goes through the tunnel" "$CA" tunnel 9.9.9.9
+ask "subnet, allow by address: B, not selected, goes through the WAN" "$CB" wan 9.9.9.9
+
+reset
+firc subnet 9.9.9.9/32 deny mac:02:00:00:00:00:0b
+ask "subnet, deny by MAC: A, not denied, goes through the tunnel" "$CA" tunnel 9.9.9.9
+ask "subnet, deny by MAC: B, denied, goes through the WAN" "$CB" wan 9.9.9.9
 
 echo "PASS: selector routing"

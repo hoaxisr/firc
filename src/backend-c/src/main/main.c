@@ -1267,6 +1267,7 @@ int main(int argc, char **argv)
     /* Before the groups start: a deny rendered without the device lookup writes nothing while DNS refuses. */
     firc_app_set_device_lookup(d.app, firc_kn_policies_mark, firc_kn_policies_hosts_in, firc_kn_policies_policy_hosts,
                                firc_kn_policies_policy_nets, d.policies);
+    firc_app_set_policies_read(d.app, firc_kn_policies_read);
 #endif
     /* No group stops the daemon: one that fails is logged and left out. */
     err = firc_app_start_groups(d.app);

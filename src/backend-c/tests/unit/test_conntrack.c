@@ -793,78 +793,6 @@ TEST an_entry_already_gone_is_not_an_error(void) {
     PASS();
 }
 
-/* Catches: a narrowing flush by mark alone, ignoring the mark, or without the handled bit. */
-TEST a_narrowed_selector_resets_only_its_chunk_flows(void) {
-    fx_t f;
-    ASSERT(up(&f));
-    const uint8_t src[4] = {192, 168, 1, 10};
-    const uint8_t chunk[4] = {198, 18, 3, 7}, chunk_reply[4] = {104, 18, 29, 7};
-    const uint8_t sub[4] = {10, 1, 2, 3};
-    const uint8_t other_reply[4] = {104, 18, 29, 8}, unhandled_reply[4] = {104, 18, 29, 9};
-    const uint8_t pool4[4] = {198, 18, 0, 0};
-    uint32_t ours = firc_mark_group_value(3), theirs = firc_mark_group_value(4);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, chunk_reply, ours | FIRC_MARK_HANDLED);
-    fake_ct_add(f.kernel, AF_INET, src, sub, sub, ours | FIRC_MARK_HANDLED);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, other_reply, theirs | FIRC_MARK_HANDLED);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, unhandled_reply, ours);
-    size_t deleted = 0;
-    ASSERT_EQ(FIRC_OK, firc_ct_flush_group_chunk_flows(f.ct, ours, pool4, 15, NULL, 0, &deleted));
-    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
-    ASSERTm("the chunk flow went", fake_ct_deleted(f.kernel, chunk_reply, 4));
-    ASSERT_FALSEm("the subnet flow stayed", fake_ct_deleted(f.kernel, sub, 4));
-    ASSERT_FALSE(fake_ct_deleted(f.kernel, other_reply, 4));
-    ASSERT_FALSE(fake_ct_deleted(f.kernel, unhandled_reply, 4));
-    uint32_t value = 0, mask = 0;
-    ASSERT(fake_ct_dump_filtered_on_mark(f.kernel, &value, &mask));
-    ASSERT_EQ_FMT(ours | FIRC_MARK_HANDLED, value, "0x%x");
-    ASSERT_EQ_FMT(FIRC_MARK_GROUP_MASK | FIRC_MARK_HANDLED, mask, "0x%x");
-    down(&f);
-    PASS();
-}
-
-/* Catches: wanted() leaving the narrowing's mark to a kernel that ignores the filter. */
-TEST a_narrowing_on_a_kernel_that_ignores_the_filter_judges_the_mark_itself(void) {
-    fx_t f;
-    ASSERT(up(&f));
-    const uint8_t src[4] = {192, 168, 1, 10};
-    const uint8_t chunk[4] = {198, 18, 3, 7}, chunk_reply[4] = {104, 18, 29, 7};
-    const uint8_t other_reply[4] = {104, 18, 29, 8}, unhandled_reply[4] = {104, 18, 29, 9};
-    const uint8_t pool4[4] = {198, 18, 0, 0};
-    uint32_t ours = firc_mark_group_value(3), theirs = firc_mark_group_value(4);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, chunk_reply, ours | FIRC_MARK_HANDLED);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, other_reply, theirs | FIRC_MARK_HANDLED);
-    fake_ct_add(f.kernel, AF_INET, src, chunk, unhandled_reply, ours);
-    fake_ct_ignore_mark_filter(f.kernel);
-    size_t deleted = 0;
-    ASSERT_EQ(FIRC_OK, firc_ct_flush_group_chunk_flows(f.ct, ours, pool4, 15, NULL, 0, &deleted));
-    ASSERTm("the filter was asked for", fake_ct_dump_filtered_on_mark(f.kernel, NULL, NULL));
-    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
-    ASSERT(fake_ct_deleted(f.kernel, chunk_reply, 4));
-    ASSERT_FALSE(fake_ct_deleted(f.kernel, other_reply, 4));
-    ASSERT_FALSE(fake_ct_deleted(f.kernel, unhandled_reply, 4));
-    down(&f);
-    PASS();
-}
-
-/* Catches: v6 flows judged by the v4 prefix, or a zero-length prefix covering everything. */
-TEST a_narrowing_judges_v6_flows_by_the_v6_pool(void) {
-    const uint8_t src6[16] = {0xfd, 0x00, [15] = 0x10};
-    const uint8_t dst6[16] = {0xfd, 0x37, 0x00, 0x00, [15] = 0x05}, reply6[16] = {0x20, 0x01, 0x0d, 0xb8, [15] = 0x07};
-    const uint8_t pool6[16] = {0xfd, 0x37};
-    uint32_t ours = firc_mark_group_value(3);
-    for (int with6 = 1; with6 >= 0; with6--) {
-        fx_t f;
-        ASSERT(up(&f));
-        fake_ct_add(f.kernel, AF_INET6, src6, dst6, reply6, ours | FIRC_MARK_HANDLED);
-        size_t deleted = 0;
-        ASSERT_EQ(FIRC_OK, firc_ct_flush_group_chunk_flows(f.ct, ours, NULL, 0, with6 ? pool6 : NULL,
-                                                           with6 ? 48 : 0, &deleted));
-        ASSERT_EQ_FMTm(with6 ? "inside the v6 pool" : "no v6 pool, nothing inside it", (size_t)with6, deleted, "%zu");
-        down(&f);
-    }
-    PASS();
-}
-
 /* Catches: a selector group's chunk deleting a flow whose field's holder routes a covering subnet. */
 TEST a_selector_group_s_chunk_keeps_a_field_whose_holder_routes_the_address(void) {
     fx_t f;
@@ -980,9 +908,6 @@ int main(int argc, char **argv) {
     RUN_TEST(a_dump_the_kernel_refuses_deletes_nothing);
     RUN_TEST(a_refused_delete_does_not_stop_the_others);
     RUN_TEST(an_entry_already_gone_is_not_an_error);
-    RUN_TEST(a_narrowed_selector_resets_only_its_chunk_flows);
-    RUN_TEST(a_narrowing_on_a_kernel_that_ignores_the_filter_judges_the_mark_itself);
-    RUN_TEST(a_narrowing_judges_v6_flows_by_the_v6_pool);
     RUN_TEST(a_selector_group_s_chunk_keeps_a_field_whose_holder_routes_the_address);
     RUN_TEST(a_selector_group_s_chunk_drops_a_field_nobody_vouches_for);
     RUN_TEST(a_selector_group_s_v6_chunk_keeps_only_a_field_whose_holder_routes_v6);

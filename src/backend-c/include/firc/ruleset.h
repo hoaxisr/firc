@@ -22,6 +22,7 @@ typedef struct firc_ruleset_lookup {
     firc_devsel_policy_hosts_fn policy_hosts;
     firc_devsel_policy_nets_fn policy_nets;
     void *ud;
+    bool (*policies_read)(void *ud);
 } firc_ruleset_lookup_t;
 
 /* All pointers borrowed and must outlive every ruleset built with them; pool, ct, lookup nullable. */

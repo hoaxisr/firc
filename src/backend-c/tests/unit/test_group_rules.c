@@ -552,7 +552,8 @@ typedef struct {
 } built_t;
 
 /* Builds group g1 as FIRC_g1 on field 5 through nwg0 over the two-chunk pool with `dev`, committed. */
-static bool build_g1(built_t *b, firc_ipt_proto_t proto, const firc_nf_devices_t *dev)
+static bool build_g1_subnets(built_t *b, firc_ipt_proto_t proto, const firc_nf_devices_t *dev,
+                             const firc_ipv4_subnet_t *v4, size_t n4, const firc_ipv6_subnet_t *v6, size_t n6)
 {
     memset(b, 0, sizeof(*b));
     b->pool = pool_with_two_v4_chunks();
@@ -569,7 +570,13 @@ static bool build_g1(built_t *b, firc_ipt_proto_t proto, const firc_nf_devices_t
     uint32_t mark = 0;
     if (!firc_mark_for_field(5, &mark)) { return false; }
     return firc_ipset_to_link_build_rules_dev(b->ipt, "FIRC_g1", "nwg0", mark, 5, b->snap, "g1", dev) == FIRC_OK &&
+           firc_ipset_to_link_build_subnet_rules_dev(b->ipt, "FIRC_g1", mark, v4, n4, v6, n6, dev) == FIRC_OK &&
            firc_ipt_commit(b->ipt) == FIRC_OK;
+}
+
+static bool build_g1(built_t *b, firc_ipt_proto_t proto, const firc_nf_devices_t *dev)
+{
+    return build_g1_subnets(b, proto, dev, NULL, 0, NULL, 0);
 }
 
 static void built_free(built_t *b)
@@ -616,6 +623,78 @@ TEST a_selector_group_jumps_from_each_chunk_to_its_devices_chain(void)
     };
     ASSERT(rules_are(b.f, "mangle", "FIRC_g1D", want, 2));
     built_free(&b);
+    PASS();
+}
+
+/* Catches: a selector group's subnet rule marking by itself, losing its guard, ctdir or ports, or keeping a CONNMARK twin, in either family. */
+TEST a_selector_group_s_subnet_rule_jumps_to_its_devices_chain(void)
+{
+    firc_nf_source_t allow[] = {mac_src()};
+    firc_nf_devices_t dev = {.active = true, .allow = allow, .n_allow = 1};
+    const firc_ipv4_subnet_t v4[] = {
+        {.addr = {10, 1, 0, 0}, .cidr = 16},
+        {.addr = {10, 2, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP, .ports = "443,1000:2000"},
+        {.addr = {0, 0, 0, 0}, .cidr = 0, .proto = IPPROTO_UDP, .ports = "51820"},
+    };
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    built_t b4, b6;
+    ASSERT(build_g1_subnets(&b4, FIRC_IPT_PROTO_IPV4, &dev, v4, 3, v6, 1));
+    ASSERT(build_g1_subnets(&b6, FIRC_IPT_PROTO_IPV6, &dev, v4, 3, v6, 1));
+
+    static const char *j1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
+                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
+    static const char *j2[] = {"-d", "10.2.0.0/16", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL",
+                               "-m", "mark", "!", "--mark", "0x40000000/0x40000000", "-m", "multiport",
+                               "--dports", "443,1000:2000", "-j", "FIRC_g1D"};
+    static const char *j0[] = {"-p", "udp", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!",
+                               "--mark", "0x40000000/0x40000000", "-m", "udp", "--dport", "51820", "-j",
+                               "FIRC_g1D"};
+    static const char *j6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
+                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
+    ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j1, 13));
+    ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j2, 19));
+    ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j0, 17));
+    ASSERT_EQ_FMTm("the ctdir return, two chunk jumps, three subnet jumps", (size_t)6,
+                   rule_count(b4.f, "mangle", "FIRC_g1"), "%zu");
+    ASSERT_FALSE(any_arg_equals(b4.f, "mangle", "FIRC_g1", "--set-xmark"));
+    ASSERT_FALSE(any_arg_equals(b4.f, "mangle", "FIRC_g1", "CONNMARK"));
+    ASSERT_FALSE(any_arg_equals(b4.f, "mangle", "FIRC_g1", "0.0.0.0/0"));
+    static const char *const want[] = {
+        "-m mac --mac-source AA:BB:CC:DD:EE:FF -j MARK --set-xmark " F5,
+        F5_CONNMARK,
+    };
+    ASSERT(rules_are(b4.f, "mangle", "FIRC_g1D", want, 2));
+
+    ASSERT(has_rule(b6.f, "mangle", "FIRC_g1", j6, 13));
+    ASSERT_EQ_FMT((size_t)3, rule_count(b6.f, "mangle", "FIRC_g1"), "%zu");
+    ASSERT_FALSE(any_arg_equals(b6.f, "mangle", "FIRC_g1", "10.1.0.0/16"));
+    ASSERT_FALSE(any_arg_equals(b6.f, "mangle", "FIRC_g1", "--set-xmark"));
+    ASSERT(rules_are(b6.f, "mangle", "FIRC_g1D", want, 2));
+    built_free(&b4);
+    built_free(&b6);
+    PASS();
+}
+
+/* Catches: an inactive or absent selector writing the subnet jump to a devices chain that does not exist. */
+TEST a_group_without_a_selector_keeps_its_subnet_mark_and_connmark(void)
+{
+    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
+    static const char *m1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
+                               "mark", "!", "--mark", "0x40000000/0x40000000", "-j", "MARK", "--set-xmark",
+                               "0x40050000/0x40ff0000"};
+    static const char *c1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL",
+                               "-j", "CONNMARK", "--save-mark", "--nfmask", "0x40ff0000", "--ctmask", "0x40ff0000"};
+    firc_nf_devices_t none = {0};
+    const firc_nf_devices_t *cases[] = {&none, NULL};
+    for (size_t i = 0; i < 2; i++) {
+        built_t b;
+        ASSERT(build_g1_subnets(&b, FIRC_IPT_PROTO_IPV4, cases[i], v4, 1, NULL, 0));
+        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", m1, 15));
+        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", c1, 13));
+        ASSERT_FALSE(any_arg_equals(b.f, "mangle", "FIRC_g1", "FIRC_g1D"));
+        ASSERT_FALSE(firc_fake_ipt_chain_exists(b.f, "mangle", "FIRC_g1D"));
+        built_free(&b);
+    }
     PASS();
 }
 
@@ -738,6 +817,52 @@ TEST devices_set_on_the_object_reach_the_pass(void)
     PASS();
 }
 
+/* Catches: the link's pass handing the subnet builder no selector, or a stale one, while its chunks jump. */
+TEST subnets_and_devices_set_on_the_object_jump_together(void)
+{
+    firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_netfilter_register_base_chains(ipt4, NULL);
+    firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6));
+    firc_netfilter_register_base_chains(NULL, ipt6);
+    firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, ipt6, NULL, 100, NULL, "g1", NULL, NULL);
+    ASSERT(l != NULL);
+    firc_nf_source_t allow[] = {mac_src()};
+    firc_nf_devices_t dev = {.active = true, .allow = allow, .n_allow = 1};
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_devices(l, &dev, NULL));
+    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_subnets(l, v4, 1, v6, 1, NULL));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_stage_for_test(l));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
+
+    static const char *j4[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
+                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
+    static const char *j6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
+                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
+    ASSERT(has_rule(f4, "mangle", "FIRC_g1", j4, 13));
+    ASSERT(has_rule(f6, "mangle", "FIRC_g1", j6, 13));
+    ASSERT(firc_fake_ipt_chain_exists(f4, "mangle", "FIRC_g1D"));
+    ASSERT(firc_fake_ipt_chain_exists(f6, "mangle", "FIRC_g1D"));
+
+    firc_nf_devices_t none = {0};
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_devices(l, &none, NULL));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_stage_for_test(l));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
+    ASSERT(any_arg_equals(f4, "mangle", "FIRC_g1", "MARK"));
+    ASSERT(any_arg_equals(f6, "mangle", "FIRC_g1", "MARK"));
+    ASSERT_FALSE(any_arg_equals(f4, "mangle", "FIRC_g1", "FIRC_g1D"));
+    ASSERT_FALSE(any_arg_equals(f6, "mangle", "FIRC_g1", "FIRC_g1D"));
+
+    firc_ipset_to_link_free(l);
+    firc_ipt_free(ipt4);
+    firc_ipt_free(ipt6);
+    PASS();
+}
+
 /* Catches: sources compared by struct bytes instead of by what they render. */
 TEST a_source_is_compared_by_what_it_renders(void)
 {
@@ -836,6 +961,33 @@ TEST a_narrowing_render_is_a_gained_deny_or_a_lost_allow(void)
     PASS();
 }
 
+/* Catches: a chain that marked nobody read as narrowed when its deny list grows, flushing flows it never marked. */
+TEST a_chain_that_marked_nobody_cannot_narrow(void)
+{
+    static const uint8_t n1[] = {1, 0}, n12[] = {1, 2, 0};
+    struct {
+        firc_nf_devices_t was, now;
+        bool narrows;
+    } k[] = {
+        {devs(false, NULL, NULL), devs(true, n1, NULL), false},
+        {devs(false, n1, NULL), devs(true, n12, NULL), false},
+        {devs(false, NULL, NULL), devs(false, n1, NULL), false},
+        {devs(false, n1, NULL), devs(false, n12, n1), false},
+        {devs(false, NULL, n1), devs(false, n1, n1), true},
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        bool got = firc_nf_devices_narrows(&k[i].was, &k[i].now);
+        firc_nf_devices_clear(&k[i].was);
+        firc_nf_devices_clear(&k[i].now);
+        if (got != k[i].narrows) {
+            static char row[32];
+            snprintf(row, sizeof(row), "row %zu", i + 1);
+            FAILm(row);
+        }
+    }
+    PASS();
+}
+
 /* Catches: push growing by one instead of doubling, or losing the duplicate check when it grows. */
 TEST push_doubles_its_room_and_keeps_the_duplicate_scan(void)
 {
@@ -881,14 +1033,18 @@ int main(int argc, char **argv)
     RUN_TEST(a_group_with_no_chunks_emits_no_chunk_rules);
     RUN_TEST(a_group_without_a_selector_marks_its_chunks_as_before);
     RUN_TEST(a_selector_group_jumps_from_each_chunk_to_its_devices_chain);
+    RUN_TEST(a_selector_group_s_subnet_rule_jumps_to_its_devices_chain);
+    RUN_TEST(a_group_without_a_selector_keeps_its_subnet_mark_and_connmark);
     RUN_TEST(everyone_except_a_denied_address_is_one_return_and_one_mark);
     RUN_TEST(a_policy_is_matched_by_its_mark_outside_firc_s_bits);
     RUN_TEST(each_family_gets_its_own_sources);
     RUN_TEST(a_whole_family_entry_is_written_without_a_source);
     RUN_TEST(an_allow_list_that_renders_nothing_marks_nobody);
     RUN_TEST(devices_set_on_the_object_reach_the_pass);
+    RUN_TEST(subnets_and_devices_set_on_the_object_jump_together);
     RUN_TEST(a_source_is_compared_by_what_it_renders);
     RUN_TEST(a_narrowing_render_is_a_gained_deny_or_a_lost_allow);
+    RUN_TEST(a_chain_that_marked_nobody_cannot_narrow);
     RUN_TEST(push_doubles_its_room_and_keeps_the_duplicate_scan);
     GREATEST_MAIN_END();
 }

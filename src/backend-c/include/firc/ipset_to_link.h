@@ -96,6 +96,12 @@ firc_err_t firc_ipset_to_link_build_subnet_rules(firc_ipt_t *ipt, const char *ch
                                                  size_t n4, const firc_ipv6_subnet_t *v6,
                                                  size_t n6);
 
+/* Same, each rule jumping to the devices chain when dev is active. */
+firc_err_t firc_ipset_to_link_build_subnet_rules_dev(firc_ipt_t *ipt, const char *chain_name, uint32_t mark,
+                                                     const firc_ipv4_subnet_t *v4, size_t n4,
+                                                     const firc_ipv6_subnet_t *v6, size_t n6,
+                                                     const firc_nf_devices_t *dev);
+
 /* Whether the group's flows survive its routing coming down. Callers must choose. */
 typedef enum {
     FIRC_FLOWS_KEEP = 0,

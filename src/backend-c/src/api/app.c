@@ -49,7 +49,7 @@ typedef struct nf_flush {
     char owner_s[FIRC_ID_STR_LEN];
     char iface[64];
     uint64_t ticket;
-    bool narrowed; /* owner's selector narrowed: if routed again the same way, only its chunk flows go, not none */
+    bool narrowed; /* owner's selector narrowed: paid even if routed again the same way */
 } nf_flush_t;
 
 struct firc_app {
@@ -336,20 +336,6 @@ static bool flush_queued_for(const firc_app_t *app, firc_id_t owner) {
     return false;
 }
 
-/* a narrowed selector flushes only the group's chunk flows; subnet flows stay, not scoped by the selector */
-static void flush_chunk_flows(firc_app_t *app, uint32_t value, const char *who) {
-    if (app->ct == NULL || value == 0) { return; }
-    size_t dropped = 0;
-    firc_err_t err = firc_ct_flush_group_chunk_flows(
-        app->ct, value, app->reject_has[0] ? app->reject_base[0].b : NULL, app->reject_has[0] ? app->reject_len[0] : 0,
-        app->reject_has[1] ? app->reject_base[1].b : NULL, app->reject_has[1] ? app->reject_len[1] : 0, &dropped);
-    if (dropped > 0) { FIRC_DEBUG("dropped %zu flow(s) to the chunks of group %s: its selector narrowed", dropped, who); }
-    if (err != FIRC_OK) {
-        FIRC_WARN("could not drop all flows to the chunks of group %s after its selector narrowed: %s; a device "
-                  "no longer selected keeps its route for those until they end", who, firc_err_str(err));
-    }
-}
-
 /* a field already queued keeps its entry (and interface) with the new ticket, so A->B->A leaves flows where they were */
 static void flush_queue_add(firc_app_t *app, uint32_t value, const firc_group_t *g, bool narrowed) {
     uint64_t ticket = ++app->nf_change;
@@ -367,11 +353,7 @@ static void flush_queue_add(firc_app_t *app, uint32_t value, const firc_group_t 
         nf_flush_t *grown = realloc(app->flushes, cap * sizeof(*grown));
         if (grown == NULL) { /* early rather than never, as a teardown flush always did */
             FIRC_WARN("no memory to queue the flush of group %s; flushing now", who);
-            if (narrowed) {
-                flush_chunk_flows(app, value, who);
-            } else {
-                firc_ipset_to_link_flush_mark(app->ct, value, who);
-            }
+            firc_ipset_to_link_flush_mark(app->ct, value, who);
             return;
         }
         app->flushes = grown;
@@ -397,14 +379,10 @@ static void pay_flushes(firc_app_t *app, uint64_t ticket) {
         }
         firc_ruleset_t *rs = firc_app_find_group_by_id(app, e.owner);
         const char *now = rs != NULL ? firc_ruleset_group(rs)->iface : NULL;
-        if (rs != NULL && firc_ruleset_routed(rs) && now != NULL && strcmp(now, e.iface) == 0 &&
-            firc_ruleset_mark_field(rs) == e.value) {
-            if (e.narrowed) { /* routed again, narrower selector: flush only the chunk flows for devices no longer named */
-                flush_chunk_flows(app, e.value, e.owner_s);
-            } else {
-                FIRC_DEBUG("group %s routes through %s again: its flows are its own, not flushed", e.owner_s,
-                           e.iface);
-            }
+        bool again = rs != NULL && firc_ruleset_routed(rs) && now != NULL && strcmp(now, e.iface) == 0 &&
+                     firc_ruleset_mark_field(rs) == e.value;
+        if (again && !e.narrowed) {
+            FIRC_DEBUG("group %s routes through %s again: its flows are its own, not flushed", e.owner_s, e.iface);
             continue;
         }
         firc_ipset_to_link_flush_mark(app->ct, e.value, e.owner_s);
@@ -557,7 +535,7 @@ static void note_narrowed(firc_app_t *app, firc_ruleset_t *rs) {
     }
     char who[FIRC_ID_STR_LEN];
     firc_id_format(g->id, who);
-    flush_chunk_flows(app, value, who);
+    firc_ipset_to_link_flush_mark(app->ct, value, who);
 }
 
 /* kept across a teardown so the enable after it can compare; ok false (OOM) counts as a narrowing */
@@ -1000,7 +978,7 @@ static firc_err_t sync_group_ruleset_locked(firc_app_t *app, firc_ruleset_t *rs)
             if (r == FIRC_OK) { r = w; }
         }
     }
-    if (firc_ruleset_devices_narrowed(rs)) { note_narrowed(app, rs); } /* a render that narrowed resets chunk flows exactly as a narrowing edit does */
+    if (firc_ruleset_devices_narrowed(rs)) { note_narrowed(app, rs); } /* a render that narrowed resets its flows exactly as a narrowing edit does */
     return r;
 }
 
@@ -2475,6 +2453,10 @@ void firc_app_set_device_lookup(firc_app_t *app, firc_devsel_mark_fn mark, firc_
     app->lookup.policy_hosts = policy_hosts;
     app->lookup.policy_nets = policy_nets;
     app->lookup.ud = ud;
+}
+
+void firc_app_set_policies_read(firc_app_t *app, bool (*read)(void *ud)) {
+    if (app != NULL) { app->lookup.policies_read = read; }
 }
 
 void firc_app_devices_changed(firc_app_t *app) {

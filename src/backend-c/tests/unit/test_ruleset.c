@@ -219,7 +219,7 @@ static firc_err_t t_policy_hosts(const char *policy, bool deny, firc_devsel_addr
     return FIRC_OK;
 }
 
-static const firc_ruleset_lookup_t k_lookup = {t_mark, t_hosts, t_policy_hosts, NULL, NULL};
+static const firc_ruleset_lookup_t k_lookup = {t_mark, t_hosts, t_policy_hosts, NULL, NULL, NULL};
 
 static firc_group_t *selector(char **allow, size_t na, char **deny, size_t nd) {
     firc_group_t *g = firc_group_new();
@@ -440,6 +440,51 @@ TEST a_deny_entry_that_cannot_be_rendered_marks_nobody(void) {
     PASS();
 }
 
+static bool t_not_read(void *ud) {
+    (void)ud;
+    return false;
+}
+
+static bool t_read(void *ud) {
+    (void)ud;
+    return true;
+}
+
+/* Catches: a policy entry rendered before the first map marking everyone (a deny of nobody) or its allow siblings. */
+TEST a_policy_entry_before_the_first_map_marks_nobody(void) {
+    char kids[] = "policy:Kids", host[] = "192.168.1.30", other[] = "192.168.1.31";
+    char *deny_kids[] = {kids}, *allow_mixed[] = {host, kids}, *deny_addr[] = {other};
+    firc_ruleset_lookup_t early = {t_mark, t_hosts, t_policy_hosts, NULL, NULL, t_not_read};
+    firc_ruleset_lookup_t read = {t_mark, t_hosts, t_policy_hosts, NULL, NULL, t_read};
+    firc_nf_devices_t d;
+
+    firc_group_t *g = selector(NULL, 0, deny_kids, 1);
+    ASSERT_EQ(FIRC_OK, firc_ruleset_render_devices(g, &early, &d));
+    ASSERT(d.active);
+    ASSERT_FALSEm("no map yet: not everyone", d.allow_all);
+    ASSERT_EQ_FMT((size_t)0, d.n_allow, "%zu");
+    firc_nf_devices_clear(&d);
+    ASSERT_EQ(FIRC_OK, firc_ruleset_render_devices(g, &read, &d));
+    ASSERTm("the map read: everyone but Kids", d.allow_all);
+    ASSERT(d.n_deny >= 1);
+    firc_nf_devices_clear(&d);
+    firc_group_free(g);
+
+    g = selector(allow_mixed, 2, NULL, 0);
+    ASSERT_EQ(FIRC_OK, firc_ruleset_render_devices(g, &early, &d));
+    ASSERT_FALSE(d.allow_all);
+    ASSERT_EQ_FMTm("the address beside the unread policy is not marked either", (size_t)0, d.n_allow, "%zu");
+    firc_nf_devices_clear(&d);
+    firc_group_free(g);
+
+    g = selector(NULL, 0, deny_addr, 1);
+    ASSERT_EQ(FIRC_OK, firc_ruleset_render_devices(g, &early, &d));
+    ASSERTm("a selector naming no policy does not wait for the map", d.allow_all);
+    firc_nf_devices_clear(&d);
+    firc_group_free(g);
+    PASS();
+}
+
 /* A policy mark with no bits under firc's mask: 0x40ff0000 & 0xbf00ffff is 0. */
 static bool t_mark_zero(const char *policy, uint32_t *mark, void *ud) {
     (void)ud;
@@ -448,7 +493,7 @@ static bool t_mark_zero(const char *policy, uint32_t *mark, void *ud) {
 }
 
 TEST a_policy_mark_that_masks_to_zero_is_not_written(void) {
-    firc_ruleset_lookup_t lk = {t_mark_zero, NULL, NULL, NULL, NULL};
+    firc_ruleset_lookup_t lk = {t_mark_zero, NULL, NULL, NULL, NULL, NULL};
     char zero[] = "policy:Zero", host[] = "192.168.1.30";
     char *allow[] = {zero, host}, *deny[] = {zero}, *allow_host[] = {host};
 
@@ -484,7 +529,7 @@ static firc_err_t t_hosts_broken(const firc_ip_t *net, uint8_t prefix, bool deny
 }
 
 TEST an_address_the_table_gets_wrong_is_not_written(void) {
-    static const firc_ruleset_lookup_t broken = {NULL, t_hosts_broken, NULL, NULL, NULL};
+    static const firc_ruleset_lookup_t broken = {NULL, t_hosts_broken, NULL, NULL, NULL, NULL};
     char host[] = "192.168.1.30";
     char *list[] = {host};
 
@@ -531,7 +576,7 @@ static bool devices_chain_has(firc_fake_ipt_t *fipt, const char *chain, const ch
     return false;
 }
 
-static const firc_ruleset_lookup_t k_moving = {NULL, t_hosts_moving, NULL, NULL, NULL};
+static const firc_ruleset_lookup_t k_moving = {NULL, t_hosts_moving, NULL, NULL, NULL, NULL};
 
 typedef struct nf_fx {
     firc_fake_ipt_t *fipt;
@@ -692,7 +737,7 @@ static const uint8_t k_fd77[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 TEST a_denied_address_renders_every_host_that_lists_it(void) {
     firc_kn_policy_map_t *m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse(k_stale, NULL, &m));
-    firc_ruleset_lookup_t lk = {m_mark, m_hosts, m_policy_hosts, m_policy_nets, m};
+    firc_ruleset_lookup_t lk = {m_mark, m_hosts, m_policy_hosts, m_policy_nets, m, NULL};
     char e[] = "192.168.1.50";
     char *list[] = {e};
 
@@ -725,7 +770,7 @@ TEST a_policy_renders_its_segments(void) {
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse("{\"host\":[]}", "{\"Policy9\":{\"description\":\"Guests\"}}", &m));
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_add_marks(m, "{\"Policy9\":{\"mark\":\"ffffaad\"}}"));
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_add_segment(m, "Policy9", "10.99.0.1", "255.255.255.0"));
-    firc_ruleset_lookup_t lk = {m_mark, m_hosts, m_policy_hosts, m_policy_nets, m};
+    firc_ruleset_lookup_t lk = {m_mark, m_hosts, m_policy_hosts, m_policy_nets, m, NULL};
     char e[] = "policy:Guests";
     char *list[] = {e};
     const uint8_t net[4] = {10, 99, 0, 0};
@@ -782,7 +827,7 @@ static firc_err_t t_nets_broken(const char *policy, bool deny, firc_devsel_net_f
 }
 
 TEST a_segment_the_table_gets_wrong_is_not_written(void) {
-    static const firc_ruleset_lookup_t broken = {NULL, NULL, NULL, t_nets_broken, NULL};
+    static const firc_ruleset_lookup_t broken = {NULL, NULL, NULL, t_nets_broken, NULL, NULL};
     char pol[] = "policy:Guests", host[] = "192.168.1.30";
     char *deny[] = {pol}, *allow[] = {host};
     firc_group_t *g = selector(allow, 1, deny, 1);
@@ -868,6 +913,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_whole_family_entry_is_its_family_s_zero_prefix);
     RUN_TEST(a_prefix_off_a_byte_boundary_keeps_only_its_network_bits);
     RUN_TEST(a_deny_entry_that_cannot_be_rendered_marks_nobody);
+    RUN_TEST(a_policy_entry_before_the_first_map_marks_nobody);
     RUN_TEST(a_policy_mark_that_masks_to_zero_is_not_written);
     RUN_TEST(an_address_the_table_gets_wrong_is_not_written);
     RUN_TEST(sync_renders_the_selector_again_and_says_when_it_moved);

@@ -356,6 +356,19 @@ TEST the_first_read_can_be_waited_for(void) {
     PASS();
 }
 
+/* Catches: the devices chain told the policies are read before any map, or never once one arrives. */
+TEST the_policies_count_as_read_from_the_first_map_on(void) {
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    ASSERT_FALSE(firc_kn_policies_read(p));
+    firc_kn_policy_map_t *m = NULL;
+    ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse("{\"host\":[]}", NULL, &m));
+    firc_kn_policies_swap(p, m);
+    ASSERT(firc_kn_policies_read(p));
+    firc_kn_policies_stop(p);
+    PASS();
+}
+
 /* Catches: the resolver answering before the first read, or from a map a swap replaced. */
 TEST the_resolver_answers_from_the_latest_map(void) {
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
@@ -1933,7 +1946,7 @@ static bool deny_kids_has_mark(firc_kn_policies_t *p) {
     firc_devsel_spec_t spec = {.deny = deny, .n_deny = 1};
     if (g == NULL || firc_devsel_spec_copy(&g->devices, &spec) != FIRC_OK) { abort(); }
     firc_ruleset_lookup_t lk = {firc_kn_policies_mark, firc_kn_policies_hosts_in, firc_kn_policies_policy_hosts,
-                                firc_kn_policies_policy_nets, p};
+                                firc_kn_policies_policy_nets, p, firc_kn_policies_read};
     firc_nf_devices_t d;
     bool has = false;
     if (firc_ruleset_render_devices(g, &lk, &d) == FIRC_OK) {
@@ -2065,6 +2078,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_wait_is_woken_by_a_swap_and_by_a_stop);
     RUN_TEST(a_stop_does_not_free_the_object_under_a_waiter);
     RUN_TEST(a_stop_wakes_the_waiter_and_the_refresher_alike);
+    RUN_TEST(the_policies_count_as_read_from_the_first_map_on);
     RUN_TEST(the_resolver_answers_from_the_latest_map);
     RUN_TEST(each_host_is_recorded_with_its_mac_and_names);
     RUN_TEST(a_listed_host_reports_its_effective_policy);

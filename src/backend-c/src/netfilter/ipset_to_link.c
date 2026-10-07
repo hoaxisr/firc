@@ -293,8 +293,8 @@ static firc_err_t build_iptables_rules(firc_ipset_to_link_t *l, firc_ipt_t *ipt)
                                                         l->snap ? l->snap(l->snap_ud) : NULL,
                                                         l->group_id, &l->dev);
     if (err != FIRC_OK) { return err; }
-    return firc_ipset_to_link_build_subnet_rules(ipt, l->chain_name, l->mark, l->sub4, l->n_sub4,
-                                                 l->sub6, l->n_sub6);
+    return firc_ipset_to_link_build_subnet_rules_dev(ipt, l->chain_name, l->mark, l->sub4, l->n_sub4,
+                                                     l->sub6, l->n_sub6, &l->dev);
 }
 
 firc_err_t firc_ipset_to_link_set_subnets(firc_ipset_to_link_t *l, const firc_ipv4_subnet_t *v4,
@@ -387,6 +387,7 @@ static bool source_in(const firc_nf_source_t *s, const firc_nf_source_t *v, size
 
 /* An inactive chain counts as marking every device. */
 bool firc_nf_devices_narrows(const firc_nf_devices_t *was, const firc_nf_devices_t *now) {
+    if (was->active && !was->allow_all && was->n_allow == 0) { return false; }
     bool was_all = !was->active || was->allow_all;
     bool now_all = !now->active || now->allow_all;
     size_t was_deny = was->active ? was->n_deny : 0;
@@ -447,7 +448,7 @@ static const char *proto_name(uint8_t proto) {
 
 static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const char *cidr,
                                    unsigned prefix, uint8_t proto, const char *ports,
-                                   const char *mark_str) {
+                                   const char *mark_str, const char *jump) {
     char handled[32];
     snprintf(handled, sizeof(handled), "0x%x/0x%x", FIRC_MARK_HANDLED, FIRC_MARK_HANDLED);
     const char *pn = proto_name(proto);
@@ -472,6 +473,11 @@ static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const cha
     const char *unm[] = {"-m", "mark", "!", "--mark", handled};
     for (size_t i = 0; i < 5; i++) { mk[nm++] = unm[i]; }
     for (size_t i = 0; i < np; i++) { mk[nm++] = pm[i]; cm[nc++] = pm[i]; }
+    if (jump != NULL) {
+        mk[nm++] = "-j";
+        mk[nm++] = jump;
+        return firc_ipt_append(ipt, "mangle", chain, mk, nm);
+    }
     const char *tgt[] = {"-j", "MARK", "--set-xmark", mark_str};
     for (size_t i = 0; i < 4; i++) { mk[nm++] = tgt[i]; }
     firc_err_t err = firc_ipt_append(ipt, "mangle", chain, mk, nm);
@@ -481,11 +487,16 @@ static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const cha
     return firc_ipt_append(ipt, "mangle", chain, cm, nc);
 }
 
-firc_err_t firc_ipset_to_link_build_subnet_rules(firc_ipt_t *ipt, const char *chain_name,
-                                                 uint32_t mark, const firc_ipv4_subnet_t *v4,
-                                                 size_t n4, const firc_ipv6_subnet_t *v6,
-                                                 size_t n6) {
+firc_err_t firc_ipset_to_link_build_subnet_rules_dev(firc_ipt_t *ipt, const char *chain_name, uint32_t mark,
+                                                     const firc_ipv4_subnet_t *v4, size_t n4,
+                                                     const firc_ipv6_subnet_t *v6, size_t n6,
+                                                     const firc_nf_devices_t *dev) {
     if (!ipt) { return FIRC_OK; }
+    bool with_dev = dev != NULL && dev->active;
+    char dchain[128];
+    if (with_dev && firc_ipset_to_link_devices_chain_of(chain_name, dchain, sizeof(dchain)) != FIRC_OK) {
+        return FIRC_ERR_INVAL;
+    }
     char mark_str[32];
     snprintf(mark_str, sizeof(mark_str), "0x%x/0x%x", mark, FIRC_MARK_WRITE_MASK);
     bool is6 = firc_ipt_proto(ipt) == FIRC_IPT_PROTO_IPV6;
@@ -501,10 +512,18 @@ firc_err_t firc_ipset_to_link_build_subnet_rules(firc_ipt_t *ipt, const char *ch
         const char *ports = is6 ? v6[i].ports : v4[i].ports;
         /* Ports without a protocol would mark every port. */
         if (proto == 0 && ports[0] != '\0') { return FIRC_ERR_INVAL; }
-        firc_err_t err = emit_subnet_rule(ipt, chain_name, cidr, prefix, proto, ports, mark_str);
+        firc_err_t err = emit_subnet_rule(ipt, chain_name, cidr, prefix, proto, ports, mark_str,
+                                          with_dev ? dchain : NULL);
         if (err != FIRC_OK) { return err; }
     }
     return FIRC_OK;
+}
+
+firc_err_t firc_ipset_to_link_build_subnet_rules(firc_ipt_t *ipt, const char *chain_name,
+                                                 uint32_t mark, const firc_ipv4_subnet_t *v4,
+                                                 size_t n4, const firc_ipv6_subnet_t *v6,
+                                                 size_t n6) {
+    return firc_ipset_to_link_build_subnet_rules_dev(ipt, chain_name, mark, v4, n4, v6, n6, NULL);
 }
 
 static firc_err_t insert_iptables_rules(firc_ipset_to_link_t *l, firc_ipt_t *ipt) {

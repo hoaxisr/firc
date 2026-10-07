@@ -52,7 +52,6 @@ typedef enum {
     SCAN_BY_MARK,
     SCAN_POOL_REPLIES,
     SCAN_STALE_MARKS,
-    SCAN_CHUNK_FLOWS,
 } scan_mode_t;
 
 typedef struct {
@@ -263,16 +262,13 @@ static bool wanted(const struct nlmsghdr *h, scan_t *s, ct_hit_t *out) {
             orig = a;
         }
     }
-    if ((s->mode == SCAN_BY_MARK || s->mode == SCAN_CHUNK_FLOWS) &&
+    if (s->mode == SCAN_BY_MARK &&
         (!have_mark || (mark & s->mark_mask) != (s->mark_value & s->mark_mask))) {
         return false;
     }
     if (orig == NULL) { return false; }
 
-    if (s->mode == SCAN_CHUNK_FLOWS) {
-        uint8_t orig_dst[16] = {0};
-        if (!tuple_dst(orig, family, orig_dst) || !in_pool(s, family, orig_dst)) { return false; }
-    } else if (s->mode == SCAN_POOL_REPLIES) {
+    if (s->mode == SCAN_POOL_REPLIES) {
         /* An unbound flow replies from the fake address it was given. */
         uint8_t reply_src[16] = {0};
         if (reply == NULL || !tuple_src(reply, family, reply_src)) { return false; }
@@ -589,23 +585,6 @@ firc_err_t firc_ct_flush_pool_replies(firc_ct_t *ct, const uint8_t v4[4], uint8_
     scan_t s = {0};
     s.mode = SCAN_POOL_REPLIES;
     /* No mark filter: flows born while a full pass has our chains down carry no mark. */
-    s.v4 = v4;
-    s.v4_len = v4_len;
-    s.v6 = v6;
-    s.v6_len = v6_len;
-    return flush(ct, &s, deleted);
-}
-
-firc_err_t firc_ct_flush_group_chunk_flows(firc_ct_t *ct, uint32_t value, const uint8_t v4[4], uint8_t v4_len,
-                                           const uint8_t v6[16], uint8_t v6_len, size_t *deleted) {
-    scan_t s = {0};
-    s.mode = SCAN_CHUNK_FLOWS;
-    /* Handled bit in value and mask: the field alone would take firmware-policy flows. */
-    s.mark_value = value | FIRC_MARK_HANDLED;
-    s.mark_mask = FIRC_MARK_GROUP_MASK | FIRC_MARK_HANDLED;
-    s.filter_mark = true;
-    s.filter_value = s.mark_value & s.mark_mask;
-    s.filter_mask = s.mark_mask;
     s.v4 = v4;
     s.v4_len = v4_len;
     s.v6 = v6;

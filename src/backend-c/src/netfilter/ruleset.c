@@ -306,6 +306,7 @@ typedef struct render {
     firc_nf_devices_t *out;
     size_t refused_deny;
     size_t refused_allow;
+    size_t unread;
 } render_t;
 
 static void refuse(render_t *r, bool deny) {
@@ -393,6 +394,10 @@ static firc_err_t render_entry(render_t *r, const char *text, bool deny, const f
         memcpy(s.mac, e.mac.b, sizeof(s.mac));
         return firc_nf_devices_push(r->out, deny, &s);
     case FIRC_DEVSEL_POLICY: {
+        if (lk != NULL && lk->policies_read != NULL && !lk->policies_read(lk->ud)) {
+            r->unread++;
+            return FIRC_OK;
+        }
         uint32_t mark = 0;
         if (lk != NULL && lk->policy_mark != NULL && lk->policy_mark(e.policy, &mark, lk->ud)) {
             s.kind = FIRC_NF_SRC_MARK;
@@ -434,7 +439,7 @@ static firc_err_t render_devices(const firc_group_t *g, const firc_ruleset_looku
         firc_nf_devices_clear(out);
         return err;
     }
-    if (r->refused_deny > 0) {
+    if (r->refused_deny > 0 || r->unread > 0) {
         /* A deny we could not write: mark nobody rather than the devices it keeps out. */
         free(out->allow);
         out->allow = NULL;
@@ -447,13 +452,13 @@ static firc_err_t render_devices(const firc_group_t *g, const firc_ruleset_looku
 
 firc_err_t firc_ruleset_render_devices(const firc_group_t *g, const firc_ruleset_lookup_t *lk,
                                        firc_nf_devices_t *out) {
-    render_t r = {out, 0, 0};
+    render_t r = {out, 0, 0, 0};
     return render_devices(g, lk, &r);
 }
 
 static firc_err_t devices_apply(firc_ruleset_t *rs, bool *changed) {
     firc_nf_devices_t d;
-    render_t r = {&d, 0, 0};
+    render_t r = {&d, 0, 0, 0};
     bool moved = false;
     rs->dev_narrowed = false;
     firc_err_t err = render_devices(rs->group, rs->deps.lookup, &r);
@@ -500,7 +505,7 @@ firc_err_t firc_ruleset_devices_would_move(const firc_ruleset_t *rs, bool *moved
     *moved = false;
     if (!firc_ruleset_routed(rs) || !firc_ruleset_devices_follow_table(rs)) { return FIRC_OK; }
     firc_nf_devices_t d;
-    render_t r = {&d, 0, 0};
+    render_t r = {&d, 0, 0, 0};
     firc_err_t err = render_devices(rs->group, rs->deps.lookup, &r);
     if (err == FIRC_OK) { *moved = !firc_nf_devices_equal(firc_ipset_to_link_devices(rs->ipset_to_link), &d); }
     firc_nf_devices_clear(&d);

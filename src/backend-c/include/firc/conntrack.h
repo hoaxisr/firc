@@ -26,10 +26,6 @@ firc_err_t firc_ct_flush_by_mark(firc_ct_t *ct, uint32_t value, uint32_t mask, s
 firc_err_t firc_ct_flush_pool_replies(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len,
                                       const uint8_t v6[16], uint8_t v6_len, size_t *deleted);
 
-/* Deletes the group's marked entries whose original destination is in a pool prefix. */
-firc_err_t firc_ct_flush_group_chunk_flows(firc_ct_t *ct, uint32_t value, const uint8_t v4[4], uint8_t v4_len,
-                                           const uint8_t v6[16], uint8_t v6_len, size_t *deleted);
-
 /* A prefix a group reaches and the mark field it holds now. */
 typedef struct {
     uint8_t family;
