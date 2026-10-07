@@ -74,6 +74,7 @@
   let visibleRuleIndices = $derived(store.visibilityMap.get(group_index));
   let effectiveOpen = $derived(group ? (store.open_state[group.id] ?? false) : false);
   let duplicateConflicts = $derived(group ? store.getDuplicateConflictsForGroup(group.id) : []);
+  let invalidRuleIds = $derived(group ? (store.invalidRules.get(group.id) ?? []) : []);
   let deviceCount = $derived(
     group ? (group.devices?.allow.length ?? 0) + (group.devices?.deny.length ?? 0) : 0,
   );
@@ -418,6 +419,17 @@
               </div>
             </div>
             <div class="group-badges">
+              {#if invalidRuleIds.length > 0}
+                <button
+                  type="button"
+                  class="invalid-badge"
+                  onclick={() => store.requestDuplicateRuleFocus(group.id, invalidRuleIds[0])}
+                  >{t("Invalid rules: {count}").replace(
+                    "{count}",
+                    String(invalidRuleIds.length),
+                  )}</button
+                >
+              {/if}
               {#if hasList}
                 <span class="list-badge"><RSS size={12} />{t("list")}</span>
               {/if}
@@ -850,6 +862,20 @@
   .fallback-badge {
     background: color-mix(in oklab, var(--red) 18%, transparent);
     color: var(--red);
+  }
+
+  .invalid-badge {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    height: 1.35rem;
+    padding: 0 0.5rem;
+    border: none;
+    border-radius: 0.7rem;
+    font: 600 0.75rem var(--font);
+    background: color-mix(in oklab, var(--red) 18%, transparent);
+    color: var(--red);
+    cursor: pointer;
   }
 
   .group-name-wrap :global([data-dropdown-menu-trigger]) {

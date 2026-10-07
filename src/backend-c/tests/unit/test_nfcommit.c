@@ -344,7 +344,7 @@ static uint64_t now_ms(void) {
 #define ESCALATION "netfilter pass keeps failing (3 in a row since "
 #define RECOVERY "netfilter pass completed again"
 
-/* Catches: one hard failure read as failing at once, said at ERR, or followed by a recovery line. */
+/* Catches: one hard failure read as failing at once, said at WARN or ERR, or followed by a recovery line. */
 TEST one_refusal_then_a_completed_pass_is_not_failing_and_no_error(void) {
     probe_t p;
     probe_init(&p);
@@ -367,8 +367,7 @@ TEST one_refusal_then_a_completed_pass_is_not_failing_and_no_error(void) {
 
     firc_nfcommit_free(c);
     const char *log = log_capture_end();
-    ASSERT_EQ_FMTm("the failure was said at WARN", 1,
-                   occurrences(log, "WRN failed to rebuild netfilter table (i/o error)"), "%d");
+    ASSERT_EQ_FMTm("nothing at WARN", 0, occurrences(log, " WRN "), "%d");
     ASSERT_EQ_FMTm("and nothing at ERR", 0, occurrences(log, " ERR "), "%d");
     ASSERT_EQ_FMTm("no recovery from a run that never escalated", 0, occurrences(log, RECOVERY), "%d");
     probe_destroy(&p);

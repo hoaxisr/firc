@@ -28,6 +28,8 @@ bool firc_log_level_parse(const char *s, firc_log_level_t *out);
 
 /* Redirects output (default fd 1). */
 void firc_log_set_fd(int fd);
+/* Lines below floor still reach the journal but are not written to the output. */
+void firc_log_set_output_floor(firc_log_level_t floor);
 /* Makes a pipe or socket fd non-blocking: a stalled reader drops lines instead of stalling the loop. */
 void firc_log_nonblocking(void);
 

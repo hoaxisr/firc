@@ -305,14 +305,14 @@ test.describe("Device dialog", () => {
     });
   });
 
-  // Catches an address entry shown as a checked row, a bad line marked only on submit, or Done closing over it.
+  // Catches an address entry shown as a checked row or behind a shut block, a bad line marked only on submit, or Done closing over it.
   test("«Вручную» holds address entries and marks a bad line as it is typed", async ({ page }) => {
     await stub(page, { allow: ["192.168.1.0/24"], deny: [] });
     await groupsPage.goto();
     await openDevices(page);
     await expect(switchOf(page, "01")).toHaveAttribute("aria-checked", "true");
     await expect(row(page, "01").locator(".note")).toHaveText("on through a manual entry");
-    await page.locator("button.manual-toggle").click();
+    await expect(page.locator("button.manual-toggle")).toHaveAttribute("aria-expanded", "true");
     await expect(page.locator("#devices-allow")).toHaveValue("192.168.1.0/24");
     await page.locator("#devices-allow").fill("192.168.1.0/24\nlaptop.lan");
     await expect(page.locator(".modal .error")).toContainText("laptop.lan");
@@ -321,6 +321,29 @@ test.describe("Device dialog", () => {
     await expect(page.locator(".modal")).toHaveAttribute("data-state", "open");
     await page.locator("#devices-allow").fill("192.168.2.0/24");
     expect(await savedDevices(page, groupsPage)).toEqual({ allow: ["192.168.2.0/24"], deny: [] });
+  });
+
+  // Catches the help hidden for good, or a fixed clamp in it instead of the daemon's.
+  test("the help says a deny is not a block and names the daemon's TTL ceiling", async ({
+    page,
+  }) => {
+    await stub(page, { allow: [], deny: [] });
+    await page.route("**/system/settings", (route) =>
+      route.fulfill({
+        json: {
+          settings: { "app.addressPool.ttlClamp": 90 },
+          classes: {},
+          boot: "b",
+          pendingRestart: [],
+        },
+      }),
+    );
+    await groupsPage.goto();
+    await openDevices(page);
+    await expect(page.locator("#devices-help")).toHaveCount(0);
+    await page.locator(".help-toggle").click();
+    await expect(page.locator("#devices-help")).toContainText("This is not a block");
+    await expect(page.locator("#devices-help")).toContainText("for up to 90 s.");
   });
 
   // Catches an empty host list leaving the manual block shut with no explanation.

@@ -40,7 +40,7 @@
       <Button small onclick={() => (infoIsOpen = true)}>
         <div class="info-content">
           <Info size={16} />
-          {t("About")}
+          <span class="info-label">{t("About")}</span>
         </div>
       </Button>
     </Tooltip>
@@ -154,6 +154,10 @@
   }
 
   @media (max-width: 700px) {
+    .info-label {
+      display: none;
+    }
+
     .locale,
     .logout {
       gap: 0.5rem;

@@ -76,7 +76,7 @@ if (processObj) {
     writable: true,
   });
 }
-const { GroupsStore } = await import("../../src/modules/groups/groups.svelte");
+const { GroupsStore, invalidRulesByGroup } = await import("../../src/modules/groups/groups.svelte");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
     Object.defineProperty(processObj, "env", originalProcessEnvDescriptor);
@@ -105,7 +105,6 @@ const createStore = (groups: Group[] = []) => {
   const store = new GroupsStore();
   store.data.splice(0, store.data.length, ...structuredClone(groups));
   store.dataRevision = 0;
-  store.valid_rules = true;
   store.open_state = {};
   for (const group of store.data) {
     store.open_state[group.id] = false;
@@ -127,18 +126,12 @@ const withPatchedGlobal = async <T>(key: string, value: unknown, action: () => T
 };
 
 describe("GroupsStore mutations and validation", () => {
-  it("checkRulesValidityState toggles valid_rules based on invalid inputs", async () => {
-    const store = createStore();
-
-    await withPatchedGlobal("document", { querySelector: () => ({}) }, () => {
-      store.checkRulesValidityState();
-      assert.strictEqual(store.valid_rules, false);
-    });
-
-    await withPatchedGlobal("document", { querySelector: () => null }, () => {
-      store.checkRulesValidityState();
-      assert.strictEqual(store.valid_rules, true);
-    });
+  it("invalidRules names each group's empty or malformed rules, and nothing else", () => {
+    const groups = [
+      makeGroup("g1", [makeRule("ok"), makeRule("empty", ""), makeRule("bad", "a..b")]),
+      makeGroup("g2", [makeRule("fine")]),
+    ];
+    assert.deepStrictEqual([...invalidRulesByGroup(groups).entries()], [["g1", ["empty", "bad"]]]);
   });
 
   it("markDataRevision increments revision counter", () => {
@@ -220,7 +213,6 @@ describe("GroupsStore mutations and validation", () => {
 
     await store.addRuleToGroup(0, makeRule("r2", ""), false);
     assert.deepStrictEqual(ruleIds(store, 0), ["r2", "r1"]);
-    assert.strictEqual(store.valid_rules, false);
     assert.strictEqual(store.dataRevision, 1);
 
     await store.addRuleToGroup(99, makeRule("r3"), false);

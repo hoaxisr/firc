@@ -1,6 +1,7 @@
 tunnels:
   - id: main
     device: tunvless0
+    description: "ПРАВ-1: NL"
     uplink: iface:ppp0
     sources:
       - id: 0000000a

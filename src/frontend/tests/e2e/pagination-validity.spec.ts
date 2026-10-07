@@ -45,7 +45,22 @@ test.describe("Rule validity across pagination", () => {
     await name.fill("Renamed");
     await name.blur();
 
-    await expect(page.locator("#save-changes")).toHaveClass(/inactive/);
+    await expect(page.locator("#save-changes")).toHaveClass(/fail/);
+  });
+
+  // Catches a blocked Save that says nothing and leaves the bad rule out of sight.
+  test("a blocked Save names the group and shows the rule", async ({ page }) => {
+    await setup(page, PAGE_SIZE + 5);
+
+    const name = page.locator(".group-header input.group-name").first();
+    await name.fill("Renamed");
+    await name.blur();
+
+    await expect(page.locator(".invalid-badge")).toHaveText(/1/);
+    const bad = page.locator(`[data-uuid="7000${(PAGE_SIZE + 5).toString().padStart(4, "0")}"]`);
+    await expect(bad).toHaveCount(0);
+    await page.locator("#save-changes").click();
+    await expect(bad).toBeInViewport();
   });
 
   // Catches an unknown rule type passing because only types with a validator were checked.
@@ -56,7 +71,7 @@ test.describe("Rule validity across pagination", () => {
     await name.fill("Renamed");
     await name.blur();
 
-    await expect(page.locator("#save-changes")).toHaveClass(/inactive/);
+    await expect(page.locator("#save-changes")).toHaveClass(/fail/);
   });
 
   test("...and a group whose rules all work saves", async ({ page }) => {
@@ -66,6 +81,6 @@ test.describe("Rule validity across pagination", () => {
     await name.fill("Renamed");
     await name.blur();
 
-    await expect(page.locator("#save-changes")).not.toHaveClass(/inactive/);
+    await expect(page.locator("#save-changes")).not.toHaveClass(/inactive|fail/);
   });
 });

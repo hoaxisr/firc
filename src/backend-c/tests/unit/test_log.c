@@ -32,6 +32,24 @@ static ssize_t capture(int level_to_log, const char *msg, char *out,
     return n;
 }
 
+/* Catches: an output floor that also starves the journal, or lets a line under it through. */
+TEST the_output_floor_thins_the_output_but_not_the_journal(void) {
+    firc_event_reset_for_test();
+    firc_log_set_level(FIRC_LOG_INFO);
+    firc_log_set_output_floor(FIRC_LOG_WARN);
+    char out[256];
+    ssize_t quiet = capture(FIRC_LOG_INFO, "kept for the journal", out, sizeof(out));
+    ssize_t loud = capture(FIRC_LOG_WARN, "said everywhere", out, sizeof(out));
+    firc_log_set_output_floor(FIRC_LOG_TRACE);
+    ASSERT_EQ_FMT((ssize_t)0, quiet, "%zd");
+    ASSERT(loud > 0 && strstr(out, " WRN said everywhere") != NULL);
+    firc_event_t ev[4];
+    uint64_t next = 0, dropped = 0;
+    ASSERT_EQ_FMT((size_t)2, firc_event_read(0, ev, 4, &next, &dropped), "%zu");
+    ASSERT_STR_EQ("kept for the journal", ev[0].u.log.text);
+    PASS();
+}
+
 /* Catches: the ring not keeping the lines the daemon logged. */
 TEST the_ring_keeps_what_the_daemon_said(void) {
     firc_event_reset_for_test();
@@ -277,6 +295,7 @@ int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(the_ring_keeps_what_the_daemon_said);
+    RUN_TEST(the_output_floor_thins_the_output_but_not_the_journal);
     RUN_TEST(a_reader_that_fell_behind_is_told_how_much_it_missed);
     RUN_TEST(the_ring_keeps_only_what_the_level_let_through);
     RUN_TEST(a_line_longer_than_the_ring_holds_is_cut_not_dropped);

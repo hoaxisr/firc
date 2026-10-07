@@ -94,7 +94,7 @@
   </div>
   <div slot="actions" class="buttons">
     <Button type="button" onclick={onclose}>{t("Cancel")}</Button>
-    <Button type="submit">{source ? t("Apply") : t("Add")}</Button>
+    <Button type="submit" class="primary">{source ? t("Apply") : t("Add")}</Button>
   </div>
 </GenericDialog>
 

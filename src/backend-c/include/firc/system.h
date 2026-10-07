@@ -6,6 +6,7 @@
 
 #include "firc/app.h"
 #include "firc/httpd.h"
+#include "firc/tunnels.h"
 
 typedef struct firc_system_ctx {
     void *policies; /* Keenetic policy resolver; NULL before main starts it, empty before its first read */
@@ -18,9 +19,13 @@ typedef struct firc_system_ctx {
     int64_t restart_timeout_ms; /* 0 takes FIRC_RESTART_TIMEOUT_MS; a test shortens it */
     uint16_t web_port; /* the WebUI's listening port, 0 if none */
     uint16_t web_moved_from; /* the port it was configured on when that one was busy, else 0 */
+    const firc_tunnels_t *tunnels; /* the running tunnels, read on the loop thread; NULL if none */
 } firc_system_ctx_t;
 
 void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx);
+
+/* names each tunnel device in ifaces by its tunnel's description, over any alias; ts NULL changes nothing */
+void firc_system_name_tunnels(firc_iface_info_t *ifaces, size_t n, const firc_tunnels_t *ts);
 
 #define FIRC_RESTART_TIMEOUT_MS 90000
 

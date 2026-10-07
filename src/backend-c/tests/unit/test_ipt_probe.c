@@ -148,40 +148,63 @@ TEST the_loader_names_each_module_the_kernel_refuses(void) {
     PASS();
 }
 
-/* Catches: a refused restore said at ERR, losing the quoted line, or not FIRC_ERR_IO. */
-TEST a_refused_restore_is_a_warning_that_quotes_the_line(void) {
-    stand_in(1);
+static firc_err_t restore_logged(const char *transcript, char *log, size_t cap) {
     firc_ipt_executable_t *exe = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-    ASSERT(exe != NULL);
-    static const char transcript[] = "*filter\n"
-                                     ":X - [0:0]\n"
-                                     "-A X -j ACCEPT\n"
-                                     "-A X -j NFLOG\n"
-                                     "COMMIT\n";
+    if (exe == NULL) { return FIRC_ERR_NOMEM; }
     char out[128];
     snprintf(out, sizeof(out), "%s/daemon.log", g_dir);
     int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    ASSERT(fd >= 0);
+    if (fd < 0) {
+        firc_ipt_executable_free(exe);
+        return FIRC_ERR_SYS;
+    }
     firc_log_level_t kept = firc_log_level();
     firc_log_set_level(FIRC_LOG_INFO);
     firc_log_set_fd(fd);
-    firc_err_t err = exe->ops->restore(exe, (const uint8_t *)transcript, sizeof(transcript) - 1);
+    firc_err_t err = exe->ops->restore(exe, (const uint8_t *)transcript, strlen(transcript));
     firc_log_set_fd(2);
     firc_log_set_level(kept);
     close(fd);
     firc_ipt_executable_free(exe);
-
-    ASSERT_EQ_FMT(FIRC_ERR_IO, err, "%d");
+    log[0] = '\0';
     FILE *f = fopen(out, "r");
-    ASSERT(f != NULL);
+    if (f != NULL) {
+        size_t n = fread(log, 1, cap - 1, f);
+        log[n] = '\0';
+        fclose(f);
+    }
+    return err;
+}
+
+/* Catches: a refused restore said at ERR, losing the quoted line, or not FIRC_ERR_IO. */
+TEST a_refused_restore_is_a_warning_that_quotes_the_line(void) {
+    stand_in(1);
     char log[4096];
-    size_t n = fread(log, 1, sizeof(log) - 1, f);
-    log[n] = '\0';
-    fclose(f);
+    firc_err_t err = restore_logged("*filter\n"
+                                    ":X - [0:0]\n"
+                                    "-A X -j ACCEPT\n"
+                                    "-A X -j NFLOG\n"
+                                    "COMMIT\n",
+                                    log, sizeof(log));
+    ASSERT_EQ_FMT(FIRC_ERR_IO, err, "%d");
     ASSERTm("the refusal is said, at WARN",
             strstr(log, " WRN iptables-restore failed (status=256): iptables-restore: line 4 failed") != NULL);
     ASSERTm("with the line it refused", strstr(log, "the line it refused was: -A X -j NFLOG") != NULL);
     ASSERTm("and nothing at ERR", strstr(log, " ERR ") == NULL);
+    PASS();
+}
+
+/* Catches: a refusal at COMMIT, the firmware's usual race, said at WARN on its first time. */
+TEST a_refusal_at_commit_is_not_a_warning(void) {
+    stand_in(1);
+    char log[4096];
+    firc_err_t err = restore_logged("*filter\n"
+                                    ":X - [0:0]\n"
+                                    "-A X -j NFLOG\n"
+                                    "COMMIT\n",
+                                    log, sizeof(log));
+    ASSERT_EQ_FMT(FIRC_ERR_IO, err, "%d");
+    ASSERT_STR_EQ("", log);
     PASS();
 }
 
@@ -232,6 +255,7 @@ SUITE(probe) {
     RUN_TEST(an_accepted_probe_writes_nothing_that_stays);
     RUN_TEST(the_loader_names_each_module_the_kernel_refuses);
     RUN_TEST(a_refused_restore_is_a_warning_that_quotes_the_line);
+    RUN_TEST(a_refusal_at_commit_is_not_a_warning);
     RUN_TEST(a_refused_save_is_a_warning_too);
 }
 

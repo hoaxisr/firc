@@ -811,6 +811,7 @@ int main(int argc, char **argv)
     /* --purge takes the lock like a start; an unknown argument prints usage and exits 2. */
     bool purge = false;
     const char *config_path = FIRC_CONFIG_PATH;
+    firc_log_level_t out_floor = FIRC_LOG_TRACE;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
             /* the flavour string is what CI greps the shipped binary for */
@@ -824,8 +825,13 @@ int main(int argc, char **argv)
             purge = true;
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (strcmp(argv[i], "--output-floor") == 0 && i + 1 < argc &&
+                   firc_log_level_parse(argv[i + 1], &out_floor)) {
+            firc_log_set_output_floor(out_floor);
+            i++;
         } else {
-            fprintf(stderr, "usage: fircd [--config <path>] [--purge] | --version\n");
+            fprintf(stderr, "usage: fircd [--config <path>] [--output-floor <level>] [--purge] | "
+                            "--version\n");
             return 2;
         }
     }
@@ -1379,6 +1385,7 @@ int main(int argc, char **argv)
         .app = d.app,
         .config_path = config_path,
         .config_version = FIRC_VERSION,
+        .tunnels = firc_tunrun_config(d.tunrun),
     };
 #ifdef FIRC_ENTWARE_KN
     system_ctx.policies = d.policies;

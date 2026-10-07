@@ -118,7 +118,7 @@
     </div>
     <div class="buttons">
       <Button type="button" onclick={close}>{t("Cancel")}</Button>
-      <Button type="submit" onclick={submit}>{t("Import")}</Button>
+      <Button type="submit" onclick={submit} class="primary">{t("Import")}</Button>
     </div>
   </div>
 </GenericDialog>

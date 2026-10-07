@@ -338,9 +338,7 @@
 
   <div slot="actions" class="rule-type-select">
     <Select options={RULE_TYPE_SELECT} bind:selected={selectedRuleType} />
-    <Button type="submit" onclick={submit} style="color: var(--text); font-size: 1rem;"
-      >{t("Import")}</Button
-    >
+    <Button type="submit" onclick={submit} class="primary">{t("Import")}</Button>
   </div>
 </GenericDialog>
 

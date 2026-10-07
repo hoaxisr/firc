@@ -61,7 +61,6 @@
     void rule.type;
     void portsInvalid;
     applyPatternClass();
-    store.checkRulesValidityState();
   });
 
   function patternValidation() {
@@ -248,7 +247,7 @@
     </div>
     <div class="pattern">
       <div class="label">{t("Pattern")}</div>
-      <div class="pattern-fields">
+      <div class="pattern-fields" class:with-ports={showsPorts}>
         <div class="search-highlight-field">
           <input
             type="text"
@@ -362,8 +361,12 @@
     flex: 1 1 6rem;
   }
 
+  .pattern-fields.with-ports > .search-highlight-field {
+    flex: 0 1 19rem;
+  }
+
   .ports-input {
-    flex: 0 1 11rem;
+    flex: 1 1 11rem;
     width: auto;
     min-width: 0;
   }
@@ -606,7 +609,8 @@
     .pattern .label {
       align-self: start;
     }
-    .pattern-fields > .search-highlight-field {
+    .pattern-fields > .search-highlight-field,
+    .pattern-fields.with-ports > .search-highlight-field {
       flex: 1 0 100%;
     }
     .pattern .ports-input {

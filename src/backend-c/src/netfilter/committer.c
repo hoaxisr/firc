@@ -301,7 +301,7 @@ static void *committer_main(void *arg) {
             FIRC_DEBUG("netfilter table changed during rebuild, starting over");
             delay_ms = c->delay_ms;
         } else {
-            FIRC_WARN("failed to rebuild netfilter table (%s), starting over", firc_err_str(err));
+            FIRC_DEBUG("failed to rebuild netfilter table (%s), starting over", firc_err_str(err));
             delay_ms = delay_ms * 2 < c->max_delay_ms ? delay_ms * 2 : c->max_delay_ms;
         }
 

@@ -214,7 +214,7 @@ const char *firc_ipt_offending_line(const uint8_t *data, size_t len, const char 
     return NULL;
 }
 
-/* A refusal is WARN: a lost COMMIT race looks the same, and the committer says ERR if it persists. */
+/* A refusal at COMMIT is DEBUG: a lost race with the firmware looks the same; the committer says ERR if it persists. */
 static firc_err_t wait_child(pid_t pid, const char *cmd, firc_bytebuf_t *err_buf,
                              const uint8_t *sent, size_t sent_len) {
     int status = 0;
@@ -233,7 +233,10 @@ static firc_err_t wait_child(pid_t pid, const char *cmd, firc_bytebuf_t *err_buf
         size_t line_len = 0;
         const char *line = firc_ipt_offending_line(sent, sent_len, (const char *)err_buf->data,
                                                    err_buf->len, &line_len);
-        if (line != NULL) {
+        if (line != NULL && line_len == 6 && memcmp(line, "COMMIT", 6) == 0) {
+            FIRC_DEBUG("%s failed at COMMIT (status=%d): %.*s", cmd, status, (int)err_buf->len,
+                       (const char *)err_buf->data);
+        } else if (line != NULL) {
             FIRC_WARN("%s failed (status=%d): %.*s -- the line it refused was: %.*s", cmd,
                      status, (int)err_buf->len, (const char *)err_buf->data, (int)line_len, line);
         } else {

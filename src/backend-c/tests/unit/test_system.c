@@ -18,6 +18,7 @@
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/system.h"
+#include "firc/tunnels.h"
 
 static void *g_policies;
 
@@ -278,6 +279,62 @@ TEST the_netfilter_route_says_the_first_write_is_pending(void) {
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(out, "since"));
     cJSON_Delete(out);
     harness_stop(h);
+    PASS();
+}
+
+/* Catches: a tunnel's description not given as the name of its device in the interface list. */
+TEST a_tunnel_device_is_named_by_its_description(void) {
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    h->cfg.app.show_all_interfaces = true;
+    firc_tunnel_t t[2];
+    memset(t, 0, sizeof t);
+    snprintf(t[0].device, sizeof t[0].device, "lo");
+    snprintf(t[0].description, sizeof t[0].description, "PRAW-1");
+    snprintf(t[1].device, sizeof t[1].device, "tunvless9");
+    snprintf(t[1].description, sizeof t[1].description, "other");
+    firc_tunnels_t ts = {.t = t, .n = 2};
+    h->ctx.tunnels = &ts;
+
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
+    const cJSON *lo = NULL;
+    const cJSON *it;
+    cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(out, "interfaces")) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(it, "id");
+        if (cJSON_IsString(id) && strcmp(id->valuestring, "lo") == 0) { lo = it; }
+    }
+    ASSERT(lo != NULL);
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(lo, "name");
+    ASSERT(cJSON_IsString(name));
+    ASSERT_STR_EQ("PRAW-1", name->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a Keenetic alias winning over the tunnel description, or an empty description erasing the alias. */
+TEST a_tunnel_description_wins_over_an_alias(void) {
+    firc_iface_info_t ifs[3];
+    memset(ifs, 0, sizeof ifs);
+    snprintf(ifs[0].id, sizeof ifs[0].id, "tunvless0");
+    snprintf(ifs[0].name, sizeof ifs[0].name, "Alias0");
+    snprintf(ifs[1].id, sizeof ifs[1].id, "tunvless1");
+    snprintf(ifs[1].name, sizeof ifs[1].name, "Alias1");
+    snprintf(ifs[2].id, sizeof ifs[2].id, "ppp0");
+    snprintf(ifs[2].name, sizeof ifs[2].name, "ISP");
+    firc_tunnel_t t[2];
+    memset(t, 0, sizeof t);
+    snprintf(t[0].device, sizeof t[0].device, "tunvless0");
+    snprintf(t[0].description, sizeof t[0].description, "PRAW-1");
+    snprintf(t[1].device, sizeof t[1].device, "tunvless1");
+    firc_tunnels_t ts = {.t = t, .n = 2};
+    firc_system_name_tunnels(ifs, 3, &ts);
+    ASSERT_STR_EQ("PRAW-1", ifs[0].name);
+    ASSERT_STR_EQ("Alias1", ifs[1].name);
+    ASSERT_STR_EQ("ISP", ifs[2].name);
+    firc_system_name_tunnels(ifs, 3, NULL);
+    ASSERT_STR_EQ("PRAW-1", ifs[0].name);
     PASS();
 }
 
@@ -587,6 +644,8 @@ int main(int argc, char **argv) {
     RUN_TEST(the_events_route_answers_what_the_daemon_said);
     RUN_TEST(the_resolvers_route_answers_a_list);
     RUN_TEST(list_interfaces_includes_blackhole_first);
+    RUN_TEST(a_tunnel_device_is_named_by_its_description);
+    RUN_TEST(a_tunnel_description_wins_over_an_alias);
     RUN_TEST(save_config_writes_file);
     RUN_TEST(save_config_noop_without_path);
     RUN_TEST(netfilterd_hook_ok_and_bad_json);

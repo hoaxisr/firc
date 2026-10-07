@@ -616,6 +616,7 @@ let TUNNELS: any[] = [
   {
     id: "main",
     device: "tunvless0",
+    description: "PRAW-1",
     enable: true,
     active: 1,
     by: "connection",
@@ -664,6 +665,17 @@ const tunnelRefusal = (tunnels: any[]) => {
     ids.add(tn.id);
     if (!/^tunvless([0-9]|[1-9][0-9])$/.test(tn.device ?? "")) {
       return { error: "device must be tunvless0..tunvless99", field: "device", tunnel: tn.id };
+    }
+    const description = String(tn.description ?? "");
+    if (
+      new TextEncoder().encode(description).length > 63 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(description)
+    ) {
+      return {
+        error: "up to 63 bytes, no control characters",
+        field: "description",
+        tunnel: tn.id,
+      };
     }
     if (devices.has(tn.device))
       return { error: "device is used twice", field: "device", tunnel: tn.id };
@@ -761,6 +773,7 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
   const before = new Map(TUNNELS.map((tn: any) => [tn.id, tn]));
   TUNNELS = tunnels.map((tn: any) => ({
     ...tn,
+    description: tn.description ?? "",
     sources: (tn.sources ?? []).map((src: any) => ({
       ...src,
       id: src.id || derivedId(src.link ?? src.url ?? ""),
@@ -773,7 +786,8 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
     (tn: any) =>
       before.has(tn.id) &&
       runOf(before.get(tn.id)) === runOf(tn) &&
-      JSON.stringify(before.get(tn.id)) !== JSON.stringify(tn),
+      JSON.stringify({ ...before.get(tn.id), description: "" }) !==
+        JSON.stringify({ ...tn, description: "" }),
   ).map((tn: any) => tn.device);
   return c.json({ tunnels: TUNNELS, restarted, updated });
 });
@@ -835,7 +849,14 @@ app.post(`${API_BASE}/tunnels/:id/restart`, (c) => {
   return c.json({ queued: true }, 202);
 });
 
-app.get(`${API_BASE}/system/interfaces`, (c) => c.json(INTERFACES));
+app.get(`${API_BASE}/system/interfaces`, (c) =>
+  c.json({
+    interfaces: INTERFACES.interfaces.map((item) => {
+      const description = TUNNELS.find((tn: any) => tn.device === item.id)?.description;
+      return description ? { ...item, name: description } : item;
+    }),
+  }),
+);
 
 app.get(`${API_BASE}/system/resolvers`, (c) => c.json(RESOLVERS));
 

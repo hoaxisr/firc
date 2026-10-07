@@ -149,6 +149,21 @@ describe("TunnelsStore load and dirty", () => {
     assert.strictEqual(store.canSave, false);
   });
 
+  // Catches a description edit missing from dirty tracking, or a tunnel without one reading dirty on load.
+  it("a description edit is a change and a missing one loads as empty", async () => {
+    const bare = tunnel("main") as Record<string, unknown>;
+    delete bare.description;
+    stub({ "/tunnels": { tunnels: [bare] } });
+    const store = new TunnelsStore();
+    await store.load();
+    assert.strictEqual(store.data[0].description, "");
+    assert.strictEqual(store.canSave, false);
+    store.data[0].description = "PRAW-1";
+    assert.strictEqual(store.canSave, true);
+    store.data[0].description = "";
+    assert.strictEqual(store.canSave, false);
+  });
+
   // Catches an edit in a source, or a swap of two, not marking the set dirty.
   it("a source edit and a source swap are both changes", async () => {
     const two = tunnel("main", {

@@ -10,6 +10,7 @@
 #define FIRC_TUN_MAX_SOURCES 256
 #define FIRC_TUN_MAX_KEYS 1024
 #define FIRC_TUN_KEY_MAX 191
+#define FIRC_TUN_DESCRIPTION_MAX 63
 
 typedef enum { FIRC_UPLINK_AUTO, FIRC_UPLINK_IFACE, FIRC_UPLINK_TUNNEL } firc_uplink_kind_t;
 
@@ -31,6 +32,7 @@ typedef struct {
 typedef struct {
     char id[16];
     char device[16];
+    char description[FIRC_TUN_DESCRIPTION_MAX + 1];
     bool enable;
     firc_uplink_kind_t uplink;
     char uplink_ref[16];

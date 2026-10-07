@@ -528,6 +528,84 @@ TEST same_run_ignores_filter_order_and_exclude(void) {
     PASS();
 }
 
+static int save_and_reload(const char *doc, firc_tunnels_t *b, char *file, size_t cap)
+{
+    firc_tunnels_t a = {0};
+    firc_tun_err_t e = {0};
+    char path[] = "/tmp/tconfig-XXXXXX";
+    int fd = mkstemp(path);
+    close(fd);
+    int ok = firc_tunnels_load_buffer(&a, doc, strlen(doc), &e) == FIRC_OK && firc_tunnels_save_file(&a, path) == FIRC_OK &&
+             firc_tunnels_load_file(b, path, &e) == FIRC_OK;
+    FILE *f = fopen(path, "r");
+    size_t n = f != NULL ? fread(file, 1, cap - 1, f) : 0;
+    file[n] = '\0';
+    if (f != NULL) {
+        fclose(f);
+    }
+    unlink(path);
+    firc_tunnels_free(&a);
+    return ok;
+}
+
+/* catches: a description dropped, cut or altered by YAML quoting on save and load */
+TEST a_description_survives_save_and_load(void) {
+    static const char doc[] =
+        "tunnels:\n  - id: a1\n    device: tunvless0\n    description: \"\xd0\x9f\xd0\xa0\xd0\x90\xd0\x92-1: \\\"x\\\" #y\"\n"
+        "    sources:\n" LINK;
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(doc, &b, file, sizeof file));
+    ASSERT_STR_EQ("\xd0\x9f\xd0\xa0\xd0\x90\xd0\x92-1: \"x\" #y", b.t[0].description);
+    firc_tunnels_free(&b);
+    PASS();
+}
+
+/* catches: an absent description loaded as something, or written back as an empty key */
+TEST no_description_is_empty_and_not_written(void) {
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(ONE, &b, file, sizeof file));
+    ASSERT_STR_EQ("", b.t[0].description);
+    ASSERT(strstr(file, "description") == NULL);
+    firc_tunnels_free(&b);
+    PASS();
+}
+
+/* catches: the 63-byte limit counted in characters, off by one, or a description over it accepted */
+TEST a_description_over_63_bytes_is_refused(void) {
+    char extra[256];
+    char cyr[80] = "";
+    for (int i = 0; i < 31; i++) {
+        strcat(cyr, "\xd0\x9f");
+    }
+    snprintf(extra, sizeof extra, "    description: \"%s1\"\n", cyr);
+    ASSERT(loads_extra(extra));
+    snprintf(extra, sizeof extra, "    description: \"%s\xd0\x9f\"\n", cyr);
+    ASSERT(with_extra(extra, "tunnels[0].description", "63 bytes"));
+    snprintf(extra, sizeof extra, "    description: \"%s12\"\n", cyr);
+    ASSERT(with_extra(extra, "tunnels[0].description", "63 bytes"));
+    PASS();
+}
+
+/* catches: a tab, newline, DEL or C1 control character in a description accepted */
+TEST a_description_with_a_control_character_is_refused(void) {
+    static const char *const bad[] = {"a\\tb", "a\\nb", "\\x01", "a\\x7f", "a\\u009b"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char extra[128];
+        snprintf(extra, sizeof extra, "    description: \"%s\"\n", bad[i]);
+        ASSERTm(bad[i], with_extra(extra, "tunnels[0].description", "control"));
+    }
+    ASSERT(loads_extra("    description: \"a b\"\n"));
+    PASS();
+}
+
+/* catches: a description edit restarting tunvless or resending its nodes */
+TEST same_run_ignores_the_description(void) {
+    ASSERT_EQ(3, same_after("active: 1", "active: 1\n    description: x"));
+    PASS();
+}
+
 /* catches: a ninth tunnel accepted past the cap */
 TEST nine_tunnels_are_refused(void) {
     char doc[16384] = "tunnels:\n";
@@ -745,6 +823,11 @@ int main(int argc, char **argv) {
     RUN_TEST(a_long_order_or_exclude_key_is_refused);
     RUN_TEST(same_run_ignores_filter_order_and_exclude);
     RUN_TEST(nine_tunnels_are_refused);
+    RUN_TEST(a_description_survives_save_and_load);
+    RUN_TEST(no_description_is_empty_and_not_written);
+    RUN_TEST(a_description_over_63_bytes_is_refused);
+    RUN_TEST(a_description_with_a_control_character_is_refused);
+    RUN_TEST(same_run_ignores_the_description);
     RUN_TEST(same_run_is_false_when_only_active_differs);
     RUN_TEST(same_run_is_false_when_only_enable_differs);
     RUN_TEST(same_run_is_false_when_a_link_differs);

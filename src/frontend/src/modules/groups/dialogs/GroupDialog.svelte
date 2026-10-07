@@ -416,7 +416,7 @@
 
   <div slot="actions" class="group-dialog-actions">
     <div class="button-container">
-      <Button onclick={handleSubmit} disabled={!canSubmit} style="width: 100%">
+      <Button onclick={handleSubmit} disabled={!canSubmit} class="primary" style="width: 100%">
         {mode === "create" ? t("Create") : t("Save")}
       </Button>
     </div>

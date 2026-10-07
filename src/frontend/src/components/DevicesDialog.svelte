@@ -4,6 +4,7 @@
   import { fetchHosts, hosts } from "../data/hosts.svelte";
   import { t } from "../data/locale.svelte";
   import { fetchPolicies, policies } from "../data/policies.svelte";
+  import { loadSettings, settings } from "../modules/settings/settings.svelte";
   import Button from "./ui/Button.svelte";
   import GenericDialog from "./ui/GenericDialog.svelte";
   import Switch from "./ui/Switch.svelte";
@@ -29,7 +30,7 @@
     type RowNote,
   } from "../utils/device-picker";
   import { invalidDeviceEntries } from "../utils/device-validators";
-  import { Search, SelectOpen } from "./ui/icons";
+  import { Info, Search, SelectOpen } from "./ui/icons";
 
   type DevicesTarget = { id: string; devices: DeviceSelector };
 
@@ -54,7 +55,16 @@
     if (open) {
       void fetchPolicies();
       void fetchHosts();
+      if (!settings.loaded) void loadSettings();
     }
+  });
+
+  let helpOpen = $state(false);
+  let clampText = $derived.by(() => {
+    const secs = Number(settings.saved["app.addressPool.ttlClamp"] ?? 300);
+    return secs % 60 === 0
+      ? t("{n} min").replace("{n}", String(secs / 60))
+      : t("{n} s").replace("{n}", String(secs));
   });
 
   const toLines = (entries: string[]) => entries.join("\n");
@@ -80,11 +90,7 @@
     seededMacs = [...picked.macs.keys()];
     chosenMode = selectorMode(picked);
     query = "";
-    /* a line the daemon would refuse is not hidden behind a closed block */
-    manualOpen =
-      noHosts ||
-      invalidDeviceEntries(picked.manual.allow).length > 0 ||
-      invalidDeviceEntries(picked.manual.deny).length > 0;
+    manualOpen = noHosts || picked.manual.allow.length + picked.manual.deny.length > 0;
     seededFor = target.id;
   });
 
@@ -166,7 +172,37 @@
 </script>
 
 <GenericDialog {open} title={t("Devices")} maxWidth={640} on:close={close} on:submit={submit}>
+  <button
+    slot="title"
+    type="button"
+    class="help-toggle"
+    aria-label={t("How the device choice works")}
+    aria-expanded={helpOpen}
+    aria-controls="devices-help"
+    onclick={() => (helpOpen = !helpOpen)}><Info size={18} /></button
+  >
   <div slot="body" class="dialog-body">
+    {#if helpOpen}
+      <section id="devices-help" class="block help">
+        <div class="label">{t("How the device choice works")}</div>
+        <p>
+          {t(
+            "For a denied device the group is as if switched off. Its DNS queries get the ordinary answer, and its traffic goes straight out through the main internet, past the group's interface. This is not a block: a site the provider blocks will not open directly.",
+          )}
+        </p>
+        <p>
+          <strong>{t("A change does not take effect at once.")}</strong>
+          {t(
+            "A device that has already asked for a domain of the group keeps the address firc gave it in its DNS cache for up to {clamp}. Until that cache expires, the site will not open on a denied device: firc does not let its addresses past the group. Flushing the device's DNS cache or restarting the browser speeds it up.",
+          ).replace("{clamp}", clampText)}
+        </p>
+        <p>
+          {t(
+            "The other way round too: a device just allowed goes direct until the TTL of the answer it got earlier expires.",
+          )}
+        </p>
+      </section>
+    {/if}
     <section class="block">
       <div class="seg" role="group" aria-label={t("Who the group works for")}>
         <button
@@ -371,7 +407,7 @@
       type="submit"
       disabled={nothingChosen}
       aria-describedby={nothingChosen ? "devices-done-hint" : undefined}
-      style="color: var(--text); font-size: 1rem;"
+      class="primary"
     >
       {t("Done")}
     </Button>
@@ -452,6 +488,32 @@
   .seg button:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+
+  .help-toggle {
+    display: inline-flex;
+    vertical-align: middle;
+    margin-left: 0.4rem;
+    padding: 0.1rem;
+    border: none;
+    background: none;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  .help-toggle:hover,
+  .help-toggle[aria-expanded="true"] {
+    color: var(--accent);
+  }
+
+  .help p {
+    font-size: 0.85em;
+    color: var(--text-2);
+    margin: 0;
+  }
+
+  .help strong {
+    color: var(--text);
   }
 
   .hint {

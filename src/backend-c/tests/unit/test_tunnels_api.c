@@ -466,7 +466,7 @@ static bool wait_for_status(const char *id, const char *status, int ms)
 }
 
 #define FULL_TUN                                                                                    \
-    "tunnels:\n  - id: a\n    device: tunvless0\n    sources:\n"                                    \
+    "tunnels:\n  - id: a\n    device: tunvless0\n    description: PRAW-1\n    sources:\n"               \
     "      - id: 0000000a\n        link: \"" LINK_A "\"\n"                                           \
     "      - id: 0000000b\n        subscription: { name: P, url: \"" SUB_URL "\", interval: 1h }\n"   \
     "    filter: \"^(A|B)$\"\n    order: [\"0000000b:B\"]\n    exclude: [\"0000000b:C\"]\n"          \
@@ -481,7 +481,7 @@ TEST get_answers_every_tunnel_in_the_agreed_shape(void)
     cJSON *ans = NULL;
     ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &ans));
     ASSERT(same_json(ans,
-                     "{\"tunnels\":[{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":true,"
+                     "{\"tunnels\":[{\"id\":\"a\",\"device\":\"tunvless0\",\"description\":\"PRAW-1\",\"enable\":true,"
                      "\"uplink\":{\"kind\":\"auto\",\"ref\":\"\"},"
                      "\"sources\":[{\"id\":\"0000000a\",\"kind\":\"link\",\"link\":\"" LINK_A "\"},"
                      "{\"id\":\"0000000b\",\"kind\":\"subscription\",\"name\":\"P\",\"url\":\"" SUB_URL "\","
@@ -489,7 +489,7 @@ TEST get_answers_every_tunnel_in_the_agreed_shape(void)
                      "\"filter\":\"^(A|B)$\",\"order\":[\"0000000b:B\"],\"exclude\":[\"0000000b:C\"],"
                      "\"active\":2,\"by\":\"site\",\"interval\":30,\"silence\":10,"
                      "\"advanced\":{\"timeout\":5,\"insecure\":true,\"ca\":\"/etc/ca.pem\"}},"
-                     "{\"id\":\"b\",\"device\":\"tunvless1\",\"enable\":false,"
+                     "{\"id\":\"b\",\"device\":\"tunvless1\",\"description\":\"\",\"enable\":false,"
                      "\"uplink\":{\"kind\":\"iface\",\"ref\":\"eth9\"},\"sources\":[],"
                      "\"filter\":\"\",\"order\":[],\"exclude\":[],"
                      "\"active\":1,\"by\":\"connection\",\"interval\":60,\"silence\":20,"
@@ -1002,6 +1002,53 @@ TEST wrong_json_types_are_refused_with_their_field(void)
     PASS();
 }
 
+/* catches: a description over 63 bytes or with a control character saved instead of refused with its field */
+TEST a_bad_description_is_refused_with_its_field(void)
+{
+    ASSERT(hx_start(NULL, 0) != NULL);
+    char long_desc[200];
+    snprintf(long_desc, sizeof long_desc,
+             "{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"description\":\"%064d\"}", 0);
+    static const char *const ctl = "{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"description\":\"a\\u0007\"}";
+    const char *const cases[] = {long_desc, ctl};
+    for (size_t i = 0; i < 2; i++) {
+        cJSON *ans = NULL;
+        ASSERT_EQm(cases[i], 400, put_field_error(cases[i], &ans));
+        ASSERT_STR_EQm(cases[i], "description", at(ans, "field")->valuestring);
+        ASSERT_STR_EQm(cases[i], "a", at(ans, "tunnel")->valuestring);
+        cJSON_Delete(ans);
+    }
+    cJSON *ans = NULL;
+    ASSERT_EQ(400, put_field_error("{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"description\":3}", &ans));
+    ASSERT(same_json(ans, "{\"error\":\"must be a string\",\"field\":\"description\",\"tunnel\":\"a\"}"));
+    cJSON_Delete(ans);
+    ASSERT_EQ(-1, access(g_hx->path, F_OK));
+    PASS();
+}
+
+/* catches: a description edit not saved, or restarting or updating the running tunvless */
+TEST a_description_edit_is_saved_and_restarts_nothing(void)
+{
+    ASSERT(hx_start(FULL_TUN, 0) != NULL);
+    cJSON *got = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &got));
+    cJSON *a = (cJSON *)tunnel_named(got, "a");
+    ASSERT(cJSON_ReplaceItemInObjectCaseSensitive(a, "description", cJSON_CreateString("\xd0\x9f\xd0\xa0\xd0\x90\xd0\x92")));
+    char *body = cJSON_PrintUnformatted(got);
+    cJSON_Delete(got);
+    cJSON *put = NULL;
+    ASSERT_EQ(200, call_api("PUT", "/api/v1/tunnels", body, &put));
+    free(body);
+    ASSERT(same_json(at(put, "restarted"), "[]"));
+    ASSERT(same_json(at(put, "updated"), "[]"));
+    cJSON_Delete(put);
+    firc_tunnels_t saved = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_file(&saved, g_hx->path, NULL));
+    ASSERT_STR_EQ("\xd0\x9f\xd0\xa0\xd0\x90\xd0\x92", saved.t[0].description);
+    firc_tunnels_free(&saved);
+    PASS();
+}
+
 /* catches: a GET answer that a PUT does not take back unchanged, or source ids that drift on the way */
 TEST a_get_answer_put_back_reads_the_same(void)
 {
@@ -1044,6 +1091,8 @@ SUITE(tunnels_api)
     RUN_TEST(the_routes_need_a_session);
     RUN_TEST(wrong_json_types_are_refused_with_their_field);
     RUN_TEST(a_get_answer_put_back_reads_the_same);
+    RUN_TEST(a_bad_description_is_refused_with_its_field);
+    RUN_TEST(a_description_edit_is_saved_and_restarts_nothing);
 }
 
 GREATEST_MAIN_DEFS();

@@ -603,6 +603,10 @@ definitions:
       id:
         example: nwg0
         type: string
+      name:
+        description: 'Friendly name: the tunnel description for a tunvless device, else the Keenetic interface description; absent when none'
+        example: PRAW-1
+        type: string
     type: object
   types.InterfaceResolvers:
     properties:
@@ -876,6 +880,10 @@ definitions:
         - site
         - site-client
         example: connection
+        type: string
+      description:
+        description: 'Free text shown next to the device, up to 63 bytes of UTF-8, no control characters; empty for none'
+        example: PRAW-1
         type: string
       device:
         description: 'tunvless<N>, N 0..99, unique'

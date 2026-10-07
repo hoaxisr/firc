@@ -137,6 +137,7 @@ def run_tunnel_sequence(t, conn):
             {
                 "id": "t1",
                 "device": "tunvless0",
+                "description": "PRAW-1",
                 "sources": [
                     {"id": "0000000a", "kind": "link", "link": TUN_LINK},
                     {"id": "0000000b", "kind": "subscription", "name": "Stub", "url": STUB_TUN_URL,

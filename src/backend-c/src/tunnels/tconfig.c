@@ -240,6 +240,16 @@ static bool sub_name_ok(const char *s)
     return true;
 }
 
+static bool description_ok(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
+        if (*p < 0x20 || *p == 0x7f || (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static firc_err_t parse_sub(ctx_t *c, node_t *m, size_t ti, size_t i, firc_tun_sub_t *sub)
 {
     char section[48];
@@ -569,6 +579,10 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
         } else if (strcmp(key, "device") == 0) {
             if (!copy_str(v, t->device, sizeof t->device)) {
                 return fail(c, "must start with tunvless", "tunnels[%zu].device", ti);
+            }
+        } else if (strcmp(key, "description") == 0) {
+            if (!copy_str(v, t->description, sizeof t->description) || !description_ok(t->description)) {
+                return fail(c, "up to 63 bytes, no control characters", "tunnels[%zu].description", ti);
             }
         } else if (strcmp(key, "enable") == 0) {
             if (!parse_bool(v, &t->enable)) {
@@ -925,6 +939,9 @@ static void emit_tunnel(em_t *e, const firc_tunnel_t *t)
     map_start(e);
     kv(e, "id", t->id, true);
     kv(e, "device", t->device, true);
+    if (t->description[0] != '\0') {
+        kv(e, "description", t->description, true);
+    }
     kv(e, "enable", t->enable ? "true" : "false", false);
     if (t->uplink == FIRC_UPLINK_AUTO) {
         snprintf(b, sizeof b, "auto");

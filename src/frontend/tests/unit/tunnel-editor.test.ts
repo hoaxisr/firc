@@ -3,6 +3,7 @@ import { describe, it } from "jsr:@std/testing@1.0.19/bdd";
 
 import {
   agoText,
+  descriptionProblem,
   deviceProblem,
   formatRate,
   keepHidden,
@@ -301,6 +302,32 @@ describe("device names", () => {
     assert.strictEqual(deviceProblem("eth0", set, "t0") !== null, true);
     assert.strictEqual(deviceProblem("tunvless0", set, "t0"), null);
     assert.strictEqual(deviceProblem("tunvless99", set, "t0"), null);
+  });
+});
+
+describe("the description field", () => {
+  // Catches the 63-byte limit counted in characters, which lets 40 Cyrillic letters through to a 400.
+  it("counts the limit in UTF-8 bytes, not characters", () => {
+    assert.strictEqual(descriptionProblem("", t), null);
+    assert.strictEqual(descriptionProblem("a".repeat(63), t), null);
+    assert.notStrictEqual(descriptionProblem("a".repeat(64), t), null);
+    assert.strictEqual(descriptionProblem("П".repeat(31) + "1", t), null);
+    assert.notStrictEqual(descriptionProblem("П".repeat(32), t), null);
+  });
+
+  // Catches a tab, newline, DEL or C1 control character passed on for the daemon to refuse.
+  it("refuses control characters", () => {
+    for (const bad of ["a\tb", "a\nb", "\u0001", "a\u007f", "a\u009b"]) {
+      assert.notStrictEqual(descriptionProblem(bad, t), null, JSON.stringify(bad));
+    }
+    assert.strictEqual(descriptionProblem("ПРАВ-1: NL «x»", t), null);
+  });
+
+  // Catches a description edit announced as a restart, though the daemon restarts nothing for it.
+  it("names no restart for a description edit", () => {
+    const before = [tn("a", "tunvless0")];
+    const after = [tn("a", "tunvless0", { description: "PRAW-1" })];
+    assert.deepStrictEqual(restartingDevices(before, after), []);
   });
 });
 

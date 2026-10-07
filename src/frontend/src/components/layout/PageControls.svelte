@@ -10,6 +10,7 @@
     search: Snippet;
     addLabel: string;
     canSave: boolean;
+    saveError?: string;
     controlsClass?: string;
     actionsClass?: string;
     onAdd: () => void;
@@ -28,6 +29,7 @@
     addLabel,
     actionsClass = "",
     canSave,
+    saveError,
     controlsClass = "",
     exportLabel,
     importAccept = ".firc",
@@ -51,8 +53,13 @@
   </div>
 
   <div class={`page-controls-actions ${actionsClass}`}>
-    <Tooltip value={saveLabel}>
-      <Button onclick={onSave} id={saveButtonId} class="accent" inactive={!canSave}>
+    <Tooltip value={saveError ?? saveLabel}>
+      <Button
+        onclick={onSave}
+        id={saveButtonId}
+        class={saveError ? "accent fail" : "accent"}
+        inactive={!canSave && !saveError}
+      >
         <Save size={22} />
       </Button>
     </Tooltip>

@@ -16,6 +16,7 @@
 
 static _Atomic int g_level = FIRC_LOG_INFO;
 static _Atomic int g_fd = STDOUT_FILENO;
+static _Atomic int g_output_floor = FIRC_LOG_TRACE;
 
 void firc_log_set_level(firc_log_level_t level)
 {
@@ -31,6 +32,11 @@ firc_log_level_t firc_log_level(void)
 void firc_log_set_fd(int fd)
 {
     atomic_store_explicit(&g_fd, fd, memory_order_relaxed);
+}
+
+void firc_log_set_output_floor(firc_log_level_t floor)
+{
+    atomic_store_explicit(&g_output_floor, (int)floor, memory_order_relaxed);
 }
 
 void firc_log_nonblocking(void)
@@ -124,6 +130,9 @@ void firc_log(firc_log_level_t level, const char *fmt, ...)
     }
     /* Before the write, text only: the UI renders its own timestamp and level. */
     firc_event_put_log(level, (int64_t)ts.tv_sec, buf + off);
+    if ((int)level < atomic_load_explicit(&g_output_floor, memory_order_relaxed)) {
+        return;
+    }
 
     buf[len] = '\n';
     len += 1;

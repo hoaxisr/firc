@@ -16,6 +16,12 @@
   import { Cable, LayoutList, Logs, Menu, Settings } from "../ui/icons";
 
   const TABS = ["groups", "tunnels", "logs", "settings"];
+  const TAB_TITLES: Record<string, string> = {
+    groups: "Groups",
+    tunnels: "Tunnels",
+    logs: "Journal",
+    settings: "Settings",
+  };
   const lastActiveTab = persistedState("active_tab", "groups");
   let active_tab = $state(TABS.includes(lastActiveTab.current) ? lastActiveTab.current : "groups");
   let isMenuOpen = $state(false);
@@ -39,6 +45,15 @@
 
 <main>
   <Tabs.Root bind:value={active_tab}>
+    {#if isMenuOpen}
+      <button
+        type="button"
+        class="menu-backdrop"
+        aria-label={t("Close menu")}
+        tabindex="-1"
+        onclick={closeMenu}
+      ></button>
+    {/if}
     <nav>
       <div class="nav-left">
         <button
@@ -52,6 +67,7 @@
             <Menu size={24} />
           </span>
         </button>
+        <span class="mobile-title">{t(TAB_TITLES[active_tab])}</span>
 
         <div class="tabs-panel" class:open={isMenuOpen}>
           <Tabs.List>
@@ -132,9 +148,13 @@
   .nav-left {
     display: flex;
     align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
   }
 
-  .mobile-dropdown-btn {
+  .mobile-dropdown-btn,
+  .mobile-title,
+  .menu-backdrop {
     display: none;
   }
 
@@ -200,15 +220,38 @@
       -webkit-tap-highlight-color: transparent;
     }
 
+    nav {
+      z-index: 11;
+    }
+
+    .mobile-title {
+      display: block;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .menu-backdrop {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 9;
+      border: 0;
+      padding: 0;
+      background: rgba(0, 0, 0, 0.45);
+    }
+
     .tabs-panel {
       position: absolute;
-      top: 100%;
+      top: calc(100% + 0.3rem);
       left: 0;
-      right: 0;
-      background: var(--bg-dark);
-      border-top: 1px solid var(--border-light);
-      border-bottom: 1px solid var(--border-light);
-      padding: 1rem 0.7rem;
+      width: min(16rem, 100%);
+      background: var(--bg-light);
+      border: 1px solid var(--border-light);
+      border-radius: 0.75rem;
+      box-shadow: var(--shadow-popover);
+      padding: 0.35rem;
       display: flex;
       flex-direction: column;
       opacity: 0;
@@ -238,19 +281,33 @@
 
     :global([data-tabs-list]) {
       flex-direction: column;
-      gap: 1.2rem;
-      align-items: flex-start;
+      gap: 0.15rem;
+      align-items: stretch;
     }
 
     :global([data-tabs-trigger]) {
-      font-size: 1.5rem;
+      font-size: 1.1rem;
       font-weight: 500;
       border-bottom: none;
-      padding: 0;
+      border-radius: 0.5rem;
+      padding: 0.65rem 0.75rem;
       width: 100%;
       justify-content: flex-start;
-      gap: 0.8rem;
+      gap: 0.75rem;
       line-height: 1;
+    }
+
+    :global([data-tabs-trigger][data-state="active"]) {
+      background: color-mix(in oklab, var(--accent) 14%, transparent);
+    }
+
+    :global([data-tabs-trigger]:hover) {
+      background: var(--bg-light-extra);
+    }
+
+    .tab-icon :global(svg) {
+      width: 20px;
+      height: 20px;
     }
   }
 

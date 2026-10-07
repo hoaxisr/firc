@@ -28,6 +28,7 @@ export function normalizeTunnel(raw: Partial<Tunnel>): Tunnel {
   return {
     id: raw.id ?? "",
     device: raw.device ?? "",
+    description: raw.description ?? "",
     enable: raw.enable ?? true,
     active: raw.active ?? 1,
     by: raw.by ?? "connection",

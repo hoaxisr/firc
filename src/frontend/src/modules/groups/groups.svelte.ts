@@ -51,6 +51,24 @@ export function normalizeListUrl(value: string) {
   return (value ?? "").trim();
 }
 
+export function ruleIsInvalid(rule: Rule): boolean {
+  if (rule.proto || rule.ports) {
+    if (!ruleTakesPorts(rule.type) || !rule.proto) return true;
+    if (rule.ports && !isValidPorts(rule.ports)) return true;
+  }
+  const validator = VALIDATOP_MAP[rule.type];
+  return !rule.rule || !validator || !validator(rule.rule);
+}
+
+export function invalidRulesByGroup(groups: Group[]): Map<string, string[]> {
+  const byGroup = new Map<string, string[]>();
+  for (const group of groups) {
+    const ids = (group.rules ?? []).filter(ruleIsInvalid).map((rule) => rule.id);
+    if (ids.length > 0) byGroup.set(group.id, ids);
+  }
+  return byGroup;
+}
+
 export function isValidListUrl(value: string) {
   const normalized = normalizeListUrl(value);
   if (!normalized) return false;
@@ -165,7 +183,6 @@ export class GroupsStore {
   tracker = $state(new ChangeTracker<Group[]>([]));
   data = $derived.by(() => this.tracker.data);
   dataRevision = $state(0);
-  valid_rules = $state(true);
 
   lists = new ListsController((id) => this.data.find((group) => group.id === id), {
     listGroups: () => this.data.filter((group) => Boolean(group.list)),
@@ -216,28 +233,12 @@ export class GroupsStore {
     return false;
   }
 
-  allRulesRoutable = $derived.by(() => {
-    for (const group of this.tracker.data) {
-      for (const rule of group.rules ?? []) {
-        if (rule.proto || rule.ports) {
-          if (!ruleTakesPorts(rule.type)) return false;
-          if (!rule.proto) return false;
-          if (rule.ports && !isValidPorts(rule.ports)) return false;
-        }
-        if (!rule.rule) continue;
-        const validator = VALIDATOP_MAP[rule.type];
-        if (!validator) return false;
-        if (!validator(rule.rule)) return false;
-      }
-    }
-    return true;
-  });
+  invalidRules = $derived(invalidRulesByGroup(this.tracker.data));
   /* A getter, not $derived: lists state changes behind it between reads. */
   get canSave() {
     return (
       (this.tracker.isDirty || this.lists.hasPendingEdits || this.hasListMetaEdits) &&
-      this.valid_rules &&
-      this.allRulesRoutable &&
+      this.invalidRules.size === 0 &&
       this.validListUrls &&
       !this.lists.syncBlockingSave
     );
@@ -542,12 +543,6 @@ export class GroupsStore {
       });
 
       $effect(() => {
-        this.dataRevision;
-        if (typeof window === "undefined") return;
-        setTimeout(() => this.checkRulesValidityState(), 10);
-      });
-
-      $effect(() => {
         const query = this.normalizedSearch;
         this.dataRevision;
         this.data.length;
@@ -666,9 +661,6 @@ export class GroupsStore {
       this.tracker = new ChangeTracker(fetched);
       this.dataRevision = 0;
       this.resetListMetaBaseline(fetched);
-      if (typeof window !== "undefined") {
-        setTimeout(() => this.checkRulesValidityState(), 10);
-      }
 
       for (const group of fetched) {
         const state = group.list?.sync?.state;
@@ -691,7 +683,7 @@ export class GroupsStore {
 
   handleSaveShortcut = (event: KeyboardEvent) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-      if (this.canSave) {
+      if (this.canSave || this.invalidRules.size > 0) {
         event.preventDefault();
         this.saveChanges();
       }
@@ -1032,6 +1024,10 @@ export class GroupsStore {
   #saving = false;
 
   async saveChanges() {
+    if (this.invalidRules.size > 0) {
+      this.revealInvalidRule();
+      return;
+    }
     if (!this.canSave) return;
     if (this.#saving) return;
     this.#saving = true;
@@ -1124,9 +1120,12 @@ export class GroupsStore {
     }
   }
 
-  checkRulesValidityState = () => {
-    if (typeof document === "undefined") return;
-    this.valid_rules = !document.querySelector(".rule input.invalid");
+  revealInvalidRule = () => {
+    const first = this.data.find((group) => this.invalidRules.has(group.id));
+    const ruleId = first && this.invalidRules.get(first.id)?.[0];
+    if (!first || !ruleId) return;
+    toast.error(t("Fill in or fix the highlighted rules before saving"));
+    this.requestDuplicateRuleFocus(first.id, ruleId);
   };
 
   #sortDuplicateConflicts(conflicts: GroupDuplicateConflict[]) {
@@ -1415,9 +1414,6 @@ export class GroupsStore {
     if (!group) return;
     group.rules.unshift(rule);
     this.markDataRevision();
-    if (!rule.rule) {
-      this.valid_rules = false;
-    }
     if (this.searchActive) {
       this.forceVisibleRule(group.id, rule.id);
     }
@@ -1431,7 +1427,6 @@ export class GroupsStore {
       el.querySelector<HTMLInputElement>("div.pattern input.pattern-input")?.classList.add(
         "invalid",
       );
-      this.checkRulesValidityState();
     }
   }
 

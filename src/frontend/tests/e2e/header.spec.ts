@@ -12,6 +12,22 @@ test.describe("Header Settings", () => {
     await page.goto("/");
   });
 
+  // Catches a phone menu that hides which page is open, cannot be dismissed by a tap outside, or leaves its backdrop behind.
+  test("on a phone the menu names the page and a tap outside closes it", async ({ page }) => {
+    await page.setViewportSize({ width: 400, height: 760 });
+    const button = page.locator(".mobile-dropdown-btn");
+    await expect(page.locator(".mobile-title")).toHaveText("Groups");
+    await button.click();
+    await expect(button).toHaveAttribute("aria-expanded", "true");
+    await page.mouse.click(380, 700);
+    await expect(button).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator(".menu-backdrop")).toHaveCount(0);
+    await button.click();
+    await page.getByRole("tab", { name: "Journal" }).click();
+    await expect(page.locator(".mobile-title")).toHaveText("Journal");
+    await expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
   test("should display version", async ({ page }) => {
     const version = page.locator(".version .version-text");
     await expect(version).toBeVisible();

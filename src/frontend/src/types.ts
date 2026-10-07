@@ -153,6 +153,7 @@ export type TunnelAdvanced = { ca: string; insecure: boolean; timeout: number };
 export type Tunnel = {
   id: string;
   device: string;
+  description: string;
   enable: boolean;
   active: number;
   by: "connection" | "site" | "site-client";

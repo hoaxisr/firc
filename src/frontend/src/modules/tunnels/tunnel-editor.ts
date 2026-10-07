@@ -155,6 +155,16 @@ export function deviceProblem(
   return null;
 }
 
+export const DESCRIPTION_MAX_BYTES = 63 as const;
+
+export function descriptionProblem(text: string, t: T): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(text)) return t("No control characters");
+  if (new TextEncoder().encode(text).length > DESCRIPTION_MAX_BYTES) {
+    return t("At most 63 bytes: 63 Latin or 31 Cyrillic letters");
+  }
+  return null;
+}
+
 export function linkName(link: string): string {
   const hash = link.indexOf("#");
   if (hash >= 0 && hash < link.length - 1) {

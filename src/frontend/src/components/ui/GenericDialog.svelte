@@ -28,7 +28,7 @@
   >
     {#snippet child({ props })}
       <div {...props} class="modal {contentClass}">
-        <Dialog.Title class="title">{title}</Dialog.Title>
+        <Dialog.Title class="title">{title}<slot name="title" /></Dialog.Title>
         <Dialog.Close class="close">
           <Add size={22} style="transform:rotate(45deg)" />
         </Dialog.Close>

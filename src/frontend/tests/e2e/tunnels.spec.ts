@@ -43,6 +43,7 @@ test.describe("Tunnels page", () => {
           {
             id: "tunnel1",
             device: "tunvless0",
+            description: "",
             enable: true,
             active: 1,
             by: "connection",
@@ -71,6 +72,51 @@ test.describe("Tunnels page", () => {
     await tunnels.tab("Groups").click();
     await page.locator(".iface-select [data-select-trigger]").first().click();
     await expect(page.locator('[data-select-item][data-value="tunvless0"]')).toBeVisible();
+  });
+
+  // Catches a description not sent in the save, missing from the card header, or not shown in the group interface list.
+  test("a description is saved, shown on the card and named in the group interface list", async ({
+    page,
+  }) => {
+    const daemon = await stubDaemon(page, {
+      interfaces: ["wg0", "tunvless0"],
+      tunnels: [tunnel("a", "tunvless0", { enable: false })],
+      groups: [
+        {
+          id: "aaaaaaaa",
+          name: "g",
+          interface: "wg0",
+          enable: true,
+          rules: [],
+          devices: { allow: [], deny: [] },
+          resolve: { tunnel: true, server: "" },
+        },
+      ],
+    });
+    daemon.putAnswer = (body, route) => {
+      daemon.names = { tunvless0: body.tunnels[0].description };
+      return route.fulfill({ json: { tunnels: body.tunnels, restarted: [], updated: [] } });
+    };
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    const field = tunnels.card("a").getByRole("textbox", { name: "Description" });
+
+    await field.fill("П".repeat(32));
+    await expect(field).toHaveAttribute("aria-invalid", "true");
+    await expect(tunnels.card("a")).toContainText("At most 63 bytes");
+    await field.fill("PRAW-1");
+    await expect(field).toHaveAttribute("aria-invalid", "false");
+    await expect(tunnels.card("a").locator(".title-row input.description")).toHaveValue("PRAW-1");
+
+    await tunnels.save.click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(daemon.puts[0].tunnels[0].description).toBe("PRAW-1");
+
+    await tunnels.tab("Groups").click();
+    await page.locator(".iface-select [data-select-trigger]").first().click();
+    await expect(page.locator('[data-select-item][data-value="tunvless0"]')).toContainText(
+      "PRAW-1",
+    );
   });
 
   // Catches a state looked up by list position instead of the daemon's tunnel id, or a status word lost on the card.

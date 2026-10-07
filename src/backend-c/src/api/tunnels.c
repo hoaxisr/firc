@@ -126,6 +126,7 @@ static cJSON *tunnel_json(const firc_tunnel_t *t)
          cJSON_AddStringToObject(adv, "ca", t->ca) != NULL;
     ok = ok && cJSON_AddStringToObject(o, "id", t->id) != NULL &&
          cJSON_AddStringToObject(o, "device", t->device) != NULL &&
+         cJSON_AddStringToObject(o, "description", t->description) != NULL &&
          cJSON_AddBoolToObject(o, "enable", t->enable) != NULL;
     if (ok) {
         ok = put_item(o, "uplink", up);
@@ -387,7 +388,7 @@ static const jkey_t TUNNEL_KEYS[] = {
     {"id", T_STR},     {"device", T_STR},  {"enable", T_BOOL},  {"uplink", T_OBJ},
     {"sources", T_ARR}, {"filter", T_STR},  {"order", T_ARR},    {"exclude", T_ARR},
     {"active", T_NUM}, {"by", T_STR},      {"interval", T_NUM}, {"silence", T_NUM},
-    {"advanced", T_OBJ},
+    {"advanced", T_OBJ}, {"description", T_STR},
 };
 static const jkey_t UPLINK_KEYS[] = {{"kind", T_STR}, {"ref", T_STR}};
 static const jkey_t ADVANCED_KEYS[] = {{"timeout", T_NUM}, {"insecure", T_BOOL}, {"ca", T_STR}};

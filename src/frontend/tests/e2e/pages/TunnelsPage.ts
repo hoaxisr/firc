@@ -7,6 +7,7 @@ type Json = Record<string, any>;
 export const tunnel = (id: string, device: string, extra: Json = {}): Json => ({
   id,
   device,
+  description: "",
   enable: true,
   active: 1,
   by: "connection",
@@ -48,6 +49,7 @@ export type Daemon = {
   tunnels: Json[];
   states: Json[];
   interfaces: string[];
+  names: Record<string, string>;
   groups: Json[];
   puts: Json[];
   previews: Json[];
@@ -65,6 +67,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     tunnels: [],
     states: [],
     interfaces: ["wg0"],
+    names: {},
     groups: [],
     puts: [],
     previews: [],
@@ -81,7 +84,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
   await page.route("**/interfaces", (route) => {
     daemon.interfaceFetches++;
     return route.fulfill({
-      json: { interfaces: daemon.interfaces.map((id) => ({ id, name: id })) },
+      json: { interfaces: daemon.interfaces.map((id) => ({ id, name: daemon.names[id] ?? id })) },
     });
   });
   await page.route("**/groups?with_rules=true", (route) =>

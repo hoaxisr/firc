@@ -31,7 +31,7 @@
     Unplug,
   } from "../../../components/ui/icons";
   import { counted } from "../../../utils/plural";
-  import { formatRate } from "../tunnel-editor";
+  import { descriptionProblem, formatRate } from "../tunnel-editor";
   import { tunnelLook } from "../tunnel-state";
   import type { ClientTunnel } from "../tunnels-data";
 
@@ -43,6 +43,7 @@
   };
 
   let { store, tunnel = $bindable(), open, onOpenChange }: Props = $props();
+  const descriptionBad = $derived(descriptionProblem(tunnel.description, t));
 
   const ICONS = {
     CircleCheck,
@@ -130,6 +131,17 @@
       <div class="meta">
         <div class="title-row">
           <span class="title">{tunnel.device || tunnel.id}</span>
+          <input
+            type="text"
+            class="description"
+            maxlength="63"
+            placeholder={t("description...")}
+            aria-label={t("Description")}
+            title={descriptionBad ?? ""}
+            class:invalid={Boolean(descriptionBad)}
+            aria-invalid={Boolean(descriptionBad)}
+            bind:value={tunnel.description}
+          />
           {#if !saved}
             <span class="badge">{t("not saved")}</span>
           {:else if up && live}
@@ -151,6 +163,9 @@
             <span class="badge" class:toned style:--tone={look.color}>{look.label}</span>
           {/if}
         </div>
+        {#if descriptionBad}
+          <div class="description-error">{descriptionBad}</div>
+        {/if}
         <div class="line">
           {#if up && live}
             <ArrowDownUp size={15} />
@@ -263,6 +278,29 @@
   .title {
     font-size: 1.3rem;
     font-weight: 600;
+  }
+  .description {
+    flex: 0 1 16rem;
+    min-width: 6rem;
+    font: 400 1rem var(--font);
+    color: var(--text-2);
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid transparent;
+    padding: 0.1rem 0.2rem;
+  }
+  .description:hover,
+  .description:focus {
+    border-bottom-color: var(--bg-light-extra);
+    color: var(--text);
+    outline: none;
+  }
+  .description.invalid {
+    border-bottom-color: var(--red);
+  }
+  .description-error {
+    color: var(--red);
+    font-size: 0.8rem;
   }
   .line {
     display: flex;

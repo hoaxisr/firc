@@ -323,6 +323,17 @@ static void handle_netfilter(firc_http_req_t *req, firc_http_res_t *res, void *u
     firc_http_res_write_json(res, 200, out);
 }
 
+void firc_system_name_tunnels(firc_iface_info_t *ifaces, size_t n, const firc_tunnels_t *ts) {
+    for (size_t i = 0; ts != NULL && i < ts->n; i++) {
+        if (ts->t[i].description[0] == '\0') { continue; }
+        for (size_t j = 0; j < n; j++) {
+            if (strcmp(ifaces[j].id, ts->t[i].device) == 0) {
+                snprintf(ifaces[j].name, sizeof(ifaces[j].name), "%.63s", ts->t[i].description);
+            }
+        }
+    }
+}
+
 static void handle_list_interfaces(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     (void)req;
     firc_system_ctx_t *ctx = ud;
@@ -334,6 +345,7 @@ static void handle_list_interfaces(firc_http_req_t *req, firc_http_res_t *res, v
         firc_http_res_write_error(res, 500, firc_err_str(err));
         return;
     }
+    firc_system_name_tunnels(ifaces, n, ctx->tunnels);
 
     cJSON *out = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(out, "interfaces");

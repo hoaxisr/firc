@@ -53,7 +53,7 @@ test.describe("Groups Management", () => {
     await expect(page.locator(".rule")).toHaveCount(2);
     await expect(page.locator(".rule .pattern-input").first()).toHaveClass(/invalid/);
     await expect(page.locator(".rule .pattern-input").nth(1)).not.toHaveClass(/invalid/);
-    await expect(groupsPage.saveButton).toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).toHaveClass(/fail/);
   });
 
   // A group made through the dialog has no rules; there is no inline add with a default rule.
@@ -96,7 +96,7 @@ test.describe("Groups Management", () => {
     await groupsPage.setGroupName(0, "Valid Group");
     await groupsPage.setRulePattern(0, 0, "domain.com");
 
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
 
     let saveRequestReceived = false;
     await page.route("**/groups?save=true", async (route) => {
@@ -124,14 +124,14 @@ test.describe("Groups Management", () => {
     await groupsPage.setGroupName(0, "IPv6 Group");
     await groupsPage.setRulePattern(0, 0, "2001:db8::1");
 
-    await expect(groupsPage.saveButton).toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).toHaveClass(/fail/);
 
     await groupsPage.setRuleType(0, 0, "IPv6 subnet");
 
     await expect(
       (await groupsPage.getRule(0, 0)).locator(".pattern .pattern-input"),
     ).not.toHaveClass(/invalid/);
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
   });
 
   // Catches a subnet rule losing its protocol and ports on the round trip.
@@ -163,11 +163,11 @@ test.describe("Groups Management", () => {
 
     await groupsPage.setRulePorts(0, 0, "53,");
     await expect(ports).toHaveClass(/invalid/);
-    await expect(groupsPage.saveButton).toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).toHaveClass(/fail/);
 
     await groupsPage.setRulePorts(0, 0, "53,1000-2000");
     await expect(ports).not.toHaveClass(/invalid/);
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
 
     await groupsPage.save();
     await expect(page.getByText("Saved")).toBeVisible();
@@ -202,7 +202,7 @@ test.describe("Groups Management", () => {
     await groupsPage.setRulePattern(0, 0, "example.com");
     await expect((await groupsPage.getRule(0, 0)).locator(".ports-input")).toHaveCount(0);
 
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
     await groupsPage.save();
     await expect(page.getByText("Saved")).toBeVisible();
 
@@ -247,11 +247,11 @@ test.describe("Groups Management", () => {
     await expect(ports).toHaveClass(/invalid/);
 
     await groupsPage.setGroupName(0, "hand edited twice");
-    await expect(groupsPage.saveButton).toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).toHaveClass(/fail/);
 
     await groupsPage.setRuleProto(0, 0, "UDP");
     await expect(ports).not.toHaveClass(/invalid/);
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
   });
 
   // Catches an invalid rule on an unrendered page not holding Save; only a check over the data can.
@@ -289,7 +289,7 @@ test.describe("Groups Management", () => {
     await expect(page.locator(".rule input.invalid")).toHaveCount(0);
 
     await groupsPage.setGroupName(0, "big and edited");
-    await expect(groupsPage.saveButton).toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).toHaveClass(/fail/);
   });
 
   test("should delete a rule", async ({ page }) => {
@@ -378,7 +378,7 @@ test.describe("Groups Management", () => {
       await route.fulfill({ status: 200, json: {} });
     });
 
-    await expect(groupsPage.saveButton).not.toHaveClass(/inactive/);
+    await expect(groupsPage.saveButton).not.toHaveClass(/inactive|fail/);
     await groupsPage.save();
 
     await expect(page.getByText("Saved")).toBeVisible();

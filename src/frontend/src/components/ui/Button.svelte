@@ -113,6 +113,24 @@
       animation-play-state: running;
     }
 
+    &.primary {
+      background-color: color-mix(in oklab, var(--accent) 22%, var(--bg-light));
+      border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+      color: var(--text);
+      font-weight: 600;
+
+      &:hover:not(:disabled) {
+        background-color: color-mix(in oklab, var(--accent) 34%, var(--bg-light));
+      }
+
+      &:disabled {
+        background-color: var(--bg-light);
+        border-color: var(--bg-light-extra);
+        color: var(--text-2);
+        font-weight: 400;
+      }
+    }
+
     &.general {
       color: var(--text);
       font-size: 1rem;
@@ -166,6 +184,15 @@
 
     &.accent:hover {
       color: var(--accent);
+    }
+
+    &.accent.fail {
+      color: var(--red);
+    }
+
+    &.accent.fail::before {
+      background-image: conic-gradient(transparent 180deg, var(--red) 360deg);
+      animation-play-state: running;
     }
 
     &.accent:hover::after {
