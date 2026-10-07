@@ -49,6 +49,7 @@ export async function fetcher<T>(...args: any[]): Promise<T> {
     }
     return (await res.json()) as T;
   } catch (e) {
+    if ((e as Error)?.name === "AbortError") throw e;
     console.error("Fetch error:", e);
 
     if (!quiet && (e as Error).message !== "Unauthorized") {

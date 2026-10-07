@@ -1670,7 +1670,7 @@ firc_err_t firc_fakeip_save_file(const firc_fakeip_t *f, const char *path, bool 
     char tmp[512];
     if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) { return FIRC_ERR_INVAL; }
     /* fsync before rename, or a power cut can leave an empty file where the good one was. */
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) { return firc_err_from_errno(errno); }
     FILE *out = fdopen(fd, "w");
     if (out == NULL) {
@@ -1693,7 +1693,7 @@ firc_err_t firc_fakeip_save_file(const firc_fakeip_t *f, const char *path, bool 
 firc_err_t firc_fakeip_load_file(firc_fakeip_t *f, const char *path, int64_t now, size_t *restored) {
     if (restored != NULL) { *restored = 0; }
     if (f == NULL || path == NULL) { return FIRC_ERR_INVAL; }
-    FILE *in = fopen(path, "r");
+    FILE *in = fopen(path, "re");
     if (in == NULL) { return errno == ENOENT ? FIRC_ERR_NOENT : firc_err_from_errno(errno); }
     firc_err_t err = firc_fakeip_load(f, in, now, restored);
     fclose(in);

@@ -479,5 +479,6 @@ firc_err_t firc_loop_run(firc_loop_t *loop)
         loop->dispatching = false;
         graveyard_clear(loop);
     }
+    atomic_store(&loop->stopping, false);
     return FIRC_OK;
 }

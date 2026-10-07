@@ -136,3 +136,106 @@ export type Interfaces = {
     name?: string;
   }[];
 };
+
+export type TunnelUplink = { kind: "auto" | "iface" | "tunnel"; ref: string };
+
+export type TunnelSource = {
+  id: string;
+  kind: "link" | "subscription";
+  link?: string;
+  name?: string;
+  url?: string;
+  interval?: number;
+};
+
+export type TunnelAdvanced = { ca: string; insecure: boolean; timeout: number };
+
+export type Tunnel = {
+  id: string;
+  device: string;
+  enable: boolean;
+  active: number;
+  by: "connection" | "site" | "site-client";
+  interval: number;
+  silence: number;
+  filter: string;
+  order: string[];
+  exclude: string[];
+  sources: TunnelSource[];
+  uplink: TunnelUplink;
+  advanced: TunnelAdvanced;
+};
+
+export type TunnelsRes = { tunnels: Tunnel[]; restarted?: string[]; updated?: string[] };
+
+export type TunnelError = { error: string; field?: string | null; tunnel?: string | null };
+
+export type TunnelStatus =
+  | "off"
+  | "starting"
+  | "up"
+  | "no_node"
+  | "backoff"
+  | "bad_config"
+  | "waiting"
+  | "uplink_down";
+
+export type TunnelNodeState = {
+  key: string;
+  name: string;
+  source: string;
+  state: "active" | "down" | "reserve" | "excluded" | "missing" | "skipped";
+  since: number;
+  skipReason?: string;
+};
+
+export type TunnelSubState = {
+  name: string;
+  nodes: number;
+  fetching: boolean;
+  lastOk: number;
+  lastTry: number;
+  error: string;
+};
+
+export type TunnelState = {
+  id: string;
+  device: string;
+  status: TunnelStatus;
+  since: number;
+  backoffS: number;
+  lastExit: number;
+  uplinkOk: boolean;
+  active: string[];
+  groups: string[];
+  nodes: TunnelNodeState[];
+  subscriptions: TunnelSubState[];
+  rxBps: number;
+  txBps: number;
+};
+
+export type TunnelPreviewRow = {
+  key: string;
+  name: string;
+  source: string;
+  isNew: boolean;
+  missing: boolean;
+  excluded: boolean;
+  overCap: boolean;
+  skipReason?: string;
+};
+
+export type TunnelPreview = {
+  total: number;
+  matched: number;
+  nodes: TunnelPreviewRow[];
+  subscriptions: { name: string; cached: boolean }[];
+};
+
+export type TunnelProbeRow = {
+  key: string;
+  ok: boolean;
+  why: string;
+  handshakeMs: number | null;
+  firstByteMs: number | null;
+};

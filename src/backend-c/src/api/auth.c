@@ -13,6 +13,7 @@
 
 #include <cjson/cJSON.h>
 
+#include "firc/atomic_write.h"
 #include "firc/crypt.h"
 #include "firc/hash.h"
 #include "firc/jwt.h"
@@ -300,10 +301,8 @@ static firc_err_t load_or_create_secret(const char *state_dir) {
     if (snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int)sizeof(tmp)) {
         return FIRC_ERR_INVAL;
     }
-    int fd = mkstemp(tmp);
+    int fd = firc_mkstemp_cloexec(tmp);
     if (fd < 0) { return firc_err_from_errno(errno); }
-    /* mkstemp's fd has no FD_CLOEXEC by default; this daemon forks iptables from another thread all day */
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (fchmod(fd, 0600) != 0) {
         close(fd);
         unlink(tmp);

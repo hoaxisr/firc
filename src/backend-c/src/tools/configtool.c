@@ -7,6 +7,7 @@
 #include "firc/match.h"
 #include "firc/models.h"
 #include "firc/subparse.h"
+#include "firc/tunnels.h"
 #include "firc/yamlio.h"
 
 static int cmd_resave(const char *path, const char *version)
@@ -149,11 +150,36 @@ static int cmd_duration(void)
     return 0;
 }
 
+static int cmd_tunnels_resave(const char *in, const char *out)
+{
+    firc_tunnels_t t;
+    firc_tun_err_t e = {{0}, {0}};
+    firc_err_t err = firc_tunnels_load_file(&t, in, &e);
+    if (err == FIRC_OK) {
+        err = firc_tunnels_save_file(&t, out);
+        firc_tunnels_free(&t);
+        e.where[0] = 0;
+        e.why[0] = 0;
+    }
+    if (err == FIRC_OK) {
+        return 0;
+    }
+    if (e.where[0] != 0 || e.why[0] != 0) {
+        printf("ERROR %s: %s\n", e.where, e.why);
+    } else {
+        printf("ERROR %s\n", firc_err_str(err));
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     firc_log_set_fd(2); /* keep stdout clean for differential comparison */
     if (argc >= 2 && strcmp(argv[1], "resave") == 0 && argc == 4) {
         return cmd_resave(argv[2], argv[3]);
+    }
+    if (argc == 4 && strcmp(argv[1], "tunnels-resave") == 0) {
+        return cmd_tunnels_resave(argv[2], argv[3]);
     }
     if (argc == 2 && strcmp(argv[1], "match") == 0) {
         return cmd_match();
@@ -165,7 +191,7 @@ int main(int argc, char **argv)
         return cmd_duration();
     }
     fprintf(stderr,
-            "usage: firc-configtool resave <file> <version> | match | "
+            "usage: firc-configtool resave <file> <version> | tunnels-resave <in> <out> | match | "
             "subparse | duration\n");
     return 2;
 }

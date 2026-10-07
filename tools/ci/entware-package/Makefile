@@ -39,7 +39,8 @@ define Package/firc
   CATEGORY:=Network
   TITLE:=DNS-based routing application
   URL:=https://github.com/hoaxisr/firc
-  DEPENDS:=+iptables +libyaml +libpcre2 +libmnl +libcurl +cJSON +socat
+  DEPENDS:=+iptables +libyaml +libpcre2 +libmnl +libcurl +cJSON +socat +ca-bundle
+  CONFLICTS:=tunvless
 endef
 
 define Package/firc/description
@@ -201,6 +202,8 @@ case "$$ACTION" in
         logger -t firc "purge did not finish; some rules or routes may be left until the next reboot"
     fi
     rm -rf /tmp/firc-init
+    rm -rf /opt/var/lib/firc/tunnels
+    rmdir /opt/var/lib/firc 2>/dev/null
     ;;
   upgrade) ;;
   *) logger -t firc "prerm: action '$$ACTION' unknown; the pool's routes and barrier are left for the next daemon" 2>/dev/null ;;
@@ -224,6 +227,9 @@ define Build/Compile
 			-Wl,-rpath,/opt/lib \
 			-L$(STAGING_DIR)/opt/lib \
 			-Wl,-rpath-link,$(STAGING_DIR)/opt/lib"
+	$(MAKE) -C $(PKG_BUILD_DIR)/src/tunvless CC="$(TARGET_CC)" AR="$(TARGET_CROSS)ar" \
+		CFLAGS="$(TARGET_CFLAGS)" VERSION="$(PKG_VERSION)" \
+		LDFLAGS="$(TARGET_LDFLAGS) -Wl,--dynamic-linker=/opt/lib/$(FIRC_DYNAMIC_LINKER) -Wl,-rpath,/opt/lib"
 endef
 
 define Package/firc/install
@@ -231,6 +237,7 @@ define Package/firc/install
 	$(INSTALL_BIN) \
 		$(PKG_BUILD_DIR)/src/backend-c/build/entware-$(FIRC_TARGET)/fircd \
 		$(1)/opt/bin/fircd
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/tunvless/out/tunvless $(1)/opt/bin/tunvless
 
 	$(INSTALL_DIR) $(1)/opt/usr/share/firc/skins/default
 	$(CP) $(PKG_BUILD_DIR)/src/frontend/dist/. \

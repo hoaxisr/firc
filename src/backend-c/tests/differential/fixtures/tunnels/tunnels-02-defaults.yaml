@@ -1,0 +1,6 @@
+tunnels:
+  - id: min
+    device: tunvless7
+    sources:
+      - id: 0000000b
+        subscription: { name: P, url: "http://sub.example.invalid/x" }

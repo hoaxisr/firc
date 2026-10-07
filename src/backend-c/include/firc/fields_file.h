@@ -8,8 +8,10 @@
 #include "firc/id.h"
 #include "firc/rtnl.h"
 
+#define FIRC_FIELDS_OWNER_LEN 20
+
 typedef struct {
-    char owner[FIRC_ID_STR_LEN];
+    char owner[FIRC_FIELDS_OWNER_LEN];
     uint32_t field;
 } firc_fields_entry_t;
 

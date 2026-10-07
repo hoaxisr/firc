@@ -8,6 +8,7 @@ on:
       - '**'
     paths:
       - 'src/backend-c/**'
+      - 'src/tunvless/**'
       - 'files/**'
       - 'tools/ci/entware-package/**'
       - 'tools/ci/**'
@@ -275,6 +276,14 @@ jobs:
           sudo modprobe nft_chain_nat || true # the nat chain type, when iptables is the nft backend
           make CFLAGS_EXTRA=-Werror routing
 
+      - name: fircd starts, reloads and stops its tunnels (user namespace)
+        working-directory: src/backend-c
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get install -y python3 iproute2 curl
+          make -C ../tunvless fetch
+          sh tests/e2e/tunnels.sh
+
       - name: Sanitizers (ASan+UBSan)
         working-directory: src/backend-c
         run: make sanitize
@@ -391,7 +400,7 @@ jobs:
           cp tools/ci/entware-package/Makefile "$feed/firc/Makefile"
           printf 'FIRC_VERSION:=0.0.0\nFIRC_RELEASE:=1\nFIRC_TARGET:=mips-3.4_kn\n' > "$feed/firc/version.mk"
           mkdir -p src/frontend/dist
-          tar -czf "$feed/firc/firc-source.tar.gz" --transform "s,^,firc-0.0.0/," LICENSE files src/backend-c src/frontend/dist
+          tar -czf "$feed/firc/firc-source.tar.gz" --transform "s,^,firc-0.0.0/," LICENSE files src/backend-c src/tunvless src/frontend/dist
           printf '#!/bin/sh\ncase "$1" in -V|--version) echo "Python 2.7.18" >&2; exit 0 ;; esac\nexit 127\n' > "$SDK_HOME/shim/python2"
           cp "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
           chmod +x "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
@@ -420,3 +429,85 @@ jobs:
           export CROSS_COMPILE="$tc/bin/mips-openwrt-linux-gnu-"
           export SYSROOT=$(echo "$sdk"/staging_dir/target-mips_*)
           sh tools/ci/mips-qemu-tests.sh
+
+  tunvless:
+    name: tunvless
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install tools
+        run: sudo apt-get install -y nftables bc wget python3 iproute2
+
+      - name: Fetch wolfSSL
+        run: make -C src/tunvless fetch
+
+      - name: Unit tests
+        run: make -C src/tunvless test
+
+      - name: Unit tests under AddressSanitizer
+        run: make -C src/tunvless O=out-asan SANITIZE=address test
+
+      - name: Tunnel tests in namespaces
+        run: sudo make -C src/tunvless e2e
+
+  tunvless_cross:
+    name: tunvless cross build and tests under qemu (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            libc: arm64
+            skip: ""
+          - arch: mipsel
+            libc: mipsel
+            skip: ""
+          # qemu-user truncates TCP_INFO to an int and byte-swaps it on big-endian guests, so
+          # tunnelmatch's node-abort checks cannot pass under qemu-mips
+          - arch: mips
+            libc: mips
+            skip: tunnelmatch
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install the cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-${{ matrix.arch }}-linux-gnu \
+            libc6-dev-${{ matrix.libc }}-cross qemu-user
+
+      - name: Fetch wolfSSL
+        run: make -C src/tunvless fetch
+
+      - name: Build
+        run: |
+          make -C src/tunvless -j"$(nproc)" O=out-${{ matrix.arch }} \
+            CC=${{ matrix.arch }}-linux-gnu-gcc AR=${{ matrix.arch }}-linux-gnu-ar
+          file src/tunvless/out-${{ matrix.arch }}/tunvless
+
+      - name: Tests under qemu
+        working-directory: src/tunvless
+        env:
+          ARCH: ${{ matrix.arch }}
+          SKIP: ${{ matrix.skip }}
+        run: |
+          set -eu
+          tests="h2match xhupmatch wsmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
+                 rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch \
+                 scryptomatch hellofreeze echmatch vlessmatch takematch"
+          run=""
+          for t in $tests; do
+            case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac
+            run="$run $t"
+          done
+          make -j"$(nproc)" O=out-$ARCH CC=$ARCH-linux-gnu-gcc AR=$ARCH-linux-gnu-ar \
+            $(for t in $run; do printf ' out-%s/tests/%s' "$ARCH" "$t"; done)
+          qemu-$ARCH -L /usr/$ARCH-linux-gnu out-$ARCH/tunvless --version
+          for t in $run; do
+            echo "== $t"
+            qemu-$ARCH -L /usr/$ARCH-linux-gnu out-$ARCH/tests/$t
+          done

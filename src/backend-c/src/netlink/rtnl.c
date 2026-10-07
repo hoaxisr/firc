@@ -748,7 +748,10 @@ static void stale_scan_cb(const struct nlmsghdr *h, void *ud) {
     /* Mask and priority together: either alone could claim a foreign rule. */
     if (!have_mask || !have_priority) { return; }
     if (mask != FIRC_MARK_GROUP_MASK) { return; }
-    if (priority != FIRC_RULE_PRIORITY && priority != FIRC_RULE_PRIORITY_REPLY) { return; }
+    if (priority != FIRC_RULE_PRIORITY && priority != FIRC_RULE_PRIORITY_REPLY &&
+        priority != FIRC_RULE_PRIORITY_TUNNEL) {
+        return;
+    }
 
     if (ctx->n == ctx->cap) {
         size_t cap = ctx->cap ? ctx->cap * 2 : 8;
@@ -763,6 +766,8 @@ static void stale_scan_cb(const struct nlmsghdr *h, void *ud) {
     ctx->v[ctx->n++] = (stale_rule_t){ctx->family, mark, mask, table, priority};
 }
 
+static firc_err_t flush_tunnel_tables(firc_rtnl_t *r, const stale_ctx_t *ctx, const bool *gone);
+
 firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed) {
     if (removed != NULL) { *removed = 0; }
     if (r == NULL) { return FIRC_ERR_INVAL; }
@@ -776,18 +781,31 @@ firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed) {
     }
     if (err == FIRC_OK && ctx.oom) { err = FIRC_ERR_NOMEM; }
 
+    bool *gone = NULL;
+    if (err == FIRC_OK && ctx.n > 0) {
+        gone = calloc(ctx.n, sizeof(*gone));
+        if (gone == NULL) { err = FIRC_ERR_NOMEM; }
+    }
     if (err == FIRC_OK) {
+        bool any_tunnel = false;
         for (size_t i = 0; i < ctx.n; i++) {
             const stale_rule_t *sr = &ctx.v[i];
             firc_err_t e = firc_rtnl_rule_del(r, sr->family, sr->mark, sr->mask, sr->table,
                                               sr->priority);
             if (e != FIRC_OK) {
                 err = e;
-            } else if (removed != NULL) {
-                (*removed)++;
+                continue;
             }
+            gone[i] = true;
+            any_tunnel = any_tunnel || sr->priority == FIRC_RULE_PRIORITY_TUNNEL;
+            if (removed != NULL) { (*removed)++; }
+        }
+        if (any_tunnel) {
+            firc_err_t e = flush_tunnel_tables(r, &ctx, gone);
+            if (err == FIRC_OK) { err = e; }
         }
     }
+    free(gone);
     free(ctx.v);
     return err;
 }
@@ -885,6 +903,28 @@ static firc_err_t del_seen_route(firc_rtnl_t *r, const seen_route_t *o, bool *de
     }
     if (code == ESRCH || code == ENOENT) { return FIRC_OK; }
     return firc_err_from_errno(code);
+}
+
+static firc_err_t flush_tunnel_tables(firc_rtnl_t *r, const stale_ctx_t *ctx, const bool *gone) {
+    routes_ctx_t routes = {0};
+    firc_err_t err = dump_routes(r, &routes);
+    size_t n = err == FIRC_OK ? routes.n : 0;
+    for (size_t i = 0; i < n; i++) {
+        const seen_route_t *o = &routes.v[i];
+        if (o->protocol != FIRC_RTPROT) { continue; }
+        bool stale = false;
+        for (size_t j = 0; j < ctx->n && !stale; j++) {
+            const stale_rule_t *sr = &ctx->v[j];
+            stale = gone[j] && sr->priority == FIRC_RULE_PRIORITY_TUNNEL && sr->family == o->family &&
+                    sr->table == o->table;
+        }
+        if (!stale) { continue; }
+        bool deleted = false;
+        firc_err_t e = del_seen_route(r, o, &deleted);
+        if (e != FIRC_OK) { err = e; }
+    }
+    free(routes.v);
+    return err;
 }
 
 firc_err_t firc_rtnl_purge_tagged_routes(firc_rtnl_t *r, size_t *removed, size_t *left) {

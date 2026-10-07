@@ -1999,6 +1999,24 @@ static bool iface_is_ignored(const char *name) {
 
 bool firc_iface_is_ignored_for_test(const char *name) { return iface_is_ignored(name); }
 
+static bool is_tunvless(const char *name) {
+    if (strncmp(name, "tunvless", 8) != 0) { return false; }
+    size_t n = 0;
+    for (const char *p = name + 8; *p != '\0'; p++, n++) {
+        if (*p < '0' || *p > '9') { return false; }
+    }
+    return n >= 1 && n <= 3;
+}
+
+static bool iface_listed(const char *name, unsigned flags, bool show_all) {
+    if (show_all || is_tunvless(name)) { return true; }
+    return (flags & IFF_POINTOPOINT) != 0 && !iface_is_ignored(name);
+}
+
+bool firc_iface_listed_for_test(const char *name, unsigned flags, bool show_all) {
+    return iface_listed(name, flags, show_all);
+}
+
 firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **out, size_t *out_n) {
     *out = NULL;
     *out_n = 0;
@@ -2021,7 +2039,7 @@ firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **o
         }
         if (already) { continue; }
 
-        if (!show_all && ((p->ifa_flags & IFF_POINTOPOINT) == 0 || iface_is_ignored(p->ifa_name))) { continue; }
+        if (!iface_listed(p->ifa_name, p->ifa_flags, show_all)) { continue; }
 
         if (n == cap) {
             size_t new_cap = cap ? cap * 2 : 8;

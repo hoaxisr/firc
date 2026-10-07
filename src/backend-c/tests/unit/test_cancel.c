@@ -1,5 +1,6 @@
 #include "greatest.h"
 
+#include <fcntl.h>
 #include <poll.h>
 
 #include "firc/cancel.h"
@@ -7,6 +8,17 @@
 static bool fd_readable(int fd) {
     struct pollfd p = {.fd = fd, .events = POLLIN};
     return poll(&p, 1, 0) == 1 && (p.revents & POLLIN) != 0;
+}
+
+TEST fd_is_cloexec_and_nonblocking(void) {
+    /* catches: the wake pipe opened without O_CLOEXEC or O_NONBLOCK */
+    firc_cancel_t *c = firc_cancel_new();
+    ASSERT(c != NULL);
+    int fd = firc_cancel_fd(c);
+    ASSERT((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+    ASSERT((fcntl(fd, F_GETFL) & O_NONBLOCK) != 0);
+    firc_cancel_free(c);
+    PASS();
 }
 
 TEST starts_lowered(void) {
@@ -73,6 +85,7 @@ GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
+    RUN_TEST(fd_is_cloexec_and_nonblocking);
     RUN_TEST(starts_lowered);
     RUN_TEST(raise_is_visible_both_ways);
     RUN_TEST(clear_lowers_and_drains);

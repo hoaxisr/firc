@@ -116,6 +116,7 @@ jobs:
           esac
           cp "${{ matrix.config }}" .config
           make build_frontend
+          make -C src/tunvless fetch
           make _return_export_dynamic_env > .build/entware-package.env
 
           feed_dir="${RUNNER_TEMP}/firc-feed-${{ matrix.name }}"
@@ -129,7 +130,7 @@ jobs:
           } > "$feed_dir/firc/version.mk"
           tar -czf "$feed_dir/firc/firc-source.tar.gz" \
             --transform "s,^,firc-${PKG_VERSION}/," \
-            LICENSE files src/backend-c src/frontend/dist
+            LICENSE files src/backend-c src/tunvless src/frontend/dist
 
           echo "feed_dir=$feed_dir" >> "$GITHUB_OUTPUT"
           echo "artifacts_dir=$artifacts_dir" >> "$GITHUB_OUTPUT"
@@ -218,44 +219,52 @@ jobs:
             data_archive=$(mktemp)
             binary=$(mktemp)
             ipk_member "$package" data.tar.gz > "$data_archive"
-            binary_member=$(
-              tar -tzf "$data_archive" |
-                awk '$0 == "opt/bin/fircd" || $0 == "./opt/bin/fircd" { print; exit }'
-            )
-            if [ -z "$binary_member" ]; then
-              echo "No /opt/bin/fircd in $package" >&2
-              exit 1
-            fi
-            tar -xzOf "$data_archive" "$binary_member" > "$binary"
-
-            readelf -h "$binary"
-            readelf -l "$binary"
-            case "${{ matrix.name }}" in
-              aarch64-*)
-                readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
-                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
-                readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
-                ;;
-              mipsel-*)
-                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
-                readelf -h "$binary" | grep -Eq 'Data:.*little endian'
-                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
-                ;;
-              mips-*)
-                readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
-                readelf -h "$binary" | grep -Eq 'Data:.*big endian'
-                readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
-                ;;
-              *)
-                # a target without an ELF check must not ship unchecked
-                echo "no ELF check for ${{ matrix.name }}: add one before adding the target" >&2
+            for bin_name in fircd tunvless; do
+              binary_member=$(
+                tar -tzf "$data_archive" |
+                  awk '$0 == "opt/bin/'"$bin_name"'" || $0 == "./opt/bin/'"$bin_name"'" { print; exit }'
+              )
+              if [ -z "$binary_member" ]; then
+                echo "No /opt/bin/$bin_name in $package" >&2
                 exit 1
-                ;;
-            esac
+              fi
+              tar -xzOf "$data_archive" "$binary_member" > "$binary"
 
-            # a build without -DFIRC_ENTWARE_KN lacks the Keenetic code and nothing else would notice
-            strings "$binary" | grep -q 'firc-flavour=entware_kn' \
-              || { echo "the binary is not the Keenetic flavour (no firc-flavour=entware_kn in it)" >&2; exit 1; }
+              readelf -h "$binary"
+              readelf -l "$binary"
+              if strings "$binary" | grep -q '/hom[e]/'; then
+                echo "$bin_name embeds a build path under the home directory" >&2
+                exit 1
+              fi
+              case "${{ matrix.name }}" in
+                aarch64-*)
+                  readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+                  readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                  readelf -l "$binary" | grep -F '/opt/lib/ld-linux-aarch64.so.1'
+                  ;;
+                mipsel-*)
+                  readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                  readelf -h "$binary" | grep -Eq 'Data:.*little endian'
+                  readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                  ;;
+                mips-*)
+                  readelf -h "$binary" | grep -Eq 'Machine:.*MIPS'
+                  readelf -h "$binary" | grep -Eq 'Data:.*big endian'
+                  readelf -l "$binary" | grep -F '/opt/lib/ld.so.1'
+                  ;;
+                *)
+                  # a target without an ELF check must not ship unchecked
+                  echo "no ELF check for ${{ matrix.name }}: add one before adding the target" >&2
+                  exit 1
+                  ;;
+              esac
+
+              # a build without -DFIRC_ENTWARE_KN lacks the Keenetic code and nothing else would notice
+              if [ "$bin_name" = fircd ]; then
+                strings "$binary" | grep -q 'firc-flavour=entware_kn' \
+                  || { echo "the binary is not the Keenetic flavour (no firc-flavour=entware_kn in it)" >&2; exit 1; }
+              fi
+            done
             control_archive=$(mktemp)
             ipk_member "$package" control.tar.gz > "$control_archive"
             control_list=$(tar -tzf "$control_archive")
@@ -282,6 +291,7 @@ jobs:
                 prerm)
                   printf '%s\n' "$text" | grep -q 'fircd --purge' || { echo "$member does not purge" >&2; exit 1; }
                   printf '%s\n' "$text" | grep -qF 'case "$ACTION" in' || { echo "$member lost its action guard" >&2; exit 1; }
+                  printf '%s\n' "$text" | grep -qF 'rm -rf /opt/var/lib/firc/tunnels' || { echo "$member leaves the tunnel cache behind" >&2; exit 1; }
                   ;;
                 postinst)
                   printf '%s\n' "$text" | grep -q 'S99firc restart' || { echo "$member does not restart the daemon" >&2; exit 1; }

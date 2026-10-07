@@ -1,0 +1,5 @@
+tunnels:
+  - id: a
+    device: tunvless0
+    sources:
+      - subscription: { name: P, url: "ftp://sub.example.invalid/x" }

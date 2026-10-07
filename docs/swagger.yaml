@@ -802,6 +802,393 @@ definitions:
         example: 1
         type: integer
     type: object
+  types.TunnelUplink:
+    properties:
+      kind:
+        description: 'auto: the router''s own routes; iface: leave by an interface; tunnel: leave through another tunnel'
+        enum:
+        - auto
+        - iface
+        - tunnel
+        example: iface
+        type: string
+      ref:
+        description: 'The interface name or the tunnel id; empty for auto'
+        example: ppp0
+        type: string
+    type: object
+  types.TunnelSource:
+    properties:
+      id:
+        description: 'Eight hex digits; node keys start with it. Optional on PUT: a missing one is derived from the link or URL'
+        example: 0000000a
+        type: string
+      interval:
+        description: 'subscription only: seconds between fetches, 0 = by hand only, else 600..604800 (default 21600)'
+        example: 21600
+        type: integer
+      kind:
+        enum:
+        - link
+        - subscription
+        example: subscription
+        type: string
+      link:
+        description: 'link only: one vless:// link'
+        example: vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A
+        type: string
+      name:
+        description: 'subscription only: 1..63 letters, digits, spaces, ''.'', ''_'' or ''-'', unique in the tunnel'
+        example: Provider
+        type: string
+      url:
+        description: 'subscription only: an http:// or https:// URL, fetched through the tunnel''s uplink'
+        example: https://sub.example.invalid/feed
+        type: string
+    type: object
+  types.TunnelAdvanced:
+    properties:
+      ca:
+        description: 'Trusted roots (PEM file) for security=tls nodes; empty for the system ones'
+        example: ""
+        type: string
+      insecure:
+        description: 'Accept allowInsecure nodes and skip certificate checks'
+        example: false
+        type: boolean
+      timeout:
+        description: 'Probe timeout in seconds, 1..600 (default 8)'
+        example: 8
+        type: integer
+    type: object
+  types.Tunnel:
+    properties:
+      active:
+        description: 'How many nodes carry traffic at once, 1..8'
+        example: 1
+        type: integer
+      advanced:
+        $ref: '#/definitions/types.TunnelAdvanced'
+      by:
+        description: 'How flows spread over the active nodes'
+        enum:
+        - connection
+        - site
+        - site-client
+        example: connection
+        type: string
+      device:
+        description: 'tunvless<N>, N 0..99, unique'
+        example: tunvless0
+        type: string
+      enable:
+        example: true
+        type: boolean
+      exclude:
+        description: 'Node keys never used'
+        items:
+          type: string
+        type: array
+      filter:
+        description: 'POSIX extended regular expression on subscription node names, case-insensitive; empty keeps all'
+        example: ^NL-
+        type: string
+      id:
+        description: 'Letters, digits, - and _, under 16 bytes, unique'
+        example: main
+        type: string
+      interval:
+        description: 'Seconds between checks of the active nodes, 5..86400'
+        example: 60
+        type: integer
+      order:
+        description: 'Node keys listed first, in this order'
+        items:
+          type: string
+        type: array
+      silence:
+        description: 'Seconds of silence before a node is checked, 0..3600'
+        example: 20
+        type: integer
+      sources:
+        items:
+          $ref: '#/definitions/types.TunnelSource'
+        type: array
+      uplink:
+        $ref: '#/definitions/types.TunnelUplink'
+    type: object
+  types.TunnelsReq:
+    properties:
+      tunnels:
+        description: 'The whole set, at most 8; a missing field takes its default'
+        items:
+          $ref: '#/definitions/types.Tunnel'
+        type: array
+    type: object
+  types.TunnelsRes:
+    properties:
+      restarted:
+        description: 'PUT only: devices whose tunvless this save started or restarted'
+        items:
+          example: tunvless0
+          type: string
+        type: array
+      tunnels:
+        items:
+          $ref: '#/definitions/types.Tunnel'
+        type: array
+      updated:
+        description: 'PUT only: devices whose running tunvless this save sent a new node list, without a restart'
+        items:
+          example: tunvless1
+          type: string
+        type: array
+    type: object
+  types.TunnelErrorRes:
+    properties:
+      error:
+        example: no tunnel with this id
+        type: string
+      field:
+        description: 'The rejected field of the tunnel, as in the request (sources[1].url); null when none applies'
+        example: uplink
+        type: string
+      tunnel:
+        description: 'The id of the rejected tunnel; null when it has none or the set itself was rejected'
+        example: chained
+        type: string
+    type: object
+  types.TunnelNodeState:
+    properties:
+      key:
+        example: 0000000a:NL-1
+        type: string
+      name:
+        example: NL-1
+        type: string
+      since:
+        description: 'down only: unix seconds since the node stopped answering; else 0'
+        example: 0
+        type: integer
+      skipReason:
+        description: 'skipped only: why the node cannot be used'
+        example: ""
+        type: string
+      source:
+        description: '"link" or the subscription''s name'
+        example: Provider
+        type: string
+      state:
+        enum:
+        - active
+        - down
+        - reserve
+        - excluded
+        - missing
+        - skipped
+        example: active
+        type: string
+    type: object
+  types.TunnelSubState:
+    properties:
+      error:
+        description: 'Why the last fetch failed; the URL in it is cut to scheme://host'
+        example: ""
+        type: string
+      fetching:
+        example: false
+        type: boolean
+      lastOk:
+        description: 'Unix seconds of the last good fetch; 0 never'
+        example: 1791300000
+        type: integer
+      lastTry:
+        description: 'Unix seconds of the last fetch; 0 never'
+        example: 1791300000
+        type: integer
+      name:
+        example: Provider
+        type: string
+      nodes:
+        description: 'Nodes in the held body'
+        example: 12
+        type: integer
+    type: object
+  types.TunnelState:
+    properties:
+      active:
+        description: 'Names of the nodes carrying traffic'
+        items:
+          type: string
+        type: array
+      backoffS:
+        description: 'backoff only: seconds until the next start'
+        example: 0
+        type: integer
+      device:
+        example: tunvless0
+        type: string
+      groups:
+        description: 'Names of the groups routed through the device'
+        items:
+          type: string
+        type: array
+      id:
+        example: main
+        type: string
+      lastExit:
+        description: 'Exit code of the last tunvless, 128+signal when killed'
+        example: 0
+        type: integer
+      nodes:
+        items:
+          $ref: '#/definitions/types.TunnelNodeState'
+        type: array
+      rxBps:
+        description: 'Bytes per second received on the device since the previous poll'
+        example: 0
+        type: integer
+      since:
+        description: 'Unix seconds since the status last changed'
+        example: 1791300000
+        type: integer
+      status:
+        description: 'waiting: no nodes yet; uplink_down: its uplink could not be set up'
+        enum:
+        - "off"
+        - starting
+        - up
+        - no_node
+        - backoff
+        - bad_config
+        - waiting
+        - uplink_down
+        example: up
+        type: string
+      subscriptions:
+        items:
+          $ref: '#/definitions/types.TunnelSubState'
+        type: array
+      txBps:
+        example: 0
+        type: integer
+      uplinkOk:
+        description: 'The uplink route is in place (always true for auto)'
+        example: true
+        type: boolean
+    type: object
+  types.TunnelStatesRes:
+    properties:
+      tunnels:
+        description: 'Every configured tunnel, in config order'
+        items:
+          $ref: '#/definitions/types.TunnelState'
+        type: array
+    type: object
+  types.TunnelDraftReq:
+    properties:
+      tunnel:
+        $ref: '#/definitions/types.Tunnel'
+    type: object
+  types.TunnelPreviewRow:
+    properties:
+      excluded:
+        example: false
+        type: boolean
+      isNew:
+        description: 'Not named in order'
+        example: true
+        type: boolean
+      key:
+        example: 0000000a:NL-1
+        type: string
+      missing:
+        description: 'Named in order but in no source'
+        example: false
+        type: boolean
+      name:
+        example: NL-1
+        type: string
+      overCap:
+        description: 'Past the 256 nodes tunvless is given'
+        example: false
+        type: boolean
+      skipReason:
+        example: ""
+        type: string
+      source:
+        example: Provider
+        type: string
+    type: object
+  types.TunnelPreviewRes:
+    properties:
+      matched:
+        description: 'Usable nodes the filter keeps'
+        example: 3
+        type: integer
+      nodes:
+        items:
+          $ref: '#/definitions/types.TunnelPreviewRow'
+        type: array
+      subscriptions:
+        items:
+          properties:
+            cached:
+              description: 'A body for this subscription and uplink is held'
+              example: true
+              type: boolean
+            name:
+              example: Provider
+              type: string
+          type: object
+        type: array
+      total:
+        description: 'Usable nodes in every source'
+        example: 4
+        type: integer
+    type: object
+  types.TunnelProbeReq:
+    properties:
+      id:
+        description: 'Probe the saved tunnel with this id'
+        example: main
+        type: string
+      tunnel:
+        $ref: '#/definitions/types.Tunnel'
+    type: object
+  types.TunnelProbeRow:
+    properties:
+      firstByteMs:
+        description: 'null when the node failed'
+        example: 61
+        type: integer
+      handshakeMs:
+        description: 'null when the node failed'
+        example: 42
+        type: integer
+      key:
+        example: 0000000a:NL-1
+        type: string
+      ok:
+        example: true
+        type: boolean
+      why:
+        example: ""
+        type: string
+    type: object
+  types.TunnelProbeRes:
+    properties:
+      nodes:
+        items:
+          $ref: '#/definitions/types.TunnelProbeRow'
+        type: array
+    type: object
+  types.QueuedRes:
+    properties:
+      queued:
+        example: true
+        type: boolean
+    type: object
 info:
   contact: {}
   title: firc API
@@ -1848,7 +2235,7 @@ paths:
       - system
   /api/v1/system/interfaces:
     get:
-      description: 'Returns the list of interfaces'
+      description: 'Returns the list of interfaces; tunvless devices are listed even without showAllInterfaces'
       produces:
       - application/json
       responses:
@@ -1863,6 +2250,206 @@ paths:
       summary: 'Get the list of interfaces'
       tags:
       - config
+  /api/v1/tunnels:
+    get:
+      description: 'Returns the saved tunnels, links and subscription URLs included'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelsRes'
+        "503":
+          description: 'Service Unavailable -- tunnels are not running'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get the tunnels'
+      tags:
+      - tunnels
+    put:
+      consumes:
+      - application/json
+      description: >-
+        Replaces the whole set: validates it, writes tunnels.yaml (mode 0600)
+        and applies it at once. A tunnel is restarted only when an option its
+        tunvless is started with changed; a change of its nodes alone is sent
+        to the running tunvless. A rejection names the tunnel and its field.
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.TunnelsReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelsRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.TunnelErrorRes'
+        "500":
+          description: 'Internal Server Error -- tunnels.yaml not written, or saved but not applied'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: 'Service Unavailable -- tunnels are not running'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Save and apply the tunnels'
+      tags:
+      - tunnels
+  /api/v1/tunnels/state:
+    get:
+      description: 'Returns the live state of every configured tunnel; never a link'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelStatesRes'
+        "503":
+          description: 'Service Unavailable -- tunnels are not running'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Get the tunnels'' state'
+      tags:
+      - tunnels
+  /api/v1/tunnels/preview:
+    post:
+      consumes:
+      - application/json
+      description: >-
+        Builds the node table of a draft tunnel from the subscription bodies
+        already held; fetches nothing. For the id of a saved tunnel the
+        bodies held for that tunnel are used whatever uplink the draft names,
+        a disabled tunnel's included. A subscription not held yet is listed
+        with cached false. Rows never carry links.
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.TunnelDraftReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelPreviewRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.TunnelErrorRes'
+        "503":
+          description: 'Service Unavailable -- tunnels are not running'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Preview a tunnel''s nodes'
+      tags:
+      - tunnels
+  /api/v1/tunnels/probe:
+    post:
+      consumes:
+      - application/json
+      description: >-
+        Checks every node a saved tunnel ({"id"}) or a draft ({"tunnel"})
+        would use, excluded nodes included, one tunvless --probe at a time,
+        3 s per node; answers once
+        it is done. A tunnel that leaves by an interface or another tunnel is
+        probed only through the uplink of the saved tunnel with that id while
+        its tunvless runs.
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.TunnelProbeReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelProbeRes'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.TunnelErrorRes'
+        "404":
+          description: 'Not Found -- no saved tunnel with this id'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'Conflict -- a probe is running, or the uplink needs the tunnel saved and running first ("save first")'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: 'Internal Server Error -- the probe could not start'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Probe a tunnel''s nodes'
+      tags:
+      - tunnels
+  /api/v1/tunnels/{id}/refresh:
+    post:
+      description: 'Queues a fetch of every subscription of the tunnel; queued is false when it has none being kept fresh'
+      parameters:
+      - description: 'Tunnel ID'
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.QueuedRes'
+        "404":
+          description: 'Not Found -- no such tunnel'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Refresh a tunnel''s subscriptions'
+      tags:
+      - tunnels
+  /api/v1/tunnels/{id}/restart:
+    post:
+      description: 'Restarts the tunnel''s tunvless even when nothing changed'
+      parameters:
+      - description: 'Tunnel ID'
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.QueuedRes'
+        "404":
+          description: 'Not Found -- no such tunnel'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'Conflict -- the tunnel is off, waiting for nodes or without its uplink'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Restart a tunnel'
+      tags:
+      - tunnels
 securityDefinitions:
   token:
     description: >-

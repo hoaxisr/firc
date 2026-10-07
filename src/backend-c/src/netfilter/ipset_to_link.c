@@ -16,10 +16,7 @@ typedef struct family_state {
     bool rule_added;
     bool reply_rule_added; /* IPv4 only */
     bool blackhole_added;
-    bool iface_route_present;
-    bool iface_has_gw;
-    uint8_t gw[16];
-    uint8_t gw_len;
+    firc_iface_route_t route;
 } family_state_t;
 
 struct firc_ipset_to_link {
@@ -652,8 +649,8 @@ static firc_err_t delete_ip_rule(firc_ipset_to_link_t *l) {
     return first_err;
 }
 
-static firc_err_t update_iface_route(firc_ipset_to_link_t *l, int family, int ifindex,
-                                   bool point_to_point, family_state_t *fs) {
+firc_err_t firc_iface_route_update(firc_rtnl_t *r, int family, uint32_t table, const char *iface_name,
+                                  int ifindex, bool point_to_point, firc_iface_route_t *st) {
     bool has_gw = false;
     uint8_t gw[16] = {0};
     uint8_t gw_len = 0;
@@ -662,22 +659,22 @@ static firc_err_t update_iface_route(firc_ipset_to_link_t *l, int family, int if
         bool found;
         bool gatewayless = false;
         firc_err_t err =
-            firc_rtnl_gateway_for_iface2(l->rtnl, family, ifindex, &found, gw, &gw_len, &gatewayless);
+            firc_rtnl_gateway_for_iface2(r, family, ifindex, &found, gw, &gw_len, &gatewayless);
         if (err == FIRC_OK && !found && gatewayless) {
             /* On-link default: drop the learnt gateway, or a dead one stays forever. */
-            FIRC_DEBUG("%s has a default route with no gateway; the group's default follows it", l->iface_name);
+            FIRC_DEBUG("%s has a default route with no gateway; the group's default follows it", iface_name);
         } else if (err != FIRC_OK || !found) {
             /* No default found is not "no gateway": keep the last one rather than write a dev-only route. */
             if (err != FIRC_OK) {
-                FIRC_WARN("gateway lookup failed for %s: %s; keeping the gateway last written", l->iface_name,
+                FIRC_WARN("gateway lookup failed for %s: %s; keeping the gateway last written", iface_name,
                           firc_err_str(err));
-            } else if (fs->iface_has_gw) {
-                FIRC_DEBUG("no default route on %s yet; keeping the gateway last written", l->iface_name);
+            } else if (st->has_gw) {
+                FIRC_DEBUG("no default route on %s yet; keeping the gateway last written", iface_name);
             }
-            if (fs->iface_has_gw) {
+            if (st->has_gw) {
                 has_gw = true;
-                gw_len = fs->gw_len;
-                memcpy(gw, fs->gw, sizeof(gw));
+                gw_len = st->gw_len;
+                memcpy(gw, st->gw, sizeof(gw));
             }
         } else {
             has_gw = true;
@@ -686,20 +683,38 @@ static firc_err_t update_iface_route(firc_ipset_to_link_t *l, int family, int if
 
     /* Always rewritten with NLM_F_REPLACE: link-down purges device routes behind our back. */
     bool enodev = false;
-    firc_err_t err = firc_rtnl_route_add_iface(l->rtnl, family, l->table, 10, ifindex,
-                                          has_gw ? gw : NULL, gw_len, &enodev);
+    firc_err_t err = firc_rtnl_route_add_iface(r, family, table, FIRC_IFACE_ROUTE_METRIC, ifindex,
+                                               has_gw ? gw : NULL, gw_len, &enodev);
     if (err != FIRC_OK) { return err; }
     if (enodev) {
-        FIRC_WARN("interface %s not ready for this IP family, skipping route", l->iface_name);
-        fs->iface_route_present = false;
+        FIRC_WARN("interface %s not ready for this IP family, skipping route", iface_name);
+        st->present = false;
         return FIRC_OK;
     }
 
-    fs->iface_route_present = true;
-    fs->iface_has_gw = has_gw;
-    fs->gw_len = gw_len;
-    memcpy(fs->gw, gw, sizeof(fs->gw));
+    st->present = true;
+    st->has_gw = has_gw;
+    st->gw_len = gw_len;
+    memcpy(st->gw, gw, sizeof(st->gw));
     return FIRC_OK;
+}
+
+firc_err_t firc_iface_route_remove(firc_rtnl_t *r, int family, uint32_t table, const char *iface_name,
+                                  firc_iface_route_t *st) {
+    if (!st->present) { return FIRC_OK; }
+    firc_link_info_t li;
+    bool found;
+    firc_rtnl_link_by_name(r, iface_name, &li, &found);
+    int ifindex = found ? li.ifindex : 0;
+    st->present = false;
+    return firc_rtnl_route_del_iface(r, family, table, FIRC_IFACE_ROUTE_METRIC, ifindex,
+                                     st->has_gw ? st->gw : NULL, st->gw_len);
+}
+
+static firc_err_t update_iface_route(firc_ipset_to_link_t *l, int family, int ifindex,
+                                   bool point_to_point, family_state_t *fs) {
+    return firc_iface_route_update(l->rtnl, family, l->table, l->iface_name, ifindex, point_to_point,
+                                   &fs->route);
 }
 
 static firc_err_t insert_ip_route(firc_ipset_to_link_t *l) {
@@ -743,26 +758,10 @@ static firc_err_t insert_ip_route(firc_ipset_to_link_t *l) {
 static firc_err_t delete_ip_route(firc_ipset_to_link_t *l) {
     firc_err_t first_err = FIRC_OK;
 
-    if (l->v4.iface_route_present) {
-        firc_link_info_t li;
-        bool found;
-        firc_rtnl_link_by_name(l->rtnl, l->iface_name, &li, &found);
-        int ifindex = found ? li.ifindex : 0;
-        firc_err_t err = firc_rtnl_route_del_iface(l->rtnl, AF_INET, l->table, 10, ifindex,
-                                              l->v4.iface_has_gw ? l->v4.gw : NULL, l->v4.gw_len);
-        if (err != FIRC_OK && first_err == FIRC_OK) { first_err = err; }
-        l->v4.iface_route_present = false;
-    }
-    if (l->v6.iface_route_present) {
-        firc_link_info_t li;
-        bool found;
-        firc_rtnl_link_by_name(l->rtnl, l->iface_name, &li, &found);
-        int ifindex = found ? li.ifindex : 0;
-        firc_err_t err = firc_rtnl_route_del_iface(l->rtnl, AF_INET6, l->table, 10, ifindex,
-                                              l->v6.iface_has_gw ? l->v6.gw : NULL, l->v6.gw_len);
-        if (err != FIRC_OK && first_err == FIRC_OK) { first_err = err; }
-        l->v6.iface_route_present = false;
-    }
+    firc_err_t e4 = firc_iface_route_remove(l->rtnl, AF_INET, l->table, l->iface_name, &l->v4.route);
+    if (e4 != FIRC_OK && first_err == FIRC_OK) { first_err = e4; }
+    firc_err_t e6 = firc_iface_route_remove(l->rtnl, AF_INET6, l->table, l->iface_name, &l->v6.route);
+    if (e6 != FIRC_OK && first_err == FIRC_OK) { first_err = e6; }
     if (l->v4.blackhole_added) {
         firc_err_t err = firc_rtnl_route_del_blackhole(l->rtnl, AF_INET, l->table, 20);
         if (err != FIRC_OK && first_err == FIRC_OK) { first_err = err; }
@@ -808,7 +807,7 @@ uint32_t firc_ipset_to_link_mark_field(const firc_ipset_to_link_t *l) {
 
 bool firc_ipset_to_link_has_iface_route(const firc_ipset_to_link_t *l, int family) {
     if (l == NULL) { return false; }
-    return family == AF_INET6 ? l->v6.iface_route_present : l->v4.iface_route_present;
+    return family == AF_INET6 ? l->v6.route.present : l->v4.route.present;
 }
 
 static firc_err_t teardown(firc_ipset_to_link_t *l, firc_nf_write_t mode) {

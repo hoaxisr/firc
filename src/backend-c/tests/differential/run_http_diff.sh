@@ -1,6 +1,6 @@
 #!/bin/sh
 # HTTP API contract suite: drives fircd through http_contract/contract.py and diffs the trace with golden/.
-# Needs root (real iptables and /run/firc) and python3; the config, groups.yaml and logs all stay in out/.
+# Needs root (real iptables and /run/firc) and python3; the config, groups.yaml, tunnels.yaml and logs all stay in out/.
 # The bare rm -rf /run/firc drops the pool file a previous run left, which this run would otherwise inherit.
 set -eu
 rm -rf /run/firc 2>/dev/null || true
@@ -19,7 +19,8 @@ PIDFILE=/var/run/firc.pid
 C_PID=
 cleanup() {
     [ -n "$C_PID" ] && kill "$C_PID" 2>/dev/null || true
-    rm -f "$OUT/groups.yaml"
+    rm -f "$OUT/groups.yaml" "$OUT/tunnels.yaml"
+    rm -rf "$OUT/tunnels-cache"
     rm -f "$SOCK" "$PIDFILE"
 }
 trap cleanup EXIT
@@ -74,8 +75,11 @@ wait_for_port() {
 }
 
 echo "== running contract against C daemon"
-rm -f "$SOCK" "$PIDFILE" "$OUT/groups.yaml"
-"$C_BIN" --config "$SCRATCH_CONFIG" > "$OUT/c_daemon.log" 2>&1 &
+rm -f "$SOCK" "$PIDFILE" "$OUT/groups.yaml" "$OUT/tunnels.yaml"
+rm -rf "$OUT/tunnels-cache"
+FIRC_TUNNELS_PATH="$OUT/tunnels.yaml" FIRC_TUNNELS_CACHE_DIR="$OUT/tunnels-cache" \
+    FIRC_TUNVLESS_BIN="$BACKEND_C_DIR/tests/unit/fixtures/fake_tunvless.sh" \
+    "$C_BIN" --config "$SCRATCH_CONFIG" > "$OUT/c_daemon.log" 2>&1 &
 C_PID=$!
 if ! wait_for_port; then
     echo "C daemon failed to start:"; cat "$OUT/c_daemon.log"; exit 1

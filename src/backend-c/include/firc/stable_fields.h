@@ -13,6 +13,7 @@ typedef struct {
     size_t kept;
     size_t freed;
     size_t reserved;
+    size_t tunnels;
 } firc_stable_fields_adoption_t;
 
 typedef struct {
@@ -22,8 +23,8 @@ typedef struct {
     size_t n;
 } firc_stable_fields_t;
 
-/* Seeds the ids cfg names; flushes by mark and frees every other entry, or reserves it when the flush
- * fails or !groups_known. Compacts v to the entries seeded. ct may be NULL. */
+/* Seeds the ids cfg names and every tunnel uplink entry; flushes by mark and frees every other entry, or
+ * reserves it when the flush fails or !groups_known. Compacts v to the entries seeded. ct may be NULL. */
 firc_stable_fields_adoption_t firc_stable_fields_adopt(firc_rtnl_t *rtnl, firc_ct_t *ct, const firc_config_t *cfg,
                                                        bool groups_known, firc_fields_entry_t *v, size_t *n);
 

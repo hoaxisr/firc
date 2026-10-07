@@ -260,6 +260,25 @@ TEST a_chunk_names_its_owner_even_under_a_holder_that_routes_everything(void) {
     PASS();
 }
 
+/* Catches: a tunnel uplink's own flow, its field held by no group and without the handled bit, reset at a start. */
+TEST a_tunnel_uplink_s_flow_survives_every_sweep(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t src[4] = {192, 168, 1, 1}, server[4] = {203, 0, 113, 7};
+    fake_ct_add(f.kernel, AF_INET, src, server, server, firc_mark_group_value(3));
+    fake_ct_ignore_mark_filter(f.kernel);
+    firc_stale_group_t groups[1] = {{.id = "g1", .field = firc_mark_group_value(1), .field_kept = true}};
+    for (int mode = 0; mode < 3; mode++) {
+        size_t dropped = 0;
+        ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, mode != 1, mode != 2, groups, 1, FIRC_MARK_GROUP_MASK,
+                                                  &dropped));
+        ASSERT_EQ_FMT((size_t)0, dropped, "%zu");
+    }
+    ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
 /* Catches: the sweep keeping a handled flow to a real address whose field no live group holds. */
 TEST a_field_nobody_holds_outside_the_pool_goes(void) {
     fx_t f;
@@ -554,6 +573,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_holder_that_routes_everything_makes_nothing_stale);
     RUN_TEST(a_fake_address_no_live_chunk_covers_goes);
     RUN_TEST(a_chunk_names_its_owner_even_under_a_holder_that_routes_everything);
+    RUN_TEST(a_tunnel_uplink_s_flow_survives_every_sweep);
     RUN_TEST(a_field_nobody_holds_outside_the_pool_goes);
     RUN_TEST(a_subnet_covering_the_pool_does_not_answer_for_a_chunk);
     RUN_TEST(another_group_s_subnet_does_not_vouch_for_this_field);

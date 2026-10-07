@@ -1,0 +1,7 @@
+# Build output (make, cross builds with O=, the Entware package step).
+/out/
+/out-*/
+/.build/
+# wolfSSL sources fetched by build/wolfssl/fetch.sh.
+/third_party/
+__pycache__/

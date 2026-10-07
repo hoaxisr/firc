@@ -5,6 +5,7 @@
   import GroupsView from "../../modules/groups/GroupsView.svelte";
   import JournalView from "../../modules/logs/JournalView.svelte";
   import SettingsView from "../../modules/settings/SettingsView.svelte";
+  import TunnelsView from "../../modules/tunnels/TunnelsView.svelte";
   import { persistedState } from "../../utils/persisted-state.svelte";
   import Overlay from "../feedback/Overlay.svelte";
   import ScrollToTop from "../feedback/ScrollToTop.svelte";
@@ -12,9 +13,9 @@
   import Toast from "../feedback/Toast.svelte";
   import HeaderSettings from "./HeaderSettings.svelte";
 
-  import { LayoutList, Logs, Menu, Settings } from "../ui/icons";
+  import { Cable, LayoutList, Logs, Menu, Settings } from "../ui/icons";
 
-  const TABS = ["groups", "logs", "settings"];
+  const TABS = ["groups", "tunnels", "logs", "settings"];
   const lastActiveTab = persistedState("active_tab", "groups");
   let active_tab = $state(TABS.includes(lastActiveTab.current) ? lastActiveTab.current : "groups");
   let isMenuOpen = $state(false);
@@ -59,6 +60,11 @@
               {t("Groups")}
             </Tabs.Trigger>
 
+            <Tabs.Trigger value="tunnels" onclick={closeMenu}>
+              <span class="tab-icon"><Cable size={24} /></span>
+              {t("Tunnels")}
+            </Tabs.Trigger>
+
             <Tabs.Trigger value="logs" onclick={closeMenu}>
               <span class="tab-icon"><Logs size={24} /></span>
               {t("Journal")}
@@ -80,6 +86,9 @@
     <article>
       <Tabs.Content value="groups">
         <GroupsView onRenderComplete={() => (isRenderCompleteGroups = true)} />
+      </Tabs.Content>
+      <Tabs.Content value="tunnels">
+        <TunnelsView active={active_tab === "tunnels"} />
       </Tabs.Content>
       <Tabs.Content value="logs">
         <JournalView />

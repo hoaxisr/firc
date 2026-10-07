@@ -54,6 +54,9 @@
 #include "firc/sub_fetch.h"
 #include "firc/capture.h"
 #include "firc/system.h"
+#include "firc/tunnels_api.h"
+#include "firc/tunrun.h"
+#include "firc/tunsubs.h"
 #include "firc/version.h"
 #include "firc/yamlio.h"
 
@@ -93,6 +96,8 @@ struct daemon {
     int refresh_timer;
     firc_port_remap_t *port_remap;
     firc_app_t *app;
+    firc_tunrun_t *tunrun;
+    firc_tunsubs_t *tunsubs;
     firc_httpd_t *http_tcp;
     firc_httpd_t *http_unix;
 
@@ -101,6 +106,7 @@ struct daemon {
     const char *config_path;
     /* Not owned: open list-sync streams hang off it and teardown ends them before the servers go. */
     firc_groups_ctx_t *groups_ctx;
+    firc_tunnels_ctx_t *tunnels_ctx;
 };
 
 static int64_t now_unix(void)
@@ -164,6 +170,13 @@ static bool pool_overlaps_an_interface(const firc_fakeip_t *pool, char *iface, s
 
 static void daemon_teardown(struct daemon *d)
 {
+    firc_tunnels_api_close(d->tunnels_ctx);
+    if (d->tunrun != NULL) { firc_tunrun_set_subs(d->tunrun, NULL); }
+    firc_tunsubs_free(d->tunsubs);
+    d->tunsubs = NULL;
+    firc_tunrun_stop(d->tunrun, 5000);
+    firc_tunrun_free(d->tunrun);
+    d->tunrun = NULL;
     /* Ordering only: delete before anything its callback reads is freed. */
     if (d->refresh_timer != 0 && d->loop != NULL) {
         (void)firc_loop_del_timer(d->loop, d->refresh_timer);
@@ -349,12 +362,36 @@ static void reload_config(struct daemon *d)
     FIRC_INFO("config reloaded from %s", d->config_path);
 }
 
+static bool load_tunnels(firc_tunnels_t *out, const char *keeping)
+{
+    firc_tun_err_t terr = {0};
+    const char *path = firc_tunnels_path();
+    firc_err_t err = firc_tunnels_load_file(out, path, &terr);
+    if (err == FIRC_OK) { return true; }
+    if (terr.where[0] != 0 || terr.why[0] != 0) {
+        FIRC_ERROR("%s: %s: %s; %s", path, terr.where, terr.why, keeping);
+    } else {
+        FIRC_ERROR("%s: %s; %s", path, firc_err_str(err), keeping);
+    }
+    return false;
+}
+
+static void reload_tunnels(struct daemon *d)
+{
+    if (d->tunrun == NULL) { return; }
+    firc_tunnels_t t = {0};
+    if (!load_tunnels(&t, "the running tunnels are kept")) { return; }
+    (void)firc_tunrun_apply(d->tunrun, &t);
+    firc_tunnels_free(&t);
+}
+
 static void on_signal(firc_loop_t *loop, int signo, void *ud)
 {
     struct daemon *d = ud;
     if (signo == SIGHUP) {
         FIRC_INFO("received signal: hangup (reloading config)");
         reload_config(d);
+        reload_tunnels(d);
         return;
     }
     FIRC_INFO("received signal: %s", strsignal(signo));
@@ -430,6 +467,7 @@ static void on_list_auto_update_timer(firc_loop_t *loop, void *ud)
     (void)loop;
     struct daemon *d = ud;
     firc_app_request_sync_due(d->app, now_unix());
+    firc_tunsubs_due(d->tunsubs);
 }
 
 static firc_dns_verdict_t on_response(firc_dns_msg_t *msg, const firc_ip_t *client,
@@ -595,6 +633,7 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
                      g->name, firc_err_str(err));
         }
     }
+    firc_tunrun_link_up(d->tunrun, iface_name);
     /* An interface coming up is the likeliest reason a failed group's retry now holds. */
     (void)firc_app_retry_groups(d->app, iface_name);
     firc_app_republish_resolve_routes(d->app);
@@ -1295,6 +1334,30 @@ int main(int argc, char **argv)
     /* After start_groups and the pool load: both halves of "which marks are stale" are in hand. */
     flush_stale_group_marks(&d);
 
+    const char *tunvless_bin = getenv("FIRC_TUNVLESS_BIN");
+    if (tunvless_bin == NULL || tunvless_bin[0] == 0) { tunvless_bin = FIRC_TUNVLESS_BIN; }
+    {
+        d.tunrun = firc_tunrun_new(d.loop, d.rtnl, cfg.app.netfilter.start_mark_table_index, tunvless_bin);
+        if (d.tunrun == NULL) {
+            FIRC_ERROR("failed to create the tunnel supervisor");
+            daemon_teardown(&d);
+            firc_config_clear(&cfg);
+            return 1;
+        }
+        const char *cache = getenv("FIRC_TUNNELS_CACHE_DIR");
+        d.tunsubs = firc_tunsubs_new(d.loop, cache != NULL && cache[0] != 0 ? cache : FIRC_TUNNELS_CACHE_DIR,
+                                     firc_tunrun_bodies_changed, d.tunrun);
+        if (d.tunsubs == NULL) {
+            FIRC_ERROR("tunnels: subscriptions cannot be fetched (no worker thread); links still work");
+        }
+        firc_tunrun_set_subs(d.tunrun, d.tunsubs);
+        firc_tunnels_t tunnels = {0};
+        if (load_tunnels(&tunnels, "starting with no tunnels")) {
+            (void)firc_tunrun_apply(d.tunrun, &tunnels);
+        }
+        firc_tunnels_free(&tunnels);
+    }
+
     /* Initial delay is the interval, not 0: the boot sweep below already asks for missing lists. */
     int list_auto_update_timer = 0;
     if (firc_loop_add_timer(d.loop, FIRC_LIST_AUTO_UPDATE_INTERVAL_MS,
@@ -1322,6 +1385,14 @@ int main(int argc, char **argv)
     system_ctx.resolvers = d.resolvers;
 #endif
     d.groups_ctx = &groups_ctx;
+    firc_tunnels_ctx_t tunnels_ctx = {
+        .run = d.tunrun,
+        .subs = d.tunsubs,
+        .app = d.app,
+        .path = firc_tunnels_path(),
+        .binary = tunvless_bin,
+    };
+    d.tunnels_ctx = &tunnels_ctx;
     firc_capture_ctx_t capture_ctx = {
         .app = d.app,
     };
@@ -1338,6 +1409,7 @@ int main(int argc, char **argv)
     }
     firc_system_register_routes(d.http_unix, &system_ctx);
     firc_groups_register_routes(d.http_unix, &groups_ctx);
+    firc_tunnels_register_routes(d.http_unix, &tunnels_ctx);
     /* Capture routes on both sockets: a browser cannot reach the Unix socket. */
     firc_capture_register_routes(d.http_unix, &capture_ctx);
     firc_httpd_route(d.http_unix, "GET", "/api/v1/auth", firc_auth_status_handler, &auth_ctx);
@@ -1361,6 +1433,7 @@ int main(int argc, char **argv)
         }
         firc_system_register_routes(d.http_tcp, &system_ctx);
         firc_groups_register_routes(d.http_tcp, &groups_ctx);
+        firc_tunnels_register_routes(d.http_tcp, &tunnels_ctx);
         firc_capture_register_routes(d.http_tcp, &capture_ctx);
         firc_httpd_route(d.http_tcp, "GET", "/api/v1/auth", firc_auth_status_handler, &auth_ctx);
         firc_httpd_route(d.http_tcp, "POST", "/api/v1/auth", firc_auth_login_handler, &auth_ctx);

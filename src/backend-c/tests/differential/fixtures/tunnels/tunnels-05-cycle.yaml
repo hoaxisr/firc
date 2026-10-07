@@ -1,0 +1,9 @@
+tunnels:
+  - id: a
+    device: tunvless0
+    enable: false
+    uplink: tunnel:b
+  - id: b
+    device: tunvless1
+    enable: false
+    uplink: tunnel:a

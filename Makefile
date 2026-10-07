@@ -74,10 +74,10 @@ CROSS_COMPILE ?=
 SYSROOT ?=
 
 # Entware's cJSON package is named `cJSON`, not `libcjson`.
-DEPS_IPK := libatomic, libyaml, libpcre2, libmnl, libcurl
+DEPS_IPK := libatomic, libyaml, libpcre2, libmnl, libcurl, ca-bundle
 
 BACKEND_DEPENDENCIES :=
-BACKEND_SOURCES := $(shell find ./src/backend-c/src ./src/backend-c/include -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null)
+BACKEND_SOURCES := $(shell find ./src/backend-c/src ./src/backend-c/include ./src/tunvless/src ./src/tunvless/build -type f \( -name '*.c' -o -name '*.h' -o -name '*.sh' -o -name Makefile \) 2>/dev/null)
 BACKEND_BUILD_PROPERTIES := PLATFORM=\"$(PLATFORM)\" TARGET=\"$(TARGET)\" PKG_VERSION=\"$(PKG_VERSION)\" CROSS_COMPILE=\"$(CROSS_COMPILE)\" SYSROOT=\"$(SYSROOT)\" ENTWARE_KN=\"$(ENTWARE_KN)\"
 
 FRONTEND_DEPENDENCIES := ./src/frontend/package.json ./src/frontend/package-lock.json
@@ -138,6 +138,11 @@ $(STAMPS_DIR)/build-backend-$(UNIQUE_NAME): $(STAMPS_DIR)/download-backend $(BAC
 	    $(if $(SYSROOT),SYSROOT="$(SYSROOT)") \
 	    $(if $(ENTWARE_KN),ENTWARE_KN=1)
 	cp "./src/backend-c/build/$(UNIQUE_NAME)/fircd" "$(COMPILE_DIR)/fircd"
+	$(MAKE) -C ./src/tunvless fetch
+	$(MAKE) -C ./src/tunvless CC="$(CROSS_COMPILE)gcc" AR="$(CROSS_COMPILE)ar" \
+		CFLAGS="$(if $(SYSROOT),--sysroot=$(SYSROOT) )-O2" LDFLAGS="$(if $(SYSROOT),--sysroot=$(SYSROOT))" \
+		VERSION="$(PKG_VERSION)" O=$(abspath $(COMPILE_DIR))/tunvless
+	cp "$(COMPILE_DIR)/tunvless/tunvless" "$(COMPILE_DIR)/tunvless-bin"
 
 	@mkdir -p $(STAMPS_DIR)
 	@touch "$(STAMPS_DIR)/build-backend-$(UNIQUE_NAME)"
@@ -188,6 +193,7 @@ prepare_files: build
 	rm -rf "$(ROOT_DIR)"
 	mkdir -p "$(BIN_DIR)"
 	cp "$(COMPILE_DIR)/fircd" "$(BIN_DIR)/fircd"
+	install -m 0755 "$(COMPILE_DIR)/tunvless-bin" "$(BIN_DIR)/tunvless"
 	mkdir -p "$(USRSHARE_DIR)/firc/skins/default"
 	cp -r ./src/frontend/dist/* "$(USRSHARE_DIR)/firc/skins/default"
 	$(call _copy_files,./files/common)
@@ -216,6 +222,7 @@ package_ipk: prepare_files
 		DEPS="$$DEPS, socat"; \
 	fi; \
 	echo "Depends: $$DEPS" >> $(IPK_CONTROL_DIR)/control
+	echo 'Conflicts: tunvless' >> $(IPK_CONTROL_DIR)/control
 
 	tar -C "$(IPK_CONTROL_DIR)" -czvf "$(IPK_DIR)/control.tar.gz" --owner=0 --group=0 .
 	tar -C "$(ROOT_DIR)" -czvf "$(IPK_DIR)/data.tar.gz" --owner=0 --group=0 .

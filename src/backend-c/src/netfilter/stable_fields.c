@@ -27,7 +27,7 @@ static firc_err_t flush_dead(firc_ct_t *ct, uint32_t field) {
 static bool seed(firc_rtnl_t *rtnl, const firc_fields_entry_t *e) {
     firc_err_t err = firc_rtnl_seed_mark_field(rtnl, e->owner, e->field);
     if (err != FIRC_OK) {
-        FIRC_WARN("field %u of group %s not kept: %s", (unsigned)e->field, e->owner, firc_err_str(err));
+        FIRC_WARN("field %u of %s not kept: %s", (unsigned)e->field, e->owner, firc_err_str(err));
     }
     return err == FIRC_OK;
 }
@@ -39,7 +39,10 @@ firc_stable_fields_adoption_t firc_stable_fields_adopt(firc_rtnl_t *rtnl, firc_c
     for (size_t i = 0; v != NULL && i < *n; i++) {
         firc_fields_entry_t e = v[i];
         bool keep = false;
-        if (configured(cfg, e.owner)) {
+        if (strncmp(e.owner, FIRC_MARK_TUNNEL_OWNER, sizeof(FIRC_MARK_TUNNEL_OWNER) - 1) == 0) {
+            keep = seed(rtnl, &e);
+            if (keep) { r.tunnels++; }
+        } else if (configured(cfg, e.owner)) {
             keep = seed(rtnl, &e);
             if (keep) { r.kept++; }
         } else if (!groups_known) {
@@ -81,7 +84,8 @@ bool firc_stable_fields_start(firc_stable_fields_t *sf, const char *path, firc_r
     if (err == FIRC_OK) {
         sf->loaded = true;
         firc_stable_fields_adoption_t r = firc_stable_fields_adopt(rtnl, ct, cfg, groups_known, sf->v, &sf->n);
-        FIRC_INFO("mark fields from %s: %zu kept, %zu freed, %zu reserved", path, r.kept, r.freed, r.reserved);
+        FIRC_INFO("mark fields from %s: %zu kept, %zu freed, %zu reserved, %zu for tunnels", path, r.kept, r.freed,
+                  r.reserved, r.tunnels);
         firc_rtnl_fields_now(rtnl, save_on_change, sf);
     } else if (err == FIRC_ERR_NOENT) {
         FIRC_INFO("no mark field map at %s: fields are assigned afresh", path);

@@ -52,17 +52,36 @@ firc_err_t firc_fields_file_save(const char *path, const firc_rtnl_field_t *v, s
     return err;
 }
 
+static bool group_owner(const char *s, size_t n) {
+    if (n != 8) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) { return false; }
+    }
+    return true;
+}
+
+static bool tunnel_owner(const char *s, size_t n) {
+    size_t pl = sizeof(FIRC_MARK_TUNNEL_OWNER) - 1;
+    if (n <= pl || n >= FIRC_FIELDS_OWNER_LEN || memcmp(s, FIRC_MARK_TUNNEL_OWNER, pl) != 0) { return false; }
+    for (size_t i = pl; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_entry(const char *line, size_t len, firc_fields_entry_t *e) {
     static const char prefix[] = "field ";
     size_t pl = sizeof(prefix) - 1;
-    if (len < pl + 8 + 2 || memcmp(line, prefix, pl) != 0) { return false; }
+    if (len < pl + 3 || memcmp(line, prefix, pl) != 0) { return false; }
     const char *id = line + pl;
-    for (size_t i = 0; i < 8; i++) {
-        char c = id[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return false; }
-    }
-    if (id[8] != ' ') { return false; }
-    const char *num = id + 9;
+    const char *sp = memchr(id, ' ', len - pl);
+    if (sp == NULL) { return false; }
+    size_t il = (size_t)(sp - id);
+    if (!group_owner(id, il) && !tunnel_owner(id, il)) { return false; }
+    const char *num = sp + 1;
     size_t nl = len - (size_t)(num - line);
     if (nl == 0 || nl > 3 || num[0] == '0') { return false; }
     uint32_t field = 0;
@@ -71,8 +90,8 @@ static bool parse_entry(const char *line, size_t len, firc_fields_entry_t *e) {
         field = field * 10 + (uint32_t)(num[i] - '0');
     }
     if (field < 1 || field > FIRC_MARK_MAX_GROUPS) { return false; }
-    memcpy(e->owner, id, 8);
-    e->owner[8] = '\0';
+    memcpy(e->owner, id, il);
+    e->owner[il] = '\0';
     e->field = field;
     return true;
 }

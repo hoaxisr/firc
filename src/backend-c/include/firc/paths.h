@@ -1,6 +1,8 @@
 #ifndef FIRC_PATHS_H
 #define FIRC_PATHS_H
 
+#include <stdlib.h>
+
 #if defined(FIRC_PLATFORM_ENTWARE)
 
 #ifndef FIRC_APP_SHARE_DIR
@@ -26,6 +28,12 @@
 #ifndef FIRC_INIT_SCRIPT
 #define FIRC_INIT_SCRIPT "/opt/etc/init.d/S99firc"
 #endif
+#ifndef FIRC_TUNVLESS_BIN
+#define FIRC_TUNVLESS_BIN "/opt/bin/tunvless"
+#endif
+#ifndef FIRC_TUNNELS_CACHE_DIR
+#define FIRC_TUNNELS_CACHE_DIR "/opt/var/lib/firc/tunnels"
+#endif
 
 #else
 
@@ -50,11 +58,20 @@
 #ifndef FIRC_INIT_SCRIPT
 #define FIRC_INIT_SCRIPT "/opt/etc/init.d/S99firc"
 #endif
+#ifndef FIRC_TUNVLESS_BIN
+#define FIRC_TUNVLESS_BIN "tunvless"
+#endif
+#ifndef FIRC_TUNNELS_CACHE_DIR
+#define FIRC_TUNNELS_CACHE_DIR "/var/lib/firc/tunnels"
+#endif
 
 #endif
 
 #ifndef FIRC_CONFIG_PATH
 #define FIRC_CONFIG_PATH FIRC_APP_CONF_DIR "/firc.conf"
+#endif
+#ifndef FIRC_TUNNELS_PATH
+#define FIRC_TUNNELS_PATH FIRC_APP_CONF_DIR "/tunnels.yaml"
 #endif
 #ifndef FIRC_FIELDS_STATE_PATH
 #define FIRC_FIELDS_STATE_PATH FIRC_APP_RUN_DIR "/fields.state"
@@ -62,5 +79,12 @@
 #ifndef FIRC_FAKEIP_V6_PREFIX_FILE
 #define FIRC_FAKEIP_V6_PREFIX_FILE FIRC_APP_CONF_DIR "/v6-pool-prefix"
 #endif
+
+/* tunnels.yaml: FIRC_TUNNELS_PATH from the environment when set, for tests and the contract run. */
+static inline const char *firc_tunnels_path(void)
+{
+    const char *p = getenv("FIRC_TUNNELS_PATH");
+    return p != NULL && p[0] != 0 ? p : FIRC_TUNNELS_PATH;
+}
 
 #endif

@@ -7,3 +7,5 @@ public-key.pem
 src/backend-c/tests/differential/out.root-owned/
 src/backend-c/tests/differential/out/
 __pycache__/
+src/tunvless/out/
+src/tunvless/third_party/

@@ -138,8 +138,18 @@ wait_ready() {
   return 1
 }
 
+TUNNELS=/opt/etc/firc/tunnels.yaml
+TUN_DEV=/dev/net/tun
+load_tun() {
+  [ -f "$TUNNELS" ] || return 0
+  [ -c "$TUN_DEV" ] && return 0
+  modprobe tun 2>/dev/null || insmod tun 2>/dev/null
+  [ -c "$TUN_DEV" ] || logger "$DESC: $TUN_DEV is missing and the tun module did not load; tunnels cannot start."
+}
+
 # Detached from the caller's descriptors, or `$(S99firc start)` would wait for the daemon to exit.
 launch() {
+  load_tun
   # reset HUP: the boot loop ignores it, and an ignored disposition survives exec
   ( trap - HUP; exec > /dev/null 2>&1 < /dev/null; $PREARGS $PROC $ARGS 2>&1 | logger -t $PROC ) &
 }

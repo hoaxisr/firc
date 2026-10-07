@@ -1,0 +1,42 @@
+tunnels:
+- id: "main"
+  device: "tunvless0"
+  enable: true
+  uplink: "iface:ppp0"
+  sources:
+  - id: "0000000a"
+    link: "vless://00000000-0000-4000-8000-000000000001@one.example.invalid:443?security=tls&sni=one.example.invalid#One"
+  - id: "31947f04"
+    link: "vless://00000000-0000-4000-8000-000000000002@two.example.invalid:8443?type=ws&path=%2Fws&security=none#Two"
+  - id: "aa806787"
+    subscription:
+      name: "Provider A"
+      url: "https://sub.example.invalid/feed?token=fake"
+      interval: 43200s
+  filter: "^(NL|DE)-"
+  order:
+  - "aa806787:NL-1"
+  - "0000000a:One"
+  exclude:
+  - "aa806787:DE-9"
+  active: 2
+  by: "site-client"
+  interval: 120s
+  silence: 0s
+  advanced:
+    timeout: 10s
+    insecure: false
+    ca: "/opt/etc/firc/ca.pem"
+- id: "chained"
+  device: "tunvless1"
+  enable: false
+  uplink: "tunnel:main"
+  sources: []
+  active: 1
+  by: "connection"
+  interval: 60s
+  silence: 20s
+  advanced:
+    timeout: 8s
+    insecure: false
+    ca: ""

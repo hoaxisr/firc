@@ -10,6 +10,13 @@ import time
 
 STUB_SUB_PORT = 18099
 STUB_SUB_URL = "http://127.0.0.1:%d/list.txt" % STUB_SUB_PORT
+STUB_TUN_URL = "http://127.0.0.1:%d/tunnels-sub.txt?token=fake" % STUB_SUB_PORT
+FAKE_UUID = "00000000-0000-4000-8000-000000000001"
+TUN_SUB_BODY = "".join(
+    "vless://%s@%s.example.invalid:443?security=none#%s\n" % (FAKE_UUID, n.lower(), n)
+    for n in ("NL-1", "NL-2", "DE-1")
+).encode("utf-8")
+TUN_LINK = "vless://%s@a.example.invalid:443?security=none#A" % FAKE_UUID
 
 
 class _StubSubListHandler(http.server.BaseHTTPRequestHandler):
@@ -26,6 +33,12 @@ class _StubSubListHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/tunnels-sub.txt"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(TUN_SUB_BODY)))
+            self.end_headers()
+            self.wfile.write(TUN_SUB_BODY)
         else:
             self.send_response(404)
             self.end_headers()
@@ -40,14 +53,18 @@ def start_stub_sub_server():
 
 _LIVE_TS_KEYS = ("lastUpdate", "lastCheck")
 
+_VOLATILE_KEYS = ("since", "backoffS", "lastExit", "rxBps", "txBps", "lastOk", "lastTry")
+
 
 def _redact_live_timestamps(obj):
-    """Replaces non-zero lastUpdate/lastCheck values with a placeholder."""
+    """Replaces non-zero lastUpdate/lastCheck values and every live tunnel figure with a placeholder."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             if k in _LIVE_TS_KEYS and isinstance(v, (int, float)) and v != 0:
                 out[k] = "<TS>"
+            elif k in _VOLATILE_KEYS and isinstance(v, (int, float)):
+                out[k] = "<LIVE>"
             else:
                 out[k] = _redact_live_timestamps(v)
         return out
@@ -91,6 +108,70 @@ def wait_settled(conn, group_id, tries=400):
         "group %s did not settle in %.0f s: list.sync.state is %r"
         % (group_id, tries * 0.05, last)
     )
+
+
+def wait_tunnel_ready(conn, tunnel_id, tries=400):
+    last = None
+    for _ in range(tries):
+        status, data = request(conn, "GET", "/api/v1/tunnels/state")
+        if status != 200:
+            raise RuntimeError("GET /api/v1/tunnels/state answered %s" % status)
+        obj = json.loads(data.decode("utf-8"))
+        for rec in obj.get("tunnels") or []:
+            if rec.get("id") != tunnel_id:
+                continue
+            subs = rec.get("subscriptions") or []
+            last = (rec.get("status"), [x.get("lastOk") for x in subs])
+            if rec.get("status") == "up" and subs and all(x.get("lastOk") for x in subs):
+                return
+        time.sleep(0.05)
+    raise RuntimeError("tunnel %s not ready in %.0f s: %r" % (tunnel_id, tries * 0.05, last))
+
+
+def run_tunnel_sequence(t, conn):
+    t.step("GET", "/api/v1/tunnels")
+    t.step("PUT", "/api/v1/tunnels", "{}")
+    t.step("PUT", "/api/v1/tunnels", json.dumps({"tunnels": [{"id": "t1", "device": "eth0", "enable": False}]}))
+    tunnels = {
+        "tunnels": [
+            {
+                "id": "t1",
+                "device": "tunvless0",
+                "sources": [
+                    {"id": "0000000a", "kind": "link", "link": TUN_LINK},
+                    {"id": "0000000b", "kind": "subscription", "name": "Stub", "url": STUB_TUN_URL,
+                     "interval": 3600},
+                ],
+                "filter": "^(A|NL-.*)$",
+                "order": ["0000000b:NL-2"],
+                "exclude": ["0000000b:NL-1"],
+            },
+            {
+                "id": "t2",
+                "device": "tunvless1",
+                "enable": False,
+                "uplink": {"kind": "tunnel", "ref": "t1"},
+                "sources": [{"id": "0000000c", "kind": "link", "link": TUN_LINK}],
+            },
+        ]
+    }
+    t.step("PUT", "/api/v1/tunnels", json.dumps(tunnels))
+    wait_tunnel_ready(conn, "t1")
+    t.step("GET", "/api/v1/tunnels")
+    t.step("GET", "/api/v1/tunnels/state")
+    draft = dict(tunnels["tunnels"][0], filter="^(NL|DE)-", exclude=[], order=["0000000b:DE-1"])
+    t.step("POST", "/api/v1/tunnels/preview", json.dumps({"tunnel": draft}))
+    t.step("POST", "/api/v1/tunnels/preview", json.dumps({"tunnel": dict(draft, filter="(")}))
+    t.step("POST", "/api/v1/tunnels/probe", json.dumps({"id": "t1"}))
+    t.step("POST", "/api/v1/tunnels/probe", json.dumps({"id": "zz"}))
+    t.step("POST", "/api/v1/tunnels/t1/refresh")
+    t.step("POST", "/api/v1/tunnels/t2/refresh")
+    t.step("POST", "/api/v1/tunnels/zz/refresh")
+    t.step("POST", "/api/v1/tunnels/t2/restart")
+    t.step("POST", "/api/v1/tunnels/zz/restart")
+    t.step("POST", "/api/v1/tunnels/t1/restart")
+    t.step("PUT", "/api/v1/tunnels", json.dumps({"tunnels": []}))
+    t.step("GET", "/api/v1/tunnels/state")
 
 
 def _normalize_host_interfaces(obj):
@@ -362,6 +443,8 @@ def run_api_sequence(conn, out):
     t.step("DELETE", "/api/v1/groups/40404040")
     t.step("DELETE", "/api/v1/groups/40404040")  # already gone -> 404
     t.step("GET", "/api/v1/groups")
+
+    run_tunnel_sequence(t, conn)
 
     t.step("GET", "/api/v1/auth")
 

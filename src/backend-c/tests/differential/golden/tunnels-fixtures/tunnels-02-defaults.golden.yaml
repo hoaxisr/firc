@@ -1,0 +1,19 @@
+tunnels:
+- id: "min"
+  device: "tunvless7"
+  enable: true
+  uplink: "auto"
+  sources:
+  - id: "0000000b"
+    subscription:
+      name: "P"
+      url: "http://sub.example.invalid/x"
+      interval: 21600s
+  active: 1
+  by: "connection"
+  interval: 60s
+  silence: 20s
+  advanced:
+    timeout: 8s
+    insecure: false
+    ca: ""

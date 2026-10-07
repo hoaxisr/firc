@@ -65,6 +65,8 @@ struct fake_rtnl {
         size_t len;
     } dgrams[FAKE_RTNL_MAX_ROUTES + 4];
     size_t n_dgrams, next_dgram;
+    fake_rtnl_record_fn on_record;
+    void *on_record_ud;
 };
 
 static void record(fake_rtnl_t *f, const struct nlmsghdr *h) {
@@ -131,6 +133,16 @@ static void record(fake_rtnl_t *f, const struct nlmsghdr *h) {
     }
     pthread_mutex_lock(&f->mu);
     if (f->n < FAKE_RTNL_MAX) { f->msgs[f->n++] = m; }
+    fake_rtnl_record_fn fn = f->on_record;
+    void *ud = f->on_record_ud;
+    pthread_mutex_unlock(&f->mu);
+    if (fn != NULL) { fn(&m, ud); }
+}
+
+void fake_rtnl_on_record(fake_rtnl_t *f, fake_rtnl_record_fn fn, void *ud) {
+    pthread_mutex_lock(&f->mu);
+    f->on_record = fn;
+    f->on_record_ud = ud;
     pthread_mutex_unlock(&f->mu);
 }
 

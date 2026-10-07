@@ -53,6 +53,9 @@ void fake_rtnl_fail_after_of(fake_rtnl_t *f, uint16_t type, int err, unsigned sk
 bool fake_rtnl_failure_armed(fake_rtnl_t *f);
 void fake_rtnl_fail_times(fake_rtnl_t *f, uint16_t type, int err, unsigned n);
 
+typedef void (*fake_rtnl_record_fn)(const fake_rtnl_msg_t *m, void *ud);
+void fake_rtnl_on_record(fake_rtnl_t *f, fake_rtnl_record_fn fn, void *ud);
+
 size_t fake_rtnl_messages(fake_rtnl_t *f, fake_rtnl_msg_t *out, size_t cap);
 size_t fake_rtnl_count(fake_rtnl_t *f, uint16_t type, uint8_t rtm_type);
 

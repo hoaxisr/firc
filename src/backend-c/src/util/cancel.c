@@ -1,3 +1,5 @@
+#define _GNU_SOURCE /* NOLINT(bugprone-reserved-identifier) */
+
 #include "firc/cancel.h"
 
 #include <errno.h>
@@ -15,26 +17,12 @@ struct firc_cancel {
     int wr;
 };
 
-static int set_nonblock_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { return -1; }
-    flags = fcntl(fd, F_GETFD, 0);
-    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) { return -1; }
-    return 0;
-}
-
 firc_cancel_t *firc_cancel_new(void) {
     firc_cancel_t *c = calloc(1, sizeof(*c));
     if (!c) { return NULL; }
 
     int fds[2];
-    if (pipe(fds) != 0) {
-        free(c);
-        return NULL;
-    }
-    if (set_nonblock_cloexec(fds[0]) != 0 || set_nonblock_cloexec(fds[1]) != 0) {
-        close(fds[0]);
-        close(fds[1]);
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
         free(c);
         return NULL;
     }

@@ -28,6 +28,8 @@ case "$ACTION" in
         logger -t firc "purge did not finish; some rules or routes may be left until the next reboot"
     fi
     rm -rf /tmp/firc-init
+    rm -rf /opt/var/lib/firc/tunnels
+    rmdir /opt/var/lib/firc 2>/dev/null
     ;;
   upgrade) ;;
   *) logger -t firc "prerm: action '$ACTION' unknown; the pool's routes and barrier are left for the next daemon" 2>/dev/null ;;

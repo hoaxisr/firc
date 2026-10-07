@@ -231,10 +231,11 @@ typedef struct firc_iface_info {
     char name[64]; /* friendly alias; empty unless built with FIRC_ENTWARE_KN */
 } firc_iface_info_t;
 
-/* enumerates system interfaces (getifaddrs, deduped); without showAllInterfaces keeps only IFF_POINTOPOINT ones */
+/* enumerates system interfaces (getifaddrs, deduped); without showAllInterfaces keeps IFF_POINTOPOINT and tunvless ones */
 firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **out, size_t *out_n);
 
 bool firc_iface_is_ignored_for_test(const char *name); /* test seam, always false without FIRC_ENTWARE_KN */
+bool firc_iface_listed_for_test(const char *name, unsigned flags, bool show_all); /* test seam: the list's filter */
 
 /* two files sharing one path; _save_groups writes only groups.yaml; _save_config writes both, from the saved copy */
 firc_err_t firc_app_save_groups(firc_app_t *app, const char *conf_path,

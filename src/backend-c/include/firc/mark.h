@@ -37,6 +37,12 @@ static inline uint32_t firc_mark_group_value(uint32_t field) {
 /* Reply twin: FASTNAT routes DNAT replies by ct->mark; this sends them via main. */
 #define FIRC_RULE_PRIORITY_REPLY 49u
 
+/* Owner of a tunnel uplink's field in the shared allocator: this + the tunnel id. */
+#define FIRC_MARK_TUNNEL_OWNER "tun:"
+
+/* A tunnel's own sockets, ahead of every group rule. */
+#define FIRC_RULE_PRIORITY_TUNNEL 48u
+
 static inline uint32_t firc_rule_priority_for_field(uint32_t field) {
     (void)field;
     return FIRC_RULE_PRIORITY;

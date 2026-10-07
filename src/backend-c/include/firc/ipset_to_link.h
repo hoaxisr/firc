@@ -16,6 +16,23 @@
 
 typedef struct firc_ipset_to_link firc_ipset_to_link_t;
 
+#define FIRC_IFACE_ROUTE_METRIC 10u
+
+typedef struct firc_iface_route {
+    bool present;
+    bool has_gw;
+    uint8_t gw[16];
+    uint8_t gw_len;
+} firc_iface_route_t;
+
+/* Writes the table's default via the interface (gateway if it has one), keeping the last gateway when none is found. */
+firc_err_t firc_iface_route_update(firc_rtnl_t *r, int family, uint32_t table, const char *iface_name,
+                                  int ifindex, bool point_to_point, firc_iface_route_t *st);
+
+/* Deletes the default update wrote, if any. */
+firc_err_t firc_iface_route_remove(firc_rtnl_t *r, int family, uint32_t table, const char *iface_name,
+                                  firc_iface_route_t *st);
+
 typedef enum {
     FIRC_NF_SRC_ADDR = 1,
     FIRC_NF_SRC_MAC = 2,

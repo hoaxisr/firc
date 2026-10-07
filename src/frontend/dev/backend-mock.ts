@@ -14,6 +14,7 @@ const INTERFACES: Interfaces = {
     { id: "longinterf" },
     { id: "eth1" },
     { id: "wg0", name: "WireGuard Interface" },
+    { id: "tunvless0" },
   ],
 };
 
@@ -607,6 +608,231 @@ app.get(`${API_BASE}/groups/:id/list/sync/events`, (c) => {
       await stream.sleep(300);
     }
   });
+});
+
+const TUNNEL_LINK =
+  "vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A";
+let TUNNELS: any[] = [
+  {
+    id: "main",
+    device: "tunvless0",
+    enable: true,
+    active: 1,
+    by: "connection",
+    interval: 60,
+    silence: 20,
+    filter: "",
+    order: [],
+    exclude: [],
+    sources: [
+      { id: "0000000a", kind: "link", link: TUNNEL_LINK },
+      {
+        id: "0000000b",
+        kind: "subscription",
+        name: "Provider",
+        url: "https://sub.example.invalid/feed",
+        interval: 21600,
+      },
+    ],
+    uplink: { kind: "auto", ref: "" },
+    advanced: { ca: "", insecure: false, timeout: 8 },
+  },
+];
+
+const TUNNEL_STATUS_CYCLE = ["up", "up", "up", "no_node", "backoff", "starting"];
+let TUNNEL_TICK = 0;
+
+const derivedId = (text: string) => {
+  let h = 0x811c9dc5;
+  for (const ch of text) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+  return h.toString(16).padStart(8, "0");
+};
+
+const tunnelRefusal = (tunnels: any[]) => {
+  if (tunnels.length > 8) return { error: "at most 8 tunnels", field: null, tunnel: null };
+  const ids = new Set<string>();
+  const devices = new Set<string>();
+  for (const tn of tunnels) {
+    if (!/^[A-Za-z0-9_-]{1,15}$/.test(tn?.id ?? "")) {
+      return {
+        error: "id: letters, digits, - and _, under 16 bytes",
+        field: "id",
+        tunnel: tn?.id ?? null,
+      };
+    }
+    if (ids.has(tn.id)) return { error: "id is used twice", field: "id", tunnel: tn.id };
+    ids.add(tn.id);
+    if (!/^tunvless([0-9]|[1-9][0-9])$/.test(tn.device ?? "")) {
+      return { error: "device must be tunvless0..tunvless99", field: "device", tunnel: tn.id };
+    }
+    if (devices.has(tn.device))
+      return { error: "device is used twice", field: "device", tunnel: tn.id };
+    devices.add(tn.device);
+    for (const [i, src] of (tn.sources ?? []).entries()) {
+      if (src.kind === "link" && !String(src.link ?? "").startsWith("vless://")) {
+        return {
+          error: "link must be a vless:// link",
+          field: `sources[${i}].link`,
+          tunnel: tn.id,
+        };
+      }
+      if (src.kind === "subscription" && !/^https?:\/\//.test(String(src.url ?? ""))) {
+        return { error: "url must be http or https", field: `sources[${i}].url`, tunnel: tn.id };
+      }
+    }
+  }
+  return null;
+};
+
+const tunnelNodes = (tn: any) =>
+  (tn.sources ?? [])
+    .flatMap((src: any, i: number) =>
+      [1, 2].map((n) => {
+        const name = src.kind === "link" ? "A" : `${src.name ?? "Sub"}-${n}`;
+        return {
+          src,
+          name: src.kind === "link" && n === 2 ? null : name,
+          key: `${src.id}:${name}`,
+          i,
+        };
+      }),
+    )
+    .filter((row: any) => row.name !== null);
+
+const tunnelState = (tn: any) => {
+  const status = !tn.enable
+    ? "off"
+    : TUNNEL_STATUS_CYCLE[Math.floor(TUNNEL_TICK / 3) % TUNNEL_STATUS_CYCLE.length];
+  const nodes = tunnelNodes(tn).map((row: any, k: number) => ({
+    key: row.key,
+    name: row.name,
+    source: row.src.kind === "link" ? "link" : row.src.name,
+    state: tn.exclude.includes(row.key)
+      ? "excluded"
+      : k === 0 && status === "up"
+        ? "active"
+        : "reserve",
+    since: 0,
+  }));
+  return {
+    id: tn.id,
+    device: tn.device,
+    status,
+    since: Math.floor(Date.now() / 1000) - 60,
+    backoffS: status === "backoff" || status === "no_node" ? 12 : 0,
+    lastExit: 0,
+    uplinkOk: true,
+    active: nodes.filter((n: any) => n.state === "active").map((n: any) => n.name),
+    groups: [],
+    nodes,
+    subscriptions: (tn.sources ?? [])
+      .filter((src: any) => src.kind === "subscription")
+      .map((src: any) => ({
+        name: src.name,
+        nodes: 2,
+        fetching: false,
+        lastOk: Math.floor(Date.now() / 1000) - 300,
+        lastTry: Math.floor(Date.now() / 1000) - 300,
+        error: "",
+      })),
+    rxBps: status === "up" ? 1200 : 0,
+    txBps: status === "up" ? 300 : 0,
+  };
+};
+
+app.get(`${API_BASE}/tunnels`, (c) => c.json({ tunnels: TUNNELS }));
+
+app.put(`${API_BASE}/tunnels`, async (c) => {
+  const body = await c.req.json();
+  const tunnels = Array.isArray(body?.tunnels) ? body.tunnels : [];
+  const refusal = tunnelRefusal(tunnels);
+  if (refusal) return c.json(refusal, 400);
+  const runOf = (tn: any) =>
+    JSON.stringify([
+      tn.device,
+      tn.enable,
+      tn.active,
+      tn.by,
+      tn.interval,
+      tn.silence,
+      tn.uplink,
+      tn.advanced,
+    ]);
+  const before = new Map(TUNNELS.map((tn: any) => [tn.id, tn]));
+  TUNNELS = tunnels.map((tn: any) => ({
+    ...tn,
+    sources: (tn.sources ?? []).map((src: any) => ({
+      ...src,
+      id: src.id || derivedId(src.link ?? src.url ?? ""),
+    })),
+  }));
+  const restarted = TUNNELS.filter(
+    (tn: any) => !before.has(tn.id) || runOf(before.get(tn.id)) !== runOf(tn),
+  ).map((tn: any) => tn.device);
+  const updated = TUNNELS.filter(
+    (tn: any) =>
+      before.has(tn.id) &&
+      runOf(before.get(tn.id)) === runOf(tn) &&
+      JSON.stringify(before.get(tn.id)) !== JSON.stringify(tn),
+  ).map((tn: any) => tn.device);
+  return c.json({ tunnels: TUNNELS, restarted, updated });
+});
+
+app.get(`${API_BASE}/tunnels/state`, (c) => {
+  TUNNEL_TICK++;
+  return c.json({ tunnels: TUNNELS.map(tunnelState) });
+});
+
+app.post(`${API_BASE}/tunnels/preview`, async (c) => {
+  const body = await c.req.json();
+  const draft = body?.tunnel;
+  if (!draft) return c.json({ error: "tunnel is required", field: null, tunnel: null }, 400);
+  const rows = tunnelNodes(draft).map((row: any) => ({
+    key: row.key,
+    name: row.name,
+    source: row.src.kind === "link" ? "link" : row.src.name,
+    isNew: !(draft.order ?? []).includes(row.key),
+    missing: false,
+    excluded: (draft.exclude ?? []).includes(row.key),
+    overCap: false,
+    skipReason: "",
+  }));
+  return c.json({
+    total: rows.length,
+    matched: rows.filter((r: any) => !r.excluded).length,
+    nodes: rows,
+    subscriptions: (draft.sources ?? [])
+      .filter((src: any) => src.kind === "subscription")
+      .map((src: any) => ({ name: src.name, cached: true })),
+  });
+});
+
+app.post(`${API_BASE}/tunnels/probe`, async (c) => {
+  const body = await c.req.json();
+  const target = body?.id ? TUNNELS.find((tn: any) => tn.id === body.id) : body?.tunnel;
+  if (!target) return c.json({ error: "no tunnel with this id" }, 404);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  return c.json({
+    nodes: tunnelNodes(target).map((row: any, k: number) =>
+      k % 3 === 2
+        ? { key: row.key, ok: false, why: "timeout", handshakeMs: null, firstByteMs: null }
+        : { key: row.key, ok: true, why: "", handshakeMs: 40 + k, firstByteMs: 60 + k },
+    ),
+  });
+});
+
+app.post(`${API_BASE}/tunnels/:id/refresh`, (c) => {
+  const tn = TUNNELS.find((x: any) => x.id === c.req.param("id"));
+  if (!tn) return c.json({ error: "no such tunnel" }, 404);
+  const has = (tn.sources ?? []).some((src: any) => src.kind === "subscription");
+  return c.json({ queued: has }, 202);
+});
+
+app.post(`${API_BASE}/tunnels/:id/restart`, (c) => {
+  const tn = TUNNELS.find((x: any) => x.id === c.req.param("id"));
+  if (!tn) return c.json({ error: "no such tunnel" }, 404);
+  if (!tn.enable) return c.json({ error: "the tunnel is off" }, 409);
+  return c.json({ queued: true }, 202);
 });
 
 app.get(`${API_BASE}/system/interfaces`, (c) => c.json(INTERFACES));

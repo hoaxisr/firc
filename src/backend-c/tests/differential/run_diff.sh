@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs the regex, yaml, config, match, subparse, dns, migrate and http suites, each diffed against golden/.
+# Runs the regex, yaml, config, tunnels, match, subparse, dns, migrate and http suites, each diffed against golden/.
 # A red suite is a regression until a named change explains it; regenerate a golden only with that change.
 # Goldens that diverge by design: regexp2.tsv (see known_divergences.tsv), match, subparse, http_contract.
 set -eu
@@ -60,6 +60,22 @@ if ! diff -u "$GOLDEN/config-fixtures/missing.golden.yaml" "$OUT/missing.c.yaml"
 else
     echo "   defaults: OK"
 fi
+
+echo "== differential: tunnels.yaml load/save fixtures (vs golden)"
+for fixture in "$DIR"/fixtures/tunnels/*.yaml; do
+    name=$(basename "$fixture" .yaml)
+    got="$OUT/$name.c.yaml"
+    rm -f "$got" "$OUT/$name.c.txt"
+    "$CONFIGTOOL" tunnels-resave "$fixture" "$got" > "$OUT/$name.c.txt" 2>/dev/null || true
+    if [ -f "$got" ]; then cat "$got" >> "$OUT/$name.c.txt"; fi
+    if ! diff -u "$GOLDEN/tunnels-fixtures/$name.golden.yaml" "$OUT/$name.c.txt" > "$OUT/$name.diff" 2>&1; then
+        echo "   REGRESSION in $name (vs golden):"
+        head -20 "$OUT/$name.diff"
+        fail=1
+    else
+        echo "   $name: OK"
+    fi
+done
 
 echo "== differential: rule matching corpus (vs golden)"
 "$CONFIGTOOL" match < "$DIR/corpus/match_corpus.tsv" > "$OUT/match.c.tsv"

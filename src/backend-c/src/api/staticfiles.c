@@ -68,7 +68,7 @@ void firc_static_handler(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
         break;
     }
 
-    FILE *f = fopen(file_path, "rb");
+    FILE *f = fopen(file_path, "rbe");
     if (!f) {
         firc_http_res_write_error(res, 500, "failed to read file");
         return;

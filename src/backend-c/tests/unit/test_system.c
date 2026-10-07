@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <linux/if.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -504,6 +505,19 @@ TEST a_bypass_event_without_a_last_answer_has_no_last(void) {
     PASS();
 }
 
+/* catches: a tunnel device hidden from group pickers unless every interface is shown, or any tunvless-like name let through */
+TEST tunnel_devices_are_listed_without_show_all(void) {
+    ASSERT(firc_iface_listed_for_test("tunvless0", 0, false));
+    ASSERT(firc_iface_listed_for_test("tunvless12", IFF_UP, false));
+    ASSERT_FALSE(firc_iface_listed_for_test("tunvless", 0, false));
+    ASSERT_FALSE(firc_iface_listed_for_test("tunvlessx", 0, false));
+    ASSERT_FALSE(firc_iface_listed_for_test("tunvless1a", 0, false));
+    ASSERT_FALSE(firc_iface_listed_for_test("eth0", IFF_UP, false));
+    ASSERT(firc_iface_listed_for_test("ppp0", IFF_POINTOPOINT, false));
+    ASSERT(firc_iface_listed_for_test("eth0", 0, true));
+    PASS();
+}
+
 TEST ignored_interfaces_list(void) {
 #ifdef FIRC_ENTWARE_KN
     ASSERT(firc_iface_is_ignored_for_test("ra0"));
@@ -581,6 +595,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_bypass_event_is_answered_with_every_field);
     RUN_TEST(a_bypass_event_without_a_last_answer_has_no_last);
     RUN_TEST(ignored_interfaces_list);
+    RUN_TEST(tunnel_devices_are_listed_without_show_all);
     RUN_TEST(the_hosts_route_answers_the_refreshers_table);
     RUN_TEST(the_netfilter_route_says_whether_the_committer_is_failing);
     RUN_TEST(the_netfilter_route_says_the_first_write_is_pending);

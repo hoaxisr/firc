@@ -1,3 +1,5 @@
+#define _GNU_SOURCE /* NOLINT(bugprone-reserved-identifier) */
+
 #include "firc/iptables.h"
 #include "firc/bytebuf.h"
 #include "firc/log.h"
@@ -99,13 +101,13 @@ static firc_err_t spawn_with_pipes(const char *const argv[], bool need_stdin_pip
     *stdout_rd = -1;
     *stderr_rd = -1;
 
-    if (need_stdin_pipe && pipe(in_pipe) != 0) { return firc_err_from_errno(errno); }
-    if (pipe(out_pipe) != 0) {
+    if (need_stdin_pipe && pipe2(in_pipe, O_CLOEXEC) != 0) { return firc_err_from_errno(errno); }
+    if (pipe2(out_pipe, O_CLOEXEC) != 0) {
         close_if_valid(in_pipe[0]);
         close_if_valid(in_pipe[1]);
         return firc_err_from_errno(errno);
     }
-    if (pipe(err_pipe) != 0) {
+    if (pipe2(err_pipe, O_CLOEXEC) != 0) {
         close_if_valid(in_pipe[0]);
         close_if_valid(in_pipe[1]);
         close(out_pipe[0]);

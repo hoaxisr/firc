@@ -7,6 +7,7 @@
 #include "firc/loop.h"
 #include "firc/httpd.h"
 #include "firc/sub_fetch.h"
+#include "firc/version.h"
 
 #define TEST_PORT 18100
 
@@ -53,6 +54,13 @@ static void h_big300k(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     (void)req;
     (void)ud;
     firc_http_res_write(res, 200, "text/plain", (const uint8_t *)g_big300k_body, sizeof(g_big300k_body));
+}
+
+static void h_ua(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)ud;
+    const char *ua = firc_http_req_header(req, "User-Agent");
+    const char *body = ua != NULL ? ua : "";
+    firc_http_res_write(res, 200, "text/plain", (const uint8_t *)body, strlen(body));
 }
 
 typedef struct redirect_ud {
@@ -103,9 +111,11 @@ static harness_t *harness_start(void) {
     firc_httpd_route(h->srv, "GET", "/404", h_notfound_status, NULL);
     firc_httpd_route(h->srv, "GET", "/big", h_big, NULL);
     firc_httpd_route(h->srv, "GET", "/big300k", h_big300k, NULL);
+    firc_httpd_route(h->srv, "GET", "/ua", h_ua, NULL);
 
     add_redirect(h, "/redirect301", 301, "/list");
     add_redirect(h, "/redirect302", 302, "/list");
+    add_redirect(h, "/redirect_ua", 302, "/ua");
     add_redirect(h, "/loopA", 302, "/loopB");
     add_redirect(h, "/loopB", 302, "/loopA");
     add_redirect(h, "/chain_ok0", 302, "/chain_ok1");
@@ -352,6 +362,23 @@ TEST the_cap_beats_a_live_progress_callback(void) {
     PASS();
 }
 
+/* catches: a fetch sent with curl's default User-Agent or none, on the first hop or after a redirect */
+TEST every_fetch_names_firc_and_its_version(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char *body = NULL;
+    size_t len = 0;
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list(url_for("/ua"), &body, &len));
+    ASSERT_STR_EQ("firc/" FIRC_VERSION, body);
+    free(body);
+    body = NULL;
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/redirect_ua"), 0, &body, &len, NULL, NULL, NULL));
+    ASSERT_STR_EQ("firc/" FIRC_VERSION, body);
+    free(body);
+    harness_stop(h);
+    PASS();
+}
+
 TEST connection_refused_is_io_error(void) {
     char *body = NULL;
     size_t len = 0;
@@ -377,6 +404,7 @@ int main(int argc, char **argv) {
     RUN_TEST(unsupported_scheme_is_inval);
     RUN_TEST(malformed_url_is_inval);
     RUN_TEST(connection_refused_is_io_error);
+    RUN_TEST(every_fetch_names_firc_and_its_version);
     RUN_TEST(fetch_reports_progress_with_the_declared_total);
     RUN_TEST(a_404_reports_its_status);
     RUN_TEST(fetch_aborted_by_the_callback_is_canceled_and_leaves_no_body);

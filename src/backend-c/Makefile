@@ -17,7 +17,9 @@ CSTD     := -std=c11
 OPT      ?= -O2
 CFLAGS   ?=
 # POSIX.1-2008 project-wide; only src/platform/ defines _GNU_SOURCE.
-CFLAGS   += $(CSTD) $(OPT) $(WARNINGS) -Iinclude -MMD -MP \
+TUNVLESS_DIR := ../tunvless
+TUNVLESS_HDR := -I$(TUNVLESS_DIR)/src/proto/vless
+CFLAGS   += $(CSTD) $(OPT) $(WARNINGS) -Iinclude $(TUNVLESS_HDR) -MMD -MP \
             -D_POSIX_C_SOURCE=200809L \
             -DFIRC_VERSION=\"$(FIRC_VERSION)\" -fno-common \
             $(if $(ENTWARE_KN),-DFIRC_ENTWARE_KN) \
@@ -38,6 +40,7 @@ endif
 # No external library dependencies.
 CORE_SRCS := \
     src/util/err.c \
+    src/util/atomic_write.c \
     src/util/queue.c \
     src/util/bytebuf.c \
     src/util/cancel.c \
@@ -122,7 +125,31 @@ API_SRCS := \
     src/api/capture.c \
     src/api/staticfiles.c \
     src/api/group_lists.c \
+    src/api/tunnels.c \
     src/crypto/jwt.c
+
+# Needs libyaml.
+TUNNELS_SRCS := \
+    src/tunnels/tconfig.c \
+    src/tunnels/tunproto.c \
+    src/tunnels/tunsup.c \
+    src/tunnels/tunnet.c \
+    src/tunnels/tunrun.c \
+    src/tunnels/tunnodes.c \
+    src/tunnels/tunsubs.c \
+    src/tunnels/tunprobe.c
+
+# The tunvless parser, built with tunvless's own flags; its own tests cover it.
+TUNVLESS_PARSER_SRCS := \
+    $(TUNVLESS_DIR)/src/proto/vless/sub.c \
+    $(TUNVLESS_DIR)/src/proto/vless/sublink.c \
+    $(TUNVLESS_DIR)/src/proto/vless/vless_proto.c \
+    $(TUNVLESS_DIR)/src/proto/vless/vlink.c \
+    $(TUNVLESS_DIR)/src/proto/transport/trpath.c
+TUNVLESS_CFLAGS = -std=gnu11 $(OPT) -Wall -Wextra $(filter-out -Werror%,$(CFLAGS_EXTRA)) -MMD -MP \
+    -I$(TUNVLESS_DIR)/src/lib -I$(TUNVLESS_DIR)/src/tunnel -I$(TUNVLESS_DIR)/src/proto/vless \
+    -I$(TUNVLESS_DIR)/src/proto/transport -I$(TUNVLESS_DIR)/src/proto/tls \
+    $(if $(SYSROOT),--sysroot=$(SYSROOT))
 
 # Needs libcurl.
 SUBSCRIPTIONS_SRCS := \
@@ -152,7 +179,7 @@ INTERFACES_SRCS := \
     src/interfaces/keenetic_resolvers.c
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS) $(SUBSCRIPTIONS_SRCS) \
-            $(INTERFACES_SRCS) $(TAP_RULES_SRCS) $(TAP_SRCS) $(TAP_CFG_SRCS)
+            $(TUNNELS_SRCS) $(INTERFACES_SRCS) $(TAP_RULES_SRCS) $(TAP_SRCS) $(TAP_CFG_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
@@ -163,11 +190,13 @@ CONFIG_OBJS := $(CONFIG_SRCS:%.c=$(BUILDDIR)/%.o)
 NETFILTER_OBJS := $(NETFILTER_SRCS:%.c=$(BUILDDIR)/%.o)
 API_OBJS := $(API_SRCS:%.c=$(BUILDDIR)/%.o)
 SUBSCRIPTIONS_OBJS := $(SUBSCRIPTIONS_SRCS:%.c=$(BUILDDIR)/%.o)
+TUNNELS_OBJS := $(TUNNELS_SRCS:%.c=$(BUILDDIR)/%.o) \
+    $(TUNVLESS_PARSER_SRCS:$(TUNVLESS_DIR)/%.c=$(BUILDDIR)/tunvless/%.o)
 INTERFACES_OBJS := $(INTERFACES_SRCS:%.c=$(BUILDDIR)/%.o)
 TAP_RULES_OBJS := $(TAP_RULES_SRCS:%.c=$(BUILDDIR)/%.o)
 TAP_OBJS := $(TAP_SRCS:%.c=$(BUILDDIR)/%.o) $(TAP_CFG_SRCS:%.c=$(BUILDDIR)/%.o)
 LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS) $(API_OBJS) $(SUBSCRIPTIONS_OBJS) \
-            $(INTERFACES_OBJS) $(TAP_RULES_OBJS) $(TAP_OBJS)
+            $(TUNNELS_OBJS) $(INTERFACES_OBJS) $(TAP_RULES_OBJS) $(TAP_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)
@@ -217,6 +246,10 @@ $(BUILDDIR)/firc-dnstool: $(CORE_OBJS) $(DNSTOOL_OBJ)
 $(BUILDDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/tunvless/%.o: $(TUNVLESS_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(TUNVLESS_CFLAGS) -c -o $@ $<
 
 # Keep support objects, or make deletes them as intermediates and rebuilds every test.
 .PRECIOUS: $(BUILDDIR)/tests/support/%.o
@@ -327,12 +360,12 @@ ANALYSIS_JOBS ?= $(shell nproc)
 static_analysis:
 	@if command -v clang-tidy >/dev/null; then \
 	    printf '%s\n' $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(TEST_SUPPORT_SRCS) | \
-	    xargs -P $(ANALYSIS_JOBS) -n 4 sh -c 'clang-tidy --quiet "$$@" -- $(CSTD) -Iinclude -Itests/unit \
+	    xargs -P $(ANALYSIS_JOBS) -n 4 sh -c 'clang-tidy --quiet "$$@" -- $(CSTD) -Iinclude $(TUNVLESS_HDR) -Itests/unit \
 	        -D_POSIX_C_SOURCE=200809L -DFIRC_VERSION=\"$(FIRC_VERSION)\"' clang-tidy; \
 	else echo "clang-tidy not found (skipped)"; fi
 	@if command -v cppcheck >/dev/null; then \
 	    cppcheck -j $(ANALYSIS_JOBS) --std=c11 --enable=warning,performance,portability \
-	        --error-exitcode=1 --inline-suppr -Iinclude -Itests/unit \
+	        --error-exitcode=1 --inline-suppr -Iinclude $(TUNVLESS_HDR) -Itests/unit \
 	        -D_POSIX_C_SOURCE=200809L \
 	        $(LIB_SRCS) $(MAIN_SRC) $(CONFIGTOOL_SRC) $(DNSTOOL_SRC) $(TEST_SUPPORT_SRCS); \
 	else echo "cppcheck not found (skipped)"; fi

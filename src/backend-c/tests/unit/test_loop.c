@@ -34,6 +34,23 @@ TEST oneshot_timer_fires_and_stops(void)
     PASS();
 }
 
+/* catches: a stop that outlives its run, so every later run returns before anything is dispatched */
+TEST a_stop_ends_one_run_only(void)
+{
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    int first = 0;
+    int second = 0;
+    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 10, 0, stop_timer_cb, &first, NULL));
+    ASSERT_EQ(FIRC_OK, firc_loop_run(loop));
+    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 30, 0, stop_timer_cb, &second, NULL));
+    ASSERT_EQ(FIRC_OK, firc_loop_run(loop));
+    ASSERT_EQ(1, first);
+    ASSERT_EQ(1, second);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
 struct periodic_ctx {
     int fires;
 };
@@ -449,6 +466,7 @@ int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(oneshot_timer_fires_and_stops);
+    RUN_TEST(a_stop_ends_one_run_only);
     RUN_TEST(periodic_timer_fires_repeatedly);
     RUN_TEST(fd_readable_event_delivers_data);
     RUN_TEST(cross_thread_post_executes_on_loop);

@@ -1,7 +1,5 @@
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <libgen.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +7,7 @@
 #include <unistd.h>
 #include <yaml.h>
 
+#include "firc/atomic_write.h"
 #include "firc/yamlio.h"
 #include "yaml_scalar.h"
 
@@ -478,66 +477,9 @@ firc_err_t firc_config_save_part_file(const firc_config_t *cfg, const char *vers
         return err;
     }
 
-    /* mkstemp, not a pid-based name: open(O_CREAT) without O_EXCL would follow a planted symlink */
-    char tmp_path[4096];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path);
-    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
-        free(data);
-        return FIRC_ERR_INVAL;
-    }
-
-    int fd = mkstemp(tmp_path);
-    if (fd < 0) {
-        free(data);
-        return firc_err_from_errno(errno);
-    }
-    /* belt-and-braces: mkstemp already creates at 0600; rename doesn't carry a mode over on its own */
-    if (fchmod(fd, 0600) != 0) {
-        err = firc_err_from_errno(errno);
-        close(fd);
-        unlink(tmp_path);
-        free(data);
-        return err;
-    }
-    size_t written = 0;
-    while (written < len) {
-        ssize_t rc = write(fd, data + written, len - written);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            err = firc_err_from_errno(errno);
-            close(fd);
-            unlink(tmp_path);
-            free(data);
-            return err;
-        }
-        written += (size_t)rc;
-    }
-    if (fsync(fd) != 0 || close(fd) != 0) {
-        err = firc_err_from_errno(errno);
-        unlink(tmp_path);
-        free(data);
-        return err;
-    }
+    err = firc_atomic_write(path, data, len);
     free(data);
-
-    if (rename(tmp_path, path) != 0) {
-        err = firc_err_from_errno(errno);
-        unlink(tmp_path);
-        return err;
-    }
-
-    /* fsync the directory so the rename is durable */
-    char dir_buf[4096];
-    snprintf(dir_buf, sizeof(dir_buf), "%s", path);
-    const char *dir = dirname(dir_buf);
-    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd >= 0) {
-        (void)fsync(dfd);
-        close(dfd);
-    }
-    return FIRC_OK;
+    return err;
 }
 
 firc_err_t firc_config_save_file(const firc_config_t *cfg, const char *version, const char *path)

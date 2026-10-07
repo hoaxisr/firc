@@ -822,7 +822,7 @@ out:
 
 firc_err_t firc_config_load_file(firc_config_t *cfg, const char *path)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = fopen(path, "rbe");
     if (f == NULL) {
         /* NOENT only for a literal missing file; every other errno is a file that exists but couldn't be read */
         return errno == ENOENT ? FIRC_ERR_NOENT : firc_err_from_errno(errno);

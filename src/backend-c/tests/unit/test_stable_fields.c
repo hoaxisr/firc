@@ -117,6 +117,27 @@ TEST a_gone_owner_s_flows_are_flushed_and_its_field_is_free(void) {
     PASS();
 }
 
+/* Catches: a tunnel uplink's entry taken for a deleted group: its field flushed, freed and handed to a group. */
+TEST a_tunnel_entry_is_seeded_unflushed_and_no_group_takes_it(void) {
+    fx_t f;
+    ASSERT(up(&f, "0000000a", true));
+    const uint8_t s1[4] = {192, 168, 1, 10}, d1[4] = {10, 1, 2, 3};
+    fake_ct_add(f.ctk, AF_INET, s1, d1, d1, 0x40010000u);
+    firc_fields_entry_t map[1] = {{"tun:a", 1}};
+    size_t n = 1;
+
+    firc_stable_fields_adoption_t r = firc_stable_fields_adopt(f.rtnl, f.ct, &f.cfg, true, map, &n);
+    ASSERT_EQ_FMT((size_t)0, r.freed, "%zu");
+    ASSERT_EQ_FMT((size_t)1, r.tunnels, "%zu");
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    ASSERT_STR_EQ("tun:a", map[0].owner);
+    ASSERT_EQ_FMT((size_t)0, fake_ct_deletes(f.ctk), "%zu");
+    ASSERT_EQ_FMT(2u, alloc(&f, "0000000a"), "%u");
+    ASSERT_EQ_FMT(1u, alloc(&f, "tun:a"), "%u");
+    down(&f);
+    PASS();
+}
+
 /* Catches: a disabled group treated as gone, its flows flushed and its field given away. */
 TEST a_disabled_group_s_entry_is_seeded_not_flushed(void) {
     fx_t f;
@@ -237,6 +258,25 @@ TEST a_loaded_map_is_saved_without_its_dead_and_again_at_every_change(void) {
     PASS();
 }
 
+/* Catches: a map holding a tunnel's field not loaded, or saved back without it, so the tunnel's mark moves. */
+TEST a_tunnel_s_field_survives_a_start(void) {
+    fx_t f;
+    ASSERT(up(&f, "0000000a", true));
+    ASSERT(write_text(f.path, "firc-fields\nfield tun:a 1\nfield 0000000a 2\nend\n"));
+    firc_stable_fields_t sf;
+
+    ASSERT(firc_stable_fields_start(&sf, f.path, f.rtnl, f.ct, &f.cfg, true));
+    size_t n = 0;
+    ASSERT_EQ_FMT(1u, field_in_file(f.path, "tun:a", &n), "%u");
+    ASSERT_EQ_FMT((size_t)2, n, "%zu");
+    ASSERT_EQ_FMT(2u, alloc(&f, "0000000a"), "%u");
+    ASSERT_EQ_FMT(1u, alloc(&f, "tun:a"), "%u");
+    ASSERT_EQ_FMT(3u, alloc(&f, "0000000c"), "%u");
+    firc_stable_fields_release(&sf);
+    down(&f);
+    PASS();
+}
+
 /* Catches: a malformed map kept on disk, or the on-change save left out when the start had no map. */
 TEST a_malformed_map_is_removed_and_changes_are_still_saved(void) {
     fx_t f;
@@ -276,12 +316,14 @@ GREATEST_MAIN_DEFS();
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(a_gone_owner_s_flows_are_flushed_and_its_field_is_free);
+    RUN_TEST(a_tunnel_entry_is_seeded_unflushed_and_no_group_takes_it);
     RUN_TEST(a_disabled_group_s_entry_is_seeded_not_flushed);
     RUN_TEST(without_conntrack_a_dead_entry_is_still_dropped);
     RUN_TEST(a_gone_owner_whose_flush_fails_keeps_its_field_reserved);
     RUN_TEST(a_refused_seed_is_not_kept);
     RUN_TEST(without_a_groups_file_nothing_is_flushed_and_every_entry_stays);
     RUN_TEST(a_loaded_map_is_saved_without_its_dead_and_again_at_every_change);
+    RUN_TEST(a_tunnel_s_field_survives_a_start);
     RUN_TEST(a_malformed_map_is_removed_and_changes_are_still_saved);
     RUN_TEST(a_map_that_cannot_be_read_is_left_in_place);
     GREATEST_MAIN_END();

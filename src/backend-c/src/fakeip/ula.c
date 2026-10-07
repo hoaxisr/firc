@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "firc/atomic_write.h"
 #include "firc/log.h"
 #include "firc/rand.h"
 
@@ -33,7 +34,7 @@ typedef enum {
 static prefix_read_t read_prefix_state(const char *path, firc_ip_t *out, uint8_t *prefix_out);
 
 static prefix_read_t read_prefix_state(const char *path, firc_ip_t *out, uint8_t *prefix_out) {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "re");
     if (f == NULL) {
         /* Only ENOENT means absent; any other failure isn't license to delete. */
         return errno == ENOENT ? PREFIX_ABSENT : PREFIX_ERROR;
@@ -69,7 +70,7 @@ static firc_err_t write_prefix(const char *path, const firc_ip_t *base, bool rep
     if (snprintf(tmp, sizeof(tmp), "%s.tmpXXXXXX", path) >= (int)sizeof(tmp)) {
         return FIRC_ERR_INVAL;
     }
-    int fd = mkstemp(tmp);
+    int fd = firc_mkstemp_cloexec(tmp);
     if (fd < 0) { return FIRC_ERR_SYS; }
     if (fchmod(fd, 0600) != 0) {
         close(fd);

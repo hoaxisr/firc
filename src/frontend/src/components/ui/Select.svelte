@@ -1,9 +1,17 @@
 <script lang="ts">
   import { Select } from "bits-ui";
 
+  import Tooltip from "./Tooltip.svelte";
+
   import { Check, SelectOpen } from "./icons";
 
-  type Option = { value: string; label: string; description?: string };
+  type Option = {
+    value: string;
+    label: string;
+    description?: string;
+    disabled?: boolean;
+    hint?: string;
+  };
   type Props = {
     options?: Option[];
     selected?: string;
@@ -34,6 +42,20 @@
   );
 </script>
 
+{#snippet body(option: Option, selected: boolean)}
+  <div class="option">
+    <div class="option-text">
+      <span class="option-label">{option.label}</span>
+      {#if option.description}
+        <span class="option-description">{option.description}</span>
+      {/if}
+    </div>
+    <div class="option-check">
+      {#if selected}<Check size={16} />{/if}
+    </div>
+  </div>
+{/snippet}
+
 <div class="select-wrap" class:missing={missing_selection} class:disabled {...rest}>
   <Select.Root type="single" {onValueChange} items={options} bind:value={selected} {disabled}>
     <Select.Trigger aria-label={ariaLabel}>
@@ -55,19 +77,15 @@
     <Select.Portal>
       <Select.Content align="start" sideOffset={4} collisionPadding={8}>
         {#each options as option}
-          <Select.Item value={option.value} label={option.label}>
+          <Select.Item value={option.value} label={option.label} disabled={option.disabled}>
             {#snippet children({ selected })}
-              <div class="option">
-                <div class="option-text">
-                  <span class="option-label">{option.label}</span>
-                  {#if option.description}
-                    <span class="option-description">{option.description}</span>
-                  {/if}
-                </div>
-                <div class="option-check">
-                  {#if selected}<Check size={16} />{/if}
-                </div>
-              </div>
+              {#if option.hint}
+                <Tooltip value={option.hint}>
+                  {@render body(option, selected)}
+                </Tooltip>
+              {:else}
+                {@render body(option, selected)}
+              {/if}
             {/snippet}
           </Select.Item>
         {/each}
@@ -142,6 +160,10 @@
   }
   :global([data-select-item]:hover) {
     background-color: var(--bg-light-extra);
+  }
+  :global([data-select-item][data-disabled]) {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .selected {

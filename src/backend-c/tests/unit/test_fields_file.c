@@ -64,6 +64,26 @@ TEST a_saved_map_loads_back_identically(void) {
     PASS();
 }
 
+/* Catches: a tunnel uplink's owner refused by the loader, so one running tunnel throws the whole map away. */
+TEST a_tunnel_owner_loads_back_beside_groups(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const firc_rtnl_field_t v[3] = {{"tun:a", 2}, {"aaaaaaaa", 5}, {"tun:Office_2-b01234", 9}};
+    ASSERT_EQ(FIRC_OK, firc_fields_file_save(f.path, v, 3));
+    firc_fields_entry_t *out = NULL;
+    size_t n = 0;
+    ASSERT_EQ(FIRC_OK, firc_fields_file_load(f.path, &out, &n));
+    ASSERT_EQ_FMT((size_t)3, n, "%zu");
+    ASSERT_STR_EQ("tun:a", out[0].owner);
+    ASSERT_EQ_FMT(2u, out[0].field, "%u");
+    ASSERT_STR_EQ("aaaaaaaa", out[1].owner);
+    ASSERT_STR_EQ("tun:Office_2-b01234", out[2].owner);
+    ASSERT_EQ_FMT(9u, out[2].field, "%u");
+    free(out);
+    down(&f);
+    PASS();
+}
+
 /* Catches: a format drift that the writer and the loader of one build share, the line separator included. */
 TEST the_bytes_are_the_documented_format(void) {
     fx_t f;
@@ -135,6 +155,12 @@ TEST anything_the_writer_could_not_have_produced_refuses_the_whole_file(void) {
         "firc-fields\nfield aaaaaaaa 5x\nend\n",
         "firc-fields\nend\nfield aaaaaaaa 5\n",
         "firc-fields\nfield aaaaaaaa 5\nend",
+        "firc-fields\nfield tun: 5\nend\n",
+        "firc-fields\nfield tun:abcdefghijklmnop 5\nend\n",
+        "firc-fields\nfield tun:a.b 5\nend\n",
+        "firc-fields\nfield tun:a 5\nfield tun:a 6\nend\n",
+        "firc-fields\nfield tunx:a 5\nend\n",
+        "firc-fields\nfield tun:a 0\nend\n",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         ASSERT(write_text(f.path, bad[i]));
@@ -162,6 +188,7 @@ GREATEST_MAIN_DEFS();
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(a_saved_map_loads_back_identically);
+    RUN_TEST(a_tunnel_owner_loads_back_beside_groups);
     RUN_TEST(the_bytes_are_the_documented_format);
     RUN_TEST(the_file_is_replaced_not_overwritten);
     RUN_TEST(anything_the_writer_could_not_have_produced_refuses_the_whole_file);
