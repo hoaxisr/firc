@@ -1,6 +1,7 @@
 #include "greatest.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
 
@@ -309,6 +310,132 @@ TEST a_reply_larger_than_the_buffer_is_an_error_not_a_miss(void) {
     PASS();
 }
 
+typedef struct {
+    size_t calls;
+    size_t n;
+    char owner[4][48];
+    uint32_t field[4];
+} seen_fields_t;
+
+static void store_cb(void *ud, const firc_rtnl_field_t *v, size_t n) {
+    seen_fields_t *s = ud;
+    s->calls++;
+    s->n = n;
+    for (size_t i = 0; i < n && i < 4; i++) {
+        snprintf(s->owner[i], sizeof(s->owner[i]), "%s", v[i].owner);
+        s->field[i] = v[i].field;
+    }
+}
+
+/* Catches: the seed ignored, so a group comes back on the lowest free field. */
+TEST a_seeded_owner_gets_its_field_back_over_a_lower_free_one(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "aaaaaaaa", 5));
+    uint32_t field = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "aaaaaaaa", &field));
+    ASSERT_EQ_FMT(5u, field, "%u");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "bbbbbbbb", &field));
+    ASSERT_EQ_FMT(1u, field, "%u");
+    down(&f);
+    PASS();
+}
+
+/* Catches: seeded entries not counted as taken, so a new group lands on another owner's field. */
+TEST a_new_owner_never_takes_a_seeded_field(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "aaaaaaaa", 1));
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "cccccccc", 2));
+    uint32_t field = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "bbbbbbbb", &field));
+    ASSERT_EQ_FMT(3u, field, "%u");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "cccccccc", &field));
+    ASSERT_EQ_FMT(2u, field, "%u");
+    down(&f);
+    PASS();
+}
+
+/* Catches: two owners on one field, one owner on two fields, or a field outside 1..255 entering the table. */
+TEST a_seed_naming_a_field_or_owner_already_seeded_is_refused(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "aaaaaaaa", 3));
+    ASSERT_EQ(FIRC_ERR_EXIST, firc_rtnl_seed_mark_field(f.rtnl, "bbbbbbbb", 3));
+    ASSERT_EQ(FIRC_ERR_EXIST, firc_rtnl_seed_mark_field(f.rtnl, "aaaaaaaa", 4));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_rtnl_seed_mark_field(f.rtnl, "dddddddd", 0));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_rtnl_seed_mark_field(f.rtnl, "dddddddd", 256));
+    ASSERT_EQ(FIRC_ERR_INVAL,
+              firc_rtnl_seed_mark_field(f.rtnl, "0123456789012345678901234567890123456789012345678", 7));
+    uint32_t field = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "bbbbbbbb", &field));
+    ASSERT_EQ_FMT(1u, field, "%u");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "aaaaaaaa", &field));
+    ASSERT_EQ_FMT(3u, field, "%u");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "dddddddd", &field));
+    ASSERT_EQ_FMT(2u, field, "%u");
+    down(&f);
+    PASS();
+}
+
+/* Catches: a change of assignment not reported to the store, or a report on no change or on a seed. */
+TEST the_store_is_told_at_every_change_and_only_then(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    seen_fields_t got = {0};
+    firc_rtnl_watch_mark_fields(f.rtnl, store_cb, &got);
+    uint32_t field = 0;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "aaaaaaaa", &field));
+    ASSERT_EQ_FMT((size_t)1, got.calls, "%zu");
+    ASSERT_EQ_FMT((size_t)1, got.n, "%zu");
+    ASSERT_STR_EQ("aaaaaaaa", got.owner[0]);
+    ASSERT_EQ_FMT(1u, got.field[0], "%u");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "aaaaaaaa", &field));
+    ASSERT_EQ_FMT((size_t)1, got.calls, "%zu");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "bbbbbbbb", &field));
+    ASSERT_EQ_FMT((size_t)2, got.calls, "%zu");
+    ASSERT_EQ_FMT((size_t)2, got.n, "%zu");
+    firc_rtnl_forget_mark_field(f.rtnl, "aaaaaaaa");
+    ASSERT_EQ_FMT((size_t)3, got.calls, "%zu");
+    ASSERT_EQ_FMT((size_t)1, got.n, "%zu");
+    ASSERT_STR_EQ("bbbbbbbb", got.owner[0]);
+    ASSERT_EQ_FMT(2u, got.field[0], "%u");
+    firc_rtnl_forget_mark_field(f.rtnl, "eeeeeeee");
+    ASSERT_EQ_FMT((size_t)3, got.calls, "%zu");
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "cccccccc", 9));
+    ASSERT_EQ_FMT((size_t)3, got.calls, "%zu");
+    fake_rtnl_add_rule(f.kernel, AF_INET, 0x20000, FIRC_MARK_GROUP_MASK, 100, FIRC_RULE_PRIORITY);
+    ASSERT_EQ(FIRC_OK, firc_rtnl_alloc_mark_field_for(f.rtnl, "bbbbbbbb", &field));
+    ASSERT_EQ_FMT(1u, field, "%u");
+    ASSERT_EQ_FMT((size_t)4, got.calls, "%zu");
+    ASSERT_EQ_FMT((size_t)2, got.n, "%zu");
+    firc_rtnl_watch_mark_fields(f.rtnl, NULL, NULL);
+    firc_rtnl_forget_mark_field(f.rtnl, "bbbbbbbb");
+    ASSERT_EQ_FMT((size_t)4, got.calls, "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: the table handed on demand missing a seeded entry or calling the watcher instead. */
+TEST the_table_is_handed_whole_on_demand(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    seen_fields_t watched = {0}, now = {0};
+    firc_rtnl_watch_mark_fields(f.rtnl, store_cb, &watched);
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "aaaaaaaa", 5));
+    ASSERT_EQ(FIRC_OK, firc_rtnl_seed_mark_field(f.rtnl, "bbbbbbbb", 2));
+    firc_rtnl_fields_now(f.rtnl, store_cb, &now);
+    ASSERT_EQ_FMT((size_t)1, now.calls, "%zu");
+    ASSERT_EQ_FMT((size_t)2, now.n, "%zu");
+    ASSERT_STR_EQ("aaaaaaaa", now.owner[0]);
+    ASSERT_EQ_FMT(5u, now.field[0], "%u");
+    ASSERT_STR_EQ("bbbbbbbb", now.owner[1]);
+    ASSERT_EQ_FMT(2u, now.field[1], "%u");
+    ASSERT_EQ_FMT((size_t)0, watched.calls, "%zu");
+    down(&f);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -328,5 +455,10 @@ int main(int argc, char **argv) {
     RUN_TEST(a_kernel_gone_silent_is_an_error_not_a_yes);
     RUN_TEST(an_unexplained_eexist_is_retried_exclusively_never_as_a_replace);
     RUN_TEST(a_reply_larger_than_the_buffer_is_an_error_not_a_miss);
+    RUN_TEST(a_seeded_owner_gets_its_field_back_over_a_lower_free_one);
+    RUN_TEST(a_new_owner_never_takes_a_seeded_field);
+    RUN_TEST(a_seed_naming_a_field_or_owner_already_seeded_is_refused);
+    RUN_TEST(the_store_is_told_at_every_change_and_only_then);
+    RUN_TEST(the_table_is_handed_whole_on_demand);
     GREATEST_MAIN_END();
 }

@@ -41,5 +41,11 @@ firc_err_t firc_ct_flush_stale_group_marks(firc_ct_t *ct, const uint8_t v4[4], u
                                            const uint8_t v6[16], uint8_t v6_len,
                                            const firc_ct_chunk_t *chunks, size_t n_chunks,
                                            uint32_t mask, size_t *deleted);
+/* As above for a pool state that is not trusted: inside the pool only a field held[n] (n = field number,
+ * NULL = none held) is left alone. */
+firc_err_t firc_ct_flush_stale_marks_outside_pool(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len,
+                                                  const uint8_t v6[16], uint8_t v6_len,
+                                                  const firc_ct_chunk_t *chunks, size_t n_chunks,
+                                                  uint32_t mask, const bool *held, size_t *deleted);
 
 #endif /* FIRC_CONNTRACK_H */

@@ -1968,6 +1968,79 @@ TEST a_removed_group_gives_its_field_back(void) {
     PASS();
 }
 
+typedef struct {
+    pthread_mutex_t mu;
+    size_t calls;
+    size_t n;
+    char owner[FIRC_ID_STR_LEN];
+    uint32_t field;
+} field_store_t;
+
+static void field_store_cb(void *ud, const firc_rtnl_field_t *v, size_t n) {
+    field_store_t *s = ud;
+    pthread_mutex_lock(&s->mu);
+    s->calls++;
+    s->n = n;
+    s->owner[0] = '\0';
+    s->field = 0;
+    if (n > 0) {
+        snprintf(s->owner, sizeof(s->owner), "%s", v[0].owner);
+        s->field = v[0].field;
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+
+static size_t field_store_n(field_store_t *s) {
+    pthread_mutex_lock(&s->mu);
+    size_t n = s->n;
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+/* Catches: a removed group's field left in the stored map after its flush, or dropped from it before. */
+TEST a_removed_group_s_entry_leaves_the_store_when_its_flush_is_paid(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    field_store_t store = {.mu = PTHREAD_MUTEX_INITIALIZER};
+    firc_rtnl_watch_mark_fields(l.rtnl, field_store_cb, &store);
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+
+    firc_group_t *a = firc_group_new();
+    a->id = firc_id_random();
+    a->name = strdup("a");
+    a->iface = strdup("lo");
+    a->enable = true;
+    firc_id_t a_id = a->id;
+    char a_str[FIRC_ID_STR_LEN];
+    firc_id_format(a_id, a_str);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, a));
+    ASSERT(wait_written_after(&l, 0));
+    uint32_t a_field = firc_ruleset_mark_field(firc_app_find_group_by_id(l.app, a_id)) >> FIRC_MARK_GROUP_SHIFT;
+    pthread_mutex_lock(&store.mu);
+    size_t n_after_add = store.n;
+    uint32_t stored_field = store.field;
+    bool stored_a = strcmp(store.owner, a_str) == 0;
+    pthread_mutex_unlock(&store.mu);
+    ASSERT_EQ_FMT((size_t)1, n_after_add, "%zu");
+    ASSERT(stored_a);
+    ASSERT_EQ_FMT(a_field, stored_field, "%u");
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    firc_app_remove_group_by_id(l.app, a_id);
+    size_t n_before_pass = field_store_n(&store);
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ_FMT((size_t)1, n_before_pass, "%zu");
+    ASSERT(wait_written_after(&l, started));
+    for (int i = 0; i < 500 && field_store_n(&store) != 0; i++) { sleep_ms(10); }
+    ASSERT_EQ_FMT((size_t)0, field_store_n(&store), "%zu");
+
+    firc_rtnl_watch_mark_fields(l.rtnl, NULL, NULL);
+    locked_app_down(&l);
+    PASS();
+}
+
 static void *drain_loop(void *ud) {
     firc_loop_run((firc_loop_t *)ud);
     return NULL;
@@ -5265,6 +5338,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_reorder_does_not_move_a_group_s_mark_field);
     RUN_TEST(adding_a_group_ahead_of_another_does_not_take_its_field);
     RUN_TEST(a_removed_group_gives_its_field_back);
+    RUN_TEST(a_removed_group_s_entry_leaves_the_store_when_its_flush_is_paid);
     RUN_TEST(an_unreportable_full_pass_asks_once_and_then_says_so);
     RUN_TEST(a_list_group_that_changes_interface_drops_its_flows);
     RUN_TEST(a_list_group_that_is_turned_off_drops_its_flows);

@@ -68,6 +68,8 @@ typedef struct {
     uint8_t v6_len;
     const firc_ct_chunk_t *chunks;
     size_t n_chunks;
+    bool pool_untrusted;
+    const bool *held;
     /* Kernel-side filter: narrows what arrives; wanted() still decides. */
     bool filter_mark;
     uint32_t filter_value, filter_mask;
@@ -184,14 +186,6 @@ static bool chunk_owner_field(const scan_t *s, int family, const uint8_t *dst, u
     return false;
 }
 
-/* Errs towards keeping: a live group with no prefix yet is invisible here. */
-static bool anyone_holds(const scan_t *s, uint32_t field) {
-    for (size_t i = 0; i < s->n_chunks; i++) {
-        if ((s->chunks[i].field & s->mark_mask) == field) { return true; }
-    }
-    return false;
-}
-
 static bool holder_routes_to(const scan_t *s, int family, const uint8_t *dst, uint32_t field) {
     for (size_t i = 0; i < s->n_chunks; i++) {
         const firc_ct_chunk_t *c = &s->chunks[i];
@@ -209,6 +203,10 @@ static bool mark_is_left_over(const scan_t *s, int family, const uint8_t *dst, u
     const char *ignored = NULL;
     if (why == NULL) { why = &ignored; }
     if (in_pool(s, family, dst)) {
+        if (s->pool_untrusted) {
+            *why = "no group of this run holds its field, and the pool cannot say whose chunk it is";
+            return !(s->held != NULL && s->held[field >> FIRC_MARK_GROUP_SHIFT]);
+        }
         uint32_t owner = 0;
         bool inexact = false;
         if (!chunk_owner_field(s, family, dst, &owner, &inexact)) {
@@ -224,9 +222,7 @@ static bool mark_is_left_over(const scan_t *s, int family, const uint8_t *dst, u
                "nothing that covers it";
         return !holder_routes_to(s, family, dst, field);
     }
-    /* Outside the pool a field nobody holds proves nothing: keep the stranger's flow. */
-    if (!anyone_holds(s, field)) { return false; }
-    *why = "the group holding its field routes nothing that covers it";
+    *why = "no group of this run holding its field routes a subnet that covers it";
     return !holder_routes_to(s, family, dst, field);
 }
 
@@ -592,11 +588,12 @@ firc_err_t firc_ct_flush_pool_replies(firc_ct_t *ct, const uint8_t v4[4], uint8_
     return flush(ct, &s, deleted);
 }
 
-firc_err_t firc_ct_flush_stale_group_marks(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len,
-                                           const uint8_t v6[16], uint8_t v6_len,
-                                           const firc_ct_chunk_t *chunks, size_t n_chunks,
-                                           uint32_t mask, size_t *deleted) {
+static firc_err_t flush_stale(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len, const uint8_t v6[16],
+                             uint8_t v6_len, const firc_ct_chunk_t *chunks, size_t n_chunks, uint32_t mask,
+                             bool pool_untrusted, const bool *held, size_t *deleted) {
     scan_t s = {0};
+    s.pool_untrusted = pool_untrusted;
+    s.held = held;
     s.mode = SCAN_STALE_MARKS;
     s.mark_mask = mask;
     /* The handled bit as value and mask: this also keeps firmware policy marks out. */
@@ -610,4 +607,18 @@ firc_err_t firc_ct_flush_stale_group_marks(firc_ct_t *ct, const uint8_t v4[4], u
     s.chunks = chunks;
     s.n_chunks = n_chunks;
     return flush(ct, &s, deleted);
+}
+
+firc_err_t firc_ct_flush_stale_group_marks(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len,
+                                           const uint8_t v6[16], uint8_t v6_len,
+                                           const firc_ct_chunk_t *chunks, size_t n_chunks,
+                                           uint32_t mask, size_t *deleted) {
+    return flush_stale(ct, v4, v4_len, v6, v6_len, chunks, n_chunks, mask, false, NULL, deleted);
+}
+
+firc_err_t firc_ct_flush_stale_marks_outside_pool(firc_ct_t *ct, const uint8_t v4[4], uint8_t v4_len,
+                                                  const uint8_t v6[16], uint8_t v6_len,
+                                                  const firc_ct_chunk_t *chunks, size_t n_chunks,
+                                                  uint32_t mask, const bool *held, size_t *deleted) {
+    return flush_stale(ct, v4, v4_len, v6, v6_len, chunks, n_chunks, mask, true, held, deleted);
 }

@@ -308,23 +308,189 @@ TEST a_fake_address_no_live_chunk_covers_goes(void) {
     PASS();
 }
 
-/* Catches: a flow to a real address deleted only because nobody holds its field. */
-TEST a_field_nobody_holds_outside_the_pool_is_left_alone(void) {
+/* Catches: a handled flow to a real address kept although no group of this run holds its field. */
+TEST a_field_nobody_holds_outside_the_pool_goes(void) {
     fx_t f;
     ASSERT(up(&f));
     const uint8_t src[4] = {192, 168, 1, 10};
-    const uint8_t elsewhere[4] = {10, 1, 2, 3}, reply[4] = {10, 1, 2, 3};
+    const uint8_t elsewhere[4] = {10, 1, 2, 3}, reply[4] = {172, 16, 0, 2};
+    const uint8_t held[4] = {10, 9, 9, 9};
     const uint8_t pool4[4] = {198, 18, 0, 0};
-    fake_ct_add(f.kernel, AF_INET, src, elsewhere, reply, firc_mark_group_value(1) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, elsewhere, reply, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, held, held, firc_mark_group_value(4) | FIRC_MARK_HANDLED);
+
+    firc_ct_chunk_t chunks[2] = {
+        {.family = AF_INET, .base = {198, 18, 3, 0}, .prefix = 24, .field = firc_mark_group_value(4)},
+        {.family = AF_INET, .base = {10, 0, 0, 0}, .prefix = 8, .is_subnet = true, .field = firc_mark_group_value(4)},
+    };
+    size_t deleted = 0;
+    ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_group_marks(f.ct, pool4, 15, NULL, 0, chunks, 2,
+                                                       FIRC_MARK_GROUP_MASK, &deleted));
+    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, reply, 4));
+    ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: a v6 flow judged by a v4 prefix: a field held only by a v4 /0 keeps its v6 flow. */
+TEST a_v6_field_nobody_holds_outside_the_pool_goes(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t src6[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+    const uint8_t unheld6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11};
+    const uint8_t v4only6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x33, 0x33};
+    const uint8_t held6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22, 0x22};
+    const uint8_t pool6[16] = {0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    fake_ct_add(f.kernel, AF_INET6, src6, unheld6, unheld6, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET6, src6, v4only6, v4only6, firc_mark_group_value(6) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET6, src6, held6, held6, firc_mark_group_value(4) | FIRC_MARK_HANDLED);
+
+    firc_ct_chunk_t chunks[3] = {
+        {.family = AF_INET6, .base = {0xfd, 0x37, 0, 0, 0, 0, 0, 3}, .prefix = 64, .field = firc_mark_group_value(4)},
+        {.family = AF_INET6, .base = {0x26, 0x06, 0x47}, .prefix = 24, .is_subnet = true, .field = firc_mark_group_value(4)},
+        {.family = AF_INET, .base = {0, 0, 0, 0}, .prefix = 0, .is_subnet = true, .field = firc_mark_group_value(6)},
+    };
+    size_t deleted = 0;
+    ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_group_marks(f.ct, NULL, 0, pool6, 48, chunks, 3,
+                                                       FIRC_MARK_GROUP_MASK, &deleted));
+    ASSERT_EQ_FMT((size_t)2, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, unheld6, 16));
+    ASSERT(fake_ct_deleted(f.kernel, v4only6, 16));
+    ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: the unheld-field delete outside the pool reaching a flow without firc's handled bit. */
+TEST an_unhandled_mark_outside_the_pool_is_left_alone(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t src[4] = {192, 168, 1, 10};
+    const uint8_t elsewhere[4] = {10, 1, 2, 3}, reply[4] = {10, 1, 2, 3}, other[4] = {10, 1, 2, 4};
+    const uint8_t handled[4] = {10, 1, 2, 5};
+    const uint8_t pool4[4] = {198, 18, 0, 0};
+    fake_ct_add(f.kernel, AF_INET, src, elsewhere, reply, 0x0ffffaaau);
+    fake_ct_add(f.kernel, AF_INET, src, elsewhere, other, firc_mark_group_value(5));
+    fake_ct_add(f.kernel, AF_INET, src, elsewhere, handled, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+    fake_ct_ignore_mark_filter(f.kernel);
 
     firc_ct_chunk_t chunks[1] = {
-        {.family = AF_INET, .base = {198, 18, 3, 0}, .prefix = 24, .field = firc_mark_group_value(2)}};
+        {.family = AF_INET, .base = {198, 18, 3, 0}, .prefix = 24, .field = firc_mark_group_value(4)}};
     size_t deleted = 0;
     ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_group_marks(f.ct, pool4, 15, NULL, 0, chunks, 1,
                                                        FIRC_MARK_GROUP_MASK, &deleted));
-    ASSERT_EQ_FMTm("nobody holds field 1, and nothing says it is ours", (size_t)0, deleted, "%zu");
+    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, handled, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: a holder covering its whole family not vouching outside the pool or in another's inexact chunk. */
+TEST a_holder_covering_everything_keeps_its_flows_while_an_unheld_field_goes(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t src[4] = {192, 168, 1, 10};
+    const uint8_t src6[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+    const uint8_t out4[4] = {8, 8, 8, 8}, chunk4[4] = {198, 18, 3, 7}, chunk4_reply[4] = {104, 18, 29, 7};
+    const uint8_t gone4[4] = {9, 9, 9, 9};
+    const uint8_t out6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11};
+    const uint8_t pool4[4] = {198, 18, 0, 0};
+    const uint8_t pool6[16] = {0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t f4 = firc_mark_group_value(4) | FIRC_MARK_HANDLED;
+    fake_ct_add(f.kernel, AF_INET, src, out4, out4, f4);
+    fake_ct_add(f.kernel, AF_INET, src, chunk4, chunk4_reply, f4);
+    fake_ct_add(f.kernel, AF_INET6, src6, out6, out6, f4);
+    fake_ct_add(f.kernel, AF_INET, src, gone4, gone4, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+
+    firc_ct_chunk_t chunks[3] = {
+        {.family = AF_INET, .base = {198, 18, 3, 0}, .prefix = 24, .field = firc_mark_group_value(3), .inexact = true},
+        {.family = AF_INET, .base = {0, 0, 0, 0}, .prefix = 0, .is_subnet = true, .field = firc_mark_group_value(4)},
+        {.family = AF_INET6, .base = {0}, .prefix = 0, .is_subnet = true, .field = firc_mark_group_value(4)},
+    };
+    size_t deleted = 0;
+    ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_group_marks(f.ct, pool4, 15, pool6, 48, chunks, 3,
+                                                       FIRC_MARK_GROUP_MASK, &deleted));
+    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, gone4, 4));
+    ASSERT_EQ_FMT((size_t)3, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: an untrusted pool judging a held field's pool flow by chunks it lacks, or skipping flows outside it. */
+TEST outside_the_pool_is_judged_without_the_pool_s_chunks(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t src[4] = {192, 168, 1, 10};
+    const uint8_t issued[4] = {198, 18, 9, 5}, issued_reply[4] = {104, 18, 29, 7};
+    const uint8_t gone4[4] = {9, 9, 9, 9}, held[4] = {10, 9, 9, 9};
+    const uint8_t pool4[4] = {198, 18, 0, 0};
+    fake_ct_add(f.kernel, AF_INET, src, issued, issued_reply, firc_mark_group_value(4) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, gone4, gone4, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+    bool holds[FIRC_MARK_MAX_GROUPS + 1] = {false};
+    holds[4] = true;
+    fake_ct_add(f.kernel, AF_INET, src, held, held, firc_mark_group_value(4) | FIRC_MARK_HANDLED);
+
+    firc_ct_chunk_t chunks[1] = {
+        {.family = AF_INET, .base = {10, 0, 0, 0}, .prefix = 8, .is_subnet = true, .field = firc_mark_group_value(4)}};
+    size_t deleted = 0;
+    ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_marks_outside_pool(f.ct, pool4, 15, NULL, 0, chunks, 1,
+                                                              FIRC_MARK_GROUP_MASK, holds, &deleted));
+    ASSERT_EQ_FMT((size_t)1, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, gone4, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: an untrusted pool keeping a fake-addressed flow on an unheld field, or deleting a held one's. */
+TEST inside_an_untrusted_pool_an_unheld_field_goes_and_a_held_one_stays(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    const uint8_t s1[4] = {192, 168, 1, 10}, s2[4] = {192, 168, 1, 11};
+    const uint8_t d1[4] = {198, 18, 0, 5}, r1[4] = {93, 184, 216, 34};
+    const uint8_t d2[4] = {198, 18, 0, 6}, r2[4] = {93, 184, 216, 35};
+    const uint8_t s6[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+    const uint8_t d6[16] = {0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5};
+    const uint8_t r6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3};
+    const uint8_t pool4[4] = {198, 18, 0, 0};
+    const uint8_t pool6[16] = {0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    fake_ct_add(f.kernel, AF_INET, s1, d1, r1, 0x40030000u);
+    fake_ct_add(f.kernel, AF_INET, s2, d2, r2, 0x40010000u);
+    fake_ct_add(f.kernel, AF_INET6, s6, d6, r6, 0x40030000u);
+    bool held[FIRC_MARK_MAX_GROUPS + 1] = {false};
+    held[1] = true;
+    size_t deleted = 0;
+    ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_marks_outside_pool(f.ct, pool4, 15, pool6, 48, NULL, 0,
+                                                              FIRC_MARK_GROUP_MASK, held, &deleted));
+    ASSERT_EQ_FMT((size_t)2, deleted, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, r1, 4));
+    ASSERT(fake_ct_deleted(f.kernel, r6, 16));
     ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
     down(&f);
+    PASS();
+}
+
+/* Catches: held read from the prefix table, so a group with no chunk and no subnet loses its pool flows. */
+TEST a_group_with_no_prefix_at_all_still_holds_its_field_inside_an_untrusted_pool(void) {
+    const uint8_t src[4] = {192, 168, 1, 10}, dst[4] = {198, 18, 0, 7}, reply[4] = {93, 184, 216, 36};
+    const uint8_t pool4[4] = {198, 18, 0, 0};
+    bool held[FIRC_MARK_MAX_GROUPS + 1] = {false};
+    held[2] = true;
+    for (int pass = 0; pass < 2; pass++) {
+        fx_t f;
+        ASSERT(up(&f));
+        fake_ct_add(f.kernel, AF_INET, src, dst, reply, 0x40020000u);
+        firc_ct_chunk_t chunks[1] = {
+            {.family = AF_INET, .base = {10, 0, 0, 0}, .prefix = 8, .is_subnet = true, .field = firc_mark_group_value(1)}};
+        size_t deleted = 0;
+        ASSERT_EQ(FIRC_OK, firc_ct_flush_stale_marks_outside_pool(f.ct, pool4, 15, NULL, 0, chunks, 1, FIRC_MARK_GROUP_MASK,
+                                                                  pass == 0 ? held : NULL, &deleted));
+        ASSERT_EQ_FMT(pass == 0 ? (size_t)0 : (size_t)1, deleted, "%zu");
+        down(&f);
+    }
     PASS();
 }
 
@@ -887,7 +1053,13 @@ int main(int argc, char **argv) {
     RUN_TEST(a_flow_whose_group_is_gone_goes);
     RUN_TEST(a_mark_firc_did_not_write_is_left_alone);
     RUN_TEST(a_fake_address_no_live_chunk_covers_goes);
-    RUN_TEST(a_field_nobody_holds_outside_the_pool_is_left_alone);
+    RUN_TEST(a_field_nobody_holds_outside_the_pool_goes);
+    RUN_TEST(a_v6_field_nobody_holds_outside_the_pool_goes);
+    RUN_TEST(an_unhandled_mark_outside_the_pool_is_left_alone);
+    RUN_TEST(a_holder_covering_everything_keeps_its_flows_while_an_unheld_field_goes);
+    RUN_TEST(outside_the_pool_is_judged_without_the_pool_s_chunks);
+    RUN_TEST(inside_an_untrusted_pool_an_unheld_field_goes_and_a_held_one_stays);
+    RUN_TEST(a_group_with_no_prefix_at_all_still_holds_its_field_inside_an_untrusted_pool);
     RUN_TEST(a_chunk_answers_only_for_its_own_family);
     RUN_TEST(inside_the_pool_a_subnet_does_not_name_an_owner);
     RUN_TEST(outside_the_pool_only_the_holder_s_own_subnet_vouches);

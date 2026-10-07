@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 
 #include "firc/log.h"
+#include "firc/mark.h"
 #include "firc/match.h"
 
 typedef struct {
@@ -51,16 +52,16 @@ static void collect_chunk(void *ud, const char *group_id, unsigned family, const
     c->inexact = t->inexact;
 }
 
-bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, firc_ct_chunk_t **out,
+bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, bool field_kept, firc_ct_chunk_t **out,
                               size_t *out_n) {
     *out = NULL;
     *out_n = 0;
-    if (g == NULL || (g->n_rules == 0 && (g->list == NULL || g->list->rules.n == 0))) {
-        return true;
-    }
+    if (g == NULL) { return true; }
+    bool unloaded = field_kept && g->list != NULL && g->list->rules.n == 0;
+    if (g->n_rules == 0 && g->list == NULL) { return true; }
     const firc_sub_rules_t *lr = g->list != NULL ? &g->list->rules : NULL;
     /* Counted first: a long list holds only a handful of subnet rules. */
-    size_t want = 0;
+    size_t want = unloaded ? 2 : 0;
     for (size_t i = 0; i < g->n_rules; i++) {
         const firc_rule_t *r = g->rules[i];
         if (!r->enable || r->type == NULL || r->rule == NULL) { continue; }
@@ -80,6 +81,11 @@ bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, firc_ct_chu
     if (v == NULL) { return false; }
 
     size_t n = 0;
+    if (unloaded) {
+        v[0] = (firc_ct_chunk_t){.family = AF_INET, .is_subnet = true, .field = field};
+        v[1] = (firc_ct_chunk_t){.family = AF_INET6, .is_subnet = true, .field = field};
+        n = 2;
+    }
     for (size_t i = 0; i < g->n_rules && n < want; i++) {
         const firc_rule_t *r = g->rules[i];
         if (!r->enable || r->type == NULL || r->rule == NULL) { continue; }
@@ -135,18 +141,24 @@ bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, firc_ct_chu
 }
 
 firc_err_t firc_stale_marks_sweep(firc_ct_t *ct, const firc_fakeip_t *pool, bool pool_state_trusted,
-                                  const firc_stale_group_t *groups, size_t n_groups, uint32_t mask,
+                                  bool fields_loaded, const firc_stale_group_t *groups, size_t n_groups, uint32_t mask,
                                   size_t *dropped) {
     if (dropped != NULL) { *dropped = 0; }
     if (ct == NULL || pool == NULL) { return FIRC_OK; }
+    if (!fields_loaded) {
+        FIRC_INFO("no mark field map was loaded: every flow firc marked is reset once");
+        return firc_ct_flush_by_mark(ct, FIRC_MARK_HANDLED, FIRC_MARK_HANDLED, dropped);
+    }
     if (!pool_state_trusted) {
-        FIRC_INFO("not checking for flows marked by a previous run: the pool state this run holds is "
-                  "not the one that issued their addresses");
-        return FIRC_OK;
+        FIRC_INFO("not checking flows to the pool marked by a previous run: the pool state this run holds "
+                  "is not the one that issued their addresses");
     }
 
     table_t t = {0};
+    bool held[FIRC_MARK_MAX_GROUPS + 1] = {false};
     for (size_t i = 0; i < n_groups; i++) {
+        uint32_t number = (groups[i].field & mask) >> FIRC_MARK_GROUP_SHIFT;
+        if (groups[i].field_kept && number >= 1 && number <= FIRC_MARK_MAX_GROUPS) { held[number] = true; }
         t.field = groups[i].field & mask;
         t.inexact = groups[i].inexact;
         if (groups[i].id != NULL) { firc_fakeip_walk_chunks(pool, groups[i].id, collect_chunk, &t); }
@@ -168,9 +180,11 @@ firc_err_t firc_stale_marks_sweep(firc_ct_t *ct, const firc_fakeip_t *pool, bool
     uint8_t l4 = 0, l6 = 0;
     bool has4 = firc_fakeip_pool_prefix(pool, FIRC_FAM_V4, &b4, &l4);
     bool has6 = firc_fakeip_pool_prefix(pool, FIRC_FAM_V6, &b6, &l6);
-    firc_err_t err = firc_ct_flush_stale_group_marks(ct, has4 ? b4.b : NULL, has4 ? l4 : 0,
-                                                     has6 ? b6.b : NULL, has6 ? l6 : 0, t.v, t.n, mask,
-                                                     dropped);
+    const uint8_t *p4 = has4 ? b4.b : NULL, *p6 = has6 ? b6.b : NULL;
+    uint8_t n4 = has4 ? l4 : 0, n6 = has6 ? l6 : 0;
+    firc_err_t err = pool_state_trusted
+                         ? firc_ct_flush_stale_group_marks(ct, p4, n4, p6, n6, t.v, t.n, mask, dropped)
+                         : firc_ct_flush_stale_marks_outside_pool(ct, p4, n4, p6, n6, t.v, t.n, mask, held, dropped);
     free(t.v);
     return err;
 }

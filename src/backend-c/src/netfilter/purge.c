@@ -71,6 +71,11 @@ firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, con
         if (paths->pool_file != NULL && snprintf(tmp, sizeof(tmp), "%s.tmp", paths->pool_file) < (int)sizeof(tmp)) {
             unlink_quiet(tmp, &first);
         }
+        unlink_quiet(paths->fields_file, &first);
+        if (paths->fields_file != NULL &&
+            snprintf(tmp, sizeof(tmp), "%s.tmp", paths->fields_file) < (int)sizeof(tmp)) {
+            unlink_quiet(tmp, &first);
+        }
         unlink_quiet(paths->sock, &first);
         unlink_quiet(paths->lock, &first);
         if (paths->run_dir != NULL) {

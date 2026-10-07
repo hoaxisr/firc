@@ -16,15 +16,18 @@ typedef struct {
     const firc_ct_chunk_t *subnets;
     size_t n_subnets;
     bool inexact;
+    bool field_kept;
 } firc_stale_group_t;
 
-/* False only on allocation failure, and then the caller must not sweep. Caller frees *out. */
-bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, firc_ct_chunk_t **out,
+/* False only on allocation failure, and then the caller must not sweep. Caller frees *out.
+ * A list not loaded yet counts as a /0 in both families, only when field_kept (the field map says so). */
+bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, bool field_kept, firc_ct_chunk_t **out,
                               size_t *out_n);
 
-/* Skipped (FIRC_OK, *dropped 0) unless pool_state_trusted: an untrusted empty pool would drop every flow. */
+/* Without fields_loaded every flow carrying the handled bit goes. Unless pool_state_trusted, a flow to
+ * the pool stays only on a field a group holds with field_kept. */
 firc_err_t firc_stale_marks_sweep(firc_ct_t *ct, const firc_fakeip_t *pool, bool pool_state_trusted,
-                                  const firc_stale_group_t *groups, size_t n_groups,
+                                  bool fields_loaded, const firc_stale_group_t *groups, size_t n_groups,
                                   uint32_t mask, size_t *dropped);
 
 #endif /* FIRC_STALE_MARKS_H */

@@ -20,6 +20,7 @@
 #include "firc/conntrack.h"
 #include "firc/mark.h"
 #include "firc/stale_marks.h"
+#include "firc/stable_fields.h"
 #include "firc/subnet.h"
 #include "firc/pool_reject.h"
 #include "firc/purge.h"
@@ -84,6 +85,7 @@ struct daemon {
     firc_fakeip_t *pool;
     firc_nl_watcher_t *watcher;
     firc_ct_t *ct;
+    firc_stable_fields_t fields;
     /* Debounced interface refresh; more than 8 distinct names falls back to refreshing every group. */
     char refresh_ifaces[8][IF_NAMESIZE];
     size_t n_refresh_ifaces;
@@ -199,6 +201,7 @@ static void daemon_teardown(struct daemon *d)
     d->watcher = NULL;
     firc_ct_close(d->ct);
     d->ct = NULL;
+    firc_stable_fields_release(&d->fields);
     firc_dnsproxy_destroy(d->proxy);
     d->proxy = NULL;
     firc_resolve_router_free(d->router);
@@ -680,8 +683,15 @@ static const char *auth_state_dir_fn(void *ud)
     return FIRC_APP_CONF_DIR;
 }
 
-static bool this_runs_groups(firc_app_t *app, firc_stale_group_t **out, size_t *out_n,
+static bool groups_file_exists(const char *config_path) {
+    char groups_path[4096];
+    if (firc_config_groups_path(config_path, groups_path, sizeof(groups_path)) != FIRC_OK) { return true; }
+    return access(groups_path, F_OK) == 0 || errno != ENOENT;
+}
+
+static bool this_runs_groups(const struct daemon *d, firc_stale_group_t **out, size_t *out_n,
                              char (**ids_out)[FIRC_ID_STR_LEN]) {
+    firc_app_t *app = d->app;
     size_t n = firc_app_user_group_count(app);
     *out = NULL;
     *out_n = 0;
@@ -705,8 +715,9 @@ static bool this_runs_groups(firc_app_t *app, firc_stale_group_t **out, size_t *
         g[k].id = ids[k];
         g[k].field = firc_ruleset_mark_field(rs);
         g[k].inexact = firc_ruleset_has_devices(rs);
+        g[k].field_kept = firc_stable_fields_kept(&d->fields, ids[k], g[k].field);
         /* An allocation failure must not read as "routes no subnets": skip the sweep instead. */
-        if (!firc_stale_group_subnets(grp, g[k].field, (firc_ct_chunk_t **)&g[k].subnets,
+        if (!firc_stale_group_subnets(grp, g[k].field, g[k].field_kept, (firc_ct_chunk_t **)&g[k].subnets,
                                       &g[k].n_subnets)) {
             for (size_t j = 0; j < k; j++) { free((void *)g[j].subnets); }
             free(g);
@@ -726,16 +737,17 @@ static void flush_stale_group_marks(struct daemon *d) {
     size_t n = 0;
     char (*ids)[FIRC_ID_STR_LEN] = NULL;
     firc_stale_group_t *groups = NULL;
-    if (!this_runs_groups(d->app, &groups, &n, &ids)) {
+    if (!this_runs_groups(d, &groups, &n, &ids)) {
         FIRC_WARN("not enough memory to check for flows marked by a previous run; none were touched");
         return;
     }
     size_t dropped = 0;
-    firc_err_t err = firc_stale_marks_sweep(d->ct, d->pool, d->pool_state_trusted, groups, n,
+    firc_err_t err = firc_stale_marks_sweep(d->ct, d->pool, d->pool_state_trusted, d->fields.loaded, groups, n,
                                             FIRC_MARK_GROUP_MASK, &dropped);
     for (size_t i = 0; i < n; i++) { free((void *)groups[i].subnets); }
     free(groups);
     free(ids);
+    firc_stable_fields_release(&d->fields);
     /* Count first: a sweep that failed halfway has still deleted flows. */
     if (dropped > 0) {
         FIRC_INFO("dropped %zu flow(s) still carrying a mark from a previous run", dropped);
@@ -944,7 +956,8 @@ int main(int argc, char **argv)
     if (purge) {
         d.rtnl = firc_rtnl_open();
         if (d.rtnl == NULL) { FIRC_WARN("purge: rtnetlink not available"); }
-        firc_purge_paths_t paths = {FIRC_POOL_STATE_PATH, FIRC_SOCK_PATH, FIRC_INSTANCE_LOCK_PATH, FIRC_APP_RUN_DIR};
+        firc_purge_paths_t paths = {.pool_file = FIRC_POOL_STATE_PATH, .fields_file = FIRC_FIELDS_STATE_PATH,
+                                    .sock = FIRC_SOCK_PATH, .lock = FIRC_INSTANCE_LOCK_PATH, .run_dir = FIRC_APP_RUN_DIR};
         firc_purge_report_t report;
         err = firc_purge(d.ipt4, d.ipt6, d.rtnl, cfg.app.netfilter.iptables.chain_prefix, &paths, &report);
         daemon_teardown(&d);
@@ -981,6 +994,8 @@ int main(int argc, char **argv)
     } else if (stale > 0) {
         FIRC_INFO("removed %zu ip rule(s) left by a previous instance", stale);
     }
+    (void)firc_stable_fields_start(&d.fields, FIRC_FIELDS_STATE_PATH, d.rtnl, d.ct, &cfg,
+                                   groups_file_exists(config_path));
 
     firc_fakeip_cfg_t pool_cfg;
     err = firc_fakeip_cfg_from_app(&cfg.app, FIRC_FAKEIP_V6_PREFIX_FILE, &pool_cfg);

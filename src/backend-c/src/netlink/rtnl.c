@@ -30,6 +30,8 @@ struct firc_rtnl {
     uint32_t seq;
     field_hint_t hints[FIRC_MARK_MAX_GROUPS];
     size_t n_hints;
+    firc_rtnl_fields_fn on_fields;
+    void *on_fields_ud;
 };
 
 static uint32_t hint_for(const firc_rtnl_t *r, const char *owner) {
@@ -40,18 +42,34 @@ static uint32_t hint_for(const firc_rtnl_t *r, const char *owner) {
     return 0;
 }
 
-static void remember_hint(firc_rtnl_t *r, const char *owner, uint32_t field) {
-    if (owner == NULL || strlen(owner) >= sizeof(r->hints[0].owner)) { return; }
+static bool remember_hint(firc_rtnl_t *r, const char *owner, uint32_t field) {
+    if (owner == NULL || strlen(owner) >= sizeof(r->hints[0].owner)) { return false; }
     for (size_t i = 0; i < r->n_hints; i++) {
         if (strcmp(r->hints[i].owner, owner) == 0) {
+            bool changed = r->hints[i].field != field;
             r->hints[i].field = field;
-            return;
+            return changed;
         }
     }
-    if (r->n_hints == FIRC_MARK_MAX_GROUPS) { return; }
+    if (r->n_hints == FIRC_MARK_MAX_GROUPS) { return false; }
     snprintf(r->hints[r->n_hints].owner, sizeof(r->hints[0].owner), "%s", owner);
     r->hints[r->n_hints].field = field;
     r->n_hints++;
+    return true;
+}
+
+static void hand_fields(const firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud) {
+    if (fn == NULL) { return; }
+    firc_rtnl_field_t v[FIRC_MARK_MAX_GROUPS];
+    for (size_t i = 0; i < r->n_hints; i++) {
+        v[i].owner = r->hints[i].owner;
+        v[i].field = r->hints[i].field;
+    }
+    fn(ud, v, r->n_hints);
+}
+
+static void notify_fields(const firc_rtnl_t *r) {
+    hand_fields(r, r->on_fields, r->on_fields_ud);
 }
 
 firc_rtnl_t *firc_rtnl_open(void) {
@@ -934,6 +952,7 @@ void firc_rtnl_forget_mark_field(firc_rtnl_t *r, const char *owner) {
     for (size_t i = 0; i < r->n_hints; i++) {
         if (strcmp(r->hints[i].owner, owner) != 0) { continue; }
         r->hints[i] = r->hints[--r->n_hints];
+        notify_fields(r);
         return;
     }
 }
@@ -976,7 +995,7 @@ firc_err_t firc_rtnl_alloc_mark_field_for(firc_rtnl_t *r, const char *owner, uin
             err = FIRC_ERR_LIMIT;
         } else {
             *out_field = f;
-            remember_hint(r, owner, f);
+            if (remember_hint(r, owner, f)) { notify_fields(r); }
         }
     }
 
@@ -1010,4 +1029,27 @@ firc_err_t firc_rtnl_alloc_mark_table(firc_rtnl_t *r, uint32_t start_idx, uint32
     free(ctx.marks.vals);
     free(ctx.tables.vals);
     return err;
+}
+
+firc_err_t firc_rtnl_seed_mark_field(firc_rtnl_t *r, const char *owner, uint32_t field) {
+    if (r == NULL || owner == NULL || strlen(owner) >= sizeof(r->hints[0].owner)) { return FIRC_ERR_INVAL; }
+    if (field < 1 || field > FIRC_MARK_MAX_GROUPS) { return FIRC_ERR_INVAL; }
+    for (size_t i = 0; i < r->n_hints; i++) {
+        if (r->hints[i].field == field || strcmp(r->hints[i].owner, owner) == 0) { return FIRC_ERR_EXIST; }
+    }
+    if (r->n_hints == FIRC_MARK_MAX_GROUPS) { return FIRC_ERR_LIMIT; }
+    snprintf(r->hints[r->n_hints].owner, sizeof(r->hints[0].owner), "%s", owner);
+    r->hints[r->n_hints].field = field;
+    r->n_hints++;
+    return FIRC_OK;
+}
+
+void firc_rtnl_watch_mark_fields(firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud) {
+    if (r == NULL) { return; }
+    r->on_fields = fn;
+    r->on_fields_ud = ud;
+}
+
+void firc_rtnl_fields_now(const firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud) {
+    if (r != NULL) { hand_fields(r, fn, ud); }
 }

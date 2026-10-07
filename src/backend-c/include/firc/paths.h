@@ -56,6 +56,9 @@
 #ifndef FIRC_CONFIG_PATH
 #define FIRC_CONFIG_PATH FIRC_APP_CONF_DIR "/firc.conf"
 #endif
+#ifndef FIRC_FIELDS_STATE_PATH
+#define FIRC_FIELDS_STATE_PATH FIRC_APP_RUN_DIR "/fields.state"
+#endif
 #ifndef FIRC_FAKEIP_V6_PREFIX_FILE
 #define FIRC_FAKEIP_V6_PREFIX_FILE FIRC_APP_CONF_DIR "/v6-pool-prefix"
 #endif

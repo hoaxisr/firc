@@ -21,7 +21,7 @@ typedef struct {
     fake_rtnl_t *kernel;
     firc_rtnl_t *rtnl;
     char dir[64];
-    char pool[128], tmp[128], sock[128], lock[128];
+    char pool[128], tmp[128], sock[128], lock[128], fields[128], fields_tmp[136];
 } fx_t;
 
 static void seed_family(firc_fake_ipt_t *f, const char *pool) {
@@ -78,8 +78,10 @@ static bool up(fx_t *f) {
     snprintf(f->tmp, sizeof(f->tmp), "%s/pool.state.tmp", f->dir);
     snprintf(f->sock, sizeof(f->sock), "%s/firc.sock", f->dir);
     snprintf(f->lock, sizeof(f->lock), "%s/fircd.lock", f->dir);
-    const char *files[4] = {f->pool, f->tmp, f->sock, f->lock};
-    for (int i = 0; i < 4; i++) {
+    snprintf(f->fields, sizeof(f->fields), "%s/fields.state", f->dir);
+    snprintf(f->fields_tmp, sizeof(f->fields_tmp), "%s/fields.state.tmp", f->dir);
+    const char *files[6] = {f->pool, f->tmp, f->sock, f->lock, f->fields, f->fields_tmp};
+    for (int i = 0; i < 6; i++) {
         FILE *fp = fopen(files[i], "w");
         if (fp == NULL) { return false; }
         fputs("x", fp);
@@ -97,11 +99,13 @@ static void down(fx_t *f) {
     unlink(f->tmp);
     unlink(f->sock);
     unlink(f->lock);
+    unlink(f->fields);
+    unlink(f->fields_tmp);
     rmdir(f->dir);
 }
 
 static firc_purge_paths_t paths_of(const fx_t *f) {
-    firc_purge_paths_t p = {f->pool, f->sock, f->lock, f->dir};
+    firc_purge_paths_t p = {.pool_file = f->pool, .fields_file = f->fields, .sock = f->sock, .lock = f->lock, .run_dir = f->dir};
     return p;
 }
 

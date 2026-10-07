@@ -49,7 +49,7 @@ TEST a_group_that_kept_its_field_keeps_its_flows(void) {
 
     firc_stale_group_t groups[1] = {{.id = "g1", .field = field}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("nothing is stale", (size_t)0, dropped, "%zu");
     ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
     down(&f);
@@ -67,7 +67,7 @@ TEST a_group_whose_field_moved_loses_its_flows(void) {
 
     firc_stale_group_t groups[1] = {{.id = "g1", .field = firc_mark_group_value(2)}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("the flow steered by the old field goes", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -83,25 +83,67 @@ TEST a_group_that_is_gone_loses_its_flows(void) {
 
     firc_stale_group_t groups[1] = {{.id = "still-here", .field = firc_mark_group_value(1)}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("its flows go with it", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
 }
 
-/* Catches: a sweep run on an empty, untrusted pool, deleting every routed flow. */
-TEST an_untrusted_pool_state_sweeps_nothing(void) {
+/* Catches: the judge told of fields this run's groups hold but the map did not keep for them. */
+TEST an_untrusted_pool_state_keeps_only_held_fields_inside_the_pool(void) {
     fx_t f;
     ASSERT(up(&f));
-    const uint8_t src[4] = {192, 168, 1, 10}, dst[4] = {198, 18, 3, 9}, reply[4] = {104, 18, 29, 7};
-    fake_ct_add(f.kernel, AF_INET, src, dst, reply, firc_mark_group_value(1) | FIRC_MARK_HANDLED);
+    const uint8_t src[4] = {192, 168, 1, 10};
+    const uint8_t held_dst[4] = {198, 18, 3, 9}, held_reply[4] = {104, 18, 29, 7};
+    const uint8_t gone_dst[4] = {198, 18, 3, 10}, gone_reply[4] = {104, 18, 29, 8};
+    const uint8_t out[4] = {10, 1, 2, 3}, out_reply[4] = {172, 16, 0, 2};
+    fake_ct_add(f.kernel, AF_INET, src, held_dst, held_reply, firc_mark_group_value(1) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, gone_dst, gone_reply, firc_mark_group_value(7) | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, out, out_reply, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+    const uint8_t moved_dst[4] = {198, 18, 3, 11}, moved_reply[4] = {104, 18, 29, 9};
+    fake_ct_add(f.kernel, AF_INET, src, moved_dst, moved_reply, firc_mark_group_value(2) | FIRC_MARK_HANDLED);
 
-    firc_stale_group_t groups[1] = {{.id = "g1", .field = firc_mark_group_value(1)}};
+    firc_stale_group_t groups[2] = {
+        {.id = "g1", .field = firc_mark_group_value(1), .field_kept = true},
+        {.id = "g2", .field = firc_mark_group_value(2)},
+    };
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, false, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
-    ASSERT_EQ_FMTm("nothing was decided, so nothing was deleted", (size_t)0, dropped, "%zu");
-    ASSERT_EQ_FMTm("the kernel was not even asked", (size_t)0, fake_ct_deletes(f.kernel), "%zu");
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, false, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ_FMT((size_t)3, dropped, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, gone_reply, 4));
+    ASSERT(fake_ct_deleted(f.kernel, out_reply, 4));
+    ASSERT(fake_ct_deleted(f.kernel, moved_reply, 4));
     ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
+    down(&f);
+    PASS();
+}
+
+/* Catches: a start without the field map judging by fields that may have shifted instead of resetting firc's flows. */
+TEST without_the_field_map_every_handled_flow_goes(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_ip_t a = {{0}, 0};
+    ASSERT(issue(&f, "g1", "a.example.com", &a));
+    const uint8_t src[4] = {192, 168, 1, 10}, reply[4] = {104, 18, 29, 7};
+    const uint8_t out[4] = {10, 1, 2, 3}, unhandled[4] = {10, 1, 2, 4};
+    uint32_t f1 = firc_mark_group_value(1);
+    fake_ct_add(f.kernel, AF_INET, src, a.b, reply, f1 | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, out, out, f1 | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, unhandled, unhandled, f1);
+    fake_ct_add(f.kernel, AF_INET, src, unhandled, reply, 0x0ffffaaau);
+    fake_ct_ignore_mark_filter(f.kernel);
+
+    firc_ct_chunk_t subs[1] = {{.family = AF_INET, .base = {10, 0, 0, 0}, .prefix = 8, .field = f1}};
+    firc_stale_group_t groups[1] = {{.id = "g1", .field = f1, .subnets = subs, .n_subnets = 1, .field_kept = true}};
+    for (int loaded = 1; loaded >= 0; loaded--) {
+        size_t dropped = 0;
+        ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, loaded == 1, groups, 1, FIRC_MARK_GROUP_MASK,
+                                                  &dropped));
+        ASSERT_EQ_FMT(loaded == 1 ? (size_t)0 : (size_t)2, dropped, "%zu");
+    }
+    ASSERT(fake_ct_deleted(f.kernel, reply, 4));
+    ASSERT(fake_ct_deleted(f.kernel, out, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(f.kernel), "%zu");
     down(&f);
     PASS();
 }
@@ -117,7 +159,7 @@ TEST a_group_that_holds_no_field_loses_its_flows(void) {
 
     firc_stale_group_t groups[1] = {{.id = "g1", .field = 0}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("a group that routes nothing steers nothing", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -135,7 +177,7 @@ TEST a_flow_to_a_subnet_its_field_holder_cannot_reach_goes(void) {
     firc_ct_chunk_t subs[1] = {{.family = AF_INET, .base = {192, 168, 0, 0}, .prefix = 16, .field = f1}};
     firc_stale_group_t groups[1] = {{.id = "g1", .field = f1, .subnets = subs, .n_subnets = 1}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("its holder cannot have produced it", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -152,7 +194,7 @@ TEST a_flow_inside_its_field_holder_s_subnet_stays(void) {
     firc_ct_chunk_t subs[1] = {{.family = AF_INET, .base = {10, 0, 0, 0}, .prefix = 8, .field = f1}};
     firc_stale_group_t groups[1] = {{.id = "g1", .field = f1, .subnets = subs, .n_subnets = 1}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("10.1.2.3 is inside 10.0.0.0/8", (size_t)0, dropped, "%zu");
     down(&f);
     PASS();
@@ -170,7 +212,7 @@ TEST a_holder_that_routes_everything_makes_nothing_stale(void) {
     firc_ct_chunk_t subs[1] = {{.family = AF_INET, .base = {0, 0, 0, 0}, .prefix = 0, .field = f1}};
     firc_stale_group_t groups[1] = {{.id = "g1", .field = f1, .subnets = subs, .n_subnets = 1}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("a /0 holder could have produced it", (size_t)0, dropped, "%zu");
     ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
     down(&f);
@@ -191,7 +233,7 @@ TEST a_fake_address_no_live_chunk_covers_goes(void) {
     firc_stale_group_t groups[1] = {
         {.id = "g1", .field = firc_mark_group_value(1), .subnets = subs, .n_subnets = 1}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("an issued address nobody owns now", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -212,13 +254,14 @@ TEST a_chunk_names_its_owner_even_under_a_holder_that_routes_everything(void) {
         {.id = "g2", .field = f2},
     };
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("the chunk's owner decides, not the /0", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
 }
 
-TEST a_field_nobody_holds_is_left_alone_outside_the_pool(void) {
+/* Catches: the sweep keeping a handled flow to a real address whose field no live group holds. */
+TEST a_field_nobody_holds_outside_the_pool_goes(void) {
     fx_t f;
     ASSERT(up(&f));
     const uint8_t src[4] = {192, 168, 1, 10};
@@ -230,9 +273,9 @@ TEST a_field_nobody_holds_is_left_alone_outside_the_pool(void) {
     firc_stale_group_t groups[1] = {
         {.id = "g1", .field = firc_mark_group_value(1), .subnets = subs, .n_subnets = 1}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
-    ASSERT_EQ_FMTm("nobody holds field 7, and nothing says it is ours", (size_t)0, dropped, "%zu");
-    ASSERT_EQ_FMT((size_t)1, fake_ct_remaining(f.kernel), "%zu");
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ_FMT((size_t)1, dropped, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, reply, 4));
     down(&f);
     PASS();
 }
@@ -254,7 +297,7 @@ TEST a_subnet_covering_the_pool_does_not_answer_for_a_chunk(void) {
         {.id = "g2", .field = f2},
     };
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("the chunk's owner decides inside the pool", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -278,7 +321,7 @@ TEST another_group_s_subnet_does_not_vouch_for_this_field(void) {
         {.id = "g2", .field = f2, .subnets = subs, .n_subnets = 1},
     };
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("g1 could not have produced it", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -304,7 +347,7 @@ TEST a_group_s_subnet_rules_become_prefixes(void) {
     size_t n = 0;
     uint32_t field = firc_mark_group_value(3);
     ASSERTm("a group whose rules parse is not a failure",
-            firc_stale_group_subnets(g, field, &v, &n));
+            firc_stale_group_subnets(g, field, false, &v, &n));
     ASSERT_EQ_FMTm("the domain, the unparseable and the disabled are all out", (size_t)2, n, "%zu");
     ASSERT_EQ_FMT((int)AF_INET, (int)v[0].family, "%d");
     ASSERT_EQ_FMT(8, (int)v[0].prefix, "%d");
@@ -330,7 +373,7 @@ TEST a_group_with_no_subnet_rules_is_not_a_failure(void) {
 
     firc_ct_chunk_t *v = NULL;
     size_t n = 0;
-    ASSERT(firc_stale_group_subnets(g, firc_mark_group_value(1), &v, &n));
+    ASSERT(firc_stale_group_subnets(g, firc_mark_group_value(1), false, &v, &n));
     ASSERT_EQ_FMT((size_t)0, n, "%zu");
     ASSERT(v == NULL);
     firc_group_free(g);
@@ -352,7 +395,7 @@ TEST a_list_group_with_no_hand_rules_is_swept(void) {
     size_t n = 0;
     uint32_t field = firc_mark_group_value(1);
     ASSERTm("a group whose list rules parse is not a failure",
-            firc_stale_group_subnets(g, field, &v, &n));
+            firc_stale_group_subnets(g, field, false, &v, &n));
     ASSERT_EQ_FMT((size_t)1, n, "%zu");
     ASSERT_EQ_FMT((int)AF_INET, (int)v[0].family, "%d");
     ASSERT_EQ_FMT(8, (int)v[0].prefix, "%d");
@@ -360,6 +403,71 @@ TEST a_list_group_with_no_hand_rules_is_swept(void) {
                    "%u");
     free(v);
     firc_group_free(g);
+    PASS();
+}
+
+/* Catches: a group whose list is not fetched yet read as routing nothing, so its field's flows are reset. */
+TEST a_group_whose_list_is_not_loaded_keeps_its_field_s_flows(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    g->list = firc_group_list_new();
+    ASSERT(g->list != NULL);
+    uint32_t f4 = firc_mark_group_value(4);
+    firc_ct_chunk_t *v = NULL;
+    size_t n = 0;
+    ASSERT(firc_stale_group_subnets(g, f4, true, &v, &n));
+
+    const uint8_t src[4] = {192, 168, 1, 10}, out4[4] = {8, 8, 8, 8}, gone4[4] = {9, 9, 9, 9};
+    const uint8_t src6[16] = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+    const uint8_t out6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11};
+    fake_ct_add(f.kernel, AF_INET, src, out4, out4, f4 | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET6, src6, out6, out6, f4 | FIRC_MARK_HANDLED);
+    fake_ct_add(f.kernel, AF_INET, src, gone4, gone4, firc_mark_group_value(5) | FIRC_MARK_HANDLED);
+
+    firc_stale_group_t groups[1] = {{.id = "g1", .field = f4, .subnets = v, .n_subnets = n}};
+    size_t dropped = 0;
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ_FMT((size_t)1, dropped, "%zu");
+    ASSERT(fake_ct_deleted(f.kernel, gone4, 4));
+    ASSERT_EQ_FMT((size_t)2, fake_ct_remaining(f.kernel), "%zu");
+    free(v);
+    firc_group_free(g);
+    down(&f);
+    PASS();
+}
+
+/* Catches: an unfetched list vouching for every flow on a field it did not hold last run. */
+TEST an_unfetched_list_vouches_only_for_a_field_the_file_says_it_held(void) {
+    const uint8_t src[4] = {192, 168, 1, 10}, dst[4] = {93, 184, 216, 34};
+    uint32_t field = firc_mark_group_value(1);
+    for (int kept = 0; kept < 2; kept++) {
+        fx_t f;
+        ASSERT(up(&f));
+        firc_group_t *g = firc_group_new();
+        ASSERT(g != NULL);
+        g->list = firc_group_list_new();
+        ASSERT(g->list != NULL);
+        firc_ct_chunk_t *v = NULL;
+        size_t n = 99;
+        ASSERT(firc_stale_group_subnets(g, field, kept == 1, &v, &n));
+        ASSERT_EQ_FMT(kept == 1 ? (size_t)2 : (size_t)0, n, "%zu");
+        if (kept == 1) {
+            ASSERT_EQ_FMT((int)AF_INET, (int)v[0].family, "%d");
+            ASSERT_EQ_FMT((int)AF_INET6, (int)v[1].family, "%d");
+            ASSERT(v[0].prefix == 0 && v[1].prefix == 0 && v[0].is_subnet && v[1].is_subnet);
+        }
+        fake_ct_add(f.kernel, AF_INET, src, dst, dst, field | FIRC_MARK_HANDLED);
+        firc_stale_group_t groups[1] = {{.id = "g1", .field = field, .subnets = v, .n_subnets = n}};
+        size_t dropped = 0;
+        ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 1, FIRC_MARK_GROUP_MASK, &dropped));
+        ASSERT_EQ_FMT(kept == 1 ? (size_t)0 : (size_t)1, dropped, "%zu");
+        ASSERT_EQ_FMT(kept == 1 ? (size_t)1 : (size_t)0, fake_ct_remaining(f.kernel), "%zu");
+        free(v);
+        firc_group_free(g);
+        down(&f);
+    }
     PASS();
 }
 
@@ -379,7 +487,7 @@ TEST each_group_s_chunks_carry_that_group_s_field(void) {
 
     firc_stale_group_t groups[2] = {{.id = "g1", .field = f1}, {.id = "g2", .field = f2}};
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("only the one whose chunk belongs to the other group", (size_t)1, dropped, "%zu");
     ASSERTm("g1's own flow stayed", !fake_ct_deleted(f.kernel, r1, 4));
     ASSERTm("the one in g2's chunk went", fake_ct_deleted(f.kernel, r2, 4));
@@ -401,7 +509,7 @@ TEST a_group_with_no_chunks_yet_does_not_stop_the_sweep(void) {
         {.id = "g1", .field = firc_mark_group_value(2)},
     };
     size_t dropped = 0;
-    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+    ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
     ASSERT_EQ_FMTm("g1's stale flow is still judged", (size_t)1, dropped, "%zu");
     down(&f);
     PASS();
@@ -423,7 +531,7 @@ TEST a_selector_group_s_chunk_keeps_a_flow_another_group_s_subnet_marked(void) {
             {.id = "g2", .field = f2, .subnets = &all, .n_subnets = 1},
         };
         size_t dropped = 0;
-        ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
+        ASSERT_EQ(FIRC_OK, firc_stale_marks_sweep(f.ct, f.pool, true, true, groups, 2, FIRC_MARK_GROUP_MASK, &dropped));
         ASSERT_EQ_FMTm(sel ? "kept in a selector group's chunk" : "deleted in an ordinary chunk",
                        (size_t)(sel ? 0 : 1), dropped, "%zu");
         down(&f);
@@ -438,19 +546,22 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_that_kept_its_field_keeps_its_flows);
     RUN_TEST(a_group_whose_field_moved_loses_its_flows);
     RUN_TEST(a_group_that_is_gone_loses_its_flows);
-    RUN_TEST(an_untrusted_pool_state_sweeps_nothing);
+    RUN_TEST(an_untrusted_pool_state_keeps_only_held_fields_inside_the_pool);
+    RUN_TEST(without_the_field_map_every_handled_flow_goes);
     RUN_TEST(a_group_that_holds_no_field_loses_its_flows);
     RUN_TEST(a_flow_to_a_subnet_its_field_holder_cannot_reach_goes);
     RUN_TEST(a_flow_inside_its_field_holder_s_subnet_stays);
     RUN_TEST(a_holder_that_routes_everything_makes_nothing_stale);
     RUN_TEST(a_fake_address_no_live_chunk_covers_goes);
     RUN_TEST(a_chunk_names_its_owner_even_under_a_holder_that_routes_everything);
-    RUN_TEST(a_field_nobody_holds_is_left_alone_outside_the_pool);
+    RUN_TEST(a_field_nobody_holds_outside_the_pool_goes);
     RUN_TEST(a_subnet_covering_the_pool_does_not_answer_for_a_chunk);
     RUN_TEST(another_group_s_subnet_does_not_vouch_for_this_field);
     RUN_TEST(a_group_s_subnet_rules_become_prefixes);
     RUN_TEST(a_group_with_no_subnet_rules_is_not_a_failure);
     RUN_TEST(a_list_group_with_no_hand_rules_is_swept);
+    RUN_TEST(a_group_whose_list_is_not_loaded_keeps_its_field_s_flows);
+    RUN_TEST(an_unfetched_list_vouches_only_for_a_field_the_file_says_it_held);
     RUN_TEST(each_group_s_chunks_carry_that_group_s_field);
     RUN_TEST(a_group_with_no_chunks_yet_does_not_stop_the_sweep);
     RUN_TEST(a_selector_group_s_chunk_keeps_a_flow_another_group_s_subnet_marked);

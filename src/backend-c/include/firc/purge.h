@@ -10,6 +10,7 @@
 
 typedef struct {
     const char *pool_file;
+    const char *fields_file;
     const char *sock;
     const char *lock;
     const char *run_dir;

@@ -83,11 +83,25 @@ firc_err_t firc_rtnl_alloc_mark_table(firc_rtnl_t *r, uint32_t start_idx, uint32
 /* Lowest group field no ip rule uses; FIRC_ERR_LIMIT when all are taken. */
 firc_err_t firc_rtnl_alloc_mark_field(firc_rtnl_t *r, uint32_t *out_field);
 
-/* Same, but an owner gets back the field it had while that field is free; process memory only. */
+/* Same, but an owner gets back the field it had (or was seeded with) while that field is free. */
 firc_err_t firc_rtnl_alloc_mark_field_for(firc_rtnl_t *r, const char *owner, uint32_t *out_field);
 
 /* Call only when the owner leaves the config, not on a teardown before re-enable. */
 void firc_rtnl_forget_mark_field(firc_rtnl_t *r, const char *owner);
+
+typedef struct {
+    const char *owner;
+    uint32_t field;
+} firc_rtnl_field_t;
+typedef void (*firc_rtnl_fields_fn)(void *ud, const firc_rtnl_field_t *v, size_t n);
+
+/* Pre-assigns a field to an owner from a loaded map; EXIST when either is already in the table,
+ * INVAL outside 1..255 or for an owner too long. Does not notify. */
+firc_err_t firc_rtnl_seed_mark_field(firc_rtnl_t *r, const char *owner, uint32_t field);
+/* Called with the whole table after every change of an assignment; NULL stops it. */
+void firc_rtnl_watch_mark_fields(firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud);
+/* Calls fn once with the whole table as it is now. */
+void firc_rtnl_fields_now(const firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud);
 
 /* Removes ip rules a previous instance left (firc's mask at firc's priority); call at startup. */
 firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed);

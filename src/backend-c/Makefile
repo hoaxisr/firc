@@ -101,6 +101,8 @@ NETFILTER_SRCS := \
     src/netfilter/purge.c \
     src/netfilter/conntrack.c \
     src/netfilter/stale_marks.c \
+    src/netfilter/fields_file.c \
+    src/netfilter/stable_fields.c \
     src/netfilter/committer.c \
     src/netfilter/ruleset.c \
     src/netfilter/pool_reject.c \
