@@ -410,10 +410,12 @@ static bool tap_rule_text(const locked_app_t *l, char *out, size_t cap) {
     firc_ipt_rule_t *const *rules = NULL;
     size_t n = 0;
     out[0] = '\0';
-    if (!firc_fake_ipt_get_rules(l->fake, "mangle", "FIRC_TAP", &rules, &n) || n == 0) {
-        return false;
+    firc_app_nf_enter(l->app);
+    char *s = NULL;
+    if (firc_fake_ipt_get_rules(l->fake, "mangle", "FIRC_TAP", &rules, &n) && n > 0) {
+        s = firc_ipt_rule_string(rules[0]);
     }
-    char *s = firc_ipt_rule_string(rules[0]);
+    firc_app_nf_leave(l->app);
     if (s == NULL) { return false; }
     snprintf(out, cap, "%s", s);
     free(s);
@@ -1542,15 +1544,19 @@ TEST a_group_whose_interface_is_not_a_name_routes_nothing(void) {
     }
     firc_ipt_rule_t *const *rules = NULL;
     size_t n = 0;
+    bool injected = false, unreadable = false;
+    firc_app_nf_enter(l.app);
     if (firc_fake_ipt_get_rules(l.fake, "mangle", "FORWARD", &rules, &n)) {
         for (size_t i = 0; i < n; i++) {
             char *text = firc_ipt_rule_string(rules[i]);
-            ASSERT(text != NULL);
-            bool injected = strstr(text, "-j ACCEPT") != NULL;
+            unreadable = unreadable || text == NULL;
+            injected = injected || (text != NULL && strstr(text, "-j ACCEPT") != NULL);
             free(text);
-            ASSERT_FALSEm("a rule nobody asked for, out of an interface name", injected);
         }
     }
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSE(unreadable);
+    ASSERT_FALSEm("a rule nobody asked for, out of an interface name", injected);
     locked_app_down(&l);
     PASS();
 }
@@ -4697,7 +4703,7 @@ TEST without_a_committer_the_devices_chain_is_written_at_once(void) {
     char dchain[64];
     devices_chain_of(&l, gid, dchain, sizeof(dchain));
     ASSERT(firc_fake_ipt_chain_exists(l.fake, "mangle", dchain));
-    ASSERT(chain_has_text_in(l.fake, "mangle", dchain, "--mac-source AA:BB:CC:DD:EE:FF"));
+    ASSERT(mangle_has(&l, dchain, "--mac-source AA:BB:CC:DD:EE:FF"));
     locked_app_down(&l);
     PASS();
 }
