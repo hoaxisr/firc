@@ -363,7 +363,7 @@ jobs:
       SDK_ASSET: entware-sdk-mips-3.4_gcc-8.4.0_glibc-2.27.Linux-x86_64
       SDK_TAG: v2026.07.04
       SDK_SHA256: 48e6d2712841d62d98e34b25888159254b84c7cf86bc00fdb258a4b97ac8445a
-      SDK_HOME: ${{ github.workspace }}/../mips-sdk
+      SDK_HOME: ${{ github.workspace }}/.mips-sdk
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -375,7 +375,7 @@ jobs:
 
       - name: Restore SDK with built dependencies
         id: sdk_cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.SDK_HOME }}
           key: mips-sdk-${{ env.SDK_ASSET }}-${{ env.SDK_TAG }}-${{ hashFiles('tools/ci/entware-package/Makefile') }}-1
@@ -417,7 +417,7 @@ jobs:
 
       - name: Save SDK with built dependencies
         if: steps.sdk_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ env.SDK_HOME }}
           key: ${{ steps.sdk_cache.outputs.cache-primary-key }}

@@ -23,6 +23,7 @@ export class GroupsPage {
 
   async goto() {
     await this.page.goto("/");
+    await expect(this.addGroupButton).not.toHaveClass(/inactive/);
   }
 
   async search(query: string) {

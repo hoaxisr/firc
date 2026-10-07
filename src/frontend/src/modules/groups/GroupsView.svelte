@@ -281,6 +281,7 @@
     controlsClass="group-controls"
     addLabel={t("Add Group")}
     canSave={store.canSave}
+    ready={store.canAdd}
     saveError={store.invalidRules.size > 0 ? t("Some rules are empty or invalid") : undefined}
     exportLabel={t("Export Config")}
     importLabel={t("Import Config")}

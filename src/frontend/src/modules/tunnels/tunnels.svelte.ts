@@ -79,7 +79,7 @@ export class TunnelsStore {
   }
 
   get canAdd() {
-    return this.data.length < MAX_TUNNELS;
+    return this.loaded && this.data.length < MAX_TUNNELS;
   }
 
   refusalFor(id: string): TunnelFieldError | null {

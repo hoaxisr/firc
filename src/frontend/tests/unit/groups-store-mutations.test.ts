@@ -105,6 +105,7 @@ const createStore = (groups: Group[] = []) => {
   const store = new GroupsStore();
   store.data.splice(0, store.data.length, ...structuredClone(groups));
   store.dataRevision = 0;
+  store.dataLoaded = true;
   store.open_state = {};
   for (const group of store.data) {
     store.open_state[group.id] = false;
@@ -139,6 +140,19 @@ describe("GroupsStore mutations and validation", () => {
     store.markDataRevision();
     store.markDataRevision();
     assert.strictEqual(store.dataRevision, 2);
+  });
+
+  // Catches a group added before the list arrives or after it failed, which the load or a save would then clobber.
+  it("nothing is added while the list is not loaded or failed to load", async () => {
+    const store = createStore();
+    store.dataLoaded = false;
+    await store.addGroup();
+    await store.addGroups([makeGroup("g1")]);
+    assert.strictEqual(store.data.length, 0);
+    store.dataLoaded = true;
+    store.fetchError = true;
+    await store.addGroup();
+    assert.strictEqual(store.data.length, 0);
   });
 
   it("addGroup prepends group, adds default rule and opens it", async () => {

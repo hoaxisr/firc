@@ -30,7 +30,7 @@ test.describe("Tunnels page", () => {
     await tunnels.open();
     await expect(page.getByText("No tunnels yet")).toBeVisible();
 
-    await tunnels.add.click();
+    await tunnels.addTunnel();
     await tunnels.addSubscription("tunnel1", "Provider", "https://sub.example/feed");
     await tunnels.addLink("tunnel1", "vless://u@h.example:443?security=tls#Solo");
     const before = daemon.interfaceFetches;

@@ -115,6 +115,23 @@ test.describe("Groups Management", () => {
     expect(saveRequestReceived).toBe(true);
   });
 
+  // Catches a group added while the list is still loading, wiped when the list arrives.
+  test("Add waits for the group list, and a group added after it stays", async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    await page.unroute("**/groups?with_rules=true");
+    await page.route("**/groups?with_rules=true", async (route) => {
+      await held;
+      await route.fulfill({ json: { groups: [] } });
+    });
+    await page.goto("/");
+    await expect(groupsPage.addGroupButton).toHaveClass(/inactive/);
+    release();
+    await expect(groupsPage.addGroupButton).not.toHaveClass(/inactive/);
+    await groupsPage.createGroup("kept");
+    await expect(page.locator(".group-wrapper")).toHaveCount(1);
+  });
+
   test("should enable save after switching rule type to IPv6 for IPv6 pattern", async ({
     page,
   }) => {

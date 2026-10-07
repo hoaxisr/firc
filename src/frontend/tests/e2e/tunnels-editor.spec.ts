@@ -132,7 +132,7 @@ test.describe("Tunnel editor", () => {
     const daemon = await stubDaemon(page);
     const tunnels = new TunnelsPage(page);
     await tunnels.open();
-    await tunnels.add.click();
+    await tunnels.addTunnel();
     await tunnels.addLink("tunnel1", "vless://u@h.example:443#Solo");
     const button = tunnels.card("tunnel1").locator("button", { hasText: "Check nodes" });
     await expect(button).toHaveClass(/inactive/);
@@ -177,7 +177,7 @@ test.describe("Tunnel editor", () => {
     await stubDaemon(page);
     const tunnels = new TunnelsPage(page);
     await tunnels.open();
-    await tunnels.add.click();
+    await tunnels.addTunnel();
     await tunnels.card("tunnel1").getByRole("button", { name: "Subscription" }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByLabel("Name").fill("Provider");

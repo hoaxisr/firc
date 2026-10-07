@@ -360,6 +360,7 @@ describe("a group's device selector", () => {
   // Regression guard: addGroup() must keep giving a fresh group the empty selector.
   it("a_freshly_added_group_has_an_empty_selector", async () => {
     const store = new GroupsStore();
+    store.dataLoaded = true;
 
     const hadDocument = "document" in globalThis;
     const originalDocument = (globalThis as any).document;

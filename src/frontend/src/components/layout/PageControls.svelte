@@ -10,6 +10,7 @@
     search: Snippet;
     addLabel: string;
     canSave: boolean;
+    ready?: boolean;
     saveError?: string;
     controlsClass?: string;
     actionsClass?: string;
@@ -29,6 +30,7 @@
     addLabel,
     actionsClass = "",
     canSave,
+    ready = true,
     saveError,
     controlsClass = "",
     exportLabel,
@@ -73,7 +75,7 @@
           accept={importAccept}
           onchange={onImport}
         />
-        <Button onclick={() => importInputRef?.click()}>
+        <Button inactive={!ready} onclick={() => importInputRef?.click()}>
           <Import size={22} />
         </Button>
       </Tooltip>
@@ -88,7 +90,7 @@
     {/if}
 
     <Tooltip value={addLabel}>
-      <Button onclick={onAdd}><Add size={22} /></Button>
+      <Button inactive={!ready} onclick={onAdd}><Add size={22} /></Button>
     </Tooltip>
   </div>
 </div>

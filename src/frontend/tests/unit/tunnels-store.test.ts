@@ -138,6 +138,17 @@ describe("TunnelsStore load and dirty", () => {
     assert.strictEqual(store.canSave, false);
   });
 
+  // Catches a tunnel added before the list arrives: the load is then skipped and a save would drop every saved tunnel.
+  it("nothing can be added before the list has loaded", async () => {
+    stub({ "/tunnels": { tunnels: [tunnel("main")] } });
+    const store = new TunnelsStore();
+    assert.strictEqual(store.canAdd, false);
+    store.addTunnel();
+    assert.strictEqual(store.data.length, 0);
+    await store.load();
+    assert.strictEqual(store.canAdd, true);
+  });
+
   // Catches an edit that never reaches the tracker, the save button staying dead.
   it("editing a field makes the set savable, and undoing it makes it clean again", async () => {
     stub({ "/tunnels": { tunnels: [tunnel("main")] } });

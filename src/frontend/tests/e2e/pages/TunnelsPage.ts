@@ -1,4 +1,4 @@
-import type { Locator, Page, Route } from "@playwright/test";
+import { expect, type Locator, type Page, type Route } from "@playwright/test";
 
 import { signedIn } from "./session";
 
@@ -167,6 +167,11 @@ export class TunnelsPage {
   async open() {
     await this.page.goto("/");
     await this.tab("Tunnels").click();
+  }
+
+  async addTunnel() {
+    await expect(this.add).not.toHaveClass(/inactive/);
+    await this.add.click();
   }
 
   tab(name: string): Locator {

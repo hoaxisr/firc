@@ -46,6 +46,7 @@
   <PageControls
     addLabel={t("Add tunnel")}
     canSave={store.canSave}
+    ready={store.canAdd}
     onAdd={addTunnel}
     onSave={() => void store.saveChanges()}
     saveLabel={t("Save")}

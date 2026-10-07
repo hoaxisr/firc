@@ -1521,7 +1521,12 @@ export class GroupsStore {
     this.changeGroupIndex(from_index, to_index, insert);
   };
 
+  get canAdd() {
+    return this.dataLoaded && !this.fetchError;
+  }
+
   async addGroup() {
+    if (!this.canAdd) return;
     const group = defaultGroup();
     this.data.unshift(group);
     this.open_state[group.id] = true;
@@ -1551,6 +1556,7 @@ export class GroupsStore {
   }
 
   async createGroupFromDialog(payload: GroupDialogPayload) {
+    if (!this.canAdd) return;
     const group: Group = {
       id: randomId(),
       name: payload.name,
@@ -1690,7 +1696,7 @@ export class GroupsStore {
   }
 
   async addGroups(groups: Group[]) {
-    if (!groups.length) return;
+    if (!groups.length || !this.canAdd) return;
     await prependGroupsData(
       this.data,
       this.open_state,
