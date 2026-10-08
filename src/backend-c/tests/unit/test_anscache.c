@@ -402,7 +402,6 @@ TEST the_byte_bound_evicts_the_least_recently_used(void) {
     ASSERT(firc_anscache_put(probe, &k[0], a.b, a.n, 300, 1000));
     size_t one = firc_anscache_bytes(probe);
     firc_anscache_free(probe);
-    ASSERT(one >= a.n + sizeof(NAME_A) + 2);
     size_t bound = 2 * one + one / 2;
     firc_anscache_t *c = firc_anscache_new(16, bound);
     ASSERT(firc_anscache_put(c, &k[0], a.b, a.n, 300, 1000));
@@ -415,6 +414,49 @@ TEST the_byte_bound_evicts_the_least_recently_used(void) {
     ASSERT(hits(c, &k[1], 1000));
     ASSERT(hits(c, &k[2], 1000));
     firc_anscache_free(c);
+    PASS();
+}
+
+/* Catches: the accounting leaving out wire bytes or the per-TTL offset. */
+TEST the_accounted_bytes_grow_by_a_records_wire_and_offset(void) {
+    firc_anscache_key_t k = key_for(NAME_A, sizeof(NAME_A));
+    wire_t a;
+    answer_a(&a, 300, 1);
+    firc_anscache_t *one = firc_anscache_new(16, 1u << 20);
+    ASSERT(firc_anscache_put(one, &k, a.b, a.n, 300, 1000));
+    ASSERT(firc_anscache_bytes(one) >= a.n + sizeof(NAME_A) + 2);
+    add_a(&a, 300, 2);
+    firc_anscache_t *two = firc_anscache_new(16, 1u << 20);
+    ASSERT(firc_anscache_put(two, &k, a.b, a.n, 300, 1000));
+    ASSERT_EQ_FMT((size_t)18, firc_anscache_bytes(two) - firc_anscache_bytes(one), "%zu");
+    firc_anscache_free(one);
+    firc_anscache_free(two);
+    PASS();
+}
+
+/* Catches: bytes after the last record stored and served with the answer. */
+TEST bytes_after_the_last_record_are_not_cached(void) {
+    firc_anscache_t *c = firc_anscache_new(64, 1u << 20);
+    firc_anscache_key_t k = key_for(NAME_A, sizeof(NAME_A));
+    wire_t a;
+    answer_a(&a, 300, 1);
+    a.b[a.n++] = 0x77;
+    ASSERT_FALSE(firc_anscache_put(c, &k, a.b, a.n, 300, 1000));
+    ASSERT_EQ_FMT((size_t)0, firc_anscache_count(c), "%zu");
+    firc_anscache_free(c);
+    PASS();
+}
+
+/* Catches: a TTL with the top bit set read as a huge lifetime instead of zero (RFC 2181). */
+TEST a_ttl_above_2_31_minus_1_is_not_cached(void) {
+    wire_t w;
+    answer_a(&w, 0x80000000u, 1);
+    ASSERT_EQ_FMT(0u, lifetime_of(&w), "%u");
+    answer_a(&w, 0x7fffffffu, 1);
+    ASSERT_EQ_FMT(86400u, lifetime_of(&w), "%u");
+    begin(&w, 1, 0x8183, NAME_A, sizeof(NAME_A));
+    add_soa(&w, 0x80000000u, 30);
+    ASSERT_EQ_FMT(0u, lifetime_of(&w), "%u");
     PASS();
 }
 
@@ -595,6 +637,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_put_replaces_its_keys_entry);
     RUN_TEST(the_count_bound_evicts_the_least_recently_used);
     RUN_TEST(the_byte_bound_evicts_the_least_recently_used);
+    RUN_TEST(the_accounted_bytes_grow_by_a_records_wire_and_offset);
+    RUN_TEST(bytes_after_the_last_record_are_not_cached);
+    RUN_TEST(a_ttl_above_2_31_minus_1_is_not_cached);
     RUN_TEST(an_answer_over_4096_bytes_is_not_cached);
     RUN_TEST(an_answer_to_another_question_is_not_stored);
     RUN_TEST(an_answer_of_another_type_or_class_is_not_stored);

@@ -4,6 +4,8 @@
 #include <string.h>
 
 #define FLAG_CD 0x0010u
+#define MALLOC_OVERHEAD 16u
+#define MAX_TTL_WIRE 0x7fffffffu
 #define MAX_TTLS (FIRC_ANSCACHE_MAX_ANSWER / 11u + 1u)
 
 typedef struct entry {
@@ -137,6 +139,7 @@ static bool walk(const uint8_t *w, size_t len, uint16_t *offs, size_t *n_out, si
         }
         off = end;
     }
+    if (off != len) { return false; }
     *n_out = n;
     return true;
 }
@@ -246,7 +249,8 @@ static uint32_t negative_lifetime(const firc_dns_msg_t *m)
         const firc_dns_rr_t *rr = &m->authority[i];
         if (rr->rtype != FIRC_DNS_TYPE_SOA || rr->rdata_len < 22) { continue; }
         uint32_t minimum = rd32(rr->rdata + rr->rdata_len - 4);
-        uint32_t ttl = rr->ttl < minimum ? rr->ttl : minimum;
+        uint32_t rttl = rr->ttl > MAX_TTL_WIRE ? 0 : rr->ttl;
+        uint32_t ttl = rttl < minimum ? rttl : minimum;
         return ttl < FIRC_ANSCACHE_MAX_NEGATIVE_TTL ? ttl : FIRC_ANSCACHE_MAX_NEGATIVE_TTL;
     }
     return 0;
@@ -262,7 +266,8 @@ uint32_t firc_anscache_lifetime(const firc_dns_msg_t *answer)
     if (rcode != 0) { return 0; }
     uint32_t ttl = FIRC_ANSCACHE_MAX_TTL;
     for (size_t i = 0; i < answer->n_answers; i++) {
-        if (answer->answers[i].ttl < ttl) { ttl = answer->answers[i].ttl; }
+        uint32_t t = answer->answers[i].ttl > MAX_TTL_WIRE ? 0 : answer->answers[i].ttl;
+        if (t < ttl) { ttl = t; }
     }
     return ttl;
 }
@@ -286,9 +291,10 @@ bool firc_anscache_put(firc_anscache_t *c, const firc_anscache_key_t *key, const
     size_t n = 0;
     size_t keep = len;
     if (!walk(wire, len, offs, &n, &keep)) { return false; }
-    size_t cost = sizeof(entry_t) + key->name_len + keep + n * sizeof(uint16_t);
+    size_t need = sizeof(entry_t) + key->name_len + keep + n * sizeof(uint16_t);
+    size_t cost = need + MALLOC_OVERHEAD;
     if (cost > c->max_bytes) { return false; }
-    entry_t *e = malloc(cost);
+    entry_t *e = malloc(need);
     if (e == NULL) { return false; }
     memset(e, 0, sizeof(*e));
     e->hash = key_hash(key);
