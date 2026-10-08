@@ -120,6 +120,120 @@ static firc_nfcommit_t *start_committer(probe_t *p) {
     return c;
 }
 
+static long elapsed_ms(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (long)(t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static firc_nfcommit_t *start_settling(probe_t *p, unsigned long_ms, unsigned addr_ms) {
+    firc_nfcommit_t *c = firc_nfcommit_new(probe_rebuild, p);
+    firc_nfcommit_set_delays_for_test(c, long_ms, long_ms * 4u);
+    firc_nfcommit_set_addr_delay_for_test(c, addr_ms);
+    firc_nfcommit_start(c);
+    return c;
+}
+
+/* Catches: a pass for new fake addresses waiting the settle meant for firmware bursts. */
+TEST an_address_request_settles_short(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 300, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 2);
+    ASSERT_LT(elapsed_ms(&t0), 150);
+    pthread_mutex_lock(&p.mu);
+    int partial = p.partial_passes;
+    pthread_mutex_unlock(&p.mu);
+    ASSERT_EQ_FMT(1, partial, "%d");
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: a chain change asked with request_more settling short like an address request. */
+TEST a_more_request_settles_long(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 300, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_request_more(c);
+    AWAIT(&p, p.started >= 2);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: the settle length fixed when the wait begins, so a full request inside a short one is served early or twice. */
+TEST a_full_request_during_a_short_settle_waits_the_long_one(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 300, 100);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_request_addresses(c);
+    sleep_ms(50);
+    firc_nfcommit_request(c);
+    AWAIT(&p, p.started >= 2);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
+    sleep_ms(400);
+    pthread_mutex_lock(&p.mu);
+    int started = p.started, full = p.full_passes;
+    pthread_mutex_unlock(&p.mu);
+    ASSERT_EQ_FMT(2, started, "%d");
+    ASSERT_EQ_FMT(2, full, "%d");
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: the startup pass, which wipes, settling short. */
+TEST the_first_pass_settles_long(void) {
+    probe_t p;
+    probe_init(&p);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_t *c = start_settling(&p, 300, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 1);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: a hard failure's backoff replaced by the short settle on the retry of an address pass. */
+TEST a_failed_address_pass_still_backs_off(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 100, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    pthread_mutex_lock(&p.mu);
+    p.fail_times = 1;
+    p.fail_with = FIRC_ERR_SYS;
+    pthread_mutex_unlock(&p.mu);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 2);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    AWAIT(&p, p.started >= 3);
+    ASSERT_GTE(elapsed_ms(&t0), 190);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
 TEST request_triggers_a_rebuild(void) {
     probe_t p;
     probe_init(&p);
@@ -849,6 +963,11 @@ int main(int argc, char **argv) {
     RUN_TEST(request_does_not_wait_for_the_write);
     RUN_TEST(request_interrupts_and_restarts);
     RUN_TEST(request_more_does_not_interrupt_but_still_schedules);
+    RUN_TEST(an_address_request_settles_short);
+    RUN_TEST(a_more_request_settles_long);
+    RUN_TEST(a_full_request_during_a_short_settle_waits_the_long_one);
+    RUN_TEST(the_first_pass_settles_long);
+    RUN_TEST(a_failed_address_pass_still_backs_off);
     RUN_TEST(an_interrupt_at_the_instant_a_pass_begins_is_not_lost);
     RUN_TEST(requests_coalesce);
     RUN_TEST(retries_until_the_table_holds_still);

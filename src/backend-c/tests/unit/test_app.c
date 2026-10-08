@@ -1608,6 +1608,36 @@ TEST a_pool_change_does_not_take_the_interrupting_lock_and_asks_for_a_pass(void)
     PASS();
 }
 
+/* Catches: a pool change asking for its pass with the long settle meant for chain changes. */
+TEST a_pool_change_gets_its_pass_after_the_short_settle(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    firc_nfcommit_t *c = firc_app_committer_for_test(l.app);
+    ASSERT(c != NULL);
+    firc_app_pool_changed(l.app);
+    for (int i = 0; i < 500 && !pass_landed(&l); i++) { sleep_ms(10); }
+    ASSERT(pass_landed(&l));
+    uint64_t before = firc_nfcommit_passes(c);
+    for (int quiet = 0; quiet < 30; quiet++) {
+        sleep_ms(10);
+        uint64_t now = firc_nfcommit_passes(c);
+        if (now != before) {
+            before = now;
+            quiet = 0;
+        }
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_app_pool_changed(l.app);
+    for (int i = 0; i < 2000 && firc_nfcommit_passes(c) == before; i++) { sleep_ms(1); }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    ASSERT(firc_nfcommit_passes(c) > before);
+    ASSERT_LT(ms, 120);
+    locked_app_down(&l);
+    PASS();
+}
+
 /* Catches: a group enabled outside a pass built from a stale snapshot, missing its chunk rules. */
 TEST outside_a_pass_the_rules_read_the_current_snapshot(void) {
     firc_fakeip_cfg_t c = {0};
@@ -5333,6 +5363,7 @@ int main(int argc, char **argv) {
     RUN_TEST(stopping_the_daemon_ends_the_capture);
     RUN_TEST(a_capture_logs_its_start_its_stop_and_its_summary);
     RUN_TEST(a_pool_change_does_not_take_the_interrupting_lock_and_asks_for_a_pass);
+    RUN_TEST(a_pool_change_gets_its_pass_after_the_short_settle);
     RUN_TEST(a_replacement_keeps_the_pool_state_of_groups_that_persist);
     RUN_TEST(outside_a_pass_the_rules_read_the_current_snapshot);
     RUN_TEST(replace_groups_takes_the_netfilter_lock_once);
