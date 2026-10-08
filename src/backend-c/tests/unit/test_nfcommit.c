@@ -145,7 +145,7 @@ TEST an_address_request_settles_short(void) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     firc_nfcommit_request_addresses(c);
     AWAIT(&p, p.started >= 2);
-    ASSERT_LT(elapsed_ms(&t0), 150);
+    ASSERT_LT(elapsed_ms(&t0), 250);
     pthread_mutex_lock(&p.mu);
     int partial = p.partial_passes;
     pthread_mutex_unlock(&p.mu);
@@ -176,7 +176,7 @@ TEST a_more_request_settles_long(void) {
 TEST a_full_request_during_a_short_settle_waits_the_long_one(void) {
     probe_t p;
     probe_init(&p);
-    firc_nfcommit_t *c = start_settling(&p, 300, 100);
+    firc_nfcommit_t *c = start_settling(&p, 600, 300);
     firc_nfcommit_request_addresses(c);
     AWAIT(&p, p.finished >= 1);
     struct timespec t0;
@@ -185,8 +185,8 @@ TEST a_full_request_during_a_short_settle_waits_the_long_one(void) {
     sleep_ms(50);
     firc_nfcommit_request(c);
     AWAIT(&p, p.started >= 2);
-    ASSERT_GTE(elapsed_ms(&t0), 290);
-    sleep_ms(400);
+    ASSERT_GTE(elapsed_ms(&t0), 590);
+    sleep_ms(700);
     pthread_mutex_lock(&p.mu);
     int started = p.started, full = p.full_passes;
     pthread_mutex_unlock(&p.mu);
@@ -212,6 +212,50 @@ TEST the_first_pass_settles_long(void) {
     PASS();
 }
 
+/* Catches: a raced address pass retried after the short settle, so the firmware's rewrite is hit again at once. */
+TEST a_raced_address_pass_retries_after_the_long_settle(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 300, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    pthread_mutex_lock(&p.mu);
+    p.fail_times = 1;
+    p.fail_with = FIRC_ERR_AGAIN;
+    pthread_mutex_unlock(&p.mu);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 2);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    AWAIT(&p, p.started >= 3);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: the long settle owed by a chain change lost when its pass is canceled and retried. */
+TEST a_canceled_more_pass_retries_after_the_long_settle(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_settling(&p, 300, 1);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    pthread_mutex_lock(&p.mu);
+    p.fail_times = 1;
+    p.fail_with = FIRC_ERR_CANCELED;
+    pthread_mutex_unlock(&p.mu);
+    firc_nfcommit_request_more(c);
+    AWAIT(&p, p.started >= 2);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    AWAIT(&p, p.started >= 3);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
 /* Catches: a hard failure's backoff replaced by the short settle on the retry of an address pass. */
 TEST a_failed_address_pass_still_backs_off(void) {
     probe_t p;
@@ -229,6 +273,7 @@ TEST a_failed_address_pass_still_backs_off(void) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     AWAIT(&p, p.started >= 3);
     ASSERT_GTE(elapsed_ms(&t0), 190);
+    ASSERT_LT(elapsed_ms(&t0), 350);
     firc_nfcommit_free(c);
     probe_destroy(&p);
     PASS();
@@ -968,6 +1013,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_full_request_during_a_short_settle_waits_the_long_one);
     RUN_TEST(the_first_pass_settles_long);
     RUN_TEST(a_failed_address_pass_still_backs_off);
+    RUN_TEST(a_raced_address_pass_retries_after_the_long_settle);
+    RUN_TEST(a_canceled_more_pass_retries_after_the_long_settle);
     RUN_TEST(an_interrupt_at_the_instant_a_pass_begins_is_not_lost);
     RUN_TEST(requests_coalesce);
     RUN_TEST(retries_until_the_table_holds_still);

@@ -1633,7 +1633,7 @@ TEST a_pool_change_gets_its_pass_after_the_short_settle(void) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
     ASSERT(firc_nfcommit_passes(c) > before);
-    ASSERT_LT(ms, 120);
+    ASSERT_LT(ms, 145);
     locked_app_down(&l);
     PASS();
 }

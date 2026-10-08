@@ -211,7 +211,6 @@ void firc_nfcommit_request(firc_nfcommit_t *c) {
     c->n_requests++;
     c->pending = true;
     c->full_owed = true;
-    c->long_owed = true;
     /* Raised under the lock so decide-and-raise is one step. */
     if (c->running) { firc_cancel_raise(c->cancel); }
     pthread_cond_signal(&c->cv);
@@ -268,13 +267,6 @@ static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
     return go_on;
 }
 
-static bool owed_long(firc_nfcommit_t *c) {
-    pthread_mutex_lock(&c->mu);
-    bool owed = c->long_owed || c->full_owed;
-    pthread_mutex_unlock(&c->mu);
-    return owed;
-}
-
 static void *committer_main(void *arg) {
     firc_nfcommit_t *c = arg;
     unsigned backoff_ms = 0;
@@ -288,11 +280,13 @@ static void *committer_main(void *arg) {
 
         unsigned short_ms = c->addr_delay_ms < c->delay_ms ? c->addr_delay_ms : c->delay_ms;
         if (!settle(c, backoff_ms != 0 ? backoff_ms : short_ms)) { break; }
-        if (backoff_ms == 0 && short_ms < c->delay_ms && owed_long(c) && !settle(c, c->delay_ms - short_ms)) {
-            break;
-        }
 
         pthread_mutex_lock(&c->mu);
+        if (backoff_ms == 0 && short_ms < c->delay_ms && !c->stopping && (c->long_owed || c->full_owed)) {
+            pthread_mutex_unlock(&c->mu);
+            if (!settle(c, c->delay_ms - short_ms)) { break; }
+            pthread_mutex_lock(&c->mu);
+        }
         if (c->stopping) {
             pthread_mutex_unlock(&c->mu);
             break;
@@ -332,6 +326,7 @@ static void *committer_main(void *arg) {
         } else if (err == FIRC_ERR_AGAIN) {
             FIRC_DEBUG("netfilter table changed during rebuild, starting over");
             backoff_ms = 0;
+            was_long = true;
         } else {
             FIRC_DEBUG("failed to rebuild netfilter table (%s), starting over", firc_err_str(err));
             unsigned base = backoff_ms != 0 ? backoff_ms : c->delay_ms;
