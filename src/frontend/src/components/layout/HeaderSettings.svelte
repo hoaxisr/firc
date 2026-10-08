@@ -153,6 +153,12 @@
     font-size: 0.85rem;
   }
 
+  @media (max-width: 380px) {
+    .version-text {
+      display: none;
+    }
+  }
+
   @media (max-width: 700px) {
     .info-label {
       display: none;

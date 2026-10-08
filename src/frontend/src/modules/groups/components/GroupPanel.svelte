@@ -10,7 +10,7 @@
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { hosts } from "../../../data/hosts.svelte";
-  import { interfaces } from "../../../data/interfaces.svelte";
+  import { groupInterfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
   import { policies } from "../../../data/policies.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
@@ -453,7 +453,7 @@
 
         <div class="group-actions">
           <Select
-            options={interfaces.list.map((item) => ({
+            options={groupInterfaces().map((item) => ({
               value: item.id,
               label: item.id,
               description: item.name,

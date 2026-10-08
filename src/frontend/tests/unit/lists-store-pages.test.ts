@@ -55,6 +55,7 @@ if (processObj) {
   });
 }
 const { GroupsStore } = await import("../../src/modules/groups/groups.svelte");
+const { answer, confirmation } = await import("../../src/utils/confirm.svelte");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
     Object.defineProperty(processObj, "env", originalProcessEnvDescriptor);
@@ -350,10 +351,6 @@ describe("a group's list, paged and searched", () => {
         }),
     });
 
-    const hadConfirm = "confirm" in globalThis;
-    const originalConfirm = (globalThis as any).confirm;
-    (globalThis as any).confirm = () => true;
-
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 5)]);
@@ -365,6 +362,7 @@ describe("a group's list, paged and searched", () => {
       store.lists.pageState[id].rules[0].enable = false;
 
       const syncing = withWindowStub(() => store.lists.requestSync(id));
+      answer(true);
       for (let i = 0; i < 6; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 
       assert.strictEqual(
@@ -403,11 +401,6 @@ describe("a group's list, paged and searched", () => {
       );
     } finally {
       stub.restore();
-      if (hadConfirm) {
-        (globalThis as any).confirm = originalConfirm;
-      } else {
-        delete (globalThis as any).confirm;
-      }
     }
   });
 
@@ -1112,12 +1105,13 @@ describe("a group's list, paged and searched", () => {
     });
 
     const asked: string[] = [];
-    let answer = false;
-    const hadConfirm = "confirm" in globalThis;
-    const originalConfirm = (globalThis as any).confirm;
-    (globalThis as any).confirm = (message: string) => {
-      asked.push(message);
-      return answer;
+    const syncAnswering = async (store: InstanceType<typeof GroupsStore>, ok: boolean) => {
+      const run = withWindowStub(() => store.lists.requestSync(id));
+      if (confirmation.current) {
+        asked.push(confirmation.current.title);
+        answer(ok);
+      }
+      await run;
     };
 
     try {
@@ -1129,17 +1123,16 @@ describe("a group's list, paged and searched", () => {
       store.lists.pageState[id].rules[0].enable = false;
       assert.strictEqual(store.lists.ruleEdits(id).length, 1, "fixture: there is an edit to lose");
 
-      await withWindowStub(() => store.lists.requestSync(id));
+      await syncAnswering(store, false);
 
-      assert.deepStrictEqual(asked, ["Unsaved rule edits will be lost by the sync. Continue?"]);
+      assert.deepStrictEqual(asked, ["Sync the list?"]);
       assert.ok(
         !stub.calls.includes(`/groups/${id}/list/sync`),
         `a declined sync must not be asked for, got: ${stub.calls.join(", ")}`,
       );
       assert.strictEqual(store.lists.ruleEdits(id).length, 1, "and the edit is still there");
 
-      answer = true;
-      await withWindowStub(() => store.lists.requestSync(id));
+      await syncAnswering(store, true);
 
       assert.strictEqual(asked.length, 2, "fixture: asked again");
       assert.ok(
@@ -1148,11 +1141,6 @@ describe("a group's list, paged and searched", () => {
       );
     } finally {
       stub.restore();
-      if (hadConfirm) {
-        (globalThis as any).confirm = originalConfirm;
-      } else {
-        delete (globalThis as any).confirm;
-      }
     }
   });
 

@@ -15,6 +15,7 @@
 #include "firc/app.h"
 #include "firc/events.h"
 #include "firc/keenetic_policy.h"
+#include "firc/keenetic_rci.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/system.h"
@@ -637,6 +638,111 @@ TEST the_hosts_route_answers_the_refreshers_table(void) {
     PASS();
 }
 
+static const char *g_kn_iface;
+static const char *g_kn_alias;
+static bool g_kn_inet;
+
+firc_err_t __real_firc_kn_get_iface_aliases(firc_kn_aliases_t *out);
+firc_err_t __wrap_firc_kn_get_iface_aliases(firc_kn_aliases_t *out);
+firc_err_t __wrap_firc_kn_get_iface_aliases(firc_kn_aliases_t *out) {
+    if (g_kn_iface == NULL) { return __real_firc_kn_get_iface_aliases(out); }
+    out->items = calloc(1, sizeof(*out->items));
+    if (out->items == NULL) { return FIRC_ERR_NOMEM; }
+    out->n = 1;
+    snprintf(out->items[0].system_name, sizeof(out->items[0].system_name), "%s", g_kn_iface);
+    snprintf(out->items[0].alias, sizeof(out->items[0].alias), "%s", g_kn_alias);
+    out->items[0].inet = g_kn_inet;
+    return FIRC_OK;
+}
+
+static void stub_kn(const char *iface, const char *alias, bool inet) {
+    g_kn_iface = iface;
+    g_kn_alias = alias;
+    g_kn_inet = inet;
+}
+
+static const firc_iface_info_t *find_iface(const firc_iface_info_t *ifs, size_t n, const char *id) {
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(ifs[i].id, id) == 0) { return &ifs[i]; }
+    }
+    return NULL;
+}
+
+/* Catches: an external interface hidden without show-all, flagged when listed anyway, or a non-external one let through. */
+TEST an_external_interface_is_listed_only_for_the_uplink(void) {
+    firc_config_t cfg;
+    firc_config_init_defaults(&cfg);
+    firc_app_deps_t deps = {.cfg = &cfg};
+    firc_app_t *app = firc_app_create(&deps);
+    firc_iface_info_t *ifs = NULL;
+    size_t n = 0;
+
+    stub_kn("lo", "", true);
+    cfg.app.show_all_interfaces = false;
+    ASSERT_EQ(FIRC_OK, firc_app_list_interfaces(app, &ifs, &n));
+    const firc_iface_info_t *lo = find_iface(ifs, n, "lo");
+    ASSERT(lo != NULL);
+    ASSERT(lo->uplink_only);
+    ASSERT_STR_EQ("", lo->name);
+    free(ifs);
+
+    stub_kn("lo", "Loop", false);
+    ASSERT_EQ(FIRC_OK, firc_app_list_interfaces(app, &ifs, &n));
+    ASSERT(find_iface(ifs, n, "lo") == NULL);
+    free(ifs);
+
+    stub_kn("lo", "Loop", true);
+    cfg.app.show_all_interfaces = true;
+    ASSERT_EQ(FIRC_OK, firc_app_list_interfaces(app, &ifs, &n));
+    lo = find_iface(ifs, n, "lo");
+    ASSERT(lo != NULL);
+    ASSERT_FALSE(lo->uplink_only);
+    ASSERT_STR_EQ("Loop", lo->name);
+    for (size_t i = 0; i < n; i++) { ASSERT_FALSEm(ifs[i].id, ifs[i].uplink_only); }
+    free(ifs);
+
+    stub_kn(NULL, NULL, false);
+    firc_app_destroy(app);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+static const cJSON *iface_item(const cJSON *out, const char *id) {
+    const cJSON *it;
+    cJSON_ArrayForEach(it, cJSON_GetObjectItemCaseSensitive(out, "interfaces")) {
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(it, "id");
+        if (cJSON_IsString(v) && strcmp(v->valuestring, id) == 0) { return it; }
+    }
+    return NULL;
+}
+
+/* Catches: uplinkOnly missing on an interface listed only for being external, or sent on one the setting lists. */
+TEST the_interfaces_route_marks_an_uplink_only_interface(void) {
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    stub_kn("lo", "Broadband", true);
+
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
+    const cJSON *lo = iface_item(out, "lo");
+    ASSERT(lo != NULL);
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(lo, "uplinkOnly")));
+    ASSERT_STR_EQ("Broadband", cJSON_GetObjectItemCaseSensitive(lo, "name")->valuestring);
+    ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "blackhole"), "uplinkOnly"));
+    cJSON_Delete(out);
+
+    h->cfg.app.show_all_interfaces = true;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
+    lo = iface_item(out, "lo");
+    ASSERT(lo != NULL);
+    ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(lo, "uplinkOnly"));
+    cJSON_Delete(out);
+
+    stub_kn(NULL, NULL, false);
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -658,5 +764,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_hosts_route_answers_the_refreshers_table);
     RUN_TEST(the_netfilter_route_says_whether_the_committer_is_failing);
     RUN_TEST(the_netfilter_route_says_the_first_write_is_pending);
+    RUN_TEST(an_external_interface_is_listed_only_for_the_uplink);
+    RUN_TEST(the_interfaces_route_marks_an_uplink_only_interface);
     GREATEST_MAIN_END();
 }

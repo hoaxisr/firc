@@ -34,6 +34,33 @@ static void copy_trimmed_member(char *dst, size_t dst_sz, const cJSON *obj, cons
     if (cJSON_IsString(m)) { copy_trimmed(dst, dst_sz, m->valuestring); }
 }
 
+static bool role_has_inet(const cJSON *entry) {
+    const cJSON *role = cJSON_GetObjectItemCaseSensitive(entry, "role");
+    const cJSON *r = NULL;
+    if (!cJSON_IsArray(role)) { return false; }
+    cJSON_ArrayForEach(r, role) {
+        if (cJSON_IsString(r) && strcmp(r->valuestring, "inet") == 0) { return true; }
+    }
+    return false;
+}
+
+static void mark_inet_for(const cJSON *entry, firc_kn_iface_meta_t *arr, size_t n) {
+    const cJSON *role = cJSON_GetObjectItemCaseSensitive(entry, "role");
+    const cJSON *r = NULL;
+    if (!cJSON_IsArray(role)) { return; }
+    cJSON_ArrayForEach(r, role) {
+        const cJSON *what = cJSON_GetObjectItemCaseSensitive(r, "role");
+        const cJSON *target = cJSON_GetObjectItemCaseSensitive(r, "for");
+        if (!cJSON_IsObject(r) || !cJSON_IsString(what) || strcmp(what->valuestring, "inet") != 0 ||
+            !cJSON_IsString(target)) {
+            continue;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(arr[i].id, target->valuestring) == 0) { arr[i].inet = true; }
+        }
+    }
+}
+
 firc_err_t firc_kn_parse_interface_list(const char *json, firc_kn_iface_meta_t **out, size_t *out_n) {
     *out = NULL;
     *out_n = 0;
@@ -71,7 +98,12 @@ firc_err_t firc_kn_parse_interface_list(const char *json, firc_kn_iface_meta_t *
         copy_trimmed_member(arr[n].description, sizeof(arr[n].description), entry, "description");
         copy_trimmed_member(arr[n].interface_name, sizeof(arr[n].interface_name), entry,
                             "interface-name");
+        arr[n].inet = role_has_inet(entry);
         n++;
+    }
+
+    cJSON_ArrayForEach(entry, root) {
+        if (cJSON_IsObject(entry)) { mark_inet_for(entry, arr, n); }
     }
 
     cJSON_Delete(root);
@@ -158,10 +190,12 @@ firc_err_t firc_kn_build_aliases(const firc_kn_iface_meta_t *metas, size_t n, fi
         char alias[sizeof(arr[count].alias)];
         copy_trimmed(alias, sizeof(alias), metas[i].description);
         if (alias[0] == '\0') { copy_trimmed(alias, sizeof(alias), metas[i].interface_name); }
-        if (alias[0] == '\0' || strcmp(alias, system_name) == 0) { continue; }
+        if (strcmp(alias, system_name) == 0) { alias[0] = '\0'; }
+        if (alias[0] == '\0' && !metas[i].inet) { continue; }
 
-        snprintf(arr[count].system_name, sizeof(arr[count].system_name), "%s", system_name);
-        snprintf(arr[count].alias, sizeof(arr[count].alias), "%s", alias);
+        snprintf(arr[count].system_name, sizeof(arr[count].system_name), "%.15s", system_name);
+        snprintf(arr[count].alias, sizeof(arr[count].alias), "%.63s", alias);
+        arr[count].inet = metas[i].inet;
         count++;
     }
 
@@ -177,11 +211,22 @@ firc_err_t firc_kn_build_aliases(const firc_kn_iface_meta_t *metas, size_t n, fi
 const char *firc_kn_aliases_lookup(const firc_kn_aliases_t *aliases, const char *system_name) {
     if (!aliases || !aliases->items || !system_name) { return NULL; }
     for (size_t i = 0; i < aliases->n; i++) {
-        if (strcmp(aliases->items[i].system_name, system_name) == 0) {
+        if (aliases->items[i].alias[0] != '\0' &&
+            strcmp(aliases->items[i].system_name, system_name) == 0) {
             return aliases->items[i].alias;
         }
     }
     return NULL;
+}
+
+bool firc_kn_aliases_inet(const firc_kn_aliases_t *aliases, const char *system_name) {
+    if (!aliases || !aliases->items || !system_name) { return false; }
+    for (size_t i = 0; i < aliases->n; i++) {
+        if (aliases->items[i].inet && strcmp(aliases->items[i].system_name, system_name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void firc_kn_aliases_free(firc_kn_aliases_t *aliases) {

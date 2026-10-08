@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { answerConfirm } from "./pages/confirm";
 import { signedIn } from "./pages/session";
 
 const group = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
@@ -220,24 +221,17 @@ test.describe("Group bulk actions", () => {
     await numberOf(page, "Insta").click();
     await numberOf(page, "Telegram").click();
 
-    const asked: string[] = [];
-    page.once("dialog", (dialog) => {
-      asked.push(dialog.message());
-      void dialog.dismiss();
-    });
     await bar(page).getByRole("button", { name: "Delete" }).click();
-    await expect.poll(() => asked).toEqual(["Delete the selected groups (2)?"]);
+    await expect(page.getByRole("alertdialog").locator("li")).toHaveText(["Insta", "Telegram"]);
+    expect(await answerConfirm(page, false)).toBe("Delete the selected groups (2)?");
     expect(await cardNames(page)).toEqual(NAMES);
     await expect(bar(page).getByRole("status")).toHaveText("2 groups selected");
 
-    page.on("dialog", (dialog) => {
-      asked.push(dialog.message());
-      void dialog.accept();
-    });
     await bar(page).getByRole("button", { name: "Delete" }).click();
+    await answerConfirm(page, true);
     await expect(page.locator(".group")).toHaveCount(3);
     expect(await cardNames(page)).toEqual(["Speedtest", "Unavailable", "Work"]);
-    expect(asked).toHaveLength(2);
+    await expect(page.getByRole("alertdialog")).toHaveCount(0);
     await expect(bar(page)).toHaveCount(0);
     await expect(page.locator("#save-changes")).toBeEnabled();
   });
@@ -394,8 +388,8 @@ test.describe("Group bulk actions", () => {
     await expect(numberOf(page, "Speedtest")).toBeFocused();
 
     await numberOf(page, "Speedtest").click();
-    page.once("dialog", (dialog) => void dialog.accept());
     await bar(page).getByRole("button", { name: "Delete" }).click();
+    await answerConfirm(page, true);
     await expect(bar(page)).toHaveCount(0);
     await expect(numberOf(page, "Unavailable")).toBeFocused();
   });
@@ -405,8 +399,8 @@ test.describe("Group bulk actions", () => {
     const daemon = await setup(page);
     await numberOf(page, "Insta").click();
     await numberOf(page, "Telegram").click();
-    page.once("dialog", (dialog) => void dialog.accept());
     await bar(page).getByRole("button", { name: "Delete" }).click();
+    await answerConfirm(page, true);
     await expect(page.locator(".group")).toHaveCount(3);
 
     await page.locator("#save-changes").click();

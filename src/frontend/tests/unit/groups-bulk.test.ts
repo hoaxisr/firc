@@ -62,6 +62,7 @@ if (processObj) {
   });
 }
 const { GroupsStore } = await import("../../src/modules/groups/groups.svelte");
+const { answer, confirmation } = await import("../../src/utils/confirm.svelte");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
     Object.defineProperty(processObj, "env", originalProcessEnvDescriptor);
@@ -91,17 +92,14 @@ function seeded(groups: ReturnType<typeof makeGroup>[]) {
 
 const ids = (groups: { id: string }[]) => groups.map((g) => g.id);
 
-function withConfirm<T>(answer: boolean, action: () => T): { result: T; asked: string[] } {
-  const asked: string[] = [];
-  const restore = patchGlobal("confirm", (message: string) => {
-    asked.push(message);
-    return answer;
-  });
-  try {
-    return { result: action(), asked };
-  } finally {
-    restore();
+async function withConfirm<T>(ok: boolean, action: () => Promise<T>) {
+  const asked: { title: string; items?: string[] }[] = [];
+  const running = action();
+  if (confirmation.current) {
+    asked.push({ title: confirmation.current.title, items: confirmation.current.items });
+    answer(ok);
   }
+  return { result: await running, asked };
 }
 
 describe("the selection, as pure functions", () => {
@@ -213,18 +211,19 @@ describe("GroupsStore bulk actions", () => {
   });
 
   // Catches a cancelled confirm deleting, a confirm without the count, or deleted groups lingering selected.
-  it("deletes the selected groups after one confirm", () => {
+  it("deletes the selected groups after one confirm", async () => {
     const store = seeded([makeGroup("a"), makeGroup("b"), makeGroup("c")]);
     store.toggleSelected("a");
     store.toggleSelected("c");
 
-    const cancelled = withConfirm(false, () => store.deleteSelected());
+    const cancelled = await withConfirm(false, () => store.deleteSelected());
     assert.strictEqual(cancelled.asked.length, 1);
-    assert.match(cancelled.asked[0], /\(2\)/);
+    assert.match(cancelled.asked[0].title, /\(2\)/);
+    assert.deepStrictEqual(cancelled.asked[0].items, ["group-a", "group-c"]);
     assert.deepStrictEqual(ids(store.data), ["a", "b", "c"]);
     assert.deepStrictEqual(store.selection, ["a", "c"]);
 
-    const accepted = withConfirm(true, () => store.deleteSelected());
+    const accepted = await withConfirm(true, () => store.deleteSelected());
     assert.strictEqual(accepted.asked.length, 1);
     assert.deepStrictEqual(ids(store.data), ["b"]);
     assert.deepStrictEqual(store.selection, []);
@@ -232,11 +231,11 @@ describe("GroupsStore bulk actions", () => {
   });
 
   // Catches a group deleted from its own card staying selected.
-  it("a group deleted from its card leaves the selection", () => {
+  it("a group deleted from its card leaves the selection", async () => {
     const store = seeded([makeGroup("a"), makeGroup("b")]);
     store.toggleSelected("a");
     store.toggleSelected("b");
-    withConfirm(true, () => store.deleteGroup(0));
+    await withConfirm(true, () => store.deleteGroup(0));
     assert.deepStrictEqual(store.selection, ["b"]);
     assert.deepStrictEqual(store.selectedIds, ["b"]);
   });

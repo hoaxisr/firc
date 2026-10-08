@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { answerConfirm } from "./pages/confirm";
 import { GroupsPage } from "./pages/GroupsPage";
 import { signedIn } from "./pages/session";
 
@@ -323,9 +324,8 @@ test.describe("Groups Management", () => {
     await groupsPage.createGroup();
     await expect(page.locator(".group-wrapper")).toHaveCount(1);
 
-    page.on("dialog", (dialog) => dialog.accept());
-
     await groupsPage.deleteGroup(0);
+    await answerConfirm(page, true);
     await expect(page.locator(".group-wrapper")).toHaveCount(0);
   });
 

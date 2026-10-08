@@ -161,7 +161,7 @@
     const input = event?.currentTarget as HTMLInputElement;
     const file = input?.files?.[0];
     if (!file) {
-      alert(t("Please select a CONFIG file to load."));
+      toast.error(t("Choose a config file to import."));
       return;
     }
 

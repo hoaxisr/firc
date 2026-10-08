@@ -15,6 +15,7 @@ const INTERFACES: Interfaces = {
     { id: "eth1" },
     { id: "wg0", name: "WireGuard Interface" },
     { id: "tunvless0" },
+    { id: "ppp0", name: "Broadband connection", uplinkOnly: true },
   ],
 };
 

@@ -607,6 +607,10 @@ definitions:
         description: 'Friendly name: the tunnel description for a tunvless device, else the Keenetic interface description; absent when none'
         example: PRAW-1
         type: string
+      uplinkOnly:
+        description: 'True when the interface is listed only because the router marks it external (inet role): offered as a tunnel uplink, not to groups; absent otherwise'
+        example: true
+        type: boolean
     type: object
   types.InterfaceResolvers:
     properties:
@@ -2243,7 +2247,7 @@ paths:
       - system
   /api/v1/system/interfaces:
     get:
-      description: 'Returns the list of interfaces; tunvless devices are listed even without showAllInterfaces'
+      description: 'Returns the list of interfaces; tunvless devices are listed even without showAllInterfaces, and so are external ones, flagged uplinkOnly'
       produces:
       - application/json
       responses:

@@ -212,9 +212,6 @@
 </section>
 
 <style>
-  .sec {
-    border-bottom: 1px solid var(--bg-light-extra);
-  }
   .sec-h {
     display: flex;
     align-items: center;

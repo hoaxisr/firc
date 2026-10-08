@@ -273,7 +273,7 @@ $(BUILDDIR)/tests/test_app: tests/unit/test_app.c $(LIB_OBJS) $(TEST_SUPPORT_OBJ
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(APP_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
-SYSTEM_WRAP := -Wl,--wrap=firc_app_netfilter_health
+SYSTEM_WRAP := -Wl,--wrap=firc_app_netfilter_health,--wrap=firc_kn_get_iface_aliases
 
 $(BUILDDIR)/tests/test_system: tests/unit/test_system.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
 	@mkdir -p $(dir $@)

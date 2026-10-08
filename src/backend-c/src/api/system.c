@@ -356,6 +356,7 @@ static void handle_list_interfaces(firc_http_req_t *req, firc_http_res_t *res, v
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "id", ifaces[i].id);
         if (ifaces[i].name[0] != '\0') { cJSON_AddStringToObject(item, "name", ifaces[i].name); }
+        if (ifaces[i].uplink_only) { cJSON_AddBoolToObject(item, "uplinkOnly", true); }
         cJSON_AddItemToArray(arr, item);
     }
     free(ifaces);

@@ -2,7 +2,7 @@
   import Select from "../../components/ui/Select.svelte";
   import Switch from "../../components/ui/Switch.svelte";
   import TagInput from "../../components/ui/TagInput.svelte";
-  import { interfaces } from "../../data/interfaces.svelte";
+  import { groupInterfaces } from "../../data/interfaces.svelte";
   import { t } from "../../data/locale.svelte";
   import { settings } from "./settings.svelte";
 
@@ -26,7 +26,11 @@
       ? t("The page will open on port {port}").replace("{port}", String(settings.draft[WEB_PORT]))
       : row.hint(),
   );
-  const suggestions = $derived(interfaces.list.map((i) => i.id).filter((id) => id !== "blackhole"));
+  const suggestions = $derived(
+    groupInterfaces()
+      .map((i) => i.id)
+      .filter((id) => id !== "blackhole"),
+  );
 </script>
 
 <div class="row" data-row={row.fields[0].key}>

@@ -2,7 +2,7 @@
   import { DropdownMenu } from "bits-ui";
   import { getContext } from "svelte";
 
-  import { interfaces } from "../../../data/interfaces.svelte";
+  import { groupInterfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
 
@@ -93,7 +93,7 @@
           sideOffset={8}
           collisionPadding={8}
         >
-          {#each interfaces.list as item (item.id)}
+          {#each groupInterfaces() as item (item.id)}
             <DropdownMenu.Item
               class="bulk-menu-item"
               onSelect={() => store.setSelectedInterface(item.id)}
@@ -155,10 +155,12 @@
     max-width: calc(100vw - 2rem);
     box-sizing: border-box;
     padding: 0.55rem 0.6rem;
-    border: 1px solid var(--bg-light-extra);
+    border: 1px solid color-mix(in oklab, var(--accent) 55%, transparent);
     border-radius: 14px;
-    background: var(--bg-dark-extra);
-    box-shadow: 0 12px 40px #0006;
+    background: color-mix(in oklab, var(--accent) 7%, var(--bg-dark-extra));
+    box-shadow:
+      0 12px 40px #0006,
+      0 0 0 4px color-mix(in oklab, var(--accent) 10%, transparent);
     color: var(--text);
   }
 

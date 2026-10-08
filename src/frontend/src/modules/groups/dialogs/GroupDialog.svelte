@@ -7,7 +7,7 @@
   import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import { hosts } from "../../../data/hosts.svelte";
-  import { interfaces } from "../../../data/interfaces.svelte";
+  import { groupInterfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
   import { policies } from "../../../data/policies.svelte";
   import { fetchResolvers, resolvers } from "../../../data/resolvers.svelte";
@@ -85,7 +85,7 @@
     if (seededFor === key) return;
 
     name = group?.name ?? "";
-    selectedInterface = group?.interface ?? interfaces.list[0]?.id ?? "";
+    selectedInterface = group?.interface ?? groupInterfaces()[0]?.id ?? "";
     devicesTarget = {
       id: group?.id ?? "draft",
       devices: group?.devices ? { ...group.devices } : { allow: [], deny: [] },
@@ -226,7 +226,7 @@
       <div class="field">
         <span class="lbl">{t("Interface")}</span>
         <Select
-          options={interfaces.list.map((item) => ({
+          options={groupInterfaces().map((item) => ({
             value: item.id,
             label: item.id,
             description: item.name,

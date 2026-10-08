@@ -2024,6 +2024,14 @@ firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **o
     struct ifaddrs *ifap;
     if (getifaddrs(&ifap) != 0) { return firc_err_from_errno(errno); }
 
+    /* friendly names where the platform supplies them; an unreachable RCI must never fail the interface list itself */
+    firc_kn_aliases_t aliases = {0};
+    firc_err_t alias_err = firc_kn_get_iface_aliases(&aliases);
+    if (alias_err != FIRC_OK) {
+        FIRC_DEBUG("failed to load interface aliases: %s", firc_err_str(alias_err));
+        firc_kn_aliases_free(&aliases);
+    }
+
     bool show_all = app->cfg->app.show_all_interfaces;
     size_t cap = 0;
     size_t n = 0;
@@ -2039,7 +2047,8 @@ firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **o
         }
         if (already) { continue; }
 
-        if (!iface_listed(p->ifa_name, p->ifa_flags, show_all)) { continue; }
+        bool listed = iface_listed(p->ifa_name, p->ifa_flags, show_all);
+        if (!listed && !firc_kn_aliases_inet(&aliases, p->ifa_name)) { continue; }
 
         if (n == cap) {
             size_t new_cap = cap ? cap * 2 : 8;
@@ -2047,6 +2056,7 @@ firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **o
             if (!na) {
                 free(arr);
                 freeifaddrs(ifap);
+                firc_kn_aliases_free(&aliases);
                 return FIRC_ERR_NOMEM;
             }
             arr = na;
@@ -2054,21 +2064,12 @@ firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **o
         }
         memset(&arr[n], 0, sizeof(arr[n]));
         snprintf(arr[n].id, sizeof(arr[n].id), "%s", p->ifa_name);
+        arr[n].uplink_only = !listed;
+        const char *alias = firc_kn_aliases_lookup(&aliases, arr[n].id);
+        if (alias) { snprintf(arr[n].name, sizeof(arr[n].name), "%.63s", alias); }
         n++;
     }
     freeifaddrs(ifap);
-
-    /* friendly names where the platform supplies them; an unreachable RCI must never fail the interface list itself */
-    firc_kn_aliases_t aliases = {0};
-    firc_err_t alias_err = firc_kn_get_iface_aliases(&aliases);
-    if (alias_err != FIRC_OK) {
-        FIRC_DEBUG("failed to load interface aliases: %s", firc_err_str(alias_err));
-    } else {
-        for (size_t i = 0; i < n; i++) {
-            const char *alias = firc_kn_aliases_lookup(&aliases, arr[i].id);
-            if (alias) { snprintf(arr[i].name, sizeof(arr[i].name), "%s", alias); }
-        }
-    }
     firc_kn_aliases_free(&aliases);
 
     *out = arr;

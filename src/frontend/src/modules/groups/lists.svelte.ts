@@ -2,6 +2,7 @@ import { array, nullable, object, optional, parse, string } from "valibot";
 
 import { token } from "../../data/auth.svelte";
 import { locale, t } from "../../data/locale.svelte";
+import { ask } from "../../utils/confirm.svelte";
 
 import { GroupListSchema, syncIdle, type Group, type ListRule, type SyncState } from "../../types";
 import { toast } from "../../utils/events";
@@ -423,7 +424,13 @@ export class ListsController {
     const target = url ?? group.list.url;
 
     if (this.ruleEdits(groupId).length > 0) {
-      if (!confirm(t("Unsaved rule edits will be lost by the sync. Continue?"))) return;
+      const ok = await ask({
+        tone: "warn",
+        title: t("Sync the list?"),
+        message: t("Unsaved rule edits in this group will be lost."),
+        confirm: t("Sync"),
+      });
+      if (!ok) return;
     }
 
     try {

@@ -229,9 +229,10 @@ size_t firc_app_pending_restart(const firc_app_t *app, bool pending[FIRC_SETTING
 typedef struct firc_iface_info {
     char id[16];   /* IFNAMSIZ */
     char name[64]; /* friendly alias; empty unless built with FIRC_ENTWARE_KN */
+    bool uplink_only;
 } firc_iface_info_t;
 
-/* enumerates system interfaces (getifaddrs, deduped); without showAllInterfaces keeps IFF_POINTOPOINT and tunvless ones */
+/* enumerates system interfaces (getifaddrs, deduped); without showAllInterfaces keeps IFF_POINTOPOINT and tunvless ones, and external ones as uplink_only */
 firc_err_t firc_app_list_interfaces(const firc_app_t *app, firc_iface_info_t **out, size_t *out_n);
 
 bool firc_iface_is_ignored_for_test(const char *name); /* test seam, always false without FIRC_ENTWARE_KN */

@@ -73,7 +73,16 @@ export async function openSettings(
   }
   await page.route("**/groups?with_rules=true", (r) => r.fulfill({ json: { groups: [] } }));
   await page.route("**/interfaces", (r) =>
-    r.fulfill({ json: { interfaces: [{ id: "blackhole" }, { id: "br0" }, { id: "br1" }] } }),
+    r.fulfill({
+      json: {
+        interfaces: [
+          { id: "blackhole" },
+          { id: "br0" },
+          { id: "br1" },
+          { id: "ppp0", uplinkOnly: true },
+        ],
+      },
+    }),
   );
   await page.route("**/system/settings", onSettings);
   if (opts.onRestart) await page.route("**/system/restart", opts.onRestart);

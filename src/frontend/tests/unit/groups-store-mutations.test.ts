@@ -77,6 +77,7 @@ if (processObj) {
   });
 }
 const { GroupsStore, invalidRulesByGroup } = await import("../../src/modules/groups/groups.svelte");
+const { answer, confirmation } = await import("../../src/utils/confirm.svelte");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
     Object.defineProperty(processObj, "env", originalProcessEnvDescriptor);
@@ -169,31 +170,26 @@ describe("GroupsStore mutations and validation", () => {
     assert.strictEqual(store.dataRevision, 2);
   });
 
-  it("deleteGroup respects confirm and removes open_state entry", async () => {
-    const store = createStore([makeGroup("g1"), makeGroup("g2")]);
+  // Catches a declined dialog deleting, a dialog not naming the group and its rule count, or a delete of whatever moved into the index while it was open.
+  it("deleteGroup asks, names the group, and removes the one it asked about", async () => {
+    const store = createStore([makeGroup("g1", [makeRule("r1"), makeRule("r2")]), makeGroup("g2")]);
     store.open_state.g1 = true;
     store.open_state.g2 = true;
 
-    await withPatchedGlobal(
-      "confirm",
-      () => false,
-      () => {
-        store.deleteGroup(0);
-        assert.deepStrictEqual(groupIds(store), ["g1", "g2"]);
-        assert.strictEqual(store.dataRevision, 0);
-      },
-    );
+    const declined = store.deleteGroup(0);
+    assert.strictEqual(confirmation.current?.title, "Delete group «group-g1»?");
+    assert.match(confirmation.current?.message ?? "", /\b2 rules\b/);
+    answer(false);
+    await declined;
+    assert.deepStrictEqual(groupIds(store), ["g1", "g2"]);
+    assert.strictEqual(store.dataRevision, 0);
 
-    await withPatchedGlobal(
-      "confirm",
-      () => true,
-      () => {
-        store.deleteGroup(0);
-        assert.deepStrictEqual(groupIds(store), ["g2"]);
-        assert.strictEqual("g1" in store.open_state, false);
-        assert.strictEqual(store.dataRevision, 1);
-      },
-    );
+    const accepted = store.deleteGroup(0);
+    store.changeGroupIndex(0, 1, "after");
+    answer(true);
+    await accepted;
+    assert.deepStrictEqual(groupIds(store), ["g2"]);
+    assert.strictEqual("g1" in store.open_state, false);
   });
 
   it("changeGroupIndex supports before/after and clamps target indexes", () => {

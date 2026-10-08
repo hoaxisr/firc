@@ -6,6 +6,7 @@
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { locale, t } from "../../../data/locale.svelte";
+  import { ask } from "../../../utils/confirm.svelte";
   import type { TunnelsStore } from "../tunnels.svelte";
   import FailoverSection from "./FailoverSection.svelte";
   import NodesSection from "./NodesSection.svelte";
@@ -104,19 +105,24 @@
         )}: ${live.groups.join(", ")}`,
   );
 
-  function remove() {
-    if (!confirm(t("Delete tunnel {device}?").replace("{device}", tunnel.device))) return;
-    store.removeTunnel(tunnel.id);
+  async function remove() {
+    const ok = await ask({
+      tone: "danger",
+      title: t("Delete tunnel {device}?").replace("{device}", tunnel.device),
+      message: t("The tunnel goes away once you save."),
+      confirm: t("Delete"),
+    });
+    if (ok) store.removeTunnel(tunnel.id);
   }
 
-  function restart() {
-    if (
-      !confirm(
-        t("Restart {device}? Connections through it will drop.").replace("{device}", tunnel.device),
-      )
-    )
-      return;
-    void store.restart(tunnel.id);
+  async function restart() {
+    const ok = await ask({
+      tone: "warn",
+      title: t("Restart {device}?").replace("{device}", tunnel.device),
+      message: t("Connections through the tunnel will drop and reconnect."),
+      confirm: t("Restart"),
+    });
+    if (ok) void store.restart(tunnel.id);
   }
 </script>
 
@@ -239,11 +245,18 @@
 
 <style>
   .card {
+    --tunnel-line: color-mix(in oklab, var(--text-2) 30%, transparent);
     background: var(--bg-medium);
-    border: 1px solid var(--bg-light-extra);
+    border: 1px solid var(--tunnel-line);
     border-radius: 0.5rem;
     margin-bottom: 1rem;
     overflow: hidden;
+  }
+  .body {
+    border-top: 1px solid var(--tunnel-line);
+  }
+  .body > :global(.sec + .sec) {
+    border-top: 1px solid var(--tunnel-line);
   }
   .head {
     display: flex;
@@ -336,9 +349,6 @@
   }
   .acts :global([data-switch-root]) {
     margin: 0 0.3rem;
-  }
-  .body {
-    border-top: 1px solid var(--bg-light-extra);
   }
   .refusal {
     color: var(--red);

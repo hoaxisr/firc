@@ -188,3 +188,11 @@ test("Russian counts agree with the number", async ({ page }) => {
   await page.getByRole("spinbutton", { name: "Таймаут запроса" }).fill("2500");
   await expect(page.getByTestId("settings-counter")).toHaveText("Изменены 2 настройки");
 });
+
+// Catches an interface listed only as a tunnel uplink suggested as a LAN interface.
+test("the LAN interface suggestions leave out uplink-only interfaces", async ({ page }) => {
+  await openSettings(page, (r) => r.fulfill({ json: answer() }));
+  const offered = page.locator('[data-row="app.link"] datalist option');
+  await expect(offered).toHaveCount(1);
+  await expect(offered).toHaveAttribute("value", "br1");
+});

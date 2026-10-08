@@ -49,6 +49,7 @@ export type Daemon = {
   tunnels: Json[];
   states: Json[];
   interfaces: string[];
+  uplinkOnly: string[];
   names: Record<string, string>;
   groups: Json[];
   puts: Json[];
@@ -67,6 +68,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     tunnels: [],
     states: [],
     interfaces: ["wg0"],
+    uplinkOnly: [],
     names: {},
     groups: [],
     puts: [],
@@ -84,7 +86,13 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
   await page.route("**/interfaces", (route) => {
     daemon.interfaceFetches++;
     return route.fulfill({
-      json: { interfaces: daemon.interfaces.map((id) => ({ id, name: daemon.names[id] ?? id })) },
+      json: {
+        interfaces: daemon.interfaces.map((id) => ({
+          id,
+          name: daemon.names[id] ?? id,
+          ...(daemon.uplinkOnly.includes(id) ? { uplinkOnly: true } : {}),
+        })),
+      },
     });
   });
   await page.route("**/groups?with_rules=true", (route) =>

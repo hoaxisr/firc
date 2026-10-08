@@ -1,8 +1,9 @@
 import { tick } from "svelte";
 
 import { followGroupsLoad, setKnownGroups } from "../../data/known-groups.svelte";
-import { t } from "../../data/locale.svelte";
+import { locale, t } from "../../data/locale.svelte";
 import { ChangeTracker } from "../../utils/change-tracker.svelte";
+import { ask } from "../../utils/confirm.svelte";
 import { ListsController } from "./lists.svelte";
 
 import {
@@ -17,6 +18,7 @@ import {
 import { defaultGroup, defaultRule } from "../../utils/defaults";
 import { overlay, toast } from "../../utils/events";
 import { fetcher, HttpError } from "../../utils/fetcher";
+import { counted } from "../../utils/plural";
 import { randomId } from "../../utils/random-id";
 import { type SortDirection } from "../../utils/rule-sorter";
 import { isValidPorts, VALIDATOP_MAP } from "../../utils/rule-validators";
@@ -67,6 +69,10 @@ export function invalidRulesByGroup(groups: Group[]): Map<string, string[]> {
     if (ids.length > 0) byGroup.set(group.id, ids);
   }
   return byGroup;
+}
+
+function groupTitle(group: Group) {
+  return group.name.trim() || t("untitled");
 }
 
 export function isValidListUrl(value: string) {
@@ -339,12 +345,18 @@ export class GroupsStore {
   }
 
   /* One confirm naming the count, then no per-group one. */
-  deleteSelected = () => {
+  deleteSelected = async () => {
     const doomed = new Set(this.selection);
     if (!doomed.size) return;
-    if (!confirm(t("Delete the selected groups ({n})?").replace("{n}", String(doomed.size)))) {
-      return;
-    }
+    const names = this.data.filter((g) => doomed.has(g.id)).map((g) => groupTitle(g));
+    const ok = await ask({
+      tone: "danger",
+      title: t("Delete the selected groups ({n})?").replace("{n}", String(doomed.size)),
+      message: t("They go away once you save:"),
+      items: names,
+      confirm: t("Delete {n}").replace("{n}", String(doomed.size)),
+    });
+    if (!ok) return;
     for (let i = this.data.length - 1; i >= 0; i--) {
       if (doomed.has(this.data[i].id)) this.#removeGroupAt(i);
     }
@@ -1641,9 +1653,26 @@ export class GroupsStore {
     if (changed) this.markDataRevision();
   }
 
-  deleteGroup = (index: number) => {
-    if (!confirm(t("Delete this group?"))) return;
-    this.#removeGroupAt(index);
+  deleteGroup = async (index: number) => {
+    const group = this.data[index];
+    if (!group) return;
+    const n = group.rules.length;
+    const ok = await ask({
+      tone: "danger",
+      title: t("Delete group «{name}»?").replace("{name}", groupTitle(group)),
+      message: counted(
+        n,
+        locale.current,
+        t("The group and its {n} rule go away once you save."),
+        t("The group and its {n} rules go away once you save. (2-4)"),
+        t("The group and its {n} rules go away once you save."),
+      ),
+      confirm: t("Delete"),
+    });
+    if (!ok) return;
+    const at = this.data.findIndex((g) => g.id === group.id);
+    if (at < 0) return;
+    this.#removeGroupAt(at);
     this.markDataRevision();
   };
 

@@ -1,8 +1,53 @@
 import { expect, test } from "@playwright/test";
 
+import { answerConfirm } from "./pages/confirm";
 import { state, stubDaemon, tunnel, TunnelsPage } from "./pages/TunnelsPage";
 
 test.describe("Tunnels page", () => {
+  // Catches a restart sent without asking, sent after Cancel or Escape, or a dialog that lands on the confirming button.
+  test("a restart asks first, and only the confirming button sends it", async ({ page }) => {
+    await stubDaemon(page, { tunnels: [tunnel("a", "tunvless0")] });
+    let restarts = 0;
+    await page.route("**/tunnels/a/restart", (route) => {
+      restarts += 1;
+      return route.fulfill({ json: {} });
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    const restartButton = tunnels.card("a").getByRole("button", { name: "Restart" });
+    const dialog = page.getByRole("alertdialog");
+
+    await restartButton.click();
+    await expect(dialog.locator(".confirm-title")).toHaveText("Restart tunvless0?");
+    await expect(dialog.locator(".confirm-cancel")).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+
+    await restartButton.click();
+    expect(await answerConfirm(page, false)).toBe("Restart tunvless0?");
+    expect(restarts).toBe(0);
+
+    await restartButton.click();
+    await answerConfirm(page, true);
+    await expect.poll(() => restarts).toBe(1);
+  });
+
+  // Catches a link or subscription address, which carry the account secret, shown before it is asked for.
+  test("source addresses stay hidden until shown", async ({ page }) => {
+    await stubDaemon(page, {});
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.addTunnel();
+    await tunnels.addSubscription("tunnel1", "Provider", "https://sub.example/feed?token=s3cret");
+    await tunnels.addLink("tunnel1", "vless://u-secret@h.example:443?security=tls#Solo");
+    const card = tunnels.card("tunnel1");
+    await expect(card).not.toContainText("s3cret");
+    await expect(card).not.toContainText("u-secret");
+    await card.getByRole("button", { name: "Show the address" }).nth(1).click();
+    await expect(card).toContainText("u-secret");
+    await expect(card).not.toContainText("s3cret");
+  });
+
   // Catches a save sending a different body than the editor shows, or the picker not learning the new device.
   test("a new tunnel with a subscription and a link saves exactly and joins the group interface list", async ({
     page,
@@ -317,6 +362,58 @@ test.describe("Tunnels page", () => {
       tunnels.card("b").getByRole("button", { name: "Way out to the internet" }),
     ).toContainText("wg0");
     await expect(tunnels.save).toHaveClass(/inactive/);
+  });
+
+  // Catches an external interface missing from the uplink select, or offered to a group by its picker, bulk menu or dialog.
+  test("an uplink-only interface is offered to the tunnel and to no group", async ({ page }) => {
+    await stubDaemon(page, {
+      interfaces: ["ppp0", "wg0"],
+      uplinkOnly: ["ppp0"],
+      tunnels: [tunnel("a", "tunvless0")],
+      states: [],
+      groups: [
+        {
+          id: "aaaaaaaa",
+          name: "g",
+          interface: "wg0",
+          enable: true,
+          rules: [],
+          devices: { allow: [], deny: [] },
+          resolve: { tunnel: true, server: "" },
+        },
+      ],
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.expand("a");
+    await tunnels.card("a").getByRole("button", { name: "Way out to the internet" }).click();
+    const item = (value: string) => page.locator(`[data-select-item][data-value="${value}"]`);
+    await expect(item("iface:ppp0")).toBeVisible();
+    await expect(item("iface:wg0")).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    await tunnels.tab("Groups").click();
+    await page.locator(".iface-select [data-select-trigger]").first().click();
+    await expect(item("wg0")).toBeVisible();
+    await expect(item("ppp0")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+
+    await page.getByRole("button", { name: "Select group g", exact: true }).click();
+    const bar = page.getByRole("region", { name: "Selected groups" });
+    await bar.getByRole("button", { name: "Interface" }).click();
+    const menu = page.getByRole("menuitem");
+    await expect(menu.filter({ hasText: "wg0" })).toHaveCount(1);
+    await expect(menu.filter({ hasText: "ppp0" })).toHaveCount(0);
+    await page.keyboard.press("Escape");
+
+    await page.locator('[data-value="Add Group"] button').click();
+    const dialog = page.getByRole("dialog");
+    const picker = dialog.locator(".interface-select [data-select-trigger]");
+    await expect(picker).toContainText("wg0");
+    await expect(picker).not.toContainText("ppp0");
+    await picker.click();
+    await expect(item("wg0")).toBeVisible();
+    await expect(item("ppp0")).toHaveCount(0);
   });
 
   // Catches an icon-only tunnel control, or a node switch, that a screen reader announces as nothing.

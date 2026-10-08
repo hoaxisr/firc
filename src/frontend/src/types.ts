@@ -134,6 +134,7 @@ export type Interfaces = {
   interfaces: {
     id: string;
     name?: string;
+    uplinkOnly?: boolean;
   }[];
 };
 

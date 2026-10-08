@@ -7,6 +7,7 @@
   import SettingsView from "../../modules/settings/SettingsView.svelte";
   import TunnelsView from "../../modules/tunnels/TunnelsView.svelte";
   import { persistedState } from "../../utils/persisted-state.svelte";
+  import ConfirmDialog from "../feedback/ConfirmDialog.svelte";
   import Overlay from "../feedback/Overlay.svelte";
   import ScrollToTop from "../feedback/ScrollToTop.svelte";
   import SnowField from "../feedback/SnowField.svelte";
@@ -37,6 +38,7 @@
 </script>
 
 <Toast />
+<ConfirmDialog />
 <Overlay />
 <ScrollToTop />
 {#if [11, 0, 1].includes(new Date().getMonth())}

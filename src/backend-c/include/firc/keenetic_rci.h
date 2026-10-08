@@ -1,6 +1,7 @@
 #ifndef FIRC_KEENETIC_RCI_H
 #define FIRC_KEENETIC_RCI_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "firc/err.h"
@@ -14,6 +15,7 @@
 typedef struct firc_kn_alias {
     char system_name[16]; /* IFNAMSIZ */
     char alias[64];
+    bool inet;
 } firc_kn_alias_t;
 
 typedef struct firc_kn_aliases {
@@ -33,6 +35,9 @@ firc_err_t firc_kn_rci_get(const char *base_url, const char *path, char **out_bo
 /* Alias for system_name, or NULL; a NULL or empty set is fine. */
 const char *firc_kn_aliases_lookup(const firc_kn_aliases_t *aliases, const char *system_name);
 
+/* True when an entry for system_name carries the router's inet role. */
+bool firc_kn_aliases_inet(const firc_kn_aliases_t *aliases, const char *system_name);
+
 /* Frees *aliases and zeroes it; safe on a zeroed struct. */
 void firc_kn_aliases_free(firc_kn_aliases_t *aliases);
 
@@ -41,9 +46,10 @@ typedef struct firc_kn_iface_meta {
     char description[64];
     char interface_name[64];
     char system_name[16];
+    bool inet;
 } firc_kn_iface_meta_t;
 
-/* Parses GET /rci/show/interface, skipping non-object members. Caller frees *out. */
+/* Parses GET /rci/show/interface, skipping non-object members; inet from its own role or a "for" role. Caller frees *out. */
 firc_err_t firc_kn_parse_interface_list(const char *json, firc_kn_iface_meta_t **out, size_t *out_n);
 
 /* Builds the POST /rci/ batch body; caller frees; NULL on allocation failure. */
@@ -52,7 +58,7 @@ char *firc_kn_build_system_name_request(const firc_kn_iface_meta_t *metas, size_
 /* Fills metas[i].system_name by position (RCI echoes no id); extra or missing elements are tolerated. */
 firc_err_t firc_kn_parse_system_names(const char *json, firc_kn_iface_meta_t *metas, size_t n);
 
-/* Applies the alias selection rules; free *out with firc_kn_aliases_free(). */
+/* Applies the alias selection rules, keeping inet entries without a label; free *out with firc_kn_aliases_free(). */
 firc_err_t firc_kn_build_aliases(const firc_kn_iface_meta_t *metas, size_t n, firc_kn_aliases_t *out);
 
 /* RCI interface id to kernel name ("Wireguard0" to "nwg0"). */

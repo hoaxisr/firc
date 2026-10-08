@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { answerConfirm } from "./pages/confirm";
 import { state, stubDaemon, tunnel, TunnelsPage } from "./pages/TunnelsPage";
 
 const SUB = {
@@ -116,12 +117,12 @@ test.describe("Tunnel editor", () => {
     await card.locator("button", { hasText: "Check nodes" }).click();
     await expect(tunnels.nodeRows("a").nth(0).locator(".lat")).toHaveText("90 ms");
 
-    page.once("dialog", (dialog) => void dialog.accept());
     await card
       .locator(".src")
       .filter({ hasText: "Solo" })
       .getByRole("button", { name: "Delete" })
       .click();
+    await answerConfirm(page, true);
     await expect(card.getByText("Solo")).toHaveCount(0);
     await expect(tunnels.nodeRows("a").nth(0).locator(".lat")).toHaveText("");
     await expect(card.locator("button", { hasText: "By latency" })).toHaveClass(/inactive/);

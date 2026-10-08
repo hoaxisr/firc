@@ -3,10 +3,20 @@
   import Select from "../../../components/ui/Select.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { locale, t } from "../../../data/locale.svelte";
+  import { ask } from "../../../utils/confirm.svelte";
   import type { TunnelsStore } from "../tunnels.svelte";
   import AddSourceDialog from "./AddSourceDialog.svelte";
 
-  import { CloudDownload, Delete, Link, Pencil, Refresh, RSS } from "../../../components/ui/icons";
+  import {
+    CloudDownload,
+    Delete,
+    Eye,
+    EyeOff,
+    Link,
+    Pencil,
+    Refresh,
+    RSS,
+  } from "../../../components/ui/icons";
   import type { TunnelSource } from "../../../types";
   import { counted } from "../../../utils/plural";
   import { linkName, middleEllipsis, subscriptionIntervals } from "../tunnel-editor";
@@ -15,6 +25,8 @@
   let { store, tunnel = $bindable() }: { store: TunnelsStore; tunnel: ClientTunnel } = $props();
 
   let dialog = $state<{ kind: "subscription" | "link"; index: number | null } | null>(null);
+  let shown = $state<Record<number, boolean>>({});
+  const HIDDEN = "••••••••••••••••••••";
 
   const live = $derived(store.stateOf(tunnel.id));
   const saved = $derived(store.isSaved(tunnel.id));
@@ -29,11 +41,20 @@
     return `${two(d.getDate())}.${two(d.getMonth() + 1)}.${d.getFullYear()} ${two(d.getHours())}:${two(d.getMinutes())}`;
   }
 
-  function removeSource(index: number) {
+  async function removeSource(index: number) {
     const source = tunnel.sources[index];
     const name = source.kind === "link" ? linkName(source.link ?? "") : (source.name ?? "");
-    if (!confirm(t("Delete source {name}?").replace("{name}", name))) return;
-    tunnel.sources.splice(index, 1);
+    const ok = await ask({
+      tone: "danger",
+      title: t("Delete source «{name}»?").replace("{name}", name),
+      message: t("Its nodes will be removed from the tunnel once you save."),
+      confirm: t("Delete"),
+    });
+    if (!ok) return;
+    const at = tunnel.sources.indexOf(source);
+    if (at < 0) return;
+    tunnel.sources.splice(at, 1);
+    shown = {};
   }
 
   function saveSource(source: TunnelSource) {
@@ -83,7 +104,9 @@
               <span class="badge red">{t("error: {e}").replace("{e}", sub.error)}</span>
             {/if}
           </span>
-          <span class="line url"><Link size={15} /><span class="cut">{source.url}</span></span>
+          <span class="line url"
+            ><Link size={15} /><span class="cut">{shown[index] ? source.url : HIDDEN}</span></span
+          >
           <span class="line">
             <CloudDownload size={15} />
             {#if sub && sub.lastOk > 0}
@@ -100,6 +123,7 @@
             />
           </span>
         </div>
+        {@render reveal(index)}
         <Tooltip value={t(saved ? "Refresh subscriptions" : "Save the tunnel first")}>
           <Button small inactive={!saved} onclick={() => void store.refresh(tunnel.id)}>
             <Refresh size={20} />
@@ -117,8 +141,9 @@
         <div class="main">
           <span class="n">{linkName(source.link ?? "")} <span class="badge">{t("link")}</span></span
           >
-          <span class="mono">{middleEllipsis(source.link ?? "", 96)}</span>
+          <span class="mono">{shown[index] ? middleEllipsis(source.link ?? "", 96) : HIDDEN}</span>
         </div>
+        {@render reveal(index)}
         <Tooltip value={t("Edit")}>
           <Button small onclick={() => (dialog = { kind: "link", index })}>
             <Pencil size={20} />
@@ -134,6 +159,18 @@
   {/each}
 </section>
 
+{#snippet reveal(index: number)}
+  <Tooltip value={t(shown[index] ? "Hide the address" : "Show the address")}>
+    <Button
+      small
+      aria-pressed={Boolean(shown[index])}
+      onclick={() => (shown[index] = !shown[index])}
+    >
+      {#if shown[index]}<EyeOff size={20} />{:else}<Eye size={20} />{/if}
+    </Button>
+  </Tooltip>
+{/snippet}
+
 {#if dialog}
   <AddSourceDialog
     kind={dialog.kind}
@@ -147,9 +184,6 @@
 {/if}
 
 <style>
-  .sec {
-    border-bottom: 1px solid var(--bg-light-extra);
-  }
   .sec-h {
     display: flex;
     align-items: center;
