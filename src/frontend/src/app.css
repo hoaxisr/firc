@@ -178,3 +178,74 @@ body.has-overlay-scrollbar::-webkit-scrollbar {
 .devices-icon.scoped {
   color: var(--accent, #6ea8fe);
 }
+
+html.dnd-dragging,
+html.dnd-dragging * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing !important;
+}
+
+.dnd-origin {
+  opacity: 0.35;
+  outline: 1.5px dashed color-mix(in oklab, var(--accent) 70%, transparent);
+  outline-offset: -1.5px;
+}
+
+.dnd-slot {
+  box-sizing: border-box;
+  border: 1.5px dashed var(--accent);
+  background: color-mix(in oklab, var(--accent) 9%, transparent);
+  overflow: hidden;
+  pointer-events: none;
+  transition:
+    height 0.14s ease,
+    margin 0.14s ease;
+}
+
+.dnd-chip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: min(22rem, calc(100vw - 2rem));
+  padding: 0.4rem 0.7rem;
+  border-radius: 0.6rem;
+  background: var(--bg-light-extra);
+  border: 1px solid color-mix(in oklab, var(--accent) 45%, transparent);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4);
+  color: var(--text);
+  font: 600 0.85rem/1.2 var(--font);
+  white-space: nowrap;
+  will-change: transform;
+}
+
+.dnd-chip-grip {
+  display: inline-flex;
+  color: var(--text-2);
+}
+
+.dnd-chip-grip svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.dnd-chip-muted {
+  color: var(--text-2);
+  font-weight: 400;
+}
+
+.dnd-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dnd-slot {
+    transition: none;
+  }
+}

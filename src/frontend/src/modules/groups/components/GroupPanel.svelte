@@ -36,10 +36,11 @@
     SortDesc,
     SortNeutral,
   } from "../../../components/ui/icons";
-  import { draggable, droppable } from "../../../lib/dnd";
+  import { draggable, droppable, type Chip } from "../../../lib/dnd";
   import { type Rule } from "../../../types";
   import { defaultRule } from "../../../utils/defaults";
   import { coverageLabel } from "../../../utils/device-picker";
+  import { counted } from "../../../utils/plural";
   import { type SortDirection } from "../../../utils/rule-sorter";
   import { fallbackCountText, resolverTag } from "../resolve-choice";
 
@@ -137,35 +138,28 @@
     count: number;
   };
 
-  function createGroupDragPreview(headerEl: HTMLElement, name: string, count: number) {
-    const badge = document.createElement("div");
-    badge.style.cssText =
-      "position:fixed;top:-1000px;left:-1000px;pointer-events:none;z-index:2147483647;transform:translateZ(0);font:600 13px/1.2 var(--font, -apple-system, system-ui, Segoe UI, Roboto, sans-serif);color:var(--text,#e5e7eb);";
+  type RuleDnD = {
+    rule_id: string;
+    group_id: string;
+    rule_index: number;
+    group_index: number;
+  };
 
-    const inner = document.createElement("div");
-    inner.style.cssText =
-      "display:flex;align-items:center;gap:.55rem;padding:.42rem .7rem;border-radius:.7rem;background:var(--bg-light,rgba(30,30,36,.92));border:1px solid var(--bg-light-extra,rgba(255,255,255,.12));box-shadow:0 6px 18px rgba(0,0,0,.35);backdrop-filter:saturate(120%) blur(6px);";
+  function groupChip(): Chip {
+    const n = group?.rules.length ?? 0;
+    return {
+      parts: [
+        group?.name || t("group name..."),
+        {
+          text: counted(n, locale.current, t("{n} rule"), t("{n} rules (2-4)"), t("{n} rules")),
+          muted: true,
+        },
+      ],
+    };
+  }
 
-    const title = document.createElement("span");
-    title.textContent = name || "group";
-    title.style.cssText =
-      "max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
-    inner.appendChild(title);
-
-    const cnt = document.createElement("span");
-    cnt.textContent = `• ${count}`;
-    cnt.style.opacity = "0.8";
-    inner.appendChild(cnt);
-
-    const gripClone = headerEl.querySelector(".group-grip")?.cloneNode(true) as HTMLElement | null;
-    if (gripClone) {
-      gripClone.style.cssText += "opacity:.9;display:flex;align-items:center;margin-left:.25rem;";
-      inner.appendChild(gripClone);
-    }
-
-    badge.appendChild(inner);
-    document.body.appendChild(badge);
-    return badge;
+  function dropOnHeader(source: RuleDnD) {
+    store.changeRuleIndex(source.group_index, source.rule_index, group_index, 0, "", "before");
   }
 
   let totalRulesCount = $derived(
@@ -342,13 +336,7 @@
       } as GroupDnD,
       scope: "group",
       handle: ".group-grip",
-      effects: { effectAllowed: "move", dropEffect: "move" },
-      dragImage: (node) =>
-        createGroupDragPreview(
-          (node.querySelector(".group-header") ?? node) as HTMLElement,
-          group.name,
-          group.rules.length,
-        ),
+      chip: groupChip,
     }}
   >
     <Collapsible.Root open={effectiveOpen} onOpenChange={toggleOpen}>
@@ -358,7 +346,8 @@
         use:droppable={{
           data: { rule_id: "", rule_index: 0, group_id: group.id, group_index },
           scope: "rule",
-          canDrop: (src) => src.group_id === group.id,
+          edge: "after",
+          onDrop: dropOnHeader,
         }}
       >
         <div class="group-left">
@@ -699,11 +688,6 @@
       background-color: var(--bg-light);
       position: relative;
     }
-
-    &:global(.dragover) {
-      outline: 1px solid var(--accent);
-      box-shadow: inset 0 0 5px 0 var(--accent);
-    }
   }
 
   .group-left {
@@ -723,6 +707,8 @@
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
   }
   .group-grip:hover {
     color: var(--text);
@@ -1139,7 +1125,8 @@
     }
 
     .group-grip {
-      display: none;
+      align-self: stretch;
+      padding: 0 0.2rem;
     }
 
     .group-actions {

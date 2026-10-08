@@ -3,13 +3,11 @@ export type DnDState = {
   source: any;
   target: any;
   source_scope: string;
-  valid_droppable: boolean;
 };
 
 export const dnd_state = $state<DnDState>({
   is_dragging: false,
-  source: {} as any,
-  target: {} as any,
+  source: null,
+  target: null,
   source_scope: "",
-  valid_droppable: false,
 });

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { dragTo } from "./pages/drag";
 import { signedIn } from "./pages/session";
 
 type ListRule = {
@@ -906,22 +907,12 @@ test.describe("Groups with a list", () => {
     await expect(page.locator(".place-number").nth(0)).toHaveText("1");
     await expect(page.locator(".place-number").nth(1)).toHaveText("2");
 
-    const source = page.locator(".group-wrapper").nth(1).locator(".group-grip");
-    const sourceBox = await source.boundingBox();
-    if (!sourceBox) throw new Error("Source grip not found");
-
-    await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
-    await page.mouse.down();
-
-    const targetGroup = page.locator(".group-wrapper").nth(0);
-    const dropSlot = targetGroup.locator(".group-drop-slot--top");
-    const targetBox = await dropSlot.boundingBox();
-    if (!targetBox) throw new Error("Target slot not found");
-
-    await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, {
-      steps: 10,
-    });
-    await page.mouse.up();
+    await dragTo(
+      page,
+      page.locator(".group-wrapper").nth(1).locator(".group-grip"),
+      page.locator(".group-wrapper").nth(0),
+      "before",
+    );
 
     await expect(page.locator(".group-wrapper").nth(0).locator("input.group-name")).toHaveValue(
       "Listed",

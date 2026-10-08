@@ -4,7 +4,7 @@
   import { t } from "../../../data/locale.svelte";
 
   import { Grip } from "../../../components/ui/icons";
-  import { dnd_state, draggable, droppable } from "../../../lib/dnd";
+  import { draggable, droppable } from "../../../lib/dnd";
   import type { TunnelNodeState, TunnelPreviewRow, TunnelProbeRow } from "../../../types";
   import { agoText, latencyOf, type NodeDnD } from "../tunnel-editor";
 
@@ -20,8 +20,6 @@
   };
 
   let { row, scope, excluded, live, probe, now, onToggle, onDrop }: Props = $props();
-
-  let edge = $state<"before" | "after">("before");
 
   const latency = $derived(latencyOf(probe));
 
@@ -47,33 +45,24 @@
         return { dot: "", text: "" };
     }
   });
-
-  function track(event: DragEvent) {
-    if (dnd_state.source_scope !== "tunnel-node") return;
-    const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    edge = event.clientY - box.top > box.height / 2 ? "after" : "before";
-  }
 </script>
 
 <div
   class="node"
   class:ex={excluded}
   data-key={row.key}
-  data-drop-edge={edge}
   role="listitem"
-  ondragenter={track}
-  ondragover={track}
   use:draggable={{
     data: { scope, key: row.key } as NodeDnD,
     scope: "tunnel-node",
     handle: ".grip",
-    effects: { effectAllowed: "move", dropEffect: "move" },
+    chip: () => ({ parts: [row.name] }),
   }}
   use:droppable={{
-    data: { scope, key: row.key, edge },
+    data: { scope, key: row.key } as NodeDnD,
     scope: "tunnel-node",
     canDrop: (src: NodeDnD) => src.scope === scope && src.key !== row.key,
-    onDrop: (src: NodeDnD) => onDrop(src, { scope, key: row.key, edge }),
+    onDrop: (src: NodeDnD, _target, edge) => onDrop(src, { scope, key: row.key, edge }),
   }}
 >
   <div class="grip" title={t("Drag node")}><Grip size={16} /></div>
@@ -113,17 +102,8 @@
     border-top: 1px solid var(--bg-light-extra);
     font-size: 0.95rem;
   }
-  .node:nth-child(even) {
+  .node:nth-child(odd of .node) {
     background: var(--bg-light);
-  }
-  .node:global(.dragover) {
-    outline: 1px solid var(--accent);
-  }
-  .node:global(.dragover)[data-drop-edge="before"] {
-    box-shadow: inset 0 2px 0 var(--accent);
-  }
-  .node:global(.dragover)[data-drop-edge="after"] {
-    box-shadow: inset 0 -2px 0 var(--accent);
   }
   .grip {
     display: flex;
@@ -131,7 +111,10 @@
     color: var(--text-2);
     cursor: grab;
     user-select: none;
+    -webkit-user-select: none;
     -webkit-user-drag: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
   }
   .grip:hover {
     color: var(--text);

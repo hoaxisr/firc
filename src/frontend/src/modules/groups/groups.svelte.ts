@@ -377,10 +377,6 @@ export class GroupsStore {
 
   visibilityMap = $derived(new Map(this.visibleGroups.map((v) => [v.group_index, v.ruleIndices])));
 
-  firstVisibleGroupIndex = $derived(
-    this.searchActive ? (this.visibleGroups.length ? this.visibleGroups[0].group_index : -1) : 0,
-  );
-
   noVisibleGroups = $derived(
     this.searchActive && !this.searchPending && this.visibleGroups.length === 0,
   );

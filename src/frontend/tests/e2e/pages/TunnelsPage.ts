@@ -1,5 +1,6 @@
 import { expect, type Locator, type Page, type Route } from "@playwright/test";
 
+import { dragTo } from "./drag";
 import { signedIn } from "./session";
 
 type Json = Record<string, any>;
@@ -224,17 +225,7 @@ export class TunnelsPage {
   }
 
   async drag(source: Locator, target: Locator, where: "before" | "after") {
-    const from = await source.locator(".grip").boundingBox();
-    const to = await target.boundingBox();
-    if (!from || !to) throw new Error("no box to drag");
-    await this.page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
-    await this.page.mouse.down();
-    await this.page.mouse.move(
-      to.x + to.width / 2,
-      to.y + to.height * (where === "before" ? 0.25 : 0.75),
-      { steps: 10 },
-    );
-    await this.page.mouse.up();
+    await dragTo(this.page, source.locator(".grip"), target, where);
   }
 
   async settle() {

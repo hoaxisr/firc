@@ -332,41 +332,25 @@
     {#each store.data.slice(0, store.renderGroupsLimit) as group, group_index (group.id)}
       {@const isVisible = !store.searchActive || store.visibilityMap.has(group_index)}
 
-      <div class="group-wrapper" class:is-hidden={!isVisible}>
+      <div
+        class="group-wrapper"
+        class:is-hidden={!isVisible}
+        use:droppable={{
+          data: { group_index, insert: "before" } as GroupDropSlotData,
+          scope: "group",
+          canDrop: (source: GroupDragData, target: GroupDropSlotData) =>
+            source.group_index !== target.group_index,
+          onDrop: (source: GroupDragData, target: GroupDropSlotData, edge) =>
+            store.handleGroupSlotDrop(source, { ...target, insert: edge }),
+        }}
+      >
         <div class="group-wrapper-inner">
-          {#if group_index === store.firstVisibleGroupIndex}
-            <div
-              class="group-drop-slot group-drop-slot--top"
-              aria-hidden="true"
-              use:droppable={{
-                data: { group_index, insert: "before" } as GroupDropSlotData,
-                scope: "group",
-                canDrop: (source: GroupDragData, target: GroupDropSlotData) =>
-                  source.group_index !== target.group_index,
-                dropEffect: "move",
-                onDrop: store.handleGroupSlotDrop,
-              }}
-            ></div>
-          {/if}
-
           <GroupPanel
             {group_index}
             on:importRules={() => openImportRulesModal(group_index)}
             on:devices={() => openDevicesModal(group_index)}
             on:settings={() => openGroupSettings(group_index)}
           />
-
-          <div
-            class="group-drop-slot group-drop-slot--bottom"
-            aria-hidden="true"
-            use:droppable={{
-              data: { group_index, insert: "after" } as GroupDropSlotData,
-              scope: "group",
-              canDrop: () => true,
-              dropEffect: "move",
-              onDrop: store.handleGroupSlotDrop,
-            }}
-          ></div>
         </div>
       </div>
     {/each}
@@ -449,32 +433,5 @@
 
   .group-wrapper.is-hidden {
     display: none;
-  }
-
-  .group-drop-slot {
-    position: absolute;
-    left: 0;
-    right: 0;
-    height: 1rem;
-    pointer-events: none;
-    background: color-mix(in oklab, var(--accent) 28%, transparent);
-    box-shadow: inset 0 0 0 2px color-mix(in oklab, var(--accent) 54%, transparent);
-    opacity: 0;
-  }
-
-  .group-drop-slot--top {
-    top: -1rem;
-  }
-
-  .group-drop-slot--bottom {
-    bottom: -1rem;
-  }
-
-  :global(html[data-dnd-scope="group"]) .group-drop-slot {
-    pointer-events: auto;
-  }
-
-  :global(html[data-dnd-scope="group"]) .group-drop-slot:global(.dragover) {
-    opacity: 1;
   }
 </style>

@@ -1,257 +1,367 @@
 import { dnd_state } from "./dnd.svelte";
 
-export type DragEffects = {
-  effectAllowed?: DataTransfer["effectAllowed"];
-  dropEffect?: DataTransfer["dropEffect"];
-};
+import { dropTargets, whenTargetGone, type DropTarget, type Edge } from "./droppable";
 
-export type DraggableOptions<S, T> = {
+export type ChipPart = string | { text: string; muted?: boolean };
+
+export type Chip = { grip?: boolean; parts: ChipPart[] };
+
+export type DraggableOptions<S> = {
   data: S;
   scope: string;
-  onDrop?: (source: S, target: T) => void;
-  handle?: string;
-  effects?: DragEffects;
-  dragImage?: HTMLElement | ((node: HTMLElement, data: S) => HTMLElement | null);
-  debug?: boolean;
+  handle: string;
+  chip?: () => Chip;
+  onDrop?: (source: S, target: any, edge: Edge) => void;
 };
 
-let idCounter = 0;
+const THRESHOLD = 4;
+const EDGE_ZONE = 60;
+const MAX_SCROLL = 18;
+const MAX_SLOT = 120;
+const SLOT_CLOSE_MS = 200;
 
-function isEventFromHandle(
-  target: EventTarget | null,
-  root: HTMLElement,
-  selector: string,
-): boolean {
-  if (!selector) return true;
-  if (!(target instanceof Element)) return false;
+type Drag = {
+  node: HTMLElement;
+  handle: Element;
+  options: () => DraggableOptions<any>;
+  pointerId: number;
+  x0: number;
+  y0: number;
+  x: number;
+  y: number;
+  started: boolean;
+  target: DropTarget | null;
+  edge: Edge;
+  slot: HTMLElement | null;
+  chip: HTMLElement | null;
+  slotHeight: number;
+  slotRadius: string;
+  raf: number;
+};
 
-  if (target.matches?.(selector)) return true;
+let drag: Drag | null = null;
 
-  const viaClosest = typeof target.closest === "function" ? target.closest(selector) : null;
-  if (viaClosest && root.contains(viaClosest)) return true;
+const reducedMotion = () =>
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  const handleEl = root.querySelector(selector);
-  return !!(handleEl && handleEl.contains(target));
+function inside(r: DOMRect, x: number, y: number) {
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
-export function draggable<S, T>(node: HTMLElement, options: DraggableOptions<S, T>) {
-  const id = ++idCounter;
-  const log = (...a: any[]) => options?.debug && console.debug(`[dnd:draggable#${id}]`, ...a);
+function visibleRect(el: Element): DOMRect | null {
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0 ? r : null;
+}
 
-  node.draggable = true;
-
-  let startedFromHandle = false;
-  let cleanupDragImg: (() => void) | null = null;
-
-  function isHandleVisible(root: HTMLElement, selector: string) {
-    const el = root.querySelector(selector) as HTMLElement | null;
-    if (!el) return false;
-    const s = getComputedStyle(el);
-    if (s.display === "none" || s.visibility === "hidden" || s.pointerEvents === "none")
-      return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
+function buildChip(d: Drag): HTMLElement {
+  const chip = document.createElement("div");
+  chip.className = "dnd-chip";
+  chip.setAttribute("aria-hidden", "true");
+  const spec = d.options().chip?.() ?? { parts: [] };
+  if (spec.grip) {
+    const grip = document.createElement("span");
+    grip.className = "dnd-chip-grip";
+    const svg = d.handle.querySelector("svg");
+    if (svg) grip.appendChild(svg.cloneNode(true));
+    else grip.textContent = "⋮⋮";
+    chip.appendChild(grip);
   }
-
-  let blockersOn = false;
-  let savedUserSelect = "";
-  let savedWebkitUserSelect = "";
-  let pointerUpReset: number | null = null;
-  let activeDrag = false;
-
-  function preventSelect(e: Event) {
-    e.preventDefault();
+  for (const part of spec.parts) {
+    const span = document.createElement("span");
+    const muted = typeof part !== "string" && part.muted;
+    span.className = muted ? "dnd-chip-muted" : "dnd-chip-text";
+    span.textContent = typeof part === "string" ? part : part.text;
+    chip.appendChild(span);
   }
+  document.body.appendChild(chip);
+  return chip;
+}
 
-  function installBlockers() {
-    if (blockersOn) return;
-    blockersOn = true;
-    window.addEventListener("selectstart", preventSelect, true);
-    const style = document.documentElement.style as any;
-    savedUserSelect = style.userSelect ?? "";
-    savedWebkitUserSelect = style.webkitUserSelect ?? "";
-    style.userSelect = "none";
-    style.webkitUserSelect = "none";
+function placeChip(d: Drag) {
+  if (!d.chip) return;
+  const left = Math.max(4, Math.min(d.x - 14, window.innerWidth - d.chip.offsetWidth - 8));
+  d.chip.style.transform = `translate(${left}px, ${d.y}px) translateY(-50%) rotate(-1.5deg)`;
+}
+
+function closeSlot(slot: HTMLElement) {
+  slot.classList.add("dnd-slot-closing");
+  if (reducedMotion()) {
+    slot.remove();
+    return;
   }
+  slot.style.height = "0px";
+  slot.style.marginTop = "0px";
+  slot.style.marginBottom = "0px";
+  window.setTimeout(() => slot.remove(), SLOT_CLOSE_MS);
+}
 
-  function removeBlockers() {
-    if (!blockersOn) return;
-    blockersOn = false;
-    window.removeEventListener("selectstart", preventSelect, true);
-    const style = document.documentElement.style as any;
-    style.userSelect = savedUserSelect;
-    style.webkitUserSelect = savedWebkitUserSelect;
+function liveNeighbour(el: Element, dir: "previousElementSibling" | "nextElementSibling") {
+  let n = el[dir];
+  while (n && n.classList.contains("dnd-slot-closing")) n = n[dir];
+  return n;
+}
+
+function openSlot(d: Drag, target: DropTarget, edge: Edge) {
+  if (d.slot) {
+    const settled =
+      edge === "after"
+        ? liveNeighbour(d.slot, "previousElementSibling") === target.node
+        : liveNeighbour(d.slot, "nextElementSibling") === target.node;
+    if (settled) return;
+    closeSlot(d.slot);
   }
-
-  function onPointerDown(e: PointerEvent) {
-    const needHandle = !!options?.handle && isHandleVisible(node, options.handle!);
-
-    if (needHandle) {
-      startedFromHandle = isEventFromHandle(e.target, node, options.handle!);
-      node.draggable = startedFromHandle;
-    } else {
-      startedFromHandle = true;
-      node.draggable = true;
-    }
-
-    if (startedFromHandle) {
-      document.documentElement.classList.add("dnd-possible");
-      installBlockers(); // must precede a possible selectstart
-    }
+  const slot = document.createElement("div");
+  slot.className = "dnd-slot";
+  slot.setAttribute("aria-hidden", "true");
+  slot.style.borderRadius = d.slotRadius;
+  const css = getComputedStyle(target.node);
+  const height = `${d.slotHeight}px`;
+  if (edge === "after") target.node.after(slot);
+  else target.node.before(slot);
+  if (reducedMotion()) {
+    slot.style.height = height;
+    slot.style.marginTop = css.marginTop;
+    slot.style.marginBottom = css.marginBottom;
+  } else {
+    slot.style.height = "0px";
+    slot.style.marginTop = "0px";
+    slot.style.marginBottom = "0px";
+    void slot.offsetHeight;
+    slot.style.height = height;
+    slot.style.marginTop = css.marginTop;
+    slot.style.marginBottom = css.marginBottom;
   }
+  d.slot = slot;
+}
 
-  function onPointerUp() {
-    if (pointerUpReset != null) window.clearTimeout(pointerUpReset);
-    // Safari can end the pointer sequence before dragstart fires.
-    pointerUpReset = window.setTimeout(() => {
-      if (dnd_state.is_dragging) return;
-      startedFromHandle = false;
-      node.draggable = true;
-      document.documentElement.classList.remove("dnd-possible");
-      removeBlockers();
-      pointerUpReset = null;
-    }, 0);
+function setTarget(d: Drag, target: DropTarget | null, edge: Edge) {
+  d.target = target;
+  d.edge = edge;
+  dnd_state.target = target ? target.options.data : null;
+  if (target) openSlot(d, target, edge);
+  else if (d.slot) {
+    closeSlot(d.slot);
+    d.slot = null;
   }
+}
 
-  function makeTransparentDragImage() {
-    const el = document.createElement("div");
-    el.style.width = "1px";
-    el.style.height = "1px";
-    el.style.opacity = "0";
-    el.style.position = "fixed";
-    el.style.top = "-10px";
-    el.style.pointerEvents = "none";
-    document.body.appendChild(el);
-    return { el, cleanup: () => el.remove() };
-  }
-
-  function setDT(ev: DragEvent) {
-    if (!ev.dataTransfer) return;
-
-    ev.dataTransfer.effectAllowed = options?.effects?.effectAllowed ?? "move";
-    ev.dataTransfer.dropEffect = options?.effects?.dropEffect ?? "move";
-
-    try {
-      ev.dataTransfer.setData("text/plain", "drag");
-      ev.dataTransfer.setData("application/x-dnd-scope", options.scope);
-      ev.dataTransfer.setData("application/json", JSON.stringify(options.data));
-    } catch {
-      /* noop */
-    }
-
-    if (options?.dragImage) {
-      const img =
-        typeof options.dragImage === "function"
-          ? options.dragImage(node, options.data)
-          : options.dragImage;
-
-      if (img) {
-        if (!document.body.contains(img)) document.body.appendChild(img);
-        cleanupDragImg = () => img.remove();
-        ev.dataTransfer.setDragImage(img, 12, 12);
-        return;
-      }
-    }
-
-    const { el, cleanup } = makeTransparentDragImage();
-    cleanupDragImg = cleanup;
-    ev.dataTransfer.setDragImage(el, 0, 0);
-  }
-
-  function handleDragStart(ev: DragEvent) {
-    if (ev.target !== node) return;
-    log("dragstart", { target: ev.target, handle: options?.handle, startedFromHandle });
-
-    const needHandle = !!options?.handle && isHandleVisible(node, options.handle!);
-    if (needHandle && !startedFromHandle) {
-      // Safari can skip pointerdown, so the handle is checked again on dragstart.
-      startedFromHandle = isEventFromHandle(ev.target, node, options.handle!);
-    }
-    if (needHandle && !startedFromHandle) {
-      ev.preventDefault();
+function hitTest(d: Drag) {
+  const options = d.options();
+  const candidates = dropTargets(options.scope);
+  let union: { top: number; bottom: number; left: number; right: number } | null = null;
+  for (const target of candidates) {
+    const r = visibleRect(target.node);
+    if (!r) continue;
+    union = union
+      ? {
+          top: Math.min(union.top, r.top),
+          bottom: Math.max(union.bottom, r.bottom),
+          left: Math.min(union.left, r.left),
+          right: Math.max(union.right, r.right),
+        }
+      : { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+    if (!inside(r, d.x, d.y)) continue;
+    const allowed = target.options.canDrop?.(options.data, target.options.data) ?? true;
+    if (!allowed) {
+      setTarget(d, null, "before");
       return;
     }
+    const edge = target.options.edge ?? (d.y > r.top + r.height / 2 ? "after" : "before");
+    setTarget(d, target, edge);
+    return;
+  }
+  if (d.target && d.slot) {
+    const s = d.slot.getBoundingClientRect();
+    const inSlot = inside(s, d.x, d.y);
+    const inUnion =
+      union !== null &&
+      d.x >= union.left &&
+      d.x <= union.right &&
+      d.y >= Math.min(union.top, s.top) &&
+      d.y <= Math.max(union.bottom, s.bottom);
+    if (inSlot || inUnion) return;
+  }
+  setTarget(d, null, "before");
+}
 
-    dnd_state.is_dragging = true;
-    dnd_state.source = options.data;
-    dnd_state.source_scope = options.scope;
-    dnd_state.valid_droppable = false;
+function autoScroll() {
+  const d = drag;
+  if (!d || !d.started) return;
+  const h = window.innerHeight;
+  let dy = 0;
+  if (d.y < EDGE_ZONE) dy = -Math.ceil(MAX_SCROLL * Math.min(1, (EDGE_ZONE - d.y) / EDGE_ZONE));
+  else if (d.y > h - EDGE_ZONE)
+    dy = Math.ceil(MAX_SCROLL * Math.min(1, (d.y - (h - EDGE_ZONE)) / EDGE_ZONE));
+  if (dy !== 0) {
+    const before = window.scrollY;
+    window.scrollBy(0, dy);
+    if (window.scrollY !== before) hitTest(d);
+  }
+  d.raf = requestAnimationFrame(autoScroll);
+}
 
-    activeDrag = true;
+function blockSelect(e: Event) {
+  e.preventDefault();
+}
 
-    document.documentElement.setAttribute("data-dnd-scope", options.scope);
+function begin(d: Drag) {
+  d.started = true;
+  const options = d.options();
+  const box = d.node.getBoundingClientRect();
+  d.slotHeight = Math.round(Math.min(box.height, MAX_SLOT));
+  const radius = getComputedStyle(d.node).borderRadius;
+  d.slotRadius = radius && radius !== "0px" ? radius : "8px";
 
-    node.classList.add("dragging");
-    node.setAttribute("aria-grabbed", "true");
+  dnd_state.is_dragging = true;
+  dnd_state.source = options.data;
+  dnd_state.source_scope = options.scope;
+  dnd_state.target = null;
 
-    document.documentElement.classList.remove("dnd-possible");
-    document.documentElement.classList.add("dnd-dragging");
+  const html = document.documentElement;
+  html.classList.add("dnd-dragging");
+  html.dataset.dndScope = options.scope;
+  d.node.classList.add("dnd-origin");
+  d.node.setAttribute("aria-grabbed", "true");
+  window.getSelection()?.removeAllRanges();
+  window.addEventListener("selectstart", blockSelect, true);
 
-    installBlockers();
+  d.chip = buildChip(d);
+  placeChip(d);
+  d.raf = requestAnimationFrame(autoScroll);
+}
 
-    setDT(ev);
+function finish(d: Drag) {
+  drag = null;
+  cancelAnimationFrame(d.raf);
+  window.removeEventListener("pointermove", onMove, true);
+  window.removeEventListener("pointerup", onUp, true);
+  window.removeEventListener("pointercancel", onCancel, true);
+  window.removeEventListener("keydown", onKey, true);
+  window.removeEventListener("selectstart", blockSelect, true);
+  d.handle.removeEventListener("lostpointercapture", onLost);
+  try {
+    if (d.handle.hasPointerCapture(d.pointerId)) d.handle.releasePointerCapture(d.pointerId);
+  } catch {}
+  if (!d.started) return;
+
+  document.querySelectorAll(".dnd-slot").forEach((el) => el.remove());
+  d.chip?.remove();
+  d.node.classList.remove("dnd-origin");
+  d.node.removeAttribute("aria-grabbed");
+  const html = document.documentElement;
+  html.classList.remove("dnd-dragging");
+  delete html.dataset.dndScope;
+
+  dnd_state.is_dragging = false;
+  dnd_state.source = null;
+  dnd_state.target = null;
+  dnd_state.source_scope = "";
+
+  const swallow = (e: Event) => {
+    e.stopPropagation();
+    e.preventDefault();
+  };
+  window.addEventListener("click", swallow, true);
+  window.setTimeout(() => window.removeEventListener("click", swallow, true), 0);
+}
+
+function onMove(e: PointerEvent) {
+  const d = drag;
+  if (!d || e.pointerId !== d.pointerId) return;
+  d.x = e.clientX;
+  d.y = e.clientY;
+  if (!d.started) {
+    if (Math.hypot(d.x - d.x0, d.y - d.y0) < THRESHOLD) return;
+    begin(d);
+  }
+  e.preventDefault();
+  placeChip(d);
+  hitTest(d);
+}
+
+function onUp(e: PointerEvent) {
+  const d = drag;
+  if (!d || e.pointerId !== d.pointerId) return;
+  if (!d.started) {
+    finish(d);
+    return;
+  }
+  d.x = e.clientX;
+  d.y = e.clientY;
+  hitTest(d);
+  const { target, edge } = d;
+  const options = d.options();
+  finish(d);
+  if (!target) return;
+  if (!(target.options.canDrop?.(options.data, target.options.data) ?? true)) return;
+  const drop = target.options.onDrop ?? options.onDrop;
+  drop?.(options.data, target.options.data, edge);
+}
+
+function onCancel(e: PointerEvent) {
+  if (drag && e.pointerId === drag.pointerId) finish(drag);
+}
+
+function onLost(e: Event) {
+  if (drag && (e as PointerEvent).pointerId === drag.pointerId) finish(drag);
+}
+
+function onKey(e: KeyboardEvent) {
+  if (!drag || e.key !== "Escape") return;
+  if (drag.started) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  finish(drag);
+}
+
+whenTargetGone((target) => {
+  if (drag?.started && drag.target === target) setTarget(drag, null, "before");
+});
+
+export function draggable<S>(node: HTMLElement, options: DraggableOptions<S>) {
+  function onDown(e: PointerEvent) {
+    if (drag || !e.isPrimary || e.button !== 0) return;
+    const handle = (e.target as Element | null)?.closest?.(options.handle);
+    if (!handle || !node.contains(handle)) return;
+    e.preventDefault();
+    drag = {
+      node,
+      handle,
+      options: () => options,
+      pointerId: e.pointerId,
+      x0: e.clientX,
+      y0: e.clientY,
+      x: e.clientX,
+      y: e.clientY,
+      started: false,
+      target: null,
+      edge: "before",
+      slot: null,
+      chip: null,
+      slotHeight: 0,
+      slotRadius: "",
+      raf: 0,
+    };
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {}
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+    window.addEventListener("keydown", onKey, true);
+    handle.addEventListener("lostpointercapture", onLost);
   }
 
-  function cleanupOverClasses() {
-    document.querySelectorAll<HTMLElement>("[data-droppable].dragover").forEach((el) => {
-      el.classList.remove("dragover");
-      (el as HTMLElement).dataset.drop = "";
-    });
-  }
-
-  function handleDragEnd(_ev: DragEvent) {
-    if (!activeDrag) return;
-    activeDrag = false;
-
-    if (dnd_state.valid_droppable && options?.onDrop) {
-      options.onDrop(dnd_state.source as S, dnd_state.target as T);
-    }
-
-    dnd_state.is_dragging = false;
-    dnd_state.source = null;
-    dnd_state.target = null;
-    dnd_state.valid_droppable = false;
-    dnd_state.source_scope = "";
-
-    node.classList.remove("dragging");
-    node.removeAttribute("aria-grabbed");
-
-    document.documentElement.classList.remove("dnd-dragging", "dnd-possible");
-    document.documentElement.removeAttribute("data-dnd-scope");
-    removeBlockers();
-    cleanupOverClasses();
-
-    if (cleanupDragImg) {
-      cleanupDragImg();
-      cleanupDragImg = null;
-    }
-
-    startedFromHandle = false;
-    node.draggable = true;
-  }
-
-  node.addEventListener("pointerdown", onPointerDown, true);
-  window.addEventListener("pointerup", onPointerUp, true);
-  node.addEventListener("dragstart", handleDragStart, true);
-  node.addEventListener("dragend", handleDragEnd);
-
-  window.addEventListener("drop", handleDragEnd as any);
+  node.addEventListener("pointerdown", onDown);
 
   return {
-    update(new_options: DraggableOptions<S, T>) {
-      options = new_options;
-      node.draggable = true;
+    update(next: DraggableOptions<S>) {
+      options = next;
     },
     destroy() {
-      node.removeEventListener("pointerdown", onPointerDown, true);
-      window.removeEventListener("pointerup", onPointerUp, true);
-      node.removeEventListener("dragstart", handleDragStart, true);
-      node.removeEventListener("dragend", handleDragEnd);
-      window.removeEventListener("drop", handleDragEnd as any);
-      if (pointerUpReset != null) window.clearTimeout(pointerUpReset);
-      activeDrag = false;
-      removeBlockers();
-      document.documentElement.classList.remove("dnd-dragging", "dnd-possible");
+      node.removeEventListener("pointerdown", onDown);
+      if (drag?.node === node) finish(drag);
     },
   };
 }

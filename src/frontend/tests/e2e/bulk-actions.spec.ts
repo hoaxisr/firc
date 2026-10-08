@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 import { answerConfirm } from "./pages/confirm";
+import { dragTo } from "./pages/drag";
 import { signedIn } from "./pages/session";
 
 const group = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
@@ -280,18 +281,12 @@ test.describe("Group bulk actions", () => {
     await setup(page);
     await numberOf(page, "Speedtest").click();
 
-    const source = card(page, 0).locator(".group-grip");
-    const sourceBox = await source.boundingBox();
-    if (!sourceBox) throw new Error("grip not found");
-    await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
-    await page.mouse.down();
-    const slot = page.locator(".group-wrapper").nth(1).locator(".group-drop-slot--bottom");
-    const slotBox = await slot.boundingBox();
-    if (!slotBox) throw new Error("slot not found");
-    await page.mouse.move(slotBox.x + slotBox.width / 2, slotBox.y + slotBox.height / 2, {
-      steps: 10,
-    });
-    await page.mouse.up();
+    await dragTo(
+      page,
+      card(page, 0).locator(".group-grip"),
+      page.locator(".group-wrapper").nth(1),
+      "after",
+    );
 
     await expect
       .poll(() => cardNames(page))
