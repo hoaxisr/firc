@@ -54,6 +54,7 @@ void firc_dnsproxy_set_sock_ops(firc_dnsproxy_t *p, const firc_dnsproxy_sock_ops
 
 #define FIRC_DNSPROXY_TUNNEL_TIMEOUT_MS 1000u
 #define FIRC_DNSPROXY_FALLBACK_FLOOR_MS 250u
+#define FIRC_DNSPROXY_RETRY_MS 300u
 
 #define FIRC_RESOLVE_HEALTH_FAILS 3u
 #define FIRC_RESOLVE_HEALTH_SKIP_MS 30000u
