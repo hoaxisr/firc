@@ -1,9 +1,11 @@
 #include "firc/iptables.h"
 #include "firc/bytebuf.h"
+#include "firc/log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct chain_reg {
     char *chain_name;
@@ -689,9 +691,12 @@ firc_err_t firc_ipt_commit(firc_ipt_t *ipt) {
     /* Checked here too, so an abort between the two transfers stops the write. */
     if (firc_cancel_raised(ipt->cancel)) { return FIRC_ERR_CANCELED; }
 
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     firc_ipt_rules_snapshot_t *cur = NULL;
     firc_err_t err = firc_ipt_get_current_rules(ipt, &cur);
     if (err != FIRC_OK) { return err; }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
     firc_bytebuf_t buf;
     firc_bytebuf_init(&buf);
@@ -761,6 +766,10 @@ firc_err_t firc_ipt_commit(firc_ipt_t *ipt) {
     }
 
     firc_ipt_rules_snapshot_free(cur);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    FIRC_DEBUG("iptables commit: read %lld ms, compile %lld ms, %zu bytes",
+               (long long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000),
+               (long long)((t2.tv_sec - t1.tv_sec) * 1000 + (t2.tv_nsec - t1.tv_nsec) / 1000000), buf.len);
 
     if (err != FIRC_OK) {
         firc_bytebuf_free(&buf);

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <spawn.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -248,7 +249,13 @@ static firc_err_t wait_child(pid_t pid, const char *cmd, firc_bytebuf_t *err_buf
     return FIRC_OK;
 }
 
-static firc_err_t real_save(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len) {
+static uint64_t elapsed_ms(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000u + (uint64_t)((t1.tv_nsec - t0->tv_nsec) / 1000000);
+}
+
+static firc_err_t real_save_run(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len) {
     exe_real_t *e = (exe_real_t *)self;
     const char *argv[] = {e->save_cmd, NULL};
 
@@ -365,13 +372,27 @@ static firc_err_t real_save(firc_ipt_executable_t *self, uint8_t **out, size_t *
     return FIRC_OK;
 }
 
+static firc_err_t real_save(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len) {
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_err_t err = real_save_run(self, out, out_len);
+    FIRC_DEBUG("%s: %llu ms, %zu bytes (%s)", ((exe_real_t *)self)->save_cmd,
+               (unsigned long long)elapsed_ms(&t0), err == FIRC_OK ? *out_len : 0, firc_err_str(err));
+    return err;
+}
+
 static firc_err_t real_restore_argv(firc_ipt_executable_t *self, const uint8_t *data, size_t len,
                                     const char *const *argv, const char *label);
 
 static firc_err_t real_restore(firc_ipt_executable_t *self, const uint8_t *data, size_t len) {
     exe_real_t *e = (exe_real_t *)self;
     const char *argv[] = {e->restore_cmd, "--noflush", NULL};
-    return real_restore_argv(self, data, len, argv, e->restore_cmd);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_err_t err = real_restore_argv(self, data, len, argv, e->restore_cmd);
+    FIRC_DEBUG("%s: %llu ms, %zu bytes (%s)", e->restore_cmd, (unsigned long long)elapsed_ms(&t0), len,
+               firc_err_str(err));
+    return err;
 }
 
 static firc_err_t real_restore_argv(firc_ipt_executable_t *self, const uint8_t *data, size_t len,
