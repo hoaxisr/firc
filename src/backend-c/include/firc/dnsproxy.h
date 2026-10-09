@@ -93,6 +93,12 @@ void firc_dnsproxy_set_pool_prefixes(firc_dnsproxy_t *p, const firc_ip_t *v4, ui
 
 void firc_dnsproxy_set_pool(firc_dnsproxy_t *p, const firc_fakeip_t *pool, uint32_t ttl);
 
+/* 0 for either bound turns the group resolver answer cache off. Loop thread, or before start. */
+void firc_dnsproxy_set_cache(firc_dnsproxy_t *p, size_t max_entries, size_t max_bytes);
+
+/* Tests only: the clock the cache ages entries by. NULL restores the monotonic one. */
+void firc_dnsproxy_set_cache_clock_for_test(firc_dnsproxy_t *p, uint64_t (*now_ms)(void));
+
 /* Sends every held answer `ready` approves of. Loop thread only (firc_loop_post). */
 typedef bool (*firc_dnsproxy_ready_fn)(const firc_dns_msg_t *msg, void *ud);
 void firc_dnsproxy_release(firc_dnsproxy_t *p, firc_dnsproxy_ready_fn ready, void *ud);

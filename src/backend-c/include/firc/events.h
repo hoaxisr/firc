@@ -39,6 +39,7 @@ typedef enum firc_dns_resolver {
     FIRC_DNS_RESOLVER_FALLBACK_REFUSED,
     FIRC_DNS_RESOLVER_FALLBACK_SINK,
     FIRC_DNS_RESOLVER_HEALTH_SKIP,
+    FIRC_DNS_RESOLVER_CACHE,
 } firc_dns_resolver_t;
 
 typedef enum firc_bypass_how { FIRC_BYPASS_BY_ADDR = 0, FIRC_BYPASS_BY_SNI } firc_bypass_how_t;

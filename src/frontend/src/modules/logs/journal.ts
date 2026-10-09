@@ -82,6 +82,8 @@ export function resolverNote(r: DnsResolverSource | undefined, t: (s: string) =>
       return t("the group's DNS answered a sink address; the common upstream answered");
     case "health_skip":
       return t("the group's DNS is resting after failures; the common upstream answered");
+    case "cache":
+      return t("from the group's DNS cache");
     default:
       return "";
   }

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "firc/listen.h"
+#include "firc/anscache.h"
 #include "firc/log.h"
 #include "firc/resolver_addr.h"
 #include "pktinfo.h"
@@ -74,6 +75,8 @@ struct firc_dnsproxy {
     bool have_pool4, have_pool6;
     const firc_fakeip_t *fakeip;
     uint32_t ptr_ttl;
+    firc_anscache_t *cache;
+    uint64_t (*cache_now)(void);
 
     group_health_t *health;
     size_t n_health, cap_health;
@@ -223,6 +226,11 @@ typedef struct exchange {
     uint8_t resolver;     /* firc_dns_resolver_t: where the answer came from */
     uint64_t deadline_ms; /* monotonic; one deadline shared by both legs */
     bool probe;
+    firc_anscache_key_t ckey;
+    bool cacheable;
+    bool want_prefetch;
+    uint8_t *cached;
+    size_t cached_len;
 
     uint16_t qid;
     size_t n_q;
@@ -406,6 +414,7 @@ void firc_dnsproxy_close_group_pools(firc_dnsproxy_t *p, firc_id_t group_id)
             p->tpools[i].epoch++;
         }
     }
+    firc_anscache_drop_group(p->cache, group_id);
 }
 
 void firc_dnsproxy_forget_group(firc_dnsproxy_t *p, firc_id_t group_id)
@@ -424,6 +433,7 @@ void firc_dnsproxy_forget_group(firc_dnsproxy_t *p, firc_id_t group_id)
             break;
         }
     }
+    firc_anscache_drop_group(p->cache, group_id);
 }
 
 static void exchange_free(exchange_t *ex)
@@ -432,6 +442,7 @@ static void exchange_free(exchange_t *ex)
     free(ex->resp);
     free(ex->out);
     free(ex->held);
+    free(ex->cached);
     firc_dns_msg_free(ex->held_msg);
     free(ex);
 }
@@ -744,7 +755,12 @@ static void deliver_response(exchange_t *ex, const uint8_t *resp,
             return;
         }
     }
-    if (ex->tunnel) { health_success(p, ex); }
+    if (ex->tunnel) {
+        health_success(p, ex);
+        if (ex->cacheable) {
+            (void)firc_anscache_put(p->cache, &ex->ckey, resp, resp_len, firc_anscache_lifetime(msg), p->cache_now());
+        }
+    }
     firc_dns_verdict_t verdict = FIRC_DNS_PASS;
     if (p->cb != NULL) {
         firc_ip_t client;
@@ -1103,6 +1119,25 @@ static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex)
     ex->timer_id = tid;
 }
 
+static void exchange_begin(firc_dnsproxy_t *p, exchange_t *ex)
+{
+    if (ex->cached == NULL) {
+        start_upstream(p, ex);
+        return;
+    }
+    if (ex->want_prefetch) { firc_anscache_prefetch_done(p->cache, &ex->ckey); }
+    uint8_t *wire = ex->cached;
+    size_t len = ex->cached_len;
+    ex->cached = NULL;
+    if (ex->is_tcp && firc_loop_add_timer(p->loop, leg_timeout_ms(ex), 0, on_timeout, ex, &ex->timer_id) != FIRC_OK) {
+        free(wire);
+        exchange_finish(ex, false);
+        return;
+    }
+    deliver_response(ex, wire, len);
+    free(wire);
+}
+
 typedef enum request_disp {
     REQ_DROP = 0,     /* consumed: caller must finish/free */
     REQ_REPLIED_ASYNC, /* TCP local reply queued: keep ex, wait for write */
@@ -1165,6 +1200,21 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
         if (p->route_fn(p->route_ud, req_msg, client_ip(ex, &client) ? &client : NULL, &rt) &&
             rt.n_servers > 0 && rt.n_servers <= FIRC_RESOLVE_MAX_SERVERS && rt.mark != 0) {
             ex->route = rt;
+            ex->cacheable = firc_anscache_key_of(req_msg, rt.group_id, rt.gen, &ex->ckey);
+            firc_anscache_hit_t hit;
+            if (ex->cacheable &&
+                firc_anscache_get(p->cache, &ex->ckey, ex->req, ex->req_len, p->cache_now(), &hit)) {
+                if (ex->is_tcp || hit.len <= ex->udp_max) {
+                    ex->cached = hit.wire;
+                    ex->cached_len = hit.len;
+                    ex->want_prefetch = hit.prefetch;
+                    ex->resolver = FIRC_DNS_RESOLVER_CACHE;
+                    firc_dns_msg_free(req_msg);
+                    return REQ_FORWARD;
+                }
+                if (hit.prefetch) { firc_anscache_prefetch_done(p->cache, &ex->ckey); }
+                free(hit.wire);
+            }
             group_health_t *h = health_for(p, rt.group_id, rt.gen);
             uint64_t now = mono_ms();
             bool resting = h != NULL && h->rest_until_ms != 0 && (now < h->rest_until_ms || h->probing);
@@ -1260,7 +1310,7 @@ static void on_udp_readable(firc_loop_t *loop, int fd, uint32_t events,
             exchange_free(ex);
             continue;
         }
-        start_upstream(p, ex);
+        exchange_begin(p, ex);
     }
 }
 
@@ -1342,7 +1392,7 @@ static void on_tcp_client_read(firc_loop_t *loop, int fd, uint32_t events,
     if (disp == REQ_REPLIED_ASYNC) {
         return;
     }
-    start_upstream(ex->p, ex);
+    exchange_begin(ex->p, ex);
 }
 
 static void on_tcp_accept(firc_loop_t *loop, int fd, uint32_t events, void *ud)
@@ -1419,6 +1469,8 @@ firc_err_t firc_dnsproxy_create(const firc_dnsproxy_config_t *cfg, firc_loop_t *
         return FIRC_ERR_NOMEM;
     }
     p->cfg.upstream_addr = p->upstream_addr;
+    p->cache_now = mono_ms;
+    p->cache = firc_anscache_new(FIRC_ANSCACHE_ENTRIES, FIRC_ANSCACHE_BYTES);
 
     int fam_listen;
     struct sockaddr_storage listen_sa;
@@ -1426,6 +1478,7 @@ firc_err_t firc_dnsproxy_create(const firc_dnsproxy_config_t *cfg, firc_loop_t *
     if (parse_listen(cfg->listen_addr, cfg->listen_port, &fam_listen,
                      &listen_sa, &listen_len) != 0) {
         free(p->upstream_addr);
+        firc_anscache_free(p->cache);
         free(p);
         return FIRC_ERR_INVAL;
     }
@@ -1435,6 +1488,7 @@ firc_err_t firc_dnsproxy_create(const firc_dnsproxy_config_t *cfg, firc_loop_t *
     if (parse_listen(cfg->upstream_addr, cfg->upstream_port, &fam_up,
                      &p->upstream_sa, &p->upstream_sa_len) != 0) {
         free(p->upstream_addr);
+        firc_anscache_free(p->cache);
         free(p);
         return FIRC_ERR_INVAL;
     }
@@ -1524,6 +1578,7 @@ void firc_dnsproxy_destroy(firc_dnsproxy_t *p)
     free(p->tpools);
     free(p->upstream_addr);
     free(p->health);
+    firc_anscache_free(p->cache);
     free(p);
 }
 
@@ -1576,4 +1631,15 @@ const char *firc_dnsproxy_upstream(const firc_dnsproxy_t *p, uint16_t *port_out)
 {
     if (port_out != NULL) { *port_out = p->cfg.upstream_port; }
     return p->cfg.upstream_addr;
+}
+
+void firc_dnsproxy_set_cache(firc_dnsproxy_t *p, size_t max_entries, size_t max_bytes)
+{
+    firc_anscache_free(p->cache);
+    p->cache = firc_anscache_new(max_entries, max_bytes);
+}
+
+void firc_dnsproxy_set_cache_clock_for_test(firc_dnsproxy_t *p, uint64_t (*now_ms)(void))
+{
+    p->cache_now = now_ms != NULL ? now_ms : mono_ms;
 }

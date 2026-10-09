@@ -451,29 +451,31 @@ TEST a_dns_event_is_answered_with_every_field(void) {
     PASS();
 }
 
+/* Catches: a resolver source without its API name, or an unknown byte not read as upstream. */
 TEST every_resolver_source_has_its_name(void) {
     static const char *want[] = {"upstream",         "group",          "fallback_unreachable", "fallback_timeout",
-                                 "fallback_servfail", "fallback_refused", "fallback_sink",       "health_skip"};
+                                 "fallback_servfail", "fallback_refused", "fallback_sink",       "health_skip",
+                                 "cache"};
     harness_t *h = harness_start(false);
     ASSERT(h != NULL);
     firc_event_reset_for_test();
-    for (unsigned i = 0; i < 9; i++) {
+    for (unsigned i = 0; i < 10; i++) {
         firc_event_t e;
         memset(&e, 0, sizeof(e));
         e.kind = FIRC_EVENT_DNS;
         e.u.dns.client = (firc_ip_t){{192, 168, 1, 42}, 4};
         snprintf(e.u.dns.name, sizeof(e.u.dns.name), "n%u.test", i);
-        e.u.dns.resolver = (uint8_t)(i < 8 ? i : 200);
+        e.u.dns.resolver = (uint8_t)(i < 9 ? i : 200);
         firc_event_put(&e);
     }
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/events", NULL, &out));
     cJSON *events = cJSON_GetObjectItemCaseSensitive(out, "events");
-    ASSERT_EQ_FMT(9, cJSON_GetArraySize(events), "%d");
-    for (int i = 0; i < 9; i++) {
+    ASSERT_EQ_FMT(10, cJSON_GetArraySize(events), "%d");
+    for (int i = 0; i < 10; i++) {
         cJSON *r = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(events, i), "resolver");
         ASSERT(cJSON_IsString(r));
-        ASSERT_STR_EQ(i < 8 ? want[i] : "upstream", r->valuestring);
+        ASSERT_STR_EQ(i < 9 ? want[i] : "upstream", r->valuestring);
     }
     cJSON_Delete(out);
     harness_stop(h);

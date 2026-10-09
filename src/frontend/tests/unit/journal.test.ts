@@ -254,6 +254,13 @@ describe("describeDns, where the answer came from", () => {
       assert.match(describeDns(dns({ resolver: r }), id), /the common upstream answered$/, r);
     }
   });
+  // Catches a cache hit unsaid, or said as a fallback.
+  it("names an answer from the group's DNS cache", () => {
+    assert.strictEqual(
+      describeDns(dns({ resolver: "cache" }), id),
+      "youtube.com A → media · issued 198.18.0.5 (142.250.1.1) · from the group's DNS cache",
+    );
+  });
 });
 
 describe("the group filter's options", () => {
