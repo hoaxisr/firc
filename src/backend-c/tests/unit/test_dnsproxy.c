@@ -830,6 +830,7 @@ typedef struct {
     _Atomic int decoy_first;
     _Atomic int drop;
     _Atomic int tc;
+    _Atomic int replied;
 } stub_t;
 
 #define STUB_A_LAST_OCTET 46
@@ -905,6 +906,7 @@ static void *stub_serve(void *arg) {
             sendto(s->fd, d, alen, 0, (struct sockaddr *)&from, fl);
         }
         sendto(s->fd, a, alen, 0, (struct sockaddr *)&from, fl);
+        atomic_fetch_add(&s->replied, 1);
     }
     return NULL;
 }
@@ -3312,6 +3314,14 @@ static bool await_received(stub_t *s, int n) {
     return atomic_load(&s->received) >= n;
 }
 
+static bool await_replied(stub_t *s, int n) {
+    for (int i = 0; i < 400 && atomic_load(&s->replied) < n; i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&s->replied) >= n;
+}
+
 static void pause_ms(long ms) {
     struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
@@ -3325,15 +3335,15 @@ TEST every_group_resolver_is_asked_at_once_and_the_first_good_answer_wins(void) 
     g_troute.n = 2;
     g_troute.ports[0] = lv.b.port;
     g_troute.ports[1] = lv.c.port;
-    atomic_store(&lv.b.hold_ms, 300);
+    atomic_store(&lv.b.hold_ms, 600);
     long t0 = ms_now();
     ASSERT_EQ(3, ask(lv.proxy_port, 0xb101));
-    ASSERT_LT(ms_now() - t0, 250);
+    ASSERT_LT(ms_now() - t0, 400);
     ASSERT(await_received(&lv.b, 1));
     ASSERT_EQ(1, atomic_load(&lv.c.received));
     ASSERT_EQ(0, atomic_load(&lv.a.received));
     ASSERT_EQ(0u, live_fallbacks(&lv));
-    pause_ms(400);
+    pause_ms(700);
     live_stop(&lv);
     PASS();
 }
@@ -3410,7 +3420,8 @@ TEST a_losing_resolvers_socket_is_pooled_and_its_late_answer_ignored(void) {
     g_troute.ports[1] = lv.c.port;
     atomic_store(&lv.c.hold_ms, 150);
     ASSERT_EQ(2, ask(lv.proxy_port, 0xb501));
-    pause_ms(300);
+    ASSERT(await_replied(&lv.c, 1));
+    pause_ms(50);
     atomic_store(&lv.c.mark, 4);
     atomic_store(&lv.c.hold_ms, 0);
     atomic_store(&lv.b.hold, 1);
@@ -3589,6 +3600,99 @@ TEST a_silent_resolvers_socket_is_pooled_at_the_timeout(void) {
     PASS();
 }
 
+/* Catches: a late answer cached under a generation that is no longer live once its group came back. */
+TEST a_late_answer_after_its_group_came_back_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf01);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    live_forget_group(&lv, 7);
+    g_troute.gen = 2;
+    g_troute.ports[0] = lv.c.port;
+    ASSERT_EQ(3, ask_for(lv.proxy_port, 0xbf02, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    g_troute.gen = 1;
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf03));
+    ASSERT_EQm("the dead generation's answer was not kept", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: an answer on a socket whose pool was closed mid-flight cached after the close dropped the group's answers. */
+TEST an_answer_landing_after_its_pool_was_closed_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf11);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    live_close_group(&lv, 7);
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf12));
+    ASSERT_EQm("asked the resolver, not the cache", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a full send buffer on a resolver's socket taken for an unreachable resolver instead of a send to retry. */
+TEST a_send_that_would_block_is_covered_by_the_resend(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&g_rec.fail_send, EAGAIN);
+    long t0 = ms_now();
+    int c = ask_send(lv.proxy_port, 0xbf21);
+    ASSERT(c >= 0);
+    pause_ms(100);
+    atomic_store(&g_rec.fail_send, 0);
+    ASSERT_EQ(2, ask_read(c));
+    ASSERT_GTE(ms_now() - t0, (long)FIRC_DNSPROXY_RETRY_MS - 20);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a late answer cached for a generation the group has since left, while its socket's pool is untouched. */
+TEST a_late_answer_from_a_replaced_generation_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf31);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    g_troute.gen = 2;
+    g_troute.ports[0] = lv.c.port;
+    ASSERT_EQ(3, ask_for(lv.proxy_port, 0xbf32, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    g_troute.gen = 1;
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf33));
+    ASSERT_EQm("the replaced generation's answer was not kept", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -3692,5 +3796,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_tcp_tunnel_answer_is_served_from_the_cache_to_a_udp_asker);
     RUN_TEST(a_tunnel_answer_after_its_group_is_forgotten_is_not_cached);
     RUN_TEST(a_silent_resolvers_socket_is_pooled_at_the_timeout);
+    RUN_TEST(a_late_answer_after_its_group_came_back_is_not_cached);
+    RUN_TEST(an_answer_landing_after_its_pool_was_closed_is_not_cached);
+    RUN_TEST(a_send_that_would_block_is_covered_by_the_resend);
+    RUN_TEST(a_late_answer_from_a_replaced_generation_is_not_cached);
     GREATEST_MAIN_END();
 }
