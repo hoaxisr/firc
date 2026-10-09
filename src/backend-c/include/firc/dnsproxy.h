@@ -55,6 +55,7 @@ void firc_dnsproxy_set_sock_ops(firc_dnsproxy_t *p, const firc_dnsproxy_sock_ops
 #define FIRC_DNSPROXY_TUNNEL_TIMEOUT_MS 1000u
 #define FIRC_DNSPROXY_FALLBACK_FLOOR_MS 250u
 #define FIRC_DNSPROXY_RETRY_MS 300u
+#define FIRC_DNSPROXY_MAX_PREFETCH 16u
 
 #define FIRC_RESOLVE_HEALTH_FAILS 3u
 #define FIRC_RESOLVE_HEALTH_SKIP_MS 30000u
@@ -105,6 +106,9 @@ typedef bool (*firc_dnsproxy_ready_fn)(const firc_dns_msg_t *msg, void *ud);
 void firc_dnsproxy_release(firc_dnsproxy_t *p, firc_dnsproxy_ready_fn ready, void *ud);
 
 size_t firc_dnsproxy_held(const firc_dnsproxy_t *p);
+
+/* Cache refreshes in flight. Loop thread. */
+size_t firc_dnsproxy_prefetching(const firc_dnsproxy_t *p);
 
 firc_err_t firc_dnsproxy_create(const firc_dnsproxy_config_t *cfg, firc_loop_t *loop,
                             firc_dnsproxy_msg_cb cb, void *cb_ud,

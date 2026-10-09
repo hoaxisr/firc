@@ -3693,6 +3693,276 @@ TEST a_late_answer_from_a_replaced_generation_is_not_cached(void) {
     PASS();
 }
 
+typedef struct {
+    firc_dnsproxy_t *proxy;
+    _Atomic size_t out;
+    _Atomic int done;
+} pfq_t;
+
+static void prefetching_on_loop(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    pfq_t *q = ud;
+    atomic_store(&q->out, firc_dnsproxy_prefetching(q->proxy));
+    atomic_store(&q->done, 1);
+}
+
+static size_t live_prefetching(live_t *lv) {
+    pfq_t q = {.proxy = lv->proxy};
+    if (firc_loop_post(lv->loop, prefetching_on_loop, &q) != FIRC_OK) { return SIZE_MAX; }
+    for (int i = 0; i < 200 && !atomic_load(&q.done); i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&q.done) ? atomic_load(&q.out) : SIZE_MAX;
+}
+
+static bool await_no_prefetch(live_t *lv) {
+    for (int i = 0; i < 300; i++) {
+        if (live_prefetching(lv) == 0) { return true; }
+        pause_ms(10);
+    }
+    return false;
+}
+
+/* Catches: a failed refresh counted as a group failure, resting a group no client saw fail. */
+TEST failed_refreshes_never_rest_the_group(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    for (int i = 0; i < 4; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc500 + i), 0, (char)('a' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.rcode, 2);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc510 + i), 0, (char)('a' + i)));
+        ASSERT(await_received(&lv.b, 5 + i));
+        ASSERT(await_no_prefetch(&lv));
+    }
+    atomic_store(&lv.b.rcode, 0);
+    int before = atomic_load(&lv.b.received);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc520, 0, 'z'));
+    ASSERT_EQm("a fresh name still goes through the tunnel", before + 1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a hit in the last tenth not refreshing the entry, refreshing it through the pipeline, or twice at once. */
+TEST a_hit_in_the_last_tenth_refreshes_the_entry_once(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc101));
+    atomic_store(&g_cache_skew_ms, 269000);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc102));
+    ASSERT_EQm("31 s of 300 left: no refresh", 1, atomic_load(&g_rec.sends));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc103));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc104));
+    ASSERT_EQm("29 s left: one refresh, not one per hit", 2, atomic_load(&g_rec.sends));
+    atomic_store(&lv.b.mark, 5);
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(5, ask(lv.proxy_port, 0xc105));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQm("the refresh never reached the pipeline", 5, atomic_load(&g_live_hook_calls));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a failed refresh dropping the entry, falling back to the common upstream, or blocking the next refresh. */
+TEST a_failed_refresh_leaves_the_entry_and_a_later_hit_tries_again(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc201));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.rcode, 2);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc202));
+    ASSERT(await_received(&lv.b, 2));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc203));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT(await_received(&lv.b, 3));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: more than 16 refreshes in flight at once, or a capped hit keeping its entry from asking again. */
+TEST refreshes_are_capped_at_sixteen(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    for (int i = 0; i < 17; i++) { ASSERT(ask_for(lv.proxy_port, (uint16_t)(0xc300 + i), 0, (char)('a' + i)) > 0); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    int s0 = atomic_load(&g_rec.sends);
+    for (int i = 0; i < 17; i++) { ASSERT(ask_for(lv.proxy_port, (uint16_t)(0xc320 + i), 0, (char)('a' + i)) > 0); }
+    ASSERT_EQm("16 refreshes of two legs each", 32, atomic_load(&g_rec.sends) - s0);
+    ASSERT_EQ((size_t)FIRC_DNSPROXY_MAX_PREFETCH, live_prefetching(&lv));
+    atomic_store(&lv.b.go, 1);
+    atomic_store(&lv.c.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    int s1 = atomic_load(&g_rec.sends);
+    ASSERT(ask_for(lv.proxy_port, 0xc340, 0, (char)('a' + 16)) > 0);
+    ASSERT_EQm("the capped entry may ask again", 2, atomic_load(&g_rec.sends) - s1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: refreshes taking the client in-flight budget, so they crowd out client queries. */
+TEST refreshes_do_not_take_the_client_budget(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_max_concurrent = 2;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc400 + i), 0, (char)('a' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc410 + i), 0, (char)('a' + i))); }
+    ASSERT_EQ(3u, live_prefetching(&lv));
+    g_troute.take = false;
+    ASSERT_EQ(1, ask_for(lv.proxy_port, 0xc420, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh started while the group rests, or while another query is its probe. */
+TEST no_refresh_starts_while_the_group_rests_or_probes(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_rest_ms = 1000;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc601, 0, 'a'));
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xc610 + i), 0, (char)('b' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    int s0 = atomic_load(&g_rec.sends);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc620, 0, 'a'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    pause_ms(50);
+    ASSERT_EQm("resting: no refresh", s0, atomic_load(&g_rec.sends));
+    ASSERT_EQ(0u, live_prefetching(&lv));
+
+    pause_ms(1050);
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    int c = ask_send_for(lv.proxy_port, 0xc630, 0, 'y');
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 2));
+    ASSERT(await_received(&lv.c, 1));
+    int s1 = atomic_load(&g_rec.sends);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc631, 0, 'a'));
+    pause_ms(50);
+    ASSERT_EQm("probing: no refresh", s1, atomic_load(&g_rec.sends));
+    ASSERT_EQ(0u, live_prefetching(&lv));
+    atomic_store(&lv.b.go, 1);
+    atomic_store(&lv.c.go, 1);
+    ASSERT(ask_read(c) > 1);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh whose resolver stays silent never ending, or ending by dropping the entry or asking the common upstream. */
+TEST a_silent_refresh_ends_at_the_timeout_and_leaves_the_entry(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc701));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc702));
+    ASSERT_EQ(1u, live_prefetching(&lv));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc703));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh in flight at shutdown left allocated (LSan) or its sockets left open. */
+TEST a_refresh_in_flight_at_shutdown_is_freed(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    ASSERT(ask(lv.proxy_port, 0xc801) > 1);
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    ASSERT(ask(lv.proxy_port, 0xc802) > 1);
+    ASSERT_EQ(1u, live_prefetching(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+static enum greatest_test_res refresh_cut_mid_flight(bool forget) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc901));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc902));
+    ASSERT(await_received(&lv.b, 2));
+    live_group_call(&lv, 7, forget);
+    atomic_store(&lv.b.mark, 5);
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(5, ask(lv.proxy_port, 0xc903));
+    ASSERT_EQm("the cut group's refresh was not stored", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh landing after its group was forgotten stored again, or never released. */
+TEST a_refresh_for_a_forgotten_group_ends_unstored(void) {
+    CHECK_CALL(refresh_cut_mid_flight(true));
+    PASS();
+}
+
+/* Catches: a refresh landing after its group's pools were closed stored again, or never released. */
+TEST a_refresh_for_a_closed_group_ends_unstored(void) {
+    CHECK_CALL(refresh_cut_mid_flight(false));
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -3800,5 +4070,15 @@ int main(int argc, char **argv)
     RUN_TEST(an_answer_landing_after_its_pool_was_closed_is_not_cached);
     RUN_TEST(a_send_that_would_block_is_covered_by_the_resend);
     RUN_TEST(a_late_answer_from_a_replaced_generation_is_not_cached);
+    RUN_TEST(failed_refreshes_never_rest_the_group);
+    RUN_TEST(a_hit_in_the_last_tenth_refreshes_the_entry_once);
+    RUN_TEST(a_failed_refresh_leaves_the_entry_and_a_later_hit_tries_again);
+    RUN_TEST(refreshes_are_capped_at_sixteen);
+    RUN_TEST(refreshes_do_not_take_the_client_budget);
+    RUN_TEST(no_refresh_starts_while_the_group_rests_or_probes);
+    RUN_TEST(a_silent_refresh_ends_at_the_timeout_and_leaves_the_entry);
+    RUN_TEST(a_refresh_in_flight_at_shutdown_is_freed);
+    RUN_TEST(a_refresh_for_a_forgotten_group_ends_unstored);
+    RUN_TEST(a_refresh_for_a_closed_group_ends_unstored);
     GREATEST_MAIN_END();
 }

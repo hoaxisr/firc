@@ -91,6 +91,8 @@ struct firc_dnsproxy {
 
     struct exchange *held_head;
     size_t n_held;
+    struct exchange *prefetch_head;
+    size_t n_prefetch;
 };
 
 static void pool_init(sock_pool_t *p, size_t cap)
@@ -240,6 +242,7 @@ typedef struct exchange {
     firc_anscache_key_t ckey;
     bool cacheable;
     bool want_prefetch;
+    bool prefetch;
     uint8_t *cached;
     size_t cached_len;
 
@@ -251,6 +254,7 @@ typedef struct exchange {
     size_t held_len;
     firc_dns_msg_t *held_msg;
     struct exchange *held_next;
+    struct exchange *prefetch_next;
 } exchange_t;
 
 static uint64_t mono_ms(void)
@@ -468,6 +472,7 @@ static bool rearm_fd(firc_loop_t *loop, int fd, uint32_t events, firc_fd_cb cb,
 }
 
 static void held_unlink(firc_dnsproxy_t *p, exchange_t *ex);
+static void prefetch_unlink(firc_dnsproxy_t *p, exchange_t *ex);
 static void leg_failed(exchange_t *ex, firc_dns_resolver_t why);
 static void tunnel_failed(exchange_t *ex, firc_dns_resolver_t why);
 static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex);
@@ -531,6 +536,10 @@ static void exchange_finish(exchange_t *ex, bool pool_upstream)
         ex->client_fd = -1;
     }
     if (ex->held_msg != NULL) { held_unlink(p, ex); } /* a TCP client gone mid-hold */
+    if (ex->prefetch) {
+        prefetch_unlink(p, ex);
+        firc_anscache_prefetch_done(p->cache, &ex->ckey);
+    }
     if (ex->counted) { atomic_fetch_sub(&p->inflight, 1); }
     exchange_free(ex);
 }
@@ -611,6 +620,18 @@ static void held_unlink(firc_dnsproxy_t *p, exchange_t *ex)
         }
     }
     ex->held_next = NULL;
+}
+
+static void prefetch_unlink(firc_dnsproxy_t *p, exchange_t *ex)
+{
+    for (exchange_t **pp = &p->prefetch_head; *pp != NULL; pp = &(*pp)->prefetch_next) {
+        if (*pp == ex) {
+            *pp = ex->prefetch_next;
+            p->n_prefetch--;
+            break;
+        }
+    }
+    ex->prefetch_next = NULL;
 }
 
 static void held_send(exchange_t *ex)
@@ -767,6 +788,11 @@ static void deliver_parsed(exchange_t *ex, firc_dns_msg_t *msg, const uint8_t *r
     firc_dnsproxy_t *p = ex->p;
     const char *network = ex->is_tcp ? "tcp" : "udp";
     firc_dns_verdict_t verdict = FIRC_DNS_PASS;
+    if (ex->prefetch) {
+        firc_dns_msg_free(msg);
+        exchange_finish(ex, true);
+        return;
+    }
     if (p->cb != NULL) {
         firc_ip_t client;
         verdict = p->cb(msg, client_ip(ex, &client) ? &client : NULL, network,
@@ -1184,8 +1210,12 @@ static void tunnel_failed(exchange_t *ex, firc_dns_resolver_t why)
     }
     legs_release(p, ex, true);
     upstream_release(p, ex, false);
-    health_failure(p, ex);
     ex->tunnel = false;
+    if (ex->prefetch) {
+        exchange_finish(ex, false);
+        return;
+    }
+    health_failure(p, ex);
     health_fallback_counted(p, ex->route.group_id);
     ex->resolver = (uint8_t)why;
     FIRC_DEBUG("group resolver failed (%d), asking the common upstream", (int)why);
@@ -1297,13 +1327,49 @@ static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex)
     ex->timer_id = tid;
 }
 
+static void prefetch_start(firc_dnsproxy_t *p, const exchange_t *src)
+{
+    group_health_t *h = health_lookup(p, src->route.group_id);
+    bool own = h != NULL && h->gen == src->route.gen;
+    bool gated = own && h->rest_until_ms != 0;
+    exchange_t *ex = (p->n_prefetch < FIRC_DNSPROXY_MAX_PREFETCH && !gated) ? calloc(1, sizeof(*ex)) : NULL;
+    uint8_t *req = ex != NULL ? malloc(src->req_len) : NULL;
+    if (req == NULL) {
+        free(ex);
+        firc_anscache_prefetch_done(p->cache, &src->ckey);
+        return;
+    }
+    memcpy(req, src->req, src->req_len);
+    ex->p = p;
+    ex->upstream_fd = -1;
+    ex->client_fd = -1;
+    ex->req = req;
+    ex->req_len = src->req_len;
+    ex->udp_max = src->udp_max;
+    ex->qid = src->qid;
+    ex->n_q = src->n_q;
+    ex->q = src->q;
+    ex->route = src->route;
+    ex->ckey = src->ckey;
+    ex->cacheable = true;
+    ex->prefetch = true;
+    ex->tunnel = true;
+    ex->server = own ? h->preferred % src->route.n_servers : 0;
+    ex->resolver = FIRC_DNS_RESOLVER_GROUP;
+    ex->deadline_ms = mono_ms() + p->cfg.timeout_ms;
+    ex->prefetch_next = p->prefetch_head;
+    p->prefetch_head = ex;
+    p->n_prefetch++;
+    start_upstream(p, ex);
+}
+
 static void exchange_begin(firc_dnsproxy_t *p, exchange_t *ex)
 {
     if (ex->cached == NULL) {
         start_upstream(p, ex);
         return;
     }
-    if (ex->want_prefetch) { firc_anscache_prefetch_done(p->cache, &ex->ckey); }
+    if (ex->want_prefetch) { prefetch_start(p, ex); }
     uint8_t *wire = ex->cached;
     size_t len = ex->cached_len;
     ex->cached = NULL;
@@ -1743,6 +1809,14 @@ void firc_dnsproxy_destroy(firc_dnsproxy_t *p)
         }
         exchange_free(ex);
     }
+    while (p->prefetch_head != NULL) {
+        exchange_t *ex = p->prefetch_head;
+        p->prefetch_head = ex->prefetch_next;
+        if (ex->timer_id > 0) { firc_loop_del_timer(p->loop, ex->timer_id); }
+        legs_release(p, ex, false);
+        exchange_free(ex);
+    }
+    p->n_prefetch = 0;
     if (p->udp_fd >= 0) {
         firc_loop_del_fd(p->loop, p->udp_fd);
         close(p->udp_fd);
@@ -1820,4 +1894,9 @@ void firc_dnsproxy_set_cache(firc_dnsproxy_t *p, size_t max_entries, size_t max_
 void firc_dnsproxy_set_cache_clock_for_test(firc_dnsproxy_t *p, uint64_t (*now_ms)(void))
 {
     p->cache_now = now_ms != NULL ? now_ms : mono_ms;
+}
+
+size_t firc_dnsproxy_prefetching(const firc_dnsproxy_t *p)
+{
+    return p == NULL ? 0 : p->n_prefetch;
 }
