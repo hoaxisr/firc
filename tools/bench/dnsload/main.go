@@ -25,6 +25,7 @@ var (
 	mode        = flag.String("mode", "load", "load or probe")
 	probeLimit  = flag.Duration("probe-limit", 30*time.Second, "max total time for probe mode")
 	label       = flag.String("label", "", "free-form label copied into the JSON output")
+	qtypeName   = flag.String("qtype", "A", "query type, e.g. A, AAAA, TXT")
 )
 
 type result struct {
@@ -46,7 +47,7 @@ type result struct {
 
 func query(c *dns.Client, name string) (time.Duration, error) {
 	m := new(dns.Msg)
-	m.SetQuestion(name, dns.TypeA)
+	m.SetQuestion(name, dns.StringToType[*qtypeName])
 	m.Id = dns.Id()
 	_, rtt, err := c.Exchange(m, *server)
 	return rtt, err
@@ -98,7 +99,7 @@ func main() {
 			for time.Now().Before(deadline) {
 				name := fmt.Sprintf(*pattern, rng.Intn(*nDomains))
 				m := new(dns.Msg)
-				m.SetQuestion(name, dns.TypeA)
+				m.SetQuestion(name, dns.StringToType[*qtypeName])
 				m.Id = dns.Id()
 				atomic.AddInt64(&sent, 1)
 				var rtt time.Duration
