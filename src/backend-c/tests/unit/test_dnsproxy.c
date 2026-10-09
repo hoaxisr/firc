@@ -3995,6 +3995,93 @@ TEST a_refresh_for_a_closed_group_ends_unstored(void) {
     PASS();
 }
 
+typedef struct {
+    uint16_t port;
+    uint16_t id;
+    int got;
+} tcp_ask_t;
+
+static void *tcp_ask_thread(void *arg) {
+    tcp_ask_t *t = arg;
+    t->got = ask_tcp(t->port, t->id);
+    return NULL;
+}
+
+/* Catches: a TCP tunnel answer in flight across a pool close stored under the live key. */
+TEST a_tcp_tunnel_answer_landing_after_its_pool_was_closed_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    g_troute.ports[0] = port;
+    tcp_ask_t t = {.port = lv.proxy_port, .id = 0xcb01, .got = -1};
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, tcp_ask_thread, &t));
+    for (int i = 0; i < 400 && atomic_load(&g_tcp_probe.received) < 1; i++) { pause_ms(5); }
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    live_close_group(&lv, 7);
+    atomic_store(&g_tcp_probe.go, 1);
+    pthread_join(th, NULL);
+    ASSERT_EQ(3, t.got);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcb02));
+    ASSERT_EQm("asked the resolver, not the cache", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, atomic_load(&g_tcp_probe.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a TCP tunnel answer compared against a stale epoch, so after one pool close nothing over TCP is cached again. */
+TEST a_tcp_tunnel_answer_after_an_earlier_pool_close_is_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    atomic_store(&g_tcp_probe.go, 1);
+    g_troute.ports[0] = port;
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd01));
+    live_close_group(&lv, 7);
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd02));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd03));
+    ASSERT_EQm("the answer after the close was cached", FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, atomic_load(&g_tcp_probe.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a rest that has run out still blocking refreshes until some client query ends it. */
+TEST a_hit_after_the_rest_ran_out_refreshes(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_rest_ms = 300;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xcc01, 0, 'a'));
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xcc10 + i), 0, (char)('b' + i))); }
+    pause_ms(400);
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&g_cache_skew_ms, 271000);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xcc20, 0, 'a'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERTm("the hit refreshed the entry", await_received(&lv.b, 2));
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -4113,5 +4200,8 @@ int main(int argc, char **argv)
     RUN_TEST(a_refresh_in_flight_at_shutdown_is_freed);
     RUN_TEST(a_refresh_for_a_forgotten_group_ends_unstored);
     RUN_TEST(a_refresh_for_a_closed_group_ends_unstored);
+    RUN_TEST(a_tcp_tunnel_answer_landing_after_its_pool_was_closed_is_not_cached);
+    RUN_TEST(a_tcp_tunnel_answer_after_an_earlier_pool_close_is_cached);
+    RUN_TEST(a_hit_after_the_rest_ran_out_refreshes);
     GREATEST_MAIN_END();
 }

@@ -241,6 +241,7 @@ typedef struct exchange {
     bool probe;
     firc_anscache_key_t ckey;
     bool cacheable;
+    uint64_t tpool_epoch;
     bool want_prefetch;
     bool prefetch;
     uint8_t *cached;
@@ -775,7 +776,7 @@ static bool question_matches(const exchange_t *ex, const firc_dns_msg_t *msg)
            name_eq_nocase(a->name, ex->q.name, a->name_len);
 }
 
-/* UDP: ignore it and keep waiting (late duplicate, spoof); TCP: an unusable answer. */
+/* UDP: ignore it and keep waiting (late duplicate, spoof); TCP or a cache hit: an unusable answer. */
 static void stray_answer(exchange_t *ex)
 {
     FIRC_DEBUG("upstream message does not answer the query: %s",
@@ -917,6 +918,8 @@ static void deliver_response(exchange_t *ex, const uint8_t *resp, size_t resp_le
             leg_failed(ex, why);
             return;
         }
+        tunnel_pool_t *t = tpool_find(p, &ex->route, ex->server);
+        if (t == NULL || t->epoch != ex->tpool_epoch) { ex->cacheable = false; }
         tunnel_won(ex, msg, resp, resp_len);
     }
     deliver_parsed(ex, msg, resp, resp_len);
@@ -1250,6 +1253,8 @@ static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex)
     socklen_t dst_len = p->upstream_sa_len;
     int family = p->family;
     if (ex->tunnel) {
+        tunnel_pool_t *t = tpool_for(p, &ex->route, ex->server);
+        ex->tpool_epoch = t != NULL ? t->epoch : 0;
         dst = (const struct sockaddr *)&ex->route.servers[ex->server];
         dst_len = ex->route.server_lens[ex->server];
         family = ex->route.servers[ex->server].ss_family;
@@ -1331,7 +1336,8 @@ static void prefetch_start(firc_dnsproxy_t *p, const exchange_t *src)
 {
     group_health_t *h = health_lookup(p, src->route.group_id);
     bool own = h != NULL && h->gen == src->route.gen;
-    bool gated = own && h->rest_until_ms != 0;
+    uint64_t now = mono_ms();
+    bool gated = own && h->rest_until_ms != 0 && (now < h->rest_until_ms || h->probing);
     exchange_t *ex = (p->n_prefetch < FIRC_DNSPROXY_MAX_PREFETCH && !gated) ? calloc(1, sizeof(*ex)) : NULL;
     uint8_t *req = ex != NULL ? malloc(src->req_len) : NULL;
     if (req == NULL) {
