@@ -1,12 +1,16 @@
 #include "greatest.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <linux/rtnetlink.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "fake_conntrack.h"
@@ -24,7 +28,10 @@
 #include "firc/netfilter_cleaner.h"
 #include "firc/port_remap.h"
 #include "firc/log.h"
+#include "firc/anscache.h"
 #include "firc/dnspipeline.h"
+#include "firc/dnsproxy.h"
+#include "firc/dnswire.h"
 #include "firc/events.h"
 #include "firc/recall.h"
 #include "firc/rulesnap.h"
@@ -1608,6 +1615,36 @@ TEST a_pool_change_does_not_take_the_interrupting_lock_and_asks_for_a_pass(void)
     PASS();
 }
 
+/* Catches: a pool change asking for its pass with the long settle meant for chain changes. */
+TEST a_pool_change_gets_its_pass_after_the_short_settle(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    firc_nfcommit_t *c = firc_app_committer_for_test(l.app);
+    ASSERT(c != NULL);
+    firc_app_pool_changed(l.app);
+    for (int i = 0; i < 500 && !pass_landed(&l); i++) { sleep_ms(10); }
+    ASSERT(pass_landed(&l));
+    uint64_t before = firc_nfcommit_passes(c);
+    for (int quiet = 0; quiet < 45; quiet++) {
+        sleep_ms(10);
+        uint64_t now = firc_nfcommit_passes(c);
+        if (now != before) {
+            before = now;
+            quiet = 0;
+        }
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_app_pool_changed(l.app);
+    for (int i = 0; i < 2000 && firc_nfcommit_passes(c) == before; i++) { sleep_ms(1); }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (long)(t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    ASSERT(firc_nfcommit_passes(c) > before);
+    ASSERT_LT(ms, 145);
+    locked_app_down(&l);
+    PASS();
+}
+
 /* Catches: a group enabled outside a pass built from a stale snapshot, missing its chunk rules. */
 TEST outside_a_pass_the_rules_read_the_current_snapshot(void) {
     firc_fakeip_cfg_t c = {0};
@@ -2278,6 +2315,246 @@ TEST a_held_answer_waits_only_for_the_families_it_carries(void) {
     firc_app_destroy(app);
     firc_config_clear(&cfg);
     firc_fakeip_free(pool);
+    PASS();
+}
+
+typedef struct {
+    int fd;
+    uint16_t port;
+    _Atomic int received;
+    _Atomic int stop;
+    pthread_t th;
+} resolver_stub_t;
+
+static void *resolver_stub_serve(void *arg) {
+    resolver_stub_t *s = arg;
+    uint8_t q[512], a[600];
+    while (!atomic_load(&s->stop)) {
+        struct sockaddr_storage from;
+        socklen_t fl = sizeof(from);
+        ssize_t n = recvfrom(s->fd, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
+        if (n < 12) { continue; }
+        atomic_fetch_add(&s->received, 1);
+        size_t qd_end = 12;
+        while (qd_end < (size_t)n && q[qd_end] != 0) { qd_end += 1u + q[qd_end]; }
+        qd_end += 5;
+        if (qd_end > (size_t)n) { continue; }
+        memcpy(a, q, qd_end);
+        a[2] = 0x81; a[3] = 0x80;
+        a[6] = 0; a[7] = 1; a[8] = 0; a[9] = 0; a[10] = 0; a[11] = 0;
+        static const uint8_t rr[] = {0xc0, 0x0c, 0, FIRC_DNS_TYPE_A, 0, 1, 0, 0, 0x01, 0x2c, 0, 4, 93, 184, 216, 34};
+        memcpy(a + qd_end, rr, sizeof(rr));
+        sendto(s->fd, a, qd_end + sizeof(rr), 0, (struct sockaddr *)&from, fl);
+    }
+    return NULL;
+}
+
+static bool resolver_stub_start(resolver_stub_t *s) {
+    memset(s, 0, sizeof(*s));
+    s->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s->fd < 0) { return false; }
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+    setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t sl = sizeof(sa);
+    if (bind(s->fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+        getsockname(s->fd, (struct sockaddr *)&sa, &sl) != 0 ||
+        pthread_create(&s->th, NULL, resolver_stub_serve, s) != 0) {
+        close(s->fd);
+        return false;
+    }
+    s->port = ntohs(sa.sin_port);
+    return true;
+}
+
+static void resolver_stub_stop(resolver_stub_t *s) {
+    atomic_store(&s->stop, 1);
+    pthread_join(s->th, NULL);
+    close(s->fd);
+}
+
+static uint16_t free_udp_port(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { return 0; }
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t sl = sizeof(sa);
+    uint16_t port = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0 && getsockname(fd, (struct sockaddr *)&sa, &sl) == 0) {
+        port = ntohs(sa.sin_port);
+    }
+    close(fd);
+    return port;
+}
+
+typedef struct {
+    firc_app_t *app;
+    firc_dns_pipeline_t *pipeline;
+} app_dns_t;
+
+static firc_dns_verdict_t app_on_response(firc_dns_msg_t *msg, const firc_ip_t *client, const char *network,
+                                          firc_dns_resolver_t resolver, void *ud) {
+    (void)network;
+    app_dns_t *d = ud;
+    bool changed = false;
+    firc_dns_verdict_t v =
+        firc_dns_pipeline_handle_message_from(d->pipeline, msg, (int64_t)time(NULL), client, resolver, &changed);
+    if (changed) { firc_app_pool_changed(d->app); }
+    return v;
+}
+
+static int unmarked_set_mark(void *ud, int fd, uint32_t mark) {
+    (void)ud;
+    (void)fd;
+    (void)mark;
+    return 0;
+}
+
+static int connect_to_stub(void *ud, int fd, const struct sockaddr *sa, socklen_t len) {
+    (void)sa;
+    (void)len;
+    const resolver_stub_t *s = ud;
+    struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(s->port),
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    return connect(fd, (const struct sockaddr *)&to, sizeof(to));
+}
+
+static bool ask_a_fake(uint16_t port, uint16_t id, firc_ip_t *fake) {
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    if (c < 0) { return false; }
+    struct timeval tv = {.tv_sec = 4, .tv_usec = 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in pa = {.sin_family = AF_INET, .sin_port = htons(port),
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    uint8_t q[64] = {(uint8_t)(id >> 8), (uint8_t)id, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+    static const uint8_t name[] = {1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+                                   0, FIRC_DNS_TYPE_A, 0, 1};
+    memcpy(q + 12, name, sizeof(name));
+    size_t qlen = 12 + sizeof(name);
+    uint8_t r[1024];
+    ssize_t n = -1;
+    if (sendto(c, q, qlen, 0, (struct sockaddr *)&pa, sizeof(pa)) == (ssize_t)qlen) {
+        n = recv(c, r, sizeof(r), 0);
+    }
+    close(c);
+    if (n <= 0) { return false; }
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(r, (size_t)n, &msg) != FIRC_OK) { return false; }
+    bool got = false;
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        if (msg->answers[i].rtype == FIRC_DNS_TYPE_A && msg->answers[i].rdata_len == 4) {
+            memcpy(fake->b, msg->answers[i].rdata, 4);
+            fake->len = 4;
+            got = true;
+        }
+    }
+    firc_dns_msg_free(msg);
+    return got;
+}
+
+typedef struct {
+    locked_app_t *l;
+    firc_loop_t *loop;
+    uint16_t port;
+    firc_ip_t first, second;
+    bool got_first, got_second;
+    long second_ms;
+    uint64_t passes_before, passes_after;
+} cached_run_t;
+
+static void *cached_run_client(void *ud) {
+    cached_run_t *r = ud;
+    r->got_first = ask_a_fake(r->port, 0x7101, &r->first);
+    sleep_ms(100);
+    r->passes_before = firc_app_nf_passes_for_test(r->l->app);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    r->got_second = ask_a_fake(r->port, 0x7102, &r->second);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    r->second_ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    sleep_ms(300);
+    r->passes_after = firc_app_nf_passes_for_test(r->l->app);
+    while (firc_loop_post(r->loop, stop_the_loop, NULL) != FIRC_OK) { sched_yield(); }
+    return NULL;
+}
+
+/* Catches: a cache hit for a name whose fake address is already committed waiting for a pass anyway. */
+TEST a_cached_answer_for_a_committed_address_is_not_held(void) {
+    resolver_stub_t stub;
+    ASSERT(resolver_stub_start(&stub));
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    app_dns_t ctx = {0};
+    firc_dnsproxy_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.listen_addr = "127.0.0.1";
+    pcfg.listen_port = free_udp_port();
+    pcfg.upstream_addr = "127.0.0.1";
+    pcfg.upstream_port = free_udp_port();
+    pcfg.timeout_ms = 3000;
+    pcfg.max_concurrent = 16;
+    pcfg.max_idle_conns = 2;
+    pcfg.hold_ms = 5000;
+    firc_dnsproxy_t *proxy = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dnsproxy_create(&pcfg, loop, app_on_response, &ctx, &proxy));
+    firc_dnsproxy_sock_ops_t ops = firc_dnsproxy_sock_ops_real;
+    ops.set_mark = unmarked_set_mark;
+    ops.connect = connect_to_stub;
+    ops.ud = &stub;
+    firc_dnsproxy_set_sock_ops(proxy, &ops);
+    firc_dnsproxy_set_cache(proxy, FIRC_ANSCACHE_ENTRIES, FIRC_ANSCACHE_BYTES);
+
+    g_app_proxy = proxy;
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    ctx.app = l.app;
+    ctx.pipeline = l.pipeline;
+    firc_dns_pipeline_set_pool(l.pipeline, l.pool, 300);
+    firc_dnsproxy_set_router(proxy, firc_resolve_router_decide, l.router);
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+
+    firc_group_t *g = make_group("media", true);
+    firc_strset(&g->iface, "lo");
+    firc_strset(&g->resolve.server, "192.0.2.53:53");
+    firc_rule_t *rule = make_rule();
+    firc_strset(&rule->rule, "a.example.com");
+    firc_group_add_rule(g, rule);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT(wait_written_after(&l, 0));
+    ASSERT_EQ(FIRC_OK, firc_dnsproxy_start(proxy));
+
+    uint64_t since = journal_mark();
+    cached_run_t run = {.l = &l, .loop = loop, .port = pcfg.listen_port};
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, cached_run_client, &run));
+    int guard = 0;
+    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 15000, 0, stop_the_loop, loop, &guard));
+    ASSERT_EQ(FIRC_OK, firc_loop_run(loop));
+    pthread_join(th, NULL);
+
+    ASSERTm("the first answer came once its pass landed", run.got_first);
+    ASSERTm("the second answer came", run.got_second);
+    ASSERT_EQ_FMTm("with the same fake address", 0, memcmp(run.first.b, run.second.b, 4), "%d");
+    ASSERT_EQ_FMT(198, (int)run.first.b[0], "%d");
+    ASSERT_LTm("the second answer was not held for a pass", run.second_ms, 1000L);
+    ASSERT_EQ_FMTm("no pass was asked for the second answer", run.passes_before, run.passes_after, "%" PRIu64);
+    ASSERT_EQ_FMT((size_t)0, firc_dnsproxy_held(proxy), "%zu");
+    ASSERT_EQ_FMTm("the group's resolver was asked once", 1, atomic_load(&stub.received), "%d");
+
+    size_t n = journal(since);
+    int group = 0, cache = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (g_events[i].kind != FIRC_EVENT_DNS || strcmp(g_events[i].u.dns.name, "a.example.com") != 0) { continue; }
+        if (g_events[i].u.dns.resolver == FIRC_DNS_RESOLVER_GROUP) { group++; }
+        if (g_events[i].u.dns.resolver == FIRC_DNS_RESOLVER_CACHE) { cache++; }
+    }
+    ASSERT_EQ_FMTm("the first answer was the group's", 1, group, "%d");
+    ASSERT_EQ_FMTm("the second came from the cache", 1, cache, "%d");
+
+    locked_app_down(&l);
+    firc_dnsproxy_destroy(proxy);
+    firc_loop_destroy(loop);
+    resolver_stub_stop(&stub);
     PASS();
 }
 
@@ -5333,6 +5610,7 @@ int main(int argc, char **argv) {
     RUN_TEST(stopping_the_daemon_ends_the_capture);
     RUN_TEST(a_capture_logs_its_start_its_stop_and_its_summary);
     RUN_TEST(a_pool_change_does_not_take_the_interrupting_lock_and_asks_for_a_pass);
+    RUN_TEST(a_pool_change_gets_its_pass_after_the_short_settle);
     RUN_TEST(a_replacement_keeps_the_pool_state_of_groups_that_persist);
     RUN_TEST(outside_a_pass_the_rules_read_the_current_snapshot);
     RUN_TEST(replace_groups_takes_the_netfilter_lock_once);
@@ -5350,6 +5628,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_list_group_that_is_turned_off_drops_its_flows);
     RUN_TEST(a_removed_group_is_forgotten_by_the_pool);
     RUN_TEST(a_held_answer_waits_only_for_the_families_it_carries);
+    RUN_TEST(a_cached_answer_for_a_committed_address_is_not_held);
     RUN_TEST(remove_by_id_and_by_index);
     RUN_TEST(list_interfaces_show_all_finds_loopback);
     RUN_TEST(save_config_round_trips);

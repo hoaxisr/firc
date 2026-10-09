@@ -22,7 +22,8 @@ export type DnsResolverSource =
   | "fallback_servfail"
   | "fallback_refused"
   | "fallback_sink"
-  | "health_skip";
+  | "health_skip"
+  | "cache";
 
 export type DnsEvent = {
   seq: number;

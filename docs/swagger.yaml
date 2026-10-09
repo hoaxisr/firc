@@ -252,7 +252,9 @@ definitions:
           time, servfail/refused -- it answered SERVFAIL/REFUSED or garbage,
           sink -- it answered with a sink address or an address from firc's
           pool); health_skip -- the group's DNS is resting after three
-          failures in a row and the common upstream was asked.
+          failures in a row and the common upstream was asked; cache -- the
+          group's DNS answered this name earlier and that answer was still
+          valid.
         enum:
         - upstream
         - group
@@ -262,6 +264,7 @@ definitions:
         - fallback_refused
         - fallback_sink
         - health_skip
+        - cache
         type: string
       group:
         description: >-

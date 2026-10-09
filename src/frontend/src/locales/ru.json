@@ -202,6 +202,7 @@
   "fallbacks: {n}": "через общий upstream: {n}",
   "fetches and parses, saves nothing": "скачивает и разбирает, ничего не сохраняя",
   "from the list": "из списка",
+  "from the group's DNS cache": "из кэша DNS группы",
   "list": "список",
   "of its own": "своих",
   "optional: without it the group is manual": "необязательно: без него группа ручная",

@@ -28,6 +28,7 @@ struct firc_nfcommit {
     bool stopping;
     bool pending;
     bool full_owed;
+    bool long_owed;
     size_t n_requests;
     bool running;
     uint64_t passes;
@@ -35,6 +36,9 @@ struct firc_nfcommit {
 
     unsigned delay_ms;
     unsigned max_delay_ms;
+    unsigned addr_delay_ms;
+    unsigned addr_idle_ms;
+    uint64_t last_end_ms;
 
     /* 0: no failing run. Guarded by mu. */
     uint64_t fail_mono_ms;
@@ -134,6 +138,8 @@ firc_nfcommit_t *firc_nfcommit_new(firc_nfcommit_rebuild_fn fn, void *ud) {
     c->full_owed = true;
     c->delay_ms = FIRC_NFCOMMIT_DELAY_MS;
     c->max_delay_ms = FIRC_NFCOMMIT_MAX_DELAY_MS;
+    c->addr_delay_ms = FIRC_NFCOMMIT_ADDR_DELAY_MS;
+    c->addr_idle_ms = FIRC_NFCOMMIT_ADDR_IDLE_MS;
     c->failing_after_ms = FIRC_NFCOMMIT_FAILING_AFTER_MS;
     return c;
 }
@@ -150,6 +156,16 @@ void firc_nfcommit_set_delays_for_test(firc_nfcommit_t *c, unsigned delay_ms, un
     if (!c) { return; }
     c->delay_ms = delay_ms;
     c->max_delay_ms = max_delay_ms;
+}
+
+void firc_nfcommit_set_addr_delay_for_test(firc_nfcommit_t *c, unsigned ms) {
+    if (!c) { return; }
+    c->addr_delay_ms = ms;
+}
+
+void firc_nfcommit_set_addr_idle_for_test(firc_nfcommit_t *c, unsigned ms) {
+    if (!c) { return; }
+    c->addr_idle_ms = ms;
 }
 
 void firc_nfcommit_set_failing_after_for_test(firc_nfcommit_t *c, unsigned ms) {
@@ -214,9 +230,22 @@ void firc_nfcommit_request_more(firc_nfcommit_t *c) {
 
     pthread_mutex_lock(&c->mu);
     c->pending = true;
+    c->long_owed = true;
     pthread_cond_signal(&c->cv);
     pthread_mutex_unlock(&c->mu);
     /* No raise: the pass in flight finishes and `pending` makes another follow. */
+}
+
+void firc_nfcommit_request_addresses(firc_nfcommit_t *c) {
+    if (!c) { return; }
+
+    pthread_mutex_lock(&c->mu);
+    c->pending = true;
+    if (c->running || (c->last_end_ms != 0 && mono_ms() - c->last_end_ms < (uint64_t)c->addr_idle_ms)) {
+        c->long_owed = true;
+    }
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->mu);
 }
 
 void firc_nfcommit_interrupt(firc_nfcommit_t *c) {
@@ -251,7 +280,7 @@ static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
 
 static void *committer_main(void *arg) {
     firc_nfcommit_t *c = arg;
-    unsigned delay_ms = c->delay_ms;
+    unsigned backoff_ms = 0;
 
     for (;;) {
         pthread_mutex_lock(&c->mu);
@@ -260,16 +289,24 @@ static void *committer_main(void *arg) {
         pthread_mutex_unlock(&c->mu);
         if (stopping) { break; }
 
-        if (!settle(c, delay_ms)) { break; }
+        unsigned short_ms = c->addr_delay_ms < c->delay_ms ? c->addr_delay_ms : c->delay_ms;
+        if (!settle(c, backoff_ms != 0 ? backoff_ms : short_ms)) { break; }
 
         pthread_mutex_lock(&c->mu);
+        if (backoff_ms == 0 && short_ms < c->delay_ms && !c->stopping && (c->long_owed || c->full_owed)) {
+            pthread_mutex_unlock(&c->mu);
+            if (!settle(c, c->delay_ms - short_ms)) { break; }
+            pthread_mutex_lock(&c->mu);
+        }
         if (c->stopping) {
             pthread_mutex_unlock(&c->mu);
             break;
         }
         c->pending = false;
         bool full = c->full_owed;
+        bool was_long = c->long_owed || full;
         c->full_owed = false;
+        c->long_owed = false;
         /* Cleared before `running` is published, under mu, or a raise in the gap is lost. */
         firc_cancel_clear(c->cancel);
         c->running = true;
@@ -280,6 +317,7 @@ static void *committer_main(void *arg) {
 
         pthread_mutex_lock(&c->mu);
         c->running = false;
+        c->last_end_ms = mono_ms();
         if (err == FIRC_OK) { c->last_ok = ordinal; }
         unsigned hard_run = 0;
         int64_t hard_wall = 0;
@@ -290,24 +328,27 @@ static void *committer_main(void *arg) {
         if (stopping) { break; }
 
         if (err == FIRC_OK) {
-            delay_ms = c->delay_ms;
+            backoff_ms = 0;
             continue;
         }
 
         if (err == FIRC_ERR_CANCELED) {
             FIRC_DEBUG("netfilter table rebuild interrupted, starting over");
-            delay_ms = c->delay_ms;
+            backoff_ms = 0;
         } else if (err == FIRC_ERR_AGAIN) {
             FIRC_DEBUG("netfilter table changed during rebuild, starting over");
-            delay_ms = c->delay_ms;
+            backoff_ms = 0;
+            was_long = true;
         } else {
             FIRC_DEBUG("failed to rebuild netfilter table (%s), starting over", firc_err_str(err));
-            delay_ms = delay_ms * 2 < c->max_delay_ms ? delay_ms * 2 : c->max_delay_ms;
+            unsigned base = backoff_ms != 0 ? backoff_ms : c->delay_ms;
+            backoff_ms = base * 2 < c->max_delay_ms ? base * 2 : c->max_delay_ms;
         }
 
         pthread_mutex_lock(&c->mu);
         c->pending = true;
         c->full_owed = c->full_owed || full;
+        c->long_owed = c->long_owed || was_long;
         pthread_mutex_unlock(&c->mu);
     }
 

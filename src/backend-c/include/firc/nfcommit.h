@@ -30,6 +30,12 @@ void firc_nfcommit_request(firc_nfcommit_t *c);
 /* Thread-safe, non-blocking, NULL-safe: asks for another pass without aborting (aborting here livelocks). */
 void firc_nfcommit_request_more(firc_nfcommit_t *c);
 
+/* Thread-safe, non-blocking, NULL-safe: a pass for new fake addresses; settles FIRC_NFCOMMIT_ADDR_DELAY_MS only if the last pass ended FIRC_NFCOMMIT_ADDR_IDLE_MS ago, else long. */
+void firc_nfcommit_request_addresses(firc_nfcommit_t *c);
+
+#define FIRC_NFCOMMIT_ADDR_DELAY_MS 25u
+#define FIRC_NFCOMMIT_ADDR_IDLE_MS 300u
+
 /* Aborts the pass in flight, which reschedules itself. NULL-safe. */
 void firc_nfcommit_interrupt(firc_nfcommit_t *c);
 
@@ -58,6 +64,12 @@ void firc_nfcommit_set_failing_after_for_test(firc_nfcommit_t *c, unsigned ms);
 
 /* Tests only; call before start. */
 void firc_nfcommit_set_delays_for_test(firc_nfcommit_t *c, unsigned delay_ms, unsigned max_delay_ms);
+
+/* Tests only; call before start. */
+void firc_nfcommit_set_addr_delay_for_test(firc_nfcommit_t *c, unsigned ms);
+
+/* Tests only; call before start. */
+void firc_nfcommit_set_addr_idle_for_test(firc_nfcommit_t *c, unsigned ms);
 
 size_t firc_nfcommit_requests_for_test(firc_nfcommit_t *c);
 

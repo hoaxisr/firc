@@ -2933,7 +2933,7 @@ void firc_app_pool_changed(firc_app_t *app) {
         FIRC_ERROR("failed to snapshot the address pool: %s", firc_err_str(err));
     }
     if (app->committer) {
-        firc_nfcommit_request_more(app->committer);
+        firc_nfcommit_request_addresses(app->committer);
     } else {
         err = firc_app_rebuild_netfilter_kind(app, NULL, false);
         if (err != FIRC_OK) { FIRC_ERROR("netfilter rebuild failed: %s", firc_err_str(err)); }

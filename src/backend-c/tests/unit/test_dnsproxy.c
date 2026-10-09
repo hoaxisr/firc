@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 #include "firc/dnsproxy.h"
+#include "firc/anscache.h"
+#include "firc/events.h"
 #include "firc/dnswire.h"
 #include "firc/fakeip.h"
 #include "firc/log.h"
@@ -53,8 +55,7 @@ static bool free_ports(uint16_t *a_out, uint16_t *b_out) {
     return ok;
 }
 
-/* A query for a.example.com IN A, with an OPT record advertising `edns_size` when it is not 0. */
-static size_t build_query(uint8_t *buf, uint16_t id, uint16_t edns_size) {
+static size_t build_query_for(uint8_t *buf, uint16_t id, uint16_t edns_size, char first) {
     size_t p = 0;
     buf[p++] = (uint8_t)(id >> 8);
     buf[p++] = (uint8_t)id;
@@ -64,7 +65,8 @@ static size_t build_query(uint8_t *buf, uint16_t id, uint16_t edns_size) {
     buf[p++] = 0x00; buf[p++] = 0x00;
     buf[p++] = 0x00; buf[p++] = 0x00;
     buf[p++] = 0x00; buf[p++] = edns_size ? 0x01 : 0x00;
-    static const char *labels[] = {"a", "example", "com"};
+    const char first_label[2] = {first, '\0'};
+    const char *labels[] = {first_label, "example", "com"};
     for (size_t i = 0; i < 3; i++) {
         size_t l = strlen(labels[i]);
         buf[p++] = (uint8_t)l;
@@ -82,6 +84,11 @@ static size_t build_query(uint8_t *buf, uint16_t id, uint16_t edns_size) {
         buf[p++] = 0; buf[p++] = 0;
     }
     return p;
+}
+
+/* A query for a.example.com IN A, with an OPT record advertising `edns_size` when it is not 0. */
+static size_t build_query(uint8_t *buf, uint16_t id, uint16_t edns_size) {
+    return build_query_for(buf, id, edns_size, 'a');
 }
 
 static size_t build_ptr_query(uint8_t *buf, uint16_t id, const firc_ip_t *ip, bool edns) {
@@ -804,7 +811,7 @@ static int exchange(bool rewrite, bool report, bool disable_drop_aaaa, reply_t *
 typedef struct {
     int fd;
     uint16_t port;
-    uint8_t mark;
+    _Atomic uint8_t mark;
     _Atomic int received;
     _Atomic int hold;
     _Atomic int go;
@@ -821,6 +828,9 @@ typedef struct {
     _Atomic int second_a_sink;
     _Atomic int hold_ms;
     _Atomic int decoy_first;
+    _Atomic int drop;
+    _Atomic int tc;
+    _Atomic int replied;
 } stub_t;
 
 #define STUB_A_LAST_OCTET 46
@@ -834,6 +844,11 @@ static void *stub_serve(void *arg) {
         ssize_t n = recvfrom(s->fd, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
         if (n <= 0) { continue; }
         atomic_fetch_add(&s->received, 1);
+        int drops = atomic_load(&s->drop);
+        if (drops > 0) {
+            atomic_store(&s->drop, drops - 1);
+            continue;
+        }
         while (atomic_load(&s->hold) && !atomic_load(&s->go) && !atomic_load(&s->stop)) {
             struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
             nanosleep(&ts, NULL);
@@ -844,7 +859,8 @@ static void *stub_serve(void *arg) {
             nanosleep(&ts, NULL);
         }
         size_t alen = build_answer(q, (size_t)n, a);
-        a[STUB_A_LAST_OCTET] = s->mark;
+        a[STUB_A_LAST_OCTET] = atomic_load(&s->mark);
+        if (atomic_load(&s->tc)) { a[2] |= 0x02; }
         int rc = atomic_load(&s->rcode);
         if (rc != 0) { a[3] = (uint8_t)((a[3] & 0xf0) | (rc & 0x0f)); }
         if (atomic_load(&s->a_set)) {
@@ -890,13 +906,14 @@ static void *stub_serve(void *arg) {
             sendto(s->fd, d, alen, 0, (struct sockaddr *)&from, fl);
         }
         sendto(s->fd, a, alen, 0, (struct sockaddr *)&from, fl);
+        atomic_fetch_add(&s->replied, 1);
     }
     return NULL;
 }
 
 static bool stub_start(stub_t *s, uint8_t mark) {
     memset(s, 0, sizeof(*s));
-    s->mark = mark;
+    atomic_store(&s->mark, mark);
     s->fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (s->fd < 0) { return false; }
     struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
@@ -918,11 +935,20 @@ typedef struct {
     firc_loop_t *loop;
     firc_dnsproxy_t *proxy;
     uint16_t proxy_port;
-    stub_t a, b;
+    stub_t a, b, c;
     pthread_t th;
 } live_t;
 
 static bool g_live_hold;
+static bool g_live_cache;
+static _Atomic uint64_t g_cache_skew_ms;
+static _Atomic int g_live_hook_calls;
+
+static uint64_t skewed_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + atomic_load(&g_cache_skew_ms);
+}
 
 static _Atomic int g_live_resolver = -1;
 
@@ -932,6 +958,7 @@ static firc_dns_verdict_t live_hook(firc_dns_msg_t *msg, const firc_ip_t *client
     (void)client;
     (void)network;
     (void)ud;
+    atomic_fetch_add(&g_live_hook_calls, 1);
     atomic_store(&g_live_resolver, (int)resolver);
     return g_live_hold ? FIRC_DNS_HOLD : FIRC_DNS_PASS;
 }
@@ -954,6 +981,12 @@ static bool live_start(live_t *lv) {
         firc_loop_destroy(lv->loop);
         return false;
     }
+    if (!stub_start(&lv->c, 3)) {
+        stub_stop(&lv->b);
+        stub_stop(&lv->a);
+        firc_loop_destroy(lv->loop);
+        return false;
+    }
     firc_dnsproxy_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.listen_addr = "127.0.0.1";
@@ -965,12 +998,19 @@ static bool live_start(live_t *lv) {
     cfg.max_idle_conns = 2;
     cfg.hold_ms = 200;
     if (firc_dnsproxy_create(&cfg, lv->loop, live_hook, NULL, &lv->proxy) != FIRC_OK) {
+        stub_stop(&lv->c);
         stub_stop(&lv->b);
         stub_stop(&lv->a);
         firc_loop_destroy(lv->loop);
         return false;
     }
     if (g_live_ops != NULL) { firc_dnsproxy_set_sock_ops(lv->proxy, g_live_ops); }
+    if (g_live_cache) {
+        firc_dnsproxy_set_cache_clock_for_test(lv->proxy, skewed_ms);
+    } else {
+        firc_dnsproxy_set_cache(lv->proxy, 0, 0);
+    }
+    atomic_store(&g_live_hook_calls, 0);
     if (g_live_route != NULL) { firc_dnsproxy_set_router(lv->proxy, test_route, g_live_route); }
     firc_ip_t v4 = {.b = {198, 18, 0, 0}, .len = 4};
     firc_ip_t v6 = {.b = {0xfd, 0x00, 0x12, 0x34}, .len = 16};
@@ -978,6 +1018,7 @@ static bool live_start(live_t *lv) {
     if (g_live_rest_ms != 0) { firc_dnsproxy_set_health(lv->proxy, 0, g_live_rest_ms); }
     if (firc_dnsproxy_start(lv->proxy) != FIRC_OK) {
         firc_dnsproxy_destroy(lv->proxy);
+        stub_stop(&lv->c);
         stub_stop(&lv->b);
         stub_stop(&lv->a);
         firc_loop_destroy(lv->loop);
@@ -991,6 +1032,7 @@ static void live_stop(live_t *lv) {
     firc_loop_stop(lv->loop);
     pthread_join(lv->th, NULL);
     firc_dnsproxy_destroy(lv->proxy);
+    stub_stop(&lv->c);
     stub_stop(&lv->b);
     stub_stop(&lv->a);
     firc_loop_destroy(lv->loop);
@@ -999,6 +1041,8 @@ static void live_stop(live_t *lv) {
     g_live_timeout_ms = 0;
     g_live_max_concurrent = 0;
     g_live_rest_ms = 0;
+    g_live_cache = false;
+    atomic_store(&g_cache_skew_ms, 0);
 }
 
 typedef struct {
@@ -1027,7 +1071,7 @@ static firc_err_t live_set_upstream(live_t *lv, const char *addr, uint16_t port)
     return atomic_load(&s.done) ? s.err : FIRC_ERR_TIMEOUT;
 }
 
-static int ask_send(uint16_t port, uint16_t id) {
+static int ask_send_for(uint16_t port, uint16_t id, uint16_t edns, char first) {
     int c = socket(AF_INET, SOCK_DGRAM, 0);
     if (c < 0) { return -1; }
     struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
@@ -1038,12 +1082,16 @@ static int ask_send(uint16_t port, uint16_t id) {
     pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     pa.sin_port = htons(port);
     uint8_t q[512];
-    size_t qlen = build_query(q, id, 0);
+    size_t qlen = build_query_for(q, id, edns, first);
     if (sendto(c, q, qlen, 0, (struct sockaddr *)&pa, sizeof(pa)) != (ssize_t)qlen) {
         close(c);
         return -1;
     }
     return c;
+}
+
+static int ask_send(uint16_t port, uint16_t id) {
+    return ask_send_for(port, id, 0, 'a');
 }
 
 /* The last octet of the A record in the answer on `c`, or -1. Closes `c`. */
@@ -1067,6 +1115,28 @@ static int ask_read(int c) {
 static int ask(uint16_t port, uint16_t id) {
     int c = ask_send(port, id);
     return c < 0 ? -1 : ask_read(c);
+}
+
+static int ask_for(uint16_t port, uint16_t id, uint16_t edns, char first) {
+    int c = ask_send_for(port, id, edns, first);
+    return c < 0 ? -1 : ask_read(c);
+}
+
+static long ask_a_ttl(uint16_t port, uint16_t id) {
+    int c = ask_send(port, id);
+    if (c < 0) { return -1; }
+    uint8_t r[2048];
+    ssize_t n = recv(c, r, sizeof(r), 0);
+    close(c);
+    if (n <= 0) { return -1; }
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(r, (size_t)n, &msg) != FIRC_OK) { return -1; }
+    long ttl = -1;
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        if (msg->answers[i].rtype == FIRC_DNS_TYPE_A) { ttl = (long)msg->answers[i].ttl; }
+    }
+    firc_dns_msg_free(msg);
+    return ttl;
 }
 
 /* A TCP connection to the proxy with three-second send and receive timeouts, or -1. */
@@ -1945,7 +2015,7 @@ TEST a_silent_tunnel_resolver_falls_back_after_the_tunnel_timeout(void) {
     PASS();
 }
 
-/* Catches: an unusable tunnel answer kept, NXDOMAIN refused, or a pool bounds check off by one bit. */
+/* Catches: an unusable tunnel answer kept, NXDOMAIN refused, or a pool bounds check off by one bit, the cache on or off. */
 TEST each_unusable_tunnel_answer_falls_back(void) {
     struct {
         const char *what;
@@ -1976,25 +2046,28 @@ TEST each_unusable_tunnel_answer_falls_back(void) {
          1ULL, false, 2},
         {"a sink second A record after a good first one", 0, false, 0, false, false, false, 0, 0, true, 1},
     };
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        live_t lv;
-        tunnel_setup(0);
-        ASSERT(live_start_retrying(&lv));
-        g_troute.ports[0] = lv.b.port;
-        atomic_store(&lv.b.rcode, cases[i].rcode);
-        atomic_store(&lv.b.a_set, cases[i].a_set ? 1 : 0);
-        atomic_store(&lv.b.a_ip, cases[i].a_ip);
-        atomic_store(&lv.b.aaaa_loopback, cases[i].aaaa_loopback ? 1 : 0);
-        atomic_store(&lv.b.garbage, cases[i].garbage ? 1 : 0);
-        atomic_store(&lv.b.aaaa_custom_set, cases[i].aaaa_custom_set ? 1 : 0);
-        atomic_store(&lv.b.aaaa_hi, cases[i].aaaa_hi);
-        atomic_store(&lv.b.aaaa_lo, cases[i].aaaa_lo);
-        atomic_store(&lv.b.second_a_sink, cases[i].second_a_sink ? 1 : 0);
-        int got = ask(lv.proxy_port, (uint16_t)(0x6100 + i));
-        ASSERT_EQm(cases[i].what, cases[i].want, got);
-        ASSERT_EQm(cases[i].what, cases[i].want == 1 ? 1 : 0, atomic_load(&lv.a.received));
-        ASSERT_EQm(cases[i].what, 1, atomic_load(&lv.b.received));
-        live_stop(&lv);
+    for (int cached = 0; cached < 2; cached++) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            live_t lv;
+            tunnel_setup(0);
+            g_live_cache = cached != 0;
+            ASSERT(live_start_retrying(&lv));
+            g_troute.ports[0] = lv.b.port;
+            atomic_store(&lv.b.rcode, cases[i].rcode);
+            atomic_store(&lv.b.a_set, cases[i].a_set ? 1 : 0);
+            atomic_store(&lv.b.a_ip, cases[i].a_ip);
+            atomic_store(&lv.b.aaaa_loopback, cases[i].aaaa_loopback ? 1 : 0);
+            atomic_store(&lv.b.garbage, cases[i].garbage ? 1 : 0);
+            atomic_store(&lv.b.aaaa_custom_set, cases[i].aaaa_custom_set ? 1 : 0);
+            atomic_store(&lv.b.aaaa_hi, cases[i].aaaa_hi);
+            atomic_store(&lv.b.aaaa_lo, cases[i].aaaa_lo);
+            atomic_store(&lv.b.second_a_sink, cases[i].second_a_sink ? 1 : 0);
+            int got = ask(lv.proxy_port, (uint16_t)(0x6100 + i));
+            ASSERT_EQm(cases[i].what, cases[i].want, got);
+            ASSERT_EQm(cases[i].what, cases[i].want == 1 ? 1 : 0, atomic_load(&lv.a.received));
+            ASSERT_EQm(cases[i].what, 1, atomic_load(&lv.b.received));
+            live_stop(&lv);
+        }
     }
     PASS();
 }
@@ -2320,20 +2393,18 @@ static uint64_t live_fallbacks(live_t *lv) {
     return atomic_load(&f.out);
 }
 
-/* Catches: a failed query retried on the next resolver in the same exchange, or no sticky failover. */
-TEST a_failure_moves_the_group_to_its_next_resolver(void) {
+/* Catches: an unreachable resolver failing a query another resolver of the group answers. */
+TEST an_unreachable_resolver_beside_a_working_one_costs_nothing(void) {
     live_t lv;
     tunnel_setup(0);
     ASSERT(live_start_retrying(&lv));
     g_troute.n = 2;
     g_troute.ports[0] = closed_udp_port();
     g_troute.ports[1] = lv.b.port;
-    ASSERT_EQ(1, ask(lv.proxy_port, 0x7101));
-    ASSERT_EQ(0, atomic_load(&lv.b.received));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0x7101));
     ASSERT_EQ(2, ask(lv.proxy_port, 0x7102));
-    ASSERT_EQ(1, atomic_load(&lv.b.received));
-    ASSERT_EQ(2, ask(lv.proxy_port, 0x7103));
-    ASSERT_EQ(1u, live_fallbacks(&lv));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
     live_stop(&lv);
     PASS();
 }
@@ -3009,6 +3080,1008 @@ TEST a_forgotten_group_leaves_no_health_and_a_closed_one_keeps_it(void) {
     PASS();
 }
 
+/* Catches: a repeat query sent to the resolver again, or journalled as the resolver's own answer. */
+TEST a_repeat_query_is_answered_from_the_cache(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa101));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    long t0 = ms_now();
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa102));
+    ASSERT_LT(ms_now() - t0, 100);
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(1, atomic_load(&g_rec.sends));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQm("the hit went through the pipeline", 2, atomic_load(&g_live_hook_calls));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a cached answer handed out with the TTLs it arrived with. */
+TEST a_cached_answer_is_handed_out_with_its_age_taken_off(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(300, ask_a_ttl(lv.proxy_port, 0xa201));
+    atomic_store(&g_cache_skew_ms, 100000);
+    ASSERT_EQ(200, ask_a_ttl(lv.proxy_port, 0xa202));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the route generation left out of the key. */
+TEST a_rewired_route_does_not_hit_the_old_generations_answer(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    g_troute.gen = 1;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa301));
+    g_troute.gen = 2;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa302));
+    ASSERT_EQ(2, atomic_load(&lv.b.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: closing or forgetting a group leaving its answers to be served, or dropping another group's. */
+TEST closing_or_forgetting_a_group_drops_its_cached_answers(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    g_troute.group = 8;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa401));
+    g_troute.group = 7;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa402));
+    ASSERT_EQ(2, atomic_load(&lv.b.received));
+    live_close_group(&lv, 7);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa403));
+    ASSERT_EQm("closed: asked again", 3, atomic_load(&lv.b.received));
+    live_forget_group(&lv, 7);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa404));
+    ASSERT_EQm("forgotten: asked again", 4, atomic_load(&lv.b.received));
+    g_troute.group = 8;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa405));
+    ASSERT_EQm("group 8 kept its answer", 4, atomic_load(&lv.b.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the health gate consulted before the cache, so a resting group loses answers it holds. */
+TEST a_resting_group_still_answers_from_its_cache(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xa501, 0, 'a'));
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xa510 + i), 0, (char)('b' + i))); }
+    ASSERT_EQ(4, atomic_load(&g_rec.marks));
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xa520, 0, 'a'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(1, ask_for(lv.proxy_port, 0xa521, 0, 'z'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_HEALTH_SKIP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(4, atomic_load(&g_rec.marks));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refused, failed, sink or fallen-back answer cached, so the next query skips the group's resolver. */
+TEST only_the_group_resolvers_good_answer_is_cached(void) {
+    struct { const char *what; int rcode; bool sink; int want; } cases[] = {
+        {"refused", 5, false, 1}, {"servfail", 2, false, 1}, {"sink", 0, true, 1}, {"nxdomain without soa", 3, false, 2},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        live_t lv;
+        tunnel_setup(0);
+        g_live_cache = true;
+        ASSERT(live_start_retrying(&lv));
+        g_troute.ports[0] = lv.b.port;
+        atomic_store(&lv.b.rcode, cases[i].rcode);
+        atomic_store(&lv.b.a_set, cases[i].sink ? 1 : 0);
+        atomic_store(&lv.b.a_ip, 0u);
+        ASSERT_EQm(cases[i].what, cases[i].want, ask(lv.proxy_port, (uint16_t)(0xa600 + 2 * i)));
+        atomic_store(&lv.b.rcode, 0);
+        atomic_store(&lv.b.a_set, 0);
+        ASSERT_EQm(cases[i].what, 2, ask(lv.proxy_port, (uint16_t)(0xa601 + 2 * i)));
+        ASSERT_EQm(cases[i].what, 2, atomic_load(&lv.b.received));
+        live_stop(&lv);
+    }
+    PASS();
+}
+
+/* Catches: a truncated answer from the group's resolver cached, so a later asker never sees the whole one. */
+TEST a_truncated_group_answer_is_delivered_but_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.tc, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xac01));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    atomic_store(&lv.b.tc, 0);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xac02));
+    ASSERT_EQm("the second ask reached the resolver", 2, atomic_load(&lv.b.received));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a TCP client sent to the resolver though the answer is cached, or the cached answer sent unframed. */
+TEST a_tcp_client_is_answered_from_the_cache(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xa701));
+    ASSERT_EQ(2, ask_tcp(lv.proxy_port, 0xa702));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(1, atomic_load(&g_rec.connects_marked));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a cached answer larger than the asker's UDP size sent to it anyway. */
+TEST an_answer_too_big_for_the_asker_is_asked_again(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    g_big_a = 40;
+    ASSERT(ask_for(lv.proxy_port, 0xa801, 1232, 'a') > 0);
+    ASSERT(ask_for(lv.proxy_port, 0xa802, 512, 'a') > 0);
+    ASSERT_EQm("671 bytes do not fit 512", 2, atomic_load(&lv.b.received));
+    ASSERT(ask_for(lv.proxy_port, 0xa803, 1232, 'a') > 0);
+    ASSERT_EQm("they fit 1232", 2, atomic_load(&lv.b.received));
+    g_big_a = 0;
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: an EDNS client's cached answer, OPT and all, handed to a client that sent no OPT. */
+TEST a_client_without_edns_is_not_given_an_edns_clients_answer(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xa901, 1232, 'a'));
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xa902, 0, 'a'));
+    ASSERT_EQ(2, atomic_load(&lv.b.received));
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xa903, 0, 'a'));
+    ASSERT_EQ(2, atomic_load(&lv.b.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a hit carrying the first asker's name case or id to a 0x20 forwarder, which then drops it. */
+TEST a_cached_answer_echoes_the_askers_case(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xaa01, 0, 'a'));
+    int c = ask_send_for(lv.proxy_port, 0xaa02, 0, 'A');
+    ASSERT(c >= 0);
+    uint8_t r[2048];
+    ssize_t n = recv(c, r, sizeof(r), 0);
+    close(c);
+    ASSERT(n > 13);
+    ASSERT_EQ(0xaa, r[0]);
+    ASSERT_EQ(0x02, r[1]);
+    ASSERT_EQ('A', r[13]);
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the cache read before the router's owner and coverage decision. */
+TEST a_query_the_router_declines_never_reads_the_cache(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xab01));
+    g_troute.take = false;
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xab02));
+    ASSERT_EQ(1, atomic_load(&lv.a.received));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_UPSTREAM, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+static bool await_received(stub_t *s, int n) {
+    for (int i = 0; i < 400 && atomic_load(&s->received) < n; i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&s->received) >= n;
+}
+
+static bool await_replied(stub_t *s, int n) {
+    for (int i = 0; i < 400 && atomic_load(&s->replied) < n; i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&s->replied) >= n;
+}
+
+static void pause_ms(long ms) {
+    struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+/* Catches: resolvers asked one after another, or a slower resolver's answer chosen over the first. */
+TEST every_group_resolver_is_asked_at_once_and_the_first_good_answer_wins(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.b.hold_ms, 600);
+    long t0 = ms_now();
+    ASSERT_EQ(3, ask(lv.proxy_port, 0xb101));
+    ASSERT_LT(ms_now() - t0, 400);
+    ASSERT(await_received(&lv.b, 1));
+    ASSERT_EQ(1, atomic_load(&lv.c.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    pause_ms(700);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a sink from one resolver ending the exchange or falling back while another can still answer well. */
+TEST a_sink_from_one_resolver_and_a_good_answer_from_another_delivers_the_good_one(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.b.a_set, 1);
+    atomic_store(&lv.b.a_ip, 0u);
+    atomic_store(&lv.c.hold_ms, 100);
+    ASSERT_EQ(3, ask(lv.proxy_port, 0xb201));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the first failing resolver's reason journalled instead of the last, or a fallback before all failed. */
+TEST every_resolver_failing_falls_back_with_the_last_reason(void) {
+    for (int order = 0; order < 2; order++) {
+        live_t lv;
+        tunnel_setup(0);
+        ASSERT(live_start_retrying(&lv));
+        g_troute.n = 2;
+        g_troute.ports[0] = lv.b.port;
+        g_troute.ports[1] = lv.c.port;
+        atomic_store(&lv.b.rcode, order == 0 ? 5 : 2);
+        atomic_store(&lv.c.rcode, order == 0 ? 2 : 5);
+        atomic_store(&lv.c.hold_ms, 100);
+        ASSERT_EQ(1, ask(lv.proxy_port, (uint16_t)(0xb301 + order)));
+        ASSERT_EQ(1, atomic_load(&lv.a.received));
+        ASSERT_EQ(order == 0 ? FIRC_DNS_RESOLVER_FALLBACK_SERVFAIL : FIRC_DNS_RESOLVER_FALLBACK_REFUSED,
+                  atomic_load(&g_live_resolver));
+        ASSERT_EQ(1u, live_fallbacks(&lv));
+        live_stop(&lv);
+    }
+    PASS();
+}
+
+/* Catches: a silent resolver beside a failed one falling back early, or with the failed one's reason. */
+TEST a_silent_resolver_beside_a_failed_one_falls_back_at_the_timeout(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.b.rcode, 5);
+    atomic_store(&lv.c.hold, 1);
+    long t0 = ms_now();
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb401));
+    long took = ms_now() - t0;
+    ASSERT_GTE(took, (long)FIRC_DNSPROXY_TUNNEL_TIMEOUT_MS - 50);
+    ASSERT_LT(took, 2000);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_FALLBACK_TIMEOUT, atomic_load(&g_live_resolver));
+    atomic_store(&lv.c.go, 1);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a losing resolver's socket closed instead of pooled, or its late answer delivered to the next query. */
+TEST a_losing_resolvers_socket_is_pooled_and_its_late_answer_ignored(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.c.hold_ms, 150);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xb501));
+    ASSERT(await_replied(&lv.c, 1));
+    pause_ms(50);
+    atomic_store(&lv.c.mark, 4);
+    atomic_store(&lv.c.hold_ms, 0);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(4, ask(lv.proxy_port, 0xb502));
+    ASSERT_EQm("both sockets came back from their pools", 2, atomic_load(&g_rec.opens));
+    atomic_store(&lv.b.go, 1);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: health counted per leg, so two failing resolvers rest the group after two queries instead of three. */
+TEST health_counts_one_failure_per_exchange(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    uint16_t closed = closed_udp_port();
+    ASSERT(closed != 0);
+    g_troute.n = 2;
+    g_troute.ports[0] = closed;
+    g_troute.ports[1] = closed;
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb601));
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb602));
+    ASSERT_EQ(4, atomic_load(&g_rec.marks));
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb603));
+    ASSERT_EQm("two failures so far: the third query still tries", 6, atomic_load(&g_rec.marks));
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb604));
+    ASSERT_EQm("three: resting", 6, atomic_load(&g_rec.marks));
+    ASSERT_EQ(4u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a lost datagram to a lone resolver costing the tunnel timeout, or more than one resend. */
+TEST a_lone_resolver_is_asked_again_once_after_300_ms(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.drop, 1);
+    long t0 = ms_now();
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xb701));
+    long took = ms_now() - t0;
+    ASSERT_GTE(took, (long)FIRC_DNSPROXY_RETRY_MS - 20);
+    ASSERT_LT(took, 900);
+    ASSERT_EQ(2, atomic_load(&lv.b.received));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    atomic_store(&lv.b.drop, 2);
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xb702));
+    ASSERT_EQm("one resend, not one every 300 ms", 4, atomic_load(&lv.b.received));
+    ASSERT_EQ(1u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the resend's late twin, read by the next query on the pooled socket, taken for its answer or a failure. */
+TEST a_resends_late_twin_is_ignored_by_the_next_query(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold_ms, 400);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbb01));
+    ASSERT(await_received(&lv.b, 2));
+    pause_ms(500);
+    atomic_store(&lv.b.hold_ms, 0);
+    atomic_store(&lv.b.mark, 6);
+    ASSERT_EQ(6, ask(lv.proxy_port, 0xbb02));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    ASSERT_EQ(1, atomic_load(&g_rec.opens));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a TCP query sent to every resolver at once instead of the preferred one. */
+TEST a_tcp_query_still_asks_one_resolver(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    atomic_store(&g_tcp_probe.go, 1);
+    g_troute.n = 2;
+    g_troute.ports[0] = port;
+    g_troute.ports[1] = lv.b.port;
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xb801));
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    ASSERT_EQ(1, atomic_load(&g_rec.connects_marked));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a failed TCP query not moving the group's TCP queries to its next resolver. */
+TEST a_failed_tcp_query_moves_the_group_to_its_next_resolver(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    atomic_store(&g_tcp_probe.go, 1);
+    g_troute.n = 2;
+    g_troute.ports[0] = closed_udp_port();
+    g_troute.ports[1] = port;
+    (void)ask_tcp(lv.proxy_port, 0xb901);
+    ASSERT_EQ(0, atomic_load(&g_tcp_probe.received));
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xb902));
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: an answer fetched over TCP from the group's resolver left out of the cache UDP askers read. */
+TEST a_tcp_tunnel_answer_is_served_from_the_cache_to_a_udp_asker(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    atomic_store(&g_tcp_probe.go, 1);
+    g_troute.ports[0] = port;
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xbc01));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(3, ask(lv.proxy_port, 0xbc02));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    ASSERT_EQ(1, atomic_load(&g_rec.marks));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a tunnel answer landing after its group was forgotten cached again under the dead generation. */
+TEST a_tunnel_answer_after_its_group_is_forgotten_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbd01);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    live_forget_group(&lv, 7);
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbd02));
+    ASSERT_EQm("asked the resolver, not the cache", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a silent resolver's socket closed at the tunnel timeout instead of pooled, so every query costs a new flow. */
+TEST a_silent_resolvers_socket_is_pooled_at_the_timeout(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xbe01));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_FALLBACK_TIMEOUT, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, atomic_load(&g_rec.opens));
+    atomic_store(&lv.b.hold, 0);
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbe02));
+    ASSERT_EQm("the tunnel socket came back from its pool", 2, atomic_load(&g_rec.opens));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a late answer cached under a generation that is no longer live once its group came back. */
+TEST a_late_answer_after_its_group_came_back_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf01);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    live_forget_group(&lv, 7);
+    g_troute.gen = 2;
+    g_troute.ports[0] = lv.c.port;
+    ASSERT_EQ(3, ask_for(lv.proxy_port, 0xbf02, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    g_troute.gen = 1;
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf03));
+    ASSERT_EQm("the dead generation's answer was not kept", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: an answer on a socket whose pool was closed mid-flight cached after the close dropped the group's answers. */
+TEST an_answer_landing_after_its_pool_was_closed_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf11);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    live_close_group(&lv, 7);
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf12));
+    ASSERT_EQm("asked the resolver, not the cache", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a full send buffer on a resolver's socket taken for an unreachable resolver instead of a send to retry. */
+TEST a_send_that_would_block_is_covered_by_the_resend(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&g_rec.fail_send, EAGAIN);
+    long t0 = ms_now();
+    int c = ask_send(lv.proxy_port, 0xbf21);
+    ASSERT(c >= 0);
+    pause_ms(100);
+    atomic_store(&g_rec.fail_send, 0);
+    ASSERT_EQ(2, ask_read(c));
+    ASSERT_GTE(ms_now() - t0, (long)FIRC_DNSPROXY_RETRY_MS - 20);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a late answer cached for a generation the group has since left, while its socket's pool is untouched. */
+TEST a_late_answer_from_a_replaced_generation_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    int c = ask_send(lv.proxy_port, 0xbf31);
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 1));
+    g_troute.gen = 2;
+    g_troute.ports[0] = lv.c.port;
+    ASSERT_EQ(3, ask_for(lv.proxy_port, 0xbf32, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT_EQ(2, ask_read(c));
+    atomic_store(&lv.b.hold, 0);
+    g_troute.gen = 1;
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xbf33));
+    ASSERT_EQm("the replaced generation's answer was not kept", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+typedef struct {
+    firc_dnsproxy_t *proxy;
+    _Atomic size_t out;
+    _Atomic int done;
+} pfq_t;
+
+static void prefetching_on_loop(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    pfq_t *q = ud;
+    atomic_store(&q->out, firc_dnsproxy_prefetching(q->proxy));
+    atomic_store(&q->done, 1);
+}
+
+static size_t live_prefetching(live_t *lv) {
+    pfq_t q = {.proxy = lv->proxy};
+    if (firc_loop_post(lv->loop, prefetching_on_loop, &q) != FIRC_OK) { return SIZE_MAX; }
+    for (int i = 0; i < 200 && !atomic_load(&q.done); i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&q.done) ? atomic_load(&q.out) : SIZE_MAX;
+}
+
+static bool await_no_prefetch(live_t *lv) {
+    for (int i = 0; i < 300; i++) {
+        if (live_prefetching(lv) == 0) { return true; }
+        pause_ms(10);
+    }
+    return false;
+}
+
+/* Catches: a failed refresh counted as a group failure, resting a group no client saw fail. */
+TEST failed_refreshes_never_rest_the_group(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    for (int i = 0; i < 4; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc500 + i), 0, (char)('a' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.rcode, 2);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc510 + i), 0, (char)('a' + i)));
+        ASSERT(await_received(&lv.b, 5 + i));
+        ASSERT(await_no_prefetch(&lv));
+    }
+    atomic_store(&lv.b.rcode, 0);
+    int before = atomic_load(&lv.b.received);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc520, 0, 'z'));
+    ASSERT_EQm("a fresh name still goes through the tunnel", before + 1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a successful refresh not clearing the group's failure count, so later client failures rest it early. */
+TEST a_successful_refresh_clears_the_failure_count(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xca01, 0, 'a'));
+    atomic_store(&lv.b.rcode, 2);
+    for (int i = 0; i < 2; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xca10 + i), 0, (char)('b' + i))); }
+    atomic_store(&lv.b.rcode, 0);
+    atomic_store(&g_cache_skew_ms, 271000);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xca20, 0, 'a'));
+    ASSERT(await_received(&lv.b, 4));
+    ASSERT(await_no_prefetch(&lv));
+    atomic_store(&lv.b.rcode, 2);
+    for (int i = 0; i < 2; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xca30 + i), 0, (char)('d' + i))); }
+    atomic_store(&lv.b.rcode, 0);
+    int a0 = atomic_load(&lv.a.received);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xca40, 0, 'z'));
+    ASSERT_EQm("two failures since the refresh: still through the tunnel", a0, atomic_load(&lv.a.received));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a hit in the last tenth not refreshing the entry, refreshing it through the pipeline, or twice at once. */
+TEST a_hit_in_the_last_tenth_refreshes_the_entry_once(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.c.mark, 2);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc101));
+    atomic_store(&g_cache_skew_ms, 269000);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc102));
+    ASSERT_EQm("31 s of 300 left: no refresh", 2, atomic_load(&g_rec.sends));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc103));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc104));
+    ASSERT_EQm("29 s left: one refresh of two legs, not one per hit", 4, atomic_load(&g_rec.sends));
+    atomic_store(&lv.b.mark, 5);
+    atomic_store(&lv.c.mark, 5);
+    atomic_store(&lv.b.go, 1);
+    atomic_store(&lv.c.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(5, ask(lv.proxy_port, 0xc105));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQm("the refresh never reached the pipeline", 5, atomic_load(&g_live_hook_calls));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a failed refresh dropping the entry, falling back to the common upstream, or blocking the next refresh. */
+TEST a_failed_refresh_leaves_the_entry_and_a_later_hit_tries_again(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc201));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.rcode, 2);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc202));
+    ASSERT(await_received(&lv.b, 2));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc203));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT(await_received(&lv.b, 3));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: more than 16 refreshes in flight at once, or a capped hit keeping its entry from asking again. */
+TEST refreshes_are_capped_at_sixteen(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    for (int i = 0; i < 17; i++) { ASSERT(ask_for(lv.proxy_port, (uint16_t)(0xc300 + i), 0, (char)('a' + i)) > 0); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    int s0 = atomic_load(&g_rec.sends);
+    for (int i = 0; i < 17; i++) { ASSERT(ask_for(lv.proxy_port, (uint16_t)(0xc320 + i), 0, (char)('a' + i)) > 0); }
+    ASSERT_EQm("16 refreshes of two legs each", 32, atomic_load(&g_rec.sends) - s0);
+    ASSERT_EQ((size_t)FIRC_DNSPROXY_MAX_PREFETCH, live_prefetching(&lv));
+    atomic_store(&lv.b.go, 1);
+    atomic_store(&lv.c.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    int s1 = atomic_load(&g_rec.sends);
+    ASSERT(ask_for(lv.proxy_port, 0xc340, 0, (char)('a' + 16)) > 0);
+    ASSERT_EQm("the capped entry may ask again", 2, atomic_load(&g_rec.sends) - s1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: refreshes taking the client in-flight budget, so they crowd out client queries. */
+TEST refreshes_do_not_take_the_client_budget(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_max_concurrent = 2;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc400 + i), 0, (char)('a' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(2, ask_for(lv.proxy_port, (uint16_t)(0xc410 + i), 0, (char)('a' + i))); }
+    ASSERT_EQ(3u, live_prefetching(&lv));
+    g_troute.take = false;
+    ASSERT_EQ(1, ask_for(lv.proxy_port, 0xc420, 0, 'z'));
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh started while the group rests, or while another query is its probe. */
+TEST no_refresh_starts_while_the_group_rests_or_probes(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_rest_ms = 1000;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc601, 0, 'a'));
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xc610 + i), 0, (char)('b' + i))); }
+    atomic_store(&g_cache_skew_ms, 271000);
+    int s0 = atomic_load(&g_rec.sends);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc620, 0, 'a'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    pause_ms(50);
+    ASSERT_EQm("resting: no refresh", s0, atomic_load(&g_rec.sends));
+    ASSERT_EQ(0u, live_prefetching(&lv));
+
+    pause_ms(1050);
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    int c = ask_send_for(lv.proxy_port, 0xc630, 0, 'y');
+    ASSERT(c >= 0);
+    ASSERT(await_received(&lv.b, 2));
+    ASSERT(await_received(&lv.c, 1));
+    int s1 = atomic_load(&g_rec.sends);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xc631, 0, 'a'));
+    pause_ms(50);
+    ASSERT_EQm("probing: no refresh", s1, atomic_load(&g_rec.sends));
+    ASSERT_EQ(0u, live_prefetching(&lv));
+    atomic_store(&lv.b.go, 1);
+    atomic_store(&lv.c.go, 1);
+    ASSERT(ask_read(c) > 1);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh whose resolver stays silent never ending, or ending by dropping the entry or asking the common upstream. */
+TEST a_silent_refresh_ends_at_the_timeout_and_leaves_the_entry(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc701));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc702));
+    ASSERT_EQ(1u, live_prefetching(&lv));
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc703));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh in flight at shutdown left allocated (LSan) or its sockets left open. */
+TEST a_refresh_in_flight_at_shutdown_is_freed(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.n = 2;
+    g_troute.ports[0] = lv.b.port;
+    g_troute.ports[1] = lv.c.port;
+    ASSERT(ask(lv.proxy_port, 0xc801) > 1);
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    atomic_store(&lv.c.hold, 1);
+    ASSERT(ask(lv.proxy_port, 0xc802) > 1);
+    ASSERT_EQ(1u, live_prefetching(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+static enum greatest_test_res refresh_cut_mid_flight(bool forget) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc901));
+    atomic_store(&g_cache_skew_ms, 271000);
+    atomic_store(&lv.b.hold, 1);
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xc902));
+    ASSERT(await_received(&lv.b, 2));
+    live_group_call(&lv, 7, forget);
+    atomic_store(&lv.b.mark, 5);
+    atomic_store(&lv.b.go, 1);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQ(5, ask(lv.proxy_port, 0xc903));
+    ASSERT_EQm("the cut group's refresh was not stored", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a refresh landing after its group was forgotten stored again, or never released. */
+TEST a_refresh_for_a_forgotten_group_ends_unstored(void) {
+    CHECK_CALL(refresh_cut_mid_flight(true));
+    PASS();
+}
+
+/* Catches: a refresh landing after its group's pools were closed stored again, or never released. */
+TEST a_refresh_for_a_closed_group_ends_unstored(void) {
+    CHECK_CALL(refresh_cut_mid_flight(false));
+    PASS();
+}
+
+typedef struct {
+    uint16_t port;
+    uint16_t id;
+    int got;
+} tcp_ask_t;
+
+static void *tcp_ask_thread(void *arg) {
+    tcp_ask_t *t = arg;
+    t->got = ask_tcp(t->port, t->id);
+    return NULL;
+}
+
+/* Catches: a TCP tunnel answer in flight across a pool close stored under the live key. */
+TEST a_tcp_tunnel_answer_landing_after_its_pool_was_closed_is_not_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    g_troute.ports[0] = port;
+    tcp_ask_t t = {.port = lv.proxy_port, .id = 0xcb01, .got = -1};
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, tcp_ask_thread, &t));
+    for (int i = 0; i < 400 && atomic_load(&g_tcp_probe.received) < 1; i++) { pause_ms(5); }
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    live_close_group(&lv, 7);
+    atomic_store(&g_tcp_probe.go, 1);
+    pthread_join(th, NULL);
+    ASSERT_EQ(3, t.got);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcb02));
+    ASSERT_EQm("asked the resolver, not the cache", FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, atomic_load(&g_tcp_probe.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a TCP tunnel answer compared against a stale epoch, so after one pool close nothing over TCP is cached again. */
+TEST a_tcp_tunnel_answer_after_an_earlier_pool_close_is_cached(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    ASSERT(live_start_retrying(&lv));
+    int lfd = -1;
+    uint16_t port = tcp_probe_listen(lv.loop, &lfd);
+    ASSERT(port != 0);
+    atomic_store(&g_tcp_probe.go, 1);
+    g_troute.ports[0] = port;
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd01));
+    live_close_group(&lv, 7);
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd02));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0xcd03));
+    ASSERT_EQm("the answer after the close was cached", FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(2, atomic_load(&g_tcp_probe.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a rest that has run out still blocking refreshes until some client query ends it. */
+TEST a_hit_after_the_rest_ran_out_refreshes(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cache = true;
+    g_live_rest_ms = 300;
+    ASSERT(live_start_retrying(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xcc01, 0, 'a'));
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask_for(lv.proxy_port, (uint16_t)(0xcc10 + i), 0, (char)('b' + i))); }
+    pause_ms(400);
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&g_cache_skew_ms, 271000);
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0xcc20, 0, 'a'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERTm("the hit refreshed the entry", await_received(&lv.b, 2));
+    ASSERT(await_no_prefetch(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -3070,7 +4143,7 @@ int main(int argc, char **argv)
     RUN_TEST(every_upstream_socket_goes_through_the_ops);
     RUN_TEST(a_common_upstream_that_cannot_open_is_no_answer);
     RUN_TEST(a_tcp_upstream_socket_goes_through_the_ops);
-    RUN_TEST(a_failure_moves_the_group_to_its_next_resolver);
+    RUN_TEST(an_unreachable_resolver_beside_a_working_one_costs_nothing);
     RUN_TEST(the_health_gate_rests_a_failing_group_and_probes_once);
     RUN_TEST(a_publish_mid_exchange_keeps_the_copied_route);
     RUN_TEST(a_late_tunnel_answer_is_not_delivered_after_the_fallback);
@@ -3087,5 +4160,48 @@ int main(int argc, char **argv)
     RUN_TEST(a_new_generation_does_not_reuse_the_old_sockets);
     RUN_TEST(a_socket_of_an_older_generation_is_not_pooled_on_release);
     RUN_TEST(a_forgotten_group_leaves_no_health_and_a_closed_one_keeps_it);
+    RUN_TEST(a_repeat_query_is_answered_from_the_cache);
+    RUN_TEST(a_cached_answer_is_handed_out_with_its_age_taken_off);
+    RUN_TEST(a_rewired_route_does_not_hit_the_old_generations_answer);
+    RUN_TEST(closing_or_forgetting_a_group_drops_its_cached_answers);
+    RUN_TEST(a_resting_group_still_answers_from_its_cache);
+    RUN_TEST(only_the_group_resolvers_good_answer_is_cached);
+    RUN_TEST(a_truncated_group_answer_is_delivered_but_not_cached);
+    RUN_TEST(a_tcp_client_is_answered_from_the_cache);
+    RUN_TEST(an_answer_too_big_for_the_asker_is_asked_again);
+    RUN_TEST(a_client_without_edns_is_not_given_an_edns_clients_answer);
+    RUN_TEST(a_cached_answer_echoes_the_askers_case);
+    RUN_TEST(a_query_the_router_declines_never_reads_the_cache);
+    RUN_TEST(every_group_resolver_is_asked_at_once_and_the_first_good_answer_wins);
+    RUN_TEST(a_sink_from_one_resolver_and_a_good_answer_from_another_delivers_the_good_one);
+    RUN_TEST(every_resolver_failing_falls_back_with_the_last_reason);
+    RUN_TEST(a_silent_resolver_beside_a_failed_one_falls_back_at_the_timeout);
+    RUN_TEST(a_losing_resolvers_socket_is_pooled_and_its_late_answer_ignored);
+    RUN_TEST(health_counts_one_failure_per_exchange);
+    RUN_TEST(a_lone_resolver_is_asked_again_once_after_300_ms);
+    RUN_TEST(a_resends_late_twin_is_ignored_by_the_next_query);
+    RUN_TEST(a_tcp_query_still_asks_one_resolver);
+    RUN_TEST(a_failed_tcp_query_moves_the_group_to_its_next_resolver);
+    RUN_TEST(a_tcp_tunnel_answer_is_served_from_the_cache_to_a_udp_asker);
+    RUN_TEST(a_tunnel_answer_after_its_group_is_forgotten_is_not_cached);
+    RUN_TEST(a_silent_resolvers_socket_is_pooled_at_the_timeout);
+    RUN_TEST(a_late_answer_after_its_group_came_back_is_not_cached);
+    RUN_TEST(an_answer_landing_after_its_pool_was_closed_is_not_cached);
+    RUN_TEST(a_send_that_would_block_is_covered_by_the_resend);
+    RUN_TEST(a_late_answer_from_a_replaced_generation_is_not_cached);
+    RUN_TEST(failed_refreshes_never_rest_the_group);
+    RUN_TEST(a_successful_refresh_clears_the_failure_count);
+    RUN_TEST(a_hit_in_the_last_tenth_refreshes_the_entry_once);
+    RUN_TEST(a_failed_refresh_leaves_the_entry_and_a_later_hit_tries_again);
+    RUN_TEST(refreshes_are_capped_at_sixteen);
+    RUN_TEST(refreshes_do_not_take_the_client_budget);
+    RUN_TEST(no_refresh_starts_while_the_group_rests_or_probes);
+    RUN_TEST(a_silent_refresh_ends_at_the_timeout_and_leaves_the_entry);
+    RUN_TEST(a_refresh_in_flight_at_shutdown_is_freed);
+    RUN_TEST(a_refresh_for_a_forgotten_group_ends_unstored);
+    RUN_TEST(a_refresh_for_a_closed_group_ends_unstored);
+    RUN_TEST(a_tcp_tunnel_answer_landing_after_its_pool_was_closed_is_not_cached);
+    RUN_TEST(a_tcp_tunnel_answer_after_an_earlier_pool_close_is_cached);
+    RUN_TEST(a_hit_after_the_rest_ran_out_refreshes);
     GREATEST_MAIN_END();
 }
