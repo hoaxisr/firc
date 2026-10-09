@@ -1625,7 +1625,7 @@ TEST a_pool_change_gets_its_pass_after_the_short_settle(void) {
     for (int i = 0; i < 500 && !pass_landed(&l); i++) { sleep_ms(10); }
     ASSERT(pass_landed(&l));
     uint64_t before = firc_nfcommit_passes(c);
-    for (int quiet = 0; quiet < 30; quiet++) {
+    for (int quiet = 0; quiet < 45; quiet++) {
         sleep_ms(10);
         uint64_t now = firc_nfcommit_passes(c);
         if (now != before) {

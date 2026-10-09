@@ -130,6 +130,16 @@ static firc_nfcommit_t *start_settling(probe_t *p, unsigned long_ms, unsigned ad
     firc_nfcommit_t *c = firc_nfcommit_new(probe_rebuild, p);
     firc_nfcommit_set_delays_for_test(c, long_ms, long_ms * 4u);
     firc_nfcommit_set_addr_delay_for_test(c, addr_ms);
+    firc_nfcommit_set_addr_idle_for_test(c, 0);
+    firc_nfcommit_start(c);
+    return c;
+}
+
+static firc_nfcommit_t *start_idling(probe_t *p, unsigned long_ms, unsigned addr_ms, unsigned idle_ms) {
+    firc_nfcommit_t *c = firc_nfcommit_new(probe_rebuild, p);
+    firc_nfcommit_set_delays_for_test(c, long_ms, long_ms * 4u);
+    firc_nfcommit_set_addr_delay_for_test(c, addr_ms);
+    firc_nfcommit_set_addr_idle_for_test(c, idle_ms);
     firc_nfcommit_start(c);
     return c;
 }
@@ -150,6 +160,41 @@ TEST an_address_request_settles_short(void) {
     int partial = p.partial_passes;
     pthread_mutex_unlock(&p.mu);
     ASSERT_EQ_FMT(1, partial, "%d");
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: the idle check ignored or inverted, so a request long after the last pass settles long. */
+TEST an_address_request_after_an_idle_stretch_settles_short(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_idling(&p, 300, 1, 400);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    sleep_ms(450);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 2);
+    ASSERT_LT(elapsed_ms(&t0), 250);
+    firc_nfcommit_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+/* Catches: the idle check ignored, so back-to-back address passes split batches with the short settle. */
+TEST an_address_request_right_after_a_pass_settles_long(void) {
+    probe_t p;
+    probe_init(&p);
+    firc_nfcommit_t *c = start_idling(&p, 300, 1, 400);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.finished >= 1);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_request_addresses(c);
+    AWAIT(&p, p.started >= 2);
+    ASSERT_GTE(elapsed_ms(&t0), 290);
     firc_nfcommit_free(c);
     probe_destroy(&p);
     PASS();
@@ -1009,6 +1054,8 @@ int main(int argc, char **argv) {
     RUN_TEST(request_interrupts_and_restarts);
     RUN_TEST(request_more_does_not_interrupt_but_still_schedules);
     RUN_TEST(an_address_request_settles_short);
+    RUN_TEST(an_address_request_after_an_idle_stretch_settles_short);
+    RUN_TEST(an_address_request_right_after_a_pass_settles_long);
     RUN_TEST(a_more_request_settles_long);
     RUN_TEST(a_full_request_during_a_short_settle_waits_the_long_one);
     RUN_TEST(the_first_pass_settles_long);

@@ -37,6 +37,8 @@ struct firc_nfcommit {
     unsigned delay_ms;
     unsigned max_delay_ms;
     unsigned addr_delay_ms;
+    unsigned addr_idle_ms;
+    uint64_t last_end_ms;
 
     /* 0: no failing run. Guarded by mu. */
     uint64_t fail_mono_ms;
@@ -137,6 +139,7 @@ firc_nfcommit_t *firc_nfcommit_new(firc_nfcommit_rebuild_fn fn, void *ud) {
     c->delay_ms = FIRC_NFCOMMIT_DELAY_MS;
     c->max_delay_ms = FIRC_NFCOMMIT_MAX_DELAY_MS;
     c->addr_delay_ms = FIRC_NFCOMMIT_ADDR_DELAY_MS;
+    c->addr_idle_ms = FIRC_NFCOMMIT_ADDR_IDLE_MS;
     c->failing_after_ms = FIRC_NFCOMMIT_FAILING_AFTER_MS;
     return c;
 }
@@ -158,6 +161,11 @@ void firc_nfcommit_set_delays_for_test(firc_nfcommit_t *c, unsigned delay_ms, un
 void firc_nfcommit_set_addr_delay_for_test(firc_nfcommit_t *c, unsigned ms) {
     if (!c) { return; }
     c->addr_delay_ms = ms;
+}
+
+void firc_nfcommit_set_addr_idle_for_test(firc_nfcommit_t *c, unsigned ms) {
+    if (!c) { return; }
+    c->addr_idle_ms = ms;
 }
 
 void firc_nfcommit_set_failing_after_for_test(firc_nfcommit_t *c, unsigned ms) {
@@ -233,6 +241,9 @@ void firc_nfcommit_request_addresses(firc_nfcommit_t *c) {
 
     pthread_mutex_lock(&c->mu);
     c->pending = true;
+    if (c->running || (c->last_end_ms != 0 && mono_ms() - c->last_end_ms < (uint64_t)c->addr_idle_ms)) {
+        c->long_owed = true;
+    }
     pthread_cond_signal(&c->cv);
     pthread_mutex_unlock(&c->mu);
 }
@@ -306,6 +317,7 @@ static void *committer_main(void *arg) {
 
         pthread_mutex_lock(&c->mu);
         c->running = false;
+        c->last_end_ms = mono_ms();
         if (err == FIRC_OK) { c->last_ok = ordinal; }
         unsigned hard_run = 0;
         int64_t hard_wall = 0;
