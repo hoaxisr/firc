@@ -36,7 +36,6 @@ const firc_setting_t firc_settings[] = {
     {"app.dnsProxy.host.port", FIRC_SK_PORT, RESTART, AT(dns_proxy.host.port), 0, FIRC_APPLY_NONE},
     {"app.dnsProxy.disableRemap53", FIRC_SK_BOOL, RESTART, AT(dns_proxy.disable_remap53), 0, FIRC_APPLY_NONE},
     {"app.addressPool.ttlClamp", FIRC_SK_SEC, RESTART, AT(fakeip.ttl_clamp), 0, FIRC_APPLY_NONE},
-    {"app.addressPool.idleWindow", FIRC_SK_HOURS, RESTART, AT(fakeip.idle_window), 0, FIRC_APPLY_NONE},
     {"app.addressPool.maxNames", FIRC_SK_U32, RESTART, AT(fakeip.max_names), 0, FIRC_APPLY_NONE},
     {"app.addressPool.v4.pool", FIRC_SK_STRING, RESTART, AT(fakeip.v4.pool), 0, FIRC_APPLY_NONE},
     {"app.addressPool.v4.chunk", FIRC_SK_CHUNK, RESTART, AT(fakeip.v4.chunk), 0, FIRC_APPLY_NONE},
@@ -84,8 +83,7 @@ bool firc_setting_equal(const firc_setting_t *s, const firc_app_config_t *a,
     case FIRC_SK_HEX32: return *(const uint32_t *)x == *(const uint32_t *)y;
     case FIRC_SK_CHUNK: return *(const uint8_t *)x == *(const uint8_t *)y;
     case FIRC_SK_MS:
-    case FIRC_SK_SEC:
-    case FIRC_SK_HOURS: return *(const firc_duration_t *)x == *(const firc_duration_t *)y;
+    case FIRC_SK_SEC: return *(const firc_duration_t *)x == *(const firc_duration_t *)y;
     case FIRC_SK_LIST: {
         size_t na = *(const size_t *)cfield_at(a, s->off_n);
         size_t nb = *(const size_t *)cfield_at(b, s->off_n);
@@ -140,8 +138,7 @@ firc_err_t firc_setting_copy(const firc_setting_t *s, firc_app_config_t *dst,
     case FIRC_SK_HEX32: *(uint32_t *)d = *(const uint32_t *)v; return FIRC_OK;
     case FIRC_SK_CHUNK: *(uint8_t *)d = *(const uint8_t *)v; return FIRC_OK;
     case FIRC_SK_MS:
-    case FIRC_SK_SEC:
-    case FIRC_SK_HOURS: *(firc_duration_t *)d = *(const firc_duration_t *)v; return FIRC_OK;
+    case FIRC_SK_SEC: *(firc_duration_t *)d = *(const firc_duration_t *)v; return FIRC_OK;
     case FIRC_SK_LIST: return copy_list(s, dst, src);
     }
     return FIRC_ERR_INVAL;
@@ -244,7 +241,6 @@ firc_err_t firc_app_config_check(const firc_app_config_t *c, const char **field,
     static const char BAD_CHUNK[] =
         "the chunk must be longer than the pool's prefix, hold at least 4 addresses, "
         "and cut the pool into fewer than 2^32 chunks";
-    static const char BAD_WINDOW[] = "1 second to 365 days";
 
     /* a WebUI that is off binds nothing, and its host is never read */
     if (c->http_web.enabled) {
@@ -320,12 +316,9 @@ firc_err_t firc_app_config_check(const firc_app_config_t *c, const char **field,
     }
     /* asked one window at a time so refusal names the right key; a bare YAML integer here is nanoseconds */
     if (c->fakeip.ttl_clamp < FIRC_DURATION_SEC ||
+        c->fakeip.ttl_clamp > INT64_C(182) * 24 * 3600 * FIRC_DURATION_SEC ||
         firc_fakeip_check_windows(1, c->fakeip.ttl_clamp / FIRC_DURATION_SEC) != FIRC_OK) {
-        REFUSE("app.addressPool.ttlClamp", BAD_WINDOW);
-    }
-    if (c->fakeip.idle_window < FIRC_DURATION_SEC ||
-        firc_fakeip_check_windows(c->fakeip.idle_window / FIRC_DURATION_SEC, 1) != FIRC_OK) {
-        REFUSE("app.addressPool.idleWindow", BAD_WINDOW);
+        REFUSE("app.addressPool.ttlClamp", "1 second to 182 days: names are released after twice it");
     }
     /* 0 reaches the pool as "use the default", the opposite of a request for no bound */
     if (c->fakeip.max_names == 0) {

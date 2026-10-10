@@ -1,4 +1,5 @@
 #include "firc/iptables.h"
+#include "firc/xtables.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,23 +37,13 @@ static firc_err_t delete_compile(firc_ipt_chain_t *self, const char *chain_name,
     return FIRC_OK;
 }
 
-static firc_err_t delete_noop_append(firc_ipt_chain_t *self, const firc_ipt_rule_t *rule) {
+static void delete_stage(firc_ipt_chain_t *self, firc_xt_stage_chain_t *out) {
     (void)self;
-    (void)rule;
-    return FIRC_OK;
-}
-
-static firc_err_t delete_noop_insert(firc_ipt_chain_t *self, int rule_num, const firc_ipt_rule_t *rule) {
-    (void)self;
-    (void)rule_num;
-    (void)rule;
-    return FIRC_OK;
-}
-
-static firc_err_t delete_noop_remove(firc_ipt_chain_t *self, const firc_ipt_rule_t *rule) {
-    (void)self;
-    (void)rule;
-    return FIRC_OK;
+    out->kind = FIRC_XT_STAGE_DELETE;
+    out->rules = NULL;
+    out->n_rules = 0;
+    out->ops = NULL;
+    out->n_ops = 0;
 }
 
 static void delete_destroy(firc_ipt_chain_t *self) {
@@ -61,10 +52,8 @@ static void delete_destroy(firc_ipt_chain_t *self) {
 
 static const firc_ipt_chain_ops_t k_delete_ops = {
     .compile = delete_compile,
-    .append = delete_noop_append,
-    .insert = delete_noop_insert,
-    .remove = delete_noop_remove,
     .destroy = delete_destroy,
+    .stage = delete_stage,
 };
 
 firc_ipt_chain_t *firc_ipt_chain_delete_new(void) {

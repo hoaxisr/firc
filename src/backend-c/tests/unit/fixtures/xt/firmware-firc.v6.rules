@@ -1,0 +1,14 @@
+*nat
+:FIRC_DNSOR - [0:0]
+:FIRC_DNAT - [0:0]
+:FIRC_g1 - [0:0]
+:FIRC_bh - [0:0]
+-A FIRC_DNSOR -p tcp -d fd00:1::1 --dport 53 -j DNAT --to-destination :3553
+-A FIRC_DNSOR -p udp -d fd00:1::1 --dport 53 -j DNAT --to-destination :3553
+-A FIRC_DNAT -d fd37:9a00::1/128 -j DNAT --to-destination 2606:2800:220:1:248:1893:25c8:1946
+-A FIRC_g1 -o nwg1 -m mark --mark 0x10000/0xff0000 -j MASQUERADE
+-I PREROUTING 1 -j FIRC_DNSOR
+-A PREROUTING -d fd37:9a00::/48 -j FIRC_DNAT
+-A POSTROUTING -j FIRC_g1
+-A POSTROUTING -j FIRC_bh
+COMMIT

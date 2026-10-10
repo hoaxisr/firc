@@ -374,8 +374,6 @@ static void emit_app(emitter_ctx_t *ctx, const firc_app_config_t *a)
     map_end(ctx);
     emit_plain(ctx, "ttlClamp");
     emit_duration(ctx, a->fakeip.ttl_clamp);
-    emit_plain(ctx, "idleWindow");
-    emit_duration(ctx, a->fakeip.idle_window);
     emit_plain(ctx, "maxNames");
     emit_u64(ctx, a->fakeip.max_names);
     map_end(ctx);

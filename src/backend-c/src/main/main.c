@@ -35,6 +35,7 @@
 #include "firc/groups.h"
 #include "firc/httpd.h"
 #include "firc/iptables.h"
+#include "firc/xtables.h"
 #include "firc/events.h"
 #include "firc/log.h"
 #include "firc/listen.h"
@@ -798,6 +799,44 @@ static void flush_stale_group_marks(struct daemon *d) {
     }
 }
 
+static firc_ipt_t *open_engine(firc_ipt_proto_t fam, bool purge, bool *no_family) {
+    *no_family = false;
+    const char *name = fam == FIRC_IPT_PROTO_IPV6 ? "ipv6" : "ipv4";
+    firc_ipt_executable_t *exe = firc_ipt_executable_real_new(fam);
+    if (!exe) {
+        FIRC_ERROR("failed to create iptables executable (%s)", name);
+        return NULL;
+    }
+    firc_xt_t *xt = firc_xt_real_new(fam);
+    if (!xt) {
+        int e = errno;
+        firc_ipt_executable_free(exe);
+        *no_family = fam == FIRC_IPT_PROTO_IPV6 && e == EAFNOSUPPORT;
+        if (*no_family && purge) {
+            FIRC_INFO("purge: this kernel has no IPv6, its tables are skipped");
+        } else if (*no_family) {
+            FIRC_ERROR("cannot open x_tables for ipv6: this kernel has no IPv6; set netfilter.disableIPv6 to run without it");
+        } else {
+            FIRC_ERROR("cannot open x_tables for %s: %s", name, strerror(e));
+        }
+        return NULL;
+    }
+    if (firc_xt_set_dump_dir(xt, FIRC_APP_RUN_DIR) != FIRC_OK) {
+        FIRC_ERROR("netfilter helper init fail: out of memory");
+        firc_xt_free(xt);
+        firc_ipt_executable_free(exe);
+        return NULL;
+    }
+    if (!purge) { (void)firc_xt_probe(xt); }
+    firc_ipt_t *ipt = firc_ipt_new(exe, xt);
+    if (!ipt) {
+        FIRC_ERROR("netfilter helper init fail: out of memory");
+        firc_xt_free(xt);
+        firc_ipt_executable_free(exe);
+    }
+    return ipt;
+}
+
 int main(int argc, char **argv)
 {
     /* init pipes stdout into logger: a dead reader must cost a dropped line, not the daemon. */
@@ -956,34 +995,18 @@ int main(int argc, char **argv)
     }
 
     if (!cfg.app.netfilter.disable_ipv4 || purge) {
-        firc_ipt_executable_t *exe = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-        if (!exe) {
-            FIRC_ERROR("failed to create iptables executable (ipv4)");
-            daemon_teardown(&d);
-            firc_config_clear(&cfg);
-            return 1;
-        }
-        d.ipt4 = firc_ipt_new(exe);
+        bool no_family = false;
+        d.ipt4 = open_engine(FIRC_IPT_PROTO_IPV4, purge, &no_family);
         if (!d.ipt4) {
-            firc_ipt_executable_free(exe);
-            FIRC_ERROR("netfilter helper init fail: out of memory");
             daemon_teardown(&d);
             firc_config_clear(&cfg);
             return 1;
         }
     }
     if (!cfg.app.netfilter.disable_ipv6 || purge) {
-        firc_ipt_executable_t *exe = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV6);
-        if (!exe) {
-            FIRC_ERROR("failed to create iptables executable (ipv6)");
-            daemon_teardown(&d);
-            firc_config_clear(&cfg);
-            return 1;
-        }
-        d.ipt6 = firc_ipt_new(exe);
-        if (!d.ipt6) {
-            firc_ipt_executable_free(exe);
-            FIRC_ERROR("netfilter helper init fail: out of memory");
+        bool no_family = false;
+        d.ipt6 = open_engine(FIRC_IPT_PROTO_IPV6, purge, &no_family);
+        if (!d.ipt6 && !(purge && no_family)) {
             daemon_teardown(&d);
             firc_config_clear(&cfg);
             return 1;

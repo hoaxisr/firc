@@ -1,4 +1,5 @@
 #include "firc/iptables.h"
+#include "firc/xtables.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -70,37 +71,13 @@ static firc_err_t override_append(firc_ipt_chain_t *self, const firc_ipt_rule_t 
     return FIRC_OK;
 }
 
-static firc_err_t override_insert(firc_ipt_chain_t *self, int rule_num, const firc_ipt_rule_t *rule) {
+static void override_stage(firc_ipt_chain_t *self, firc_xt_stage_chain_t *out) {
     chain_override_t *c = (chain_override_t *)self;
-    if (rule_num < 1 || (size_t)rule_num > c->n + 1) { return FIRC_OK; }
-
-    if (c->n + 1 > c->cap) {
-        size_t newcap = c->cap == 0 ? 8 : c->cap * 2;
-        firc_ipt_rule_t **tmp = realloc(c->rules, newcap * sizeof(*tmp));
-        if (!tmp) { return FIRC_ERR_NOMEM; }
-        c->rules = tmp;
-        c->cap = newcap;
-    }
-    firc_ipt_rule_t *owned = firc_ipt_rule_clone(rule);
-    if (!owned) { return FIRC_ERR_NOMEM; }
-
-    size_t insert_idx = (size_t)rule_num - 1;
-    for (size_t i = c->n; i > insert_idx; i--) { c->rules[i] = c->rules[i - 1]; }
-    c->rules[insert_idx] = owned;
-    c->n++;
-    return FIRC_OK;
-}
-
-static firc_err_t override_remove(firc_ipt_chain_t *self, const firc_ipt_rule_t *rule) {
-    chain_override_t *c = (chain_override_t *)self;
-    for (size_t i = 0; i < c->n; i++) {
-        if (!firc_ipt_rule_equal(c->rules[i], rule)) { continue; }
-        firc_ipt_rule_free(c->rules[i]);
-        for (size_t j = i; j + 1 < c->n; j++) { c->rules[j] = c->rules[j + 1]; }
-        c->n--;
-        return FIRC_OK;
-    }
-    return FIRC_OK;
+    out->kind = FIRC_XT_STAGE_OVERRIDE;
+    out->rules = c->rules;
+    out->n_rules = c->n;
+    out->ops = NULL;
+    out->n_ops = 0;
 }
 
 static void override_destroy(firc_ipt_chain_t *self) {
@@ -114,9 +91,8 @@ static void override_destroy(firc_ipt_chain_t *self) {
 static const firc_ipt_chain_ops_t k_override_ops = {
     .compile = override_compile,
     .append = override_append,
-    .insert = override_insert,
-    .remove = override_remove,
     .destroy = override_destroy,
+    .stage = override_stage,
 };
 
 firc_ipt_chain_t *firc_ipt_chain_override_new(void) {

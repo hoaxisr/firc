@@ -19,8 +19,9 @@ static firc_err_t clean_one(firc_ipt_t *ipt, const char *chain_prefix, bool keep
     snprintf(jump, sizeof(jump), "-j %s", chain_prefix);
     size_t prefix_len = strlen(chain_prefix);
 
+    static const char *const k_text_tables[] = {"filter", "mangle"};
     firc_ipt_rules_snapshot_t *snap;
-    firc_err_t err = firc_ipt_get_current_rules(ipt, &snap);
+    firc_err_t err = firc_ipt_get_current_rules(ipt, k_text_tables, 2, &snap);
     if (err != FIRC_OK) { return err; }
 
     for (size_t ti = 0; ti < snap->n_tables && err == FIRC_OK; ti++) {
@@ -53,6 +54,7 @@ static firc_err_t clean_one(firc_ipt_t *ipt, const char *chain_prefix, bool keep
     }
 
     firc_ipt_rules_snapshot_free(snap);
+    if (err == FIRC_OK) { err = firc_ipt_register_sweep(ipt, "nat", chain_prefix); }
     if (err != FIRC_OK) { return err; }
     return firc_ipt_commit(ipt);
 }

@@ -925,7 +925,6 @@ const SETTINGS_DEFAULTS: Record<string, unknown> = {
   "app.dnsProxy.host.port": 3553,
   "app.dnsProxy.disableRemap53": false,
   "app.addressPool.ttlClamp": 300,
-  "app.addressPool.idleWindow": 24,
   "app.addressPool.maxNames": 65536,
   "app.addressPool.v4.pool": "198.18.0.0/15",
   "app.addressPool.v4.chunk": 24,

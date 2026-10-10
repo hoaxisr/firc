@@ -39,7 +39,7 @@ TEST the_shipped_defaults_build_a_working_pool(void) {
     ASSERT_EQ_FMT(64, (int)pc.v6.chunk_cidr, "%d");
 
     ASSERT_EQ_FMT((int64_t)300, pc.clamp_secs, "%" PRId64);
-    ASSERT_EQ_FMT((int64_t)86400, pc.idle_secs, "%" PRId64);
+    ASSERT_EQ_FMT((int64_t)3600, pc.idle_secs, "%" PRId64);
     ASSERT_EQ_FMT((size_t)65536, pc.max_names, "%zu");
 
     firc_fakeip_t *f = NULL;
@@ -84,7 +84,7 @@ TEST an_explicit_v4_pool_is_carried_through(void) {
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     const char *doc = "configVersion: 0.1.0\napp:\n  addressPool:\n"
                       "    v4:\n      pool: 100.64.0.0/10\n      chunk: 26\n"
-                      "    ttlClamp: 90s\n    idleWindow: 12h\n    maxNames: 1234\n";
+                      "    ttlClamp: 90s\n    maxNames: 1234\n";
     ASSERT_EQ(FIRC_OK, firc_config_load_buffer(&cfg, doc, strlen(doc)));
 
     firc_fakeip_cfg_t pc;
@@ -96,7 +96,7 @@ TEST an_explicit_v4_pool_is_carried_through(void) {
     ASSERT_EQ_FMT(10, (int)pc.v4.pool_cidr, "%d");
     ASSERT_EQ_FMT(26, (int)pc.v4.chunk_cidr, "%d");
     ASSERT_EQ_FMT((int64_t)90, pc.clamp_secs, "%" PRId64);
-    ASSERT_EQ_FMT((int64_t)43200, pc.idle_secs, "%" PRId64);
+    ASSERT_EQ_FMT((int64_t)3600, pc.idle_secs, "%" PRId64);
     ASSERT_EQ_FMT((size_t)1234, pc.max_names, "%zu");
 
     unlink(g_ula);
@@ -132,23 +132,18 @@ TEST a_pool_that_does_not_parse_is_refused(void) {
     PASS();
 }
 
-/* Catches: sub-second windows truncated silently, or a clamp over the ceiling accepted. */
+/* Catches: sub-second clamps truncated silently, or a clamp whose window passes the ceiling accepted. */
 TEST windows_that_do_not_convert_cleanly_are_refused(void) {
     static const struct {
         const char *why;
-        int64_t clamp_ns, idle_ns;
+        int64_t clamp_ns;
     } bad[] = {
-        {"a clamp below a second truncates to zero", FIRC_DURATION_MS * 999,
-         FIRC_DURATION_SEC * 86400},
-        {"and one that is not a whole number of seconds is rounded", FIRC_DURATION_MS * 1500,
-         FIRC_DURATION_SEC * 86400},
-        {"an idle window below a second", FIRC_DURATION_SEC * 300, FIRC_DURATION_MS * 500},
-        {"a negative clamp", -FIRC_DURATION_SEC * 5, FIRC_DURATION_SEC * 86400},
-        {"a negative idle window", FIRC_DURATION_SEC * 300, -FIRC_DURATION_SEC * 3600},
-        {"a clamp past the pool's one-year ceiling", FIRC_DURATION_SEC * 366 * 24 * 3600,
-         FIRC_DURATION_SEC * 86400},
-        {"an idle window past it", FIRC_DURATION_SEC * 300,
-         FIRC_DURATION_SEC * 366 * 24 * 3600},
+        {"a clamp below a second truncates to zero", FIRC_DURATION_MS * 999},
+        {"and one that is not a whole number of seconds is rounded", FIRC_DURATION_MS * 1500},
+        {"a negative clamp", -FIRC_DURATION_SEC * 5},
+        {"a clamp past the pool's one-year ceiling", FIRC_DURATION_SEC * 366 * 24 * 3600},
+        {"a clamp past half a year derives a window past the ceiling",
+         FIRC_DURATION_SEC * 183 * 24 * 3600},
     };
 
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -156,7 +151,6 @@ TEST windows_that_do_not_convert_cleanly_are_refused(void) {
         firc_config_t cfg;
         ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
         cfg.app.fakeip.ttl_clamp = bad[i].clamp_ns;
-        cfg.app.fakeip.idle_window = bad[i].idle_ns;
         firc_fakeip_cfg_t pc;
         memset(&pc, 0, sizeof(pc));
         firc_err_t got = firc_fakeip_cfg_from_app(&cfg.app, g_ula, &pc);
@@ -169,13 +163,39 @@ TEST windows_that_do_not_convert_cleanly_are_refused(void) {
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     cfg.app.fakeip.ttl_clamp = FIRC_DURATION_SEC;
-    cfg.app.fakeip.idle_window = FIRC_DURATION_SEC * 365 * 24 * 3600;
     firc_fakeip_cfg_t pc;
     memset(&pc, 0, sizeof(pc));
     ASSERT_EQ(FIRC_OK, firc_fakeip_cfg_from_app(&cfg.app, g_ula, &pc));
     ASSERT_EQ_FMT((int64_t)1, pc.clamp_secs, "%" PRId64);
+    ASSERT_EQ_FMT((int64_t)3600, pc.idle_secs, "%" PRId64);
     firc_config_clear(&cfg);
     unlink(g_ula);
+    PASS();
+}
+
+/* Catches: the window not derived from the clamp, the one-hour floor missing, or the factor not two. */
+TEST the_idle_window_is_twice_the_clamp_never_under_an_hour(void) {
+    ASSERT_EQ((long long)3600, (long long)firc_fakeip_idle_for_clamp(1));
+    ASSERT_EQ((long long)3600, (long long)firc_fakeip_idle_for_clamp(300));
+    ASSERT_EQ((long long)3600, (long long)firc_fakeip_idle_for_clamp(1800));
+    ASSERT_EQ((long long)3602, (long long)firc_fakeip_idle_for_clamp(1801));
+    ASSERT_EQ((long long)172800, (long long)firc_fakeip_idle_for_clamp(86400));
+    PASS();
+}
+
+/* Catches: an idleWindow left in an old file still read, or refused, instead of ignored. */
+TEST an_idle_window_in_an_old_file_is_ignored(void) {
+    ula_path("fromcfg_old_idle");
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    const char *doc = "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 90s\n    idleWindow: 12h\n";
+    ASSERT_EQ(FIRC_OK, firc_config_load_buffer(&cfg, doc, strlen(doc)));
+    firc_fakeip_cfg_t pc;
+    memset(&pc, 0, sizeof(pc));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_cfg_from_app(&cfg.app, g_ula, &pc));
+    ASSERT_EQ_FMT((int64_t)3600, pc.idle_secs, "%" PRId64);
+    unlink(g_ula);
+    firc_config_clear(&cfg);
     PASS();
 }
 
@@ -189,5 +209,7 @@ int main(int argc, char **argv)
     RUN_TEST(an_explicit_v4_pool_is_carried_through);
     RUN_TEST(a_pool_that_does_not_parse_is_refused);
     RUN_TEST(windows_that_do_not_convert_cleanly_are_refused);
+    RUN_TEST(the_idle_window_is_twice_the_clamp_never_under_an_hour);
+    RUN_TEST(an_idle_window_in_an_old_file_is_ignored);
     GREATEST_MAIN_END();
 }

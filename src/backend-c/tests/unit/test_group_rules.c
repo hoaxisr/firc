@@ -45,7 +45,7 @@ TEST the_mark_is_written_masked(void)
 {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     ASSERT(f != NULL);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     ASSERT(ipt != NULL);
     firc_netfilter_register_base_chains(ipt, NULL);
 
@@ -70,7 +70,7 @@ TEST the_masquerade_matches_the_mark_and_the_interface(void)
 {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     ASSERT(f != NULL);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     ASSERT(ipt != NULL);
     firc_netfilter_register_base_chains(ipt, NULL);
 
@@ -92,7 +92,7 @@ TEST a_blackhole_group_gets_no_masquerade(void)
 {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     ASSERT(f != NULL);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     ASSERT(ipt != NULL);
     firc_netfilter_register_base_chains(ipt, NULL);
 
@@ -115,7 +115,7 @@ TEST the_connmark_rule_keenetic_needs_is_still_emitted(void)
 {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     ASSERT(f != NULL);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     ASSERT(ipt != NULL);
     firc_netfilter_register_base_chains(ipt, NULL);
 
@@ -174,7 +174,7 @@ TEST every_chunk_a_group_holds_becomes_a_rule(void)
     ASSERT(snap != NULL);
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
 
     uint32_t mark = 0;
@@ -226,7 +226,7 @@ TEST the_v6_table_gets_the_same_rules_with_v6_chunks(void)
     firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(NULL, ipt);
 
     uint32_t mark = 0;
@@ -262,10 +262,10 @@ TEST the_v6_table_gets_the_same_rules_with_v6_chunks(void)
 TEST a_subnet_rule_is_a_static_mark_rule_in_the_groups_chain(void)
 {
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
     firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6), firc_fake_ipt_as_xt(f6));
     firc_netfilter_register_base_chains(NULL, ipt6);
 
     uint32_t mark = 0;
@@ -312,7 +312,7 @@ TEST a_subnet_rule_is_a_static_mark_rule_in_the_groups_chain(void)
 /* Catches: a subnet rule's protocol or ports left off its MARK or CONNMARK, or worded unlike iptables-save. */
 TEST a_subnet_rule_with_a_protocol_marks_that_protocol_only(void) {
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
@@ -357,7 +357,7 @@ TEST a_subnet_rule_with_a_protocol_marks_that_protocol_only(void) {
 TEST a_rewrite_drops_a_removed_prefix_and_keeps_one_jump(void)
 {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
@@ -390,10 +390,10 @@ TEST a_rewrite_drops_a_removed_prefix_and_keeps_one_jump(void)
 TEST prefixes_set_on_the_object_reach_both_engines(void)
 {
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
     firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6), firc_fake_ipt_as_xt(f6));
     firc_netfilter_register_base_chains(NULL, ipt6);
 
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, ipt6, NULL, 100,
@@ -430,7 +430,7 @@ TEST the_chunk_rules_come_from_the_snapshot_the_object_is_given(void)
     firc_fakeip_t *pool = pool_with_two_v4_chunks();
     firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
 
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, NULL, NULL, 100,
@@ -457,7 +457,7 @@ TEST a_group_with_no_chunks_emits_no_chunk_rules(void)
     ASSERT(snap != NULL);
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
 
     uint32_t mark = 0;
@@ -560,7 +560,7 @@ static bool build_g1_subnets(built_t *b, firc_ipt_proto_t proto, const firc_nf_d
     if (b->pool == NULL) { return false; }
     b->snap = firc_fakeip_snapshot_take(b->pool);
     b->f = firc_fake_ipt_new(proto);
-    b->ipt = firc_ipt_new(firc_fake_ipt_as_executable(b->f));
+    b->ipt = firc_ipt_new(firc_fake_ipt_as_executable(b->f), firc_fake_ipt_as_xt(b->f));
     if (b->snap == NULL || b->ipt == NULL) { return false; }
     if (proto == FIRC_IPT_PROTO_IPV6) {
         firc_netfilter_register_base_chains(NULL, b->ipt);
@@ -795,7 +795,7 @@ TEST an_allow_list_that_renders_nothing_marks_nobody(void)
 TEST devices_set_on_the_object_reach_the_pass(void)
 {
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, NULL, NULL, 100, NULL, "g1", NULL, NULL);
     ASSERT(l != NULL);
@@ -821,10 +821,10 @@ TEST devices_set_on_the_object_reach_the_pass(void)
 TEST subnets_and_devices_set_on_the_object_jump_together(void)
 {
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(ipt4, NULL);
     firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f6), firc_fake_ipt_as_xt(f6));
     firc_netfilter_register_base_chains(NULL, ipt6);
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, ipt6, NULL, 100, NULL, "g1", NULL, NULL);
     ASSERT(l != NULL);

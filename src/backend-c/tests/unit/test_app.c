@@ -143,7 +143,7 @@ TEST add_group_while_running_rolls_back_on_failure(void) {
     firc_config_init_defaults(&cfg);
 
     firc_ipt_executable_t *exe4 = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(exe4);
+    firc_ipt_t *ipt4 = firc_ipt_new(exe4, NULL);
     firc_rtnl_t *rtnl = firc_rtnl_open();
     ASSERT(ipt4 != NULL && rtnl != NULL);
 
@@ -298,9 +298,9 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
     l->router = firc_resolve_router_new(l->pipeline);
     if (l->router == NULL) { return false; }
     l->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    l->ipt = firc_ipt_new(firc_fake_ipt_as_executable(l->fake));
+    l->ipt = firc_ipt_new(firc_fake_ipt_as_executable(l->fake), firc_fake_ipt_as_xt(l->fake));
     l->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(l->fake6));
+    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(l->fake6), firc_fake_ipt_as_xt(l->fake6));
     firc_netfilter_register_base_chains(l->ipt, l->ipt6);
     l->kernel = fake_rtnl_start(&l->rtnl);
     if (l->kernel == NULL) { return false; }
@@ -1750,7 +1750,7 @@ TEST replace_groups_while_running_keeps_the_groups_that_did_not_come_up(void) {
     firc_config_t cfg;
     firc_config_init_defaults(&cfg);
     firc_ipt_executable_t *exe4 = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(exe4);
+    firc_ipt_t *ipt4 = firc_ipt_new(exe4, NULL);
     firc_rtnl_t *rtnl = firc_rtnl_open();
     ASSERT(ipt4 != NULL && rtnl != NULL);
     firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt4, .rtnl = rtnl};
@@ -2999,6 +2999,7 @@ TEST an_update_that_lost_one_race_comes_back(void) {
 
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_fail_at_commit(l.fake, 2, FIRC_ERR_IO);
     started = firc_app_nf_passes_for_test(l.app);
     firc_err_t err = firc_app_update_group(l.app, gid, activation_group(1, "newer.example", NULL, NULL));
@@ -3029,6 +3030,7 @@ TEST an_update_whose_write_was_refused_keeps_nothing_old(void) {
 
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_fail_next_restore(l.fake, FIRC_ERR_IO);
     started = firc_app_nf_passes_for_test(l.app);
     firc_err_t err = firc_app_update_group(l.app, gid, activation_group(1, "other.example", NULL, NULL));
@@ -3067,6 +3069,7 @@ TEST a_save_that_lost_one_race_drops_nothing(void) {
     size_t from = log_len(&l);
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_refuse_rules_containing(l.fake, mark);
     firc_err_t err = firc_app_replace_groups(l.app, arr, 3);
     firc_app_nf_leave(l.app);

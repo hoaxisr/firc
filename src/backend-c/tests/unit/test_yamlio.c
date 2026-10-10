@@ -444,7 +444,6 @@ TEST save_shape_matches_committed_fixture(void)
         "      pool: \"\"\n"
         "      chunk: 64\n"
         "    ttlClamp: 5m0s\n"
-        "    idleWindow: 24h0m0s\n"
         "    maxNames: 65536\n"
         "  link:\n"
         "  - br0\n"
@@ -502,7 +501,6 @@ TEST fakeip_block_is_read_back(void)
                                 "      pool: fd00:dead:beef::/48\n"
                                 "      chunk: 60\n"
                                 "    ttlClamp: 90s\n"
-                                "    idleWindow: 12h\n"
                                 "    maxNames: 1234\n"));
 
     ASSERT_STR_EQ("203.0.113.0/26", cfg.app.fakeip.v4.pool);
@@ -510,8 +508,6 @@ TEST fakeip_block_is_read_back(void)
     ASSERT_STR_EQ("fd00:dead:beef::/48", cfg.app.fakeip.v6.pool);
     ASSERT_EQ_FMT(60u, (unsigned)cfg.app.fakeip.v6.chunk, "%u");
     ASSERT_EQ_FMT((uint64_t)(90 * FIRC_DURATION_SEC), (uint64_t)cfg.app.fakeip.ttl_clamp, "%" PRIu64);
-    ASSERT_EQ_FMT((uint64_t)(12 * 3600 * FIRC_DURATION_SEC), (uint64_t)cfg.app.fakeip.idle_window,
-                  "%" PRIu64);
     ASSERT_EQ_FMT(1234u, cfg.app.fakeip.max_names, "%u");
 
     firc_config_clear(&cfg);
@@ -654,12 +650,13 @@ TEST an_address_pool_that_is_not_a_mapping_is_refused(void)
     PASS();
 }
 
-/* Catches: a clamp or idle window past the one-year ceiling accepted at load. */
+/* Catches: a clamp whose derived window passes the one-year ceiling accepted at load. */
 TEST windows_past_the_ceiling_are_refused(void)
 {
     static const char *bad[] = {
         "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 87600h\n",
-        "configVersion: 0.1.0\napp:\n  addressPool:\n    idleWindow: 87600h\n",
+        "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 4392h\n",
+        "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 15724801s\n",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         firc_config_t cfg;
@@ -672,7 +669,49 @@ TEST windows_past_the_ceiling_are_refused(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK,
-              load_str(&cfg, "configVersion: 0.1.0\napp:\n  addressPool:\n    idleWindow: 8760h\n"));
+              load_str(&cfg, "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 4368h\n"));
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a refused clamp not naming its key, or the cap off by a second either way. */
+TEST a_clamp_past_182_days_is_refused_naming_its_key(void)
+{
+    char path[] = "/tmp/firc_clamp_log_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0);
+    firc_log_set_fd(fd);
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    firc_err_t got = load_str(&cfg, "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 15724801s\n");
+    firc_config_clear(&cfg);
+    firc_log_set_fd(2);
+    char buf[512] = {0};
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    close(fd);
+    unlink(path);
+    ASSERT_EQ(FIRC_ERR_INVAL, got);
+    ASSERT(n > 0);
+    ASSERT(strstr(buf, "app.addressPool.ttlClamp") != NULL);
+
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 15724800s\n"));
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: an idleWindow from an old file surviving into the saved file. */
+TEST an_old_idle_window_is_dropped_by_the_next_save(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, "configVersion: 0.1.0\napp:\n  addressPool:\n    ttlClamp: 90s\n    idleWindow: 12h\n"));
+    char *out = NULL;
+    size_t len = 0;
+    ASSERT_EQ(FIRC_OK, firc_config_save_buffer(&cfg, "0.7.0", &out, &len));
+    ASSERT(strstr(out, "idleWindow") == NULL);
+    ASSERT(strstr(out, "ttlClamp: 1m30s") != NULL);
+    free(out);
     firc_config_clear(&cfg);
     PASS();
 }
@@ -1709,6 +1748,8 @@ int main(int argc, char **argv)
     RUN_TEST(fakeip_zero_max_names_is_refused);
     RUN_TEST(an_address_pool_that_is_not_a_mapping_is_refused);
     RUN_TEST(windows_past_the_ceiling_are_refused);
+    RUN_TEST(a_clamp_past_182_days_is_refused_naming_its_key);
+    RUN_TEST(an_old_idle_window_is_dropped_by_the_next_save);
     RUN_TEST(a_later_load_cannot_launder_a_refused_geometry);
     RUN_TEST(a_log_level_the_daemon_does_not_have_is_refused);
     RUN_TEST(an_upstream_that_is_not_an_address_is_refused);

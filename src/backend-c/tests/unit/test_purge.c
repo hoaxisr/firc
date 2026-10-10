@@ -54,8 +54,8 @@ static bool up(fx_t *f) {
     f->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
     seed_family(f->fake4, "198.18.0.0/15");
     seed_family(f->fake6, "fd37:9a00::/48");
-    f->ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake4));
-    f->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake6));
+    f->ipt4 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake4), firc_fake_ipt_as_xt(f->fake4));
+    f->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake6), firc_fake_ipt_as_xt(f->fake6));
     firc_netfilter_register_base_chains(f->ipt4, f->ipt6);
     f->kernel = fake_rtnl_start(&f->rtnl);
     if (f->kernel == NULL) { return false; }
@@ -299,6 +299,47 @@ TEST without_netlink_the_chains_still_go(void) {
     PASS();
 }
 
+/* Catches: a refused table's dump left in the run dir, so --purge cannot remove the directory. */
+TEST the_refused_table_dumps_go_with_the_purge(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    char d4[160], d6[160];
+    snprintf(d4, sizeof(d4), "%s/refused-ipv4-nat.bin", f.dir);
+    snprintf(d6, sizeof(d6), "%s/refused-ipv6-nat.bin", f.dir);
+    const char *dumps[2] = {d4, d6};
+    for (int i = 0; i < 2; i++) {
+        FILE *fp = fopen(dumps[i], "w");
+        ASSERT(fp != NULL);
+        fputs("x", fp);
+        fclose(fp);
+    }
+    firc_purge_paths_t p = paths_of(&f);
+    firc_purge_report_t rep;
+    (void)firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep);
+    struct stat st;
+    ASSERT(stat(d4, &st) != 0 && errno == ENOENT);
+    ASSERT(stat(d6, &st) != 0 && errno == ENOENT);
+    ASSERT(rep.run_dir_removed);
+    down(&f);
+    PASS();
+}
+
+/* Catches: a purge on a kernel without IPv6 failing or skipping the IPv4 tables because the v6 engine is absent. */
+TEST without_an_ipv6_engine_the_ipv4_tables_still_go(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_ipt_free(f.ipt6);
+    f.ipt6 = NULL;
+    firc_purge_paths_t p = paths_of(&f);
+    firc_purge_report_t rep;
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, NULL, f.rtnl, "FIRC_", &p, &rep));
+    ASSERT(rep.iptables_ok);
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake4, "nat", "FIRC_old"));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake4, "filter", "FIRC_POOLREJECT"));
+    down(&f);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -311,5 +352,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_file_that_cannot_be_removed_fails_the_purge);
     RUN_TEST(every_step_runs_whatever_the_earlier_ones_did);
     RUN_TEST(without_netlink_the_chains_still_go);
+    RUN_TEST(the_refused_table_dumps_go_with_the_purge);
+    RUN_TEST(without_an_ipv6_engine_the_ipv4_tables_still_go);
     GREATEST_MAIN_END();
 }

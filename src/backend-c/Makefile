@@ -37,6 +37,13 @@ CFLAGS  += --sysroot=$(SYSROOT)
 LDFLAGS += --sysroot=$(SYSROOT)
 endif
 
+XTABLES_SRCS := \
+    src/xtables/blob.c \
+    src/xtables/encode.c \
+    src/xtables/table.c \
+    src/xtables/commit.c \
+    src/xtables/sock.c
+
 # No external library dependencies.
 CORE_SRCS := \
     src/util/err.c \
@@ -74,7 +81,8 @@ CORE_SRCS := \
     src/crypto/sha512.c \
     src/crypto/hmac.c \
     src/crypto/base64.c \
-    src/crypto/crypt.c
+    src/crypto/crypt.c \
+    $(XTABLES_SRCS)
 
 # Needs libyaml, PCRE2 and cJSON.
 CONFIG_SRCS := \
@@ -206,7 +214,7 @@ PCRE2_LIB ?= -lpcre2-8
 CJSON_LIB ?= -lcjson
 DEP_LIBS := -lyaml $(PCRE2_LIB) -lmnl $(CJSON_LIB) -lm -lcurl
 
-TEST_SUPPORT_SRCS := tests/unit/fake_iptables.c tests/unit/fake_rtnl.c tests/unit/fake_conntrack.c tests/unit/fake_nflog.c
+TEST_SUPPORT_SRCS := tests/unit/fake_iptables.c tests/unit/fake_rtnl.c tests/unit/fake_conntrack.c tests/unit/fake_nflog.c tests/unit/xt_golden.c tests/unit/fake_xtables.c
 TEST_SUPPORT_OBJS := $(TEST_SUPPORT_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/support/%.o)
 
 TEST_SRCS := $(filter-out $(TEST_SUPPORT_SRCS), $(wildcard tests/unit/*.c))
@@ -317,14 +325,16 @@ tsan:
 # Rootless routing checks against a real kernel; each script unshares its own namespaces.
 ROUTECHECK := $(BUILDDIR)/tests/routing/firc-routecheck
 
-$(ROUTECHECK): tests/routing/routecheck.c $(LIB_OBJS)
+$(ROUTECHECK): tests/routing/routecheck.c $(LIB_OBJS) $(BUILDDIR)/tests/support/xt_golden.o
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(LDLIBS) $(DEP_LIBS)
+	$(CC) $(CFLAGS) -Itests/unit $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(BUILDDIR)/tests/support/xt_golden.o $(LDLIBS) $(DEP_LIBS)
 
 .PHONY: routing
 routing: $(ROUTECHECK)
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_mark_routing.sh
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_selector_routing.sh
+	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_xt_nat.sh v4
+	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_xt_nat.sh v6
 
 FUZZ_CC ?= clang
 FUZZ_RUNS ?= 100000

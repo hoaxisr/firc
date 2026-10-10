@@ -79,6 +79,13 @@ firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, con
         unlink_quiet(paths->sock, &first);
         unlink_quiet(paths->lock, &first);
         if (paths->run_dir != NULL) {
+            static const char *const k_dumps[] = {"refused-ipv4-nat.bin", "refused-ipv6-nat.bin"};
+            for (size_t i = 0; i < sizeof(k_dumps) / sizeof(k_dumps[0]); i++) {
+                char dump[512];
+                if (snprintf(dump, sizeof(dump), "%s/%s", paths->run_dir, k_dumps[i]) < (int)sizeof(dump)) {
+                    unlink_quiet(dump, &first);
+                }
+            }
             rep.run_dir_removed = rmdir(paths->run_dir) == 0;
             if (!rep.run_dir_removed) {
                 if (errno == ENOENT) {

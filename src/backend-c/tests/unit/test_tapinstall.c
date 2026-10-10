@@ -41,7 +41,7 @@ static bool joined(firc_fake_ipt_t *f, const char *table, const char *chain, cha
 /* Catches: removing capture rules that are not there reported as an error. */
 TEST removing_nothing_is_not_an_error(void) {
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     ASSERT_EQ(FIRC_OK, firc_tap_rules_remove(ipt, PREFIX));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
     ASSERT_FALSE(firc_fake_ipt_chain_exists(fake, "mangle", TAP_CHAIN));
@@ -54,7 +54,7 @@ TEST half_the_rules_is_not_there(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -99,7 +99,7 @@ TEST the_preflight_asks_about_the_rules_that_get_installed(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     ASSERT(ipt != NULL);
 
     const char *lan[] = {"br0"};
@@ -136,7 +136,7 @@ TEST the_capture_rules_go_in_a_chain_of_our_own(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     ASSERT(ipt != NULL);
 
     const char *lan[] = {"br0"};
@@ -173,7 +173,7 @@ TEST each_lan_interface_gets_its_own_pair_in_the_chain(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     ASSERT(ipt != NULL);
 
     const char *lan[] = {"br0", "br1"};
@@ -193,7 +193,7 @@ TEST each_lan_interface_gets_its_own_pair_in_the_chain(void) {
 TEST the_v6_engine_gets_the_v6_pool(void) {
     firc_fakeip_t *pool = make_pool();
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     ASSERT(ipt != NULL);
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
@@ -212,7 +212,7 @@ TEST the_v6_engine_gets_the_v6_pool(void) {
 TEST removing_takes_the_chain_and_the_jump(void) {
     firc_fakeip_t *pool = make_pool();
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -244,7 +244,7 @@ TEST the_jump_goes_first_and_the_other_rules_stay(void) {
     ASSERT_EQ(FIRC_OK,
               firc_fake_ipt_set_initial_rules(fake, "mangle", "FORWARD", seed, lens, 2));
 
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -273,7 +273,7 @@ TEST installing_twice_leaves_one_pair(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
 
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
@@ -297,7 +297,7 @@ TEST installing_twice_leaves_one_pair(void) {
 TEST a_killed_capture_is_swept_by_the_daemons_own_cleaner(void) {
     firc_fakeip_t *pool = make_pool();
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -320,7 +320,7 @@ TEST a_killed_capture_is_swept_by_the_daemons_own_cleaner(void) {
 TEST a_firmware_rewrite_takes_the_rules_away(void) {
     firc_fakeip_t *pool = make_pool();
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     const char *lan[] = {"br0"};
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -328,6 +328,7 @@ TEST a_firmware_rewrite_takes_the_rules_away(void) {
 
     firc_fake_ipt_reset(fake);
     ASSERT_FALSEm("gone, with nothing said", firc_fake_ipt_chain_exists(fake, "mangle", TAP_CHAIN));
+    firc_ipt_forget_written(ipt);
 
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -342,7 +343,7 @@ TEST a_capture_can_tell_whether_its_rules_are_still_there(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
 
     bool there = true;
     ASSERT_EQ(FIRC_OK, firc_tap_rules_present(ipt, PREFIX, &there));
@@ -357,6 +358,7 @@ TEST a_capture_can_tell_whether_its_rules_are_still_there(void) {
     firc_fake_ipt_reset(fake);
     ASSERT_EQ(FIRC_OK, firc_tap_rules_present(ipt, PREFIX, &there));
     ASSERT_FALSEm("taken, and the capture can see that", there);
+    firc_ipt_forget_written(ipt);
 
     ASSERT_EQ(FIRC_OK, firc_tap_rules_install(ipt, PREFIX, pool, lan, 1));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -372,7 +374,7 @@ TEST install_refuses_what_build_refuses(void) {
     firc_fakeip_t *pool = make_pool();
     ASSERT(pool != NULL);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
 
     ASSERT_EQ(FIRC_ERR_INVAL, firc_tap_rules_install(ipt, PREFIX, pool, NULL, 0));
     ASSERT_EQ(FIRC_ERR_INVAL, firc_tap_rules_supported(ipt, PREFIX, pool, NULL, 0));

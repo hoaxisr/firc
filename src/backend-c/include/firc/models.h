@@ -186,7 +186,6 @@ typedef struct firc_app_config {
             uint8_t chunk;
         } v4, v6;
         firc_duration_t ttl_clamp;   /* ceiling on the TTL we hand out */
-        firc_duration_t idle_window; /* unresolved this long and released */
         /* 32-bit: a larger value truncates to 0 on 32-bit targets, meaning "default" not "more" */
         uint32_t max_names;
     } fakeip;

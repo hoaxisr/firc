@@ -156,17 +156,6 @@ export const SECTIONS: Section[] = [
         ],
       ),
       row(
-        () => t("Release after"),
-        () => t("When nobody asked for the domain this long"),
-        [
-          {
-            key: "app.addressPool.idleWindow",
-            label: () => t("Release after"),
-            control: { kind: "number", unit: () => t("h") },
-          },
-        ],
-      ),
-      row(
         () => t("Domains in the pool, at most"),
         () => t("Past the limit a blackhole address is issued"),
         [

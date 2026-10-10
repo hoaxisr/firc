@@ -264,15 +264,17 @@ jobs:
 
       - name: Unit tests
         working-directory: src/backend-c
-        # -Werror for the test binaries too
-        run: make CFLAGS_EXTRA=-Werror test
+        # -Werror for the test binaries too; test_xt_sock needs a user namespace of its own
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          make CFLAGS_EXTRA=-Werror test
 
       - name: A group's mark and a group's selector route as they should (user namespace)
         working-directory: src/backend-c
         # suites run in user namespaces: AppArmor must allow them, and xt modules are loaded here
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          sudo modprobe -a nf_conntrack nf_nat iptable_nat xt_mac xt_mark xt_connmark xt_conntrack xt_nat xt_MASQUERADE || true
+          sudo modprobe -a nf_conntrack nf_nat iptable_nat ip6table_nat xt_mac xt_mark xt_connmark xt_conntrack xt_nat xt_MASQUERADE || true
           sudo modprobe nft_chain_nat || true # the nat chain type, when iptables is the nft backend
           make CFLAGS_EXTRA=-Werror routing
 
@@ -330,6 +332,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcre2-dev libyaml-dev libmnl-dev libcjson-dev libcurl4-openssl-dev socat
+
+      - name: Load the legacy nat tables fircd writes through x_tables
+        run: sudo modprobe -a iptable_nat ip6table_nat
 
       - name: Run differential/regression suites
         working-directory: src/backend-c

@@ -2243,6 +2243,8 @@ static bool routed_has(const char *group_id, void *ud) {
 static firc_err_t rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cancel, bool full) {
     firc_err_t err = FIRC_OK;
     if (full) {
+        firc_ipt_forget_written(app->ipt4);
+        firc_ipt_forget_written(app->ipt6);
         /* everything of ours out first, so the result depends only on the current group set, not on what was left behind */
         err = firc_netfilter_clean_iptables(app->ipt4, app->ipt6,
                                             app->cfg->app.netfilter.iptables.chain_prefix);
@@ -2794,9 +2796,20 @@ static firc_err_t firc_app_rebuild_netfilter_locked(firc_app_t *app, firc_cancel
     if (app->ipt4) { firc_ipt_set_cancel(app->ipt4, cancel); }
     if (app->ipt6) { firc_ipt_set_cancel(app->ipt6, cancel); }
 
+    char report4[512], report6[512];
+    firc_ipt_take_report(app->ipt4, report4, sizeof(report4));
+    firc_ipt_take_report(app->ipt6, report6, sizeof(report6));
+    struct timespec pass_t0, pass_t1;
+    clock_gettime(CLOCK_MONOTONIC, &pass_t0);
     uint64_t gen = pass_snapshot_begin(app);
     firc_err_t err = rebuild_netfilter_locked(app, cancel, full);
     pass_snapshot_end(app);
+    clock_gettime(CLOCK_MONOTONIC, &pass_t1);
+    firc_ipt_take_report(app->ipt4, report4, sizeof(report4));
+    firc_ipt_take_report(app->ipt6, report6, sizeof(report6));
+    FIRC_DEBUG("netfilter pass (%s): %lld ms (%s); ipv4: %s; ipv6: %s", full ? "full" : "incremental",
+               (long long)((pass_t1.tv_sec - pass_t0.tv_sec) * 1000 + (pass_t1.tv_nsec - pass_t0.tv_nsec) / 1000000),
+               firc_err_str(err), app->ipt4 ? report4 : "off", app->ipt6 ? report6 : "off");
 
     if (err != FIRC_OK) { /* discard, or the next commit on this engine (a loop-thread group enable) would carry out what was only staged */
         firc_ipt_discard(app->ipt4);
@@ -2992,6 +3005,8 @@ firc_err_t firc_app_force_commit_iptables(firc_app_t *app) {
 
     /* only before the committer has started, or after it failed; commits on the caller's thread, blocking what it serves */
     app_nf_enter(app);
+    firc_ipt_forget_written(app->ipt4);
+    firc_ipt_forget_written(app->ipt6);
     firc_err_t err = FIRC_OK;
     if (app->ipt4) { err = firc_ipt_commit(app->ipt4); }
     if (err == FIRC_OK && app->ipt6) { err = firc_ipt_commit(app->ipt6); }

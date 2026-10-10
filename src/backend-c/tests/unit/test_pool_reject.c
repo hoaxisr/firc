@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "fake_iptables.h"
 #include "firc/pool_reject.h"
 
 #define MAX_PLAN 8
@@ -146,6 +147,16 @@ TEST nothing_to_protect_plans_nothing(void) {
     PASS();
 }
 
+/* Catches: the barrier registering filter/FORWARD itself instead of needing the caller's patch chain. */
+TEST the_barrier_without_the_base_chain_is_refused(void) {
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
+    firc_ip_t base = {{198, 18, 0, 0}, 4};
+    ASSERT_EQ(FIRC_ERR_STATE, firc_pool_reject_build_rules(ipt, "FIRC_", &base, 15));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -155,5 +166,6 @@ int main(int argc, char **argv)
     RUN_TEST(the_two_tables_get_different_metrics);
     RUN_TEST(the_plan_follows_the_configured_pool);
     RUN_TEST(nothing_to_protect_plans_nothing);
+    RUN_TEST(the_barrier_without_the_base_chain_is_refused);
     GREATEST_MAIN_END();
 }

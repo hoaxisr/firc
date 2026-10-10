@@ -83,7 +83,7 @@ static void teardown(void *ud) {
 TEST a_kernel_that_refuses_the_write_refuses_the_capture(void) {
     stand_in(1);
     firc_fakeip_t *pool = make_pool();
-    firc_ipt_t *ipt = firc_ipt_new(firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4));
+    firc_ipt_t *ipt = firc_ipt_new(firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4), NULL);
     ASSERT(pool != NULL && ipt != NULL);
     const char *lan[] = {"br0"};
     ASSERT_EQ_FMT(FIRC_ERR_NOSYS, firc_tap_rules_supported(ipt, PREFIX, pool, lan, 1), "%d");
@@ -96,7 +96,7 @@ TEST a_kernel_that_refuses_the_write_refuses_the_capture(void) {
 TEST an_accepted_probe_writes_nothing_that_stays(void) {
     stand_in(0);
     firc_fakeip_t *pool = make_pool();
-    firc_ipt_t *ipt = firc_ipt_new(firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4));
+    firc_ipt_t *ipt = firc_ipt_new(firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4), NULL);
     ASSERT(pool != NULL && ipt != NULL);
     const char *lan[] = {"br0"};
     ASSERT_EQ_FMT(FIRC_OK, firc_tap_rules_supported(ipt, PREFIX, pool, lan, 1), "%d");
@@ -228,7 +228,7 @@ TEST a_refused_save_is_a_warning_too(void) {
     firc_log_set_fd(fd);
     uint8_t *data = NULL;
     size_t len = 0;
-    firc_err_t err = exe->ops->save(exe, &data, &len);
+    firc_err_t err = exe->ops->save(exe, "filter", &data, &len);
     firc_log_set_fd(2);
     firc_log_set_level(kept);
     close(fd);
@@ -248,6 +248,30 @@ TEST a_refused_save_is_a_warning_too(void) {
     PASS();
 }
 
+/* Catches: the real save asking for every table when one was asked for. */
+TEST the_real_save_asks_for_the_one_table(void) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/iptables-save", g_dir);
+    FILE *sf = fopen(path, "w");
+    ASSERT(sf != NULL);
+    fprintf(sf, "#!/bin/sh\necho \"$*\" >> '%s'\nprintf '*mangle\\n:PREROUTING ACCEPT [0:0]\\nCOMMIT\\n'\n", g_log);
+    fclose(sf);
+    chmod(path, 0755);
+    unlink(g_log);
+    firc_ipt_t *ipt = firc_ipt_new(firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4), NULL);
+    ASSERT(ipt != NULL);
+    firc_ipt_rules_snapshot_t *snap = NULL;
+    const char *tables[] = {"mangle"};
+    ASSERT_EQ_FMT(FIRC_OK, firc_ipt_get_current_rules(ipt, tables, 1, &snap), "%d");
+    char *log = read_log();
+    ASSERT_STR_EQ("-t mangle\n", log);
+    ASSERT(firc_ipt_rules_snapshot_find_table(snap, "mangle") != NULL);
+    free(log);
+    firc_ipt_rules_snapshot_free(snap);
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 SUITE(probe) {
     SET_SETUP(setup, NULL);
     SET_TEARDOWN(teardown, NULL);
@@ -257,6 +281,7 @@ SUITE(probe) {
     RUN_TEST(a_refused_restore_is_a_warning_that_quotes_the_line);
     RUN_TEST(a_refusal_at_commit_is_not_a_warning);
     RUN_TEST(a_refused_save_is_a_warning_too);
+    RUN_TEST(the_real_save_asks_for_the_one_table);
 }
 
 GREATEST_MAIN_DEFS();

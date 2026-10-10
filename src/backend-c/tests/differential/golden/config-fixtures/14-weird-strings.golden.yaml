@@ -32,7 +32,6 @@ app:
       pool: ""
       chunk: 64
     ttlClamp: 5m0s
-    idleWindow: 24h0m0s
     maxNames: 65536
   link:
   - br0

@@ -183,7 +183,8 @@ firc_err_t firc_tap_rules_present(firc_ipt_t *ipt, const char *chain_prefix, boo
     if (err != FIRC_OK) { return err; }
 
     firc_ipt_rules_snapshot_t *snap = NULL;
-    err = firc_ipt_get_current_rules(ipt, &snap);
+    static const char *const k_mangle[] = {"mangle"};
+    err = firc_ipt_get_current_rules(ipt, k_mangle, 1, &snap);
     if (err != FIRC_OK) { return err; }
 
     const firc_ipt_table_rules_t *mangle = firc_ipt_rules_snapshot_find_table(snap, "mangle");

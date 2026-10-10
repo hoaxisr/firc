@@ -27,7 +27,7 @@ typedef struct {
 static bool up(fixture_t *f, unsigned link_flags) {
     memset(f, 0, sizeof(*f));
     f->fipt = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    f->ipt = f->fipt ? firc_ipt_new(firc_fake_ipt_as_executable(f->fipt)) : NULL;
+    f->ipt = f->fipt ? firc_ipt_new(firc_fake_ipt_as_executable(f->fipt), firc_fake_ipt_as_xt(f->fipt)) : NULL;
     if (f->ipt == NULL) { return false; }
     firc_netfilter_register_base_chains(f->ipt, NULL);
     f->kernel = fake_rtnl_start(&f->rtnl);
@@ -292,8 +292,8 @@ TEST one_familys_failure_does_not_cost_the_other_its_refresh(void) {
     f.fipt = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     firc_fake_ipt_t *fipt6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
     ASSERT(f.fipt != NULL && fipt6 != NULL);
-    f.ipt = firc_ipt_new(firc_fake_ipt_as_executable(f.fipt));
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fipt6));
+    f.ipt = firc_ipt_new(firc_fake_ipt_as_executable(f.fipt), firc_fake_ipt_as_xt(f.fipt));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fipt6), firc_fake_ipt_as_xt(fipt6));
     ASSERT(f.ipt != NULL && ipt6 != NULL);
     firc_netfilter_register_base_chains(f.ipt, ipt6);
     f.kernel = fake_rtnl_start(&f.rtnl);
@@ -762,7 +762,7 @@ TEST no_twin_for_a_blackhole_group_or_for_ipv6(void) {
 
     ASSERT(up(&f, IFF_UP | IFF_POINTOPOINT));
     firc_fake_ipt_t *fipt6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt6 = fipt6 ? firc_ipt_new(firc_fake_ipt_as_executable(fipt6)) : NULL;
+    firc_ipt_t *ipt6 = fipt6 ? firc_ipt_new(firc_fake_ipt_as_executable(fipt6), firc_fake_ipt_as_xt(fipt6)) : NULL;
     ASSERT(ipt6 != NULL);
     firc_netfilter_register_base_chains(ipt6, NULL);
     firc_ipset_to_link_free(f.link);

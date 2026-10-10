@@ -1,17 +1,12 @@
 #include "firc/iptables.h"
+#include "firc/xtables.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct patch_entry {
-    firc_ipt_option_t option;
-    int rule_num;
-    firc_ipt_rule_t *rule;
-} patch_entry_t;
-
 typedef struct chain_patch {
     firc_ipt_chain_t base;
-    patch_entry_t *entries;
+    firc_xt_patch_op_t *entries;
     size_t n, cap;
 } chain_patch_t;
 
@@ -33,7 +28,7 @@ static firc_err_t add_rule(chain_patch_t *c, firc_ipt_option_t option, int rule_
 
     if (c->n + 1 > c->cap) {
         size_t newcap = c->cap == 0 ? 8 : c->cap * 2;
-        patch_entry_t *tmp = realloc(c->entries, newcap * sizeof(*tmp));
+        firc_xt_patch_op_t *tmp = realloc(c->entries, newcap * sizeof(*tmp));
         if (!tmp) {
             firc_ipt_rule_free(owned);
             return FIRC_ERR_NOMEM;
@@ -142,7 +137,7 @@ static firc_err_t patch_compile(firc_ipt_chain_t *self, const char *chain_name,
     size_t n = 0, cap = 0;
 
     for (size_t i = 0; i < c->n && err == FIRC_OK; i++) {
-        patch_entry_t *e = &c->entries[i];
+        firc_xt_patch_op_t *e = &c->entries[i];
         char *key = firc_ipt_rule_string(e->rule);
         if (!key) {
             err = FIRC_ERR_NOMEM;
@@ -200,6 +195,15 @@ static firc_err_t patch_remove(firc_ipt_chain_t *self, const firc_ipt_rule_t *ru
     return add_rule((chain_patch_t *)self, FIRC_IPT_OP_DELETE, 0, rule);
 }
 
+static void patch_stage(firc_ipt_chain_t *self, firc_xt_stage_chain_t *out) {
+    chain_patch_t *c = (chain_patch_t *)self;
+    out->kind = FIRC_XT_STAGE_PATCH;
+    out->rules = NULL;
+    out->n_rules = 0;
+    out->ops = c->entries;
+    out->n_ops = c->n;
+}
+
 static void patch_destroy(firc_ipt_chain_t *self) {
     chain_patch_t *c = (chain_patch_t *)self;
     if (!c) { return; }
@@ -214,6 +218,7 @@ static const firc_ipt_chain_ops_t k_patch_ops = {
     .insert = patch_insert,
     .remove = patch_remove,
     .destroy = patch_destroy,
+    .stage = patch_stage,
 };
 
 firc_ipt_chain_t *firc_ipt_chain_patch_new(void) {

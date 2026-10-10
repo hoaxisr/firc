@@ -8,6 +8,7 @@
 
 #include "fake_conntrack.h"
 #include "fake_iptables.h"
+#include "fake_xtables.h"
 
 #include "firc/app.h"
 #include "firc/fakeip.h"
@@ -52,7 +53,7 @@ static void fixture_up(fixture_t *fx) {
 
     fx->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     seed_foreign_rules(fx->fake);
-    fx->ipt = firc_ipt_new(firc_fake_ipt_as_executable(fx->fake));
+    fx->ipt = firc_ipt_new(firc_fake_ipt_as_executable(fx->fake), firc_fake_ipt_as_xt(fx->fake));
     firc_netfilter_register_base_chains(fx->ipt, NULL);
 
     firc_app_deps_t deps = {.cfg = &fx->cfg, .ipt4 = fx->ipt};
@@ -72,10 +73,10 @@ static void fixture_down(fixture_t *fx) {
 }
 
 static void seed_stale_chain(firc_fake_ipt_t *f) {
-    static const char *rule[] = {"-m", "set", "--match-set", "firc_old_4", "dst", "-j", "MASQUERADE"};
+    static const char *rule[] = {"-j", "MASQUERADE"};
     static const char *jump[] = {"-j", "FIRC_old"};
     const char *const *rules[1] = {rule};
-    size_t lens[1] = {7};
+    size_t lens[1] = {2};
     firc_fake_ipt_set_initial_rules(f, "nat", "FIRC_old", rules, lens, 1);
 
     const char *const *keep[2];
@@ -265,9 +266,9 @@ TEST a_pass_writes_the_dnat_chain_and_commits_the_pool(void) {
     firc_config_init_defaults(&cfg);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     seed_foreign_rules(fake);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_fake_ipt_t *fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fake6));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fake6), firc_fake_ipt_as_xt(fake6));
     firc_netfilter_register_base_chains(ipt, ipt6);
     firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt, .ipt6 = ipt6, .pool = pool};
     firc_app_t *app = firc_app_create(&deps);
@@ -322,7 +323,7 @@ static void up_with_conntrack_and_loop(firc_config_t *cfg, firc_fake_ipt_t **fak
     if (firc_fakeip_new(&c, pool) != FIRC_OK) { return; }
     firc_config_init_defaults(cfg);
     *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    *ipt = firc_ipt_new(firc_fake_ipt_as_executable(*fake));
+    *ipt = firc_ipt_new(firc_fake_ipt_as_executable(*fake), firc_fake_ipt_as_xt(*fake));
     firc_netfilter_register_base_chains(*ipt, NULL);
     *kernel = fake_ct_start(ct);
     firc_app_deps_t deps = {.cfg = cfg, .ipt4 = *ipt, .pool = *pool, .ct = *ct, .loop = loop};
@@ -564,10 +565,10 @@ TEST a_pass_puts_the_pool_reject_barrier_first_in_forward(void) {
     firc_config_init_defaults(&cfg);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     seed_foreign_rules(fake);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_fake_ipt_t *fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
     seed_foreign_rules(fake6);
-    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fake6));
+    firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(fake6), firc_fake_ipt_as_xt(fake6));
     firc_netfilter_register_base_chains(ipt, ipt6);
     firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt, .ipt6 = ipt6, .pool = pool};
     firc_app_t *app = firc_app_create(&deps);
@@ -618,7 +619,7 @@ TEST the_sweep_leaves_the_barrier_in_place(void) {
     size_t fwd_lens[2] = {2, 4};
     firc_fake_ipt_set_initial_rules(fake, "filter", "FORWARD", fwd, fwd_lens, 2);
     seed_stale_chain(fake);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_netfilter_register_base_chains(ipt, NULL);
 
     ASSERT_EQ(FIRC_OK, firc_netfilter_clean_iptables(ipt, NULL, "FIRC_"));
@@ -643,7 +644,7 @@ TEST the_purge_takes_the_barrier_as_well(void) {
     size_t fwd_lens[2] = {2, 4};
     firc_fake_ipt_set_initial_rules(fake, "filter", "FORWARD", fwd, fwd_lens, 2);
     seed_stale_chain(fake);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_netfilter_register_base_chains(ipt, NULL);
 
     ASSERT_EQ(FIRC_OK, firc_netfilter_purge_iptables(ipt, NULL, "FIRC_"));
@@ -678,7 +679,7 @@ TEST destroying_the_app_takes_the_dnat_chain_back(void) {
     firc_config_init_defaults(&cfg);
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     seed_foreign_rules(fake);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_netfilter_register_base_chains(ipt, NULL);
     firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt, .pool = pool};
     firc_app_t *app = firc_app_create(&deps);
@@ -709,6 +710,7 @@ TEST an_incremental_pass_writes_ours_and_sweeps_nothing(void) {
     fixture_up(&fx);
     seed_stale_chain(fx.fake);
     firc_fake_ipt_reset(fx.fake);
+    firc_ipt_forget_written(fx.ipt);
     seed_foreign_rules(fx.fake);
     seed_stale_chain(fx.fake);
     ASSERT(firc_fake_ipt_chain_exists(fx.fake, "nat", "FIRC_old"));
@@ -726,12 +728,18 @@ TEST an_incremental_pass_writes_ours_and_sweeps_nothing(void) {
     PASS();
 }
 
-/* Catches: a forced commit without a committer not committing at once. */
+/* Catches: a forced commit without a committer trusting its last write, so what the firmware wiped stays wiped. */
 TEST force_commit_without_a_committer_commits_in_place(void) {
     fixture_t fx;
     fixture_up(&fx);
+    ASSERT(chain_has_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2));
+    firc_fake_ipt_reset(fx.fake);
+    seed_foreign_rules(fx.fake);
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(fx.fake, "nat", "FIRC_DNSOR"));
 
     ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(fx.app));
+    ASSERT(firc_fake_ipt_chain_exists(fx.fake, "nat", "FIRC_DNSOR"));
+    ASSERT_EQ_FMT((size_t)1, count_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2), "%zu");
 
     fixture_down(&fx);
     PASS();
@@ -739,7 +747,7 @@ TEST force_commit_without_a_committer_commits_in_place(void) {
 
 TEST port_remap_uses_the_configured_chain_prefix(void) {
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
     firc_netfilter_register_base_chains(ipt, NULL);
 
     firc_port_remap_t *remap = firc_port_remap_new("XX_", 53, 3553, NULL, 0, ipt, NULL);
@@ -752,6 +760,91 @@ TEST port_remap_uses_the_configured_chain_prefix(void) {
     ASSERT_EQ(FIRC_OK, firc_port_remap_disable(remap));
     firc_port_remap_free(remap);
     firc_ipt_free(ipt);
+    PASS();
+}
+
+/* Catches: an incremental pass with nothing new reading nat, or a full pass not reading it. */
+TEST a_full_pass_reads_every_table_again(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    size_t reads = firc_fake_xt_reads(firc_fake_ipt_xt(fx.fake));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, false));
+    ASSERT_EQ_FMTm("an incremental pass with nothing new reads nothing", reads,
+                   firc_fake_xt_reads(firc_fake_ipt_xt(fx.fake)), "%zu");
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_GT(firc_fake_xt_reads(firc_fake_ipt_xt(fx.fake)), reads);
+    fixture_down(&fx);
+    PASS();
+}
+
+/* Catches: an incremental pass repairing a nat the firmware rewrote (the accepted trade moved), or the full pass after it not repairing it. */
+TEST a_full_pass_after_the_firmware_rewrote_nat_writes_it_back(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT(chain_has_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2));
+
+    static const char *pre[] = {"-i", "eth0", "-j", "ACCEPT"};
+    const char *const *rules[1] = {pre};
+    size_t lens[1] = {4};
+    ASSERT_EQ(FIRC_OK, firc_fake_ipt_set_initial_rules(fx.fake, "nat", "PREROUTING", rules, lens, 1));
+    ASSERT_FALSE(chain_has_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2));
+
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, false));
+    ASSERT_FALSEm("the accepted trade: an incremental pass trusts its last write",
+                  chain_has_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2));
+
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_EQ_FMT((size_t)1, count_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2), "%zu");
+    ASSERT(firc_fake_ipt_chain_exists(fx.fake, "nat", "FIRC_DNSOR"));
+    fixture_down(&fx);
+    PASS();
+}
+
+/* Catches: a full pass without forgetting, where the sweep keeps the barrier so filter stages as last written and the firmware's rewrite is never repaired. */
+TEST a_full_pass_after_the_firmware_rewrote_filter_puts_the_barrier_back(void) {
+    firc_fakeip_cfg_t c = {0};
+    c.v4.base.len = 4;
+    c.v4.base.b[0] = 198;
+    c.v4.base.b[1] = 18;
+    c.v4.pool_cidr = 15;
+    c.v4.chunk_cidr = 24;
+    c.v6.base.len = 16;
+    c.v6.base.b[0] = 0xfd;
+    c.v6.base.b[1] = 0x37;
+    c.v6.base.b[2] = 0x9a;
+    c.v6.pool_cidr = 48;
+    c.v6.chunk_cidr = 64;
+    c.max_names = 64;
+    c.idle_secs = 86400;
+    c.clamp_secs = 300;
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_config_t cfg;
+    firc_config_init_defaults(&cfg);
+    firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    seed_foreign_rules(fake);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(fake), firc_fake_ipt_as_xt(fake));
+    firc_netfilter_register_base_chains(ipt, NULL);
+    firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt, .pool = pool};
+    firc_app_t *app = firc_app_create(&deps);
+
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(app, NULL, true));
+    ASSERT_EQ_FMT((size_t)1, forward_jumps(fake, "FIRC_POOLREJECT"), "%zu");
+    static const char *foreign[] = {"-i", "eth0", "-j", "ACCEPT"};
+    const char *const *fwd[1] = {foreign};
+    size_t fwd_lens[1] = {4};
+    firc_fake_ipt_set_initial_rules(fake, "filter", "FORWARD", fwd, fwd_lens, 1);
+    ASSERT_EQ_FMT((size_t)0, forward_jumps(fake, "FIRC_POOLREJECT"), "%zu");
+
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(app, NULL, true));
+    ASSERT_EQ_FMT((size_t)1, forward_jumps(fake, "FIRC_POOLREJECT"), "%zu");
+
+    firc_app_destroy(app);
+    firc_ipt_free(ipt);
+    firc_config_clear(&cfg);
+    firc_fakeip_free(pool);
     PASS();
 }
 
@@ -776,6 +869,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_full_pass_clears_the_flows_of_the_window_it_opened);
     RUN_TEST(an_incremental_pass_opens_no_window_and_clears_nothing);
     RUN_TEST(the_sweep_also_happens_when_the_pass_is_reported_through_the_loop);
+    RUN_TEST(a_full_pass_reads_every_table_again);
+    RUN_TEST(a_full_pass_after_the_firmware_rewrote_nat_writes_it_back);
+    RUN_TEST(a_full_pass_after_the_firmware_rewrote_filter_puts_the_barrier_back);
     RUN_TEST(a_sweep_that_could_not_finish_waits_for_the_next_full_pass);
     RUN_TEST(an_incremental_pass_reported_through_the_loop_clears_nothing);
     GREATEST_MAIN_END();

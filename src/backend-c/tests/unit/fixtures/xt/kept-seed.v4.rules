@@ -1,0 +1,5 @@
+*nat
+:FIRC_DNSOR - [0:0]
+-A FIRC_DNSOR -p tcp -d 192.168.1.1 --dport 53 -j DNAT --to-destination :3553
+-A PREROUTING -j FIRC_DNSOR
+COMMIT

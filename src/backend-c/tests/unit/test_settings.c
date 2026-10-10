@@ -32,7 +32,6 @@ static const char EVERY_FIELD[] =
     "    v4: {pool: 100.64.0.0/10, chunk: 26}\n"
     "    v6: {pool: 'fd7a:115c:a1e0::/48', chunk: 60}\n"
     "    ttlClamp: 2m\n"
-    "    idleWindow: 36h\n"
     "    maxNames: 4096\n"
     "  link: [br0, br1]\n"
     "  showAllInterfaces: true\n"
@@ -110,7 +109,7 @@ static void v6_pool_is_v4(firc_app_config_t *c) { firc_strset(&c->fakeip.v6.pool
 static void v6_chunk_wider(firc_app_config_t *c) { c->fakeip.v6.chunk = 40; }
 static void clamp_zero(firc_app_config_t *c) { c->fakeip.ttl_clamp = 0; }
 static void clamp_past_a_year(firc_app_config_t *c) { c->fakeip.ttl_clamp = INT64_C(366) * 24 * 3600 * FIRC_DURATION_SEC; }
-static void idle_sub_second(firc_app_config_t *c) { c->fakeip.idle_window = 500 * FIRC_DURATION_MS; }
+static void clamp_past_half_a_year(firc_app_config_t *c) { c->fakeip.ttl_clamp = INT64_C(183) * 24 * 3600 * FIRC_DURATION_SEC; }
 /* An unmatchedTtl past a day; 0 means off and is allowed. */
 static void unmatched_ttl_past_a_day(firc_app_config_t *c) { c->dns_proxy.unmatched_ttl = 86401 * FIRC_DURATION_SEC; }
 static void unmatched_ttl_negative(firc_app_config_t *c) { c->dns_proxy.unmatched_ttl = -5 * FIRC_DURATION_SEC; }
@@ -175,7 +174,7 @@ static const struct {
     {clamp_past_a_year, "app.addressPool.ttlClamp"},
     {unmatched_ttl_past_a_day, "app.dnsProxy.unmatchedTtl"},
     {unmatched_ttl_negative, "app.dnsProxy.unmatchedTtl"},
-    {idle_sub_second, "app.addressPool.idleWindow"},
+    {clamp_past_half_a_year, "app.addressPool.ttlClamp"},
     {names_zero, "app.addressPool.maxNames"},
     {link_empty_name, "app.link"},
     {link_long_name, "app.link"},
@@ -311,7 +310,6 @@ static const field_t NUMERIC[] = {
     FIELD("app.dnsProxy.host.port", dns_proxy.host.port),
     FIELD("app.dnsProxy.disableRemap53", dns_proxy.disable_remap53),
     FIELD("app.addressPool.ttlClamp", fakeip.ttl_clamp),
-    FIELD("app.addressPool.idleWindow", fakeip.idle_window),
     FIELD("app.addressPool.maxNames", fakeip.max_names),
     FIELD("app.addressPool.v4.chunk", fakeip.v4.chunk),
     FIELD("app.addressPool.v6.chunk", fakeip.v6.chunk),

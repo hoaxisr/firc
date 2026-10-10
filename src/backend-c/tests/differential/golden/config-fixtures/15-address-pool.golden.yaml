@@ -32,7 +32,6 @@ app:
       pool: fd7a:115c:a1e0::/48
       chunk: 60
     ttlClamp: 2m0s
-    idleWindow: 36h0m0s
     maxNames: 4096
   link:
   - br0

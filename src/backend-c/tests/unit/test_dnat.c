@@ -2,10 +2,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #include "fake_iptables.h"
 #include "firc/dnat.h"
 #include "firc/netfilter_cleaner.h"
+#include "firc/port_remap.h"
 
 static bool has_rule(firc_fake_ipt_t *f, const char *table, const char *chain,
                      const char *const *want, size_t n_want) {
@@ -68,7 +70,7 @@ TEST a_resolved_mapping_becomes_one_host_rule(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_set_real(pool, "a.example.com", &real));
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     {
         firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
@@ -101,7 +103,7 @@ TEST an_unresolved_mapping_contributes_no_rule(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(pool, "unresolved.example.com", "g1", 1000, &a, &b));
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     {
         firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
@@ -136,7 +138,7 @@ TEST each_family_gets_only_its_own_rules(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_set_real(pool, "dual.example.com", &real6));
 
     firc_fake_ipt_t *f4 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *i4 = firc_ipt_new(firc_fake_ipt_as_executable(f4));
+    firc_ipt_t *i4 = firc_ipt_new(firc_fake_ipt_as_executable(f4), firc_fake_ipt_as_xt(f4));
     firc_netfilter_register_base_chains(i4, NULL);
     {
         firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
@@ -147,7 +149,7 @@ TEST each_family_gets_only_its_own_rules(void) {
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(i4));
 
     firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    firc_ipt_t *i6 = firc_ipt_new(firc_fake_ipt_as_executable(f6));
+    firc_ipt_t *i6 = firc_ipt_new(firc_fake_ipt_as_executable(f6), firc_fake_ipt_as_xt(f6));
     firc_netfilter_register_base_chains(NULL, i6);
     {
         firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
@@ -204,7 +206,7 @@ TEST every_resolved_mapping_gets_its_own_rule(void) {
     }
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     {
         firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
@@ -241,7 +243,7 @@ TEST a_moved_names_old_address_keeps_its_rule(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_set_real(pool, "a.example.com", &real2));
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     firc_fakeip_snapshot_t *snap_ = firc_fakeip_snapshot_take(pool);
     ASSERT_EQ(FIRC_OK, firc_dnat_build_rules(ipt, "FIRC_", snap_, NULL, NULL));
@@ -263,7 +265,7 @@ TEST a_moved_names_old_address_keeps_its_rule(void) {
 
 TEST without_a_pool_only_the_chain_is_staged(void) {
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     ASSERT_EQ(FIRC_OK, firc_dnat_build_rules(ipt, "FIRC_", NULL, NULL, NULL));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -297,7 +299,7 @@ TEST only_a_routed_groups_mappings_are_rewritten(void) {
     snprintf(d2, sizeof(d2), "%u.%u.%u.%u/32", f2.b[0], f2.b[1], f2.b[2], f2.b[3]);
 
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     firc_netfilter_register_base_chains(ipt, NULL);
     firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
     ASSERT(snap != NULL);
@@ -323,6 +325,61 @@ TEST only_a_routed_groups_mappings_are_rewritten(void) {
     PASS();
 }
 
+/* Catches: dnat registering nat/PREROUTING itself, which drops every jump another builder staged there. */
+TEST the_dnat_jump_joins_what_others_staged_in_prerouting(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
+    ASSERT_EQ(FIRC_OK, firc_netfilter_register_base_chains(ipt, NULL));
+    static const char *other[] = {"-j", "FIRC_OTHER"};
+    ASSERT_EQ(FIRC_OK, firc_ipt_register_chain_override(ipt, "nat", "FIRC_OTHER"));
+    ASSERT_EQ(FIRC_OK, firc_ipt_insert(ipt, "nat", "PREROUTING", 1, other, 2));
+    firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
+    ASSERT(snap != NULL);
+    ASSERT_EQ(FIRC_OK, firc_dnat_build_rules(ipt, "FIRC_", snap, NULL, NULL));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
+    static const char *jump[] = {"-d", "198.18.0.0/15", "-j", "FIRC_DNAT"};
+    ASSERT(has_rule(f, "nat", "PREROUTING", jump, 4));
+    ASSERTm("the jump staged before it stays", has_rule(f, "nat", "PREROUTING", other, 2));
+    firc_fakeip_snapshot_free(snap);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+/* Catches: dnat staging into nat/PREROUTING without the caller having registered it as a patch chain. */
+TEST dnat_without_the_base_chain_is_refused(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
+    firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
+    ASSERT(snap != NULL);
+    ASSERT_EQ(FIRC_ERR_STATE, firc_dnat_build_rules(ipt, "FIRC_", snap, NULL, NULL));
+    ASSERT_EQ(FIRC_ERR_STATE, firc_dnat_delete_rules(ipt, "FIRC_", snap));
+    firc_fakeip_snapshot_free(snap);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+/* Catches: the DNS remap registering nat/PREROUTING itself instead of needing the caller's patch chain. */
+TEST the_dns_remap_without_the_base_chain_is_refused(void) {
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
+    firc_remap_addr_t a = {AF_INET, {192, 168, 1, 1}, 4};
+    firc_port_remap_t *p = firc_port_remap_new("FIRC_", 53, 3553, &a, 1, ipt, NULL);
+    ASSERT(p != NULL);
+    ASSERT_EQ(FIRC_ERR_STATE, firc_port_remap_enable(p));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(f, "nat", "FIRC_DNSOR"));
+    firc_port_remap_free(p);
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -335,5 +392,8 @@ int main(int argc, char **argv)
     RUN_TEST(a_moved_names_old_address_keeps_its_rule);
     RUN_TEST(without_a_pool_only_the_chain_is_staged);
     RUN_TEST(only_a_routed_groups_mappings_are_rewritten);
+    RUN_TEST(the_dnat_jump_joins_what_others_staged_in_prerouting);
+    RUN_TEST(dnat_without_the_base_chain_is_refused);
+    RUN_TEST(the_dns_remap_without_the_base_chain_is_refused);
     GREATEST_MAIN_END();
 }
