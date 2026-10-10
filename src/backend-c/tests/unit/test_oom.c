@@ -549,8 +549,8 @@ TEST a_capture_that_could_not_be_staged_leaves_no_chain(void) {
         ASSERT_EQ(FIRC_OK, firc_fakeip_new(&pc, &pool));
         firc_fake_ipt_t *fake[2] = {firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4),
                                     firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6)};
-        firc_ipt_t *ipt[2] = {firc_ipt_new(firc_fake_ipt_as_executable(fake[0])),
-                              firc_ipt_new(firc_fake_ipt_as_executable(fake[1]))};
+        firc_ipt_t *ipt[2] = {firc_ipt_new(firc_fake_ipt_as_executable(fake[0]), firc_fake_ipt_as_xt(fake[0])),
+                              firc_ipt_new(firc_fake_ipt_as_executable(fake[1]), firc_fake_ipt_as_xt(fake[1]))};
         firc_netfilter_register_base_chains(ipt[0], ipt[1]);
         firc_app_deps_t deps = {.cfg = &cfg,
                                 .ipt4 = ipt[0],

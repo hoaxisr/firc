@@ -2,7 +2,7 @@ import type { Page, Route } from "@playwright/test";
 
 import { signedIn } from "./session";
 
-// Default units: timeout ms, ttlClamp s, idleWindow h, startMarkTableIndex hex.
+// Default units: timeout ms, ttlClamp s, startMarkTableIndex hex.
 export const DEFAULTS: Record<string, unknown> = {
   "app.dnsProxy.upstream.address": "127.0.0.1",
   "app.dnsProxy.upstream.port": 53,
@@ -15,7 +15,6 @@ export const DEFAULTS: Record<string, unknown> = {
   "app.dnsProxy.host.port": 3553,
   "app.dnsProxy.disableRemap53": false,
   "app.addressPool.ttlClamp": 300,
-  "app.addressPool.idleWindow": 24,
   "app.addressPool.maxNames": 65536,
   "app.addressPool.v4.pool": "198.18.0.0/15",
   "app.addressPool.v4.chunk": 24,

@@ -1,8 +1,11 @@
 #include "fake_iptables.h"
 
 #include "firc/bytebuf.h"
+#include "xt_golden.h"
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +21,12 @@ typedef struct fake_table {
     size_t n_chains, cap_chains;
 } fake_table_t;
 
+typedef struct nat_view {
+    firc_ipt_rule_t **rules;
+    size_t n;
+    struct nat_view *next;
+} nat_view_t;
+
 struct firc_fake_ipt {
     firc_ipt_executable_t base;
     pthread_mutex_t mu;
@@ -31,7 +40,97 @@ struct firc_fake_ipt {
     char *refuse;
     char *log;
     size_t log_len;
+    char *saved;
+    size_t saved_len;
+    firc_fake_xt_t *xt;
+    nat_view_t *nat_views;
+    void (*on_restore)(void *ud);
+    void *on_restore_ud;
 };
+
+static void log_append(firc_fake_ipt_t *f, const char *text, size_t len) {
+    char *grown = realloc(f->log, f->log_len + len + 1);
+    if (grown == NULL) { return; }
+    memcpy(grown + f->log_len, text, len);
+    f->log_len += len;
+    grown[f->log_len] = '\0';
+    f->log = grown;
+}
+
+static int nat_before(void *ud, firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info,
+                      const uint8_t *blob) {
+    firc_fake_ipt_t *f = ud;
+    (void)table;
+    char *text = firc_test_xt_print(fam, info, blob);
+    pthread_mutex_lock(&f->mu);
+    int err = 0;
+    if (f->next_restore_err != FIRC_OK && f->next_restore_err != FIRC_ERR_CANCELED) {
+        err = f->next_restore_err == FIRC_ERR_AGAIN ? EAGAIN : EINVAL;
+        f->next_restore_err = FIRC_OK;
+    } else if (text != NULL && f->refuse != NULL && f->refuse[0] != '\0' && strstr(text, f->refuse) != NULL) {
+        err = EINVAL;
+    }
+    pthread_mutex_unlock(&f->mu);
+    free(text);
+    return err;
+}
+
+static void nat_after(void *ud, const char *table) {
+    firc_fake_ipt_t *f = ud;
+    firc_xt_info_t info;
+    uint8_t *blob = NULL;
+    if (!firc_fake_xt_blob(f->xt, table, &info, &blob)) { return; }
+    char *text = firc_test_xt_print(f->proto, &info, blob);
+    free(blob);
+    if (text == NULL) { return; }
+    pthread_mutex_lock(&f->mu);
+    log_append(f, text, strlen(text));
+    pthread_mutex_unlock(&f->mu);
+    free(text);
+}
+
+static void nat_view_clear(firc_fake_ipt_t *f) {
+    while (f->nat_views != NULL) {
+        nat_view_t *v = f->nat_views;
+        f->nat_views = v->next;
+        for (size_t i = 0; i < v->n; i++) { firc_ipt_rule_free(v->rules[i]); }
+        free(v->rules);
+        free(v);
+    }
+}
+
+static bool nat_rules(firc_fake_ipt_t *f, const char *chain, firc_ipt_rule_t *const **out, size_t *n) {
+    firc_xt_info_t info;
+    uint8_t *blob = NULL;
+    if (!firc_fake_xt_blob(f->xt, "nat", &info, &blob)) { return false; }
+    char *text = firc_test_xt_print(f->proto, &info, blob);
+    free(blob);
+    if (text == NULL) { return false; }
+    char decl[64], rule[64];
+    snprintf(decl, sizeof(decl), ":%s ", chain);
+    int rule_len = snprintf(rule, sizeof(rule), "-A %s", chain);
+    bool exists = false;
+    nat_view_t *v = calloc(1, sizeof(*v));
+    for (char *save = NULL, *line = strtok_r(text, "\n", &save); v != NULL && line != NULL;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (strncmp(line, decl, strlen(decl)) == 0) { exists = true; }
+        if (strncmp(line, rule, (size_t)rule_len) != 0 || (line[rule_len] != ' ' && line[rule_len] != '\0')) { continue; }
+        firc_ipt_rule_t **grown = realloc(v->rules, (v->n + 1) * sizeof(*grown));
+        if (grown == NULL) { break; }
+        v->rules = grown;
+        v->rules[v->n++] = firc_test_rule(line + rule_len);
+    }
+    if (out != NULL) { *out = v != NULL ? v->rules : NULL; }
+    if (n != NULL) { *n = v != NULL ? v->n : 0; }
+    if (v != NULL) {
+        pthread_mutex_lock(&f->mu);
+        v->next = f->nat_views;
+        f->nat_views = v;
+        pthread_mutex_unlock(&f->mu);
+    }
+    free(text);
+    return exists;
+}
 
 /* Whether the fake refuses this transcript; call with the lock held. */
 static bool fake_refuses(const firc_fake_ipt_t *f, const uint8_t *data, size_t len) {
@@ -122,6 +221,21 @@ static void fc_clear(fake_chain_t *c) {
 firc_err_t firc_fake_ipt_set_initial_rules(firc_fake_ipt_t *f, const char *table, const char *chain,
                                        const char *const *const *rules, const size_t *rule_lens,
                                        size_t n_rules) {
+    if (strcmp(table, "nat") == 0) {
+        firc_ipt_rule_t **rs = calloc(n_rules ? n_rules : 1, sizeof(*rs));
+        if (rs == NULL) { return FIRC_ERR_NOMEM; }
+        for (size_t i = 0; i < n_rules; i++) { rs[i] = firc_ipt_rule_new(rules[i], rule_lens[i]); }
+        firc_xt_stage_chain_t sc = {chain, FIRC_XT_STAGE_OVERRIDE, rs, n_rules, NULL, 0};
+        firc_xt_stage_t stage = {&sc, 1, NULL};
+        firc_fake_xt_set_write_hooks(f->xt, NULL, NULL, NULL);
+        firc_xt_t *h = firc_fake_xt_handle(f->xt);
+        firc_err_t err = h != NULL ? firc_xt_commit(h, "nat", &stage, NULL) : FIRC_ERR_NOMEM;
+        firc_xt_free(h);
+        firc_fake_xt_set_write_hooks(f->xt, nat_before, nat_after, f);
+        for (size_t i = 0; i < n_rules; i++) { firc_ipt_rule_free(rs[i]); }
+        free(rs);
+        return err;
+    }
     fake_table_t *t = ft_find_or_create(f, table, strlen(table));
     if (!t) { return FIRC_ERR_NOMEM; }
     fake_chain_t *c = fc_find_or_create(t, chain, strlen(chain));
@@ -142,6 +256,7 @@ firc_err_t firc_fake_ipt_set_initial_rules(firc_fake_ipt_t *f, const char *table
 
 bool firc_fake_ipt_get_rules(firc_fake_ipt_t *f, const char *table, const char *chain,
                           firc_ipt_rule_t *const **out_rules, size_t *out_n) {
+    if (strcmp(table, "nat") == 0) { return nat_rules(f, chain, out_rules, out_n); }
     fake_table_t *t = ft_find(f, table);
     fake_chain_t *c = t ? fc_find(t, chain) : NULL;
     if (!c) {
@@ -155,6 +270,7 @@ bool firc_fake_ipt_get_rules(firc_fake_ipt_t *f, const char *table, const char *
 }
 
 bool firc_fake_ipt_chain_exists(firc_fake_ipt_t *f, const char *table, const char *chain) {
+    if (strcmp(table, "nat") == 0) { return nat_rules(f, chain, NULL, NULL); }
     pthread_mutex_lock(&f->mu);
     fake_table_t *t = ft_find(f, table);
     bool found = t ? fc_find(t, chain) != NULL : false;
@@ -183,7 +299,8 @@ static firc_err_t write_rule_parts(firc_bytebuf_t *buf, const firc_ipt_rule_t *r
     return err;
 }
 
-static firc_err_t fake_save_locked(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len) {
+static firc_err_t fake_save_locked(firc_ipt_executable_t *self, const char *table, uint8_t **out,
+                                   size_t *out_len) {
     firc_fake_ipt_t *f = (firc_fake_ipt_t *)self;
     firc_bytebuf_t buf;
     firc_bytebuf_init(&buf);
@@ -199,6 +316,7 @@ static firc_err_t fake_save_locked(firc_ipt_executable_t *self, uint8_t **out, s
 
     for (size_t ti = 0; ti < f->n_tables && err == FIRC_OK; ti++) {
         fake_table_t *t = tables[ti];
+        if (strcmp(t->name, table) != 0) { continue; }
         err = firc_bytebuf_append_byte(&buf, '*');
         if (err == FIRC_OK) { err = firc_bytebuf_append_str(&buf, t->name); }
         if (err == FIRC_OK) { err = firc_bytebuf_append_byte(&buf, '\n'); }
@@ -585,18 +703,39 @@ void firc_fake_ipt_reset(firc_fake_ipt_t *f) {
     if (!f) { return; }
     pthread_mutex_lock(&f->mu);
     fake_clear(f);
+    nat_view_clear(f);
+    free(f->saved);
+    f->saved = NULL;
+    f->saved_len = 0;
     pthread_mutex_unlock(&f->mu);
+    firc_fake_xt_reset(f->xt);
 }
 
-static firc_err_t fake_save(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len) {
+const char *firc_fake_ipt_saved_log(firc_fake_ipt_t *f) {
+    pthread_mutex_lock(&f->mu);
+    const char *s = f->saved != NULL ? f->saved : "";
+    pthread_mutex_unlock(&f->mu);
+    return s;
+}
+
+static firc_err_t fake_save(firc_ipt_executable_t *self, const char *table, uint8_t **out, size_t *out_len) {
     firc_fake_ipt_t *f = (firc_fake_ipt_t *)self;
     pthread_mutex_lock(&f->mu);
-    firc_err_t err = fake_save_locked(self, out, out_len);
+    size_t tl = strlen(table);
+    char *grown = realloc(f->saved, f->saved_len + tl + 2);
+    if (grown != NULL) {
+        memcpy(grown + f->saved_len, table, tl);
+        grown[f->saved_len + tl] = '\n';
+        f->saved_len += tl + 1;
+        grown[f->saved_len] = '\0';
+        f->saved = grown;
+    }
+    firc_err_t err = fake_save_locked(self, table, out, out_len);
     pthread_mutex_unlock(&f->mu);
     return err;
 }
 
-/* Every transcript handed to `restore`, in order, refused ones included */
+/* Every transcript handed to `restore`, in order, refused ones included, and every nat table written */
 const char *firc_fake_ipt_restore_log(firc_fake_ipt_t *f) {
     pthread_mutex_lock(&f->mu);
     const char *s = f->log;
@@ -608,12 +747,15 @@ static firc_err_t fake_restore(firc_ipt_executable_t *self, const uint8_t *data,
     firc_fake_ipt_t *f = (firc_fake_ipt_t *)self;
     pthread_mutex_lock(&f->mu);
     f->restore_calls++;
-    char *grown = realloc(f->log, f->log_len + len + 1);
-    if (grown != NULL) {
-        memcpy(grown + f->log_len, data, len);
-        f->log_len += len;
-        grown[f->log_len] = '\0';
-        f->log = grown;
+    log_append(f, (const char *)data, len);
+    bool names_nat = false;
+    for (size_t i = 0; i + 4 <= len && !names_nat; i++) {
+        names_nat = (i == 0 || data[i - 1] == '\n') && memcmp(data + i, "*nat", 4) == 0 &&
+                    (i + 4 == len || data[i + 4] == '\n');
+    }
+    if (names_nat) {
+        pthread_mutex_unlock(&f->mu);
+        return FIRC_ERR_STATE;
     }
     firc_err_t err = f->next_restore_err;
     if (err != FIRC_OK) {
@@ -628,8 +770,18 @@ static firc_err_t fake_restore(firc_ipt_executable_t *self, const uint8_t *data,
     } else {
         err = fake_restore_locked(self, data, len);
     }
+    void (*fn)(void *) = err == FIRC_OK ? f->on_restore : NULL;
+    void *ud = f->on_restore_ud;
     pthread_mutex_unlock(&f->mu);
+    if (fn != NULL) { fn(ud); }
     return err;
+}
+
+void firc_fake_ipt_on_restore(firc_fake_ipt_t *f, void (*fn)(void *ud), void *ud) {
+    pthread_mutex_lock(&f->mu);
+    f->on_restore = fn;
+    f->on_restore_ud = ud;
+    pthread_mutex_unlock(&f->mu);
 }
 
 size_t firc_fake_ipt_restore_calls(firc_fake_ipt_t *f) {
@@ -670,8 +822,11 @@ static void fake_destroy(firc_ipt_executable_t *self) {
     firc_fake_ipt_t *f = (firc_fake_ipt_t *)self;
     if (!f) { return; }
     fake_clear(f);
+    nat_view_clear(f);
+    firc_fake_xt_free(f->xt);
     free(f->refuse);
     free(f->log);
+    free(f->saved);
     pthread_mutex_destroy(&f->mu);
     free(f);
 }
@@ -689,9 +844,24 @@ firc_fake_ipt_t *firc_fake_ipt_new(firc_ipt_proto_t proto) {
     f->base.ops = &k_fake_ops;
     f->proto = proto;
     pthread_mutex_init(&f->mu, NULL);
+    f->xt = firc_fake_xt_new(proto);
+    if (f->xt == NULL) {
+        pthread_mutex_destroy(&f->mu);
+        free(f);
+        return NULL;
+    }
+    firc_fake_xt_set_write_hooks(f->xt, nat_before, nat_after, f);
     return f;
 }
 
 firc_ipt_executable_t *firc_fake_ipt_as_executable(firc_fake_ipt_t *f) {
     return &f->base;
+}
+
+firc_xt_t *firc_fake_ipt_as_xt(firc_fake_ipt_t *f) {
+    return firc_fake_xt_handle(f->xt);
+}
+
+firc_fake_xt_t *firc_fake_ipt_xt(firc_fake_ipt_t *f) {
+    return f->xt;
 }

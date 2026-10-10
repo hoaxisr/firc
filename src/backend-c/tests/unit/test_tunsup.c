@@ -881,7 +881,7 @@ static void *save_thread(void *ud)
     firc_ipt_executable_t *exe = ud;
     uint8_t *out = NULL;
     size_t len = 0;
-    exe->ops->save(exe, &out, &len);
+    exe->ops->save(exe, "nat", &out, &len);
     free(out);
     return NULL;
 }

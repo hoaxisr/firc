@@ -432,7 +432,6 @@ static firc_err_t load_app(yaml_document_t *doc, node_t *app,
         GET_OR_FAIL(load_fakeip_family(doc, fip, "v6", &c->fakeip.v6.pool,
                                        &c->fakeip.v6.chunk, &err));
         GET_OR_FAIL(get_duration(map_get(doc, fip, "ttlClamp"), &c->fakeip.ttl_clamp, &err));
-        GET_OR_FAIL(get_duration(map_get(doc, fip, "idleWindow"), &c->fakeip.idle_window, &err));
         uint64_t names;
         getter_res_t rn = get_uint64(map_get(doc, fip, "maxNames"), UINT32_MAX, &names, &err);
         if (rn == GET_ERR) {
@@ -452,7 +451,9 @@ static firc_err_t load_app(yaml_document_t *doc, node_t *app,
                            &err));
     /* runs unconditionally: a later overlay that omits a block must not leave an earlier value unchecked */
     const char *field = NULL, *why = NULL;
-    return firc_app_config_check(c, &field, &why);
+    firc_err_t chk = firc_app_config_check(c, &field, &why);
+    if (chk != FIRC_OK) { FIRC_ERROR("config: %s: %s", field, why); }
+    return chk;
 }
 
 static firc_err_t load_rule(yaml_document_t *doc, node_t *n, firc_rule_t *r)

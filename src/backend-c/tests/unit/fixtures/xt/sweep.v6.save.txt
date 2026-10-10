@@ -1,0 +1,16 @@
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:ACME_PRE - [0:0]
+:_NDM_DNAT - [0:0]
+:_NDM_MASQ - [0:0]
+-A PREROUTING -i eth3 -j _NDM_DNAT
+-A PREROUTING -j ACME_PRE
+-A POSTROUTING -j _NDM_MASQ
+-A ACME_PRE -s fd00:1::/64 -p udp -m udp --dport 5353 -j RETURN
+-A _NDM_DNAT -d 2001:db8::5/128 -p tcp -m tcp --dport 8443 -j DNAT --to-destination 2001:db8:1::10
+-A _NDM_MASQ -o eth3 -j SNAT --to-source 2001:db8::5
+-A _NDM_MASQ -o ppp0 -j MASQUERADE
+COMMIT

@@ -5,6 +5,8 @@
 #include "firc/duration.h"
 #include "firc/fakeip_ula.h"
 
+int64_t firc_fakeip_idle_for_clamp(int64_t clamp_secs) { return clamp_secs * 2 > 3600 ? clamp_secs * 2 : 3600; }
+
 static firc_err_t family_from_text(const char *text, uint8_t chunk, uint8_t want_len,
                                    firc_fakeip_family_cfg_t *out) {
     /* Zeroed: firc_ip_parse_cidr leaves outputs untouched on failure. */
@@ -42,13 +44,11 @@ firc_err_t firc_fakeip_cfg_from_app(const firc_app_config_t *app, const char *ul
     }
 
     /* Division truncates; refuse sub-second values instead of rounding. */
-    if (app->fakeip.ttl_clamp < FIRC_DURATION_SEC || app->fakeip.idle_window < FIRC_DURATION_SEC ||
-        app->fakeip.ttl_clamp % FIRC_DURATION_SEC != 0 ||
-        app->fakeip.idle_window % FIRC_DURATION_SEC != 0) {
+    if (app->fakeip.ttl_clamp < FIRC_DURATION_SEC || app->fakeip.ttl_clamp % FIRC_DURATION_SEC != 0) {
         return FIRC_ERR_INVAL;
     }
     cfg.clamp_secs = app->fakeip.ttl_clamp / FIRC_DURATION_SEC;
-    cfg.idle_secs = app->fakeip.idle_window / FIRC_DURATION_SEC;
+    cfg.idle_secs = firc_fakeip_idle_for_clamp(cfg.clamp_secs);
     err = firc_fakeip_check_windows(cfg.idle_secs, cfg.clamp_secs);
     if (err != FIRC_OK) { return err; }
     cfg.max_names = app->fakeip.max_names;

@@ -233,11 +233,10 @@ TEST get_answers_every_setting_typed(void) {
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
     ASSERT(out != NULL);
     const cJSON *s = item(out, "settings"), *c = item(out, "classes");
-    ASSERT_EQ(26, cJSON_GetArraySize(s));
+    ASSERT_EQ(25, cJSON_GetArraySize(s));
     ASSERT_EQ(NULL, item(s, "app.httpWeb.enabled"));
     ASSERT_EQ(5000, (int)item(s, "app.dnsProxy.timeout")->valuedouble);
     ASSERT_EQ(300, (int)item(s, "app.addressPool.ttlClamp")->valuedouble);
-    ASSERT_EQ(24, (int)item(s, "app.addressPool.idleWindow")->valuedouble);
     ASSERT_EQ(60, (int)item(s, "app.dnsProxy.unmatchedTtl")->valuedouble);
     ASSERT_STR_EQ("0x66697263", item(s, "app.netfilter.startMarkTableIndex")->valuestring);
     ASSERT(cJSON_IsNumber(item(s, "app.dnsProxy.upstream.port")));
@@ -709,7 +708,7 @@ TEST durations_and_the_mark_index_round_trip_in_their_units(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, do_request("PUT", "/api/v1/system/settings",
                               "{\"settings\":{\"app.dnsProxy.timeout\":2500,"
-                              "\"app.addressPool.ttlClamp\":90,\"app.addressPool.idleWindow\":36,"
+                              "\"app.addressPool.ttlClamp\":90,"
                               "\"app.netfilter.startMarkTableIndex\":\"0x3E8\"}}",
                               NULL));
     cJSON *out = NULL;
@@ -717,16 +716,26 @@ TEST durations_and_the_mark_index_round_trip_in_their_units(void) {
     const cJSON *s = item(out, "settings");
     ASSERT_EQ(2500, (int)item(s, "app.dnsProxy.timeout")->valuedouble);
     ASSERT_EQ(90, (int)item(s, "app.addressPool.ttlClamp")->valuedouble);
-    ASSERT_EQ(36, (int)item(s, "app.addressPool.idleWindow")->valuedouble);
     ASSERT_STR_EQ("0x3e8", item(s, "app.netfilter.startMarkTableIndex")->valuestring);
     cJSON_Delete(out);
     char *text = slurp(h->conf);
     ASSERT(text != NULL);
     ASSERT(strstr(text, "timeout: 2.5s\n") != NULL);
     ASSERT(strstr(text, "ttlClamp: 1m30s\n") != NULL);
-    ASSERT(strstr(text, "idleWindow: 36h0m0s\n") != NULL);
     ASSERT(strstr(text, "startMarkTableIndex: 1000\n") != NULL);
     free(text);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: idleWindow still accepted as a setting after it became derived. */
+TEST the_idle_window_is_not_a_setting(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    CHECK_CALL(expect_refusal("{\"settings\":{\"app.addressPool.idleWindow\":1}}", "app.addressPool.idleWindow"));
+    CHECK_CALL(expect_refusal("{\"settings\":{\"app.addressPool.ttlClamp\":15811200}}", "app.addressPool.ttlClamp"));
+    CHECK_CALL(expect_refusal("{\"settings\":{\"app.addressPool.ttlClamp\":15724801}}", "app.addressPool.ttlClamp"));
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/system/settings", "{\"settings\":{\"app.addressPool.ttlClamp\":15724800}}", NULL));
     harness_stop(h);
     PASS();
 }
@@ -1080,6 +1089,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_dns_move_on_its_own_port_that_another_program_holds_is_refused);
     RUN_TEST(a_move_on_the_running_web_port_is_not_refused_as_busy);
     RUN_TEST(durations_and_the_mark_index_round_trip_in_their_units);
+    RUN_TEST(the_idle_window_is_not_a_setting);
     RUN_TEST(numeric_settings_round_trip_whole_through_the_api_and_the_file);
     RUN_TEST(restart_answers_202_then_runs_the_script);
     RUN_TEST(a_second_restart_is_refused_while_one_is_under_way);

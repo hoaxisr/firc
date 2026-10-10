@@ -604,7 +604,6 @@ firc_err_t firc_app_config_init_defaults(firc_app_config_t *c)
     c->fakeip.v4.chunk = 24;
     c->fakeip.v6.chunk = 64;
     c->fakeip.ttl_clamp = 300 * FIRC_DURATION_SEC;
-    c->fakeip.idle_window = INT64_C(24) * 3600 * FIRC_DURATION_SEC;
     c->fakeip.max_names = 65536;
     return FIRC_OK;
 }

@@ -1,0 +1,4 @@
+*nat
+:FIRC_TMP - [0:0]
+-X FIRC_TMP
+COMMIT

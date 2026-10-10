@@ -145,7 +145,7 @@ static bool rig_up_full(rig_t *r, const rig_opts_t *o) {
     }
 
     r->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    r->ipt = firc_ipt_new(firc_fake_ipt_as_executable(r->fake));
+    r->ipt = firc_ipt_new(firc_fake_ipt_as_executable(r->fake), firc_fake_ipt_as_xt(r->fake));
     firc_netfilter_register_base_chains(r->ipt, NULL);
     RIG_STEP(firc_loop_create(&r->loop) == FIRC_OK, "loop");
 

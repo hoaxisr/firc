@@ -833,9 +833,9 @@ static bool nf_fixture_up_ex(nf_fixture_t *f, bool with_committer) {
     f->pipeline = firc_dns_pipeline_create();
     if (f->pipeline == NULL) { return false; }
     f->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    f->ipt = firc_ipt_new(firc_fake_ipt_as_executable(f->fake));
+    f->ipt = firc_ipt_new(firc_fake_ipt_as_executable(f->fake), firc_fake_ipt_as_xt(f->fake));
     f->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    f->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake6));
+    f->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(f->fake6), firc_fake_ipt_as_xt(f->fake6));
     firc_netfilter_register_base_chains(f->ipt, f->ipt6);
     f->kernel = fake_rtnl_start(&f->rtnl);
     if (f->kernel == NULL) { return false; }

@@ -1,0 +1,6 @@
+*nat
+:FIRC_g1 - [0:0]
+-A FIRC_g1 -o nwg1 -m mark --mark 0x10000/0xff0000 -j MASQUERADE
+-A POSTROUTING -j FIRC_g1
+-A POSTROUTING -j FIRC_g1
+COMMIT

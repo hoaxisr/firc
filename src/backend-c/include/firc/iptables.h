@@ -13,6 +13,9 @@ typedef enum firc_ipt_proto {
     FIRC_IPT_PROTO_IPV6 = 1,
 } firc_ipt_proto_t;
 
+typedef struct firc_xt firc_xt_t;
+struct firc_xt_stage_chain;
+
 /* argv-style rule parts, each owned. */
 typedef struct firc_ipt_rule {
     char **parts;
@@ -30,7 +33,7 @@ typedef struct firc_ipt_executable firc_ipt_executable_t;
 
 typedef struct firc_ipt_executable_ops {
     /* *out is malloc'd, not NUL-terminated. */
-    firc_err_t (*save)(firc_ipt_executable_t *self, uint8_t **out, size_t *out_len);
+    firc_err_t (*save)(firc_ipt_executable_t *self, const char *table, uint8_t **out, size_t *out_len);
     firc_err_t (*restore)(firc_ipt_executable_t *self, const uint8_t *data, size_t len);
     firc_ipt_proto_t (*proto)(firc_ipt_executable_t *self);
     void (*destroy)(firc_ipt_executable_t *self);
@@ -76,7 +79,8 @@ void firc_ipt_command_list_free(firc_ipt_command_t *cmds, size_t n);
 typedef struct firc_ipt_chain firc_ipt_chain_t;
 
 typedef struct firc_ipt_chain_ops {
-    /* existing NULL: chain absent. *out_priority orders chains in commit (patch 0, override -128, delete 127). */
+    /* existing NULL: chain absent. *out_priority orders chains in commit (patch 0, override -128, delete 127).
+     * append, insert and remove may be NULL: the kind does not take that operation. */
     firc_err_t (*compile)(firc_ipt_chain_t *self, const char *chain_name,
                          firc_ipt_rule_t *const *existing, size_t n_existing,
                          firc_ipt_command_t **out_cmds, size_t *out_n,
@@ -85,6 +89,8 @@ typedef struct firc_ipt_chain_ops {
     firc_err_t (*insert)(firc_ipt_chain_t *self, int rule_num, const firc_ipt_rule_t *rule);
     firc_err_t (*remove)(firc_ipt_chain_t *self, const firc_ipt_rule_t *rule);
     void (*destroy)(firc_ipt_chain_t *self);
+    /* The registration as staged, for a table x_tables writes; out->name is the engine's. */
+    void (*stage)(firc_ipt_chain_t *self, struct firc_xt_stage_chain *out);
 } firc_ipt_chain_ops_t;
 
 struct firc_ipt_chain {
@@ -97,8 +103,8 @@ firc_ipt_chain_t *firc_ipt_chain_delete_new(void);
 
 typedef struct firc_ipt firc_ipt_t;
 
-/* Takes ownership of exe. Not thread-safe: one thread per firc_ipt_t. */
-firc_ipt_t *firc_ipt_new(firc_ipt_executable_t *exe);
+/* Takes exe and xt on success (xt NULL: this engine never stages nat). Not thread-safe: one thread per firc_ipt_t. */
+firc_ipt_t *firc_ipt_new(firc_ipt_executable_t *exe, firc_xt_t *xt);
 
 /* Writes data as is with restore --noflush, outside any registration; iptables --test is no substitute. */
 firc_err_t firc_ipt_write_transcript(firc_ipt_t *ipt, const uint8_t *data, size_t len);
@@ -108,13 +114,21 @@ firc_ipt_proto_t firc_ipt_proto(const firc_ipt_t *ipt);
 /* Borrowed token, NULL detaches; a raised token makes commit return FIRC_ERR_CANCELED with staging intact. */
 void firc_ipt_set_cancel(firc_ipt_t *ipt, firc_cancel_t *cancel);
 
-/* Drops every registration and staged rule; call after an aborted pass. */
+/* Drops every registration and staged rule; call after an aborted pass. Keeps what was last written. */
 void firc_ipt_discard(firc_ipt_t *ipt);
+
+/* The next commit reads and compares every table it has work for, as a full pass must. */
+void firc_ipt_forget_written(firc_ipt_t *ipt);
+
+/* Per table, what the commits since the last call did ("mangle 12 ms, nat skipped"); then empties it. */
+void firc_ipt_take_report(firc_ipt_t *ipt, char *out, size_t cap);
 
 /* Registering a chain again replaces it and drops its staged rules. */
 firc_err_t firc_ipt_register_chain_delete(firc_ipt_t *ipt, const char *table, const char *chain);
 firc_err_t firc_ipt_register_chain_patch(firc_ipt_t *ipt, const char *table, const char *chain);
 firc_err_t firc_ipt_register_chain_override(firc_ipt_t *ipt, const char *table, const char *chain);
+/* nat only: the next commit also drops every chain of ours it does not override and every jump into one it does not stage. */
+firc_err_t firc_ipt_register_sweep(firc_ipt_t *ipt, const char *table, const char *prefix);
 
 /* FIRC_ERR_STATE when the chain was never registered. */
 firc_err_t firc_ipt_append(firc_ipt_t *ipt, const char *table, const char *chain,
@@ -149,10 +163,14 @@ const firc_ipt_table_rules_t *firc_ipt_rules_snapshot_find_table(
 const firc_ipt_chain_rules_t *firc_ipt_table_rules_find_chain(
     const firc_ipt_table_rules_t *table, const char *chain_name);
 
-firc_err_t firc_ipt_get_current_rules(firc_ipt_t *ipt, firc_ipt_rules_snapshot_t **out);
+firc_err_t firc_ipt_get_current_rules(firc_ipt_t *ipt, const char *const *tables, size_t n_tables,
+                                      firc_ipt_rules_snapshot_t **out);
 void firc_ipt_rules_snapshot_free(firc_ipt_rules_snapshot_t *snap);
 
-/* Compiles all registered chains into one restore; no-op when empty. FIRC_ERR_CANCELED/AGAIN mean rebuild. */
+/* filter and mangle in one restore, then nat through x_tables (FIRC_ERR_STATE without a handle); FIRC_ERR_CANCELED/AGAIN mean rebuild. */
 firc_err_t firc_ipt_commit(firc_ipt_t *ipt);
+/* nat alone, or filter and mangle alone; the other part stays staged for a later commit. */
+firc_err_t firc_ipt_commit_nat(firc_ipt_t *ipt);
+firc_err_t firc_ipt_commit_text(firc_ipt_t *ipt);
 
 #endif /* FIRC_IPTABLES_H */

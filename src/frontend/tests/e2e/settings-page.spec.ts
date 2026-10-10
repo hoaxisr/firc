@@ -179,7 +179,7 @@ test("Russian counts agree with the number", async ({ page }) => {
     "app.link",
     "app.dnsProxy.timeout",
     "app.addressPool.ttlClamp",
-    "app.addressPool.idleWindow",
+    "app.addressPool.v4.pool",
   ];
   await openSettings(page, (r) => r.fulfill({ json: answer({}, five) }), { locale: "ru" });
   await expect(page.getByTestId("settings-banner")).toContainText("5 настроек ждут перезапуска");

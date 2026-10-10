@@ -216,7 +216,7 @@ static bool firc_marks_over(uint32_t field, uint32_t before, marks_t *out) {
     bool ok = firc_fakeip_get(pool, "a.example.com", "g1", 1000, &v4, &v6) == FIRC_OK;
     firc_fakeip_snapshot_t *snap = ok ? firc_fakeip_snapshot_take(pool) : NULL;
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f));
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_executable(f), firc_fake_ipt_as_xt(f));
     uint32_t mark = 0;
     const firc_ipv4_subnet_t sub[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
     ok = ok && snap != NULL && firc_netfilter_register_base_chains(ipt, NULL) == FIRC_OK &&

@@ -70,7 +70,7 @@ static harness_t *harness_start_with_kernels(bool kernels) {
     firc_app_deps_t deps = {.cfg = &h->cfg, .pipeline = h->pipeline, .pool = h->pool, .router = h->router};
     if (kernels) {
         h->fipt = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-        h->ipt = firc_ipt_new(firc_fake_ipt_as_executable(h->fipt));
+        h->ipt = firc_ipt_new(firc_fake_ipt_as_executable(h->fipt), firc_fake_ipt_as_xt(h->fipt));
         firc_netfilter_register_base_chains(h->ipt, NULL);
         h->kernel = fake_rtnl_start(&h->rtnl);
         if (h->kernel == NULL) { return NULL; }

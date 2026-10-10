@@ -710,6 +710,38 @@ TEST a_race_streak_says_nothing_above_debug(void) {
     PASS();
 }
 
+#define RACES "netfilter pass keeps losing races since "
+#define RACES_OVER "netfilter pass completed again after losing races since "
+
+/* Catches: lost races past the bound never said above debug, said per pass, or never said over. */
+TEST a_race_run_past_the_bound_warns_once(void) {
+    probe_t p;
+    probe_init(&p);
+    p.fail_times = 1000000;
+    p.fail_with = FIRC_ERR_AGAIN;
+    log_capture_begin();
+    firc_nfcommit_t *c = start_committer_failing_after(&p, 200u);
+    firc_nfcommit_request(c);
+    ASSERT(health_becomes(c, true));
+    pthread_mutex_lock(&p.mu);
+    int seen = p.started;
+    pthread_mutex_unlock(&p.mu);
+    AWAIT(&p, p.started >= seen + 3);
+    ASSERT_EQ_FMTm("said once the bound passed", 1, occurrences(log_drain(), "WRN " RACES), "%d");
+    pthread_mutex_lock(&p.mu);
+    p.fail_times = 0;
+    pthread_mutex_unlock(&p.mu);
+    AWAIT(&p, p.finished >= 1);
+    ASSERT(health_becomes(c, false));
+    firc_nfcommit_free(c);
+    const char *log = log_capture_end();
+    ASSERT_EQ_FMTm("once per run", 1, occurrences(log, " WRN "), "%d");
+    ASSERT_EQ_FMTm("never an error", 0, occurrences(log, " ERR "), "%d");
+    ASSERT_EQ_FMTm("and its end is said", 1, occurrences(log, "INF " RACES_OVER), "%d");
+    probe_destroy(&p);
+    PASS();
+}
+
 /* Catches: a hard failure never failing, the wrong error or `since`, or a completed pass not clearing it. */
 TEST a_hard_failure_is_failing_until_a_pass_completes(void) {
     probe_t p;
@@ -1076,6 +1108,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_refusal_that_persists_escalates_once_and_fails_past_the_bound);
     RUN_TEST(races_neither_count_toward_the_escalation_nor_break_it);
     RUN_TEST(a_race_streak_says_nothing_above_debug);
+    RUN_TEST(a_race_run_past_the_bound_warns_once);
     RUN_TEST(races_within_the_bound_are_not_failing);
     RUN_TEST(races_past_the_bound_are_failing);
     RUN_TEST(a_completed_pass_starts_the_bound_over);

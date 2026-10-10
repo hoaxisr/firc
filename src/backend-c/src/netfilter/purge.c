@@ -3,13 +3,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "firc/log.h"
 #include "firc/netfilter_cleaner.h"
-
-#define PURGE_IPTABLES_ATTEMPTS 3
 
 static bool unlink_quiet(const char *path, firc_err_t *first) {
     if (path == NULL || unlink(path) == 0 || errno == ENOENT) { return true; }
@@ -24,16 +21,7 @@ firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, con
     memset(&rep, 0, sizeof(rep));
     firc_err_t first = FIRC_OK;
 
-    /* A firmware rewrite can race the write: retry briefly in place of the committer. */
-    firc_err_t err = FIRC_ERR_AGAIN;
-    for (int attempt = 0; attempt < PURGE_IPTABLES_ATTEMPTS && (err == FIRC_ERR_AGAIN || err == FIRC_ERR_CANCELED);
-         attempt++) {
-        if (attempt > 0) {
-            struct timespec pause = {0, 200 * 1000 * 1000};
-            nanosleep(&pause, NULL);
-        }
-        err = firc_netfilter_purge_iptables(ipt4, ipt6, chain_prefix);
-    }
+    firc_err_t err = firc_netfilter_purge_iptables_retrying(ipt4, ipt6, chain_prefix);
     rep.iptables_ok = err == FIRC_OK;
     if (err != FIRC_OK) {
         FIRC_WARN("purge: the netfilter chains (the FORWARD barrier among them) were not removed: %s",
@@ -79,6 +67,13 @@ firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, con
         unlink_quiet(paths->sock, &first);
         unlink_quiet(paths->lock, &first);
         if (paths->run_dir != NULL) {
+            static const char *const k_dumps[] = {"refused-ipv4-nat.bin", "refused-ipv6-nat.bin"};
+            for (size_t i = 0; i < sizeof(k_dumps) / sizeof(k_dumps[0]); i++) {
+                char dump[512];
+                if (snprintf(dump, sizeof(dump), "%s/%s", paths->run_dir, k_dumps[i]) < (int)sizeof(dump)) {
+                    unlink_quiet(dump, &first);
+                }
+            }
             rep.run_dir_removed = rmdir(paths->run_dir) == 0;
             if (!rep.run_dir_removed) {
                 if (errno == ENOENT) {

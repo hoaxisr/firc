@@ -23,7 +23,6 @@ typedef enum {
     FIRC_SK_HEX32,  /* uint32_t; the API writes it as "0x..." */
     FIRC_SK_MS,     /* firc_duration_t; the API counts whole milliseconds */
     FIRC_SK_SEC,    /* firc_duration_t; ... whole seconds */
-    FIRC_SK_HOURS,  /* firc_duration_t; ... whole hours */
     FIRC_SK_LIST,   /* char ** with its size_t count at off_n */
 } firc_setting_kind_t;
 
@@ -44,7 +43,7 @@ typedef struct firc_setting {
     firc_setting_apply_t apply; /* FIRC_APPLY_NONE for showAllInterfaces and every restart row */
 } firc_setting_t;
 
-#define FIRC_SETTINGS_COUNT 26
+#define FIRC_SETTINGS_COUNT 25
 extern const firc_setting_t firc_settings[FIRC_SETTINGS_COUNT];
 
 const firc_setting_t *firc_setting_find(const char *path); /* NULL if path names no setting */

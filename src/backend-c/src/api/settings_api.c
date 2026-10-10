@@ -29,13 +29,10 @@ static void must_route(firc_httpd_t *h, const char *method, const char *pattern,
     }
 }
 
-#define HOUR_NS (INT64_C(3600) * FIRC_DURATION_SEC)
-
 static firc_duration_t unit_of(firc_setting_kind_t kind) {
     switch (kind) {
     case FIRC_SK_MS: return FIRC_DURATION_MS;
     case FIRC_SK_SEC: return FIRC_DURATION_SEC;
-    case FIRC_SK_HOURS: return HOUR_NS;
     default: return 1;
     }
 }
@@ -63,7 +60,6 @@ static cJSON *value_json(const firc_setting_t *s, const firc_app_config_t *c) {
     }
     case FIRC_SK_MS:
     case FIRC_SK_SEC:
-    case FIRC_SK_HOURS:
         return cJSON_CreateNumber((double)(*(const firc_duration_t *)v / unit_of(s->kind)));
     case FIRC_SK_LIST: {
         size_t n = *(const size_t *)slot(c, s->off_n);
@@ -200,8 +196,7 @@ static firc_err_t value_from_json(const firc_setting_t *s, const cJSON *j, firc_
         return FIRC_OK;
     }
     case FIRC_SK_MS:
-    case FIRC_SK_SEC:
-    case FIRC_SK_HOURS: {
+    case FIRC_SK_SEC: {
         firc_duration_t unit = unit_of(s->kind);
         if (!whole(j, (double)(INT64_MAX / unit), &u)) { break; } /* bounds u*unit below overflow */
         *(firc_duration_t *)v = (firc_duration_t)u * unit;

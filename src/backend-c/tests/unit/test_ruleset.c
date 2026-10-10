@@ -591,7 +591,7 @@ static bool nf_up_sel(nf_fx_t *f, char **allow, size_t na, char **deny, size_t n
     memset(f, 0, sizeof(*f));
     g_other_octet = 61;
     f->fipt = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    f->ipt = f->fipt != NULL ? firc_ipt_new(firc_fake_ipt_as_executable(f->fipt)) : NULL;
+    f->ipt = f->fipt != NULL ? firc_ipt_new(firc_fake_ipt_as_executable(f->fipt), firc_fake_ipt_as_xt(f->fipt)) : NULL;
     if (f->ipt == NULL || firc_netfilter_register_base_chains(f->ipt, NULL) != FIRC_OK) { return false; }
     f->kernel = fake_rtnl_start(&f->rtnl);
     if (f->kernel == NULL) { return false; }

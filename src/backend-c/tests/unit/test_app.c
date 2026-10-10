@@ -143,7 +143,7 @@ TEST add_group_while_running_rolls_back_on_failure(void) {
     firc_config_init_defaults(&cfg);
 
     firc_ipt_executable_t *exe4 = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(exe4);
+    firc_ipt_t *ipt4 = firc_ipt_new(exe4, NULL);
     firc_rtnl_t *rtnl = firc_rtnl_open();
     ASSERT(ipt4 != NULL && rtnl != NULL);
 
@@ -298,9 +298,9 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
     l->router = firc_resolve_router_new(l->pipeline);
     if (l->router == NULL) { return false; }
     l->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    l->ipt = firc_ipt_new(firc_fake_ipt_as_executable(l->fake));
+    l->ipt = firc_ipt_new(firc_fake_ipt_as_executable(l->fake), firc_fake_ipt_as_xt(l->fake));
     l->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(l->fake6));
+    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_executable(l->fake6), firc_fake_ipt_as_xt(l->fake6));
     firc_netfilter_register_base_chains(l->ipt, l->ipt6);
     l->kernel = fake_rtnl_start(&l->rtnl);
     if (l->kernel == NULL) { return false; }
@@ -1750,7 +1750,7 @@ TEST replace_groups_while_running_keeps_the_groups_that_did_not_come_up(void) {
     firc_config_t cfg;
     firc_config_init_defaults(&cfg);
     firc_ipt_executable_t *exe4 = firc_ipt_executable_real_new(FIRC_IPT_PROTO_IPV4);
-    firc_ipt_t *ipt4 = firc_ipt_new(exe4);
+    firc_ipt_t *ipt4 = firc_ipt_new(exe4, NULL);
     firc_rtnl_t *rtnl = firc_rtnl_open();
     ASSERT(ipt4 != NULL && rtnl != NULL);
     firc_app_deps_t deps = {.cfg = &cfg, .ipt4 = ipt4, .rtnl = rtnl};
@@ -2999,6 +2999,7 @@ TEST an_update_that_lost_one_race_comes_back(void) {
 
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_fail_at_commit(l.fake, 2, FIRC_ERR_IO);
     started = firc_app_nf_passes_for_test(l.app);
     firc_err_t err = firc_app_update_group(l.app, gid, activation_group(1, "newer.example", NULL, NULL));
@@ -3029,6 +3030,7 @@ TEST an_update_whose_write_was_refused_keeps_nothing_old(void) {
 
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_fail_next_restore(l.fake, FIRC_ERR_IO);
     started = firc_app_nf_passes_for_test(l.app);
     firc_err_t err = firc_app_update_group(l.app, gid, activation_group(1, "other.example", NULL, NULL));
@@ -3067,6 +3069,7 @@ TEST a_save_that_lost_one_race_drops_nothing(void) {
     size_t from = log_len(&l);
     firc_app_nf_enter(l.app);
     firc_fake_ipt_reset(l.fake);
+    firc_ipt_forget_written(l.ipt);
     firc_fake_ipt_refuse_rules_containing(l.fake, mark);
     firc_err_t err = firc_app_replace_groups(l.app, arr, 3);
     firc_app_nf_leave(l.app);
@@ -4205,6 +4208,97 @@ static bool answer_ready_for_a(locked_app_t *l) {
     firc_app_nf_leave(l->app);
     return ready;
 }
+
+/* Catches: a full pass writing a table before nat's sweep, or reading nat again between the sweep and the refill. */
+TEST a_full_pass_writes_nat_alone_first_and_reads_it_twice(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up_no_committer(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    firc_ip_t f1 = {{0}, 0}, f2 = {{0}, 0};
+    ASSERT(issue(&l, "a.example", 1, &f1));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERTm("fixture: the first name is rewritten", dnat_has(&l, &f1));
+    ASSERT(issue(&l, "b.example", 1, &f2));
+    static const char *masq[] = {"-j", "MASQUERADE"};
+    const char *const *stale[1] = {masq};
+    size_t stale_lens[1] = {2};
+    ASSERT_EQ(FIRC_OK, firc_fake_ipt_set_initial_rules(l.fake, "nat", "FIRC_old", stale, stale_lens, 1));
+    const char *log = firc_fake_ipt_restore_log(l.fake);
+    size_t from = log != NULL ? strlen(log) : 0;
+    size_t reads = firc_fake_xt_reads(firc_fake_ipt_xt(l.fake));
+
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_EQ_FMTm("nat read for the sweep and for the refill, not between", (size_t)2,
+                   firc_fake_xt_reads(firc_fake_ipt_xt(l.fake)) - reads, "%zu");
+    ASSERTm("the pass's first write is nat alone", strncmp(firc_fake_ipt_restore_log(l.fake) + from, "*nat\n", 5) == 0);
+    ASSERT_FALSEm("fixture: the sweep had work", firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_old"));
+    ASSERTm("fixture: the second name is rewritten", dnat_has(&l, &f2));
+    locked_app_down(&l);
+    PASS();
+}
+
+typedef struct {
+    locked_app_t *l;
+    char chain[64];
+    size_t rules_deleted_before;
+    int restores, unmarked_while_rewritten;
+} stop_order_t;
+
+static size_t group_rules_deleted(fake_rtnl_t *k) {
+    fake_rtnl_msg_t msgs[256];
+    size_t n = fake_rtnl_messages(k, msgs, 256), deleted = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (msgs[i].type == 33 && (msgs[i].mark & FIRC_MARK_GROUP_MASK) != 0) { deleted++; }
+    }
+    return deleted;
+}
+
+static void note_stop_restore(void *ud) {
+    stop_order_t *s = ud;
+    s->restores++;
+    bool rewritten = firc_fake_ipt_chain_exists(s->l->fake, "nat", "FIRC_DNAT");
+    bool marked = firc_fake_ipt_chain_exists(s->l->fake, "mangle", s->chain);
+    if (rewritten && (!marked || group_rules_deleted(s->l->kernel) != s->rules_deleted_before)) { s->unmarked_while_rewritten++; }
+}
+
+static enum greatest_test_res stop_in_order(bool lost_race) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    firc_ip_t f1 = {{0}, 0};
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT(issue(&l, "a.example", 1, &f1));
+    ASSERT(wait_written_after(&l, started));
+    ASSERTm("fixture: the address is rewritten", dnat_has(&l, &f1));
+    ASSERTm("fixture: and the group marks", group_fully_in(&l, gid));
+
+    firc_app_stop_netfilter_committer(l.app);
+    stop_order_t s = {.l = &l, .rules_deleted_before = group_rules_deleted(l.kernel)};
+    chain_of(&l, gid, s.chain, sizeof(s.chain));
+    firc_fake_ipt_on_restore(l.fake, note_stop_restore, &s);
+    if (lost_race) { firc_fake_xt_fail_next_replace(firc_fake_ipt_xt(l.fake), EAGAIN); }
+    firc_app_destroy(l.app);
+    l.app = NULL;
+    firc_fake_ipt_on_restore(l.fake, NULL, NULL);
+    ASSERTm("fixture: the stop wrote the tables", s.restores > 0);
+    ASSERT_EQ_FMTm("never unmarked while still rewritten", 0, s.unmarked_while_rewritten, "%d");
+    ASSERT_FALSEm("the DNAT chain went", firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_DNAT"));
+    ASSERT_FALSEm("and so did the mark", firc_fake_ipt_chain_exists(l.fake, "mangle", s.chain));
+    ASSERT_GTm("and the ip rule", group_rules_deleted(l.kernel), s.rules_deleted_before);
+    locked_app_down_rest(&l);
+    PASS();
+}
+
+/* Catches: a stop taking a group's mark or ip rule away while its fake addresses are still rewritten. */
+TEST stopping_takes_the_dnat_rules_out_before_any_routing(void) { return stop_in_order(false); }
+
+/* Catches: a stop giving the DNAT delete up on one lost race and leaving it to the groups' writes. */
+TEST a_stop_that_loses_a_race_still_takes_the_dnat_rules_out_first(void) { return stop_in_order(true); }
 
 /* Catches: a turned-off group keeping its DNAT rule or chain, or a pass dropping another group's rule. */
 TEST a_group_turned_off_keeps_its_mapping_and_loses_its_dnat_rule(void) {
@@ -5680,6 +5774,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_tombstone_outlives_a_failed_pass);
     RUN_TEST(a_completed_pass_empties_the_tombstones);
     RUN_TEST(stopping_deletes_the_chains_still_tombstoned);
+    RUN_TEST(a_full_pass_writes_nat_alone_first_and_reads_it_twice);
+    RUN_TEST(stopping_takes_the_dnat_rules_out_before_any_routing);
+    RUN_TEST(a_stop_that_loses_a_race_still_takes_the_dnat_rules_out_first);
     RUN_TEST(a_group_turned_off_keeps_its_mapping_and_loses_its_dnat_rule);
     RUN_TEST(a_group_with_no_usable_interface_fails_closed);
     RUN_TEST(a_group_turned_back_on_holds_its_cached_names_until_the_pass);

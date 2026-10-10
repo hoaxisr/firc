@@ -46,6 +46,7 @@ struct firc_nfcommit {
     unsigned hard_run;
     int64_t hard_wall;
     firc_err_t fail_err;
+    bool races_said;
     unsigned failing_after_ms;
 };
 
@@ -58,17 +59,24 @@ static uint64_t mono_ms(void) {
 
 static bool is_race(firc_err_t err) { return err == FIRC_ERR_CANCELED || err == FIRC_ERR_AGAIN; }
 
-typedef enum { NOTE_QUIET, NOTE_ESCALATE, NOTE_RECOVERED } note_say_t;
+typedef enum { NOTE_QUIET, NOTE_ESCALATE, NOTE_RECOVERED, NOTE_RACES, NOTE_RACES_OVER } note_say_t;
 
 static note_say_t note_result(firc_nfcommit_t *c, firc_err_t err, unsigned *hard_run, int64_t *hard_wall) {
     *hard_run = c->hard_run;
     *hard_wall = c->hard_wall;
     if (err == FIRC_OK) {
         bool escalated = c->hard_run >= FIRC_NFCOMMIT_ESCALATE_AFTER;
+        bool races = c->races_said;
+        *hard_wall = c->fail_wall;
         c->fail_mono_ms = 0;
         c->hard_run = 0;
         c->fail_err = FIRC_OK;
-        return escalated ? NOTE_RECOVERED : NOTE_QUIET;
+        c->races_said = false;
+        if (escalated) {
+            *hard_wall = c->hard_wall;
+            return NOTE_RECOVERED;
+        }
+        return races ? NOTE_RACES_OVER : NOTE_QUIET;
     }
     if (c->fail_mono_ms == 0) {
         c->fail_mono_ms = mono_ms();
@@ -76,6 +84,12 @@ static note_say_t note_result(firc_nfcommit_t *c, firc_err_t err, unsigned *hard
     }
     if (is_race(err)) {
         if (c->hard_run == 0) { c->fail_err = err; }
+        if (err == FIRC_ERR_AGAIN && !c->races_said && c->hard_run < FIRC_NFCOMMIT_ESCALATE_AFTER &&
+            mono_ms() - c->fail_mono_ms >= c->failing_after_ms) {
+            c->races_said = true;
+            *hard_wall = c->fail_wall;
+            return NOTE_RACES;
+        }
         return NOTE_QUIET;
     }
     if (c->hard_run == 0) { c->hard_wall = (int64_t)time(NULL); }
@@ -96,6 +110,11 @@ static void say_note(note_say_t say, firc_err_t err, unsigned hard_run, int64_t 
     if (say == NOTE_ESCALATE) {
         FIRC_ERROR("netfilter pass keeps failing (%u in a row since %s): %s", hard_run, when,
                    firc_err_str(err));
+    } else if (say == NOTE_RACES) {
+        FIRC_WARN("netfilter pass keeps losing races since %s: a table changed while it was read, "
+                  "or another writer held the xtables lock", when);
+    } else if (say == NOTE_RACES_OVER) {
+        FIRC_INFO("netfilter pass completed again after losing races since %s", when);
     } else {
         FIRC_INFO("netfilter pass completed again after %u failed in a row since %s", hard_run, when);
     }

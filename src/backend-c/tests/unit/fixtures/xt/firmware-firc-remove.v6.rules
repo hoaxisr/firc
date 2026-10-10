@@ -1,0 +1,5 @@
+*nat
+:FIRC_g1 - [0:0]
+-D POSTROUTING -j FIRC_g1
+-X FIRC_g1
+COMMIT

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "firc/pool_reject.h"
 
@@ -19,8 +20,13 @@ static firc_err_t clean_one(firc_ipt_t *ipt, const char *chain_prefix, bool keep
     snprintf(jump, sizeof(jump), "-j %s", chain_prefix);
     size_t prefix_len = strlen(chain_prefix);
 
+    firc_err_t err = firc_ipt_register_sweep(ipt, "nat", chain_prefix);
+    if (err == FIRC_OK) { err = firc_ipt_commit_nat(ipt); }
+    if (err != FIRC_OK) { return err; }
+
+    static const char *const k_text_tables[] = {"filter", "mangle"};
     firc_ipt_rules_snapshot_t *snap;
-    firc_err_t err = firc_ipt_get_current_rules(ipt, &snap);
+    err = firc_ipt_get_current_rules(ipt, k_text_tables, 2, &snap);
     if (err != FIRC_OK) { return err; }
 
     for (size_t ti = 0; ti < snap->n_tables && err == FIRC_OK; ti++) {
@@ -54,7 +60,7 @@ static firc_err_t clean_one(firc_ipt_t *ipt, const char *chain_prefix, bool keep
 
     firc_ipt_rules_snapshot_free(snap);
     if (err != FIRC_OK) { return err; }
-    return firc_ipt_commit(ipt);
+    return firc_ipt_commit_text(ipt);
 }
 
 firc_err_t firc_netfilter_clean_iptables(firc_ipt_t *ipt4, firc_ipt_t *ipt6, const char *chain_prefix) {
@@ -89,4 +95,44 @@ firc_err_t firc_netfilter_register_base_chains(firc_ipt_t *ipt4, firc_ipt_t *ipt
         }
     }
     return FIRC_OK;
+}
+
+#define RETRY_ATTEMPTS 3
+
+firc_err_t firc_netfilter_retry_races(firc_err_t (*step)(void *ud), void *ud) {
+    firc_err_t err = FIRC_ERR_AGAIN;
+    for (int attempt = 0; attempt < RETRY_ATTEMPTS && (err == FIRC_ERR_AGAIN || err == FIRC_ERR_CANCELED);
+         attempt++) {
+        if (attempt > 0) {
+            struct timespec pause = {0, 200 * 1000 * 1000};
+            nanosleep(&pause, NULL);
+        }
+        err = step(ud);
+    }
+    return err;
+}
+
+typedef struct {
+    firc_ipt_t *ipt4, *ipt6;
+    const char *prefix;
+} clean_args_t;
+
+static firc_err_t clean_step(void *ud) {
+    const clean_args_t *a = ud;
+    return firc_netfilter_clean_iptables(a->ipt4, a->ipt6, a->prefix);
+}
+
+static firc_err_t purge_step(void *ud) {
+    const clean_args_t *a = ud;
+    return firc_netfilter_purge_iptables(a->ipt4, a->ipt6, a->prefix);
+}
+
+firc_err_t firc_netfilter_clean_iptables_retrying(firc_ipt_t *ipt4, firc_ipt_t *ipt6, const char *chain_prefix) {
+    clean_args_t a = {ipt4, ipt6, chain_prefix};
+    return firc_netfilter_retry_races(clean_step, &a);
+}
+
+firc_err_t firc_netfilter_purge_iptables_retrying(firc_ipt_t *ipt4, firc_ipt_t *ipt6, const char *chain_prefix) {
+    clean_args_t a = {ipt4, ipt6, chain_prefix};
+    return firc_netfilter_retry_races(purge_step, &a);
 }
