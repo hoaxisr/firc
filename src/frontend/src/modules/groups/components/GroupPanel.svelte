@@ -363,7 +363,7 @@
             aria-pressed={selected}
             aria-label={(selected ? t("Deselect group {name}") : t("Select group {name}")).replace(
               "{name}",
-              group.name || String(placeNumber),
+              () => group.name || String(placeNumber),
             )}
             onclick={() => store.toggleSelected(group.id)}>{placeNumber}</button
           >

@@ -7,6 +7,7 @@
 
 #include "firc/err.h"
 #include "firc/loop.h"
+#include "firc/subhdr.h"
 #include "firc/tunnels.h"
 #include "firc/tunnodes.h"
 
@@ -41,13 +42,22 @@ firc_err_t firc_tunsubs_refresh(firc_tunsubs_t *s, const char *tunnel_id);
 /* The held bodies of the wanted pairs; valid until the next call into s. */
 const firc_tun_body_t *firc_tunsubs_bodies(const firc_tunsubs_t *s, size_t *n);
 
-/* The held bodies of t's subscriptions as fetched through uplink_of's uplink, enabled or not, each with
-   mark 0, at most cap of them; for display only, valid until the next call into s. */
+/* The held bodies of t's subscriptions as fetched through uplink_of's uplink and with the headers of uplink_of's
+   source of the same id, enabled or not, each with mark 0 and the hsig of t's source, at most cap of them; for
+   display only, valid until the next call into s. */
 size_t firc_tunsubs_held(const firc_tunsubs_t *s, const firc_tunnel_t *uplink_of, const firc_tunnel_t *t,
                          firc_tun_body_t *out, size_t cap);
 
-/* Fills out for the subscription url of a tunnel fetching with mark; returns 1, or 0 when none is wanted. */
-size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mark, firc_tun_sub_state_t *out);
+/* Fills out for the subscription url of a tunnel fetching with mark under the headers signature hsig; returns 1,
+   or 0 when none is wanted. */
+size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mark, uint64_t hsig,
+                          firc_tun_sub_state_t *out);
+
+/* The headers every subscription starts from; every pair's next fetch sends the new set, its key unchanged. */
+void firc_tunsubs_set_defaults(firc_tunsubs_t *s, const firc_subhdr_set_t *defaults);
+
+/* The headers every subscription starts from; NULL for a NULL s. */
+const firc_subhdr_set_t *firc_tunsubs_defaults(const firc_tunsubs_t *s);
 
 void firc_tunsubs_advance_for_test(firc_tunsubs_t *s, int64_t ms); /* test seam: moves its clock forward */
 

@@ -1,0 +1,9 @@
+tunnels:
+  - id: hdr
+    device: tunvless6
+    sources:
+      - id: 0000000c
+        subscription:
+          name: Panel
+          url: "https://panel.example.invalid/au9P"
+          headers: { X-HWID: "", user-agent: "sing-box/1.12.0", Authorization: "Bearer example" }

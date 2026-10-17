@@ -17,8 +17,11 @@
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/sub_fetch.h"
+#include "firc/utf8.h"
+#include "firc/subhdr.h"
 #include "firc/tunnels.h"
 #include "firc/tunsubs.h"
+#include "firc/version.h"
 
 #define PORT 18140
 #define U "11111111-2222-3333-4444-555555555555"
@@ -32,16 +35,26 @@ static int g_hits;
 static int g_status = 200;
 static int g_delay_ms;
 static char g_body[512] = BODY_AB;
+static const char *const SEEN[] = {"User-Agent", "X-HWID", "X-Device-OS", "X-Ver-OS", "X-Device-Model", "X-Extra"};
+#define N_SEEN (sizeof SEEN / sizeof SEEN[0])
+static char g_seen[N_SEEN][128];
+static bool g_seen_set[N_SEEN];
+static char g_body_without_hwid[512];
 
 static void h_sub(firc_http_req_t *req, firc_http_res_t *res, void *ud)
 {
-    (void)req;
     int delay = ud != NULL ? *(int *)ud : 0;
     pthread_mutex_lock(&g_mu);
     g_hits++;
+    for (size_t i = 0; i < N_SEEN; i++) {
+        const char *v = firc_http_req_header(req, SEEN[i]);
+        g_seen_set[i] = v != NULL;
+        snprintf(g_seen[i], sizeof g_seen[i], "%s", v != NULL ? v : "");
+    }
+    bool hwid_less = g_body_without_hwid[0] != '\0' && !g_seen_set[1];
     int status = g_status;
     char body[512];
-    snprintf(body, sizeof body, "%s", g_body);
+    snprintf(body, sizeof body, "%s", hwid_less ? g_body_without_hwid : g_body);
     pthread_mutex_unlock(&g_mu);
     if (delay > 0) {
         struct timespec ts = {delay / 1000, (long)(delay % 1000) * 1000000L};
@@ -91,6 +104,27 @@ static void server_stop(void)
     firc_loop_destroy(g_srv->loop);
     free(g_srv);
     g_srv = NULL;
+}
+
+static const char *seen(const char *name)
+{
+    static char copy[128];
+    const char *out = NULL;
+    pthread_mutex_lock(&g_mu);
+    for (size_t i = 0; i < N_SEEN; i++) {
+        if (strcmp(SEEN[i], name) == 0 && g_seen_set[i]) {
+            snprintf(copy, sizeof copy, "%.127s", g_seen[i]);
+            out = copy;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return out;
+}
+
+static const char *sent(const char *name)
+{
+    const char *v = seen(name);
+    return v != NULL ? v : "(not sent)";
 }
 
 static int hits(void)
@@ -147,6 +181,8 @@ static void reset_server(void)
     snprintf(g_body, sizeof g_body, "%s", BODY_AB);
     g_n_marks = 0;
     g_sockopt_fail = 0;
+    g_body_without_hwid[0] = 0;
+    memset(g_seen_set, 0, sizeof g_seen_set);
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -255,7 +291,7 @@ static bool settled_after(fx_t *f, void *arg)
 {
     const int *want_hits = arg;
     firc_tun_sub_state_t st;
-    return hits() >= *want_hits && firc_tunsubs_state(f->subs, URL, 0, &st) == 1 && !st.fetching &&
+    return hits() >= *want_hits && firc_tunsubs_state(f->subs, URL, 0, 0, &st) == 1 && !st.fetching &&
            st.last_try_ms > 0;
 }
 
@@ -277,10 +313,13 @@ static void idle(fx_t *f, int ms)
     (void)run_until(f, never, NULL, ms);
 }
 
-static bool hash16(const char *url, const char *ident, char out[17])
+#define DEFAULT_LINES ""
+#define NO_HWID_LINES "\nX-HWID: "
+
+static bool hash16_with(const char *url, const char *ident, const char *lines, char out[17])
 {
-    char cmd[512];
-    snprintf(cmd, sizeof cmd, "printf '%%s\\n%%s' '%s' '%s' | sha256sum", url, ident);
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "printf '%%s\\n%%s%%s' '%s' '%s' '%s' | sha256sum", url, ident, lines);
     FILE *p = popen(cmd, "r");
     if (p == NULL) {
         return false;
@@ -291,14 +330,24 @@ static bool hash16(const char *url, const char *ident, char out[17])
     return ok;
 }
 
-static bool cache_path(fx_t *f, const char *url, const char *ident, char *buf, size_t cap)
+static bool hash16(const char *url, const char *ident, char out[17])
+{
+    return hash16_with(url, ident, DEFAULT_LINES, out);
+}
+
+static bool cache_path_with(fx_t *f, const char *url, const char *ident, const char *lines, char *buf, size_t cap)
 {
     char h[17];
-    if (!hash16(url, ident, h)) {
+    if (!hash16_with(url, ident, lines, h)) {
         return false;
     }
     snprintf(buf, cap, "%s/%s", f->cache, h);
     return true;
+}
+
+static bool cache_path(fx_t *f, const char *url, const char *ident, char *buf, size_t cap)
+{
+    return cache_path_with(f, url, ident, DEFAULT_LINES, buf, cap);
 }
 
 static size_t slurp(const char *path, char *buf, size_t cap)
@@ -318,6 +367,17 @@ static void want(fx_t *f, const uint32_t *marks)
 {
     firc_tunsubs_want(f->subs, &f->cfg, marks);
 }
+
+static void full_defaults(fx_t *f)
+{
+    firc_subhdr_set_t d;
+    firc_subhdr_defaults("6e58d9776d738a31", "5.01.C.6.0-1", "Ultra (KN-1810)", &d);
+    firc_tunsubs_set_defaults(f->subs, &d);
+}
+
+#define TUN_H(id, n, url, headers)                                                                \
+    "  - id: " id "\n    device: tunvless" n "\n    sources:\n      - id: 0000000" n "\n"           \
+    "        subscription: { name: P, url: \"" url "\", interval: 6h, headers: " headers " }\n"
 
 /* catches: a body not cached, cached under another key, or a cache readable by others */
 TEST the_first_fetch_writes_a_private_cache_file(void)
@@ -347,7 +407,7 @@ TEST the_first_fetch_writes_a_private_cache_file(void)
     ASSERT_EQ_FMT(strlen(BODY_AB), b[0].len, "%zu");
     ASSERT_MEM_EQ(BODY_AB, b[0].body, strlen(BODY_AB));
     firc_tun_sub_state_t ss;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &ss), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &ss), "%zu");
     ASSERT_EQ_FMT((size_t)2, ss.nodes, "%zu");
     char h[17];
     ASSERT(hash16(URL, "auto", h));
@@ -411,7 +471,7 @@ TEST a_failed_fetch_keeps_the_body_and_says_why(void)
     want(&f, marks);
     ASSERT(run_until(&f, changed_once, NULL, 3000));
     firc_tun_sub_state_t ok;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &ok), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &ok), "%zu");
     pthread_mutex_lock(&g_mu);
     g_status = 503;
     pthread_mutex_unlock(&g_mu);
@@ -421,7 +481,7 @@ TEST a_failed_fetch_keeps_the_body_and_says_why(void)
     int two = 2;
     ASSERT(run_until(&f, settled_after, &two, 3000));
     firc_tun_sub_state_t bad;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &bad), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &bad), "%zu");
     ASSERT(strstr(bad.error, "503") != NULL);
     ASSERT_EQ(ok.last_ok_ms, bad.last_ok_ms);
     ASSERT(bad.last_try_ms > bad.last_ok_ms);
@@ -457,7 +517,7 @@ TEST a_restart_takes_the_cache_without_network(void)
     ASSERT_STR_EQ(URL, b[0].url);
     ASSERT_MEM_EQ(BODY_AB, b[0].body, strlen(BODY_AB));
     firc_tun_sub_state_t st;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
     ASSERT_EQ_FMT((size_t)2, st.nodes, "%zu");
     fx_down(&f);
     PASS();
@@ -588,7 +648,7 @@ TEST one_uplink_fetches_once_for_two_marks(void)
     ASSERT(body_for(&f, 0x10000));
     ASSERT(body_for(&f, 0x20000));
     firc_tun_sub_state_t st;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0x20000, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0x20000, 0, &st), "%zu");
     char h[17];
     ASSERT(hash16(URL, "iface:eth8", h));
     ASSERT_STR_EQ(h, st.url_hash);
@@ -666,7 +726,7 @@ TEST an_answer_without_nodes_is_a_failed_refresh(void)
     int two = 2;
     ASSERT(run_until(&f, settled_after, &two, 3000));
     firc_tun_sub_state_t st;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
     ASSERT_STR_EQ("no nodes in the answer", st.error);
     ASSERT(st.last_try_ms > st.last_ok_ms);
     size_t n = 0;
@@ -682,7 +742,7 @@ TEST an_answer_without_nodes_is_a_failed_refresh(void)
     ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
     int three = 3;
     ASSERT(run_until(&f, settled_after, &three, 3000));
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
     ASSERT_STR_EQ("no nodes in the answer", st.error);
     slurp(path, buf, sizeof buf);
     ASSERT_STR_EQ(BODY_AB, buf);
@@ -715,7 +775,7 @@ TEST an_insecure_only_body_is_kept_and_left_to_each_tunnel(void)
     want(&f, marks);
     ASSERT(run_until(&f, changed_once, NULL, 3000));
     firc_tun_sub_state_t st;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
     ASSERT_STR_EQ("", st.error);
     ASSERT_EQ_FMT((size_t)1, st.nodes, "%zu");
     size_t n = 0;
@@ -964,7 +1024,7 @@ static bool slow_done(fx_t *f, void *arg)
 {
     (void)arg;
     firc_tun_sub_state_t st;
-    return firc_tunsubs_state(f->subs, SLOW_URL, 0, &st) == 1 && !st.fetching && st.last_ok_ms > 0;
+    return firc_tunsubs_state(f->subs, SLOW_URL, 0, 0, &st) == 1 && !st.fetching && st.last_ok_ms > 0;
 }
 
 /* catches: due or refresh queueing a second fetch of a pair already in flight */
@@ -979,7 +1039,7 @@ TEST a_pair_in_flight_is_not_queued_again(void)
     want(&f, marks);
     idle(&f, 100);
     firc_tun_sub_state_t st;
-    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, SLOW_URL, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, SLOW_URL, 0, 0, &st), "%zu");
     ASSERT(st.fetching);
     firc_tunsubs_advance_for_test(f.subs, 3600 * 1000);
     firc_tunsubs_due(f.subs);
@@ -1043,7 +1103,7 @@ TEST the_url_is_logged_as_scheme_and_host_only(void)
     int one = 1;
     bool done = run_until(&f, settled_after, &one, 3000);
     firc_tun_sub_state_t st;
-    size_t have = firc_tunsubs_state(f.subs, URL, 0, &st);
+    size_t have = firc_tunsubs_state(f.subs, URL, 0, 0, &st);
     firc_log_set_fd(1);
     firc_log_set_output_floor(FIRC_LOG_DEBUG);
     close(fd);
@@ -1064,6 +1124,296 @@ TEST the_url_is_logged_as_scheme_and_host_only(void)
     ASSERT_STR_EQ("(bad url)", r);
     fx_down(&f);
     server_stop();
+    PASS();
+}
+
+#define PLACEHOLDER "vless://" U "@0.0.0.0:1?type=tcp&security=none#Please%20turn%20on%20HWID%20in%20your%20app\n"
+
+/* Catches: a placeholder taken as one working node, the previous body or cache dropped, or the server's words not shown. */
+TEST a_placeholder_answer_keeps_the_body_and_says_what_the_server_said(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    set_body(PLACEHOLDER);
+    struct timespec ts = {0, 20 * 1000000L};
+    nanosleep(&ts, NULL);
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    int two = 2;
+    ASSERT(run_until(&f, settled_after, &two, 3000));
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT_STR_EQ("the server answered: Please turn on HWID in your app", st.error);
+    ASSERT_EQ_FMT((size_t)2, st.nodes, "%zu");
+    ASSERT(st.last_try_ms > st.last_ok_ms);
+    char path[160], buf[512];
+    ASSERT(cache_path(&f, URL, "auto", path, sizeof path));
+    slurp(path, buf, sizeof buf);
+    ASSERT_STR_EQ(BODY_AB, buf);
+    ASSERT_EQ(1, f.changed);
+    set_body(PLACEHOLDER BODY_AB BODY_C);
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    int three = 3;
+    ASSERT(run_until(&f, settled_after, &three, 3000));
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT_STR_EQ("", st.error);
+    ASSERT_EQ_FMT((size_t)3, st.nodes, "%zu");
+    slurp(path, buf, sizeof buf);
+    ASSERT_STR_EQ(PLACEHOLDER BODY_AB BODY_C, buf);
+    ASSERT_EQ(2, f.changed);
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: a long name in Cyrillic cut inside a character, so the state's error is not UTF-8 and breaks the JSON. */
+TEST a_long_placeholder_name_is_cut_on_a_character(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    char body[1024] = "vless://" U "@0.0.0.0:1?security=none#a";
+    for (int i = 0; i < 70; i++) {
+        strcat(body, "\xd0\x96");
+    }
+    strcat(body, "\n");
+    set_body(body);
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    int one = 1;
+    ASSERT(run_until(&f, settled_after, &one, 3000));
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT(strncmp(st.error, "the server answered: a\xd0\x96", 24) == 0);
+    ASSERT(firc_utf8_valid(st.error));
+    ASSERT(strlen(st.error) <= 21 + FIRC_TUN_SAID_MAX);
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: a default header or the subscription's own one missing from the request, or a removed default still sent. */
+TEST the_fetch_sends_the_defaults_and_the_own_headers(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    full_defaults(&f);
+    ASSERT(load(&f, TUN_H("t0", "0", URL, "{ x-device-model: \"\", X-Extra: \"1\" }")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    ASSERT_STR_EQ("firc/" FIRC_VERSION, sent("User-Agent"));
+    ASSERT_STR_EQ("6e58d9776d738a31", sent("X-HWID"));
+    ASSERT_STR_EQ("KeeneticOS", sent("X-Device-OS"));
+    ASSERT_STR_EQ("5.01.C.6.0-1", sent("X-Ver-OS"));
+    ASSERT_EQ(NULL, seen("X-Device-Model"));
+    ASSERT_STR_EQ("1", sent("X-Extra"));
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: two subscriptions of one URL and one uplink with other headers sharing a fetch, a cache file or a body. */
+TEST one_url_with_other_headers_fetches_and_caches_apart(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    pthread_mutex_lock(&g_mu);
+    snprintf(g_body_without_hwid, sizeof g_body_without_hwid, "%s", BODY_C);
+    pthread_mutex_unlock(&g_mu);
+    full_defaults(&f);
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h") TUN_H("t1", "1", URL, "{ X-HWID: \"\" }")));
+    const uint32_t marks[] = {0, 0};
+    want(&f, marks);
+    size_t two = 2;
+    ASSERT(run_until(&f, bodies_at_least, &two, 3000));
+    idle(&f, 200);
+    ASSERT_EQ(2, hits());
+    char with[160], without[160];
+    ASSERT(cache_path_with(&f, URL, "auto", DEFAULT_LINES, with, sizeof with));
+    ASSERT(cache_path_with(&f, URL, "auto", NO_HWID_LINES, without, sizeof without));
+    char buf[512];
+    slurp(with, buf, sizeof buf);
+    ASSERT_STR_EQ(BODY_AB, buf);
+    slurp(without, buf, sizeof buf);
+    ASSERT_STR_EQ(BODY_C, buf);
+    size_t n = 0;
+    const firc_tun_body_t *b = firc_tunsubs_bodies(f.subs, &n);
+    firc_tun_nodes_t a, c;
+    ASSERT_EQ(FIRC_OK, firc_tun_nodes_build(&f.cfg.t[0], 0, b, n, &a));
+    ASSERT_EQ(FIRC_OK, firc_tun_nodes_build(&f.cfg.t[1], 0, b, n, &c));
+    ASSERT_EQ_FMT((size_t)2, a.n, "%zu");
+    ASSERT_EQ_FMT((size_t)1, c.n, "%zu");
+    ASSERT_STR_EQ("C", c.v[0].name);
+    firc_tun_nodes_free(&a);
+    firc_tun_nodes_free(&c);
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1,
+                  firc_tunsubs_state(f.subs, URL, 0, firc_tun_sub_headers_sig(&f.cfg.t[1].src[0].sub), &st), "%zu");
+    ASSERT_EQ_FMT((size_t)1, st.nodes, "%zu");
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: the sweep keeping the file of headers no subscription sends any more, or taking the one it still uses. */
+TEST the_sweep_drops_a_file_whose_headers_changed(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f));
+    full_defaults(&f);
+    ASSERT(load(&f, TUN_H("t0", "0", URL, "{ X-HWID: \"\" }")));
+    char old[160], kept[160];
+    ASSERT(cache_path_with(&f, URL, "auto", DEFAULT_LINES, old, sizeof old));
+    ASSERT(cache_path_with(&f, URL, "auto", NO_HWID_LINES, kept, sizeof kept));
+    ASSERT(write_padded(old, strlen(BODY_AB)));
+    ASSERT(write_padded(kept, strlen(BODY_AB)));
+    firc_tunsubs_sweep(f.subs, &f.cfg);
+    ASSERT_EQ(-1, access(old, F_OK));
+    ASSERT_EQ(0, access(kept, F_OK));
+    fx_down(&f);
+    PASS();
+}
+
+/* Catches: the key of a subscription without headers moved off today's file name, which would drop every cache at this upgrade. */
+TEST a_subscription_without_headers_keeps_todays_cache_name(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    char path[160];
+    snprintf(path, sizeof path, "%s/7128cf92565f9ede", f.cache);
+    ASSERT_EQ(0, access(path, F_OK));
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: a draft with edited headers showing an empty table instead of the nodes fetched with the saved ones. */
+TEST a_draft_with_other_headers_shows_the_saved_body(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    full_defaults(&f);
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    firc_tunnels_t draft = {0};
+    char doc[1024];
+    snprintf(doc, sizeof doc, "tunnels:\n%s", TUN_H("t0", "0", URL, "{ X-HWID: \"\" }"));
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&draft, doc, strlen(doc), NULL));
+    firc_tun_body_t held[1];
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_held(f.subs, &f.cfg.t[0], &draft.t[0], held, 1), "%zu");
+    ASSERT_MEM_EQ(BODY_AB, held[0].body, strlen(BODY_AB));
+    firc_tun_nodes_t nodes;
+    ASSERT_EQ(FIRC_OK, firc_tun_nodes_build(&draft.t[0], 0, held, 1, &nodes));
+    ASSERT_EQ_FMT((size_t)2, nodes.n, "%zu");
+    firc_tun_nodes_free(&nodes);
+    firc_tunnels_free(&draft);
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: a new default set (a firc or firmware upgrade) renaming the cache file or dropping the held body, or the next fetch still sending the old defaults. */
+TEST a_new_default_set_keeps_the_key_and_the_cache(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    char path[160];
+    ASSERT(cache_path(&f, URL, "auto", path, sizeof path));
+    ASSERT_EQ(0, access(path, F_OK));
+    firc_tunsubs_free(f.subs);
+    f.subs = firc_tunsubs_new(f.loop, f.cache, on_changed, &f);
+    ASSERT(f.subs != NULL);
+    server_stop();
+    want(&f, marks);
+    full_defaults(&f);
+    size_t n = 0;
+    const firc_tun_body_t *b = firc_tunsubs_bodies(f.subs, &n);
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    ASSERT_MEM_EQ(BODY_AB, b[0].body, strlen(BODY_AB));
+    firc_tunsubs_sweep(f.subs, &f.cfg);
+    ASSERT_EQ(0, access(path, F_OK));
+    int zero = 0;
+    ASSERT(run_until(&f, settled_after, &zero, 3000));
+    ASSERT_EQ(0, access(path, F_OK));
+    ASSERT(server_start());
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    int two = 2;
+    ASSERT(run_until(&f, hits_at_least, &two, 3000));
+    ASSERT_STR_EQ("6e58d9776d738a31", sent("X-HWID"));
+    ASSERT_STR_EQ("Ultra (KN-1810)", sent("X-Device-Model"));
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+static bool settled_own(fx_t *f, void *arg)
+{
+    firc_tun_sub_state_t st;
+    uint64_t sig = firc_tun_sub_headers_sig(&f->cfg.t[0].src[0].sub);
+    return hits() >= *(int *)arg && firc_tunsubs_state(f->subs, URL, 0, sig, &st) == 1 && !st.fetching &&
+           st.last_try_ms > 0;
+}
+
+/* Catches: a header value (a token) written to the log or the journal by a failing fetch, an HTTP error or no answer at all. */
+TEST a_header_value_never_reaches_the_log(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    char logp[96];
+    snprintf(logp, sizeof logp, "%s/log", f.dir);
+    int fd = open(logp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    ASSERT(fd >= 0);
+    firc_log_set_output_floor(FIRC_LOG_DEBUG);
+    firc_log_set_fd(fd);
+    pthread_mutex_lock(&g_mu);
+    g_status = 500;
+    pthread_mutex_unlock(&g_mu);
+    ASSERT(load(&f, TUN_H("t0", "0", URL, "{ X-Token: \"tok-s3cr3t-hdr\" }")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    int one = 1;
+    bool done = run_until(&f, settled_own, &one, 3000);
+    server_stop();
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    bool done_io = run_until(&f, settled_own, &one, 20000);
+    firc_tun_sub_state_t st;
+    size_t have = firc_tunsubs_state(f.subs, URL, 0, firc_tun_sub_headers_sig(&f.cfg.t[0].src[0].sub), &st);
+    firc_log_set_fd(1);
+    close(fd);
+    ASSERT(done);
+    ASSERT(done_io);
+    ASSERT_EQ_FMT((size_t)1, have, "%zu");
+    ASSERT_STR_EQ("no answer", st.error);
+    char buf[8192];
+    slurp(logp, buf, sizeof buf);
+    ASSERT(strstr(buf, "fetch failed: HTTP 500") != NULL);
+    ASSERT_EQ(NULL, strstr(buf, "tok-s3cr3t-hdr"));
+    for (int level = FIRC_LOG_DEBUG; level <= FIRC_LOG_ERROR; level++) {
+        ASSERT_EQ_FMT((size_t)0, journal_at((firc_log_level_t)level, "tok-s3cr3t-hdr"), "%zu");
+    }
+    fx_down(&f);
     PASS();
 }
 
@@ -1091,6 +1441,15 @@ SUITE(tunsubs)
     RUN_TEST(a_pair_in_flight_is_not_queued_again);
     RUN_TEST(the_mark_reaches_the_socket_or_the_fetch_fails);
     RUN_TEST(the_url_is_logged_as_scheme_and_host_only);
+    RUN_TEST(the_fetch_sends_the_defaults_and_the_own_headers);
+    RUN_TEST(one_url_with_other_headers_fetches_and_caches_apart);
+    RUN_TEST(the_sweep_drops_a_file_whose_headers_changed);
+    RUN_TEST(a_subscription_without_headers_keeps_todays_cache_name);
+    RUN_TEST(a_draft_with_other_headers_shows_the_saved_body);
+    RUN_TEST(a_new_default_set_keeps_the_key_and_the_cache);
+    RUN_TEST(a_header_value_never_reaches_the_log);
+    RUN_TEST(a_placeholder_answer_keeps_the_body_and_says_what_the_server_said);
+    RUN_TEST(a_long_placeholder_name_is_cut_on_a_character);
 }
 
 GREATEST_MAIN_DEFS();

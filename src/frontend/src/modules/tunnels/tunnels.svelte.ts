@@ -1,7 +1,15 @@
 import { fetchInterfaces } from "../../data/interfaces.svelte";
 import { t } from "../../data/locale.svelte";
 
-import type { Tunnel, TunnelPreview, TunnelProbeRow, TunnelsRes, TunnelState } from "../../types";
+import type {
+  Tunnel,
+  TunnelHeader,
+  TunnelHeadersRes,
+  TunnelPreview,
+  TunnelProbeRow,
+  TunnelsRes,
+  TunnelState,
+} from "../../types";
 import { overlay, toast } from "../../utils/events";
 import { fetcher, HttpError } from "../../utils/fetcher";
 import { restartingDevices } from "./tunnel-editor";
@@ -29,6 +37,7 @@ export class TunnelsStore {
   saving = $state(false);
   fieldError = $state<TunnelFieldError | null>(null);
   states = $state<TunnelState[]>([]);
+  headerDefaults = $state<TunnelHeader[]>([]);
   polling = $state(false);
 
   #dispose: (() => void) | null = null;
@@ -194,6 +203,18 @@ export class TunnelsStore {
     }
   }
 
+  async loadHeaderDefaults(): Promise<void> {
+    try {
+      const answer = await fetcher.get<TunnelHeadersRes>("/tunnels/headers", { quiet: true });
+      this.headerDefaults = answer?.headers ?? [];
+    } catch (error) {
+      console.error(
+        "Failed to load the subscription headers:",
+        error instanceof Error ? error.name : "error",
+      );
+    }
+  }
+
   pollState = async (): Promise<void> => {
     const seq = ++this.#seq;
     try {
@@ -251,8 +272,10 @@ export class TunnelsStore {
     document.addEventListener("visibilitychange", this.onVisibility);
     if (document.visibilityState === "visible") this.#arm();
     const first = document.visibilityState === "visible" ? this.pollState() : Promise.resolve();
+    const headers =
+      this.headerDefaults.length === 0 ? this.loadHeaderDefaults() : Promise.resolve();
     if (!this.loaded && !this.dirty) await this.load();
-    await first;
+    await Promise.all([first, headers]);
   }
 
   handleSaveShortcut = (event: KeyboardEvent) => {

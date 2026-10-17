@@ -215,6 +215,7 @@ export function runningText(
   version: string,
   t: (key: string) => string,
 ): string {
-  if (state === "downloading") return t("Downloading {version}…").replace("{version}", version);
+  if (state === "downloading")
+    return t("Downloading {version}…").replace("{version}", () => version);
   return state === "verifying" ? t("Checking the package…") : t("Installing…");
 }

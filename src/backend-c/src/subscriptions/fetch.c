@@ -183,10 +183,44 @@ static void set_err(const firc_sub_fetch_opts_t *o, const char *msg) {
     if (o->errbuf != NULL && o->errbuf_cap > 0) { snprintf(o->errbuf, o->errbuf_cap, "%s", msg); }
 }
 
-static struct curl_slist *build_headers(const char *const *headers, bool *ok) {
+static bool line_is_credential(const char *line) {
+    return strncasecmp(line, "Authorization:", 14) == 0 || strncasecmp(line, "Cookie:", 7) == 0;
+}
+
+static firc_err_t origin_of(const char *url, char **out) {
+    *out = NULL;
+    CURLU *u = curl_url();
+    if (u == NULL) { return FIRC_ERR_NOMEM; }
+    char *scheme = NULL, *host = NULL, *port = NULL;
+    CURLUcode uc = curl_url_set(u, CURLUPART_URL, url, 0);
+    if (uc == CURLUE_OK) { uc = curl_url_get(u, CURLUPART_SCHEME, &scheme, 0); }
+    if (uc == CURLUE_OK) { uc = curl_url_get(u, CURLUPART_HOST, &host, 0); }
+    if (uc == CURLUE_OK) { uc = curl_url_get(u, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT); }
+    firc_err_t err = uc == CURLUE_OK ? FIRC_OK : uc == CURLUE_OUT_OF_MEMORY ? FIRC_ERR_NOMEM : FIRC_ERR_INVAL;
+    if (err == FIRC_OK) {
+        size_t n = strlen(scheme) + strlen(host) + strlen(port) + 5;
+        *out = malloc(n);
+        if (*out == NULL) {
+            err = FIRC_ERR_NOMEM;
+        } else {
+            snprintf(*out, n, "%s://%s:%s", scheme, host, port);
+            for (char *c = *out; *c != '\0'; c++) {
+                if (*c >= 'A' && *c <= 'Z') { *c = (char)(*c + 32); }
+            }
+        }
+    }
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_url_cleanup(u);
+    return err;
+}
+
+static struct curl_slist *build_headers(const char *const *headers, bool drop_credentials, bool *ok) {
     struct curl_slist *list = NULL;
     *ok = true;
     for (size_t i = 0; headers != NULL && headers[i] != NULL; i++) {
+        if (drop_credentials && line_is_credential(headers[i])) { continue; }
         struct curl_slist *next = curl_slist_append(list, headers[i]);
         if (next == NULL) {
             *ok = false;
@@ -206,17 +240,25 @@ firc_err_t firc_sub_fetch_to(const char *url, const firc_sub_fetch_opts_t *o, fi
     int max_redirects = o->max_redirects > 0 ? o->max_redirects : FIRC_SUB_FETCH_MAX_REDIRECTS;
     long timeout_s = o->timeout_s > 0 ? o->timeout_s : (long)FIRC_SUB_FETCH_TIMEOUT_SECONDS;
     bool headers_ok = true;
-    struct curl_slist *headers = build_headers(o->headers, &headers_ok);
+    struct curl_slist *headers = build_headers(o->headers, false, &headers_ok);
+    bool stripped_ok = true;
+    struct curl_slist *stripped = build_headers(o->headers, true, &stripped_ok);
+    char *origin = NULL;
+    firc_err_t oerr = origin_of(url, &origin);
     visited_set_t visited = {.urls = calloc((size_t)max_redirects + 1, sizeof(char *)),
                              .cap = (size_t)max_redirects + 1};
     char *current = strdup(url);
     struct curl_slist *pin = o->resolve != NULL ? curl_slist_append(NULL, o->resolve) : NULL;
-    if (!headers_ok || visited.urls == NULL || current == NULL || (o->resolve != NULL && pin == NULL)) {
+    bool alloc_ok = headers_ok && stripped_ok && oerr != FIRC_ERR_NOMEM && visited.urls != NULL && current != NULL &&
+                    (o->resolve == NULL || pin != NULL);
+    if (!alloc_ok || oerr != FIRC_OK) {
         curl_slist_free_all(pin);
         curl_slist_free_all(headers);
+        curl_slist_free_all(stripped);
+        free(origin);
         visited_clear(&visited);
         free(current);
-        return FIRC_ERR_NOMEM;
+        return alloc_ok ? oerr : FIRC_ERR_NOMEM;
     }
 
     firc_err_t result = FIRC_ERR_SYS;
@@ -245,7 +287,11 @@ firc_err_t firc_sub_fetch_to(const char *url, const firc_sub_fetch_opts_t *o, fi
             curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, o->low_speed_s);
         }
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err);
-        if (headers != NULL) { curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers); }
+        char *hop = NULL;
+        (void)origin_of(current, &hop);
+        struct curl_slist *sent = hop != NULL && strcmp(hop, origin) == 0 ? headers : stripped;
+        free(hop);
+        if (sent != NULL) { curl_easy_setopt(curl, CURLOPT_HTTPHEADER, sent); }
         if (pin != NULL) { curl_easy_setopt(curl, CURLOPT_RESOLVE, pin); }
         if (o->on_header != NULL) {
             curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
@@ -317,6 +363,8 @@ firc_err_t firc_sub_fetch_to(const char *url, const firc_sub_fetch_opts_t *o, fi
     free(current);
     visited_clear(&visited);
     curl_slist_free_all(headers);
+    curl_slist_free_all(stripped);
+    free(origin);
     curl_slist_free_all(pin);
     return result;
 }
@@ -352,11 +400,11 @@ static bool mem_sink_write(void *ud, const uint8_t *data, size_t n) {
     return true;
 }
 
-static firc_err_t fetch(const char *url, uint32_t mark, char **out_body, size_t *out_len,
-                        firc_sub_fetch_progress_fn progress, void *ud, long *out_http_status) {
+static firc_err_t fetch(const char *url, uint32_t mark, const char *const *headers, char **out_body,
+                        size_t *out_len, firc_sub_fetch_progress_fn progress, void *ud, long *out_http_status) {
     *out_body = NULL;
     *out_len = 0;
-    firc_sub_fetch_opts_t o = {.mark = mark, .progress = progress, .progress_ud = ud};
+    firc_sub_fetch_opts_t o = {.mark = mark, .headers = headers, .progress = progress, .progress_ud = ud};
     mem_sink_t m = {0};
     firc_err_t err = firc_sub_fetch_to(url, &o, mem_sink_write, &m, out_http_status);
     if (err == FIRC_ERR_CANCELED && m.over_cap) { err = FIRC_ERR_LIMIT; }
@@ -389,19 +437,20 @@ firc_err_t firc_sub_fetch_list(const char *url, char **out_body, size_t *out_len
 
 firc_err_t firc_sub_fetch_list_ex(const char *url, char **out_body, size_t *out_len,
                                   firc_sub_fetch_progress_fn progress, void *ud, long *out_http_status) {
-    return fetch(url, 0, out_body, out_len, progress, ud, out_http_status);
+    return fetch(url, 0, NULL, out_body, out_len, progress, ud, out_http_status);
 }
 
-firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, char **out_body, size_t *out_len,
-                                       int *out_http_status, firc_sub_fetch_progress_fn progress, void *ud) {
+firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, const char *const *headers,
+                                       char **out_body, size_t *out_len, int *out_http_status,
+                                       firc_sub_fetch_progress_fn progress, void *ud) {
     long status = 0;
-    firc_err_t err = fetch(url, mark, out_body, out_len, progress, ud, &status);
+    firc_err_t err = fetch(url, mark, headers, out_body, out_len, progress, ud, &status);
     if (out_http_status != NULL) { *out_http_status = (int)status; }
     return err;
 }
 
 firc_err_t firc_sub_fetch_list_mark(const char *url, uint32_t mark, char **out_body, size_t *out_len,
                                     int *out_http_status) {
-    return firc_sub_fetch_list_mark_ex(url, mark, out_body, out_len, out_http_status, NULL, NULL);
+    return firc_sub_fetch_list_mark_ex(url, mark, NULL, out_body, out_len, out_http_status, NULL, NULL);
 }
 

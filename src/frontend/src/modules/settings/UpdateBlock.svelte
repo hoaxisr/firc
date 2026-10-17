@@ -55,8 +55,8 @@
     {:else if check?.newer && latest}
       <div class="line newer">
         {t("{version} from {date}")
-          .replace("{version}", latest.version)
-          .replace("{date}", date(latest.publishedAt))}
+          .replace("{version}", () => latest.version)
+          .replace("{date}", () => date(latest.publishedAt))}
       </div>
       {#if latest.notes}
         <pre class="notes">{latest.notes}</pre>
@@ -102,7 +102,7 @@
           ? t("{version} installed, opkg exit {code}")
           : t("{version} not installed, opkg exit {code}, see logread")
         )
-          .replace("{version}", result.version)
+          .replace("{version}", () => result.version)
           .replace("{code}", String(result.opkgExit))}
       </div>
     {/if}

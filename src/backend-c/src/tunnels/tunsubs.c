@@ -17,6 +17,7 @@
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/sub_fetch.h"
+#include "firc/subhdr.h"
 
 #define RETRY_MS 60000
 #define IDENT_MAX 32
@@ -24,12 +25,15 @@
 typedef struct {
     char id[16];
     uint32_t mark;
+    uint64_t hsig;
 } user_t;
 
 typedef struct {
     char *url;
-    char ident[IDENT_MAX];
     char key[17];
+    char **lines;
+    firc_subhdr_pair_t *own;
+    size_t n_own;
     int interval_s;
     user_t users[FIRC_TUN_MAX];
     size_t n_users;
@@ -51,9 +55,11 @@ typedef struct {
 typedef struct result {
     firc_tunsubs_t *s;
     char *url;
-    char ident[IDENT_MAX];
+    char key[17];
     firc_err_t err;
     bool no_nodes;
+    bool placeholder;
+    char said[FIRC_TUN_SAID_MAX + 1];
     int status;
     char *body;
     size_t len;
@@ -67,6 +73,7 @@ typedef struct result {
 typedef struct job {
     struct job *next;
     uint32_t mark;
+    char **lines;
     char path[512];
     bool cached;
     uint8_t cached_sha[FIRC_SHA256_DIGEST_LEN];
@@ -78,6 +85,7 @@ struct firc_tunsubs {
     char dir[448];
     void (*changed)(void *ud);
     void *ud;
+    firc_subhdr_set_t defaults;
     entry_t **v;
     size_t n;
     firc_tun_body_t *bodies;
@@ -123,13 +131,19 @@ static void ident_of(const firc_tunnel_t *t, char out[IDENT_MAX])
     }
 }
 
-static void key_of(const char *url, const char *ident, char key[17])
+static void key_of(const char *ident, const firc_tun_sub_t *sub, char key[17])
 {
     firc_sha256_ctx_t c;
     firc_sha256_init(&c);
-    firc_sha256_update(&c, (const uint8_t *)url, strlen(url));
+    firc_sha256_update(&c, (const uint8_t *)sub->url, strlen(sub->url));
     firc_sha256_update(&c, (const uint8_t *)"\n", 1);
     firc_sha256_update(&c, (const uint8_t *)ident, strlen(ident));
+    for (size_t i = 0; i < sub->n_headers; i++) {
+        firc_sha256_update(&c, (const uint8_t *)"\n", 1);
+        firc_sha256_update(&c, (const uint8_t *)sub->headers[i].name, strlen(sub->headers[i].name));
+        firc_sha256_update(&c, (const uint8_t *)": ", 2);
+        firc_sha256_update(&c, (const uint8_t *)sub->headers[i].value, strlen(sub->headers[i].value));
+    }
     uint8_t d[FIRC_SHA256_DIGEST_LEN];
     firc_sha256_final(&c, d);
     static const char hex[] = "0123456789abcdef";
@@ -138,6 +152,13 @@ static void key_of(const char *url, const char *ident, char key[17])
         key[2 * i + 1] = hex[d[i] & 15];
     }
     key[16] = 0;
+}
+
+static void pair_key(const firc_tunnel_t *uplink_of, const firc_tun_sub_t *sub, char key[17])
+{
+    char ident[IDENT_MAX];
+    ident_of(uplink_of, ident);
+    key_of(ident, sub, key);
 }
 
 static void mkdirs(const char *path)
@@ -164,7 +185,7 @@ static void mkdirs(const char *path)
     }
 }
 
-static size_t count_nodes(const char *url, const char *body, size_t len)
+static size_t count_nodes(const char *url, const char *body, size_t len, bool *placeholder, char *said, size_t cap)
 {
     firc_tun_src_t src;
     memset(&src, 0, sizeof src);
@@ -176,11 +197,15 @@ static size_t count_nodes(const char *url, const char *body, size_t len)
     t.src = &src;
     t.n_src = 1;
     t.insecure = true;
-    firc_tun_body_t b = {url, 0, body, len};
+    firc_tun_body_t b = {url, 0, body, len, 0};
     firc_tun_nodes_t nodes;
     size_t n = 0;
     if (firc_tun_nodes_build(&t, 0, &b, 1, &nodes) == FIRC_OK) {
         n = nodes.total;
+        if (placeholder != NULL) {
+            *placeholder = nodes.seen > 0 && nodes.sinks == nodes.seen;
+            snprintf(said, cap, "%s", nodes.sink_name);
+        }
         firc_tun_nodes_free(&nodes);
     }
     return n;
@@ -230,7 +255,7 @@ static void load_cache(firc_tunsubs_t *s, entry_t *e)
     firc_sha256((const uint8_t *)body, len, e->sha);
     memcpy(e->cached_sha, e->sha, sizeof e->sha);
     e->cached = true;
-    e->nodes = count_nodes(e->url, body, len);
+    e->nodes = count_nodes(e->url, body, len, NULL, NULL, 0);
 }
 
 static void post_result(firc_tunsubs_t *s, result_t *r);
@@ -246,11 +271,13 @@ static void run_job(firc_tunsubs_t *s, job_t *j)
 {
     result_t *r = j->r;
     j->r = NULL;
-    r->err = firc_sub_fetch_list_mark_ex(r->url, j->mark, &r->body, &r->len, &r->status, keep_going, s);
+    r->err = firc_sub_fetch_list_mark_ex(r->url, j->mark, (const char *const *)j->lines, &r->body, &r->len, &r->status, keep_going, s);
     r->at_ms = wall_ms();
     if (r->err == FIRC_OK) {
-        r->nodes = count_nodes(r->url, r->body, r->len);
-        if (r->nodes == 0) {
+        r->nodes = count_nodes(r->url, r->body, r->len, &r->placeholder, r->said, sizeof r->said);
+        if (r->placeholder) {
+            r->err = FIRC_ERR_PROTO;
+        } else if (r->nodes == 0) {
             r->err = FIRC_ERR_PROTO;
             r->no_nodes = true;
         }
@@ -278,6 +305,7 @@ static void free_result(result_t *r)
 static void free_job(job_t *j)
 {
     free_result(j->r);
+    firc_subhdr_lines_free(j->lines);
     free(j);
 }
 
@@ -332,20 +360,20 @@ static void drop_result(void *ud)
     }
 }
 
-static entry_t *find(const firc_tunsubs_t *s, const char *url, const char *ident)
+static entry_t *find(const firc_tunsubs_t *s, const char *url, const char *key)
 {
     for (size_t i = 0; i < s->n; i++) {
-        if (strcmp(s->v[i]->ident, ident) == 0 && strcmp(s->v[i]->url, url) == 0) {
+        if (strcmp(s->v[i]->key, key) == 0 && strcmp(s->v[i]->url, url) == 0) {
             return s->v[i];
         }
     }
     return NULL;
 }
 
-static bool mark_seen(const entry_t *e, size_t upto, uint32_t mark)
+static bool user_seen(const entry_t *e, size_t upto, uint32_t mark, uint64_t hsig)
 {
     for (size_t u = 0; u < upto; u++) {
-        if (e->users[u].mark == mark) {
+        if (e->users[u].mark == mark && e->users[u].hsig == hsig) {
             return true;
         }
     }
@@ -358,13 +386,11 @@ static void rebuild_bodies(firc_tunsubs_t *s)
     for (size_t i = 0; i < s->n; i++) {
         entry_t *e = s->v[i];
         for (size_t u = 0; e->have && u < e->n_users; u++) {
-            if (mark_seen(e, u, e->users[u].mark)) {
+            if (user_seen(e, u, e->users[u].mark, e->users[u].hsig)) {
                 continue;
             }
-            s->bodies[k].url = e->url;
-            s->bodies[k].mark = e->users[u].mark;
-            s->bodies[k].body = e->body;
-            s->bodies[k].len = e->len;
+            s->bodies[k] = (firc_tun_body_t){
+                .url = e->url, .mark = e->users[u].mark, .body = e->body, .len = e->len, .hsig = e->users[u].hsig};
             k++;
         }
     }
@@ -373,7 +399,9 @@ static void rebuild_bodies(firc_tunsubs_t *s)
 
 static void describe(const result_t *r, char *buf, size_t cap)
 {
-    if (r->no_nodes) {
+    if (r->placeholder) {
+        snprintf(buf, cap, "the server answered: %.120s", r->said);
+    } else if (r->no_nodes) {
         snprintf(buf, cap, "no nodes in the answer");
     } else if (r->err == FIRC_ERR_PROTO && r->status != 0 && (r->status < 200 || r->status >= 300)) {
         snprintf(buf, cap, "HTTP %d", r->status);
@@ -401,7 +429,7 @@ static void on_result(firc_loop_t *loop, void *ud)
         }
         return;
     }
-    entry_t *e = find(s, r->url, r->ident);
+    entry_t *e = find(s, r->url, r->key);
     if (e == NULL) {
         free_result(r);
         return;
@@ -474,6 +502,7 @@ firc_tunsubs_t *firc_tunsubs_new(firc_loop_t *loop, const char *cache_dir, void 
     snprintf(s->dir, sizeof s->dir, "%s", cache_dir);
     s->changed = changed;
     s->ud = ud;
+    firc_subhdr_defaults(NULL, NULL, NULL, &s->defaults);
     atomic_init(&s->abort, false);
     if (pthread_mutex_init(&s->mu, NULL) != 0) {
         free(s);
@@ -500,18 +529,21 @@ static void enqueue(firc_tunsubs_t *s, entry_t *e)
     job_t *j = calloc(1, sizeof *j);
     result_t *r = calloc(1, sizeof *r);
     char *url = strdup(e->url);
-    if (j == NULL || r == NULL || url == NULL) {
+    char **lines = firc_subhdr_lines_copy(e->lines);
+    if (j == NULL || r == NULL || url == NULL || lines == NULL) {
         free(j);
         free(r);
         free(url);
+        firc_subhdr_lines_free(lines);
         FIRC_WARN("tunnel subscriptions: out of memory, a fetch is left for the next tick");
         return;
     }
     r->s = s;
     r->url = url;
-    memcpy(r->ident, e->ident, sizeof r->ident);
+    memcpy(r->key, e->key, sizeof r->key);
     j->r = r;
     j->mark = e->users[0].mark;
+    j->lines = lines;
     snprintf(j->path, sizeof j->path, "%s/%s", s->dir, e->key);
     j->cached = e->cached;
     memcpy(j->cached_sha, e->cached_sha, sizeof j->cached_sha);
@@ -527,14 +559,49 @@ static void enqueue(firc_tunsubs_t *s, entry_t *e)
     pthread_mutex_unlock(&s->mu);
 }
 
+static void free_own(firc_subhdr_pair_t *v, size_t n)
+{
+    for (size_t i = 0; v != NULL && i < n; i++) {
+        free(v[i].name);
+        free(v[i].value);
+    }
+    free(v);
+}
+
+static firc_subhdr_pair_t *copy_own(const firc_tun_sub_t *sub)
+{
+    if (sub->n_headers == 0) {
+        return NULL;
+    }
+    firc_subhdr_pair_t *v = calloc(sub->n_headers, sizeof *v);
+    for (size_t i = 0; v != NULL && i < sub->n_headers; i++) {
+        v[i].name = strdup(sub->headers[i].name);
+        v[i].value = strdup(sub->headers[i].value);
+        if (v[i].name == NULL || v[i].value == NULL) {
+            free_own(v, i + 1);
+            return NULL;
+        }
+    }
+    return v;
+}
+
+static char **lines_of(const firc_tunsubs_t *s, const firc_subhdr_pair_t *own, size_t n_own)
+{
+    firc_subhdr_set_t eff;
+    firc_subhdr_merge(&s->defaults, own, n_own, &eff);
+    return firc_subhdr_lines(&eff);
+}
+
 static void free_entry(entry_t *e)
 {
     free(e->url);
     free(e->body);
+    firc_subhdr_lines_free(e->lines);
+    free_own(e->own, e->n_own);
     free(e);
 }
 
-static entry_t *new_entry(firc_tunsubs_t *s, const char *url, const char *ident)
+static entry_t *new_entry(firc_tunsubs_t *s, const char *url, const char *key, const firc_tun_sub_t *sub)
 {
     entry_t **grown = realloc(s->v, (s->n + 1) * sizeof *grown);
     if (grown == NULL) {
@@ -542,26 +609,33 @@ static entry_t *new_entry(firc_tunsubs_t *s, const char *url, const char *ident)
     }
     s->v = grown;
     entry_t *e = calloc(1, sizeof *e);
-    if (e == NULL || (e->url = strdup(url)) == NULL) {
-        free(e);
+    if (e == NULL) {
         return NULL;
     }
-    snprintf(e->ident, sizeof e->ident, "%s", ident);
-    key_of(url, ident, e->key);
+    e->n_own = sub->n_headers;
+    e->own = copy_own(sub);
+    e->url = strdup(url);
+    e->lines = lines_of(s, e->own, e->n_own);
+    if (e->url == NULL || e->lines == NULL || (e->n_own > 0 && e->own == NULL)) {
+        free_entry(e);
+        return NULL;
+    }
+    memcpy(e->key, key, sizeof e->key);
     load_cache(s, e);
     s->v[s->n++] = e;
     return e;
 }
 
-static void add_user(entry_t *e, const char *id, uint32_t mark, int interval_s)
+static void add_user(entry_t *e, const char *id, uint32_t mark, uint64_t hsig, int interval_s)
 {
     bool known = false;
     for (size_t i = 0; i < e->n_users; i++) {
-        known = known || strcmp(e->users[i].id, id) == 0;
+        known = known || (strcmp(e->users[i].id, id) == 0 && e->users[i].hsig == hsig);
     }
     if (!known && e->n_users < FIRC_TUN_MAX) {
         snprintf(e->users[e->n_users].id, sizeof e->users[0].id, "%s", id);
         e->users[e->n_users].mark = mark;
+        e->users[e->n_users].hsig = hsig;
         e->n_users++;
     }
     if (interval_s > 0 && (e->interval_s == 0 || interval_s < e->interval_s)) {
@@ -580,19 +654,19 @@ void firc_tunsubs_want(firc_tunsubs_t *s, const firc_tunnels_t *t, const uint32_
     }
     for (size_t i = 0; i < t->n; i++) {
         const firc_tunnel_t *tun = &t->t[i];
-        char ident[IDENT_MAX];
-        ident_of(tun, ident);
         for (size_t k = 0; k < tun->n_src; k++) {
             const firc_tun_src_t *src = &tun->src[k];
             if (src->kind != FIRC_TUN_SRC_SUB || src->sub.url == NULL) {
                 continue;
             }
-            entry_t *e = find(s, src->sub.url, ident);
+            char key[17];
+            pair_key(tun, &src->sub, key);
+            entry_t *e = find(s, src->sub.url, key);
             if (e == NULL) {
-                e = new_entry(s, src->sub.url, ident);
+                e = new_entry(s, src->sub.url, key, &src->sub);
             }
             if (e != NULL && tun->enable) {
-                add_user(e, tun->id, marks[i], src->sub.interval_s);
+                add_user(e, tun->id, marks[i], firc_tun_sub_headers_sig(&src->sub), src->sub.interval_s);
             } else if (e != NULL) {
                 e->kept = true;
             }
@@ -637,14 +711,12 @@ static bool key_kept(const firc_tunnels_t *all, const char *name)
 {
     for (size_t i = 0; i < all->n; i++) {
         const firc_tunnel_t *tun = &all->t[i];
-        char ident[IDENT_MAX];
-        ident_of(tun, ident);
         for (size_t k = 0; k < tun->n_src; k++) {
             if (tun->src[k].kind != FIRC_TUN_SRC_SUB || tun->src[k].sub.url == NULL) {
                 continue;
             }
             char key[17];
-            key_of(tun->src[k].sub.url, ident, key);
+            pair_key(tun, &tun->src[k].sub, key);
             if (strcmp(key, name) == 0) {
                 return true;
             }
@@ -714,6 +786,18 @@ const firc_tun_body_t *firc_tunsubs_bodies(const firc_tunsubs_t *s, size_t *n)
     return s != NULL ? s->bodies : NULL;
 }
 
+static const firc_tun_sub_t *saved_sub(const firc_tunnel_t *saved, const firc_tun_src_t *src)
+{
+    for (size_t i = 0; i < saved->n_src; i++) {
+        const firc_tun_src_t *x = &saved->src[i];
+        if (x->kind == FIRC_TUN_SRC_SUB && x->sub.url != NULL && strcmp(x->id, src->id) == 0 &&
+            strcmp(x->sub.url, src->sub.url) == 0) {
+            return &x->sub;
+        }
+    }
+    return &src->sub;
+}
+
 size_t firc_tunsubs_held(const firc_tunsubs_t *s, const firc_tunnel_t *uplink_of, const firc_tunnel_t *t,
                          firc_tun_body_t *out, size_t cap)
 {
@@ -721,26 +805,31 @@ size_t firc_tunsubs_held(const firc_tunsubs_t *s, const firc_tunnel_t *uplink_of
     if (s == NULL) {
         return 0;
     }
-    char ident[IDENT_MAX];
-    ident_of(uplink_of, ident);
     for (size_t i = 0; i < t->n_src && k < cap; i++) {
         const firc_tun_src_t *src = &t->src[i];
         if (src->kind != FIRC_TUN_SRC_SUB || src->sub.url == NULL) {
             continue;
         }
-        const entry_t *e = find(s, src->sub.url, ident);
+        char key[17];
+        pair_key(uplink_of, saved_sub(uplink_of, src), key);
+        const entry_t *e = find(s, src->sub.url, key);
         if (e != NULL && e->have) {
-            out[k++] = (firc_tun_body_t){.url = e->url, .mark = 0, .body = e->body, .len = e->len};
+            out[k++] = (firc_tun_body_t){.url = e->url,
+                                         .mark = 0,
+                                         .body = e->body,
+                                         .len = e->len,
+                                         .hsig = firc_tun_sub_headers_sig(&src->sub)};
         }
     }
     return k;
 }
 
-size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mark, firc_tun_sub_state_t *out)
+size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mark, uint64_t hsig,
+                          firc_tun_sub_state_t *out)
 {
     const entry_t *e = NULL;
     for (size_t i = 0; i < s->n && e == NULL; i++) {
-        if (strcmp(s->v[i]->url, url) == 0 && mark_seen(s->v[i], s->v[i]->n_users, mark)) {
+        if (strcmp(s->v[i]->url, url) == 0 && user_seen(s->v[i], s->v[i]->n_users, mark, hsig)) {
             e = s->v[i];
         }
     }
@@ -755,6 +844,26 @@ size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mar
     out->fetching = e->fetching;
     out->nodes = e->nodes;
     return 1;
+}
+
+void firc_tunsubs_set_defaults(firc_tunsubs_t *s, const firc_subhdr_set_t *defaults)
+{
+    if (s == NULL) {
+        return;
+    }
+    s->defaults = *defaults;
+    for (size_t i = 0; i < s->n; i++) {
+        char **lines = lines_of(s, s->v[i]->own, s->v[i]->n_own);
+        if (lines != NULL) {
+            firc_subhdr_lines_free(s->v[i]->lines);
+            s->v[i]->lines = lines;
+        }
+    }
+}
+
+const firc_subhdr_set_t *firc_tunsubs_defaults(const firc_tunsubs_t *s)
+{
+    return s != NULL ? &s->defaults : NULL;
 }
 
 void firc_tunsubs_advance_for_test(firc_tunsubs_t *s, int64_t ms)

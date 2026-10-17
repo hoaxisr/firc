@@ -22,7 +22,7 @@ FIRCD=$BE/build/sanitize/fircd
 export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 SOCK=/run/firc/firc.sock
 W=$(mktemp -d)
-export FIRC_TUNNELS_CACHE_DIR="$W/cache" FIRC_UPDATE_DIR="$W/update"
+export FIRC_TUNNELS_CACHE_DIR="$W/cache" FIRC_UPDATE_DIR="$W/update" FIRC_HWID_PATH="$W/hwid"
 G=0000ac01 H=0000ac02
 pass=0 fail=0
 check() {

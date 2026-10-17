@@ -97,6 +97,16 @@ static cJSON *source_json(const firc_tun_src_t *src)
              cJSON_AddStringToObject(o, "name", src->sub.name) != NULL &&
              cJSON_AddStringToObject(o, "url", src->sub.url != NULL ? src->sub.url : "") != NULL &&
              cJSON_AddNumberToObject(o, "interval", src->sub.interval_s) != NULL;
+        if (ok && src->sub.n_headers > 0) {
+            cJSON *h = cJSON_CreateObject();
+            for (size_t i = 0; h != NULL && i < src->sub.n_headers; i++) {
+                if (cJSON_AddStringToObject(h, src->sub.headers[i].name, src->sub.headers[i].value) == NULL) {
+                    cJSON_Delete(h);
+                    h = NULL;
+                }
+            }
+            ok = put_item(o, "headers", h);
+        }
     }
     if (!ok) {
         cJSON_Delete(o);
@@ -242,7 +252,8 @@ static cJSON *shape_source(const cJSON *v)
             continue;
         }
         bool sub_field = is_sub && (strcmp(it->string, "name") == 0 || strcmp(it->string, "url") == 0 ||
-                                    strcmp(it->string, "interval") == 0);
+                                    strcmp(it->string, "interval") == 0 ||
+                                    strcmp(it->string, "headers") == 0);
         if (!sub_field) {
             ok = add_shaped(o, it->string, cJSON_Duplicate(it, true));
         } else if (strcmp(it->string, "interval") == 0) {
@@ -395,7 +406,7 @@ static const jkey_t UPLINK_KEYS[] = {{"kind", T_STR}, {"ref", T_STR}};
 static const jkey_t ADVANCED_KEYS[] = {
     {"timeout", T_NUM}, {"insecure", T_BOOL}, {"ca", T_STR}, {"kernelTcp", T_BOOL}};
 static const jkey_t SOURCE_KEYS[] = {{"id", T_STR},   {"kind", T_STR}, {"link", T_STR},
-                                     {"name", T_STR}, {"url", T_STR},  {"interval", T_NUM}};
+                                     {"name", T_STR}, {"url", T_STR},  {"interval", T_NUM}, {"headers", T_OBJ}};
 
 static bool type_is(const cJSON *v, jtype_t t)
 {
@@ -502,6 +513,14 @@ static bool tunnel_typed(const cJSON *t, load_err_t *le)
         snprintf(prefix, sizeof prefix, "sources[%d].", i);
         if (!keys_typed(src, SOURCE_KEYS, sizeof SOURCE_KEYS / sizeof SOURCE_KEYS[0], prefix, le)) {
             return false;
+        }
+        const cJSON *hv;
+        cJSON_ArrayForEach(hv, cJSON_GetObjectItemCaseSensitive(src, "headers"))
+        {
+            if (!cJSON_IsString(hv)) {
+                snprintf(prefix, sizeof prefix, "sources[%d].headers", i);
+                return refuse_type(le, "must be a string", prefix);
+            }
         }
         i++;
     }
@@ -793,7 +812,7 @@ static cJSON *sub_state_json(firc_tunnels_ctx_t *ctx, const firc_tun_src_t *src,
 {
     firc_tun_sub_state_t ss;
     memset(&ss, 0, sizeof ss);
-    if (ctx->subs == NULL || firc_tunsubs_state(ctx->subs, src->sub.url, mark, &ss) == 0) {
+    if (ctx->subs == NULL || firc_tunsubs_state(ctx->subs, src->sub.url, mark, firc_tun_sub_headers_sig(&src->sub), &ss) == 0) {
         memset(&ss, 0, sizeof ss);
     }
     int64_t ok_s = ss.last_ok_ms / 1000;
@@ -1066,10 +1085,10 @@ static const firc_tun_body_t *bodies_of(firc_tunnels_ctx_t *ctx, size_t *n)
     return ctx->subs != NULL ? firc_tunsubs_bodies(ctx->subs, n) : NULL;
 }
 
-static bool body_cached(const firc_tun_body_t *b, size_t n, const char *url, uint32_t mark)
+static bool body_cached(const firc_tun_body_t *b, size_t n, const char *url, uint32_t mark, uint64_t hsig)
 {
     for (size_t i = 0; i < n; i++) {
-        if (b[i].mark == mark && b[i].url != NULL && strcmp(b[i].url, url) == 0) {
+        if (b[i].mark == mark && b[i].hsig == hsig && b[i].url != NULL && strcmp(b[i].url, url) == 0) {
             return true;
         }
     }
@@ -1105,7 +1124,7 @@ static cJSON *preview_json(const firc_tunnel_t *t, const firc_tun_nodes_t *nodes
         }
         cJSON *x = cJSON_CreateObject();
         ok = x != NULL && cJSON_AddStringToObject(x, "name", src->sub.name) != NULL &&
-             cJSON_AddBoolToObject(x, "cached", b != NULL && body_cached(b, nb, src->sub.url, mark)) != NULL &&
+             cJSON_AddBoolToObject(x, "cached", b != NULL && body_cached(b, nb, src->sub.url, mark, firc_tun_sub_headers_sig(&src->sub))) != NULL &&
              cJSON_AddItemToArray(subs, x);
         if (!ok) {
             cJSON_Delete(x);
@@ -1343,11 +1362,41 @@ static void handle_probe(firc_http_req_t *req, firc_http_res_t *res, void *ud)
     firc_tunnels_free(&set);
 }
 
+static void handle_headers(firc_http_req_t *req, firc_http_res_t *res, void *ud)
+{
+    (void)req;
+    firc_tunnels_ctx_t *ctx = ud;
+    const firc_subhdr_set_t *d = ctx->subs != NULL ? firc_tunsubs_defaults(ctx->subs) : NULL;
+    cJSON *o = cJSON_CreateObject();
+    cJSON *a = cJSON_CreateArray();
+    bool ok = o != NULL && a != NULL;
+    for (size_t i = 0; ok && d != NULL && i < d->n; i++) {
+        cJSON *x = cJSON_CreateObject();
+        ok = x != NULL && cJSON_AddStringToObject(x, "name", d->h[i].name) != NULL &&
+             cJSON_AddStringToObject(x, "value", d->h[i].value) != NULL && cJSON_AddItemToArray(a, x);
+        if (!ok) {
+            cJSON_Delete(x);
+        }
+    }
+    if (ok) {
+        ok = put_item(o, "headers", a);
+        a = NULL;
+    }
+    cJSON_Delete(a);
+    if (!ok) {
+        cJSON_Delete(o);
+        firc_http_res_write_error(res, 500, "out of memory");
+        return;
+    }
+    firc_http_res_write_json(res, 200, o);
+}
+
 void firc_tunnels_register_routes(firc_httpd_t *h, firc_tunnels_ctx_t *ctx)
 {
     must_route(h, "GET", "/api/v1/tunnels", handle_get, ctx);
     must_route(h, "PUT", "/api/v1/tunnels", handle_put, ctx);
     must_route(h, "GET", "/api/v1/tunnels/state", handle_state, ctx);
+    must_route(h, "GET", "/api/v1/tunnels/headers", handle_headers, ctx);
     must_route(h, "POST", "/api/v1/tunnels/preview", handle_preview, ctx);
     must_route(h, "POST", "/api/v1/tunnels/probe", handle_probe, ctx);
     must_route(h, "POST", "/api/v1/tunnels/{id}/refresh", handle_refresh, ctx);

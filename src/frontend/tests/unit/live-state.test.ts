@@ -69,6 +69,14 @@ describe("a group's live state", () => {
     }
   });
 
+  // Catches an interface name used as a replacement pattern, so $& or $' in it reads as other text.
+  it("names an interface with dollar patterns as it is written", () => {
+    const live = liveTooltip("live", { iface: "wg$&$'" }, t, clock);
+    assert.deepStrictEqual(live.lines, [
+      "The group's rules are written into the router's kernel; its traffic goes through wg$&$'.",
+    ]);
+  });
+
   // Catches the interface not named where the sentence names it.
   it("names the group's interface when live and when waiting for one", () => {
     const live = liveTooltip("live", { iface: "wg0" }, t, clock);

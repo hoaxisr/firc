@@ -58,7 +58,7 @@
           {(restarting.length === 1
             ? t("{devices} will restart on save — connections through it will drop")
             : t("{devices} will restart on save — connections through them will drop")
-          ).replace("{devices}", restarting.join(", "))}
+          ).replace("{devices}", () => restarting.join(", "))}
         </span>
       {/if}
     {/snippet}
