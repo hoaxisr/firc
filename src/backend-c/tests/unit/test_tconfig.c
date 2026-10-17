@@ -572,6 +572,102 @@ TEST no_description_is_empty_and_not_written(void) {
     PASS();
 }
 
+#define SUB_WITH(h)                                                                                 \
+    "tunnels:\n  - id: a1\n    device: tunvless0\n    sources:\n"                                   \
+    "      - subscription: { name: P, url: \"http://s.example/x\", headers: " h " }\n"
+#define HDR_WHERE "tunnels[0].sources[0].subscription.headers"
+
+/* Catches: headers dropped, reordered or changed by a load and a save, or written as plain keys a YAML indicator breaks. */
+TEST subscription_headers_survive_save_and_load(void) {
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(SUB_WITH("{ X-HWID: \"\", user-agent: \"sing-box/1.12.0\", \"%x\": \"a: b\" }"), &b, file,
+                           sizeof file));
+    const firc_tun_sub_t *s = &b.t[0].src[0].sub;
+    ASSERT_EQ_FMT((size_t)3, s->n_headers, "%zu");
+    ASSERT_STR_EQ("X-HWID", s->headers[0].name);
+    ASSERT_STR_EQ("", s->headers[0].value);
+    ASSERT_STR_EQ("user-agent", s->headers[1].name);
+    ASSERT_STR_EQ("sing-box/1.12.0", s->headers[1].value);
+    ASSERT_STR_EQ("%x", s->headers[2].name);
+    ASSERT_STR_EQ("a: b", s->headers[2].value);
+    ASSERT(strstr(file, "      headers:\n        \"X-HWID\": \"\"\n") != NULL);
+    firc_tunnels_free(&b);
+    PASS();
+}
+
+/* Catches: a file without headers refused, given some, or written back with an empty headers block. */
+TEST a_subscription_without_headers_loads_and_writes_none(void) {
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(SAME_SUB, &b, file, sizeof file));
+    ASSERT_EQ_FMT((size_t)0, b.t[0].src[0].sub.n_headers, "%zu");
+    ASSERT_EQ(NULL, b.t[0].src[0].sub.headers);
+    ASSERT_EQ(NULL, strstr(file, "headers"));
+    firc_tunnels_free(&b);
+    PASS();
+}
+
+/* Catches: a header the checker refuses loaded from the file, a repeat in another case taken, more than 16 taken, or the value echoed in the error. */
+TEST a_bad_subscription_header_is_refused_without_its_value(void) {
+    ASSERT(refused(SUB_WITH("{ \"X Bad\": \"1\" }"), HDR_WHERE, "a header name is 1..64"));
+    ASSERT(refused(SUB_WITH("{ Host: evil.example }"), HDR_WHERE, "Host: set by the fetch itself, not by hand"));
+    ASSERT(refused(SUB_WITH("{ x-hwid: \"\", X-HWID: \"1\" }"), HDR_WHERE, "X-HWID: given twice"));
+    ASSERT(refused(SUB_WITH("[ X-HWID ]"), HDR_WHERE, "must be a mapping of header names to values"));
+    ASSERT(refused(SUB_WITH("{ X-Token: \"tok\\ts3cr3t\" }"), HDR_WHERE,
+                   "X-Token: a header value is up to 512 bytes without control characters"));
+    char doc[2048];
+    snprintf(doc, sizeof doc, "%s", SUB_WITH("{ X-Token: \"tok\\ts3cr3t\" }"));
+    firc_tunnels_t t = {0};
+    firc_tun_err_t e = {0};
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_tunnels_load_buffer(&t, doc, strlen(doc), &e));
+    ASSERT_EQ(NULL, strstr(e.why, "s3cr3t"));
+    ASSERT_EQ(NULL, strstr(e.where, "s3cr3t"));
+    firc_tunnels_free(&t);
+    char many[1024] = "{ ";
+    for (int i = 0; i < 17; i++) {
+        char one[24];
+        snprintf(one, sizeof one, "%sX-%d: v", i > 0 ? ", " : "", i);
+        strcat(many, one);
+    }
+    strcat(many, " }");
+    char doc17[2048];
+    snprintf(doc17, sizeof doc17, SUB_WITH("%s"), many);
+    ASSERT(refused(doc17, HDR_WHERE, "at most 16 headers"));
+    char *cut = strstr(many, ", X-16: v");
+    ASSERT(cut != NULL);
+    snprintf(cut, sizeof many - (size_t)(cut - many), " }");
+    char doc16[2048];
+    snprintf(doc16, sizeof doc16, SUB_WITH("%s"), many);
+    firc_tunnels_t ok = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&ok, doc16, strlen(doc16), NULL));
+    ASSERT_EQ_FMT((size_t)16, ok.t[0].src[0].sub.n_headers, "%zu");
+    firc_tunnels_free(&ok);
+    PASS();
+}
+
+/* Catches: a subscription without headers given a signature, two different sets given one, or one set given two. */
+TEST the_headers_signature_tells_sets_apart(void) {
+    firc_tunnels_t a = {0}, b = {0}, c = {0};
+    const char *da = SUB_WITH("{ X-A: \"1\" }");
+    const char *db = SUB_WITH("{ X-A: \"2\" }");
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&a, da, strlen(da), NULL));
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&b, db, strlen(db), NULL));
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&c, da, strlen(da), NULL));
+    uint64_t sa = firc_tun_sub_headers_sig(&a.t[0].src[0].sub);
+    ASSERT(sa != 0);
+    ASSERT(sa != firc_tun_sub_headers_sig(&b.t[0].src[0].sub));
+    ASSERT(sa == firc_tun_sub_headers_sig(&c.t[0].src[0].sub));
+    firc_tunnels_free(&a);
+    firc_tunnels_free(&b);
+    firc_tunnels_free(&c);
+    firc_tunnels_t d = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&d, SAME_SUB, strlen(SAME_SUB), NULL));
+    ASSERT(firc_tun_sub_headers_sig(&d.t[0].src[0].sub) == 0);
+    firc_tunnels_free(&d);
+    PASS();
+}
+
 /* catches: the 63-byte limit counted in characters, off by one, or a description over it accepted */
 TEST a_description_over_63_bytes_is_refused(void) {
     char extra[256];
@@ -873,6 +969,10 @@ int main(int argc, char **argv) {
     RUN_TEST(nine_tunnels_are_refused);
     RUN_TEST(a_description_survives_save_and_load);
     RUN_TEST(no_description_is_empty_and_not_written);
+    RUN_TEST(subscription_headers_survive_save_and_load);
+    RUN_TEST(a_subscription_without_headers_loads_and_writes_none);
+    RUN_TEST(a_bad_subscription_header_is_refused_without_its_value);
+    RUN_TEST(the_headers_signature_tells_sets_apart);
     RUN_TEST(a_description_over_63_bytes_is_refused);
     RUN_TEST(a_description_with_a_control_character_is_refused);
     RUN_TEST(same_run_ignores_the_description);

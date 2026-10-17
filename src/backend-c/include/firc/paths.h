@@ -37,6 +37,9 @@
 #ifndef FIRC_UPDATE_DIR
 #define FIRC_UPDATE_DIR "/opt/var/lib/firc/update"
 #endif
+#ifndef FIRC_HWID_PATH
+#define FIRC_HWID_PATH "/opt/var/lib/firc/hwid"
+#endif
 #ifndef FIRC_SH_BIN
 #define FIRC_SH_BIN "/opt/bin/sh"
 #endif
@@ -76,6 +79,9 @@
 #ifndef FIRC_UPDATE_DIR
 #define FIRC_UPDATE_DIR "/var/lib/firc/update"
 #endif
+#ifndef FIRC_HWID_PATH
+#define FIRC_HWID_PATH "/var/lib/firc/hwid"
+#endif
 #ifndef FIRC_SH_BIN
 #define FIRC_SH_BIN "/bin/sh"
 #endif
@@ -103,6 +109,13 @@ static inline const char *firc_tunnels_path(void)
 {
     const char *p = getenv("FIRC_TUNNELS_PATH");
     return p != NULL && p[0] != 0 ? p : FIRC_TUNNELS_PATH;
+}
+
+/* The stored router id: FIRC_HWID_PATH from the environment when set, for tests and the contract run. */
+static inline const char *firc_hwid_path(void)
+{
+    const char *p = getenv("FIRC_HWID_PATH");
+    return p != NULL && p[0] != 0 ? p : FIRC_HWID_PATH;
 }
 
 #endif

@@ -64,9 +64,11 @@ firc_err_t firc_sub_fetch_list(const char *url, char **out_body, size_t *out_len
 firc_err_t firc_sub_fetch_list_mark(const char *url, uint32_t mark, char **out_body, size_t *out_len,
                                     int *out_http_status);
 
-/* firc_sub_fetch_list_mark with a progress callback that can abort the transfer. */
-firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, char **out_body, size_t *out_len,
-                                       int *out_http_status, firc_sub_fetch_progress_fn progress, void *ud);
+/* firc_sub_fetch_list_mark with header lines ("Name: value", NULL-terminated, NULL for none) and a progress
+ * callback that can abort the transfer; a line replaces curl's own header of that name, "Name:" removes it. */
+firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, const char *const *headers,
+                                       char **out_body, size_t *out_len, int *out_http_status,
+                                       firc_sub_fetch_progress_fn progress, void *ud);
 
 /* Writes url as scheme://host/… into buf: paths and queries may carry tokens. */
 void firc_sub_url_redact(const char *url, char *buf, size_t cap);

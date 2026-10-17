@@ -313,4 +313,117 @@ test.describe("Tunnel editor", () => {
     );
     expect(await url.evaluate((el: HTMLInputElement) => el.validity.valid)).toBe(true);
   });
+
+  // Catches the edited flag dropped: an untouched Apply would rewrite a stored override that equals today's default and light Save.
+  test("applying an untouched subscription keeps its stored headers and Save inactive", async ({
+    page,
+  }) => {
+    const { daemon, tunnels } = await saved(page, {
+      sources: [{ ...SUB, headers: { "User-Agent": "firc/0.4.1" } }, LINK],
+    });
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByRole("textbox", { name: /^Value of/ })).toHaveCount(5);
+    await dialog.getByRole("button", { name: "Apply" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(tunnels.sourceRow("a", "Provider")).toContainText("own headers");
+    await expect(tunnels.save).toHaveClass(/inactive/);
+    expect(daemon.puts).toHaveLength(0);
+  });
+
+  // Catches a refused header name accepted by the dialog and failing only after Save.
+  test("a header the fetch sets itself blocks Apply with a message naming it", async ({ page }) => {
+    const { tunnels } = await saved(page);
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Request headers/ }).click();
+    await dialog.getByRole("button", { name: "Add header" }).click();
+    await dialog.getByRole("textbox", { name: "Header name" }).nth(5).fill("host");
+    await dialog.getByRole("textbox", { name: "Value of host" }).fill("x");
+    await dialog.getByRole("button", { name: "Apply" }).click();
+    await expect(dialog.getByRole("alert")).toHaveText("Header host is set by the fetch itself");
+    await expect(dialog).toBeVisible();
+  });
+
+  // Catches a value typed back to its default still saved as an override.
+  test("a header edited and put back to its default is not saved as an override", async ({
+    page,
+  }) => {
+    const { daemon, tunnels } = await saved(page);
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Request headers/ }).click();
+    const value = dialog.getByRole("textbox", { name: /^(Value of|Header value)/ }).nth(4);
+    await value.fill("Other");
+    await value.fill("Ultra (KN-1810)");
+    await dialog.getByRole("button", { name: "Apply" }).click();
+    await expect(tunnels.sourceRow("a", "Provider")).not.toContainText("own headers");
+    expect(daemon.puts).toHaveLength(0);
+  });
+
+  // Catches a header edit saved as the whole set, a removed default saved as absent, or the edit button missing on a subscription.
+  test("an edited subscription saves only what differs from the default headers", async ({
+    page,
+  }) => {
+    const { daemon, tunnels } = await saved(page);
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Request headers/ }).click();
+    const values = dialog.getByRole("textbox", { name: /^(Value of|Header value)/ });
+    await expect(values).toHaveCount(5);
+    await values.nth(4).fill("Mine");
+    await dialog.getByRole("button", { name: "Do not send" }).nth(1).click();
+    await expect(values.nth(1)).toBeDisabled();
+    await dialog.getByRole("button", { name: "Add header" }).click();
+    await dialog.getByRole("textbox", { name: "Header name" }).nth(5).fill("Authorization");
+    await values.nth(5).fill("Bearer x");
+    await expect(dialog.getByRole("button", { name: /Request headers/ })).toContainText(
+      "changed: 3",
+    );
+    await dialog.getByRole("button", { name: "Apply" }).click();
+    await expect(tunnels.sourceRow("a", "Provider")).toContainText("own headers");
+    await tunnels.save.click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(daemon.puts[0].tunnels[0].sources[0].headers).toEqual({
+      "X-HWID": "",
+      "X-Device-Model": "Mine",
+      Authorization: "Bearer x",
+    });
+  });
+
+  // Catches Reset to defaults leaving an empty headers object in the save, or the badge staying.
+  test("Reset to defaults drops the subscription's own headers", async ({ page }) => {
+    const { daemon, tunnels } = await saved(page, {
+      sources: [{ ...SUB, headers: { "X-HWID": "" } }, LINK],
+    });
+    await expect(tunnels.sourceRow("a", "Provider")).toContainText("own headers");
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await expect(
+      dialog.getByRole("textbox", { name: /^(Value of|Header value)/ }).nth(1),
+    ).toBeDisabled();
+    await dialog.getByRole("button", { name: "Reset to defaults" }).click();
+    await dialog.getByRole("button", { name: "Apply" }).click();
+    await expect(tunnels.sourceRow("a", "Provider")).not.toContainText("own headers");
+    await tunnels.save.click();
+    await expect.poll(() => daemon.puts.length).toBe(1);
+    expect("headers" in daemon.puts[0].tunnels[0].sources[0]).toBe(false);
+  });
+
+  // Catches the phone layout squeezing a header's name and value into one line.
+  test("on a phone a header's name sits above its value", async ({ page }) => {
+    const { tunnels } = await saved(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await tunnels.sourceRow("a", "Provider").getByRole("button", { name: "Edit" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /Request headers/ }).click();
+    const name = await dialog.getByRole("textbox", { name: "Header name" }).first().boundingBox();
+    const value = await dialog
+      .getByRole("textbox", { name: /^(Value of|Header value)/ })
+      .first()
+      .boundingBox();
+    expect(name).not.toBeNull();
+    expect(value).not.toBeNull();
+    expect(value!.y).toBeGreaterThanOrEqual(name!.y + name!.height - 1);
+  });
 });

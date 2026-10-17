@@ -667,6 +667,13 @@ app.get(`${API_BASE}/groups/:id/list/sync/events`, (c) => {
 
 const TUNNEL_LINK =
   "vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A";
+const TUNNEL_HEADERS = [
+  { name: "User-Agent", value: "firc/0.4.1" },
+  { name: "X-HWID", value: "3f9c2a71d04be658" },
+  { name: "X-Device-OS", value: "KeeneticOS" },
+  { name: "X-Ver-OS", value: "5.01.C.6.0-1" },
+  { name: "X-Device-Model", value: "Ultra (KN-1810)" },
+];
 let TUNNELS: any[] = [
   {
     id: "main",
@@ -688,6 +695,25 @@ let TUNNELS: any[] = [
         name: "Provider",
         url: "https://sub.example.invalid/feed",
         interval: 21600,
+      },
+      {
+        id: "0000000c",
+        kind: "subscription",
+        name: "Reborn VPN",
+        url: "https://panel.example.invalid/au9P",
+        interval: 21600,
+      },
+      {
+        id: "0000000d",
+        kind: "subscription",
+        name: "Office",
+        url: "https://office.example.invalid/sub",
+        interval: 21600,
+        headers: {
+          "User-Agent": "sing-box/1.12.0",
+          "X-Device-Model": "",
+          Authorization: "Bearer 7f3a…",
+        },
       },
     ],
     uplink: { kind: "auto", ref: "" },
@@ -800,11 +826,14 @@ const tunnelState = (tn: any) => {
       .filter((src: any) => src.kind === "subscription")
       .map((src: any) => ({
         name: src.name,
-        nodes: 2,
+        nodes: src.name === "Reborn VPN" ? 0 : 2,
         fetching: false,
-        lastOk: Math.floor(Date.now() / 1000) - 300,
+        lastOk: src.name === "Reborn VPN" ? 0 : Math.floor(Date.now() / 1000) - 300,
         lastTry: Math.floor(Date.now() / 1000) - 300,
-        error: "",
+        error:
+          src.name === "Reborn VPN"
+            ? "the server answered: Please turn on HWID in your app, or find the new one"
+            : "",
       })),
     rxBps: status === "up" ? 1200 : 0,
     txBps: status === "up" ? 300 : 0,
@@ -851,6 +880,8 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
   ).map((tn: any) => tn.device);
   return c.json({ tunnels: TUNNELS, restarted, updated });
 });
+
+app.get(`${API_BASE}/tunnels/headers`, (c) => c.json({ headers: TUNNEL_HEADERS }));
 
 app.get(`${API_BASE}/tunnels/state`, (c) => {
   TUNNEL_TICK++;

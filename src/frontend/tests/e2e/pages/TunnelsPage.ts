@@ -41,6 +41,14 @@ export const state = (id: string, device: string, extra: Json = {}): Json => ({
   ...extra,
 });
 
+export const HEADERS = [
+  { name: "User-Agent", value: "firc/0.4.1" },
+  { name: "X-HWID", value: "6e58d9776d738a31" },
+  { name: "X-Device-OS", value: "KeeneticOS" },
+  { name: "X-Ver-OS", value: "5.01.C.6.0-1" },
+  { name: "X-Device-Model", value: "Ultra (KN-1810)" },
+];
+
 export const NODES = [
   { key: "0000000a:A", name: "A", source: "Provider" },
   { key: "0000000a:B", name: "B", source: "Provider" },
@@ -64,6 +72,7 @@ export type Daemon = {
   probeAnswer: ((body: Json, route: Route) => Promise<void> | void) | null;
   previewAnswer: ((body: Json, route: Route) => Promise<void> | void) | null;
   nodes: Json[];
+  headers: Json[];
 };
 
 export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promise<Daemon> {
@@ -84,6 +93,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     probeAnswer: null,
     previewAnswer: null,
     nodes: NODES,
+    headers: HEADERS,
     ...init,
   };
   await signedIn(page);
@@ -126,6 +136,9 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     daemon.polls++;
     return route.fulfill({ json: { tunnels: daemon.states } });
   });
+  await page.route("**/tunnels/headers", (route) =>
+    route.fulfill({ json: { headers: daemon.headers } }),
+  );
   await page.route("**/tunnels/preview", async (route) => {
     const body = route.request().postDataJSON();
     daemon.previews.push(body);
@@ -189,6 +202,12 @@ export class TunnelsPage {
   async addTunnel() {
     await expect(this.add).not.toHaveClass(/inactive/);
     await this.add.click();
+  }
+
+  sourceRow(id: string, name: string): Locator {
+    return this.card(id)
+      .locator(".src")
+      .filter({ hasText: name, has: this.page.locator(".url") });
   }
 
   tab(name: string): Locator {

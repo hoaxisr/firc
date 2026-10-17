@@ -19,7 +19,12 @@
   } from "../../../components/ui/icons";
   import type { TunnelSource } from "../../../types";
   import { counted } from "../../../utils/plural";
-  import { linkName, middleEllipsis, subscriptionIntervals } from "../tunnel-editor";
+  import {
+    linkName,
+    middleEllipsis,
+    subscriptionError,
+    subscriptionIntervals,
+  } from "../tunnel-editor";
   import type { ClientTunnel } from "../tunnels-data";
 
   let { store, tunnel = $bindable() }: { store: TunnelsStore; tunnel: ClientTunnel } = $props();
@@ -46,7 +51,7 @@
     const name = source.kind === "link" ? linkName(source.link ?? "") : (source.name ?? "");
     const ok = await ask({
       tone: "danger",
-      title: t("Delete source «{name}»?").replace("{name}", name),
+      title: t("Delete source «{name}»?").replace("{name}", () => name),
       message: t("Its nodes will be removed from the tunnel once you save."),
       confirm: t("Delete"),
     });
@@ -101,7 +106,12 @@
               </span>
             {/if}
             {#if sub?.error}
-              <span class="badge red">{t("error: {e}").replace("{e}", sub.error)}</span>
+              <span class="badge red"
+                >{t("error: {e}").replace("{e}", () => subscriptionError(sub.error, t))}</span
+              >
+            {/if}
+            {#if source.headers && Object.keys(source.headers).length > 0}
+              <span class="badge">{t("own headers")}</span>
             {/if}
           </span>
           <span class="line url"
@@ -124,6 +134,11 @@
           </span>
         </div>
         {@render reveal(index)}
+        <Tooltip value={t("Edit")}>
+          <Button small onclick={() => (dialog = { kind: "subscription", index })}>
+            <Pencil size={20} />
+          </Button>
+        </Tooltip>
         <Tooltip value={t(saved ? "Refresh subscriptions" : "Save the tunnel first")}>
           <Button small inactive={!saved} onclick={() => void store.refresh(tunnel.id)}>
             <Refresh size={20} />
@@ -178,6 +193,7 @@
     taken={tunnel.sources
       .filter((s, i) => s.kind === "subscription" && i !== dialog?.index)
       .map((s) => s.name ?? "")}
+    defaults={store.headerDefaults}
     onsave={saveSource}
     onclose={() => (dialog = null)}
   />

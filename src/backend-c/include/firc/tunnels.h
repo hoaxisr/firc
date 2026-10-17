@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "firc/err.h"
+#include "firc/subhdr.h"
 
 #define FIRC_TUN_MAX 8
 #define FIRC_TUN_MAX_SOURCES 256
@@ -20,6 +21,8 @@ typedef struct {
     char name[64];
     char *url;
     int interval_s;
+    firc_subhdr_pair_t *headers;
+    size_t n_headers;
 } firc_tun_sub_t;
 
 typedef enum { FIRC_TUN_SRC_LINK, FIRC_TUN_SRC_SUB } firc_tun_src_kind_t;
@@ -83,5 +86,8 @@ uint16_t firc_tunnel_tcp_port(const firc_tunnel_t *t);
 
 /* True when a and b give tunvless the same nodes: source kinds, links and URLs in order. */
 bool firc_tunnel_same_nodes(const firc_tunnel_t *a, const firc_tunnel_t *b);
+
+/* 0 for a subscription without headers of its own, else a non-zero hash of its name/value pairs in order. */
+uint64_t firc_tun_sub_headers_sig(const firc_tun_sub_t *sub);
 
 #endif

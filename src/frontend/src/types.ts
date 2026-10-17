@@ -156,7 +156,12 @@ export type TunnelSource = {
   name?: string;
   url?: string;
   interval?: number;
+  headers?: Record<string, string>;
 };
+
+export type TunnelHeader = { name: string; value: string };
+
+export type TunnelHeadersRes = { headers: TunnelHeader[] };
 
 export type TunnelAdvanced = { ca: string; insecure: boolean; timeout: number; kernelTcp: boolean };
 

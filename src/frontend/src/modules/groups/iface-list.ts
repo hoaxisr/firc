@@ -56,10 +56,9 @@ export function backupText(
 ): string {
   const text =
     note.since > 0
-      ? t("Running on backup {active} · first {first} down since {time}").replace(
-          "{time}",
+      ? t("Running on backup {active} · first {first} down since {time}").replace("{time}", () =>
           clock(note.since),
         )
       : t("Running on backup {active} · first {first} down");
-  return text.replace("{active}", note.active).replace("{first}", note.first);
+  return text.replace("{active}", () => note.active).replace("{first}", () => note.first);
 }

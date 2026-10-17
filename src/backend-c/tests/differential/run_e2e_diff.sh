@@ -22,6 +22,7 @@ cleanup() {
     [ -n "$C_PID" ] && kill "$C_PID" 2>/dev/null || true
     [ -n "$C_PID" ] && wait "$C_PID" 2>/dev/null || true
     rm -f "$SOCK"
+    rm -f "$OUT/hwid"
 }
 trap cleanup EXIT
 
@@ -100,7 +101,7 @@ wait_for_port() {
 
 echo "== starting C daemon"
 rm -f "$SOCK" /var/run/firc.pid
-"$C_BIN" --config "$SCRATCH_CONFIG" > "$OUT/e2e_daemon.log" 2>&1 &
+FIRC_HWID_PATH="$OUT/hwid" "$C_BIN" --config "$SCRATCH_CONFIG" > "$OUT/e2e_daemon.log" 2>&1 &
 C_PID=$!
 if ! wait_for_port; then
     echo "C daemon failed to start:"; cat "$OUT/e2e_daemon.log"; exit 1

@@ -1302,7 +1302,7 @@ export class GroupsStore {
       overlap.kind === "shadowed"
         ? t("Shadowed by group {group}")
         : t("Same rule in group {group} for other devices");
-    return text.replace("{group}", overlap.groupName.trim() || t("Unnamed group"));
+    return text.replace("{group}", () => overlap.groupName.trim() || t("Unnamed group"));
   };
   getRuleSearchMatchMask = (ruleId: string) => this.searchRuleMatchMaskById.get(ruleId) ?? 0;
   getSearchHighlightParts = (value: string, query: string): SearchHighlightSegment[] | undefined =>
@@ -1669,7 +1669,7 @@ export class GroupsStore {
     const n = group.rules.length;
     const ok = await ask({
       tone: "danger",
-      title: t("Delete group «{name}»?").replace("{name}", groupTitle(group)),
+      title: t("Delete group «{name}»?").replace("{name}", () => groupTitle(group)),
       message: counted(
         n,
         locale.current,

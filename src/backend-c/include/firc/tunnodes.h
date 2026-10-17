@@ -10,12 +10,14 @@
 #include "firc/tunnels.h"
 
 #define FIRC_TUN_MAX_NODES 256
+#define FIRC_TUN_SAID_MAX 120
 
 typedef struct {
     const char *url;
     uint32_t mark;
     const char *body;
     size_t len;
+    uint64_t hsig;
 } firc_tun_body_t;
 
 typedef struct {
@@ -32,13 +34,15 @@ typedef struct {
     firc_tun_node_t *v;
     size_t n;
     size_t matched, total;
+    size_t seen, sinks;
+    char sink_name[FIRC_TUN_SAID_MAX + 1];
 } firc_tun_nodes_t;
 
 /* Serialises every use of the tunvless parser, whose intern table and insecure flag are global. */
 extern pthread_mutex_t firc_tun_parse_mutex;
 
 /* The effective node table of t: ordered rows first, then the rest in source order; a row with a
-   link is sent to tunvless. Subscription sources take the body matching (url, mark), if any. */
+   link is sent to tunvless. Subscription sources take the body matching (url, mark, headers signature), if any. */
 firc_err_t firc_tun_nodes_build(const firc_tunnel_t *t, uint32_t mark, const firc_tun_body_t *bodies,
                                 size_t n_bodies, firc_tun_nodes_t *out);
 

@@ -73,6 +73,26 @@ static void h_ua(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_http_res_write(res, 200, "text/plain", (const uint8_t *)body, strlen(body));
 }
 
+static void h_hdr(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)ud;
+    const char *ua = firc_http_req_header(req, "User-Agent");
+    const char *hwid = firc_http_req_header(req, "X-HWID");
+    char body[256];
+    snprintf(body, sizeof body, "%s|%s", ua != NULL ? ua : "-", hwid != NULL ? hwid : "-");
+    firc_http_res_write(res, 200, "text/plain", (const uint8_t *)body, strlen(body));
+}
+
+static void h_hdr2(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)ud;
+    const char *hwid = firc_http_req_header(req, "X-HWID");
+    const char *auth = firc_http_req_header(req, "Authorization");
+    const char *cookie = firc_http_req_header(req, "Cookie");
+    char body[256];
+    snprintf(body, sizeof body, "%s|%s|%s", hwid != NULL ? hwid : "-", auth != NULL ? auth : "-",
+             cookie != NULL ? cookie : "-");
+    firc_http_res_write(res, 200, "text/plain", (const uint8_t *)body, strlen(body));
+}
+
 static int g_hits_target;
 static int g_hits_counted;
 
@@ -218,6 +238,24 @@ static void add_redirect(harness_t *h, const char *path, int status, const char 
     firc_httpd_route(h->srv, "GET", path, h_redirect, r);
 }
 
+static void add_redirect_to(harness_t *h, const char *path, const char *location) {
+    redirect_ud_t *r = &h->redirects[h->n_redirects++];
+    r->status = 302;
+    snprintf(r->location, sizeof(r->location), "%s", location);
+    firc_httpd_route(h->srv, "GET", path, h_redirect, r);
+}
+
+static harness_t *other_origin_start(void) {
+    harness_t *h = calloc(1, sizeof(*h));
+    if (h == NULL) { return NULL; }
+    if (firc_loop_create(&h->loop) != FIRC_OK) { return NULL; }
+    if (firc_httpd_create(h->loop, &h->srv) != FIRC_OK) { return NULL; }
+    firc_httpd_route(h->srv, "GET", "/hdr2", h_hdr2, NULL);
+    if (firc_httpd_listen_tcp(h->srv, "127.0.0.1", TEST_PORT + 1) != FIRC_OK) { return NULL; }
+    pthread_create(&h->thread, NULL, loop_thread, h);
+    return h;
+}
+
 static harness_t *harness_start(void) {
     harness_t *h = calloc(1, sizeof(*h));
     memset(g_big_body, 'a', sizeof(g_big_body));
@@ -235,6 +273,10 @@ static harness_t *harness_start(void) {
     firc_httpd_route(h->srv, "GET", "/big", h_big, NULL);
     firc_httpd_route(h->srv, "GET", "/big300k", h_big300k, NULL);
     firc_httpd_route(h->srv, "GET", "/ua", h_ua, NULL);
+    firc_httpd_route(h->srv, "GET", "/hdr", h_hdr, NULL);
+    firc_httpd_route(h->srv, "GET", "/hdr2", h_hdr2, NULL);
+    add_redirect_to(h, "/same_origin_hdr2", "http://127.0.0.1:18100/hdr2");
+    add_redirect_to(h, "/other_port_hdr2", "http://127.0.0.1:18101/hdr2");
     firc_httpd_route(h->srv, "GET", "/target", h_target, NULL);
     firc_httpd_route(h->srv, "GET", "/counted", h_counted, NULL);
     firc_httpd_route(h->srv, "GET", "/payload", h_payload, NULL);
@@ -521,9 +563,63 @@ TEST every_fetch_names_firc_and_its_version(void) {
     ASSERT_STR_EQ("firc/" FIRC_VERSION, body);
     free(body);
     body = NULL;
-    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/redirect_ua"), 0, &body, &len, NULL, NULL, NULL));
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/redirect_ua"), 0, NULL, &body, &len, NULL, NULL, NULL));
     ASSERT_STR_EQ("firc/" FIRC_VERSION, body);
     free(body);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: the caller's User-Agent or X-HWID line not sent, curl's agent sent instead of the caller's, "User-Agent:" not removing it, or a rule list sent anything but the agent. */
+TEST a_marked_fetch_sends_the_callers_lines(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char *body = NULL;
+    size_t len = 0;
+    const char *const set[] = {"User-Agent: sing-box/1.12.0", "X-HWID: 6e58d9776d738a31", NULL};
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/hdr"), 0, set, &body, &len, NULL, NULL, NULL));
+    ASSERT_STR_EQ("sing-box/1.12.0|6e58d9776d738a31", body);
+    free(body);
+    body = NULL;
+    const char *const removed[] = {"X-HWID: 6e58d9776d738a31", "User-Agent:", NULL};
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/hdr"), 0, removed, &body, &len, NULL, NULL, NULL));
+    ASSERT_STR_EQ("-|6e58d9776d738a31", body);
+    free(body);
+    body = NULL;
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list(url_for("/hdr"), &body, &len));
+    ASSERT_STR_EQ("firc/" FIRC_VERSION "|-", body);
+    free(body);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a same-origin redirect dropping any caller line, Authorization and Cookie included. */
+TEST a_same_origin_redirect_keeps_every_line(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    char *body = NULL;
+    size_t len = 0;
+    const char *const set[] = {"X-HWID: 6e58d9776d738a31", "Authorization: Bearer t0k", "Cookie: a=b", NULL};
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/same_origin_hdr2"), 0, set, &body, &len, NULL, NULL, NULL));
+    ASSERT_STR_EQ("6e58d9776d738a31|Bearer t0k|a=b", body);
+    free(body);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: Authorization or Cookie reaching another origin (a different port counts), or X-HWID not following the redirect. */
+TEST a_cross_origin_redirect_drops_only_credentials(void) {
+    harness_t *h = harness_start();
+    harness_t *o = other_origin_start();
+    ASSERT(h != NULL);
+    ASSERT(o != NULL);
+    char *body = NULL;
+    size_t len = 0;
+    const char *const set[] = {"X-HWID: 6e58d9776d738a31", "Authorization: Bearer t0k", "Cookie: a=b", NULL};
+    ASSERT_EQ(FIRC_OK, firc_sub_fetch_list_mark_ex(url_for("/other_port_hdr2"), 0, set, &body, &len, NULL, NULL, NULL));
+    ASSERT_STR_EQ("6e58d9776d738a31|-|-", body);
+    free(body);
+    harness_stop(o);
     harness_stop(h);
     PASS();
 }
@@ -822,6 +918,9 @@ int main(int argc, char **argv) {
     RUN_TEST(malformed_url_is_inval);
     RUN_TEST(connection_refused_is_io_error);
     RUN_TEST(every_fetch_names_firc_and_its_version);
+    RUN_TEST(a_marked_fetch_sends_the_callers_lines);
+    RUN_TEST(a_same_origin_redirect_keeps_every_line);
+    RUN_TEST(a_cross_origin_redirect_drops_only_credentials);
     RUN_TEST(fetch_reports_progress_with_the_declared_total);
     RUN_TEST(a_404_reports_its_status);
     RUN_TEST(fetch_aborted_by_the_callback_is_canceled_and_leaves_no_body);

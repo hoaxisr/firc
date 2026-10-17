@@ -9,8 +9,13 @@ export type TunnelFieldError = { tunnel: string; field: string; error: string };
 export type ClientTunnel = Tunnel & { key: string };
 
 export function normalizeSource(source: Partial<TunnelSource>): TunnelSource {
-  const { id, ...rest } = source;
-  return { ...(id ? { id } : {}), ...rest, kind: source.kind ?? "link" } as TunnelSource;
+  const { id, headers, ...rest } = source;
+  return {
+    ...(id ? { id } : {}),
+    ...rest,
+    ...(headers && Object.keys(headers).length > 0 ? { headers: { ...headers } } : {}),
+    kind: source.kind ?? "link",
+  } as TunnelSource;
 }
 
 export function withKey(tunnel: Tunnel): ClientTunnel {

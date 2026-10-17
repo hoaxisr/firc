@@ -1,10 +1,12 @@
 #include "firc/tunnodes.h"
 
+#include <arpa/inet.h>
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/socket.h>
 
 #include "vless.h"
 #include "vlink.h"
@@ -31,6 +33,8 @@ typedef struct {
     bool have_re;
     char *buf;
     size_t total, matched;
+    size_t seen, sinks;
+    char sink_name[FIRC_TUN_SAID_MAX + 1];
     firc_err_t err;
 } build_t;
 
@@ -120,9 +124,60 @@ static void add_skipped(build_t *b, const firc_tun_src_t *src, const char *name,
     }
 }
 
+static bool is_sink(const struct vless_node *n)
+{
+    if (n->port <= 1) {
+        return true;
+    }
+    char host[sizeof n->host];
+    snprintf(host, sizeof host, "%s", n->host[0] == '[' ? n->host + 1 : n->host);
+    char *end = strchr(host, ']');
+    if (end != NULL) {
+        *end = '\0';
+    }
+    unsigned char a[16];
+    memset(a, 0, sizeof a);
+    if (inet_pton(AF_INET, host, a) != 1) {
+        memset(a, 0, sizeof a);
+        if (inet_pton(AF_INET6, host, a) != 1) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < sizeof a; i++) {
+        if (a[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void note_node(build_t *b, const struct vless_node *n)
+{
+    b->seen++;
+    if (!is_sink(n) || b->sinks++ > 0) {
+        return;
+    }
+    char said[sizeof n->name];
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)n->name; *p != 0 && o + 1 < sizeof said; p++) {
+        if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
+            p++;
+            continue;
+        }
+        if (*p < 0x20 || *p == 0x7f) {
+            continue;
+        }
+        said[o++] = (char)*p;
+    }
+    said[o] = '\0';
+    vless_name_cut(said);
+    snprintf(b->sink_name, sizeof b->sink_name, "%.120s", said);
+}
+
 static void add_node(build_t *b, const firc_tun_src_t *src, struct vless_node *n, size_t seq)
 {
     vless_name_cut(n->name);
+    note_node(b, n);
     size_t len = vless_node_link(n, b->buf, LINK_BUF);
     if (len == 0) {
         add_skipped(b, src, n->name,
@@ -154,6 +209,7 @@ static void on_node(void *ud, const struct vless_node *n, const char *reason)
     skip_ctx_t *s = ud;
     size_t seq = s->seq++;
     if (reason != NULL) {
+        note_node(s->b, n);
         add_skipped(s->b, s->src, n->name, reason, seq);
     } else if (s->n_useq < s->cap_useq) {
         s->useq[s->n_useq++] = seq;
@@ -183,10 +239,12 @@ static size_t count_vless(const char *s)
     return n;
 }
 
-static const firc_tun_body_t *find_body(const firc_tun_body_t *bodies, size_t n, const char *url, uint32_t mark)
+static const firc_tun_body_t *find_body(const firc_tun_body_t *bodies, size_t n, const char *url, uint32_t mark,
+                                        uint64_t hsig)
 {
     for (size_t i = 0; i < n; i++) {
-        if (bodies[i].mark == mark && bodies[i].url != NULL && strcmp(bodies[i].url, url) == 0) {
+        if (bodies[i].mark == mark && bodies[i].hsig == hsig && bodies[i].url != NULL &&
+            strcmp(bodies[i].url, url) == 0) {
             return &bodies[i];
         }
     }
@@ -318,7 +376,7 @@ static void collect(build_t *b, uint32_t mark, const firc_tun_body_t *bodies, si
             if (kind == FIRC_TUN_SRC_LINK) {
                 parse_link(b, src);
             } else {
-                const firc_tun_body_t *body = find_body(bodies, n_bodies, src->sub.url, mark);
+                const firc_tun_body_t *body = find_body(bodies, n_bodies, src->sub.url, mark, firc_tun_sub_headers_sig(&src->sub));
                 if (body != NULL) {
                     parse_body(b, src, body);
                 }
@@ -537,6 +595,9 @@ firc_err_t firc_tun_nodes_build(const firc_tunnel_t *t, uint32_t mark, const fir
     }
     out->total = b.total;
     out->matched = b.matched;
+    out->seen = b.seen;
+    out->sinks = b.sinks;
+    memcpy(out->sink_name, b.sink_name, sizeof out->sink_name);
     firc_err_t err = b.err;
     build_free(&b);
     if (err != FIRC_OK) {

@@ -1,0 +1,24 @@
+tunnels:
+- id: "hdr"
+  device: "tunvless6"
+  enable: true
+  uplink: "auto"
+  sources:
+  - id: "0000000c"
+    subscription:
+      name: "Panel"
+      url: "https://panel.example.invalid/au9P"
+      interval: 21600s
+      headers:
+        "X-HWID": ""
+        "user-agent": "sing-box/1.12.0"
+        "Authorization": "Bearer example"
+  active: 1
+  by: "connection"
+  interval: 60s
+  silence: 20s
+  advanced:
+    timeout: 8s
+    insecure: false
+    ca: ""
+    kernelTcp: false

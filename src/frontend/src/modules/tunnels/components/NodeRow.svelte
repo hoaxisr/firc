@@ -36,7 +36,7 @@
           dot: "red",
           text:
             live.since > 0
-              ? t("not answering · {ago}").replace("{ago}", agoText(now, live.since, t))
+              ? t("not answering · {ago}").replace("{ago}", () => agoText(now, live.since, t))
               : t("not answering"),
         };
       case "reserve":

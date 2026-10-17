@@ -94,7 +94,7 @@ TEST a_base64_list_gives_its_nodes_in_order(void)
     /* catches: a base64 body not decoded, nodes reordered, or a row without its link, source or new mark */
     const firc_tunnel_t *t = tunnel(SUB_A, "");
     ASSERT(t != NULL);
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:A", "aaaaaaaa:B", "aaaaaaaa:C"};
     ASSERT(keys_are(want, 3));
@@ -116,7 +116,7 @@ TEST a_clash_body_gives_its_two_nodes(void)
 {
     /* catches: a Clash YAML subscription not parsed into rows */
     const firc_tunnel_t *t = tunnel(SUB_B, "");
-    firc_tun_body_t b = {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1};
+    firc_tun_body_t b = {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"bbbbbbbb:NL-1", "bbbbbbbb:DE-1"};
     ASSERT(keys_are(want, 2));
@@ -128,7 +128,7 @@ TEST order_pins_its_keys_first(void)
 {
     /* catches: order ignored, or ordered rows still flagged new */
     const firc_tunnel_t *t = tunnel(SUB_A, "    order: [\"aaaaaaaa:B\"]\n");
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:B", "aaaaaaaa:A", "aaaaaaaa:C"};
     ASSERT(keys_are(want, 3));
@@ -141,7 +141,7 @@ TEST an_excluded_node_is_listed_but_not_sent(void)
 {
     /* catches: an excluded node sent to tunvless, or dropped from the table */
     const firc_tunnel_t *t = tunnel(SUB_A, "    exclude: [\"aaaaaaaa:C\"]\n");
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:A", "aaaaaaaa:B", "aaaaaaaa:C"};
     ASSERT(keys_are(want, 3));
@@ -158,7 +158,7 @@ TEST the_filter_keeps_matching_subscription_nodes_ignoring_case(void)
     const char *names[] = {"NL Amsterdam", "DE Berlin", "the Netherlands", "US", "FR"};
     char *body = names_body(names, 5);
     const firc_tunnel_t *t = tunnel(SUB_A, "    filter: \"nl|neth\"\n");
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     const char *want[] = {"aaaaaaaa:NL Amsterdam", "aaaaaaaa:the Netherlands"};
@@ -174,7 +174,7 @@ TEST duplicate_names_in_one_source_get_a_number(void)
     const char *names[] = {"X", "Y", "X", "X"};
     char *body = names_body(names, 4);
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     const char *want[] = {"aaaaaaaa:X", "aaaaaaaa:Y", "aaaaaaaa:X#2", "aaaaaaaa:X#3"};
@@ -188,7 +188,7 @@ TEST a_name_with_key_characters_is_encoded(void)
     const char *names[] = {"a%3Ab%25c%23d", "a%3Ab%25c%23d"};
     char *body = names_body(names, 2);
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     const char *want[] = {"aaaaaaaa:a%3Ab%25c%23d", "aaaaaaaa:a%3Ab%25c%23d#2"};
@@ -203,7 +203,7 @@ TEST a_name_with_control_bytes_gets_a_key_the_config_takes(void)
     char *body = names_body(names, 2);
     const firc_tunnel_t *t = tunnel(SUB_A, "    order: [\"aaaaaaaa:a%0Ab%09c%7Fd%1F\"]\n");
     ASSERT(t != NULL);
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     const char *want[] = {"aaaaaaaa:a%0Ab%09c%7Fd%1F", "aaaaaaaa:x"};
@@ -217,7 +217,7 @@ TEST an_ordered_key_no_source_has_is_a_missing_row(void)
 {
     /* catches: a vanished ordered node dropped silently, or sent */
     const firc_tunnel_t *t = tunnel(SUB_A, "    order: [\"aaaaaaaa:Gone%3A1#2\", \"aaaaaaaa:C\"]\n");
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:Gone%3A1#2", "aaaaaaaa:C", "aaaaaaaa:A", "aaaaaaaa:B"};
     ASSERT(keys_are(want, 4));
@@ -235,7 +235,7 @@ TEST a_link_source_counts_whatever_the_filter(void)
     /* catches: the filter applied to a manual link, or link sources not listed first */
     const firc_tunnel_t *t = tunnel(SUB_B "      - id: cccccccc\n        link: \"vless://" U "@m.example:443?security=none#zz-mine\"\n",
                                     "    filter: \"^nl\"\n");
-    firc_tun_body_t b = {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1};
+    firc_tun_body_t b = {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"cccccccc:zz-mine", "bbbbbbbb:NL-1"};
     ASSERT(keys_are(want, 2));
@@ -255,7 +255,7 @@ TEST at_most_256_nodes_are_sent(void)
         off += (size_t)snprintf(body + off, cap - off, "vless://" U "@h.example:443?security=none#n%d\n", i);
     }
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, off};
+    firc_tun_body_t b = {"https://a.example", 0, body, off, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     ASSERT_EQ(256u, sendable());
@@ -274,14 +274,59 @@ TEST the_body_of_another_mark_is_not_used(void)
 {
     /* catches: a body fetched through another uplink used for this tunnel */
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0x00050000u, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0x00050000u, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     ASSERT_EQ(0u, g_nodes.n);
     ASSERT_EQ(FIRC_OK, build(t, 0x00050000u, &b, 1));
     ASSERT_EQ(3u, g_nodes.n);
-    firc_tun_body_t other = {"https://other.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t other = {"https://other.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &other, 1));
     ASSERT_EQ(0u, g_nodes.n);
+    PASS();
+}
+
+#define SUB_H "      - id: aaaaaaaa\n        subscription: { name: P, url: \"https://a.example\", headers: { X-HWID: \"\" } }\n"
+
+/* Catches: a body fetched with other headers used for this subscription, or its own one missed. */
+TEST the_body_of_other_headers_is_not_used(void)
+{
+    const firc_tunnel_t *t = tunnel(SUB_H, "");
+    ASSERT(t != NULL);
+    uint64_t sig = firc_tun_sub_headers_sig(&t->src[0].sub);
+    firc_tun_body_t plain = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &plain, 1));
+    ASSERT_EQ(0u, g_nodes.n);
+    firc_tun_body_t own = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, sig};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &own, 1));
+    ASSERT_EQ(3u, g_nodes.n);
+    PASS();
+}
+
+#define SINKS                                                                                       \
+    "vless://" U "@0.0.0.0:1?security=none#Please%20turn%20on%20HWID%01\n"                          \
+    "vless://" U "@real.example:1?security=none#Second\n"
+
+/* Catches: a sink node not counted, a real node counted as one, or the first name kept with its control byte. */
+TEST nodes_at_a_sink_are_counted_with_the_first_name(void)
+{
+    const firc_tunnel_t *t = tunnel(SUB_A, "");
+    ASSERT(t != NULL);
+    firc_tun_body_t b = {"https://a.example", 0, SINKS, sizeof SINKS - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
+    ASSERT_EQ(2u, g_nodes.seen);
+    ASSERT_EQ(2u, g_nodes.sinks);
+    ASSERT_STR_EQ("Please turn on HWID", g_nodes.sink_name);
+    static const char mixed[] = SINKS "vless://" U "@a.example:443?security=none#Real\n";
+    firc_tun_body_t m = {"https://a.example", 0, mixed, sizeof mixed - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &m, 1));
+    ASSERT_EQ(3u, g_nodes.seen);
+    ASSERT_EQ(2u, g_nodes.sinks);
+    static const char six[] = "proxies:\n  - {name: Six, type: vless, server: \"::\", port: 443, uuid: " U "}\n";
+    firc_tun_body_t s6 = {"https://a.example", 0, six, sizeof six - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &s6, 1));
+    ASSERT_EQ(1u, g_nodes.seen);
+    ASSERT_EQ(1u, g_nodes.sinks);
+    ASSERT_STR_EQ("Six", g_nodes.sink_name);
     PASS();
 }
 
@@ -291,7 +336,7 @@ TEST a_node_the_parser_skips_is_listed_with_its_reason(void)
     static const char body[] = "vless://" U "@a.example:443?security=none#ok\n"
                                "vless://" U "@b.example:443?type=kcp#bad\n";
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1};
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:ok", "aaaaaaaa:bad"};
     ASSERT(keys_are(want, 2));
@@ -308,7 +353,7 @@ TEST an_ipv6_server_is_listed_as_not_supported(void)
                                "  - {name: six, type: vless, server: \"2001:db8::1\", port: 443, uuid: " U "}\n"
                                "  - {name: four, type: vless, server: 192.0.2.1, port: 443, uuid: " U "}\n";
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1};
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:six", "aaaaaaaa:four"};
     ASSERT(keys_are(want, 2));
@@ -328,7 +373,7 @@ TEST a_long_name_is_cut_to_100_bytes(void)
     const char *names[] = {name};
     char *body = names_body(names, 1);
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     ASSERT_EQ(1u, g_nodes.n);
@@ -342,7 +387,7 @@ TEST insecure_is_set_per_tunnel_for_each_build(void)
 {
     /* catches: one tunnel's insecure flag leaking into the next build */
     static const char body[] = "vless://" U "@a.example:443?security=tls&sni=a.example&allowInsecure=1#tls\n";
-    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1};
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
     const firc_tunnel_t *t = tunnel(SUB_A, "    advanced: { insecure: true }\n");
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     ASSERT_EQ(1u, sendable());
@@ -373,7 +418,7 @@ TEST a_twin_name_keeps_its_number_when_one_is_skipped(void)
     static const char body[] = "vless://" U "@a.example:443?type=kcp#X\n"
                                "vless://" U "@b.example:443?security=none#X\n";
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1};
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:X#2", "aaaaaaaa:X"};
     ASSERT(keys_are(want, 2));
@@ -391,7 +436,7 @@ TEST two_long_names_of_hashes_keep_distinct_short_keys(void)
     const char *names[] = {name, name};
     char *body = names_body(names, 2);
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     char want0[200] = "aaaaaaaa:", want1[200];
@@ -423,8 +468,8 @@ TEST subscriptions_keep_their_config_order(void)
 {
     /* catches: subscriptions reordered, e.g. by id or by the order of the bodies */
     const firc_tunnel_t *t = tunnel(SUB_B SUB_A, "");
-    firc_tun_body_t b[] = {{"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1},
-                           {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1}};
+    firc_tun_body_t b[] = {{"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0},
+                           {"https://b.example", 0, CLASH_TWO, sizeof CLASH_TWO - 1, 0}};
     ASSERT_EQ(FIRC_OK, build(t, 0, b, 2));
     const char *want[] = {"bbbbbbbb:NL-1", "bbbbbbbb:DE-1", "aaaaaaaa:A", "aaaaaaaa:B", "aaaaaaaa:C"};
     ASSERT(keys_are(want, 5));
@@ -435,7 +480,7 @@ TEST a_key_repeated_in_order_counts_once(void)
 {
     /* catches: a repeated order entry listing a node or a missing row twice */
     const firc_tunnel_t *t = tunnel(SUB_A, "    order: [\"aaaaaaaa:B\", \"aaaaaaaa:Z\", \"aaaaaaaa:B\", \"aaaaaaaa:Z\"]\n");
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:B", "aaaaaaaa:Z", "aaaaaaaa:A", "aaaaaaaa:C"};
     ASSERT(keys_are(want, 4));
@@ -451,7 +496,7 @@ TEST a_body_reads_at_most_1024_nodes(void)
         off += (size_t)snprintf(body + off, cap - off, "vless://" U "@h.example:443?security=none#n%d\n", i);
     }
     const firc_tunnel_t *t = tunnel(SUB_A, "");
-    firc_tun_body_t b = {"https://a.example", 0, body, off};
+    firc_tun_body_t b = {"https://a.example", 0, body, off, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     ASSERT_EQ(1024u, g_nodes.total);
@@ -464,7 +509,7 @@ TEST a_body_reads_at_most_1024_nodes(void)
     for (size_t i = 10; i + 5 <= big; i += 5) {
         memcpy(junk + i, "vless", 5);
     }
-    firc_tun_body_t j = {"https://a.example", 0, junk, big};
+    firc_tun_body_t j = {"https://a.example", 0, junk, big, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &j, 1));
     free(junk);
     ASSERT_EQ(0u, g_nodes.total);
@@ -490,7 +535,7 @@ TEST a_reversed_order_lists_every_node_once(void)
 {
     /* catches: an emitted node blanking its key in the sorted index, so later order keys miss and nodes repeat */
     const firc_tunnel_t *t = tunnel(SUB_A, "    order: [\"aaaaaaaa:C\", \"aaaaaaaa:B\", \"aaaaaaaa:A\"]\n");
-    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1};
+    firc_tun_body_t b = {"https://a.example", 0, B64_ABC, sizeof B64_ABC - 1, 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     const char *want[] = {"aaaaaaaa:C", "aaaaaaaa:B", "aaaaaaaa:A"};
     ASSERT(keys_are(want, 3));
@@ -515,7 +560,7 @@ TEST ten_nodes_in_reverse_order_keep_the_saved_order(void)
     }
     strcat(extra, "]\n");
     const firc_tunnel_t *t = tunnel(SUB_A, extra);
-    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body)};
+    firc_tun_body_t b = {"https://a.example", 0, body, strlen(body), 0};
     ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
     free(body);
     ASSERT(keys_are(want, 10));
@@ -541,6 +586,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_link_source_counts_whatever_the_filter);
     RUN_TEST(at_most_256_nodes_are_sent);
     RUN_TEST(the_body_of_another_mark_is_not_used);
+    RUN_TEST(the_body_of_other_headers_is_not_used);
     RUN_TEST(a_node_the_parser_skips_is_listed_with_its_reason);
     RUN_TEST(an_ipv6_server_is_listed_as_not_supported);
     RUN_TEST(a_long_name_is_cut_to_100_bytes);
@@ -551,6 +597,7 @@ int main(int argc, char **argv)
     RUN_TEST(link_sources_keep_their_config_order);
     RUN_TEST(subscriptions_keep_their_config_order);
     RUN_TEST(a_key_repeated_in_order_counts_once);
+    RUN_TEST(nodes_at_a_sink_are_counted_with_the_first_name);
     RUN_TEST(a_body_reads_at_most_1024_nodes);
     RUN_TEST(a_reversed_order_lists_every_node_once);
     RUN_TEST(ten_nodes_in_reverse_order_keep_the_saved_order);

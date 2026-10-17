@@ -113,7 +113,7 @@ export function liveTooltip(
   t: T,
   clock: (unixSeconds: number) => string,
 ): LiveTooltip {
-  const iface = (text: string) => text.replaceAll("{iface}", ctx.iface);
+  const iface = (text: string) => text.replaceAll("{iface}", () => ctx.iface);
   switch (kind) {
     case "live":
       return {
@@ -183,11 +183,12 @@ export function liveTooltip(
           footer: true,
         };
       }
+      const since = nf?.since;
       const first =
-        nf?.since !== undefined
+        since !== undefined
           ? t(
               "Since {time} the router has not accepted firc's rules, and the daemon keeps rewriting them by itself. This usually happens while the firmware rebuilds its tables, and passes within a few seconds.",
-            ).replace("{time}", clock(nf.since))
+            ).replace("{time}", () => clock(since))
           : t(
               "The router is not accepting firc's rules, and the daemon keeps rewriting them by itself. This usually happens while the firmware rebuilds its tables, and passes within a few seconds.",
             );
@@ -225,7 +226,7 @@ export function liveTooltip(
         lines: [
           t(
             "The page has had no answer from firc for {ago}. The groups' state is unknown: the router is rebooting, the daemon is stopped or the connection is lost. The page keeps asking by itself.",
-          ).replace("{ago}", agoText(ctx.silentFor ?? 0, t)),
+          ).replace("{ago}", () => agoText(ctx.silentFor ?? 0, t)),
         ],
         footer: false,
       };
@@ -242,6 +243,6 @@ export function agoText(ms: number, t: T): string {
 export function checkedText(checkedAt: number, now: number, t: T): string {
   return t("Checked {ago} ago · updates by itself, no need to reload the page").replace(
     "{ago}",
-    agoText(now - checkedAt, t),
+    () => agoText(now - checkedAt, t),
   );
 }

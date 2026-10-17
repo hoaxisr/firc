@@ -84,7 +84,7 @@
             ),
           ]
         : []),
-      ...(tunnel.filter ? [t("filter «{f}»").replace("{f}", tunnel.filter)] : []),
+      ...(tunnel.filter ? [t("filter «{f}»").replace("{f}", () => tunnel.filter)] : []),
       ...(live
         ? [counted(usable, locale.current, t("{n} node"), t("{n} nodes (2-4)"), t("{n} nodes"))]
         : []),
@@ -108,7 +108,7 @@
   async function remove() {
     const ok = await ask({
       tone: "danger",
-      title: t("Delete tunnel {device}?").replace("{device}", tunnel.device),
+      title: t("Delete tunnel {device}?").replace("{device}", () => tunnel.device),
       message: t("The tunnel goes away once you save."),
       confirm: t("Delete"),
     });
@@ -118,7 +118,7 @@
   async function restart() {
     const ok = await ask({
       tone: "warn",
-      title: t("Restart {device}?").replace("{device}", tunnel.device),
+      title: t("Restart {device}?").replace("{device}", () => tunnel.device),
       message: t("Connections through the tunnel will drop and reconnect."),
       confirm: t("Restart"),
     });
@@ -153,7 +153,7 @@
           {:else if up && live}
             {#if live.active.length > 0}
               <span class="badge green">
-                {t("active: {names}").replace("{names}", live.active.join(", "))}
+                {t("active: {names}").replace("{names}", () => live.active.join(", "))}
               </span>
             {/if}
             <span class="badge">
