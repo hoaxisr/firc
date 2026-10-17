@@ -141,7 +141,7 @@ def run_tunnel_sequence(t, conn):
                 "sources": [
                     {"id": "0000000a", "kind": "link", "link": TUN_LINK},
                     {"id": "0000000b", "kind": "subscription", "name": "Stub", "url": STUB_TUN_URL,
-                     "interval": 3600},
+                     "interval": 3600, "headers": {"X-Device-OS": ""}},
                 ],
                 "filter": "^(A|NL-.*)$",
                 "order": ["0000000b:NL-2"],
@@ -173,6 +173,7 @@ def run_tunnel_sequence(t, conn):
     t.step("POST", "/api/v1/tunnels/t1/restart")
     t.step("PUT", "/api/v1/tunnels", json.dumps({"tunnels": []}))
     t.step("GET", "/api/v1/tunnels/state")
+    t.step("GET", "/api/v1/tunnels/headers")
 
 
 _ROLES = {"tunnel", "wan", "lan", "other"}

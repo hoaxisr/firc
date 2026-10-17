@@ -112,7 +112,7 @@ export function uplinkOptions(
     const cycle = wouldCycle(tunnels, self.id, other.id);
     options.push({
       value: `tunnel:${other.id}`,
-      label: t("Through tunnel {name}").replace("{name}", other.device || other.id),
+      label: t("Through tunnel {name}").replace("{name}", () => other.device || other.id),
       disabled: cycle,
       hint: cycle ? t("This tunnel already goes out through this one: a loop") : undefined,
     });
@@ -197,8 +197,8 @@ function oneDecimal(n: number): string {
 export function formatRate(bytesPerS: number, t: T): string {
   const bits = Math.max(0, bytesPerS) * 8;
   return bits >= 1e6
-    ? t("{n} Mbit/s").replace("{n}", oneDecimal(bits / 1e6))
-    : t("{n} Kbit/s").replace("{n}", oneDecimal(bits / 1e3));
+    ? t("{n} Mbit/s").replace("{n}", () => oneDecimal(bits / 1e6))
+    : t("{n} Kbit/s").replace("{n}", () => oneDecimal(bits / 1e3));
 }
 
 export function agoText(now: number, since: number, t: T): string {
@@ -245,4 +245,12 @@ export function linkProblem(link: string, t: T): string | null {
 export function uniqueByKey<R extends { key: string }>(rows: R[]): R[] {
   const seen = new Set<string>();
   return rows.filter((row) => !seen.has(row.key) && Boolean(seen.add(row.key)));
+}
+
+const ANSWERED = "the server answered: ";
+
+export function subscriptionError(error: string, t: (key: string) => string): string {
+  return error.startsWith(ANSWERED)
+    ? t("the server answered: {s}").replace("{s}", () => error.slice(ANSWERED.length))
+    : error;
 }

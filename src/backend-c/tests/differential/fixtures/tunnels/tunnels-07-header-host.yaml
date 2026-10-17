@@ -1,0 +1,6 @@
+tunnels:
+  - id: hdr
+    device: tunvless6
+    sources:
+      - id: 0000000c
+        subscription: { name: Panel, url: "https://panel.example.invalid/x", headers: { Host: evil.example } }

@@ -178,8 +178,17 @@ jobs:
                         if "firc_loop_block_signals(" in l and not re.match(r"^[A-Za-z_]", l)), None)
           if block is None:
               sys.exit("main.c does not block the signals it subscribes to")
+          # only main()'s own body: a helper defined above it runs when main calls it
+          start = next((i for i, l in enumerate(main)
+                        if re.match(r"^int\s+main\s*\(", l) and not l.rstrip().endswith(";")), None)
+          if start is None:
+              sys.exit("main.c defines no main(): this check has stopped checking anything")
+          end = next((i for i in range(start + 1, len(main)) if main[i].startswith("}")), None)
+          if end is None:
+              sys.exit("main.c's main() has no closing brace at column 0: this check has stopped checking anything")
           first = None
-          for i, l in enumerate(main):
+          for i in range(start + 1, end):
+              l = main[i]
               if re.match(r"^[A-Za-z_]", l):   # a definition, not a call
                   continue
               if any(re.search(r"\b" + s + r"\s*\(", l) for s in starters) or "pthread_create" in l:

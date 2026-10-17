@@ -139,15 +139,15 @@
   function noteText(note: NonNullable<RowNote>): string {
     switch (note.kind) {
       case "policy-off":
-        return t("off by policy {name}").replace("{name}", note.policy);
+        return t("off by policy {name}").replace("{name}", () => note.policy);
       case "manual-off":
         return t("off by a manual entry");
       case "excluded-from":
-        return t("excluded from {name}").replace("{name}", note.policy);
+        return t("excluded from {name}").replace("{name}", () => note.policy);
       case "excluded":
         return t("excluded");
       case "via":
-        return t("on through policy {name}").replace("{name}", note.policy);
+        return t("on through policy {name}").replace("{name}", () => note.policy);
       case "manual-on":
         return t("on through a manual entry");
     }
@@ -194,7 +194,7 @@
           <strong>{t("A change does not take effect at once.")}</strong>
           {t(
             "A device that has already asked for a domain of the group keeps the address firc gave it in its DNS cache for up to {clamp}. Until that cache expires, the site will not open on a denied device: firc does not let its addresses past the group. Flushing the device's DNS cache or restarting the browser speeds it up.",
-          ).replace("{clamp}", clampText)}
+          ).replace("{clamp}", () => clampText)}
         </p>
         <p>
           {t(
@@ -238,11 +238,12 @@
           {#each chips as chip, i (chip.id)}
             {@const on = policyOn(chip.side, mode)}
             {@const noteId = `devices-policy-note-${i}`}
+            {@const takenBy = chip.takenBy}
             {@const note =
-              chip.takenBy !== null
+              takenBy !== null
                 ? t("unreachable: its name is taken by the description of policy {name}").replace(
                     "{name}",
-                    chip.takenBy,
+                    () => takenBy,
                   )
                 : chip.side === "deny"
                   ? t("excluded")

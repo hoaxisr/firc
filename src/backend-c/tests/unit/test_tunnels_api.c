@@ -30,10 +30,12 @@
 #include "firc/models.h"
 #include "firc/rtnl.h"
 #include "firc/sub_fetch.h"
+#include "firc/subhdr.h"
 #include "firc/tunnels.h"
 #include "firc/tunnels_api.h"
 #include "firc/tunrun.h"
 #include "firc/tunsubs.h"
+#include "firc/version.h"
 
 #define API_PORT 18143
 #define SUB_PORT 18144
@@ -131,6 +133,9 @@ static void bring_up(hx_t *h)
 {
     h->run = firc_tunrun_new(h->loop, h->rtnl, 4300u, FAKE);
     h->subs = firc_tunsubs_new(h->loop, h->cache, firc_tunrun_bodies_changed, h->run);
+    firc_subhdr_set_t defaults;
+    firc_subhdr_defaults("6e58d9776d738a31", "5.01.C.6.0-1", "Ultra (KN-1810)", &defaults);
+    firc_tunsubs_set_defaults(h->subs, &defaults);
     firc_tunrun_set_subs(h->run, h->subs);
     h->ctx.run = h->run;
     h->ctx.subs = h->subs;
@@ -995,7 +1000,8 @@ TEST the_routes_need_a_session(void)
     ASSERT(hx_start("tunnels:\n  - id: a\n    device: tunvless0\n    enable: false\n", 0) != NULL);
     static const char *const routes[][2] = {
         {"GET", "/api/v1/tunnels"},          {"PUT", "/api/v1/tunnels"},
-        {"GET", "/api/v1/tunnels/state"},    {"POST", "/api/v1/tunnels/preview"},
+        {"GET", "/api/v1/tunnels/state"},    {"GET", "/api/v1/tunnels/headers"},
+        {"POST", "/api/v1/tunnels/preview"},
         {"POST", "/api/v1/tunnels/probe"},   {"POST", "/api/v1/tunnels/a/refresh"},
         {"POST", "/api/v1/tunnels/a/restart"},
     };
@@ -1033,6 +1039,12 @@ TEST wrong_json_types_are_refused_with_their_field(void)
         {"{\"id\":\"a\",\"device\":\"tunvless0\",\"sources\":[{\"kind\":\"subscription\",\"name\":\"P\","
          "\"url\":\"http://x.example.invalid/\",\"interval\":\"1h\"}]}",
          "{\"error\":\"must be a number\",\"field\":\"sources[0].interval\",\"tunnel\":\"a\"}"},
+        {"{\"id\":\"a\",\"device\":\"tunvless0\",\"sources\":[{\"kind\":\"subscription\",\"name\":\"P\","
+         "\"url\":\"http://x.example.invalid/\",\"headers\":\"X-HWID\"}]}",
+         "{\"error\":\"must be an object\",\"field\":\"sources[0].headers\",\"tunnel\":\"a\"}"},
+        {"{\"id\":\"a\",\"device\":\"tunvless0\",\"sources\":[{\"kind\":\"subscription\",\"name\":\"P\","
+         "\"url\":\"http://x.example.invalid/\",\"headers\":{\"X-A\":5}}]}",
+         "{\"error\":\"must be a string\",\"field\":\"sources[0].headers\",\"tunnel\":\"a\"}"},
         {"{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"order\":[\"k\",3]}",
          "{\"error\":\"must be a string\",\"field\":\"order[1]\",\"tunnel\":\"a\"}"},
         {"{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"exclude\":\"k\"}",
@@ -1188,6 +1200,89 @@ TEST a_get_answer_put_back_reads_the_same(void)
     PASS();
 }
 
+#define HDR_TUN                                                                                     \
+    "tunnels:\n  - id: h\n    device: tunvless3\n    enable: false\n    sources:\n"                 \
+    "      - id: 0000000b\n        subscription: { name: P, url: \"" SUB_URL "\", interval: 1h, "    \
+    "headers: { X-HWID: \"\", User-Agent: \"sing-box/1.12.0\" } }\n"
+
+#define OWN_TUN                                                                                     \
+    "tunnels:\n  - id: s\n    device: tunvless2\n    sources:\n      - id: 0000000b\n"               \
+    "        subscription: { name: P, url: \"" SUB_URL "\", interval: 1h, "                          \
+    "headers: { X-Own: \"1\" } }\n"
+
+/* catches: the default set missing a header, in another order, or with another value than the fetch sends */
+TEST the_default_headers_route_lists_the_set(void)
+{
+    ASSERT(hx_start(NULL, 0) != NULL);
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/headers", NULL, &ans));
+    ASSERT(same_json(ans, "{\"headers\":[{\"name\":\"User-Agent\",\"value\":\"firc/" FIRC_VERSION "\"},"
+                          "{\"name\":\"X-HWID\",\"value\":\"6e58d9776d738a31\"},"
+                          "{\"name\":\"X-Device-OS\",\"value\":\"KeeneticOS\"},"
+                          "{\"name\":\"X-Ver-OS\",\"value\":\"5.01.C.6.0-1\"},"
+                          "{\"name\":\"X-Device-Model\",\"value\":\"Ultra (KN-1810)\"}]}"));
+    cJSON_Delete(ans);
+    PASS();
+}
+
+/* catches: headers missing from GET, reordered, lost on a PUT of the GET answer, or an unchanged PUT restarting anything */
+TEST a_subscriptions_headers_go_through_get_and_put(void)
+{
+    ASSERT(hx_start(HDR_TUN, 0) != NULL);
+    cJSON *first = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &first));
+    const cJSON *hd = at(cJSON_GetArrayItem(at(tunnel_named(first, "h"), "sources"), 0), "headers");
+    ASSERT(same_json(hd, "{\"X-HWID\":\"\",\"User-Agent\":\"sing-box/1.12.0\"}"));
+    ASSERT_STR_EQ("X-HWID", hd->child->string);
+    char *body = cJSON_PrintUnformatted(first);
+    cJSON *put = NULL;
+    ASSERT_EQ(200, call_api("PUT", "/api/v1/tunnels", body, &put));
+    free(body);
+    ASSERT(same_json(at(put, "restarted"), "[]"));
+    cJSON_Delete(put);
+    cJSON *second = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &second));
+    ASSERT(cJSON_Compare(first, second, true));
+    cJSON_Delete(first);
+    cJSON_Delete(second);
+    PASS();
+}
+
+/* catches: a header tconfig refuses accepted by the API, or refused without the field the form shows */
+TEST a_bad_header_is_refused_with_its_field(void)
+{
+    ASSERT(hx_start(NULL, 0) != NULL);
+    cJSON *ans = NULL;
+    ASSERT_EQ(400, put_field_error("{\"id\":\"a\",\"device\":\"tunvless0\",\"sources\":[{\"kind\":\"subscription\","
+                                   "\"name\":\"P\",\"url\":\"http://x.example.invalid/\",\"headers\":{\"Host\":\"x\"}}]}",
+                                   &ans));
+    ASSERT(same_json(ans, "{\"error\":\"Host: set by the fetch itself, not by hand\","
+                          "\"field\":\"sources[0].headers\",\"tunnel\":\"a\"}"));
+    cJSON_Delete(ans);
+    ASSERT_EQ(-1, access(g_hx->path, F_OK));
+    PASS();
+}
+
+/* catches: state or cached read under signature 0 for a subscription with headers of its own */
+TEST a_subscription_with_own_headers_reads_its_state_and_cache_under_its_signature(void)
+{
+    ASSERT(hx_start(OWN_TUN, 0) != NULL);
+    ASSERT(wait_for_cached(5000));
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/state", NULL, &ans));
+    const cJSON *sub = cJSON_GetArrayItem(at(tunnel_named(ans, "s"), "subscriptions"), 0);
+    ASSERT_EQ(4, (int)at(sub, "nodes")->valuedouble);
+    cJSON_Delete(ans);
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/preview",
+                            "{\"tunnel\":{\"id\":\"s\",\"device\":\"tunvless2\",\"sources\":["
+                            "{\"id\":\"0000000b\",\"kind\":\"subscription\",\"name\":\"P\",\"url\":\"" SUB_URL "\","
+                            "\"headers\":{\"X-Own\":\"1\"}}]}}",
+                            &ans));
+    ASSERT(same_json(at(ans, "subscriptions"), "[{\"name\":\"P\",\"cached\":true}]"));
+    cJSON_Delete(ans);
+    PASS();
+}
+
 SUITE(tunnels_api)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -1213,6 +1308,10 @@ SUITE(tunnels_api)
     RUN_TEST(kernel_tcp_must_be_a_bool);
     RUN_TEST(get_put_get_keeps_kernel_tcp);
     RUN_TEST(state_reports_tcp_port);
+    RUN_TEST(the_default_headers_route_lists_the_set);
+    RUN_TEST(a_subscriptions_headers_go_through_get_and_put);
+    RUN_TEST(a_bad_header_is_refused_with_its_field);
+    RUN_TEST(a_subscription_with_own_headers_reads_its_state_and_cache_under_its_signature);
 }
 
 GREATEST_MAIN_DEFS();

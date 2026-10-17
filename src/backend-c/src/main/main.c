@@ -30,6 +30,7 @@
 #include "firc/keenetic_rci.h"
 #include "firc/keenetic_resolvers.h"
 #include "firc/resolveroute.h"
+#include "firc/router_id.h"
 #include "firc/dnspipeline.h"
 #include "firc/dnsproxy.h"
 #include "firc/groups.h"
@@ -55,6 +56,7 @@
 #include "firc/ruleset.h"
 #include "firc/staticfiles.h"
 #include "firc/sub_fetch.h"
+#include "firc/subhdr.h"
 #include "firc/capture.h"
 #include "firc/system.h"
 #include "firc/tunnels_api.h"
@@ -108,6 +110,8 @@ struct daemon {
     firc_tunsubs_t *tunsubs;
     firc_update_t *update;
     int update_timer;
+    firc_router_id_retry_t *rid_retry;
+    int rid_timer;
     firc_ifcheck_t *ifcheck;
     firc_ifwatch_t *ifwatch;
     firc_httpd_t *http_tcp;
@@ -299,6 +303,12 @@ static void daemon_teardown(struct daemon *d)
     firc_tunnels_api_close(d->tunnels_ctx);
     firc_app_set_tunnel_down(d->app, NULL, NULL);
     if (d->tunrun != NULL) { firc_tunrun_set_subs(d->tunrun, NULL); }
+    if (d->rid_timer != 0 && d->loop != NULL) {
+        (void)firc_loop_del_timer(d->loop, d->rid_timer);
+        d->rid_timer = 0;
+    }
+    firc_router_id_retry_stop(d->rid_retry);
+    d->rid_retry = NULL;
     firc_tunsubs_free(d->tunsubs);
     d->tunsubs = NULL;
     firc_tunrun_stop(d->tunrun, 5000);
@@ -494,6 +504,55 @@ static void reload_config(struct daemon *d)
 
     firc_config_clear(&reload_cfg);
     FIRC_INFO("config reloaded from %s", d->config_path);
+}
+
+static void apply_identity(firc_tunsubs_t *subs, const firc_router_id_t *id)
+{
+    firc_subhdr_set_t defaults;
+    firc_subhdr_defaults(id->hwid, id->release, id->model, &defaults);
+    firc_tunsubs_set_defaults(subs, &defaults);
+}
+
+#ifdef FIRC_ENTWARE_KN
+static firc_err_t rci_identity_get(void *ud, const char *path, char **body)
+{
+    (void)ud;
+    long timeout_s = strcmp(path, "/rci/show/defaults") == 0 ? FIRC_KN_RCI_SERIAL_TIMEOUT_SECONDS
+                                                              : FIRC_KN_RCI_TIMEOUT_SECONDS;
+    return firc_kn_rci_get_timeout(FIRC_KN_RCI_BASE_URL, path, timeout_s, body);
+}
+
+static void on_identity_tick(firc_loop_t *loop, void *ud)
+{
+    struct daemon *d = ud;
+    firc_router_id_t id;
+    if (firc_router_id_next(&d->rid_retry, firc_hwid_path(), &id)) {
+        apply_identity(d->tunsubs, &id);
+    }
+    if (d->rid_retry == NULL) {
+        (void)firc_loop_del_timer(loop, d->rid_timer);
+        d->rid_timer = 0;
+    }
+}
+#endif
+
+static void subscription_defaults(struct daemon *d)
+{
+    firc_router_id_t id;
+#ifdef FIRC_ENTWARE_KN
+    d->rid_retry = firc_router_id_begin(rci_identity_get, NULL, 30, 2000, firc_hwid_path(), &id);
+    if (d->rid_retry != NULL) {
+        FIRC_INFO("router id: asking RCI in the background; subscriptions go without X-HWID until an id exists");
+        if (firc_loop_add_timer(d->loop, 1000, 1000, on_identity_tick, d, &d->rid_timer) != FIRC_OK) {
+            firc_router_id_retry_stop(d->rid_retry);
+            d->rid_retry = NULL;
+            firc_router_id_settle(&id, firc_hwid_path(), true);
+        }
+    }
+#else
+    (void)firc_router_id_begin(NULL, NULL, 0, 0, firc_hwid_path(), &id);
+#endif
+    apply_identity(d->tunsubs, &id);
 }
 
 static bool load_tunnels(firc_tunnels_t *out, const char *keeping)
@@ -1436,6 +1495,9 @@ int main(int argc, char **argv)
                                      firc_tunrun_bodies_changed, d.tunrun);
         if (d.tunsubs == NULL) {
             FIRC_WARN("tunnels: subscriptions cannot be fetched (no worker thread); links still work");
+        }
+        if (d.tunsubs != NULL) {
+            subscription_defaults(&d);
         }
         firc_tunrun_set_subs(d.tunrun, d.tunsubs);
         firc_app_set_tunnel_down(d.app, tunnel_down, d.tunrun);

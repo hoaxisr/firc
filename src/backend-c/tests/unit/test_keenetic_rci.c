@@ -1,9 +1,18 @@
 #include "greatest.h"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "firc/keenetic_rci.h"
+#include "firc/log.h"
 
 static const char *const LIST_JSON =
     "{\"Wireguard0\":{\"description\":\"Home VPN\"},"
@@ -362,6 +371,94 @@ TEST an_entry_carries_both_names_and_drops_one_equal_to_the_kernel_name(void)
     PASS();
 }
 
+typedef struct {
+    int fd;
+    int delay_ms;
+    int port;
+} slow_rci_server_t;
+
+static void *slow_rci_serve(void *ud)
+{
+    slow_rci_server_t *s = ud;
+    for (int k = 0; k < 2; k++) {
+        int c = accept(s->fd, NULL, NULL);
+        if (c < 0) {
+            break;
+        }
+        char req[2048];
+        ssize_t got = recv(c, req, sizeof req, 0);
+        (void)got;
+        struct timespec ts = {s->delay_ms / 1000, (long)(s->delay_ms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+        static const char reply[] =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\n"
+            "Connection: close\r\n\r\n{\"serial\":\"S987654321\"}";
+        ssize_t sent = send(c, reply, sizeof reply - 1, MSG_NOSIGNAL);
+        (void)sent;
+        close(c);
+    }
+    return NULL;
+}
+
+static bool slow_rci_listen(slow_rci_server_t *s)
+{
+    s->fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof a;
+    if (s->fd < 0 || bind(s->fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(s->fd, 4) != 0 ||
+        getsockname(s->fd, (struct sockaddr *)&a, &len) != 0) {
+        return false;
+    }
+    s->port = ntohs(a.sin_port);
+    return true;
+}
+
+/* Catches: the serial's call held to the 2 s every other RCI call has, so a router answering in 2.9 s never gives it. */
+TEST a_call_with_its_own_timeout_outlasts_a_slow_answer(void)
+{
+    slow_rci_server_t s = {.delay_ms = 2600};
+    ASSERT(slow_rci_listen(&s));
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, slow_rci_serve, &s));
+    char base[64];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", s.port);
+    char *body = NULL;
+    ASSERT_EQ(FIRC_ERR_TIMEOUT, firc_kn_rci_get(base, "/rci/show/defaults", &body));
+    ASSERT_EQ(NULL, body);
+    firc_err_t err = firc_kn_rci_get_timeout(base, "/rci/show/defaults", 10, &body);
+    pthread_join(th, NULL);
+    close(s.fd);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_STR_EQ("{\"serial\":\"S987654321\"}", body);
+    free(body);
+    PASS();
+}
+
+/* Catches: a failed RCI call logged with libcurl's words alone, which Entware's libcurl reduces to "Error". */
+TEST a_failed_call_names_the_curl_code(void)
+{
+    slow_rci_server_t s = {0};
+    ASSERT(slow_rci_listen(&s));
+    close(s.fd);
+    char base[64], logpath[] = "/tmp/firc_rci_log_XXXXXX", text[2048] = "";
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", s.port);
+    int fd = mkstemp(logpath);
+    ASSERT(fd >= 0);
+    firc_log_set_output_floor(FIRC_LOG_DEBUG);
+    firc_log_set_fd(fd);
+    char *body = NULL;
+    firc_err_t err = firc_kn_rci_get(base, "/rci/show/version", &body);
+    firc_log_set_fd(1);
+    ssize_t n = pread(fd, text, sizeof text - 1, 0);
+    close(fd);
+    unlink(logpath);
+    text[n > 0 ? n : 0] = '\0';
+    ASSERT_EQ(FIRC_ERR_UPSTREAM, err);
+    ASSERT(strstr(text, "/rci/show/version failed:") != NULL);
+    ASSERT(strstr(text, "(curl 7)") != NULL);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -384,5 +481,7 @@ int main(int argc, char **argv)
     RUN_TEST(malformed_roles_make_nothing_external);
     RUN_TEST(aliases_keep_external_interfaces_without_a_label);
     RUN_TEST(a_label_after_an_unlabelled_external_entry_is_found);
+    RUN_TEST(a_call_with_its_own_timeout_outlasts_a_slow_answer);
+    RUN_TEST(a_failed_call_names_the_curl_code);
     GREATEST_MAIN_END();
 }

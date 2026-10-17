@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <yaml.h>
 
@@ -180,6 +181,11 @@ void firc_tunnels_free(firc_tunnels_t *t)
         for (size_t j = 0; j < x->n_src; j++) {
             free(x->src[j].link);
             free(x->src[j].sub.url);
+            for (size_t k = 0; k < x->src[j].sub.n_headers; k++) {
+                free(x->src[j].sub.headers[k].name);
+                free(x->src[j].sub.headers[k].value);
+            }
+            free(x->src[j].sub.headers);
         }
         free(x->src);
         free(x->filter);
@@ -242,6 +248,51 @@ static bool sub_name_ok(const char *s)
     return true;
 }
 
+static firc_err_t parse_headers(ctx_t *c, node_t *m, size_t ti, const char *section, firc_tun_sub_t *sub)
+{
+    if (m == NULL || m->type != YAML_MAPPING_NODE) {
+        return fail(c, "must be a mapping of header names to values", "tunnels[%zu]%s.headers", ti, section);
+    }
+    size_t n = (size_t)(m->data.mapping.pairs.top - m->data.mapping.pairs.start);
+    if (n > FIRC_SUBHDR_OWN_MAX) {
+        return fail(c, "at most 16 headers", "tunnels[%zu]%s.headers", ti, section);
+    }
+    if (n == 0) {
+        return FIRC_OK;
+    }
+    sub->headers = calloc(n, sizeof *sub->headers);
+    if (sub->headers == NULL) {
+        return FIRC_ERR_NOMEM;
+    }
+    for (yaml_node_pair_t *p = m->data.mapping.pairs.start; p < m->data.mapping.pairs.top; p++) {
+        node_t *k = at(c, p->key);
+        node_t *v = at(c, p->value);
+        const char *name = is_scalar(k) ? text(k) : "";
+        const char *why = firc_subhdr_check(name, is_scalar(v) ? text(v) : NULL);
+        for (size_t j = 0; why == NULL && j < sub->n_headers; j++) {
+            if (sub->headers[j].name != NULL && strcasecmp(sub->headers[j].name, name) == 0) {
+                why = "given twice";
+            }
+        }
+        if (why != NULL) {
+            char said[160];
+            if (firc_subhdr_name_ok(name)) {
+                snprintf(said, sizeof said, "%.64s: %s", name, why);
+            } else {
+                snprintf(said, sizeof said, "%s", why);
+            }
+            return fail(c, said, "tunnels[%zu]%s.headers", ti, section);
+        }
+        firc_subhdr_pair_t *h = &sub->headers[sub->n_headers++];
+        h->name = strdup(name);
+        h->value = strdup(text(v));
+        if (h->name == NULL || h->value == NULL) {
+            return FIRC_ERR_NOMEM;
+        }
+    }
+    return FIRC_OK;
+}
+
 static firc_err_t parse_sub(ctx_t *c, node_t *m, size_t ti, size_t i, firc_tun_sub_t *sub)
 {
     char section[48];
@@ -277,6 +328,11 @@ static firc_err_t parse_sub(ctx_t *c, node_t *m, size_t ti, size_t i, firc_tun_s
         } else if (strcmp(text(k), "interval") == 0) {
             if (!parse_secs(v, &sub->interval_s, 0, 604800) || (sub->interval_s != 0 && sub->interval_s < 600)) {
                 return fail(c, "0s (by hand only) or whole seconds, 10m..168h", "tunnels[%zu]%s.interval", ti, section);
+            }
+        } else if (strcmp(text(k), "headers") == 0) {
+            firc_err_t r = parse_headers(c, v, ti, section, sub);
+            if (r != FIRC_OK) {
+                return r;
             }
         } else {
             return bad_key(c, k, ti, section, "unknown key");
@@ -949,6 +1005,15 @@ static void emit_tunnel(em_t *e, const firc_tunnel_t *t)
             kv(e, "name", src->sub.name, true);
             kv(e, "url", src->sub.url, true);
             kv_secs(e, "interval", src->sub.interval_s);
+            if (src->sub.n_headers > 0) {
+                str(e, "headers", false);
+                map_start(e);
+                for (size_t j = 0; j < src->sub.n_headers; j++) {
+                    str(e, src->sub.headers[j].name, true);
+                    str(e, src->sub.headers[j].value, true);
+                }
+                map_end(e);
+            }
             map_end(e);
         }
         map_end(e);
@@ -1057,4 +1122,24 @@ uint16_t firc_tunnel_tcp_port(const firc_tunnel_t *t)
         n = n * 10 + (d[1] - '0');
     }
     return (uint16_t)(FIRC_TUNNEL_TCP_PORT_BASE + n);
+}
+
+uint64_t firc_tun_sub_headers_sig(const firc_tun_sub_t *sub)
+{
+    if (sub->n_headers == 0) {
+        return 0;
+    }
+    firc_sha256_ctx_t h;
+    firc_sha256_init(&h);
+    for (size_t i = 0; i < sub->n_headers; i++) {
+        firc_sha256_update(&h, (const uint8_t *)sub->headers[i].name, strlen(sub->headers[i].name) + 1);
+        firc_sha256_update(&h, (const uint8_t *)sub->headers[i].value, strlen(sub->headers[i].value) + 1);
+    }
+    uint8_t d[FIRC_SHA256_DIGEST_LEN];
+    firc_sha256_final(&h, d);
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8; i++) {
+        v = (v << 8) | d[i];
+    }
+    return v != 0 ? v : 1;
 }

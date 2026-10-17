@@ -22,7 +22,8 @@ Object.defineProperty(globalThis, "localStorage", {
   writable: true,
 });
 const { TunnelsStore } = await import("../../src/modules/tunnels/tunnels.svelte");
-const { fieldRefusal, probeRefusal } = await import("../../src/modules/tunnels/tunnels-data");
+const { fieldRefusal, normalizeSource, probeRefusal } =
+  await import("../../src/modules/tunnels/tunnels-data");
 const { HttpError } = await import("../../src/utils/fetcher");
 
 type Handler = unknown | ((init?: any) => unknown);
@@ -123,7 +124,7 @@ afterEach(() => {
   events.length = 0;
 });
 const stub = (handlers: Record<string, Handler>) => {
-  const s = installFetchStub(handlers);
+  const s = installFetchStub({ "/tunnels/headers": { headers: [] }, ...handlers });
   stubs.push(s);
   return s;
 };
@@ -703,5 +704,47 @@ describe("an aborted preview", () => {
       console.error = original;
     }
     assert.deepStrictEqual(logged, []);
+  });
+});
+
+describe("TunnelsStore subscription headers", () => {
+  // Catches the editor left without the daemon's defaults, so every own header reads as an added one.
+  it("reads the default headers when the tab opens", async () => {
+    stub({
+      "/tunnels": { tunnels: [] },
+      "/tunnels/state": { tunnels: [] },
+      "/tunnels/headers": { headers: [{ name: "X-HWID", value: "6e58d9776d738a31" }] },
+    });
+    (globalThis as any).document = {
+      visibilityState: "visible",
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    try {
+      const store = new TunnelsStore();
+      await store.setActive(true);
+      assert.deepStrictEqual(store.headerDefaults, [{ name: "X-HWID", value: "6e58d9776d738a31" }]);
+      await store.setActive(false);
+    } finally {
+      delete (globalThis as any).document;
+    }
+  });
+
+  // Catches a subscription's headers dropped by the load, or an emptied headers object read as a change.
+  it("keeps the headers through a load and drops an empty set", async () => {
+    const sub = {
+      id: "0000000b",
+      kind: "subscription",
+      name: "P",
+      url: "https://p.example/x",
+      interval: 21600,
+      headers: { "X-HWID": "" },
+    };
+    stub({ "/tunnels": { tunnels: [tunnel("a", { sources: [sub] })] } });
+    const store = new TunnelsStore();
+    await store.load();
+    assert.deepStrictEqual(store.data[0].sources[0].headers, { "X-HWID": "" });
+    assert.strictEqual(store.dirty, false);
+    assert.strictEqual("headers" in normalizeSource({ ...sub, headers: {} } as any), false);
   });
 });

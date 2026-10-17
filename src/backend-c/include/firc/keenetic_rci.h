@@ -10,6 +10,8 @@
 
 #define FIRC_KN_RCI_TIMEOUT_SECONDS 2L
 
+#define FIRC_KN_RCI_SERIAL_TIMEOUT_SECONDS 10L
+
 #define FIRC_KN_RCI_MAX_BODY_BYTES (1024 * 1024)
 
 typedef struct firc_kn_alias {
@@ -32,6 +34,9 @@ firc_err_t firc_kn_get_iface_aliases_from(const char *base_url, firc_kn_aliases_
 
 /* One RCI GET of path under base_url; *out_body is NUL-terminated, caller frees. */
 firc_err_t firc_kn_rci_get(const char *base_url, const char *path, char **out_body);
+
+/* The same with a timeout of its own, for a call slower than the others. */
+firc_err_t firc_kn_rci_get_timeout(const char *base_url, const char *path, long timeout_s, char **out_body);
 
 /* NDMS description for system_name, or NULL; a NULL or empty set is fine. */
 const char *firc_kn_aliases_lookup(const firc_kn_aliases_t *aliases, const char *system_name);

@@ -24,6 +24,7 @@ GW=10.78.0.1 ME=10.78.0.2 A=10.79.0.1 B=10.79.0.2 PORT=10800
 SOCK=/run/firc/firc.sock
 W=$(mktemp -d)
 export FIRC_TUNNELS_CACHE_DIR="$W/cache"
+export FIRC_HWID_PATH="$W/hwid"
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); echo "ok   $1"; else
@@ -331,7 +332,18 @@ check "no tunvless process is left after the second stop" "" "$(ours)"
 mkdir -p "$W/www"
 printf 'vless://%s@%s:%s?security=none&type=tcp#A\nvless://%s@%s:%s?security=none&type=tcp#B\n' \
     "$UUID" "$A" "$PORT" "$UUID" "$B" "$PORT" > "$W/www/sub"
-ip netns exec $N python3 -m http.server 8088 --bind $B --directory "$W/www" > "$W/www.log" 2>&1 &
+cat > "$W/sub.py" <<'EOF'
+import functools, http.server, sys
+class Logged(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        sys.stderr.write("headers X-HWID=%s X-Device-OS=%s\n" % (self.headers.get("X-HWID"), self.headers.get("X-Device-OS")))
+        sys.stderr.flush()
+        super().do_GET()
+server = http.server.ThreadingHTTPServer((sys.argv[1], 8088), functools.partial(Logged, directory=sys.argv[2]))
+print("Serving HTTP on %s port 8088" % sys.argv[1], flush=True)
+server.serve_forever()
+EOF
+ip netns exec $N python3 "$W/sub.py" $B "$W/www" > "$W/www.log" 2>&1 &
 WEB=$!
 i=0
 while [ $i -lt 25 ] && ! grep -q "Serving HTTP" "$W/www.log" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
@@ -356,6 +368,13 @@ check "a subscription tunnel reaches its first node" 0 "$?"
 # catches: the body not cached, or cached readable by others
 check "one cache file, mode 600" "1 600" \
     "$(ls "$W/cache" 2>/dev/null | wc -l) $(stat -c %a "$W/cache"/* 2>/dev/null)"
+# catches: no stored id on a router without RCI, or one others can read
+check "the stored router id is 16 hex digits, mode 600" "1 600" \
+    "$(grep -cx '[0-9a-f]\{16\}' "$W/hwid" 2>/dev/null) $(stat -c %a "$W/hwid" 2>/dev/null)"
+HWID=$(cat "$W/hwid" 2>/dev/null)
+# catches: the default headers or the stored id missing from the subscription request on the wire
+check "the fetch names the router to the provider" 1 \
+    "$(grep -q "headers X-HWID=$HWID X-Device-OS=KeeneticOS" "$W/www.log" && echo 1 || echo 0)"
 journal
 # catches: the subscription URL's token written to the log or the journal
 check "the log names the subscription by host, never its token" "1 0 0" \
@@ -369,6 +388,8 @@ FP=$!
 # catches: a restart without the provider leaving the tunnel down although the cache holds its nodes
 wait_ev "\"source\":\"tunvless3\",\"message\":\"active B" 20
 check "with the provider gone the restarted tunnel comes up from the cache" 0 "$?"
+# catches: a new id made on each start, which would also key the cache anew and miss it
+check "the restart keeps the stored id" "$HWID" "$(cat "$W/hwid" 2>/dev/null)"
 i=0
 while [ $i -lt 50 ] && ! grep -q "fetch failed" "$W/fircd.log"; do sleep 0.2; i=$((i + 1)); done
 # catches: a cache test that proves nothing because the provider still answered

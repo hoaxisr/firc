@@ -82,14 +82,16 @@
             <span class="title">{t("The install failed")}</span>
             <span class="sub">
               {t("{version} not installed, opkg exit {code}, see logread")
-                .replace("{version}", status.version)
+                .replace("{version}", () => status.version)
                 .replace("{code}", String(status.code))}
             </span>
           {:else if status.kind === "check-failed"}
             <span class="title">{t("Check failed")}</span>
             <span class="sub">{status.error}</span>
           {:else if status.kind === "newer"}
-            <span class="title">{t("Install {version}").replace("{version}", status.version)}</span>
+            <span class="title"
+              >{t("Install {version}").replace("{version}", () => status.version)}</span
+            >
             {#if !status.offered}<span class="sub">{reasonText(res.reason, t)}</span>{/if}
           {:else if status.kind === "up-to-date"}
             <span class="title">{t("Latest version")}</span>

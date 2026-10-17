@@ -15,6 +15,7 @@ import {
   orderByLatency,
   parseUplink,
   restartingDevices,
+  subscriptionError,
   subscriptionIntervals,
   subscriptionProblem,
   toggleExclude,
@@ -463,5 +464,25 @@ describe("a new source", () => {
     assert.notStrictEqual(linkProblem("vmess://u@h:443", t), null);
     assert.notStrictEqual(linkProblem("vless://u@h:443 vless://v@h:1", t), null);
     assert.notStrictEqual(linkProblem("", t), null);
+  });
+});
+
+describe("subscription errors", () => {
+  // Catches the server's own words left untranslated, or another error rewritten.
+  it("translates the placeholder prefix only", () => {
+    const tr = (k: string) => (k === "the server answered: {s}" ? "сервер ответил: {s}" : k);
+    assert.strictEqual(
+      subscriptionError("the server answered: Please turn on HWID", tr),
+      "сервер ответил: Please turn on HWID",
+    );
+    assert.strictEqual(subscriptionError("HTTP 503", tr), "HTTP 503");
+  });
+
+  // Catches the server's words used as a replacement pattern, so $& or $' in them turns into other text.
+  it("shows dollar patterns in the server's words as they are", () => {
+    assert.strictEqual(
+      subscriptionError("the server answered: pay $& or $' or $$ now", t),
+      "the server answered: pay $& or $' or $$ now",
+    );
   });
 });

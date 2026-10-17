@@ -1094,8 +1094,33 @@ definitions:
         example: ppp0
         type: string
     type: object
+  types.TunnelHeader:
+    properties:
+      name:
+        example: X-HWID
+        type: string
+      value:
+        example: 6e58d9776d738a31
+        type: string
+    type: object
+  types.TunnelHeadersRes:
+    properties:
+      headers:
+        description: 'In the order they are sent; a header the router cannot give is absent'
+        items:
+          $ref: '#/definitions/types.TunnelHeader'
+        type: array
+    type: object
   types.TunnelSource:
     properties:
+      headers:
+        additionalProperties:
+          type: string
+        description: 'subscription only: request headers over the default set (GET /api/v1/tunnels/headers), matched by name in any case; an empty value leaves that default out. At most 16; a name is an HTTP token of up to 64 bytes, a value up to 512 bytes without control characters; Host, Content-Length, Transfer-Encoding and Connection are refused. Absent when the subscription has none'
+        example:
+          X-HWID: ''
+          User-Agent: sing-box/1.12.0
+        type: object
       id:
         description: 'Eight hex digits; node keys start with it. Optional on PUT: a missing one is derived from the link or URL'
         example: 0000000a
@@ -2781,6 +2806,19 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Get the tunnels'' state'
+      tags:
+      - tunnels
+  /api/v1/tunnels/headers:
+    get:
+      description: 'Returns the request headers every tunnel subscription fetch starts from: User-Agent, X-HWID, X-Device-OS, X-Ver-OS, X-Device-Model'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelHeadersRes'
+      summary: 'Get the default subscription headers'
       tags:
       - tunnels
   /api/v1/tunnels/preview:

@@ -5,19 +5,22 @@
   import GenericDialog from "../../../components/ui/GenericDialog.svelte";
   import Select from "../../../components/ui/Select.svelte";
   import { t } from "../../../data/locale.svelte";
+  import HeadersEditor from "./HeadersEditor.svelte";
 
-  import type { TunnelSource } from "../../../types";
+  import type { TunnelHeader, TunnelSource } from "../../../types";
+  import { headerRows, headersProblem, overridesOf } from "../headers";
   import { linkProblem, subscriptionIntervals, subscriptionProblem } from "../tunnel-editor";
 
   type Props = {
     kind: "subscription" | "link";
     source: TunnelSource | null;
     taken: string[];
+    defaults: TunnelHeader[];
     onsave: (source: TunnelSource) => void;
     onclose: () => void;
   };
 
-  let { kind, source, taken, onsave, onclose }: Props = $props();
+  let { kind, source, taken, defaults, onsave, onclose }: Props = $props();
 
   const initial = untrack(() => source);
   let name = $state(initial?.name ?? "");
@@ -25,10 +28,19 @@
   let interval = $state(String(initial?.interval ?? 21600));
   let link = $state(initial?.link ?? "");
   let tried = $state(false);
+  let rows = $state(untrack(() => headerRows(defaults, initial?.headers ?? {})));
+  let headersOpen = $state(Object.keys(initial?.headers ?? {}).length > 0);
+  let edited = $state(false);
+  let seeded = untrack(() => defaults.length > 0);
+  $effect(() => {
+    if (seeded || defaults.length === 0) return;
+    seeded = true;
+    rows = headerRows(defaults, overridesOf(untrack(() => rows)));
+  });
 
   const problem = $derived(
     kind === "subscription"
-      ? subscriptionProblem(name.trim(), url.trim(), taken, t)
+      ? subscriptionProblem(name.trim(), url.trim(), taken, t) || headersProblem(rows, t)
       : linkProblem(link.trim(), t),
   );
 
@@ -36,6 +48,7 @@
     tried = true;
     if (problem) return;
     const id = source?.id ? { id: source.id } : {};
+    const own = edited ? overridesOf(rows) : (initial?.headers ?? {});
     onsave(
       kind === "subscription"
         ? ({
@@ -44,6 +57,7 @@
             name: name.trim(),
             url: url.trim(),
             interval: Number(interval),
+            ...(Object.keys(own).length > 0 ? { headers: own } : {}),
           } as TunnelSource)
         : ({ ...id, kind, link: link.trim() } as TunnelSource),
     );
@@ -82,6 +96,7 @@
           bind:selected={interval}
         />
       </div>
+      <HeadersEditor {defaults} bind:rows bind:open={headersOpen} onedit={() => (edited = true)} />
     {:else}
       <label>
         <span>{t("vless:// link")}</span>

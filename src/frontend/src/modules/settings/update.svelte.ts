@@ -74,7 +74,10 @@ function failure(error: unknown): string {
       hour: "2-digit",
       minute: "2-digit",
     });
-    return t("GitHub refuses more checks for now, try again after {time}").replace("{time}", time);
+    return t("GitHub refuses more checks for now, try again after {time}").replace(
+      "{time}",
+      () => time,
+    );
   }
   return body.error || error.message;
 }
@@ -106,7 +109,7 @@ export async function installUpdate(): Promise<void> {
   if (!latest || update.checking || update.installing || running(update.res)) return;
   const ok = await ask({
     tone: "warn",
-    title: t("Install {version}?").replace("{version}", latest.version),
+    title: t("Install {version}?").replace("{version}", () => latest.version),
     message: t(
       "DNS, the WebUI and every tunnel stop for the restart, tens of seconds on mipsel. Settings saved and waiting for a restart take effect.",
     ),

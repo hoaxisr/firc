@@ -296,7 +296,7 @@ static bool refusal_is_due(void) {
     return atomic_compare_exchange_strong(&last, &prev, now.tv_sec == 0 ? 1 : now.tv_sec);
 }
 
-static firc_err_t rci_call(const char *url, const char *post_body, char **out_body) {
+static firc_err_t rci_call(const char *url, const char *post_body, long timeout_s, char **out_body) {
     *out_body = NULL;
 
     CURL *curl = curl_easy_init();
@@ -307,7 +307,7 @@ static firc_err_t rci_call(const char *url, const char *post_body, char **out_bo
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, FIRC_KN_RCI_TIMEOUT_SECONDS);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -337,7 +337,7 @@ static firc_err_t rci_call(const char *url, const char *post_body, char **out_bo
                      FIRC_KN_RCI_MAX_BODY_BYTES);
             return FIRC_ERR_LIMIT;
         }
-        FIRC_DEBUG("keenetic rci: %s failed: %s", url, curl_easy_strerror(rc));
+        FIRC_DEBUG("keenetic rci: %s failed: %s (curl %d)", url, curl_easy_strerror(rc), (int)rc);
         return rc == CURLE_OPERATION_TIMEDOUT ? FIRC_ERR_TIMEOUT : FIRC_ERR_UPSTREAM;
     }
     if (status == 401 || status == 403) {
@@ -365,6 +365,10 @@ static firc_err_t rci_call(const char *url, const char *post_body, char **out_bo
 }
 
 firc_err_t firc_kn_rci_get(const char *base_url, const char *path, char **out_body) {
+    return firc_kn_rci_get_timeout(base_url, path, FIRC_KN_RCI_TIMEOUT_SECONDS, out_body);
+}
+
+firc_err_t firc_kn_rci_get_timeout(const char *base_url, const char *path, long timeout_s, char **out_body) {
     *out_body = NULL;
     if (!base_url || !path) { return FIRC_ERR_INVAL; }
     size_t base_len = strlen(base_url);
@@ -373,7 +377,7 @@ firc_err_t firc_kn_rci_get(const char *base_url, const char *path, char **out_bo
     if (snprintf(url, sizeof(url), "%.*s%s", (int)base_len, base_url, path) >= (int)sizeof(url)) {
         return FIRC_ERR_INVAL;
     }
-    return rci_call(url, NULL, out_body);
+    return rci_call(url, NULL, timeout_s, out_body);
 }
 
 /* n == 0 leaves *metas NULL and makes no batch call. */
@@ -389,7 +393,7 @@ static firc_err_t fetch_metas(const char *base_url, firc_kn_iface_meta_t **metas
     snprintf(list_url, sizeof(list_url), "%.*s/rci/show/interface", (int)base_len, base_url);
 
     char *list_body = NULL;
-    firc_err_t err = rci_call(list_url, NULL, &list_body);
+    firc_err_t err = rci_call(list_url, NULL, FIRC_KN_RCI_TIMEOUT_SECONDS, &list_body);
     if (err != FIRC_OK) { return err; }
 
     firc_kn_iface_meta_t *metas = NULL;
@@ -413,7 +417,7 @@ static firc_err_t fetch_metas(const char *base_url, firc_kn_iface_meta_t **metas
     snprintf(batch_url, sizeof(batch_url), "%.*s/rci/", (int)base_len, base_url);
 
     char *batch_body = NULL;
-    err = rci_call(batch_url, req_body, &batch_body);
+    err = rci_call(batch_url, req_body, FIRC_KN_RCI_TIMEOUT_SECONDS, &batch_body);
     free(req_body);
     if (err != FIRC_OK) {
         free(metas);
@@ -502,3 +506,4 @@ firc_err_t firc_kn_get_iface_aliases(firc_kn_aliases_t *out) {
     return FIRC_OK;
 #endif
 }
+
