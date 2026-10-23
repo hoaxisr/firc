@@ -8,6 +8,7 @@ import {
   describeBypassTail,
   describeDns,
   describeDnsTail,
+  deviceNames,
   groupFilterOptions,
   matches,
   matchesQuery,
@@ -371,5 +372,35 @@ describe("the group filter's options", () => {
       { value: "", label: "любая группа" },
       { value: "c", label: "gone" },
     ]);
+  });
+});
+
+const host = (ip: string, name: string, ip6: string[] = []) => ({
+  mac: "aa:00:00:00:00:01",
+  name,
+  ip,
+  ip6,
+  active: true,
+  registered: true,
+  policy: "",
+});
+
+describe("deviceNames", () => {
+  // Catches a device known only by an IPv6 address, or one compared case-sensitively, shown without its name.
+  it("names every address a device holds, both families", () => {
+    const names = deviceNames([host("192.168.1.7", "Phone", ["FD00::7"]), host("192.168.1.8", "")]);
+    assert.strictEqual(names.get("192.168.1.7"), "Phone");
+    assert.strictEqual(names.get("fd00::7"), "Phone");
+    assert.strictEqual(names.has("192.168.1.8"), false);
+  });
+});
+
+describe("matchesQuery by device", () => {
+  // Catches the search ignoring the name the row shows, so typing "phone" finds nothing.
+  it("matches an event by the name of the device that asked", () => {
+    const names = deviceNames([host("192.168.1.42", "Phone")]);
+    assert.strictEqual(matchesQuery(dns({ client: "192.168.1.42" }), "PHONE", names), true);
+    assert.strictEqual(matchesQuery(bypass({ client: "192.168.1.42" }), "phone", names), true);
+    assert.strictEqual(matchesQuery(dns({ client: "192.168.1.43" }), "phone", names), false);
   });
 });

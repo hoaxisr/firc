@@ -6,6 +6,8 @@ import type {
   LogLevel,
 } from "../../data/events.svelte";
 
+import type { Host } from "../../utils/device-picker";
+
 export type Source = "fircd" | "tunnels" | "dns" | "bypass";
 
 export const SOURCES: Source[] = ["fircd", "tunnels", "dns", "bypass"];
@@ -63,13 +65,31 @@ export function matches(e: JournalEvent, f: JournalFilter): boolean {
   return true;
 }
 
-export function matchesQuery(e: JournalEvent, query: string): boolean {
+export function deviceNames(list: Host[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const h of list) {
+    if (!h.name) continue;
+    for (const addr of [h.ip, ...h.ip6]) if (addr) names.set(addr.toLowerCase(), h.name);
+  }
+  return names;
+}
+
+export function matchesQuery(
+  e: JournalEvent,
+  query: string,
+  names: Map<string, string> = new Map(),
+): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
   if (e.kind === "log") {
     return e.message.toLowerCase().includes(q) || e.source.toLowerCase().includes(q);
   }
-  return e.client.toLowerCase().includes(q) || e.name.toLowerCase().includes(q);
+  const device = names.get(e.client.toLowerCase()) ?? "";
+  return (
+    e.client.toLowerCase().includes(q) ||
+    e.name.toLowerCase().includes(q) ||
+    device.toLowerCase().includes(q)
+  );
 }
 
 export function describeDns(e: DnsEvent, t: (s: string) => string): string {

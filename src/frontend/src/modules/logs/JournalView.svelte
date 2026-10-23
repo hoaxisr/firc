@@ -19,6 +19,7 @@
     type JournalEvent,
     type LogLevel,
   } from "../../data/events.svelte";
+  import { fetchHosts, hosts } from "../../data/hosts.svelte";
   import { journalFocus } from "../../data/journal-focus.svelte";
   import { ensureKnownGroups, knownGroups } from "../../data/known-groups.svelte";
   import { locale, t } from "../../data/locale.svelte";
@@ -29,6 +30,7 @@
     DEFAULT_LEVELS,
     describeBypassTail,
     describeDnsTail,
+    deviceNames,
     groupFilterOptions,
     LEVELS,
     matches,
@@ -72,12 +74,13 @@
   });
 
   const filter = $derived({ sources, levels, group });
+  const names = $derived(deviceNames(hosts.list));
   const counts = $derived(sourceCounts(frozen ?? journal.events));
   const shown = $derived(
-    journal.events.filter((e) => matches(e, filter) && matchesQuery(e, query)),
+    journal.events.filter((e) => matches(e, filter) && matchesQuery(e, query, names)),
   );
   const rendered = $derived(
-    frozen ? frozen.filter((e) => matches(e, filter) && matchesQuery(e, query)) : shown,
+    frozen ? frozen.filter((e) => matches(e, filter) && matchesQuery(e, query, names)) : shown,
   );
   const eventsText = $derived(
     counted(
@@ -157,6 +160,7 @@
 
   onMount(() => {
     void ensureKnownGroups();
+    void fetchHosts();
     void pollEvents();
     timer = setInterval(() => void pollEvents(), POLL_MS);
     void captureTick();
@@ -332,8 +336,13 @@
           <span class="at">{stamp(e.at)}</span>
           <span class="chip" style:--c={SOURCE_COLOR.dns}>DNS</span>
           <span class="msg">
-            <button type="button" class="pick" onclick={() => (query = e.client)}>
-              {e.client}
+            <button type="button" class="pick who" onclick={() => (query = e.client)}>
+              {#if names.get(e.client.toLowerCase())}
+                <span class="dev">{names.get(e.client.toLowerCase())}</span>
+                <span class="addr">{e.client}</span>
+              {:else}
+                {e.client}
+              {/if}
             </button>
             <button type="button" class="pick name" onclick={() => (query = e.name)}>
               {e.name}
@@ -349,8 +358,13 @@
             class="msg"
             title={e.how === "addr" ? t("the last name firc recorded for this address") : undefined}
           >
-            <button type="button" class="pick" onclick={() => (query = e.client)}>
-              {e.client}
+            <button type="button" class="pick who" onclick={() => (query = e.client)}>
+              {#if names.get(e.client.toLowerCase())}
+                <span class="dev">{names.get(e.client.toLowerCase())}</span>
+                <span class="addr">{e.client}</span>
+              {:else}
+                {e.client}
+              {/if}
             </button>
             <button type="button" class="pick name" onclick={() => (query = e.name)}>
               {e.name}
@@ -682,6 +696,16 @@
     cursor: pointer;
     font-family: var(--font-mono);
     font-size: 0.82rem;
+  }
+  .pick.who .dev {
+    font-family: var(--font);
+    font-size: 0.86rem;
+    font-weight: 500;
+  }
+  .pick.who .addr {
+    margin-left: 0.3em;
+    font-size: 0.74rem;
+    color: var(--text-2);
   }
   .pick.name {
     font-weight: 600;

@@ -227,6 +227,62 @@ test("a DNS event is shown, and clicking its client filters to that client", asy
   await expect(rows.nth(0)).toContainText("youtube.com");
 });
 
+// Catches a known device shown by its address alone, or its name not found by the search.
+test("a DNS row names the device that asked, beside its address", async ({ page }) => {
+  await shell(page, [
+    {
+      seq: 1,
+      at: 1790000000,
+      kind: "dns",
+      client: "192.168.1.42",
+      name: "youtube.com",
+      qtype: "A",
+      rcode: "NOERROR",
+      decision: "issued",
+      group: { id: "g1", name: "media" },
+      fake: "198.18.0.5",
+      reals: ["142.250.1.1"],
+    },
+    {
+      seq: 2,
+      at: 1790000001,
+      kind: "dns",
+      client: "192.168.1.51",
+      name: "ya.ru",
+      qtype: "A",
+      rcode: "NOERROR",
+      decision: "no-match",
+      reals: [],
+    },
+  ]);
+  await page.route("**/system/hosts", (route) =>
+    route.fulfill({
+      json: {
+        hosts: [
+          {
+            mac: "aa:00:00:00:00:01",
+            name: "Phone",
+            ip: "192.168.1.42",
+            ip6: [],
+            active: true,
+            registered: true,
+            policy: "",
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Journal" }).click();
+  const rows = page.locator(".pane .row");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0).locator(".who")).toHaveText(/Phone\s*192\.168\.1\.42/);
+  await expect(rows.nth(1).locator(".who")).toHaveText("192.168.1.51");
+  await page.getByPlaceholder("client, name or tunnel").fill("phone");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText("youtube.com");
+});
+
 // Catches the search missing the client, the name, or the log line's own message.
 test("typing in the search field filters by client, name or message", async ({ page }) => {
   await shell(page, [
