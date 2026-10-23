@@ -12,6 +12,7 @@ const API_BASE = "/api/v1";
 const INTERFACES: Interfaces = {
   interfaces: [
     { id: "blackhole" },
+    { id: "block" },
     { id: "nwg0", name: "WARP", ndmsName: "Wireguard0", role: "tunnel" },
     { id: "nwg1", name: "AmneziaWG NL", ndmsName: "Wireguard1", role: "tunnel" },
     { id: "nwg2", ndmsName: "Wireguard2", role: "tunnel" },
@@ -44,7 +45,9 @@ function resolverOf(group: any, active: string) {
   const health = FLAKY[group.id] ?? CALM;
   const live = (servers: string[]) => (group.enable === false ? [] : servers);
   if (!resolve.tunnel) return { source: "off", servers: [], health: CALM };
-  if (active === "blackhole") return { source: "none", servers: [], health: CALM };
+  if (active === "blackhole" || active === "block") {
+    return { source: "none", servers: [], health: CALM };
+  }
   if (resolve.server)
     return { source: "group", servers: live(serverEntries(resolve.server)), health };
   const fw = RESOLVERS.resolvers.find((r) => r.interface === active)?.servers ?? [];
@@ -145,6 +148,21 @@ if (!DATA.groups.some((g: any) => g.id === "a1b2c3d4")) {
   });
 }
 
+if (!DATA.groups.some((g: any) => g.id === "ad5ad5ad")) {
+  DATA.groups.push({
+    id: "ad5ad5ad",
+    name: "Ads",
+    interface: "block",
+    block: "nxdomain",
+    enable: true,
+    devices: { allow: [], deny: [] },
+    rules: [
+      { enable: true, id: "ad5ad501", rule: "doubleclick.net", type: "namespace" },
+      { enable: true, id: "ad5ad502", rule: "tracker.example.com", type: "domain" },
+    ],
+  });
+}
+
 const LIVE_REASONS: Record<string, string> = {};
 let NETFILTER: Record<string, unknown> = { ok: true };
 
@@ -164,8 +182,12 @@ function liveOf(group: any, active: string): { live: boolean; liveReason?: strin
   return { live: true };
 }
 
-function groupRes({ list, rules: handRules, ...group }: any, withRules = false) {
-  const withResolve = { ...group, resolve: group.resolve ?? { tunnel: true, server: "" } };
+function groupRes({ list, rules: handRules, block, ...group }: any, withRules = false) {
+  const withResolve = {
+    ...group,
+    resolve: group.resolve ?? { tunnel: true, server: "" },
+    ...(group.interface === "block" ? { block: block ?? "null" } : {}),
+  };
   const out: any = withRules ? { ...withResolve, rules: handRules } : { ...withResolve };
   const names = listOf(withResolve);
   out.active = activeOf(withResolve, ACTIVE[group.id]);
@@ -243,7 +265,7 @@ const EVENTS_RING = 4096;
 const EVENTS_BOOT = `${Math.floor(Date.now() / 1000).toString(16)}-${crypto
   .randomUUID()
   .slice(0, 8)}`;
-type DnsDecision = "issued" | "not-covered" | "no-match" | "pool-refused" | "passed";
+type DnsDecision = "issued" | "not-covered" | "no-match" | "pool-refused" | "passed" | "blocked";
 type Event =
   | { seq: number; at: number; kind: "log"; level: string; source: string; message: string }
   | {
@@ -255,6 +277,7 @@ type Event =
       qtype: string;
       rcode: string;
       decision: DnsDecision;
+      resolver?: string;
       group?: { id: string; name: string };
       fake?: string;
       reals: string[];
@@ -298,12 +321,38 @@ function pushLogLine() {
   pushEvent({ kind: "log", level, source, message });
 }
 
-const DNS_CLIENTS = ["192.168.1.42", "192.168.1.51"];
+const DNS_CLIENTS = ["192.168.1.42", "192.168.1.51", "192.168.1.7", "fd00::5"];
 const DNS_NAMES = ["youtube.com", "googlevideo.com", "ya.ru", "example.com"];
 const ROUTED_NAMES = new Set(["youtube.com", "googlevideo.com"]);
+const BLOCKED_NAMES: [string, string][] = [
+  ["ads.doubleclick.net", "A"],
+  ["tracker.example.com", "AAAA"],
+  ["stats.doubleclick.net", "HTTPS"],
+];
 let dnsN = 0;
+let blockedN = 0;
+function pushBlockedEvent(client: string) {
+  const ads = DATA.groups.find((g: any) => g.interface === "block" && g.enable !== false);
+  if (!ads) return false;
+  const [name, qtype] = BLOCKED_NAMES[blockedN % BLOCKED_NAMES.length];
+  blockedN += 1;
+  const code = ads.block ?? "null";
+  pushEvent({
+    kind: "dns",
+    client,
+    name,
+    qtype,
+    rcode: code === "nxdomain" ? "NXDOMAIN" : code === "refused" ? "REFUSED" : "NOERROR",
+    decision: "blocked",
+    resolver: "local",
+    group: { id: ads.id, name: ads.name },
+    reals: [],
+  });
+  return true;
+}
 function pushDnsEvent() {
   const client = DNS_CLIENTS[Math.floor(Math.random() * DNS_CLIENTS.length)];
+  if ((client === "192.168.1.7" || client === "fd00::5") && pushBlockedEvent(client)) return;
   const name = DNS_NAMES[Math.floor(Math.random() * DNS_NAMES.length)];
   if (ROUTED_NAMES.has(name)) {
     dnsN += 1;
@@ -334,7 +383,7 @@ function pushDnsEvent() {
   });
 }
 
-const BYPASS_CLIENTS = ["192.168.1.42", "192.168.1.51", "192.168.1.77"];
+const BYPASS_CLIENTS = ["192.168.1.42", "192.168.1.51", "192.168.1.77", "192.168.1.7"];
 const BYPASS_ADDR_NAMES = ["cdn.example.net", "edge.example.net"];
 const BYPASS_SNI_NAMES = ["news.example.com", "bank.example.org"];
 let bypassSeq = 0;
@@ -536,6 +585,15 @@ app.put(`${API_BASE}/groups`, async (c) => {
   for (const group of body?.groups ?? []) {
     const refusal = resolveRefusal(group);
     if (refusal) return c.json(refusal, 400);
+    if (
+      group?.block !== undefined &&
+      ![null, "null", "nxdomain", "refused"].includes(group.block)
+    ) {
+      return c.json(
+        { error: `block "${group.block}" is not an answer`, field: "block", group: group.id },
+        400,
+      );
+    }
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -559,6 +617,9 @@ app.put(`${API_BASE}/groups`, async (c) => {
     const { list: _requestedList, resolver: _requestedResolver, ...rest } = group;
     const { list, startSync } = applyListFromReq(existing, group);
     const merged: any = { ...rest };
+    if (rest.interface !== "block") delete merged.block;
+    else if (rest.block === undefined) merged.block = existing?.block ?? "null";
+    else if (rest.block === null) merged.block = "null";
     if (list !== undefined) merged.list = list;
     if (startSync) toSync.push(list);
     return merged;

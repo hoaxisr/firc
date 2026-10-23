@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "firc/id.h"
 #include "firc/match.h"
@@ -14,6 +15,7 @@ typedef struct firc_group_snapshot {
     char *name; /* owned copy, for logging only */
     firc_matcher_t *matcher;
     firc_devsel_t *devices; /* owned */
+    int8_t block;           /* -1 not a block group, else the firc_block_answer_t */
 } firc_group_snapshot_t;
 
 typedef struct firc_ruleset_snapshot {

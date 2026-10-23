@@ -15,6 +15,7 @@
   import { isValidListUrl, normalizeListUrl, type GroupDialogPayload } from "../groups.svelte";
 
   import { Globe, Link, LoaderCircle, Type } from "../../../components/ui/icons";
+  import { BLOCK, isSink } from "../../../data/iface-choices";
   import { RULE_TYPES, type DeviceSelector, type Group, type ListRule } from "../../../types";
   import { coverageLabel } from "../../../utils/device-picker";
   import { fetcher, HttpError } from "../../../utils/fetcher";
@@ -190,7 +191,7 @@
   );
 
   let isUrlValid = $derived(!listEnabled || isValidListUrl(url));
-  let isBlackhole = $derived(selectedInterface === "blackhole");
+  let isSinkChoice = $derived(isSink(selectedInterface));
   let firmwareServers = $derived(firmwareServersFor(resolvers.list, selectedInterface));
   let isEditingSavedAuto = $derived(isSavedAutoUnchanged(group, mode, selectedInterface, dnsMode));
   let autoServers = $derived(
@@ -201,7 +202,7 @@
     }),
   );
   let serverCheck = $derived(
-    dnsMode === "own" && !isBlackhole ? resolverListProblem(dnsServer.trim()) : null,
+    dnsMode === "own" && !isSinkChoice ? resolverListProblem(dnsServer.trim()) : null,
   );
   let serverProblem = $derived(serverCheck?.problem ?? null);
   let serverProblemText = $derived.by(() => {
@@ -293,7 +294,7 @@
       interface: ifaceValue(ifaceList(draft)),
       devices: devicesTarget.devices,
       list: listEnabled ? { url: normalizeListUrl(url), interval } : null,
-      resolve: submittedResolve(isBlackhole, group?.resolve, dnsMode, dnsServer),
+      resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer),
     };
     dispatch("submit", payload);
     handleClose();
@@ -335,11 +336,13 @@
         options={dnsOptions}
         selected={dnsMode}
         onValueChange={(v: string) => (dnsMode = v as DnsMode)}
-        disabled={isBlackhole}
+        disabled={isSinkChoice}
         ariaLabel={t("DNS")}
         class="dns-select"
       />
-      {#if isBlackhole}
+      {#if selectedInterface === BLOCK}
+        <span class="dns-blackhole-hint">{t("the daemon answers the group's names")}</span>
+      {:else if isSinkChoice}
         <span class="dns-blackhole-hint">
           {t("A blackhole group has no tunnel: its names go to the common upstream.")}
         </span>

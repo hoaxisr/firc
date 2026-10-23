@@ -3955,6 +3955,27 @@ TEST before_the_first_pass_a_group_reads_not_written(void) {
     PASS();
 }
 
+/* Catches: a block group read as having no interface, or its live reason needing a link. */
+TEST a_block_group_is_live_without_a_link(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up_no_committer(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x10);
+    firc_group_t *g = activation_group(1, "a.example", NULL, NULL);
+    free(g->iface);
+    g->iface = strdup("block");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
+    firc_app_nf_enter(l.app);
+    firc_app_pool_changed(l.app);
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, 0));
+    ASSERTm("routed like blackhole", group_routed(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
 /* Catches: a group whose interface is missing or down reading live. */
 TEST live_follows_the_interface_link(void) {
     locked_app_t l;
@@ -5490,6 +5511,56 @@ TEST an_interface_change_is_paid_although_the_owner_is_routed_again(void) {
     ASSERT(wait_written_after(&l, started));
     ASSERTm("routed again, through eth0", group_routed(&l, 1));
     ASSERTm("its old flows went", fake_ct_deleted(l.ctk, one, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: a group moved to block keeping its flows. */
+TEST a_group_moved_to_block_flushes_its_flows(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    const uint8_t one[4] = {198, 18, 0, 5};
+    ASSERT(first_pass_done(&l));
+    fake_ct_add(l.ctk, AF_INET, k_flow_src, k_flow_dst, one, field_of(&l, 1) | FIRC_MARK_HANDLED);
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    firc_group_t *moved = activation_group(1, "a.example", NULL, NULL);
+    free(moved->iface);
+    moved->iface = strdup("block");
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, moved));
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT_EQ_FMT((size_t)1, fake_ct_deletes(l.ctk), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: a group moved to blackhole keeping its flows. */
+TEST a_group_moved_to_blackhole_flushes_its_flows(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    const uint8_t one[4] = {198, 18, 0, 5};
+    ASSERT(first_pass_done(&l));
+    fake_ct_add(l.ctk, AF_INET, k_flow_src, k_flow_dst, one, field_of(&l, 1) | FIRC_MARK_HANDLED);
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    firc_group_t *moved = activation_group(1, "a.example", NULL, NULL);
+    free(moved->iface);
+    moved->iface = strdup("blackhole");
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, moved));
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT_EQ_FMT((size_t)1, fake_ct_deletes(l.ctk), "%zu");
     locked_app_down(&l);
     PASS();
 }
@@ -8792,6 +8863,9 @@ int main(int argc, char **argv) {
     RUN_TEST(an_update_whose_teardown_failed_still_moves_and_comes_up);
     RUN_TEST(a_failed_re_enable_leaves_no_chain_after_the_pass);
     RUN_TEST(live_reason_is_checked_in_its_order);
+    RUN_TEST(a_block_group_is_live_without_a_link);
+    RUN_TEST(a_group_moved_to_block_flushes_its_flows);
+    RUN_TEST(a_group_moved_to_blackhole_flushes_its_flows);
     RUN_TEST(live_follows_the_interface_link);
     RUN_TEST(live_reads_the_tunnel_behind_the_interface);
     RUN_TEST(a_committer_that_keeps_failing_says_not_written);

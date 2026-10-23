@@ -27,6 +27,7 @@
   import { Capture, CaptureStop, Clear, Pause, Play, Search } from "../../components/ui/icons";
   import { counted } from "../../utils/plural";
   import {
+    blockedPart,
     DEFAULT_LEVELS,
     describeBypassTail,
     describeDnsTail,
@@ -134,6 +135,13 @@
 
   const decisionClass = (e: DnsEvent) => `dns ${e.decision}`;
 
+  function dnsTail(e: DnsEvent): [string, string] {
+    const tail = describeDnsTail(e, t);
+    const red = blockedPart(e, t);
+    if (!red || !tail.endsWith(red)) return [tail, ""];
+    return [tail.slice(0, tail.length - red.length), red];
+  }
+
   function scrollToBottom() {
     if (!paused && pane) pane.scrollTop = pane.scrollHeight;
   }
@@ -193,6 +201,12 @@
     scrollToBottom();
   });
 </script>
+
+{#snippet dnsTailOf([before, red]: [string, string])}
+  <span class="tail"
+    >{before}{#if red}<span class="blocked">{red}</span>{/if}</span
+  >
+{/snippet}
 
 <div class="tb" bind:clientWidth={toolbarWidth}>
   <div class="toolbar">
@@ -347,7 +361,7 @@
             <button type="button" class="pick name" onclick={() => (query = e.name)}>
               {e.name}
             </button>
-            <span class="tail">{describeDnsTail(e, t)}</span>
+            {@render dnsTailOf(dnsTail(e))}
           </span>
         </div>
       {:else}
@@ -690,6 +704,10 @@
   .row.dns.not-covered .tail,
   .row.dns.pool-refused .tail {
     color: var(--orange);
+  }
+  .tail .blocked {
+    color: var(--red);
+    font-weight: 600;
   }
   .pick {
     all: unset;

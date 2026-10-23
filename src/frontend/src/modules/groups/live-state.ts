@@ -1,3 +1,4 @@
+import { BLOCK } from "../../data/iface-choices";
 import type { GroupResolver } from "../../types";
 import type { IfaceState } from "./iface-list";
 
@@ -119,6 +120,13 @@ export function liveTooltip(
   const iface = (text: string) => text.replaceAll("{iface}", () => ctx.iface);
   switch (kind) {
     case "live":
+      if (ctx.iface === BLOCK) {
+        return {
+          title: t("Working"),
+          lines: [t("The daemon answers the group's names itself; nothing is routed.")],
+          footer: true,
+        };
+      }
       return {
         title: t("Working"),
         lines: [

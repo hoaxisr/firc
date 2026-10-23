@@ -14,6 +14,9 @@
 
 #define FIRC_IPSET_TO_LINK_BLACKHOLE "blackhole"
 
+/* True for the two pseudo-interfaces that route nowhere: blackhole and block. */
+bool firc_iface_is_sink(const char *iface);
+
 #define FIRC_IPSET_TO_LINK_IFACES_MAX 4
 
 typedef struct firc_ipset_to_link firc_ipset_to_link_t;

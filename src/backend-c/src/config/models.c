@@ -766,6 +766,29 @@ bool firc_group_has_iface(const firc_group_t *g, const char *name)
     return false;
 }
 
+bool firc_group_is_block(const firc_group_t *g)
+{
+    return g->n_iface_rest == 0 && g->iface != NULL && strcmp(g->iface, FIRC_IFACE_BLOCK) == 0;
+}
+
+const char *firc_block_answer_name(firc_block_answer_t a)
+{
+    return a == FIRC_BLOCK_NXDOMAIN ? "nxdomain" : a == FIRC_BLOCK_REFUSED ? "refused" : "null";
+}
+
+bool firc_block_answer_parse(const char *s, firc_block_answer_t *out)
+{
+    static const firc_block_answer_t all[] = {FIRC_BLOCK_NULL, FIRC_BLOCK_NXDOMAIN, FIRC_BLOCK_REFUSED};
+    if (s == NULL) { return false; }
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        if (strcmp(s, firc_block_answer_name(all[i])) == 0) {
+            *out = all[i];
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *firc_group_ifaces_check(const char *const *names, size_t n, size_t *bad)
 {
     *bad = 0;
@@ -774,6 +797,7 @@ const char *firc_group_ifaces_check(const char *const *names, size_t n, size_t *
         *bad = i;
         if (names[i] == NULL || !firc_is_interface_name(names[i])) { return "not an interface name"; }
         if (n > 1 && strcmp(names[i], FIRC_IPSET_TO_LINK_BLACKHOLE) == 0) { return "blackhole cannot be one of several"; }
+        if (n > 1 && strcmp(names[i], FIRC_IFACE_BLOCK) == 0) { return "block cannot be one of several"; }
         for (size_t k = 0; k < i; k++) {
             if (strcmp(names[k], names[i]) == 0) { return "named twice"; }
         }

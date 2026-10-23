@@ -1,4 +1,5 @@
 #include "firc/ipset_to_link.h"
+#include "firc/models.h"
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/mark.h"
@@ -87,9 +88,11 @@ firc_ipset_to_link_t *firc_ipset_to_link_new(const char *chain_name, const char 
 
 static const char *active_name(const firc_ipset_to_link_t *l) { return l->ifaces[l->active]; }
 
-static bool is_blackhole(const firc_ipset_to_link_t *l) {
-    return l->n_ifaces == 1 && strcmp(l->ifaces[0], FIRC_IPSET_TO_LINK_BLACKHOLE) == 0;
+bool firc_iface_is_sink(const char *iface) {
+    return iface != NULL && (strcmp(iface, FIRC_IPSET_TO_LINK_BLACKHOLE) == 0 || strcmp(iface, FIRC_IFACE_BLOCK) == 0);
 }
+
+static bool is_blackhole(const firc_ipset_to_link_t *l) { return l->n_ifaces == 1 && firc_iface_is_sink(l->ifaces[0]); }
 
 void firc_ipset_to_link_free(firc_ipset_to_link_t *l) {
     if (!l) { return; }
@@ -289,7 +292,7 @@ firc_err_t firc_ipset_to_link_build_rules_list(firc_ipt_t *ipt, const char *chai
     snprintf(match_str, sizeof(match_str), "0x%x/0x%x", firc_mark_group_value(mark_field),
              FIRC_MARK_GROUP_MASK);
 
-    bool blackhole = n == 1 && strcmp(ifaces[0], FIRC_IPSET_TO_LINK_BLACKHOLE) == 0;
+    bool blackhole = n == 1 && firc_iface_is_sink(ifaces[0]);
     /* FORWARD sees the real address, so match the mark, not the chunk. */
     for (size_t i = 0; !blackhole && i < n; i++) {
         const char *acc[] = {"-o", ifaces[i], "-m", "mark", "--mark", match_str, "-j", "ACCEPT"};

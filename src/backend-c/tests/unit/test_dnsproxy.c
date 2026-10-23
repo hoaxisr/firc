@@ -25,6 +25,9 @@
 #include "firc/logrep.h"
 #include "firc/loop.h"
 #include "firc/resolveroute.h"
+#include "firc/dnspipeline.h"
+#include "firc/models.h"
+#include "firc/rulesnap.h"
 
 static bool bind_loopback(int fd, uint16_t port, uint16_t *got) {
     struct sockaddr_in a;
@@ -380,6 +383,20 @@ static bool test_route(void *ud, const firc_dns_msg_t *q, const firc_ip_t *clien
 }
 
 static troute_t *g_live_route;
+static firc_resolve_router_t *g_live_router;
+static uint32_t g_live_clamp;
+static _Atomic int g_blocked_calls;
+static _Atomic int g_blocked_answer = -1;
+static _Atomic int g_blocked_client = -1;
+
+static void live_blocked(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client,
+                         firc_block_answer_t answer) {
+    (void)ud;
+    (void)query;
+    atomic_fetch_add(&g_blocked_calls, 1);
+    atomic_store(&g_blocked_answer, (int)answer);
+    atomic_store(&g_blocked_client, client != NULL && client->len == 4 ? client->b[3] : -1);
+}
 static uint32_t g_live_timeout_ms;
 static uint16_t g_live_upstream_port;
 static uint32_t g_live_max_concurrent;
@@ -1038,6 +1055,12 @@ static bool live_start(live_t *lv) {
     }
     atomic_store(&g_live_hook_calls, 0);
     if (g_live_route != NULL) { firc_dnsproxy_set_router(lv->proxy, test_route, g_live_route); }
+    if (g_live_router != NULL) { firc_dnsproxy_set_router(lv->proxy, firc_resolve_router_decide, g_live_router); }
+    if (g_live_clamp != 0) { firc_dnsproxy_set_pool(lv->proxy, NULL, g_live_clamp); }
+    atomic_store(&g_blocked_calls, 0);
+    atomic_store(&g_blocked_answer, -1);
+    atomic_store(&g_blocked_client, -1);
+    firc_dnsproxy_set_blocked(lv->proxy, live_blocked, NULL);
     firc_ip_t v4 = {.b = {198, 18, 0, 0}, .len = 4};
     firc_ip_t v6 = {.b = {0xfd, 0x00, 0x12, 0x34}, .len = 16};
     firc_dnsproxy_set_pool_prefixes(lv->proxy, &v4, 15, &v6, 48);
@@ -1065,6 +1088,8 @@ static void live_stop(live_t *lv) {
     firc_loop_destroy(lv->loop);
     g_live_ops = NULL;
     g_live_route = NULL;
+    g_live_router = NULL;
+    g_live_clamp = 0;
     g_live_timeout_ms = 0;
     g_live_upstream_port = 0;
     g_live_max_concurrent = 0;
@@ -2047,6 +2072,146 @@ TEST a_query_the_router_declines_goes_to_the_common_upstream(void) {
     ASSERT_EQ(0, atomic_load(&g_rec.marks));
     ASSERT_EQ(0, atomic_load(&lv.b.received));
     live_stop(&lv);
+    PASS();
+}
+
+typedef struct {
+    firc_config_t cfg;
+    firc_dns_pipeline_t *pl;
+    firc_resolve_router_t *router;
+} blockfx_t;
+
+static bool blockfx_up(blockfx_t *fx, const char *admit, firc_block_answer_t answer) {
+    memset(fx, 0, sizeof(*fx));
+    if (firc_config_init_defaults(&fx->cfg) != FIRC_OK) { return false; }
+    firc_group_t *g = firc_group_new();
+    firc_strset(&g->name, "ads");
+    firc_strset(&g->iface, FIRC_IFACE_BLOCK);
+    g->enable = true;
+    g->id.b[3] = 9;
+    g->block = answer;
+    g->devices.allow = calloc(1, sizeof(char *));
+    g->devices.allow[0] = strdup(admit);
+    g->devices.n_allow = 1;
+    firc_rule_t *r = firc_rule_new();
+    r->id.b[3] = 1;
+    firc_strset(&r->type, "namespace");
+    firc_strset(&r->rule, "example.com");
+    r->enable = true;
+    firc_group_add_rule(g, r);
+    firc_config_add_group(&fx->cfg, g);
+    fx->pl = firc_dns_pipeline_create();
+    fx->router = firc_resolve_router_new(fx->pl);
+    if (fx->pl == NULL || fx->router == NULL) { return false; }
+    firc_dns_pipeline_set_snapshot(fx->pl, firc_ruleset_snapshot_build(&fx->cfg));
+    rec_reset();
+    g_live_ops = &REC_OPS;
+    g_live_router = fx->router;
+    g_live_clamp = 300;
+    return true;
+}
+
+static void blockfx_down(blockfx_t *fx) {
+    firc_resolve_router_free(fx->router);
+    firc_dns_pipeline_destroy(fx->pl);
+    firc_config_clear(&fx->cfg);
+}
+
+/* Catches: a blocked name sent to the common upstream, answered without 0.0.0.0, a TTL not the clamp, or not reported. */
+TEST a_blocked_name_never_reaches_an_upstream(void) {
+    blockfx_t fx;
+    ASSERT(blockfx_up(&fx, "127.0.0.1", FIRC_BLOCK_NULL));
+    live_t lv;
+    ASSERT(live_start(&lv));
+    ASSERT_EQ(0, ask(lv.proxy_port, 0x5b01));
+    ASSERT_EQ(300, ask_a_ttl(lv.proxy_port, 0x5b02));
+    ASSERT_EQ(0, atomic_load(&g_rec.opens));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0, atomic_load(&g_live_hook_calls));
+    ASSERT_EQ(2, atomic_load(&g_blocked_calls));
+    ASSERT_EQ((int)FIRC_BLOCK_NULL, atomic_load(&g_blocked_answer));
+    ASSERT_EQ(1, atomic_load(&g_blocked_client));
+    live_stop(&lv);
+    blockfx_down(&fx);
+    PASS();
+}
+
+/* Catches: a blocked TCP query forwarded, left unanswered, or its reply freed twice. */
+TEST a_blocked_name_over_tcp_is_answered_too(void) {
+    blockfx_t fx;
+    ASSERT(blockfx_up(&fx, "127.0.0.1", FIRC_BLOCK_NULL));
+    live_t lv;
+    ASSERT(live_start(&lv));
+    ASSERT_EQ(0, ask_tcp(lv.proxy_port, 0x5b03));
+    ASSERT_EQ(0, atomic_load(&g_rec.opens));
+    ASSERT_EQ(1, atomic_load(&g_blocked_calls));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    blockfx_down(&fx);
+    PASS();
+}
+
+/* Catches: a route zeroed by its router and filled with only a mark and servers read as blocked. */
+TEST a_zeroed_route_is_not_blocked(void) {
+    live_t lv;
+    tunnel_setup(0);
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0x5b05));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&g_blocked_calls));
+    live_stop(&lv);
+    PASS();
+}
+
+static void ask_altered(uint16_t port, uint16_t id, uint8_t opcode, uint16_t qclass) {
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    if (c < 0) { return; }
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in pa;
+    memset(&pa, 0, sizeof(pa));
+    pa.sin_family = AF_INET;
+    pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    pa.sin_port = htons(port);
+    uint8_t q[512];
+    size_t qlen = build_query(q, id, 0);
+    q[2] = (uint8_t)(q[2] | (opcode << 3));
+    q[qlen - 2] = (uint8_t)(qclass >> 8);
+    q[qlen - 1] = (uint8_t)qclass;
+    (void)sendto(c, q, qlen, 0, (struct sockaddr *)&pa, sizeof(pa));
+    uint8_t r[2048];
+    (void)recv(c, r, sizeof(r), 0);
+    close(c);
+}
+
+/* Catches: a NOTIFY or a CH-class question for a blocked name answered locally instead of taking its old path. */
+TEST a_blocked_name_outside_an_in_query_is_not_answered_locally(void) {
+    blockfx_t fx;
+    ASSERT(blockfx_up(&fx, "127.0.0.1", FIRC_BLOCK_NULL));
+    live_t lv;
+    ASSERT(live_start(&lv));
+    ask_altered(lv.proxy_port, 0x5b06, 4, 1);
+    ASSERT_EQ_FMTm("NOTIFY reaches the upstream", 1, atomic_load(&lv.a.received), "%d");
+    ask_altered(lv.proxy_port, 0x5b07, 0, 3);
+    ASSERT_EQ_FMTm("CH class reaches the upstream", 2, atomic_load(&lv.a.received), "%d");
+    ASSERT_EQ(0, atomic_load(&g_blocked_calls));
+    live_stop(&lv);
+    blockfx_down(&fx);
+    PASS();
+}
+
+/* Catches: a name blocked for a device the block group's selector does not admit. */
+TEST a_device_the_block_group_does_not_admit_is_answered_by_the_upstream(void) {
+    blockfx_t fx;
+    ASSERT(blockfx_up(&fx, "10.0.0.1", FIRC_BLOCK_NULL));
+    live_t lv;
+    ASSERT(live_start(&lv));
+    ASSERT_EQ(1, ask(lv.proxy_port, 0x5b04));
+    ASSERT_EQ(1, atomic_load(&lv.a.received));
+    ASSERT_EQ(0, atomic_load(&g_blocked_calls));
+    live_stop(&lv);
+    blockfx_down(&fx);
     PASS();
 }
 
@@ -4833,6 +4998,11 @@ int main(int argc, char **argv)
     RUN_TEST(a_tunnel_datagram_that_answers_another_query_is_ignored);
     RUN_TEST(a_common_datagram_that_answers_another_query_is_ignored);
     RUN_TEST(a_query_the_router_declines_goes_to_the_common_upstream);
+    RUN_TEST(a_blocked_name_never_reaches_an_upstream);
+    RUN_TEST(a_blocked_name_over_tcp_is_answered_too);
+    RUN_TEST(a_device_the_block_group_does_not_admit_is_answered_by_the_upstream);
+    RUN_TEST(a_zeroed_route_is_not_blocked);
+    RUN_TEST(a_blocked_name_outside_an_in_query_is_not_answered_locally);
     RUN_TEST(a_mark_that_cannot_be_set_is_never_used);
     RUN_TEST(a_silent_common_upstream_warns_then_errs_after_a_minute);
     RUN_TEST(a_mark_set_again_ends_the_refusal);

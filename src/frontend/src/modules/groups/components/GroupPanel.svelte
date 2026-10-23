@@ -13,6 +13,7 @@
   import { locale, t } from "../../../data/locale.svelte";
   import { policies } from "../../../data/policies.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
+  import BlockAnswer from "./BlockAnswer.svelte";
   import GroupDuplicateMenu from "./GroupDuplicateMenu.svelte";
   import IfacePicker from "./IfacePicker.svelte";
   import ListHeader from "./ListHeader.svelte";
@@ -36,6 +37,7 @@
     SortDesc,
     SortNeutral,
   } from "../../../components/ui/icons";
+  import { BLOCK } from "../../../data/iface-choices";
   import { draggable, droppable, type Chip } from "../../../lib/dnd";
   import { type Rule } from "../../../types";
   import { defaultRule } from "../../../utils/defaults";
@@ -90,7 +92,8 @@
   let ifaceUnsaved = $derived(group ? store.tracker.isFieldDirty(group, "interface") : false);
 
   let hasList = $derived(Boolean(group?.list));
-  let resolverTagText = $derived(resolverTag(group?.resolver, t));
+  let resolverTagText = $derived(resolverTag(group, t));
+  let isBlock = $derived(group?.interface === BLOCK);
   let dnsHealth = $derived(
     healthTag((group && store.liveOf(group.id)?.resolver) ?? group?.resolver, t),
   );
@@ -419,7 +422,9 @@
                 <span class="list-badge"><RSS size={12} />{t("list")}</span>
               {/if}
               {#if resolverTagText}
-                <span class="resolver-badge" title={resolverTagText}>{resolverTagText}</span>
+                <span class="resolver-badge" class:blocked={isBlock} title={resolverTagText}
+                  >{resolverTagText}</span
+                >
               {/if}
               {#if dnsHealth}
                 <Tooltip value={dnsHealth.tip}>
@@ -438,13 +443,25 @@
         </div>
 
         <div class="group-actions">
-          <IfacePicker
-            bind:value={group.interface}
-            live={store.liveOf(group.id)}
-            unsaved={ifaceUnsaved}
-            closed="active"
-            class="iface-select"
-          />
+          <div class="iface-stack" class:block={isBlock}>
+            <IfacePicker
+              bind:value={group.interface}
+              live={store.liveOf(group.id)}
+              unsaved={ifaceUnsaved}
+              closed="active"
+              offset={isBlock ? 22 : undefined}
+              class="iface-select"
+            />
+            {#if isBlock}
+              <BlockAnswer
+                value={group.block ?? "null"}
+                onchange={(v) => {
+                  group.block = v;
+                  store.markDataRevision();
+                }}
+              />
+            {/if}
+          </div>
 
           <Tooltip value={t(group.enable ? "Disable Group" : "Enable Group")}>
             <Switch
@@ -854,6 +871,10 @@
     color: var(--orange);
   }
 
+  .resolver-badge.blocked {
+    color: var(--red);
+  }
+
   .health-badge.red {
     background: color-mix(in oklab, var(--red) 18%, transparent);
     color: var(--red);
@@ -982,12 +1003,46 @@
     width: calc(20px + 0.8rem + 2px);
   }
 
+  .iface-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+  }
+
+  .iface-stack :global(.iface-select) {
+    max-width: 100%;
+  }
+
+  .iface-stack :global(.iface-select [data-select-trigger]) {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .iface-stack :global(.block-answer) {
+    margin-left: 0.6rem;
+  }
+
   @media (min-width: 701px) {
-    .group-actions :global(.iface-select) {
+    .iface-stack {
+      align-items: flex-end;
+      flex: 0 0 auto;
+    }
+
+    .iface-stack :global(.iface-select) {
       display: flex;
       justify-content: flex-end;
       width: 9.5rem;
-      flex: 0 0 auto;
+    }
+
+    .iface-stack.block :global(.iface-select) {
+      width: max-content;
+      min-width: 9.5rem;
+    }
+
+    .iface-stack :global(.block-answer) {
+      margin-left: 0;
+      margin-right: calc(16px + 0.65rem);
     }
   }
 

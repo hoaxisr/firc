@@ -476,6 +476,7 @@ definitions:
         - no-match
         - pool-refused
         - passed
+        - blocked
         type: string
       resolver:
         description: >-
@@ -488,7 +489,8 @@ definitions:
           pool); health_skip -- the group's DNS is resting after three
           failures in a row and the common upstream was asked; cache -- the
           group's DNS answered this name earlier and that answer was still
-          valid.
+          valid; local -- firc answered itself, because the name's owner is a
+          block group (decision=blocked).
         enum:
         - upstream
         - group
@@ -499,6 +501,7 @@ definitions:
         - fallback_sink
         - health_skip
         - cache
+        - local
         type: string
       group:
         description: >-
@@ -554,6 +557,7 @@ definitions:
             - no-match
             - pool-refused
             - passed
+            - blocked
             type: string
           at:
             description: 'Unix time of that answer, seconds'
@@ -705,6 +709,13 @@ definitions:
     type: object
   types.GroupReq:
     properties:
+      block:
+        description: 'Only for a group whose interface is block: how its names are answered. Absent on PUT keeps the current answer; null or "null" is the default; anything but null, nxdomain and refused is a 400 with field block. Ignored on any other group.'
+        enum:
+        - 'null'
+        - nxdomain
+        - refused
+        type: string
       devices:
         $ref: '#/definitions/types.DeviceSelector'
         description: Which client devices the group applies to (decided at the DNS answer). Absent on PUT keeps the current selector; null or {} clears it (every device).
@@ -715,7 +726,7 @@ definitions:
         example: 0a1b2c3d
         type: string
       interface:
-        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole only alone. A list of one is saved and answered as a string.'
+        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole and block only alone. block routes nothing and answers the group''s names locally. A list of one is saved and answered as a string.'
         example: nwg0
       list:
         $ref: '#/definitions/types.GroupList'
@@ -736,6 +747,13 @@ definitions:
     type: object
   types.GroupRes:
     properties:
+      block:
+        description: 'Present only on a group whose interface is block: how its names are answered.'
+        enum:
+        - 'null'
+        - nxdomain
+        - refused
+        type: string
       active:
         description: 'The entry of the interface list the group routes through now. With every entry dead it is the last one chosen, and liveReason is no-interface.'
         example: nwg1
@@ -749,7 +767,7 @@ definitions:
         example: 0a1b2c3d
         type: string
       interface:
-        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole only alone. A list of one is saved and answered as a string.'
+        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole and block only alone. block routes nothing and answers the group''s names locally. A list of one is saved and answered as a string.'
         example: nwg0
       interfaces:
         description: 'Only for a list of two or more: each entry and its check state, in list order.'
@@ -906,7 +924,7 @@ definitions:
         example: Wireguard2
         type: string
       role:
-        description: 'tunnel (a tunvless device, or point-to-point and not external), wan (external by its Keenetic role), lan (a br<N> segment) or other; absent on blackhole only'
+        description: 'tunnel (a tunvless device, or point-to-point and not external), wan (external by its Keenetic role), lan (a br<N> segment) or other; absent on blackhole and block'
         enum:
         - tunnel
         - wan
@@ -2933,7 +2951,7 @@ paths:
       - system
   /api/v1/system/interfaces:
     get:
-      description: 'Returns blackhole, then the router''s interfaces but lo, ezcfg0 and the Wi-Fi radios ra<N>/rai<N> and their sub-interfaces; on Keenetic only tunnels and interfaces NDMS knows (all of the rest when NDMS gives no data)'
+      description: 'Returns blackhole and block, then the router''s interfaces but lo, ezcfg0 and the Wi-Fi radios ra<N>/rai<N> and their sub-interfaces; on Keenetic only tunnels and interfaces NDMS knows (all of the rest when NDMS gives no data)'
       produces:
       - application/json
       responses:

@@ -2077,6 +2077,70 @@ TEST a_string_interface_still_loads_as_before(void)
     PASS();
 }
 
+/* Catches: a block group's answer dropped on save or load, or written when it is the default. */
+TEST a_block_group_round_trips_its_answer(void)
+{
+    static const char doc[] = "groups:\n  - id: 0000ac01\n    name: B\n    interface: block\n    block: refused\n"
+                              "  - id: 0000ac02\n    name: C\n    interface: block\n    block: null\n";
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
+    ASSERT_EQ(FIRC_BLOCK_REFUSED, cfg.groups[0]->block);
+    ASSERT_EQ(FIRC_BLOCK_NULL, cfg.groups[1]->block);
+    ASSERT(firc_group_is_block(cfg.groups[0]));
+    char *out = save_groups(&cfg);
+    ASSERT(out != NULL);
+    const char *first = strstr(out, "block: refused\n");
+    ASSERT(first != NULL);
+    ASSERT_EQ(NULL, strstr(first + 1, "block: "));
+    ASSERT(strstr(out, "interface: block\n") != NULL);
+    firc_config_t back;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
+    ASSERT_EQ(FIRC_OK, load_str(&back, out));
+    ASSERT_EQ(FIRC_BLOCK_REFUSED, back.groups[0]->block);
+    ASSERT_EQ(FIRC_BLOCK_NULL, back.groups[1]->block);
+    free(out);
+    firc_config_clear(&back);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a block key honoured on a group that routes, where it would never be answered. */
+TEST a_block_key_on_a_routing_group_fails_the_load(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_ERR_INVAL,
+              load_str(&cfg, "groups:\n  - id: 0000ac01\n    name: R\n    interface: nwg0\n    block: refused\n"));
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a misspelt or mistyped answer read as the default. */
+TEST an_unknown_block_answer_fails_the_load(void)
+{
+    static const char *const bad[] = {"nxdomian", "7", "[nxdomain]", "\"\""};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char doc[160];
+        snprintf(doc, sizeof(doc), "groups:\n  - id: 0000ac01\n    interface: block\n    block: %s\n", bad[i]);
+        firc_config_t cfg;
+        ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+        if (load_str(&cfg, doc) != FIRC_ERR_INVAL) { FAILm(bad[i]); }
+        firc_config_clear(&cfg);
+    }
+    PASS();
+}
+
+/* Catches: block accepted inside an interface list, where it would be routed as a plain interface name. */
+TEST block_cannot_be_one_of_several(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_ERR_INVAL, load_str(&cfg, "groups:\n  - id: 0000ac01\n    interface: [block, nwg0]\n"));
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2089,6 +2153,10 @@ int main(int argc, char **argv)
     RUN_TEST(a_list_of_one_saves_as_a_string);
     RUN_TEST(a_bad_interface_list_is_refused);
     RUN_TEST(a_string_interface_still_loads_as_before);
+    RUN_TEST(a_block_group_round_trips_its_answer);
+    RUN_TEST(a_block_key_on_a_routing_group_fails_the_load);
+    RUN_TEST(an_unknown_block_answer_fails_the_load);
+    RUN_TEST(block_cannot_be_one_of_several);
     RUN_TEST(overrides_round_trip);
     RUN_TEST(an_override_with_a_full_key_round_trips);
     RUN_TEST(an_override_key_is_folded_like_the_rule_it_names);

@@ -218,6 +218,26 @@ TEST the_generation_moves_only_on_a_real_change(void)
     PASS();
 }
 
+/* Catches: a block group described as a blackhole one, or either described by the other's sentence. */
+TEST a_block_route_says_firc_answers_its_names(void)
+{
+    firc_group_t *g = group("bk", "block", 1);
+    firc_resolve_input_t in = {.group = g, .iface = "block", .mark = MARK1, .blackhole = true};
+    firc_resolve_table_t t = {0};
+    char buf[256];
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    firc_resolve_route_describe(&t.items[0], buf, sizeof(buf));
+    ASSERT_STR_EQ("uses the common upstream: its names are answered by firc", buf);
+    firc_resolve_table_free(&t);
+    in.iface = "blackhole";
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    firc_resolve_route_describe(&t.items[0], buf, sizeof(buf));
+    ASSERT_STR_EQ("uses the common upstream: a blackhole group has no tunnel", buf);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
 /* Catches: the log line missing the interface, servers or source, or "not through the tunnel". */
 TEST each_route_is_described_for_the_log(void)
 {
@@ -473,12 +493,55 @@ TEST the_owner_of_a_covered_query_is_routed_by_value(void)
     ASSERT_EQ((socklen_t)sizeof(struct sockaddr_in), r.server_lens[0]);
     ASSERT(firc_id_equal(fx.cfg.groups[0]->id, r.group_id));
     ASSERT(r.gen != 0);
+    ASSERT_FALSE(r.blocked);
 
     firc_resolve_table_t empty = {0};
     firc_resolve_router_publish(fx.router, &empty);
     ASSERT_EQ(htonl(0x09090909u), s4->sin_addr.s_addr);
     ASSERT_FALSE(decide(&fx, "a.example.com", 1, "192.168.1.5", &r));
     decide_fx_down(&fx);
+    PASS();
+}
+
+/* Catches: a block owner dropped for want of a route, its answer not carried, or its route row used. */
+TEST a_block_owner_is_claimed_without_a_route(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    firc_group_t *ads = group("ads", "block", 1);
+    ads->block = FIRC_BLOCK_NXDOMAIN;
+    add_namespace_rule(ads, "ads.test");
+    firc_config_add_group(&cfg, ads);
+    firc_dns_pipeline_t *pl = firc_dns_pipeline_create();
+    firc_resolve_router_t *router = firc_resolve_router_new(pl);
+    ASSERT(pl != NULL && router != NULL);
+    firc_dns_pipeline_set_snapshot(pl, firc_ruleset_snapshot_build(&cfg));
+
+    firc_dns_msg_t *q = query("x.ads.test", 1);
+    ASSERT(q != NULL);
+    firc_ip_t c = {{192, 168, 1, 5}, 4};
+    firc_dnsproxy_route_t r;
+    memset(&r, 0x5a, sizeof(r));
+    ASSERT(firc_resolve_router_decide(router, q, &c, &r));
+    ASSERT(r.blocked);
+    ASSERT_EQ(FIRC_BLOCK_NXDOMAIN, r.answer);
+
+    firc_resolver_addr_t fw[1] = {addr("9.9.9.9")};
+    firc_resolve_input_t in[1] = {{.group = ads, .mark = MARK1, .firmware = fw, .n_firmware = 1}};
+    firc_resolve_table_t t;
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(in, 1, NULL, &t));
+    firc_resolve_router_publish(router, &t);
+    memset(&r, 0x5a, sizeof(r));
+    ASSERT(firc_resolve_router_decide(router, q, &c, &r));
+    ASSERT(r.blocked);
+    ASSERT_EQ(FIRC_BLOCK_NXDOMAIN, r.answer);
+    ASSERT_EQ(0u, r.mark);
+    ASSERT_EQ((size_t)0, r.n_servers);
+
+    firc_dns_msg_free(q);
+    firc_resolve_router_free(router);
+    firc_dns_pipeline_destroy(pl);
+    firc_config_clear(&cfg);
     PASS();
 }
 
@@ -723,6 +786,7 @@ int main(int argc, char **argv)
     RUN_TEST(an_own_v6_server_needs_a_v6_route);
     RUN_TEST(the_generation_moves_only_on_a_real_change);
     RUN_TEST(each_route_is_described_for_the_log);
+    RUN_TEST(a_block_route_says_firc_answers_its_names);
     RUN_TEST(a_publish_logs_what_changed_and_hands_out_copies);
     RUN_TEST(the_owner_of_a_covered_query_is_routed_by_value);
     RUN_TEST(a_query_with_no_client_address_is_routed_like_the_pipeline_covers_it);
@@ -732,5 +796,6 @@ int main(int argc, char **argv)
     RUN_TEST(the_stale_groups_are_the_removed_and_the_rewired);
     RUN_TEST(a_published_v6_flag_reaches_the_answer_and_flips_with_the_next_publish);
     RUN_TEST(a_route_names_the_active_entry_not_the_first);
+    RUN_TEST(a_block_owner_is_claimed_without_a_route);
     GREATEST_MAIN_END();
 }

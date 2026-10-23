@@ -1,0 +1,13 @@
+configVersion: 0.7.0
+groups:
+  - id: 0000ad01
+    name: Refused
+    interface: block
+    block: refused
+    enable: true
+    rules: []
+  - id: 0000ad02
+    name: Default answer
+    interface: block
+    enable: true
+    rules: []

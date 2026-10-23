@@ -854,6 +854,26 @@ TEST a_refused_twin_fails_the_enable(void) {
     PASS();
 }
 
+/* Catches: a reply twin written for a block group. */
+TEST no_twin_for_a_block_group(void) {
+    fixture_t f;
+    ASSERT(up(&f, IFF_UP | IFF_POINTOPOINT));
+    firc_ipset_to_link_free(f.link);
+    f.link = firc_ipset_to_link_new("FIRC_g1", "block", f.ipt, NULL, f.rtnl, 100, NULL, "g1", NULL, NULL);
+    ASSERT(f.link != NULL);
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_enable(f.link, NULL));
+    fake_rtnl_msg_t m[64];
+    size_t n = fake_rtnl_messages(f.kernel, m, 64), group = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (m[i].type != RTM_NEWRULE) { continue; }
+        ASSERTm("no twin for a block group", m[i].priority != 49u);
+        group += m[i].priority == FIRC_RULE_PRIORITY;
+    }
+    ASSERT_EQ_FMT((size_t)1, group, "%zu");
+    down(&f);
+    PASS();
+}
+
 /* Catches: a reply twin written for a blackhole group or for IPv6. */
 TEST no_twin_for_a_blackhole_group_or_for_ipv6(void) {
     fixture_t f;
@@ -1551,6 +1571,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_s_rule_has_a_reply_twin_ahead_of_it_in_main);
     RUN_TEST(a_refused_group_rule_takes_its_twin_back);
     RUN_TEST(a_refused_twin_fails_the_enable);
+    RUN_TEST(no_twin_for_a_block_group);
     RUN_TEST(no_twin_for_a_blackhole_group_or_for_ipv6);
     RUN_TEST(disable_takes_back_the_rule_the_routes_and_the_chains);
     RUN_TEST(enable_writes_the_rules_and_leaves_the_chain_to_the_pass);

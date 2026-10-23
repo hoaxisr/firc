@@ -77,6 +77,15 @@ describe("a group's live state", () => {
     ]);
   });
 
+  // Catches a block group told its traffic goes through an interface called block.
+  it("says a working block group's names are answered by the daemon, not routed", () => {
+    const live = liveTooltip("live", { iface: "block" }, t, clock);
+    assert.strictEqual(live.title, "Working");
+    assert.deepStrictEqual(live.lines, [
+      "The daemon answers the group's names itself; nothing is routed.",
+    ]);
+  });
+
   // Catches the interface not named where the sentence names it.
   it("names the group's interface when live and when waiting for one", () => {
     const live = liveTooltip("live", { iface: "wg0" }, t, clock);

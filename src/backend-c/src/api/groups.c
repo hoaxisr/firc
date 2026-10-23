@@ -285,6 +285,23 @@ static firc_err_t resolve_from_req(const cJSON *req, const firc_group_t *existin
     return firc_strset(&out->server, s->valuestring);
 }
 
+static firc_err_t block_from_req(const cJSON *req, const firc_group_t *existing, firc_group_t *group,
+                                 const char **err_msg, const char **err_field) {
+    if (!firc_group_is_block(group)) { return FIRC_OK; }
+    const cJSON *b = cJSON_GetObjectItemCaseSensitive(req, "block");
+    if (b == NULL) {
+        if (existing != NULL) { group->block = existing->block; }
+        return FIRC_OK;
+    }
+    if (cJSON_IsNull(b)) { return FIRC_OK; }
+    if (!cJSON_IsString(b) || !firc_block_answer_parse(b->valuestring, &group->block)) {
+        *err_msg = "block must be null, nxdomain or refused";
+        *err_field = "block";
+        return FIRC_ERR_INVAL;
+    }
+    return FIRC_OK;
+}
+
 /* group_id is "" for a POST with no "id": a dialog for an id the client was never given would be wrong to mark */
 static void write_group_error(firc_http_res_t *res, const char *msg, const char *field, const char *group_id) {
     if (field == NULL) {
@@ -401,6 +418,7 @@ static firc_err_t group_from_req(const cJSON *req, const firc_group_t *existing,
     }
 
     err = resolve_from_req(req, existing, pool, &group->resolve, err_msg, err_field, msgbuf, msgbuf_len);
+    if (err == FIRC_OK) { err = block_from_req(req, existing, group, err_msg, err_field); }
     if (err != FIRC_OK) {
         firc_group_free(group);
         return err;
@@ -584,6 +602,7 @@ cJSON *firc_groups_group_json(firc_app_t *app, const firc_group_t *g, bool with_
         return NULL;
     }
     cJSON_AddBoolToObject(obj, "enable", g->enable);
+    if (firc_group_is_block(g)) { cJSON_AddStringToObject(obj, "block", firc_block_answer_name(g->block)); }
     if (app != NULL) {
         const char *reason = NULL;
         bool live = firc_app_group_live(app, g->id, &reason);

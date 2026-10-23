@@ -12,7 +12,13 @@ export type LogEvent = {
   message: string;
 };
 
-export type DnsDecision = "issued" | "not-covered" | "no-match" | "pool-refused" | "passed";
+export type DnsDecision =
+  | "issued"
+  | "not-covered"
+  | "no-match"
+  | "pool-refused"
+  | "passed"
+  | "blocked";
 
 export type DnsResolverSource =
   | "upstream"
@@ -23,7 +29,8 @@ export type DnsResolverSource =
   | "fallback_refused"
   | "fallback_sink"
   | "health_skip"
-  | "cache";
+  | "cache"
+  | "local";
 
 export type DnsEvent = {
   seq: number;

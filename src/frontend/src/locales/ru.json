@@ -723,5 +723,18 @@
   "port used twice on this interface": "порт уже занят на этом интерфейсе",
   "choose a node": "выберите узел",
   "user and password: both or neither": "логин и пароль: либо оба, либо ни одного",
-  "no ':' in a user": "в логине нет двоеточия"
+  "no ':' in a user": "в логине нет двоеточия",
+  "Block by DNS": "Блокировать по DNS",
+  "answer the names ourselves, route nowhere": "ответить на имена сами, никуда не вести",
+  "route nowhere: connections are refused": "вести в никуда: соединения отвергаются",
+  "What to answer for the group's names": "Чем отвечать на имена группы",
+  "a stand-in address: no connection starts, no retries": "адрес-заглушка: соединение не начнётся, повторов нет",
+  "“no such name”": "«такого имени нет»",
+  "Android and browsers with their own DoH may ask another DNS and get through": "Android и браузеры со своим DoH могут спросить другой DNS и обойти блокировку",
+  "DNS: blocking · {code}": "DNS: блокировка · {code}",
+  "blocked: {code}": "заблокирован: {code}",
+  "no records": "нет записей",
+  "answered by firc": "ответил firc",
+  "the daemon answers the group's names": "демон отвечает на имена группы сам",
+  "The daemon answers the group's names itself; nothing is routed.": "Демон сам отвечает на имена группы и никуда их не ведёт."
 }

@@ -202,6 +202,7 @@ const char *firc_dns_resolver_name(uint8_t r)
     case FIRC_DNS_RESOLVER_FALLBACK_SINK: return "fallback_sink";
     case FIRC_DNS_RESOLVER_HEALTH_SKIP: return "health_skip";
     case FIRC_DNS_RESOLVER_CACHE: return "cache";
+    case FIRC_DNS_RESOLVER_LOCAL: return "local";
     }
     return "upstream";
 }

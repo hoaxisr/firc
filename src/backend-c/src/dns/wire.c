@@ -677,6 +677,108 @@ firc_err_t firc_dns_make_ptr_response(const firc_dns_msg_t *query, const char *t
     return FIRC_OK;
 }
 
+uint8_t firc_dns_block_rcode(firc_block_answer_t answer)
+{
+    switch (answer) {
+    case FIRC_BLOCK_NXDOMAIN: return FIRC_DNS_RCODE_NXDOMAIN;
+    case FIRC_BLOCK_REFUSED: return 5;
+    case FIRC_BLOCK_NULL: break;
+    }
+    return 0;
+}
+
+bool firc_dns_blockable(const firc_dns_msg_t *msg)
+{
+    return msg != NULL && msg->n_questions == 1 && msg->questions != NULL && ((msg->flags >> 11) & 0x0fu) == 0 &&
+           msg->questions[0].qclass == FIRC_DNS_CLASS_IN;
+}
+
+static bool has_opt(const firc_dns_msg_t *msg)
+{
+    for (size_t i = 0; i < msg->n_additional; i++) {
+        if (msg->additional[i].rtype == FIRC_DNS_TYPE_OPT) { return true; }
+    }
+    return false;
+}
+
+static void free_section(firc_dns_rr_t **rrs, size_t *n)
+{
+    for (size_t i = 0; i < *n; i++) { free((*rrs)[i].rdata); }
+    free(*rrs);
+    *rrs = NULL;
+    *n = 0;
+}
+
+static firc_err_t block_msg(firc_dns_msg_t *msg, firc_block_answer_t answer, uint32_t ttl, bool edns)
+{
+    if (!firc_dns_blockable(msg)) { return FIRC_ERR_INVAL; }
+    const firc_dns_question_t *q = &msg->questions[0];
+    size_t addr_len = 0;
+    if (answer == FIRC_BLOCK_NULL && q->qtype == FIRC_DNS_TYPE_A) { addr_len = 4; }
+    if (answer == FIRC_BLOCK_NULL && q->qtype == FIRC_DNS_TYPE_AAAA) { addr_len = 16; }
+    firc_dns_rr_t *an = NULL, *ad = NULL;
+    if (addr_len > 0) {
+        an = calloc(1, sizeof(*an));
+        uint8_t *rd = calloc(1, addr_len);
+        if (an == NULL || rd == NULL) {
+            free(an);
+            free(rd);
+            return FIRC_ERR_NOMEM;
+        }
+        memcpy(an->name, q->name, q->name_len);
+        an->name_len = q->name_len;
+        an->rtype = q->qtype;
+        an->rclass = FIRC_DNS_CLASS_IN;
+        an->ttl = ttl;
+        an->rdata = rd;
+        an->rdata_len = addr_len;
+    }
+    if (edns) {
+        ad = calloc(1, sizeof(*ad));
+        if (ad == NULL) {
+            if (an != NULL) { free(an->rdata); }
+            free(an);
+            return FIRC_ERR_NOMEM;
+        }
+        ad->name_len = 1;
+        ad->rtype = FIRC_DNS_TYPE_OPT;
+        ad->rclass = FIRC_DNS_EDNS_SIZE;
+    }
+    free_section(&msg->answers, &msg->n_answers);
+    free_section(&msg->authority, &msg->n_authority);
+    free_section(&msg->additional, &msg->n_additional);
+    msg->flags = (uint16_t)(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RA | (msg->flags & FIRC_DNS_FLAG_RD) |
+                            firc_dns_block_rcode(answer));
+    msg->answers = an;
+    msg->n_answers = an != NULL ? 1 : 0;
+    msg->additional = ad;
+    msg->n_additional = ad != NULL ? 1 : 0;
+    return FIRC_OK;
+}
+
+firc_err_t firc_dns_msg_block(firc_dns_msg_t *msg, firc_block_answer_t answer, uint32_t ttl)
+{
+    if (msg == NULL) { return FIRC_ERR_INVAL; }
+    return block_msg(msg, answer, ttl, has_opt(msg));
+}
+
+firc_err_t firc_dns_make_block_response(const firc_dns_msg_t *query, firc_block_answer_t answer, uint32_t ttl,
+                                        uint8_t **out, size_t *out_len)
+{
+    if (query == NULL || out == NULL || out_len == NULL || query->n_questions != 1) { return FIRC_ERR_INVAL; }
+    firc_dns_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.id = query->id;
+    m.flags = query->flags;
+    m.questions = query->questions;
+    m.n_questions = 1;
+    firc_err_t err = block_msg(&m, answer, ttl, has_opt(query));
+    if (err == FIRC_OK) { err = firc_dns_msg_pack(&m, out, out_len); }
+    free_section(&m.answers, &m.n_answers);
+    free_section(&m.additional, &m.n_additional);
+    return err;
+}
+
 firc_err_t firc_dns_name_to_string(const uint8_t *name, size_t name_len,
                                char *buf, size_t buf_len, size_t *out_written)
 {

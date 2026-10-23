@@ -534,6 +534,32 @@ TEST a_kept_out_group_is_out_of_the_view_and_of_provisional(void)
     PASS();
 }
 
+/* Catches: the snapshot dropping the answer, or marking a routing group as a block group. */
+TEST the_snapshot_carries_a_block_groups_answer(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *b = make_group((firc_id_t){{1, 0, 0, 0}}, "b", true);
+    firc_strset(&b->iface, FIRC_IFACE_BLOCK);
+    b->block = FIRC_BLOCK_REFUSED;
+    firc_group_t *n = make_group((firc_id_t){{2, 0, 0, 0}}, "n", true);
+    firc_strset(&n->iface, "nwg0");
+    n->block = FIRC_BLOCK_NXDOMAIN;
+    firc_group_t *z = make_group((firc_id_t){{3, 0, 0, 0}}, "z", true);
+    firc_strset(&z->iface, FIRC_IFACE_BLOCK);
+    firc_config_add_group(&cfg, b);
+    firc_config_add_group(&cfg, n);
+    firc_config_add_group(&cfg, z);
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT(snap != NULL);
+    ASSERT_EQ(3u, (unsigned)snap->n_groups);
+    ASSERT_EQ((int)FIRC_BLOCK_REFUSED, (int)snap->groups[0]->block);
+    ASSERT_EQ(-1, (int)snap->groups[1]->block);
+    ASSERT_EQ((int)FIRC_BLOCK_NULL, (int)snap->groups[2]->block);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -559,5 +585,6 @@ int main(int argc, char **argv)
     RUN_TEST(a_deny_in_the_upper_group_passes_that_device_down);
     RUN_TEST(a_disabled_rule_or_group_is_skipped);
     RUN_TEST(a_policy_entry_is_resolved_by_the_callers_resolver);
+    RUN_TEST(the_snapshot_carries_a_block_groups_answer);
     GREATEST_MAIN_END();
 }

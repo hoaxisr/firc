@@ -103,15 +103,16 @@ describe("the dialog's DNS choice", () => {
     );
   });
 
-  // Catches a blackhole group's stale dnsMode and server reaching the payload instead of its own resolve.
-  it("a blackhole group submits its own resolve untouched, never the dialog's DNS control", () => {
+  // Catches a blackhole or block group's stale dnsMode and server reaching the payload instead of its own resolve.
+  it("a blackhole or block group submits its own resolve untouched, never the dialog's DNS control", () => {
     const stored = { tunnel: false, server: "" };
-    assert.deepStrictEqual(submittedResolve(true, stored, "own", "127.0.0.1"), stored);
-    assert.deepStrictEqual(submittedResolve(true, undefined, "own", "9.9.9.9"), {
+    assert.deepStrictEqual(submittedResolve("block", undefined, "own", "9.9.9.9"), {
       tunnel: true,
       server: "",
     });
-    assert.deepStrictEqual(submittedResolve(false, stored, "own", " 9.9.9.9 "), {
+    assert.deepStrictEqual(submittedResolve("block", stored, "own", "127.0.0.1"), stored);
+    assert.deepStrictEqual(submittedResolve("blackhole", stored, "own", "127.0.0.1"), stored);
+    assert.deepStrictEqual(submittedResolve("nwg0", stored, "own", " 9.9.9.9 "), {
       tunnel: true,
       server: "9.9.9.9",
     });
@@ -120,6 +121,7 @@ describe("the dialog's DNS choice", () => {
 
 const id = (s: string) => s;
 const toRu = (s: string) => (ru as Record<string, string>)[s] ?? s;
+const on = (resolver: any) => ({ interface: "nwg0", resolver });
 const CALM = { window: 600, total: 0, fallbacks: 0, last: 0, reason: "", resting: false, since: 0 };
 const at = (h: number, m: number) => new Date(2026, 9, 20, h, m).getTime() / 1000;
 const firmware = (health: Partial<typeof CALM>, source = "firmware") =>
@@ -129,26 +131,53 @@ describe("the panel's resolver tag", () => {
   // Catches hidden servers, "none"/"off" read as a tunnel, a tag with no report, or a zero count shown.
   it("says where the group's names are resolved", () => {
     assert.strictEqual(
-      resolverTag({ source: "firmware", servers: ["9.9.9.9", "1.0.0.1"], health: CALM }, id),
+      resolverTag(on({ source: "firmware", servers: ["9.9.9.9", "1.0.0.1"], health: CALM }), id),
       "DNS 9.9.9.9, 1.0.0.1",
     );
     assert.strictEqual(
-      resolverTag({ source: "group", servers: ["[2620:fe::fe]:853"], health: CALM }, id),
+      resolverTag(on({ source: "group", servers: ["[2620:fe::fe]:853"], health: CALM }), id),
       "DNS [2620:fe::fe]:853",
     );
     assert.strictEqual(
-      resolverTag({ source: "none", servers: [], health: CALM }, id),
+      resolverTag(on({ source: "none", servers: [], health: CALM }), id),
       "DNS: common upstream",
     );
     assert.strictEqual(
-      resolverTag({ source: "off", servers: [], health: CALM }, id),
+      resolverTag(on({ source: "off", servers: [], health: CALM }), id),
       "DNS: not through the tunnel",
     );
     assert.strictEqual(
-      resolverTag({ source: "group", servers: [], health: CALM }, id),
+      resolverTag(on({ source: "group", servers: [], health: CALM }), id),
       "DNS: common upstream",
     );
     assert.strictEqual(resolverTag(undefined, id), null);
+    assert.strictEqual(resolverTag({ interface: "nwg0" }, id), null);
+  });
+
+  // Catches a block group tagged with its resolver, the code not named, an unset code not read as 0.0.0.0, or a blackhole group tagged as blocking.
+  it("a_block_group_has_the_blocking_badge", () => {
+    const none = { source: "none" as const, servers: [], health: CALM };
+    assert.strictEqual(
+      resolverTag({ interface: "block", block: "nxdomain", resolver: none }, id),
+      "DNS: blocking · NXDOMAIN",
+    );
+    assert.strictEqual(
+      resolverTag({ interface: "block", block: "refused", resolver: none }, id),
+      "DNS: blocking · REFUSED",
+    );
+    assert.strictEqual(
+      resolverTag({ interface: "block", block: "null", resolver: none }, id),
+      "DNS: blocking · 0.0.0.0",
+    );
+    assert.strictEqual(resolverTag({ interface: "block" }, id), "DNS: blocking · 0.0.0.0");
+    assert.strictEqual(
+      resolverTag({ interface: "block", block: "nxdomain" }, toRu),
+      "DNS: блокировка · NXDOMAIN",
+    );
+    assert.strictEqual(
+      resolverTag({ interface: "blackhole", block: "nxdomain", resolver: none }, id),
+      "DNS: common upstream",
+    );
   });
 });
 

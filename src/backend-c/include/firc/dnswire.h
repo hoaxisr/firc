@@ -7,6 +7,7 @@
 
 #include "firc/err.h"
 #include "firc/fakeip_addr.h"
+#include "firc/models.h"
 
 #define FIRC_DNS_MAX_MSG 65535
 #define FIRC_DNS_MAX_NAME 255      /* wire octets incl. root */
@@ -101,6 +102,19 @@ bool firc_dns_ptr_query_addr(const firc_dns_msg_t *query, firc_ip_t *out);
 
 firc_err_t firc_dns_make_ptr_response(const firc_dns_msg_t *query, const char *target, uint32_t ttl,
                                       uint8_t **out, size_t *out_len);
+
+/* Whether msg is one QUERY-opcode question of class IN, the only kind a block group answers. */
+bool firc_dns_blockable(const firc_dns_msg_t *msg);
+
+/* The rcode a block answer carries: 0, NXDOMAIN or REFUSED. */
+uint8_t firc_dns_block_rcode(firc_block_answer_t answer);
+
+/* Turns msg into the block answer to its one question, in place; msg is unchanged on error. */
+firc_err_t firc_dns_msg_block(firc_dns_msg_t *msg, firc_block_answer_t answer, uint32_t ttl);
+
+/* The block answer to query, as firc_dns_msg_block makes it; caller frees *out. */
+firc_err_t firc_dns_make_block_response(const firc_dns_msg_t *query, firc_block_answer_t answer, uint32_t ttl,
+                                        uint8_t **out, size_t *out_len);
 
 /* Escaped presentation form; buf_len 4*255+2 always fits. *out_written (nullable)
  * excludes the terminator. */

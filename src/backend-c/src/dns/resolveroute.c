@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "firc/log.h"
+#include "firc/models.h"
 #include "firc/rulesnap.h"
 
 struct firc_resolve_router {
@@ -171,6 +172,8 @@ size_t firc_resolve_route_describe(const firc_resolve_route_t *r, char *buf, siz
     int w;
     if (r->source == FIRC_RESOLVE_SOURCE_OFF) {
         w = snprintf(buf, cap, "uses the common upstream: resolving through the tunnel is off");
+    } else if (r->blackhole && strcmp(r->iface, FIRC_IFACE_BLOCK) == 0) {
+        w = snprintf(buf, cap, "uses the common upstream: its names are answered by firc");
     } else if (r->blackhole) {
         w = snprintf(buf, cap, "uses the common upstream: a blackhole group has no tunnel");
     } else if (r->source == FIRC_RESOLVE_SOURCE_NONE) {
@@ -253,9 +256,17 @@ bool firc_resolve_router_decide(void *ud, const firc_dns_msg_t *query, const fir
                                 firc_dnsproxy_route_t *out)
 {
     firc_resolve_router_t *r = ud;
+    out->blocked = false;
     if (r == NULL || r->pipeline == NULL) { return false; }
     const firc_group_snapshot_t *owner = firc_dns_pipeline_owner(r->pipeline, query, client);
     if (owner == NULL) { return false; }
+    if (owner->block >= 0 && firc_dns_blockable(query)) {
+        memset(out, 0, sizeof(*out));
+        out->group_id = owner->id;
+        out->blocked = true;
+        out->answer = (firc_block_answer_t)owner->block;
+        return true;
+    }
     const firc_resolve_route_t *rt = firc_resolve_table_find(&r->table, owner->id);
     if (!firc_resolve_route_usable(rt)) { return false; }
     memset(out, 0, sizeof(*out));

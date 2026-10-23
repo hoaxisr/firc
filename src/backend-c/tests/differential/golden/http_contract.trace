@@ -111,7 +111,7 @@ BODY {"error":"<ERR>"}
 ---
 STEP 21 GET /api/v1/system/interfaces
 STATUS 200
-BODY {"interfaces":[{"id":"blackhole"},{"id":"<HOST-INTERFACES>"}]}
+BODY {"interfaces":[{"id":"blackhole"},{"id":"block"},{"id":"<HOST-INTERFACES>"}]}
 ---
 STEP 22 POST /api/v1/system/hooks/netfilterd
 REQBODY {"table":"nat","type":"iptables"}

@@ -716,6 +716,12 @@ static firc_dns_verdict_t on_response(firc_dns_msg_t *msg, const firc_ip_t *clie
     return v;
 }
 
+static void on_blocked(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client, firc_block_answer_t answer)
+{
+    struct daemon *d = ud;
+    firc_dns_pipeline_note_blocked(d->pipeline, query, client, answer);
+}
+
 static void on_iface_event(void *ud, const char *iface)
 {
     struct daemon *d = ud;
@@ -1435,6 +1441,7 @@ int main(int argc, char **argv)
         return 1;
     }
     firc_dnsproxy_set_router(d.proxy, firc_resolve_router_decide, d.router);
+    firc_dnsproxy_set_blocked(d.proxy, on_blocked, &d);
     firc_dns_pipeline_set_v6_fn(d.pipeline, firc_resolve_router_carries_v6, d.router);
 #ifdef FIRC_ENTWARE_KN
     /* Wait (3 s bound) for the first hotspot read: a policy host asking earlier would stay unrouted. */

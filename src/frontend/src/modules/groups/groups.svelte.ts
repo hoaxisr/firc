@@ -30,6 +30,7 @@ import {
   restoreGroupRulesOrder as restoreGroupRulesOrderData,
   sortGroupRules as sortGroupRulesData,
   toConfigPayload as toConfigPayloadData,
+  withoutStaleBlock,
 } from "./groups-data";
 import { liveOfRecord, type GroupLive, type NetfilterState } from "./live-state";
 import {
@@ -1088,7 +1089,7 @@ export class GroupsStore {
 
     const current = $state.snapshot(this.data) as Group[];
     const bodyGroups = current.map(({ list, resolver, ...rest }) => ({
-      ...rest,
+      ...withoutStaleBlock(rest),
       list: list ? { url: list.url, interval: list.interval } : null,
     }));
     const edits = current

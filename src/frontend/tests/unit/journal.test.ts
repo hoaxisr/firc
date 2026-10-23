@@ -4,6 +4,7 @@ import { describe, it } from "jsr:@std/testing@1.0.19/bdd";
 import type { BypassEvent, DnsEvent, LogEvent } from "../../src/data/events.svelte";
 
 import {
+  blockedPart,
   DEFAULT_LEVELS,
   describeBypassTail,
   describeDns,
@@ -332,6 +333,47 @@ describe("describeDns, where the answer came from", () => {
     assert.strictEqual(
       describeDns(dns({ resolver: "cache" }), id),
       "youtube.com A → media · issued 198.18.0.5 (142.250.1.1) · from the group's DNS cache",
+    );
+  });
+});
+
+describe("a blocked name", () => {
+  const ruT = (k: string) =>
+    ({
+      "blocked: {code}": "заблокирован: {code}",
+      "no records": "нет записей",
+      "answered by firc": "ответил firc",
+    })[k] ?? k;
+  const blocked = (o: Partial<DnsEvent>) =>
+    dns({
+      decision: "blocked",
+      resolver: "local",
+      group: { id: "g9", name: "Ads" },
+      fake: undefined,
+      reals: [],
+      ...o,
+    });
+
+  // Catches a code taken from the wrong field, AAAA or another type answered with 0.0.0.0, an rcode unnamed, a non-blocked event given a red part, or a blocked row not ending at it.
+  it("a_blocked_event_says_blocked_with_its_code", () => {
+    assert.strictEqual(blockedPart(blocked({ qtype: "A" }), id), "blocked: 0.0.0.0");
+    assert.strictEqual(blockedPart(blocked({ qtype: "AAAA" }), id), "blocked: ::");
+    assert.strictEqual(blockedPart(blocked({ qtype: "MX" }), id), "blocked: no records");
+    assert.strictEqual(blockedPart(blocked({ qtype: "MX" }), ruT), "заблокирован: нет записей");
+    assert.strictEqual(
+      blockedPart(blocked({ qtype: "AAAA", rcode: "NXDOMAIN" }), id),
+      "blocked: NXDOMAIN",
+    );
+    assert.strictEqual(blockedPart(blocked({ rcode: "REFUSED" }), id), "blocked: REFUSED");
+    assert.strictEqual(blockedPart(dns({}), id), null);
+    assert.strictEqual(describeDnsTail(blocked({ qtype: "A" }), id), "A → Ads · blocked: 0.0.0.0");
+    assert.strictEqual(
+      describeDnsTail(blocked({ rcode: "NXDOMAIN" }), ruT),
+      "A → Ads · заблокирован: NXDOMAIN",
+    );
+    assert.strictEqual(
+      describeDnsTail(dns({ resolver: "local" }), ruT),
+      "A → media · issued 198.18.0.5 (142.250.1.1) · ответил firc",
     );
   });
 });

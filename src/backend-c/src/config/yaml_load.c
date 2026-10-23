@@ -547,6 +547,23 @@ static firc_err_t load_resolve(yaml_document_t *doc, node_t *n, firc_group_resol
     return FIRC_OK;
 }
 
+static firc_err_t load_block(yaml_document_t *doc, node_t *n, firc_group_t *g)
+{
+    node_t *b = map_get(doc, n, "block");
+    if (b == NULL) { return FIRC_OK; }
+    const char *name = g->name != NULL ? g->name : "";
+    if (!firc_group_is_block(g)) {
+        FIRC_ERROR("config: group \"%s\": block is only for a group whose interface is block", name);
+        return FIRC_ERR_INVAL;
+    }
+    if (node_is_null(b)) { return FIRC_OK; }
+    if (b->type != YAML_SCALAR_NODE || !firc_block_answer_parse(scalar_text(b), &g->block)) {
+        FIRC_ERROR("config: group \"%s\": block must be null, nxdomain or refused", name);
+        return FIRC_ERR_INVAL;
+    }
+    return FIRC_OK;
+}
+
 /* url is required: a list with nothing to fetch is refused at load, naming the group */
 static firc_err_t load_group_list(yaml_document_t *doc, node_t *n, firc_group_list_t *l,
                                   const char *group_name)
@@ -703,6 +720,11 @@ static firc_err_t load_group(yaml_document_t *doc, node_t *n, firc_group_t *g)
     }
 
     err = load_resolve(doc, n, &g->resolve, g->name);
+    if (err != FIRC_OK) {
+        return err;
+    }
+
+    err = load_block(doc, n, g);
     if (err != FIRC_OK) {
         return err;
     }

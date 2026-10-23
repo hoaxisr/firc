@@ -114,15 +114,30 @@ export function resolverNote(r: DnsResolverSource | undefined, t: (s: string) =>
       return t("the group's DNS is resting after failures; the common upstream answered");
     case "cache":
       return t("from the group's DNS cache");
+    case "local":
+      return t("answered by firc");
     default:
       return "";
   }
 }
 
 export function describeDnsTail(e: DnsEvent, t: (s: string) => string): string {
-  const note = resolverNote(e.resolver, t);
+  const note = e.decision === "blocked" ? "" : resolverNote(e.resolver, t);
   const tail = decisionTail(e, t);
   return note ? `${tail} · ${note}` : tail;
+}
+
+export function blockedPart(e: DnsEvent, t: (s: string) => string): string | null {
+  if (e.decision !== "blocked") return null;
+  const code =
+    e.rcode !== "NOERROR"
+      ? e.rcode
+      : e.qtype === "A"
+        ? "0.0.0.0"
+        : e.qtype === "AAAA"
+          ? "::"
+          : t("no records");
+  return t("blocked: {code}").replace("{code}", () => code);
 }
 
 function decisionTail(e: DnsEvent, t: (s: string) => string): string {
@@ -147,6 +162,8 @@ function decisionTail(e: DnsEvent, t: (s: string) => string): string {
       if (e.group && (e.qtype === "HTTPS" || e.qtype === "SVCB"))
         return `${head} ${group}${t("address hints removed")}`;
       return `${head} ${group}${t("passed, no address in the answer")}`;
+    case "blocked":
+      return `${head} ${group}${blockedPart(e, t)}`;
   }
 }
 

@@ -1,7 +1,9 @@
 import type { DnsResolverSource } from "../../data/events.svelte";
 
+import { BLOCK, isSink } from "../../data/iface-choices";
 import {
   DEFAULT_RESOLVE,
+  type BlockAnswer,
   type GroupResolve,
   type GroupResolver,
   type SystemResolvers,
@@ -62,16 +64,35 @@ export function autoEffectiveServers(params: {
 }
 
 export function submittedResolve(
-  isBlackhole: boolean,
+  iface: string,
   original: GroupResolve | undefined,
   mode: DnsMode,
   server: string,
 ): GroupResolve {
-  if (isBlackhole) return original ?? DEFAULT_RESOLVE();
+  if (isSink(iface)) return original ?? DEFAULT_RESOLVE();
   return resolveOf(mode, server);
 }
 
-export function resolverTag(r: GroupResolver | undefined, t: (s: string) => string): string | null {
+const BLOCK_CODE: Record<BlockAnswer, string> = {
+  null: "0.0.0.0",
+  nxdomain: "NXDOMAIN",
+  refused: "REFUSED",
+};
+
+export function blockCode(answer: BlockAnswer | undefined): string {
+  return BLOCK_CODE[answer ?? "null"];
+}
+
+export function resolverTag(
+  group:
+    | { interface: string | string[]; block?: BlockAnswer; resolver?: GroupResolver }
+    | undefined,
+  t: (s: string) => string,
+): string | null {
+  if (group?.interface === BLOCK) {
+    return t("DNS: blocking · {code}").replace("{code}", blockCode(group.block));
+  }
+  const r = group?.resolver;
   if (!r) return null;
   if (r.source === "off") return t("DNS: not through the tunnel");
   if (r.servers.length === 0) return t("DNS: common upstream");

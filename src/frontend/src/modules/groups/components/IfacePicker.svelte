@@ -5,7 +5,14 @@
   import { interfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
 
-  import { groupChoices, ifaceTitle, moreText, type IfaceItem } from "../../../data/iface-choices";
+  import {
+    BLACKHOLE,
+    BLOCK,
+    groupChoices,
+    ifaceTitle,
+    moreText,
+    type IfaceItem,
+  } from "../../../data/iface-choices";
   import {
     backupNote,
     backupText,
@@ -23,10 +30,18 @@
     live?: GroupLive;
     unsaved?: boolean;
     closed: "active" | "chain";
+    offset?: number;
     class?: string;
   };
 
-  let { value = $bindable(), live, unsaved = false, closed, class: className }: Props = $props();
+  let {
+    value = $bindable(),
+    live,
+    unsaved = false,
+    closed,
+    offset,
+    class: className,
+  }: Props = $props();
 
   let list = $derived(ifaceList({ interface: value }));
   let choices = $derived(groupChoices(interfaces.list, list));
@@ -63,8 +78,20 @@
           option(choices.blackhole, {
             label: t("Block"),
             description: undefined,
+            subline: t("route nowhere: connections are refused"),
             danger: true,
             separator: true,
+          }),
+        ]
+      : []),
+    ...(choices.block
+      ? [
+          option(choices.block, {
+            label: t("Block by DNS"),
+            description: undefined,
+            subline: t("answer the names ourselves, route nowhere"),
+            warn: true,
+            separator: !choices.blackhole,
           }),
         ]
       : []),
@@ -138,8 +165,10 @@
   {:else if anyCircle}
     <span class="iface-gap"></span>
   {/if}
-  {#if option.value === MORE}{:else if option.value === "blackhole"}
+  {#if option.value === MORE}{:else if option.value === BLACKHOLE}
     <span class="iface-ring"></span>
+  {:else if option.value === BLOCK}
+    <span class="iface-ring square"></span>
   {:else}
     <span class="iface-dot" data-state={stateOf(option.value)}></span>
   {/if}
@@ -191,6 +220,7 @@
   onOpenChange={(open: boolean) => {
     if (open) opened = null;
   }}
+  sideOffset={offset}
   class={className}
   onkeydowncapture={onKey}
 />
@@ -256,6 +286,11 @@
     border-radius: 50%;
     flex: none;
     border: 1.5px solid var(--danger);
+  }
+
+  .iface-ring.square {
+    border-radius: 1px;
+    border-color: var(--orange);
   }
 
   .iface-foot {

@@ -6,6 +6,7 @@ import { installSvelteRunesMocks } from "../mocks/setup-svelte-runes";
 installSvelteRunesMocks();
 
 const { groupChoices, ifaceTitle, lanChoices } = await import("../../src/data/iface-choices");
+const { uplinkOptions } = await import("../../src/modules/tunnels/tunnel-editor");
 const { interfaces } = await import("../../src/data/interfaces.svelte");
 const { defaultGroup } = await import("../../src/utils/defaults");
 
@@ -18,6 +19,7 @@ type Item = {
 
 const LIST: Item[] = [
   { id: "blackhole" },
+  { id: "block" },
   { id: "eth2.1", role: "other" },
   { id: "br0", name: "Home network", role: "lan" },
   { id: "nwg0", name: "WARP", role: "tunnel" },
@@ -106,5 +108,27 @@ describe("interface choices", () => {
       { id: "wg0", role: "tunnel" },
     ];
     assert.strictEqual(defaultGroup().interface, "ppp0");
+  });
+
+  // Catches block missing, offered before the blackhole, among the rest, or offered as a LAN or a tunnel's uplink.
+  it("block_is_offered_after_blackhole_and_never_as_a_lan_or_uplink", () => {
+    const c = groupChoices(LIST, ["nwg0"]);
+    assert.strictEqual(c.blackhole?.id, "blackhole");
+    assert.strictEqual(c.block?.id, "block");
+    assert.strictEqual(ids(c.rest).includes("block"), false);
+    assert.strictEqual(ids(c.head).includes("block"), false);
+    assert.strictEqual(groupChoices(LIST, ["block"]).expanded, false);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "block")), []);
+    const self = {
+      id: "t0",
+      device: "tunvless0",
+      uplink: { kind: "auto", ref: "" },
+    } as any;
+    const values = uplinkOptions(self, [self], LIST as any, (k: string) => k, { opened: true }).map(
+      (o) => o.value,
+    );
+    assert.strictEqual(values.includes("iface:block"), false);
+    assert.strictEqual(values.includes("iface:blackhole"), false);
+    assert.strictEqual(values.includes("iface:br0"), true);
   });
 });

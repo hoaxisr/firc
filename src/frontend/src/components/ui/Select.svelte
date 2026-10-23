@@ -16,6 +16,8 @@
     mono?: boolean;
     tag?: string;
     danger?: boolean;
+    warn?: boolean;
+    subline?: string;
     separator?: boolean;
     hidden?: boolean;
     missing?: boolean;
@@ -36,6 +38,7 @@
     closed?: Snippet;
     footer?: Snippet;
     onOpenChange?: (open: boolean) => void;
+    sideOffset?: number;
     [key: string]: any;
   };
 
@@ -52,6 +55,7 @@
     closed,
     footer,
     onOpenChange,
+    sideOffset = 4,
     ...rest
   }: Props = $props();
 
@@ -83,20 +87,34 @@
   );
 </script>
 
+{#snippet text(option: Option)}
+  <div class="option-text">
+    <span
+      class="option-label"
+      class:danger={option.danger}
+      class:warn={option.warn}
+      class:gone={option.missing}>{option.label}</span
+    >
+    {#if option.description}
+      <span class="option-description" class:mono={option.mono}>{option.description}</span>
+    {/if}
+    {#if option.tag}
+      <span class="option-tag">{option.tag}</span>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet body(option: Option, selected: boolean)}
   <div class="option" class:wide={option.remove}>
     {#if lead}{@render lead(option)}{/if}
-    <div class="option-text">
-      <span class="option-label" class:danger={option.danger} class:gone={option.missing}
-        >{option.label}</span
-      >
-      {#if option.description}
-        <span class="option-description" class:mono={option.mono}>{option.description}</span>
-      {/if}
-      {#if option.tag}
-        <span class="option-tag">{option.tag}</span>
-      {/if}
-    </div>
+    {#if option.subline}
+      <div class="option-stack">
+        {@render text(option)}
+        <span class="option-subline">{option.subline}</span>
+      </div>
+    {:else}
+      {@render text(option)}
+    {/if}
     <div class="option-check" class:open={option.expanded}>
       {#if option.toggle}<SelectOpen size={16} />{:else if selected}<Check size={16} />{/if}
     </div>
@@ -155,7 +173,7 @@
     </Select.Trigger>
 
     <Select.Portal>
-      <Select.Content align="start" sideOffset={4} collisionPadding={8}>
+      <Select.Content align="start" {sideOffset} collisionPadding={8}>
         {#each options as option}
           {#if !option.hidden}
             <Select.Item
@@ -384,6 +402,21 @@
   }
   .option-label.danger {
     color: var(--danger);
+  }
+  .option-label.warn {
+    color: var(--orange);
+  }
+  .option-stack {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 0.1rem 0;
+  }
+  .option-subline {
+    color: var(--text-2);
+    font-size: 0.72rem;
+    line-height: 1.25;
+    white-space: normal;
   }
   .option-tag {
     color: var(--text-2);

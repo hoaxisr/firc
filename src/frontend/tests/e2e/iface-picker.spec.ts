@@ -4,6 +4,7 @@ import { signedIn } from "./pages/session";
 
 const IFACES = [
   { id: "blackhole" },
+  { id: "block" },
   { id: "eth2.1", role: "other" },
   { id: "br0", name: "Home network", role: "lan" },
   { id: "nwg0", name: "WARP", role: "tunnel" },
@@ -56,7 +57,14 @@ test("a group on a tunnel sees the tunnels, Block and a folded rest", async ({ p
   await expect(trigger.locator(".selected-value")).toHaveText("WARP");
   await expect(trigger.locator(".selected-description")).toHaveText("nwg0");
   await openPicker(page);
-  expect(await shown(page)).toEqual(["nwg0", "nwg2", "tunvless0", "blackhole", "__more__"]);
+  expect(await shown(page)).toEqual([
+    "nwg0",
+    "nwg2",
+    "tunvless0",
+    "blackhole",
+    "block",
+    "__more__",
+  ]);
   const block = page.locator('[data-select-item][data-value="blackhole"]');
   await expect(block).toHaveText(/Блокировать/);
   await expect(block.locator(".option-label")).toHaveClass(/danger/);
@@ -69,6 +77,7 @@ test("a group on a tunnel sees the tunnels, Block and a folded rest", async ({ p
     "nwg2",
     "tunvless0",
     "blackhole",
+    "block",
     "__more__",
     "ppp0",
     "br0",
@@ -78,6 +87,30 @@ test("a group on a tunnel sees the tunnels, Block and a folded rest", async ({ p
   await expect(page.locator('[data-select-item][data-value="br0"]')).not.toContainText("провайдер");
   await page.locator('[data-select-item][data-value="br0"]').click();
   await expect(trigger.locator(".selected-value")).toHaveText("Home network");
+});
+
+// Catches either hint missing or swapped, Block by DNS above the blackhole, or the hint repeated in the closed picker.
+test("Block and Block by DNS each say what they do", async ({ page }) => {
+  await setup(page, [group("0a000001", "YouTube", "nwg0"), group("0a000002", "Ads", "block")]);
+  const second = page.locator(".group .iface-select [data-select-trigger]").nth(1);
+  await expect(second.locator(".selected-value")).toHaveText("Блокировать по DNS");
+  await expect(second.locator(".selected-description")).toHaveCount(0);
+  await openPicker(page);
+  const blackhole = page.locator('[data-select-item][data-value="blackhole"]');
+  const block = page.locator('[data-select-item][data-value="block"]');
+  await expect(blackhole.locator(".option-label")).toHaveText("Блокировать");
+  await expect(blackhole.locator(".option-subline")).toHaveText(
+    "вести в никуда: соединения отвергаются",
+  );
+  await expect(blackhole.locator(".option-subline")).toBeVisible();
+  await expect(block.locator(".option-label")).toHaveText("Блокировать по DNS");
+  await expect(block.locator(".option-subline")).toHaveText(
+    "ответить на имена сами, никуда не вести",
+  );
+  await expect(block.locator(".option-subline")).toBeVisible();
+  await expect(block.locator(".option-label")).toHaveCSS("color", "rgb(253, 151, 31)");
+  const [b1, b2] = [await blackhole.boundingBox(), await block.boundingBox()];
+  expect(b2!.y).toBeGreaterThan(b1!.y);
 });
 
 // Catches the fold unreachable or unopenable from the keyboard, Enter on it choosing it, or a row under it out of reach.

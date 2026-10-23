@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "firc/dnswire.h"
+#include "firc/models.h"
 
 /* Builds a query for `labels` with `qtype`. */
 static size_t build_query(uint8_t *buf, uint16_t id, const char *const *labels,
@@ -322,6 +323,185 @@ TEST a_ptr_query_without_rd_is_answered_without_rd(void)
         firc_dns_msg_free(r);
     }
     firc_dns_msg_free(q);
+    PASS();
+}
+
+static firc_dns_msg_t *block_answer(uint16_t qtype, bool edns, firc_block_answer_t answer, uint32_t ttl)
+{
+    uint8_t buf[512];
+    const char *labels[] = {"ads", "example", "com"};
+    size_t len = build_query(buf, 0x4242, labels, 3, qtype);
+    if (edns) {
+        const uint8_t opt[] = {0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0};
+        memcpy(buf + len, opt, sizeof(opt));
+        len += sizeof(opt);
+        buf[11] = 1;
+    }
+    firc_dns_msg_t *q = NULL;
+    if (firc_dns_msg_parse(buf, len, &q) != FIRC_OK) { abort(); }
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    firc_err_t err = firc_dns_make_block_response(q, answer, ttl, &out, &out_len);
+    firc_dns_msg_free(q);
+    if (err != FIRC_OK) { return NULL; }
+    firc_dns_msg_t *r = NULL;
+    if (firc_dns_msg_parse(out, out_len, &r) != FIRC_OK) { abort(); }
+    free(out);
+    return r;
+}
+
+/* Catches: a null answer without its sink record, a TTL other than the given one, RD or OPT lost. */
+TEST a_null_block_answers_a_with_zero_and_aaaa_with_unspecified(void)
+{
+    firc_dns_msg_t *r = block_answer(FIRC_DNS_TYPE_A, true, FIRC_BLOCK_NULL, 77);
+    ASSERT(r != NULL);
+    ASSERT_EQ(0x4242, r->id);
+    ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RD | FIRC_DNS_FLAG_RA, r->flags);
+    ASSERT_EQ(1u, (unsigned)r->n_questions);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r->questions[0].qtype);
+    ASSERT_EQ(1u, (unsigned)r->n_answers);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r->answers[0].rtype);
+    ASSERT_EQ(1, r->answers[0].rclass);
+    ASSERT_EQ(77u, r->answers[0].ttl);
+    ASSERT_EQ(r->questions[0].name_len, r->answers[0].name_len);
+    ASSERT_MEM_EQ(r->questions[0].name, r->answers[0].name, r->answers[0].name_len);
+    ASSERT_EQ(4u, (unsigned)r->answers[0].rdata_len);
+    ASSERT_MEM_EQ("\0\0\0\0", r->answers[0].rdata, 4);
+    ASSERT_EQ(0u, (unsigned)r->n_authority);
+    ASSERT_EQ(1u, (unsigned)r->n_additional);
+    ASSERT_EQ(FIRC_DNS_TYPE_OPT, r->additional[0].rtype);
+    ASSERT_EQ(1232, r->additional[0].rclass);
+    firc_dns_msg_free(r);
+
+    r = block_answer(FIRC_DNS_TYPE_AAAA, false, FIRC_BLOCK_NULL, 77);
+    ASSERT(r != NULL);
+    ASSERT_EQ(1u, (unsigned)r->n_answers);
+    ASSERT_EQ(FIRC_DNS_TYPE_AAAA, r->answers[0].rtype);
+    ASSERT_EQ(77u, r->answers[0].ttl);
+    ASSERT_EQ(16u, (unsigned)r->answers[0].rdata_len);
+    const uint8_t zero16[16] = {0};
+    ASSERT_MEM_EQ(zero16, r->answers[0].rdata, 16);
+    ASSERT_EQ(0u, (unsigned)r->n_additional);
+    firc_dns_msg_free(r);
+    PASS();
+}
+
+/* Catches: an HTTPS question for a blocked name answered with a record that could carry hints. */
+TEST a_null_block_answers_https_with_nodata(void)
+{
+    const uint16_t types[] = {65, 64, FIRC_DNS_TYPE_MX, 255};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        firc_dns_msg_t *r = block_answer(types[i], false, FIRC_BLOCK_NULL, 77);
+        ASSERT(r != NULL);
+        ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RD | FIRC_DNS_FLAG_RA, r->flags);
+        ASSERT_EQ(types[i], r->questions[0].qtype);
+        ASSERT_EQ(0u, (unsigned)r->n_answers);
+        ASSERT_EQ(0u, (unsigned)r->n_authority);
+        firc_dns_msg_free(r);
+    }
+    PASS();
+}
+
+/* Catches: RD set in a block answer to a query that did not ask for recursion, by either builder. */
+TEST a_block_answer_to_a_query_without_rd_has_no_rd(void)
+{
+    uint8_t buf[512];
+    const char *labels[] = {"ads", "example", "com"};
+    size_t len = build_query(buf, 0x4243, labels, 3, FIRC_DNS_TYPE_A);
+    buf[2] = 0x00;
+    firc_dns_msg_t *q = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(buf, len, &q));
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_make_block_response(q, FIRC_BLOCK_NULL, 60, &out, &out_len));
+    firc_dns_msg_t *r = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(out, out_len, &r));
+    free(out);
+    ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RA, r->flags);
+    firc_dns_msg_free(r);
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_block(q, FIRC_BLOCK_NXDOMAIN, 60));
+    ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RA | FIRC_DNS_RCODE_NXDOMAIN, q->flags);
+    firc_dns_msg_free(q);
+    PASS();
+}
+
+/* Catches: the in-place rewrite dropping the OPT, keeping the upstream's other additional records or its size. */
+TEST an_answer_blocked_in_place_echoes_one_opt(void)
+{
+    uint8_t buf[512];
+    const char *labels[] = {"ads", "example", "com"};
+    size_t len = build_query(buf, 0x4244, labels, 3, FIRC_DNS_TYPE_A);
+    buf[2] = 0x81;
+    buf[3] = 0x80;
+    buf[7] = 1;
+    buf[11] = 2;
+    const uint8_t an[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34};
+    memcpy(buf + len, an, sizeof(an));
+    len += sizeof(an);
+    const uint8_t extra[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 1};
+    memcpy(buf + len, extra, sizeof(extra));
+    len += sizeof(extra);
+    const uint8_t opt[] = {0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0};
+    memcpy(buf + len, opt, sizeof(opt));
+    len += sizeof(opt);
+    firc_dns_msg_t *m = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(buf, len, &m));
+    ASSERT_EQ(2u, (unsigned)m->n_additional);
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_block(m, FIRC_BLOCK_NULL, 300));
+    ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RD | FIRC_DNS_FLAG_RA, m->flags);
+    ASSERT_EQ(1u, (unsigned)m->n_answers);
+    ASSERT_MEM_EQ("\0\0\0\0", m->answers[0].rdata, 4);
+    ASSERT_EQ(300u, m->answers[0].ttl);
+    ASSERT_EQ(1u, (unsigned)m->n_additional);
+    ASSERT_EQ(FIRC_DNS_TYPE_OPT, m->additional[0].rtype);
+    ASSERT_EQ(1232, m->additional[0].rclass);
+    ASSERT_EQ(0u, (unsigned)m->additional[0].rdata_len);
+    firc_dns_msg_free(m);
+    PASS();
+}
+
+/* Catches: a block answer built for a non-QUERY opcode or a class other than IN. */
+TEST only_an_in_query_is_blockable(void)
+{
+    uint8_t buf[512];
+    const char *labels[] = {"ads", "example", "com"};
+    size_t len = build_query(buf, 0x4245, labels, 3, FIRC_DNS_TYPE_A);
+    firc_dns_msg_t *q = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(buf, len, &q));
+    ASSERT(firc_dns_blockable(q));
+    q->flags = (uint16_t)(q->flags | (4u << 11));
+    ASSERT_FALSE(firc_dns_blockable(q));
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_make_block_response(q, FIRC_BLOCK_NULL, 60, &out, &out_len));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_block(q, FIRC_BLOCK_NULL, 60));
+    q->flags = 0x0100;
+    q->questions[0].qclass = 3;
+    ASSERT_FALSE(firc_dns_blockable(q));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_block(q, FIRC_BLOCK_NULL, 60));
+    firc_dns_msg_free(q);
+    PASS();
+}
+
+/* Catches: the answer's code ignored, or an A record left in an NXDOMAIN/REFUSED answer. */
+TEST nxdomain_and_refused_carry_their_rcode_and_no_records(void)
+{
+    const firc_block_answer_t answers[] = {FIRC_BLOCK_NXDOMAIN, FIRC_BLOCK_REFUSED};
+    const uint16_t rcodes[] = {3, 5};
+    const uint16_t types[] = {FIRC_DNS_TYPE_A, FIRC_DNS_TYPE_AAAA, 65};
+    for (size_t i = 0; i < 2; i++) {
+        for (size_t t = 0; t < 3; t++) {
+            firc_dns_msg_t *r = block_answer(types[t], true, answers[i], 77);
+            ASSERT(r != NULL);
+            ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RD | FIRC_DNS_FLAG_RA | rcodes[i], r->flags);
+            ASSERT_EQ(1u, (unsigned)r->n_questions);
+            ASSERT_EQ(0u, (unsigned)r->n_answers);
+            ASSERT_EQ(0u, (unsigned)r->n_authority);
+            ASSERT_EQ(1u, (unsigned)r->n_additional);
+            ASSERT_EQ(FIRC_DNS_TYPE_OPT, r->additional[0].rtype);
+            firc_dns_msg_free(r);
+        }
+    }
     PASS();
 }
 
@@ -748,6 +928,12 @@ int main(int argc, char **argv)
     RUN_TEST(no_target_is_nxdomain_and_edns_is_answered_in_kind);
     RUN_TEST(a_ptr_query_without_rd_is_answered_without_rd);
     RUN_TEST(a_target_that_is_not_a_name_is_refused);
+    RUN_TEST(a_null_block_answers_a_with_zero_and_aaaa_with_unspecified);
+    RUN_TEST(a_null_block_answers_https_with_nodata);
+    RUN_TEST(nxdomain_and_refused_carry_their_rcode_and_no_records);
+    RUN_TEST(a_block_answer_to_a_query_without_rd_has_no_rd);
+    RUN_TEST(an_answer_blocked_in_place_echoes_one_opt);
+    RUN_TEST(only_an_in_query_is_blockable);
     RUN_TEST(rejects_malformed);
     RUN_TEST(header_only_is_lenient);
     RUN_TEST(rejects_compression_loop);

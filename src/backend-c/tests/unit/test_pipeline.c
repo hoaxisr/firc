@@ -7,6 +7,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "firc/dnspipeline.h"
 #include "firc/events.h"
@@ -1571,6 +1572,119 @@ TEST a_failed_answer_is_journalled_with_its_rcode(void) {
     PASS();
 }
 
+static void block_group(firc_config_t *cfg, firc_block_answer_t answer) {
+    add_group(cfg, 5, "ads", FIRC_RULE_NAMESPACE, "example.com");
+    firc_group_t *g = cfg->groups[cfg->n_groups - 1];
+    firc_strset(&g->iface, FIRC_IFACE_BLOCK);
+    g->block = answer;
+}
+
+/* Catches: a blocked answer journalled without its rcode, group or local resolver, a NULL client dropped, or the recall fed only on rcode 0. */
+TEST a_blocked_answer_is_journalled_with_its_rcode(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    block_group(&cfg, FIRC_BLOCK_NXDOMAIN);
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    static const char *q[] = {"x", "example", "com"};
+    firc_dns_msg_t *msg = plain_answer(q, 3, 0);
+    int64_t before = (int64_t)time(NULL);
+    firc_dns_pipeline_note_blocked(f.p, msg, &client, FIRC_BLOCK_NXDOMAIN);
+    firc_dns_pipeline_note_blocked(f.p, msg, NULL, FIRC_BLOCK_REFUSED);
+
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)2, dns_events(all, journal(all, 8), ev), "%zu");
+    const firc_event_dns_t *d = &ev[0].u.dns;
+    ASSERT_STR_EQ("x.example.com", d->name);
+    ASSERT_MEM_EQ(client.b, d->client.b, 4);
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_TYPE_A, (unsigned)d->qtype, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_BLOCKED, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT(3u, (unsigned)d->rcode, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_RESOLVER_LOCAL, (unsigned)d->resolver, "%u");
+    ASSERT_STR_EQ("ads", d->group_name);
+    ASSERT_EQ_FMT(0u, (unsigned)d->fake.len, "%u");
+    ASSERT(ev[0].at >= before);
+    const firc_event_dns_t *n = &ev[1].u.dns;
+    ASSERT_EQ_FMT(0u, (unsigned)n->client.len, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_BLOCKED, (unsigned)n->decision, "%u");
+    ASSERT_EQ_FMT(5u, (unsigned)n->rcode, "%u");
+    ASSERT_STR_EQ("ads", n->group_name);
+
+    firc_recall_answer_t last;
+    ASSERT(firc_recall_last_answer(firc_dns_pipeline_recall(f.p), &client, "x.example.com", FIRC_RECALL_V4,
+                                   (int64_t)time(NULL), &last));
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_BLOCKED, (unsigned)last.decision, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)last.fake.len, "%u");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: an upstream answer for a block owner rewritten to a fake, passed real, or an NXDOMAIN let through. */
+TEST an_upstream_answer_for_a_block_owner_is_blocked_not_issued(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    block_group(&cfg, FIRC_BLOCK_NULL);
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = chain_answer();
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN,
+              (int)firc_dns_pipeline_handle_message_from(f.p, msg, 1000, &client, FIRC_DNS_RESOLVER_UPSTREAM,
+                                                         &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_EQ(0x1234, msg->id);
+    ASSERT_EQ(FIRC_DNS_FLAG_QR | FIRC_DNS_FLAG_RD | FIRC_DNS_FLAG_RA, msg->flags);
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_EQ(FIRC_DNS_TYPE_A, msg->answers[0].rtype);
+    ASSERT_EQ_FMT(300u, msg->answers[0].ttl, "%u");
+    ASSERT_MEM_EQ("\0\0\0\0", msg->answers[0].rdata, 4);
+    firc_dns_msg_free(msg);
+
+    static const char *q[] = {"nx", "example", "com"};
+    msg = plain_answer(q, 3, 3);
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL));
+    ASSERT_EQ(0u, msg->flags & 0x000fu);
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_MEM_EQ("\0\0\0\0", msg->answers[0].rdata, 4);
+    firc_dns_msg_free(msg);
+
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)2, dns_events(all, journal(all, 8), ev), "%zu");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_BLOCKED, (unsigned)ev[0].u.dns.decision, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_RESOLVER_LOCAL, (unsigned)ev[0].u.dns.resolver, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)ev[0].u.dns.rcode, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_BLOCKED, (unsigned)ev[1].u.dns.decision, "%u");
+    seen_t seen;
+    seen_from(f.pool, &seen);
+    ASSERT_EQ_FMTm("the pool was never asked", (size_t)0, seen.n, "%zu");
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: a NOTIFY answer for a block owner rewritten to the block answer instead of taking its old path. */
+TEST a_notify_for_a_block_owner_is_not_blocked(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    block_group(&cfg, FIRC_BLOCK_NXDOMAIN);
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    static const char *q[] = {"x", "example", "com"};
+    firc_dns_msg_t *msg = plain_answer(q, 3, 0);
+    msg->flags = (uint16_t)(msg->flags | (4u << 11));
+    (void)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL);
+    ASSERT_EQ(0u, msg->flags & 0x000fu);
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    ASSERT(ev[0].u.dns.decision != FIRC_DNS_BLOCKED);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
 /* Catches: a log line written per answer beside the answer's own event. */
 TEST an_answer_is_journalled_as_its_event_only(void) {
     firc_event_reset_for_test();
@@ -2149,6 +2263,9 @@ int main(int argc, char **argv)
     RUN_TEST(the_journal_says_where_the_answer_came_from);
     RUN_TEST(an_unmatched_name_from_a_covered_client_is_journalled);
     RUN_TEST(a_failed_answer_is_journalled_with_its_rcode);
+    RUN_TEST(a_blocked_answer_is_journalled_with_its_rcode);
+    RUN_TEST(an_upstream_answer_for_a_block_owner_is_blocked_not_issued);
+    RUN_TEST(a_notify_for_a_block_owner_is_not_blocked);
     RUN_TEST(an_answer_is_journalled_as_its_event_only);
     RUN_TEST(a_failed_answer_names_a_group_only_for_a_client_it_covers);
     RUN_TEST(a_failed_answer_names_the_first_group_that_admits_the_client);

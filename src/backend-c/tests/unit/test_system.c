@@ -485,6 +485,23 @@ TEST list_interfaces_includes_blackhole_first(void) {
     PASS();
 }
 
+/* Catches: the block pseudo-interface missing from the list, or placed anywhere but right after blackhole. */
+TEST list_interfaces_includes_block_after_blackhole(void) {
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
+    cJSON *ifaces = cJSON_GetObjectItemCaseSensitive(out, "interfaces");
+    ASSERT(cJSON_GetArraySize(ifaces) >= 2);
+    cJSON *second = cJSON_GetArrayItem(ifaces, 1);
+    ASSERT_STR_EQ("block", cJSON_GetObjectItemCaseSensitive(second, "id")->valuestring);
+    ASSERT(cJSON_GetObjectItemCaseSensitive(second, "name") == NULL);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 TEST save_config_writes_file(void) {
     harness_t *h = harness_start(true);
     ASSERT(h != NULL);
@@ -604,31 +621,63 @@ TEST a_dns_event_is_answered_with_every_field(void) {
     PASS();
 }
 
+/* Catches: a blocked event read as passed, its resolver not local, or its rcode dropped. */
+TEST a_blocked_event_is_named_blocked_and_local(void) {
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    firc_event_reset_for_test();
+    firc_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind = FIRC_EVENT_DNS;
+    e.u.dns.client = (firc_ip_t){{192, 168, 1, 42}, 4};
+    snprintf(e.u.dns.name, sizeof(e.u.dns.name), "ads.example.com");
+    e.u.dns.qtype = 1;
+    e.u.dns.rcode = 3;
+    e.u.dns.decision = FIRC_DNS_BLOCKED;
+    e.u.dns.resolver = FIRC_DNS_RESOLVER_LOCAL;
+    snprintf(e.u.dns.group_id, sizeof(e.u.dns.group_id), "d663876a");
+    snprintf(e.u.dns.group_name, sizeof(e.u.dns.group_name), "Ads");
+    firc_event_put(&e);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/system/events", NULL, &out));
+    cJSON *events = cJSON_GetObjectItemCaseSensitive(out, "events");
+    ASSERT_EQ_FMT(1, cJSON_GetArraySize(events), "%d");
+    cJSON *d = cJSON_GetArrayItem(events, 0);
+    ASSERT_STR_EQ("blocked", cJSON_GetObjectItemCaseSensitive(d, "decision")->valuestring);
+    ASSERT_STR_EQ("local", cJSON_GetObjectItemCaseSensitive(d, "resolver")->valuestring);
+    ASSERT_STR_EQ("NXDOMAIN", cJSON_GetObjectItemCaseSensitive(d, "rcode")->valuestring);
+    ASSERT_STR_EQ("Ads", cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(d, "group"), "name")
+                             ->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 /* Catches: a resolver source without its API name, or an unknown byte not read as upstream. */
 TEST every_resolver_source_has_its_name(void) {
     static const char *want[] = {"upstream",         "group",          "fallback_unreachable", "fallback_timeout",
                                  "fallback_servfail", "fallback_refused", "fallback_sink",       "health_skip",
-                                 "cache"};
+                                 "cache",            "local"};
     harness_t *h = harness_start(false);
     ASSERT(h != NULL);
     firc_event_reset_for_test();
-    for (unsigned i = 0; i < 10; i++) {
+    for (unsigned i = 0; i < 11; i++) {
         firc_event_t e;
         memset(&e, 0, sizeof(e));
         e.kind = FIRC_EVENT_DNS;
         e.u.dns.client = (firc_ip_t){{192, 168, 1, 42}, 4};
         snprintf(e.u.dns.name, sizeof(e.u.dns.name), "n%u.test", i);
-        e.u.dns.resolver = (uint8_t)(i < 9 ? i : 200);
+        e.u.dns.resolver = (uint8_t)(i < 10 ? i : 200);
         firc_event_put(&e);
     }
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/events", NULL, &out));
     cJSON *events = cJSON_GetObjectItemCaseSensitive(out, "events");
-    ASSERT_EQ_FMT(10, cJSON_GetArraySize(events), "%d");
-    for (int i = 0; i < 10; i++) {
+    ASSERT_EQ_FMT(11, cJSON_GetArraySize(events), "%d");
+    for (int i = 0; i < 11; i++) {
         cJSON *r = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(events, i), "resolver");
         ASSERT(cJSON_IsString(r));
-        ASSERT_STR_EQ(i < 9 ? want[i] : "upstream", r->valuestring);
+        ASSERT_STR_EQ(i < 10 ? want[i] : "upstream", r->valuestring);
     }
     cJSON_Delete(out);
     harness_stop(h);
@@ -881,7 +930,7 @@ TEST the_interfaces_route_answers_role_description_and_ndms_name(void) {
 
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
-    ASSERT_EQ(3, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(out, "interfaces")));
+    ASSERT_EQ(4, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(out, "interfaces")));
     const cJSON *eth3 = iface_item(out, "eth3");
     ASSERT(eth3 != NULL);
     ASSERT_STR_EQ("wan", cJSON_GetObjectItemCaseSensitive(eth3, "role")->valuestring);
@@ -892,6 +941,7 @@ TEST the_interfaces_route_answers_role_description_and_ndms_name(void) {
     ASSERT_STR_EQ("lan", cJSON_GetObjectItemCaseSensitive(br0, "role")->valuestring);
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(br0, "ndmsName"));
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "blackhole"), "role"));
+    ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "block"), "role"));
     ASSERT_EQ(NULL, iface_item(out, "lo"));
     cJSON_Delete(out);
 
@@ -1010,6 +1060,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_tunnel_line_names_its_device_as_the_source);
     RUN_TEST(the_resolvers_route_answers_a_list);
     RUN_TEST(list_interfaces_includes_blackhole_first);
+    RUN_TEST(list_interfaces_includes_block_after_blackhole);
     RUN_TEST(a_tunnel_device_is_named_by_its_description);
     RUN_TEST(a_tunnel_description_wins_over_an_alias);
     RUN_TEST(save_config_writes_file);
@@ -1018,6 +1069,7 @@ int main(int argc, char **argv) {
     RUN_TEST(an_ndm_layer_event_reaches_the_interface_watcher);
     RUN_TEST(a_dns_event_is_answered_with_every_field);
     RUN_TEST(every_resolver_source_has_its_name);
+    RUN_TEST(a_blocked_event_is_named_blocked_and_local);
     RUN_TEST(a_bypass_event_is_answered_with_every_field);
     RUN_TEST(a_bypass_event_without_a_last_answer_has_no_last);
     RUN_TEST(only_loopback_ezcfg_and_radio_names_are_hidden);

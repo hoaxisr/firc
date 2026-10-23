@@ -1,3 +1,4 @@
+import { isSink } from "../../data/iface-choices";
 import type { GroupLive } from "./live-state";
 
 export type IfaceState = {
@@ -9,8 +10,6 @@ export type IfaceState = {
 
 const IFACES_MAX = 4;
 
-const BLACKHOLE = "blackhole";
-
 export function ifaceList(group: { interface: string | string[] }): string[] {
   return Array.isArray(group.interface) ? [...group.interface] : [group.interface];
 }
@@ -20,7 +19,7 @@ export function ifaceValue(list: string[]): string | string[] {
 }
 
 export function canBackup(list: string[], name: string): boolean {
-  if (name === BLACKHOLE || list.includes(BLACKHOLE)) return false;
+  if (isSink(name) || list.some(isSink)) return false;
   return list.includes(name) || list.length < IFACES_MAX;
 }
 

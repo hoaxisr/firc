@@ -969,7 +969,7 @@ void firc_app_republish_resolve_routes(firc_app_t *app) {
         in[i].mark = (field != 0 && firc_ruleset_runtime_enabled(rs) && g->enable) ? (field | FIRC_MARK_HANDLED) : 0;
         bool blocked = false;
         (void)firc_ruleset_active(rs, &blocked);
-        in[i].blackhole = blocked || strcmp(active, FIRC_IPSET_TO_LINK_BLACKHOLE) == 0;
+        in[i].blackhole = blocked || firc_iface_is_sink(active);
         in[i].v6_route = firc_ruleset_has_iface_route(rs, AF_INET6);
         in[i].firmware = fw[i];
         in[i].n_firmware = firc_kn_resolvers_for(app->resolvers, active, fw[i], FIRC_RESOLVE_MAX_SERVERS);
@@ -1271,7 +1271,7 @@ firc_err_t firc_app_add_group(firc_app_t *app, firc_group_t *group) {
 
 /* asked of the kernel each call, on the loop that owns app->rtnl, so it is never stale; blackhole needs no link */
 static bool iface_link_up(const firc_app_t *app, const char *iface) {
-    if (iface != NULL && strcmp(iface, FIRC_IPSET_TO_LINK_BLACKHOLE) == 0) { return true; }
+    if (firc_iface_is_sink(iface)) { return true; }
     if (app->rtnl == NULL || iface == NULL) { return false; }
     firc_link_info_t li;
     bool found = false;
@@ -1570,6 +1570,7 @@ static void group_move_into(firc_app_t *app, firc_group_t *into, firc_group_t *f
     into->devices = from->devices;
     free(into->resolve.server);
     into->resolve = from->resolve;
+    into->block = from->block;
     if (into->list != NULL) { /* hand_over_list: after it, into's list is either carried into from's (blank) or finished with */
         hand_over_list(app, into, from);
         firc_group_list_free(into->list);
@@ -3110,7 +3111,7 @@ static firc_err_t move_group_locked(firc_app_t *app, firc_id_t id, size_t to, bo
     if (to >= firc_group_n_ifaces(g)) { return FIRC_ERR_INVAL; }
     bool was_blocked = false;
     size_t from = firc_ruleset_active(rs, &was_blocked);
-    bool written = blocked || strcmp(firc_group_iface_at(g, to), FIRC_IPSET_TO_LINK_BLACKHOLE) == 0 ||
+    bool written = blocked || firc_iface_is_sink(firc_group_iface_at(g, to)) ||
                    firc_ruleset_has_iface_route(rs, AF_INET);
     if (from == to && was_blocked == blocked && written) { return FIRC_OK; }
     bool redirected = from != to && (ktcp_redirected(app, firc_ruleset_active_iface(rs)) ||

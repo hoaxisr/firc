@@ -227,6 +227,80 @@ test("a DNS event is shown, and clicking its client filters to that client", asy
   await expect(rows.nth(0)).toContainText("youtube.com");
 });
 
+// Catches a blocked answer read as passed, its code missing, the decision not set apart in red, the row not ending at it, or a group name painted as the decision.
+test("a blocked row ends with a red 'blocked: 0.0.0.0'", async ({ page }) => {
+  await shell(page, [
+    {
+      seq: 1,
+      at: 1790000000,
+      kind: "dns",
+      client: "192.168.1.7",
+      name: "ads.doubleclick.net",
+      qtype: "A",
+      rcode: "NOERROR",
+      decision: "blocked",
+      resolver: "local",
+      group: { id: "a0a0a0a0", name: "Ads" },
+      reals: [],
+    },
+    {
+      seq: 2,
+      at: 1790000001,
+      kind: "dns",
+      client: "192.168.1.7",
+      name: "x.example.com",
+      qtype: "A",
+      rcode: "REFUSED",
+      decision: "blocked",
+      resolver: "local",
+      group: { id: "a0a0a0a1", name: "blocked: REFUSED" },
+      reals: [],
+    },
+    {
+      seq: 3,
+      at: 1790000002,
+      kind: "dns",
+      client: "fd00::5",
+      name: "tracker.example.com",
+      qtype: "AAAA",
+      rcode: "NXDOMAIN",
+      decision: "blocked",
+      resolver: "local",
+      group: { id: "a0a0a0a0", name: "Ads" },
+      reals: [],
+    },
+  ]);
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Journal" }).click();
+  const rows = page.locator(".pane .row");
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0).locator(".tail")).toHaveText("A → Ads · blocked: 0.0.0.0");
+  const red = rows.nth(0).locator(".tail .blocked");
+  const endsAtRed = await rows
+    .nth(0)
+    .locator(".tail")
+    .evaluate(
+      (el) =>
+        el.lastElementChild === el.querySelector(".blocked") &&
+        el.textContent!.trimEnd().endsWith(el.lastElementChild!.textContent!),
+    );
+  expect(endsAtRed).toBe(true);
+  await expect(red).toHaveText("blocked: 0.0.0.0");
+  await expect(red).toHaveCSS("color", "rgb(248, 81, 73)");
+  await expect(rows.nth(0).locator(".tail")).not.toHaveCSS("color", "rgb(248, 81, 73)");
+  await expect(rows.nth(2).locator(".tail .blocked")).toHaveText("blocked: NXDOMAIN");
+  const named = rows.nth(1).locator(".tail");
+  await expect(named).toHaveText("A → blocked: REFUSED · blocked: REFUSED");
+  await expect(named.locator(".blocked")).toHaveCount(1);
+  expect(
+    await named.evaluate(
+      (el) =>
+        el.lastElementChild === el.querySelector(".blocked") &&
+        el.textContent!.trimEnd().endsWith(el.lastElementChild!.textContent!),
+    ),
+  ).toBe(true);
+});
+
 // Catches a known device shown by its address alone, or its name not found by the search.
 test("a DNS row names the device that asked, beside its address", async ({ page }) => {
   await shell(page, [

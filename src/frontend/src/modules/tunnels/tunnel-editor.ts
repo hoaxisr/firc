@@ -1,6 +1,6 @@
 import {
-  BLACKHOLE,
   ifaceTitle,
+  isSink,
   moreText,
   TUNVLESS_DEVICE,
   type IfaceItem,
@@ -118,7 +118,7 @@ export function uplinkOptions(
 ): UplinkOption[] {
   const devices = new Set(tunnels.map((tn) => tn.device));
   const usable = ifaces.filter(
-    (i) => i.id !== BLACKHOLE && !TUNVLESS_DEVICE.test(i.id) && !devices.has(i.id),
+    (i) => !isSink(i.id) && !TUNVLESS_DEVICE.test(i.id) && !devices.has(i.id),
   );
   const head = usable.filter((i) => i.role === "wan" || i.role === "tunnel");
   const rest = usable.filter((i) => i.role !== "wan" && i.role !== "tunnel");

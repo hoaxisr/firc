@@ -110,6 +110,29 @@ TEST a_blackhole_group_gets_no_masquerade(void)
     PASS();
 }
 
+/* Catches: a masquerade rule naming "block" as a device, failing the whole commit. */
+TEST a_block_group_gets_no_masquerade(void)
+{
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    ASSERT(f != NULL);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(f), "FIRC_");
+    ASSERT(ipt != NULL);
+    firc_netfilter_register_base_chains(ipt, NULL);
+
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(3, &mark));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_bk", "block", mark, 3, NULL, NULL));
+    const firc_ipv4_subnet_t p[] = {{.addr = {10, 0, 0, 0}, .cidr = 8}};
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_bk", mark, p, 1, NULL, 0));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
+
+    ASSERT_FALSE(any_arg_equals(f, "nat", "FIRC_bk", "MASQUERADE"));
+    ASSERT_FALSE(any_arg_equals(f, "filter", "FIRC_bk", "block"));
+    ASSERT(any_arg_equals(f, "mangle", "FIRC_bk", "--set-xmark"));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 /* Catches: the CONNMARK save rule Keenetic needs missing from a MARK carrier. */
 TEST the_connmark_rule_keenetic_needs_is_still_emitted(void)
 {
@@ -1184,6 +1207,24 @@ TEST a_blackhole_group_drops_its_marked_flow_by_every_interface(void)
     PASS();
 }
 
+/* Catches: a block group without a guard, or one that lets a marked flow out by an interface named block. */
+TEST a_block_group_drops_its_marked_flow_by_every_interface(void)
+{
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(f), "FIRC_");
+    firc_netfilter_register_base_chains(ipt, NULL);
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(3, &mark));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_bk", "block", mark, 3, NULL, NULL));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
+    static const char *guard[] = {"-m", "mark", "--mark", "0x40030000/0x40ff0000", "-m", "conntrack", "--ctdir",
+                                  "ORIGINAL", "-j", "DROP"};
+    ASSERT_EQ_FMT((size_t)2, rules_in(f, "filter", "FIRC_EGRESS"), "%zu");
+    ASSERT_EQ(1, rule_index(f, "filter", "FIRC_EGRESS", guard, 10));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 /* Catches: each group opening the dispatch chain anew (only the last group's guard survives), a second early return, or a jump per group. */
 TEST every_group_shares_one_dispatch_chain_and_one_jump(void)
 {
@@ -1283,8 +1324,10 @@ int main(int argc, char **argv)
     RUN_TEST(the_mark_is_written_masked);
     RUN_TEST(the_masquerade_matches_the_mark_and_the_interface);
     RUN_TEST(a_blackhole_group_gets_no_masquerade);
+    RUN_TEST(a_block_group_gets_no_masquerade);
     RUN_TEST(a_group_drops_its_marked_flow_leaving_by_another_interface);
     RUN_TEST(a_blackhole_group_drops_its_marked_flow_by_every_interface);
+    RUN_TEST(a_block_group_drops_its_marked_flow_by_every_interface);
     RUN_TEST(every_group_shares_one_dispatch_chain_and_one_jump);
     RUN_TEST(the_connmark_rule_keenetic_needs_is_still_emitted);
     RUN_TEST(every_chunk_a_group_holds_becomes_a_rule);

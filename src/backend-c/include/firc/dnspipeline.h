@@ -49,6 +49,10 @@ firc_recall_t *firc_dns_pipeline_recall(firc_dns_pipeline_t *p);
 /* Whether some group's selector admits `client`; NULL is not covered. */
 bool firc_dns_pipeline_covers(const firc_dns_pipeline_t *p, const firc_ip_t *client);
 
+/* Journals a block answer the proxy gave to query, client NULL included, and feeds the recall. Loop thread. */
+void firc_dns_pipeline_note_blocked(firc_dns_pipeline_t *p, const firc_dns_msg_t *query, const firc_ip_t *client,
+                                    firc_block_answer_t answer);
+
 /* The group owning the queried name for client (first matching and admitting), or NULL;
  * valid until the next set_snapshot. */
 const firc_group_snapshot_t *firc_dns_pipeline_owner(firc_dns_pipeline_t *p, const firc_dns_msg_t *query,

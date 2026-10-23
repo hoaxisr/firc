@@ -16,6 +16,7 @@
 #include "firc/keenetic_rci.h"
 #include "firc/keenetic_resolvers.h"
 #include "firc/log.h"
+#include "firc/models.h"
 
 static void must_route(firc_httpd_t *h, const char *method, const char *pattern, firc_http_handler_fn fn,
                        void *ud) {
@@ -76,6 +77,7 @@ static const char *decision_name(uint8_t d) {
     case FIRC_DNS_NO_MATCH: return "no-match";
     case FIRC_DNS_POOL_REFUSED: return "pool-refused";
     case FIRC_DNS_PASSED: return "passed";
+    case FIRC_DNS_BLOCKED: return "blocked";
     }
     return "passed";
 }
@@ -353,6 +355,9 @@ static char *interfaces_body(const firc_system_ctx_t *ctx, const firc_kn_aliases
         cJSON *blackhole = cJSON_CreateObject();
         cJSON_AddStringToObject(blackhole, "id", "blackhole");
         cJSON_AddItemToArray(arr, blackhole);
+        cJSON *block = cJSON_CreateObject();
+        cJSON_AddStringToObject(block, "id", FIRC_IFACE_BLOCK);
+        cJSON_AddItemToArray(arr, block);
         for (size_t i = 0; i < n; i++) {
             cJSON *item = cJSON_CreateObject();
             cJSON_AddStringToObject(item, "id", ifaces[i].id);

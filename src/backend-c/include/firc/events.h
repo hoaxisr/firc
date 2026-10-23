@@ -31,6 +31,7 @@ typedef enum firc_dns_decision {
     FIRC_DNS_NO_MATCH,
     FIRC_DNS_POOL_REFUSED,
     FIRC_DNS_PASSED,
+    FIRC_DNS_BLOCKED,
 } firc_dns_decision_t;
 
 typedef enum firc_dns_resolver {
@@ -43,6 +44,7 @@ typedef enum firc_dns_resolver {
     FIRC_DNS_RESOLVER_FALLBACK_SINK,
     FIRC_DNS_RESOLVER_HEALTH_SKIP,
     FIRC_DNS_RESOLVER_CACHE,
+    FIRC_DNS_RESOLVER_LOCAL,
 } firc_dns_resolver_t;
 
 /* The journal's string for a firc_dns_resolver_t; an unknown byte (a newer daemon's) reads as upstream. */

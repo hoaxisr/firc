@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "firc/dnsrewrite.h"
 #include "firc/events.h"
@@ -211,6 +212,22 @@ static void journal_put(firc_dns_pipeline_t *p, firc_event_t *ev, firc_dns_decis
                        ev->u.dns.fake.len ? &ev->u.dns.fake : NULL, ev->at);
 }
 
+static void note_blocked(firc_dns_pipeline_t *p, const firc_dns_msg_t *msg, int64_t now, const firc_ip_t *client,
+                         const char *qname, const firc_group_snapshot_t *owner, firc_block_answer_t answer)
+{
+    static const firc_ip_t nobody = {{0}, 0};
+    firc_event_t ev;
+    journal_begin(&ev, now, client != NULL ? client : &nobody, qname, msg, firc_dns_block_rcode(answer),
+                  FIRC_DNS_RESOLVER_LOCAL);
+    journal_group(&ev, owner);
+    ev.u.dns.decision = (uint8_t)FIRC_DNS_BLOCKED;
+    firc_event_put(&ev);
+    const uint16_t qt = ev.u.dns.qtype;
+    if (client == NULL || (qt != FIRC_DNS_TYPE_A && qt != FIRC_DNS_TYPE_AAAA)) { return; }
+    firc_recall_answer(p->recall, client, ev.u.dns.name, qt == FIRC_DNS_TYPE_A ? FIRC_RECALL_V4 : FIRC_RECALL_V6,
+                       (uint8_t)FIRC_DNS_BLOCKED, NULL, now);
+}
+
 static firc_dns_verdict_t rewrite(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, int64_t now,
                                   const firc_group_snapshot_t *owner, const char *qname,
                                   const chain_t *chain, bool *pool_changed, firc_event_t *ev)
@@ -340,24 +357,6 @@ firc_dns_verdict_t firc_dns_pipeline_handle_message_from(firc_dns_pipeline_t *p,
             firc_logrep_reset(&p->outage);
         }
     }
-    const bool journalled = covered(p, client);
-    firc_event_t ev_store;
-    firc_event_t *ev = journalled ? &ev_store : NULL;
-    if (rcode != 0) {
-        if (ev != NULL) {
-            char nx[FIRC_DNS_MAX_NAME * 4 + 2];
-            if (!firc_dns_msg_queried_name(msg, nx, sizeof(nx))) { nx[0] = '\0'; }
-            journal_begin(ev, now, client, nx, msg, rcode, resolver);
-            const firc_group_snapshot_t *g =
-                nx[0] != '\0' ? firc_ruleset_snapshot_owner(p->snapshot, nx, client, p->policy_fn, p->device_fn,
-                                                            p->policy_ud, NULL)
-                              : NULL;
-            journal_group(ev, g);
-            journal_put(p, ev, FIRC_DNS_PASSED);
-        }
-        return FIRC_DNS_PASS;
-    }
-
     char qname[FIRC_DNS_MAX_NAME * 4 + 2];
     const firc_group_snapshot_t *owner = NULL, *matched = NULL;
     if (firc_dns_msg_queried_name(msg, qname, sizeof(qname))) {
@@ -365,6 +364,24 @@ firc_dns_verdict_t firc_dns_pipeline_handle_message_from(firc_dns_pipeline_t *p,
                                             &matched);
     } else {
         qname[0] = '\0';
+    }
+    if (owner != NULL && owner->block >= 0 && firc_dns_blockable(msg)) {
+        firc_block_answer_t answer = (firc_block_answer_t)owner->block;
+        if (firc_dns_msg_block(msg, answer, p->clamp_secs) != FIRC_OK) { return FIRC_DNS_DROP; }
+        note_blocked(p, msg, now, client, qname, owner, answer);
+        return FIRC_DNS_REWRITTEN;
+    }
+
+    const bool journalled = covered(p, client);
+    firc_event_t ev_store;
+    firc_event_t *ev = journalled ? &ev_store : NULL;
+    if (rcode != 0) {
+        if (ev != NULL) {
+            journal_begin(ev, now, client, qname, msg, rcode, resolver);
+            journal_group(ev, owner);
+            journal_put(p, ev, FIRC_DNS_PASSED);
+        }
+        return FIRC_DNS_PASS;
     }
 
     if (ev != NULL) {
@@ -437,6 +454,18 @@ firc_recall_t *firc_dns_pipeline_recall(firc_dns_pipeline_t *p)
 bool firc_dns_pipeline_covers(const firc_dns_pipeline_t *p, const firc_ip_t *client)
 {
     return p != NULL && covered(p, client);
+}
+
+void firc_dns_pipeline_note_blocked(firc_dns_pipeline_t *p, const firc_dns_msg_t *query, const firc_ip_t *client,
+                                    firc_block_answer_t answer)
+{
+    if (p == NULL || query == NULL) { return; }
+    char qname[FIRC_DNS_MAX_NAME * 4 + 2];
+    if (!firc_dns_msg_queried_name(query, qname, sizeof(qname))) { qname[0] = '\0'; }
+    const firc_group_snapshot_t *owner = qname[0] != '\0' && p->snapshot != NULL
+        ? firc_ruleset_snapshot_owner(p->snapshot, qname, client, p->policy_fn, p->device_fn, p->policy_ud, NULL)
+        : NULL;
+    note_blocked(p, query, (int64_t)time(NULL), client, qname, owner, answer);
 }
 
 const firc_group_snapshot_t *firc_dns_pipeline_owner(firc_dns_pipeline_t *p, const firc_dns_msg_t *query,

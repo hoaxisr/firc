@@ -2189,6 +2189,88 @@ TEST the_api_refuses_a_bad_interface_list_naming_the_field(void) {
     PASS();
 }
 
+/* Catches: block shown for a routing group, or a block group's answer not stored or not shown. */
+TEST a_block_groups_answer_round_trips_and_is_shown(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"b\",\"interface\":\"block\",\"block\":\"nxdomain\"}", &out));
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/groups/%s", jstr(out, "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", path, NULL, &out));
+    ASSERT_STR_EQ("nxdomain", jstr(out, "block"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"r\",\"interface\":\"nwg0\"}", &out));
+    ASSERT(cJSON_GetObjectItemCaseSensitive(out, "block") == NULL);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: group_move_into leaving block out, so any other edit resets the answer. */
+TEST an_update_keeps_the_answer(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"b\",\"interface\":\"block\",\"block\":\"nxdomain\"}", &out));
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/groups/%s", jstr(out, "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"renamed\",\"interface\":\"block\"}", &out));
+    ASSERT_STR_EQ("nxdomain", jstr(out, "block"));
+    cJSON_Delete(out);
+    ASSERT_EQ(FIRC_BLOCK_NXDOMAIN, firc_ruleset_group(only_group(h))->block);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"renamed\",\"interface\":\"block\",\"block\":\"null\"}", &out));
+    ASSERT_STR_EQ("null", jstr(out, "block"));
+    cJSON_Delete(out);
+    ASSERT_EQ(FIRC_BLOCK_NULL, firc_ruleset_group(only_group(h))->block);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a stale block key on a group that routes failing the save, or being stored. */
+TEST a_block_key_on_a_routing_group_is_ignored_by_the_api(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"g\",\"interface\":\"nwg0\"}", &out));
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/groups/%s", jstr(out, "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"g\",\"interface\":\"nwg0\",\"block\":\"refused\"}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", path, NULL, &out));
+    ASSERT(cJSON_GetObjectItemCaseSensitive(out, "block") == NULL);
+    cJSON_Delete(out);
+    ASSERT_EQ(FIRC_BLOCK_NULL, firc_ruleset_group(only_group(h))->block);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a bad answer stored, or block allowed inside an interface list through the API. */
+TEST the_api_refuses_a_bad_block_answer_and_block_in_a_list(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static const char *const bodies[] = {
+        "{\"name\":\"g\",\"interface\":\"block\",\"block\":\"nxdomian\"}",
+        "{\"name\":\"g\",\"interface\":\"block\",\"block\":7}",
+        "{\"name\":\"g\",\"interface\":\"block\",\"block\":[\"nxdomain\"]}",
+    };
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        cJSON *out = NULL;
+        ASSERT_EQm(bodies[i], 400, do_request("POST", "/api/v1/groups", bodies[i], &out));
+        ASSERT_STR_EQm(bodies[i], "block", jstr(out, "field"));
+        cJSON_Delete(out);
+    }
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups", "{\"name\":\"g\",\"interface\":[\"block\",\"nwg0\"]}", &out));
+    ASSERT_STR_EQ("interface", jstr(out, "field"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 static firc_err_t g_move_up_answer;
 static int g_move_up_calls;
 static firc_id_t g_move_up_id;
@@ -2357,6 +2439,10 @@ int main(int argc, char **argv) {
     RUN_TEST(the_api_takes_and_answers_an_interface_list);
     RUN_TEST(a_put_moves_a_live_group_between_list_lengths_both_ways);
     RUN_TEST(the_api_refuses_a_bad_interface_list_naming_the_field);
+    RUN_TEST(a_block_groups_answer_round_trips_and_is_shown);
+    RUN_TEST(an_update_keeps_the_answer);
+    RUN_TEST(a_block_key_on_a_routing_group_is_ignored_by_the_api);
+    RUN_TEST(the_api_refuses_a_bad_block_answer_and_block_in_a_list);
     RUN_TEST(a_list_group_answers_its_active_entry_and_entry_states);
     RUN_TEST(a_group_moved_to_its_second_entry_answers_it_as_active);
     RUN_TEST(move_up_asks_the_watcher_for_the_group_and_names_each_refusal);

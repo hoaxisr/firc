@@ -83,6 +83,8 @@ struct firc_dnsproxy {
     firc_dnsproxy_sock_ops_t ops;
     firc_dnsproxy_route_fn route_fn;
     void *route_ud;
+    firc_dnsproxy_blocked_cb blocked_fn;
+    void *blocked_ud;
     firc_ip_t pool4, pool6;
     uint8_t pool4_len, pool6_len;
     bool have_pool4, have_pool6;
@@ -207,6 +209,12 @@ void firc_dnsproxy_set_router(firc_dnsproxy_t *p, firc_dnsproxy_route_fn fn, voi
 {
     p->route_fn = fn;
     p->route_ud = ud;
+}
+
+void firc_dnsproxy_set_blocked(firc_dnsproxy_t *p, firc_dnsproxy_blocked_cb fn, void *ud)
+{
+    p->blocked_fn = fn;
+    p->blocked_ud = ud;
 }
 
 typedef struct leg {
@@ -1521,16 +1529,8 @@ typedef enum request_disp {
     REQ_FORWARD,      /* send upstream */
 } request_disp_t;
 
-static request_disp_t reply_ptr(firc_dnsproxy_t *p, exchange_t *ex, const firc_dns_msg_t *query,
-                                const char *name)
+static request_disp_t reply_local(firc_dnsproxy_t *p, exchange_t *ex, uint8_t *resp, size_t rlen)
 {
-    uint8_t *resp = NULL;
-    size_t rlen = 0;
-    firc_err_t err = firc_dns_make_ptr_response(query, name, p->ptr_ttl, &resp, &rlen);
-    if (err == FIRC_ERR_INVAL && name != NULL) {
-        err = firc_dns_make_ptr_response(query, NULL, p->ptr_ttl, &resp, &rlen);
-    }
-    if (err != FIRC_OK) { return REQ_DROP; }
     if (ex->is_tcp) {
         ex->out = malloc(rlen + 2);
         if (ex->out == NULL) {
@@ -1548,6 +1548,30 @@ static request_disp_t reply_ptr(firc_dnsproxy_t *p, exchange_t *ex, const firc_d
     udp_reply(p, ex, resp, rlen);
     free(resp);
     return REQ_DROP; /* UDP reply is synchronous; free ex */
+}
+
+static request_disp_t reply_ptr(firc_dnsproxy_t *p, exchange_t *ex, const firc_dns_msg_t *query,
+                                const char *name)
+{
+    uint8_t *resp = NULL;
+    size_t rlen = 0;
+    firc_err_t err = firc_dns_make_ptr_response(query, name, p->ptr_ttl, &resp, &rlen);
+    if (err == FIRC_ERR_INVAL && name != NULL) {
+        err = firc_dns_make_ptr_response(query, NULL, p->ptr_ttl, &resp, &rlen);
+    }
+    if (err != FIRC_OK) { return REQ_DROP; }
+    return reply_local(p, ex, resp, rlen);
+}
+
+static request_disp_t reply_block(firc_dnsproxy_t *p, exchange_t *ex, const firc_dns_msg_t *query,
+                                  const firc_ip_t *client, firc_block_answer_t answer)
+{
+    uint8_t *resp = NULL;
+    size_t rlen = 0;
+    if (firc_dns_make_block_response(query, answer, p->ptr_ttl, &resp, &rlen) != FIRC_OK) { return REQ_DROP; }
+    request_disp_t disp = reply_local(p, ex, resp, rlen);
+    if (p->blocked_fn != NULL) { p->blocked_fn(p->blocked_ud, query, client, answer); }
+    return disp;
 }
 
 static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
@@ -1573,9 +1597,16 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
     ex->resolver = FIRC_DNS_RESOLVER_UPSTREAM;
     if (p->route_fn != NULL) {
         firc_ip_t client;
+        const firc_ip_t *cp = client_ip(ex, &client) ? &client : NULL;
         firc_dnsproxy_route_t rt;
-        if (p->route_fn(p->route_ud, req_msg, client_ip(ex, &client) ? &client : NULL, &rt) &&
-            rt.n_servers > 0 && rt.n_servers <= FIRC_RESOLVE_MAX_SERVERS && rt.mark != 0) {
+        rt.blocked = false;
+        bool routed = p->route_fn(p->route_ud, req_msg, cp, &rt);
+        if (routed && rt.blocked) {
+            request_disp_t disp = reply_block(p, ex, req_msg, cp, rt.answer);
+            firc_dns_msg_free(req_msg);
+            return disp;
+        }
+        if (routed && rt.n_servers > 0 && rt.n_servers <= FIRC_RESOLVE_MAX_SERVERS && rt.mark != 0) {
             ex->route = rt;
             ex->cacheable = firc_anscache_key_of(req_msg, rt.group_id, rt.gen, &ex->ckey);
             firc_anscache_hit_t hit;

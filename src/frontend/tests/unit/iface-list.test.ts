@@ -73,6 +73,12 @@ describe("canBackup", () => {
     assert.strictEqual(canBackup(["wg0"], "blackhole"), false);
     assert.strictEqual(canBackup(["blackhole"], "wg0"), false);
   });
+  // Catches block offered as a backup, or a block group given circles, so a list could hold it.
+  it("offers no circle for block, nor on a block group", () => {
+    assert.strictEqual(canBackup(["wg0"], "block"), false);
+    assert.strictEqual(canBackup(["block"], "wg0"), false);
+    assert.deepStrictEqual(toggleEntry(["wg0"], "block"), ["wg0"]);
+  });
 });
 
 describe("chainLabel", () => {

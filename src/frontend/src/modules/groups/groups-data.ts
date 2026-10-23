@@ -1,3 +1,4 @@
+import { BLOCK } from "../../data/iface-choices";
 import { configFrom, DEFAULT_RESOLVE, syncIdle, type Group, type Rule } from "../../types";
 import { randomId } from "../../utils/random-id";
 import { cleanComment } from "../../utils/rule-comment";
@@ -157,6 +158,14 @@ export function restoreGroupRulesOrder(group: Group, ruleIds: string[]) {
   return true;
 }
 
+export function withoutStaleBlock<T extends { interface: string | string[]; block?: unknown }>(
+  group: T,
+): T {
+  if (group.interface === BLOCK) return group;
+  const { block: _block, ...rest } = group;
+  return rest as T;
+}
+
 export function toConfigPayload(groups: Group[]) {
-  return { groups: structuredClone(groups) };
+  return { groups: structuredClone(groups).map(withoutStaleBlock) };
 }

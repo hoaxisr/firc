@@ -46,6 +46,11 @@ typedef struct firc_group_resolve {
 
 #define FIRC_GROUP_IFACES_MAX 4
 
+/* The interface value of a group that routes nothing and answers its names locally. */
+#define FIRC_IFACE_BLOCK "block"
+
+typedef enum { FIRC_BLOCK_NULL = 0, FIRC_BLOCK_NXDOMAIN, FIRC_BLOCK_REFUSED } firc_block_answer_t;
+
 typedef struct firc_group {
     firc_id_t id;
     char *name;
@@ -57,6 +62,7 @@ typedef struct firc_group {
     size_t n_rules;
     firc_devsel_spec_t devices;
     firc_group_resolve_t resolve;
+    firc_block_answer_t block;
     firc_group_list_t *list; /* NULL: a manual group */
 } firc_group_t;
 
@@ -68,6 +74,12 @@ static inline const char *firc_group_iface_at(const firc_group_t *g, size_t i)
     if (i == 0) { return g->iface != NULL ? g->iface : ""; }
     return i - 1 < g->n_iface_rest ? g->iface_rest[i - 1] : "";
 }
+/* Whether g's interface is exactly block, alone. */
+bool firc_group_is_block(const firc_group_t *g);
+/* "null", "nxdomain" or "refused". */
+const char *firc_block_answer_name(firc_block_answer_t a);
+/* Reads one of those three names into *out; false for anything else. */
+bool firc_block_answer_parse(const char *s, firc_block_answer_t *out);
 /* Whether name is an entry of g's list. */
 bool firc_group_has_iface(const firc_group_t *g, const char *name);
 /* NULL when names is a valid list of 1..4; else why, with *bad the offending index. */

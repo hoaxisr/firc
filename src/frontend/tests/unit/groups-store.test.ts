@@ -110,4 +110,14 @@ describe("Groups data API", () => {
 
     assert.strictEqual(groups[0].name, "group-g1");
   });
+
+  // Catches a group moved off block still sending its answer (a field the daemon ignores there), or a block group losing it.
+  it("sends a block answer only for a group on block", () => {
+    const blocked = { ...makeGroup("g1", []), interface: "block", block: "nxdomain" as const };
+    const moved = { ...makeGroup("g2", []), interface: "nwg0", block: "refused" as const };
+    const payload = toConfigPayload([blocked, moved]);
+    assert.strictEqual(payload.groups[0].block, "nxdomain");
+    assert.strictEqual("block" in payload.groups[1], false);
+    assert.strictEqual(moved.block, "refused");
+  });
 });

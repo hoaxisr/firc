@@ -130,6 +130,9 @@ export type SystemResolvers = {
   resolvers: { interface: string; servers: string[] }[];
 };
 
+export const BLOCK_ANSWERS = ["null", "nxdomain", "refused"] as const;
+export type BlockAnswer = (typeof BLOCK_ANSWERS)[number];
+
 export const GroupSchema = object({
   id: fallback(pipe(string(), length(8), regex(/^[0-9a-f]{8}/)), () => randomId()),
   name: fallback(string(), ""),
@@ -140,6 +143,7 @@ export const GroupSchema = object({
   list: optional(nullable(GroupListSchema)),
   resolve: fallback(GroupResolveSchema, DEFAULT_RESOLVE),
   resolver: optional(GroupResolverSchema),
+  block: optional(fallback(picklist(BLOCK_ANSWERS), "null")),
 });
 export type Group = InferOutput<typeof GroupSchema>;
 
