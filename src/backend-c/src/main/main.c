@@ -716,6 +716,12 @@ static firc_dns_verdict_t on_response(firc_dns_msg_t *msg, const firc_ip_t *clie
     return v;
 }
 
+static void on_iface_event(void *ud, const char *iface)
+{
+    struct daemon *d = ud;
+    if (d->ifwatch != NULL) { firc_ifwatch_nudge(d->ifwatch, iface); }
+}
+
 static bool *lan_wan_snapshot(const firc_app_config_t *running)
 {
     bool *wan = calloc(running->n_link + 1, sizeof *wan);
@@ -1614,6 +1620,8 @@ int main(int argc, char **argv)
         .config_path = config_path,
         .config_version = FIRC_VERSION,
         .tunnels = firc_tunrun_config(d.tunrun),
+        .iface_event = on_iface_event,
+        .iface_event_ud = &d,
     };
 #ifdef FIRC_ENTWARE_KN
     system_ctx.policies = d.policies;

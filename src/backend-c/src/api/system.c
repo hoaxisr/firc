@@ -11,6 +11,7 @@
 
 #include "firc/keenetic_policy.h"
 #include "firc/events.h"
+#include "firc/ifacename.h"
 #include "firc/json.h"
 #include "firc/keenetic_rci.h"
 #include "firc/keenetic_resolvers.h"
@@ -532,6 +533,28 @@ static void handle_netfilterd_hook(firc_http_req_t *req, firc_http_res_t *res, v
     firc_http_res_write(res, 200, NULL, NULL, 0);
 }
 
+static void handle_iflayer_hook(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    firc_system_ctx_t *ctx = ud;
+    size_t body_len;
+    const uint8_t *body = firc_http_req_body(req, &body_len);
+    cJSON *json = body_len > 0 ? cJSON_ParseWithLength((const char *)body, body_len) : NULL;
+    const cJSON *iface = cJSON_GetObjectItemCaseSensitive(json, "iface");
+    if (!cJSON_IsString(iface) || !firc_is_interface_name(iface->valuestring)) {
+        cJSON_Delete(json);
+        firc_http_res_write_error(res, 400, "an interface name is required");
+        return;
+    }
+    const cJSON *layer = cJSON_GetObjectItemCaseSensitive(json, "layer");
+    const cJSON *level = cJSON_GetObjectItemCaseSensitive(json, "level");
+    char l1[33], l2[33];
+    firc_interface_name_for_log(cJSON_IsString(layer) ? layer->valuestring : "", l1, sizeof(l1));
+    firc_interface_name_for_log(cJSON_IsString(level) ? level->valuestring : "", l2, sizeof(l2));
+    FIRC_DEBUG("received iflayerchanged.d event: iface=%s layer=%s level=%s", iface->valuestring, l1, l2);
+    if (ctx->iface_event != NULL) { ctx->iface_event(ctx->iface_event_ud, iface->valuestring); }
+    cJSON_Delete(json);
+    firc_http_res_write(res, 200, NULL, NULL, 0);
+}
+
 void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/system/interfaces", handle_list_interfaces, ctx);
     must_route(h, "GET", "/api/v1/system/events", handle_events, ctx);
@@ -541,5 +564,6 @@ void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/system/netfilter", handle_netfilter, ctx);
     must_route(h, "POST", "/api/v1/system/config/save", handle_save_config, ctx);
     must_route(h, "POST", "/api/v1/system/hooks/netfilterd", handle_netfilterd_hook, ctx);
+    must_route(h, "POST", "/api/v1/system/hooks/iflayer", handle_iflayer_hook, ctx);
     firc_settings_register_routes(h, ctx);
 }

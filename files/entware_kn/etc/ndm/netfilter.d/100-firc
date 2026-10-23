@@ -2,7 +2,18 @@
 SOCKET_PATH="/tmp/firc/firc.sock"
 [ -S "$SOCKET_PATH" ] || exit 0
 
-BODY="{\"type\":\"$type\",\"table\":\"$table\"}"
+case "$0" in
+*/iflayerchanged.d/*)
+  case "$system_name" in ''|*[!A-Za-z0-9_.:-]*) exit 0 ;; esac
+  case "$layer$level" in *[!A-Za-z0-9_-]*) exit 0 ;; esac
+  ENDPOINT=/api/v1/system/hooks/iflayer
+  BODY="{\"iface\":\"$system_name\",\"layer\":\"$layer\",\"level\":\"$level\"}"
+  ;;
+*)
+  ENDPOINT=/api/v1/system/hooks/netfilterd
+  BODY="{\"type\":\"$type\",\"table\":\"$table\"}"
+  ;;
+esac
 LENGTH=$(printf "%s" "$BODY" | wc -c)
 
 # connect-timeout keeps a full accept queue from blocking the firmware; support is probed once per boot.
@@ -34,7 +45,7 @@ fi
 [ -z "$CT" ] && command -v timeout >/dev/null 2>&1 && WRAP="timeout 3"
 # Drop the cache only on "unknown option": a refused connection also exits 1 while the daemon starts.
 ERR=`$WRAP socat - "UNIX-CONNECT:$SOCKET_PATH$CT" 2>&1 >/dev/null <<EOF
-POST /api/v1/system/hooks/netfilterd HTTP/1.1
+POST $ENDPOINT HTTP/1.1
 Host:
 Content-Type: application/json
 Content-Length: $LENGTH

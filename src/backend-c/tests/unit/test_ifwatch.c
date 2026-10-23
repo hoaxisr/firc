@@ -408,6 +408,59 @@ static firc_ifwatch_t *tunnel_first_both_alive(void) {
     return w;
 }
 
+/* Catches: an NDM event that asks no check, asks one on every event, or decides the entry's state itself. */
+TEST an_ndm_event_pulls_a_check_forward_once_per_interval(void) {
+    firc_ifwatch_t *w = both_alive();
+    firc_ifwatch_nudge(w, "up0");
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)2, times_queued("up0"), "%zu");
+    g_now += 15000;
+    result(w, "up0", true, false);
+    g_now += 4000;
+    firc_ifwatch_nudge(w, "up0");
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMTm("a second event inside the interval asks nothing", (size_t)2, times_queued("up0"), "%zu");
+    g_now += 10999;
+    firc_ifwatch_nudge(w, "up0");
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)2, times_queued("up0"), "%zu");
+    g_now += 1;
+    firc_ifwatch_nudge(w, "up0");
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)3, times_queued("up0"), "%zu");
+    ASSERT(firc_ifwatch_pick(w, g_groups[0]).active == 0);
+    done(w);
+    PASS();
+}
+
+/* Catches: an NDM event spending the budget a kernel link-up needs to ask its own check. */
+TEST an_ndm_event_never_holds_back_a_link_up(void) {
+    firc_ifwatch_t *w = both_alive();
+    firc_ifwatch_nudge(w, "up0");
+    firc_ifwatch_tick(w);
+    g_now += 2000;
+    result(w, "up0", true, false);
+    g_now += 1000;
+    firc_ifwatch_link(w, "up0", true);
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)3, times_queued("up0"), "%zu");
+    done(w);
+    PASS();
+}
+
+/* Catches: an NDM event on a tunnel entry, which is never checked, queuing a check. */
+TEST an_ndm_event_on_a_tunnel_entry_asks_nothing(void) {
+    firc_ifwatch_t *w = tunnel_first_both_alive();
+    size_t before = times_queued("tunvless0");
+    firc_ifwatch_nudge(w, "tunvless0");
+    firc_ifwatch_nudge(w, "nosuch0");
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT(before, times_queued("tunvless0"), "%zu");
+    done(w);
+    PASS();
+}
+
+
 TEST a_tunnel_removed_from_the_config_is_dead_and_the_group_moves(void) {
     firc_ifwatch_t *w = tunnel_first_both_alive();
     ASSERT_EQ_FMT((size_t)0, g_n_moves, "%zu");
@@ -909,6 +962,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_link_down_moves_at_once_without_a_check);
     RUN_TEST(a_link_up_leaves_a_pending_confirm_where_it_is);
     RUN_TEST(a_chatty_link_pulls_a_check_forward_once_per_interval);
+    RUN_TEST(an_ndm_event_pulls_a_check_forward_once_per_interval);
+    RUN_TEST(an_ndm_event_on_a_tunnel_entry_asks_nothing);
+    RUN_TEST(an_ndm_event_never_holds_back_a_link_up);
     RUN_TEST(a_refresh_reads_the_link_and_finds_it_gone);
     RUN_TEST(a_tunnel_entry_follows_its_status_and_is_never_queued);
     RUN_TEST(a_tunnel_removed_from_the_config_is_dead_and_the_group_moves);

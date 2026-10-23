@@ -23,6 +23,8 @@ typedef struct watched_if {
     uint32_t gen;
     bool pulled;
     int64_t pulled_ms;
+    bool nudged;
+    int64_t nudged_ms;
     int64_t due_ms;
     firc_checkroute_t route;
     firc_logrep_t said;
@@ -392,6 +394,20 @@ void firc_ifwatch_results(firc_ifwatch_t *w, const firc_ifcheck_result_t *r, siz
     choose_all(w, now);
 }
 
+static void pull(const firc_ifwatch_t *w, watched_if_t *wi, int64_t now, bool *done, int64_t *done_ms) {
+    bool may_pull = !*done || now - *done_ms >= w->interval_ms;
+    if (!wi->in_flight && !wi->track.suspect && may_pull && wi->due_ms > now) {
+        wi->due_ms = now;
+        *done = true;
+        *done_ms = now;
+    }
+}
+
+void firc_ifwatch_nudge(firc_ifwatch_t *w, const char *name) {
+    watched_if_t *wi = find_if(w, name);
+    if (wi != NULL) { pull(w, wi, now_ms(w), &wi->nudged, &wi->nudged_ms); }
+}
+
 void firc_ifwatch_link(firc_ifwatch_t *w, const char *name, bool up) {
     watched_if_t *wi = find_if(w, name);
     if (wi == NULL) { return; }
@@ -399,12 +415,7 @@ void firc_ifwatch_link(firc_ifwatch_t *w, const char *name, bool up) {
     if (up) {
         if (wi->tunnel) { return; }
         if (wi->routed && w->d.rtnl != NULL) { (void)firc_checkroute_refresh(w->d.rtnl, &wi->route); }
-        bool may_pull = !wi->pulled || now - wi->pulled_ms >= w->interval_ms;
-        if (!wi->in_flight && !wi->track.suspect && may_pull && wi->due_ms > now) {
-            wi->due_ms = now;
-            wi->pulled = true;
-            wi->pulled_ms = now;
-        }
+        pull(w, wi, now, &wi->pulled, &wi->pulled_ms);
         return;
     }
     if (tunnel_still_starting(w, wi, now)) { return; }

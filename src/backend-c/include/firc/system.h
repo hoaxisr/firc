@@ -25,6 +25,8 @@ typedef struct firc_system_ctx {
     const firc_tunnels_t *tunnels; /* the running tunnels, read on the loop thread; NULL if none */
     firc_update_t *update; /* the updater, whose install refuses a restart; NULL if none */
     struct ifaces_read *ifaces_read; /* the interface read in flight, NULL if none; loop thread only */
+    void (*iface_event)(void *ud, const char *iface); /* an NDM layer event on iface; NULL ignores them */
+    void *iface_event_ud;
 } firc_system_ctx_t;
 
 void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx);

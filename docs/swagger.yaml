@@ -979,6 +979,20 @@ definitions:
         example: eyJhbGciOiJIUzI1NiJ9...
         type: string
     type: object
+  types.IfLayerHookReq:
+    properties:
+      iface:
+        example: nwg0
+        type: string
+      layer:
+        example: link
+        type: string
+      level:
+        example: disabled
+        type: string
+    required:
+    - iface
+    type: object
   types.NetfilterDHookReq:
     properties:
       table:
@@ -2649,6 +2663,30 @@ paths:
       summary: 'Install a newer release'
       tags:
       - config
+  /api/v1/system/hooks/iflayer:
+    post:
+      consumes:
+      - application/json
+      description: 'An NDM iflayerchanged.d event: the interface''s next regular check comes forward, at most once per check interval. The event never decides the interface''s state.'
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.IfLayerHookReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'iflayerchanged.d event hook'
+      tags:
+      - hooks
   /api/v1/system/hooks/netfilterd:
     post:
       consumes:

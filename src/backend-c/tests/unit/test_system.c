@@ -516,6 +516,31 @@ TEST netfilterd_hook_ok_and_bad_json(void) {
     PASS();
 }
 
+static char g_nudged[4][16];
+static size_t g_n_nudged;
+
+static void record_nudge(void *ud, const char *iface) {
+    (void)ud;
+    if (g_n_nudged < 4) { snprintf(g_nudged[g_n_nudged++], sizeof(g_nudged[0]), "%s", iface); }
+}
+
+/* Catches: an NDM layer event not handed to the interface watcher, or a name that is not one handed over. */
+TEST an_ndm_layer_event_reaches_the_interface_watcher(void) {
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    g_n_nudged = 0;
+    h->ctx.iface_event = record_nudge;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/system/hooks/iflayer",
+                              "{\"iface\":\"nwg0\",\"layer\":\"link\",\"level\":\"disabled\"}", NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/system/hooks/iflayer", "{\"iface\":\"a b/c\"}", NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/system/hooks/iflayer", "{\"layer\":\"link\"}", NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/system/hooks/iflayer", "not json", NULL));
+    ASSERT_EQ_FMT((size_t)1, g_n_nudged, "%zu");
+    ASSERT_STR_EQ("nwg0", g_nudged[0]);
+    harness_stop(h);
+    PASS();
+}
+
 /* Catches: a dns event field missing or misnamed, v6 formatted wrong, or a group without one. */
 TEST a_dns_event_is_answered_with_every_field(void) {
     harness_t *h = harness_start(false);
@@ -990,6 +1015,7 @@ int main(int argc, char **argv) {
     RUN_TEST(save_config_writes_file);
     RUN_TEST(save_config_noop_without_path);
     RUN_TEST(netfilterd_hook_ok_and_bad_json);
+    RUN_TEST(an_ndm_layer_event_reaches_the_interface_watcher);
     RUN_TEST(a_dns_event_is_answered_with_every_field);
     RUN_TEST(every_resolver_source_has_its_name);
     RUN_TEST(a_bypass_event_is_answered_with_every_field);

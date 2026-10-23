@@ -58,6 +58,10 @@ void firc_ifwatch_results(firc_ifwatch_t *w, const firc_ifcheck_result_t *r, siz
 /* A link event; down is dead at once, up brings a regular check forward, at most once per interval. */
 void firc_ifwatch_link(firc_ifwatch_t *w, const char *name, bool up);
 
+/* Something changed on name outside the kernel (an NDM layer event): its regular check comes forward, at most once
+ * per interval; an unknown name is left alone. */
+void firc_ifwatch_nudge(firc_ifwatch_t *w, const char *name);
+
 /* Reads the links again (NULL: every one) and writes their check routes again. */
 void firc_ifwatch_refresh(firc_ifwatch_t *w, const char *name);
 

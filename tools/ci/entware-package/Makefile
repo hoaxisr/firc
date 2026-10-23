@@ -414,6 +414,10 @@ define Package/firc/install
 	$(INSTALL_BIN) \
 		$(PKG_BUILD_DIR)/files/entware_kn/etc/ndm/netfilter.d/100-firc \
 		$(1)/opt/etc/ndm/netfilter.d/100-firc
+	$(INSTALL_DIR) $(1)/opt/etc/ndm/iflayerchanged.d
+	$(INSTALL_BIN) \
+		$(PKG_BUILD_DIR)/files/entware_kn/etc/ndm/netfilter.d/100-firc \
+		$(1)/opt/etc/ndm/iflayerchanged.d/100-firc
 endef
 
 $(eval $(call BuildPackage,firc))

@@ -322,7 +322,7 @@ jobs:
             done
             # the payload must carry the init script, the hook and the configs
             payload_list=$(tar -tzf "$data_archive")
-            for f in opt/etc/init.d/S99firc opt/etc/ndm/netfilter.d/100-firc \
+            for f in opt/etc/init.d/S99firc opt/etc/ndm/netfilter.d/100-firc opt/etc/ndm/iflayerchanged.d/100-firc \
                      opt/etc/firc/firc.conf opt/etc/firc/groups.yaml; do
               echo "$payload_list" | grep -Eq "^(\./)?$f\$" || { echo "data.tar.gz has no $f" >&2; exit 1; }
             done
