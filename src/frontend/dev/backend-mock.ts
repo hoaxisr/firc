@@ -163,6 +163,42 @@ if (!DATA.groups.some((g: any) => g.id === "ad5ad5ad")) {
   });
 }
 
+if (!DATA.groups.some((g: any) => g.id === "g1g1g1g1")) {
+  DATA.groups.unshift({
+    id: "g1g1g1g1",
+    name: "Example Group",
+    interface: "nwg0",
+    enable: true,
+    devices: { allow: [], deny: [] },
+    rules: [
+      { enable: true, id: "e1e1e101", rule: "facebook.com", type: "namespace" },
+      { enable: true, id: "e1e1e102", rule: "youtube.com", type: "namespace" },
+    ],
+  });
+}
+if (!DATA.groups.some((g: any) => g.id === "4d5b10c0")) {
+  DATA.groups.push({
+    id: "4d5b10c0",
+    name: "Kids block",
+    interface: "block",
+    block: "null",
+    enable: true,
+    devices: { allow: ["mac:aa:00:00:00:00:03"], deny: [] },
+    rules: [{ enable: true, id: "4d5b1001", rule: "tiktok.com", type: "namespace" }],
+  });
+}
+if (!DATA.groups.some((g: any) => g.id === "7ac7e125")) {
+  DATA.groups.push({
+    id: "7ac7e125",
+    name: "Trackers",
+    interface: "block",
+    block: "null",
+    enable: true,
+    devices: { allow: [], deny: [] },
+    rules: [{ enable: true, id: "7ac7e101", rule: "app-measurement.com", type: "namespace" }],
+  });
+}
+
 const LIVE_REASONS: Record<string, string> = {};
 let NETFILTER: Record<string, unknown> = { ok: true };
 
@@ -312,6 +348,7 @@ const LOG_SAMPLES: [string, string, string][] = [
   ["debug", "tunvless0", "tun: rx 40"],
 ];
 function pushEvent(e: Fresh<Event>) {
+  if (e.kind === "dns") tally(e.name, e.client, e.group?.id ?? "", e.decision === "blocked");
   eventSeq += 1;
   EVENTS.push({ ...e, seq: eventSeq, at: Math.floor(Date.now() / 1000) });
   if (EVENTS.length > EVENTS_RING) EVENTS.shift();
@@ -1140,6 +1177,24 @@ const HOSTS = {
       policy: "Policy0",
     },
     {
+      mac: "aa:00:00:00:00:05",
+      name: "iPad",
+      ip: "192.168.1.51",
+      ip6: [],
+      active: true,
+      registered: true,
+      policy: "",
+    },
+    {
+      mac: "aa:00:00:00:00:06",
+      name: "Desktop",
+      ip: "192.168.1.42",
+      ip6: [],
+      active: true,
+      registered: true,
+      policy: "",
+    },
+    {
       mac: "aa:00:00:00:00:04",
       name: "",
       ip: "192.168.1.8",
@@ -1370,11 +1425,38 @@ app.post(`${API_BASE}/system/update/install`, async (c) => {
 
 const CAPTURE_SECONDS = 300;
 let CAPTURE: { token: string; endsAt: number } | null = null;
+let CAPTURE_LAST: {
+  startedAt: number;
+  endedAt: number;
+  ended: "reached-end" | "stopped";
+  leaks: number;
+  summary: string[];
+} | null = null;
+
+function endCapture(endedAt: number, ended: "reached-end" | "stopped") {
+  if (!CAPTURE) return;
+  const startedAt = CAPTURE.endsAt - CAPTURE_SECONDS;
+  const leaks = EVENTS.filter(
+    (e) => e.kind === "bypass" && e.at >= startedAt && e.at <= endedAt,
+  ).length;
+  CAPTURE_LAST = {
+    startedAt,
+    endedAt,
+    ended,
+    leaks,
+    summary: [
+      `${leaks * 23 + 4} packets read, ${leaks} bypasses reported.`,
+      "3 packets carried no server name this reader could take: a hello spanning segments reads the same as a client that sent none.",
+    ],
+  };
+  CAPTURE = null;
+}
 
 function captureStatus(withToken: boolean) {
   const now = Math.floor(Date.now() / 1000);
-  if (CAPTURE && CAPTURE.endsAt <= now) CAPTURE = null;
-  if (!CAPTURE) return { running: false };
+  if (CAPTURE && CAPTURE.endsAt <= now) endCapture(CAPTURE.endsAt, "reached-end");
+  const last = CAPTURE_LAST ? { last: CAPTURE_LAST } : {};
+  if (!CAPTURE) return { running: false, ...last };
   return {
     running: true,
     endsAt: CAPTURE.endsAt,
@@ -1387,6 +1469,7 @@ app.get(`${API_BASE}/system/capture`, (c) => c.json(captureStatus(false)));
 
 app.post(`${API_BASE}/system/capture`, (c) => {
   if (captureStatus(false).running) return c.json({ error: "a capture is already running" }, 409);
+  CAPTURE_LAST = null;
   CAPTURE = {
     token: "0123456789abcdef",
     endsAt: Math.floor(Date.now() / 1000) + CAPTURE_SECONDS,
@@ -1402,7 +1485,7 @@ app.delete(`${API_BASE}/system/capture`, (c) => {
   if (CAPTURE && token !== CAPTURE.token) {
     return c.json({ error: "the running capture is not the one this token names" }, 409);
   }
-  CAPTURE = null;
+  endCapture(Math.floor(Date.now() / 1000), "stopped");
   return c.json(captureStatus(false));
 });
 
@@ -1424,6 +1507,163 @@ app.get(`${API_BASE}/system/events`, (c) => {
     dropped,
     boot: EVENTS_BOOT,
   });
+});
+
+type StatKey = {
+  name: string;
+  client: string;
+  hours: number[];
+  blocked: number[];
+  last: number;
+  owner: string;
+  ownerBlocked: boolean;
+};
+const STATS_SINCE = NOW() - 3 * 86400;
+const STATS = new Map<string, StatKey>();
+
+function tally(name: string, client: string, owner: string, blocked: boolean, at = NOW()) {
+  const id = `${name}|${client}`;
+  let k = STATS.get(id);
+  if (!k) {
+    k = { name, client, hours: [], blocked: [], last: 0, owner: "", ownerBlocked: false };
+    STATS.set(id, k);
+  }
+  k.hours.push(at);
+  if (blocked) k.blocked.push(at);
+  if (at >= k.last) {
+    k.last = at;
+    k.owner = owner;
+    k.ownerBlocked = blocked;
+  }
+}
+
+const STATS_SEED: [string, string, number, number, string][] = [
+  ["googlevideo.com", "192.168.1.51", 120, 0, ""],
+  ["googlevideo.com", "fd00::5", 60, 0, ""],
+  ["googlevideo.com", "192.168.1.7", 31, 0, ""],
+  ["googlevideo.com", "192.168.1.8", 12, 0, ""],
+  ["youtube.com", "192.168.1.42", 70, 0, "g1g1g1g1"],
+  ["youtube.com", "192.168.1.7", 42, 0, "g1g1g1g1"],
+  ["youtube.com", "192.168.1.51", 29, 0, "g1g1g1g1"],
+  ["connectivitycheck.gstatic.com", "fd00::5", 80, 0, ""],
+  ["connectivitycheck.gstatic.com", "192.168.1.8", 21, 0, ""],
+  ["connectivitycheck.gstatic.com", "192.168.1.7", 35, 0, ""],
+  ["ya.ru", "fd00::5", 60, 0, ""],
+  ["ya.ru", "192.168.1.8", 39, 0, ""],
+  ["ya.ru", "192.168.1.7", 16, 0, ""],
+  ["api.telegram.org", "192.168.1.7", 56, 0, ""],
+  ["api.telegram.org", "192.168.1.42", 49, 0, ""],
+  ["i.ytimg.com", "fd00::5", 50, 0, ""],
+  ["i.ytimg.com", "192.168.1.7", 23, 0, ""],
+  ["i.ytimg.com", "192.168.1.51", 19, 0, ""],
+  ["mc.yandex.ru", "192.168.1.51", 50, 30, "ad5ad5ad"],
+  ["mc.yandex.ru", "192.168.1.7", 12, 4, "ad5ad5ad"],
+  ["mc.yandex.ru", "fd00::5", 29, 9, "ad5ad5ad"],
+  ["ads.doubleclick.net", "192.168.1.51", 40, 40, "ad5ad5ad"],
+  ["ads.doubleclick.net", "192.168.1.42", 32, 32, "ad5ad5ad"],
+  ["ads.doubleclick.net", "192.168.1.7", 16, 16, "ad5ad5ad"],
+  ["github.com", "192.168.1.42", 71, 0, ""],
+  ["icloud.com", "192.168.1.7", 34, 0, ""],
+  ["icloud.com", "192.168.1.51", 29, 0, ""],
+  ["graph.facebook.com", "192.168.1.51", 30, 0, "g1g1g1g1"],
+  ["graph.facebook.com", "192.168.1.8", 20, 0, "g1g1g1g1"],
+  ["mail.yandex.ru", "192.168.1.8", 32, 0, ""],
+  ["mail.yandex.ru", "192.168.1.51", 10, 0, ""],
+  ["mail.yandex.ru", "192.168.1.7", 10, 0, ""],
+  ["tracker.example.com", "192.168.1.7", 30, 30, "ad5ad5ad"],
+  ["tracker.example.com", "192.168.1.42", 20, 20, "ad5ad5ad"],
+  ["time.apple.com", "192.168.1.7", 22, 0, ""],
+  ["app-measurement.com", "192.168.1.51", 14, 10, "7ac7e125"],
+  ["web.whatsapp.com", "192.168.1.42", 8, 0, ""],
+  ["example.com", "192.168.1.8", 4, 0, ""],
+  [
+    "5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa",
+    "fd00::5",
+    40,
+    0,
+    "",
+  ],
+  ["7.1.168.192.in-addr.arpa", "192.168.1.7", 25, 0, ""],
+];
+for (const [i, [name, client, n, blocked, owner]] of STATS_SEED.entries()) {
+  const lastAgo = [0, 600, 1200, 2400, 5 * 3600][i % 5];
+  for (let j = 0; j < n; j++) {
+    tally(name, client, owner, j < blocked, NOW() - lastAgo - (n - 1 - j) * 97);
+  }
+}
+
+function statsAnswer(
+  device: string[] | null,
+  q: string,
+  arpa: boolean,
+  offset: number,
+  limit: number,
+) {
+  const from = NOW() - 86400;
+  const keys = [...STATS.values()].filter(
+    (k) =>
+      (arpa || !k.name.endsWith(".arpa")) &&
+      (!device || device.includes(k.client)) &&
+      k.hours.some((at) => at > from),
+  );
+  const byName = new Map<string, StatKey[]>();
+  for (const k of keys) byName.set(k.name, [...(byName.get(k.name) ?? []), k]);
+  const count = (k: StatKey) => k.hours.filter((at) => at > from).length;
+  const countBlocked = (k: StatKey) => k.blocked.filter((at) => at > from).length;
+  const rows = [...byName.entries()].map(([name, ks]) => {
+    const latest = ks.reduce((a, b) => (b.last > a.last ? b : a));
+    const g = DATA.groups.find((x: any) => x.id === latest.owner);
+    const clients = ks
+      .map((k) => ({ address: k.client, queries: count(k) }))
+      .sort((a, b) => b.queries - a.queries);
+    return {
+      name,
+      queries: clients.reduce((a, c) => a + c.queries, 0),
+      blocked: ks.reduce((a, k) => a + countBlocked(k), 0),
+      last: latest.last,
+      owner: g
+        ? {
+            id: g.id,
+            name: g.name,
+            interface: activeOf(g, ACTIVE[g.id]),
+            blocked: latest.ownerBlocked,
+          }
+        : null,
+      clients: clients.slice(0, 16),
+      clientsTotal: clients.length,
+    };
+  });
+  const matched = rows
+    .filter((r) => r.name.includes(q))
+    .sort((a, b) => b.queries - a.queries || a.name.localeCompare(b.name));
+  return {
+    window: 86400,
+    now: NOW(),
+    since: STATS_SINCE,
+    queries: keys.reduce((a, k) => a + count(k), 0),
+    blocked: keys.reduce((a, k) => a + countBlocked(k), 0),
+    domains: byName.size,
+    rows: matched.slice(offset, offset + limit),
+    matched: matched.length,
+    offset,
+  };
+}
+
+app.get(`${API_BASE}/system/dnsstats`, (c) => {
+  const offset = Number(c.req.query("offset") ?? 0);
+  let limit = Number(c.req.query("limit") ?? 50) || 50;
+  if (limit > 500) limit = 500;
+  if (!Number.isInteger(offset) || offset < 0 || offset + limit > 550) {
+    return c.json({ error: "invalid offset: offset + limit is at most 550" }, 400);
+  }
+  const raw = c.req.query("device");
+  const device = raw ? raw.split(",").map((a) => a.toLowerCase()) : null;
+  if (device && device.length > 12) {
+    return c.json({ error: "device: at most 12 addresses" }, 400);
+  }
+  const arpa = c.req.query("arpa") === "1";
+  const q = (c.req.query("q") ?? "").toLowerCase();
+  return c.json(statsAnswer(device, q, arpa, offset, limit));
 });
 
 app.get(`${API_BASE}/system/netfilter`, (c) => c.json(NETFILTER));

@@ -95,6 +95,34 @@ TEST a_pair_is_per_client_and_per_name(void) {
     PASS();
 }
 
+/* Catches: a summary with more sentences than FIRC_TAP_SENTENCES_MAX, which the capture's kept result would cut. */
+TEST a_summary_with_every_finding_fits_the_sentence_bound(void) {
+    firc_tap_report_t *r = firc_tap_report_new(1);
+    ASSERT(r != NULL);
+    firc_ip_t a = v4(10, 0, 0, 1), b = v4(10, 0, 0, 2);
+    uint32_t rep = 0;
+    (void)firc_tap_report_admit(r, &a, "one.example.com", 0, &rep);
+    (void)firc_tap_report_admit(r, &a, "one.example.com", 1, &rep);
+    (void)firc_tap_report_admit(r, &b, "two.example.com", 1, &rep);
+    firc_tap_report_saw_iface_gone(r);
+    firc_tap_report_saw_rules_gone(r);
+    for (int i = 0; i < FIRC_TAP_LIMIT_PER_SEC; i++) {
+        firc_tap_report_saw_at(r, 0, 10);
+        firc_tap_report_saw_at(r, 1, 10);
+    }
+    firc_tap_report_saw_cold_recall(r);
+    firc_tap_report_saw_unparsed(r);
+    firc_tap_report_saw_no_name(r);
+    firc_tap_report_saw_loss(r);
+    firc_tap_report_saw_stranger(r);
+    static said_t s;
+    s = say(r, true);
+    ASSERT_EQ_FMTm(s.buf, (size_t)12, s.n, "%zu");
+    ASSERT(s.n <= FIRC_TAP_SENTENCES_MAX);
+    firc_tap_report_free(r);
+    PASS();
+}
+
 /* Catches: a bypass swallowed when the pair table is full. */
 TEST a_full_table_still_reports(void) {
     firc_tap_report_t *r = firc_tap_report_new(2);
@@ -359,6 +387,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_two_ways_of_finding_nothing_are_different_sentences_too);
     RUN_TEST(no_bypass_is_not_said_of_a_capture_that_was_not_whole);
     RUN_TEST(an_interface_gone_or_back_and_rules_gone_are_sentences);
+    RUN_TEST(a_summary_with_every_finding_fits_the_sentence_bound);
     RUN_TEST(every_sentence_fits_a_log_event);
     GREATEST_MAIN_END();
 }

@@ -6,6 +6,7 @@
   import Button from "../../components/ui/Button.svelte";
   import Placeholder from "../../components/ui/Placeholder.svelte";
   import Tooltip from "../../components/ui/Tooltip.svelte";
+  import { groupsBridge } from "../../data/groups-bridge.svelte";
   import { fetchHosts } from "../../data/hosts.svelte";
   import { t } from "../../data/locale.svelte";
   import { fetchPolicies } from "../../data/policies.svelte";
@@ -37,6 +38,7 @@
 
   const store = new GroupsStore({ onRenderComplete: () => onRenderComplete?.() });
   setContext(GROUPS_STORE_CONTEXT, store);
+  groupsBridge.store = store;
 
   let importRulesModal = $state<{ open: boolean; groupIndex: number | null }>({
     open: false,
@@ -270,6 +272,7 @@
   });
 
   onDestroy(() => {
+    if (groupsBridge.store === store) groupsBridge.store = null;
     store.destroy();
   });
 </script>

@@ -1,7 +1,6 @@
 #include "firc/groups.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -43,18 +42,6 @@ static cJSON *list_rule_to_json(const firc_sub_rules_t *rs, size_t i) {
     if (proto != NULL) { cJSON_AddStringToObject(obj, "proto", proto); }
     if (ports != NULL) { cJSON_AddStringToObject(obj, "ports", ports); }
     return obj;
-}
-
-/* takes b's bytes; on failure the buffer is freed and an error body written instead */
-static void write_built_json(firc_http_res_t *res, firc_bytebuf_t *b, firc_err_t built) {
-    if (built != FIRC_OK) {
-        firc_bytebuf_free(b);
-        firc_http_res_write_error(res, built == FIRC_ERR_LIMIT ? 507 : 500, "failed to encode response");
-        return;
-    }
-    firc_http_res_take(res, 200, "application/json; charset=utf-8", b->data, b->len);
-    b->data = NULL;
-    b->len = b->cap = 0;
 }
 
 #define FIRC_LIST_PREVIEW_SAMPLE 100
@@ -283,32 +270,13 @@ static bool ci_contains(const char *hay, const char *needle, size_t needle_len) 
 #define FIRC_LIST_PAGE_DEFAULT 50
 #define FIRC_LIST_PAGE_MAX 500
 
-/* refused rather than guessed: strtoul silently wraps "-1" and parses "abc" to 0, so both are rejected explicitly */
-static bool read_size_param(firc_http_req_t *req, firc_http_res_t *res, const char *name, size_t dflt,
-                            size_t *out) {
-    *out = dflt;
-    const char *s = firc_http_req_query(req, name);
-    if (s == NULL || s[0] == '\0') { return true; }
-    char *end = NULL;
-    errno = 0;
-    unsigned long v = strtoul(s, &end, 10);
-    if (end == s || *end != '\0' || errno == ERANGE || strchr(s, '-') != NULL) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "invalid %s", name);
-        firc_http_res_write_error(res, 400, msg);
-        return false;
-    }
-    *out = (size_t)v;
-    return true;
-}
-
 /* each matching rule is dumped straight into the answer's bytes: a cJSON tree of the whole list has killed the router */
 static void handle_get_page(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_group_t *g;
     if (!resolve_list(ud, req, res, &g)) { return; }
     size_t offset = 0, limit = FIRC_LIST_PAGE_DEFAULT;
-    if (!read_size_param(req, res, "offset", 0, &offset)) { return; }
-    if (!read_size_param(req, res, "limit", FIRC_LIST_PAGE_DEFAULT, &limit)) { return; }
+    if (!firc_http_req_size(req, res, "offset", 0, &offset)) { return; }
+    if (!firc_http_req_size(req, res, "limit", FIRC_LIST_PAGE_DEFAULT, &limit)) { return; }
     if (limit == 0) { limit = FIRC_LIST_PAGE_DEFAULT; } /* limit=0 means the default, not none */
     if (limit > FIRC_LIST_PAGE_MAX) { limit = FIRC_LIST_PAGE_MAX; }
 
@@ -354,7 +322,7 @@ static void handle_get_page(firc_http_req_t *req, firc_http_res_t *res, void *ud
         err = firc_bytebuf_append_str(&b, tail);
     }
     free(needle);
-    write_built_json(res, &b, err);
+    firc_http_res_take_json(res, &b, err);
 }
 
 /* carries only the edited rules; every refusal is found before any edit applies */

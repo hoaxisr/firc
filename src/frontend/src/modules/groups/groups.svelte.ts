@@ -1638,6 +1638,39 @@ export class GroupsStore {
       ?.focus();
   }
 
+  async createBlockGroup(name: string, devices: DeviceSelector): Promise<string> {
+    if (!this.canAdd) return "";
+    const group: Group = {
+      id: randomId(),
+      name,
+      interface: "block",
+      block: "null",
+      enable: true,
+      devices: { allow: [...devices.allow], deny: [...devices.deny] },
+      resolve: DEFAULT_RESOLVE(),
+      rules: [],
+    };
+    this.data.unshift(group);
+    this.open_state[group.id] = true;
+    this.markDataRevision();
+    if (this.searchActive) this.forceVisibleGroup(group.id);
+    return group.id;
+  }
+
+  async blockName(groupId: string, name: string) {
+    const index = this.data.findIndex((g) => g.id === groupId);
+    if (index < 0) return;
+    const held = this.data[index].rules.find((r) => r.type === "domain" && r.rule === name);
+    if (held) {
+      if (!held.enable) {
+        held.enable = true;
+        this.markDataRevision();
+      }
+      return;
+    }
+    await this.addRuleToGroup(index, { enable: true, id: randomId(), rule: name, type: "domain" });
+  }
+
   updateGroupFromDialog(groupIndex: number, payload: GroupDialogPayload) {
     const group = this.data[groupIndex];
     if (!group) return;

@@ -5,16 +5,19 @@ import type { BypassEvent, DnsEvent, LogEvent } from "../../src/data/events.svel
 
 import {
   blockedPart,
+  compactCount,
   DEFAULT_LEVELS,
   describeBypassTail,
   describeDns,
   describeDnsTail,
   deviceNames,
+  filtersHiding,
   groupFilterOptions,
   matches,
   matchesQuery,
   sourceCounts,
   sourceOf,
+  SOURCES,
   type JournalFilter,
 } from "../../src/modules/logs/journal";
 
@@ -59,7 +62,7 @@ const log = (o: Partial<LogEvent>): LogEvent => ({
   ...o,
 });
 const all = (o: Partial<JournalFilter> = {}): JournalFilter => ({
-  sources: new Set(["fircd", "tunnels", "dns", "bypass"]),
+  sources: new Set(["fircd", "tunnels", "dns"]),
   levels: new Set(["debug", "info", "warn", "error"]),
   group: "",
   ...o,
@@ -72,17 +75,20 @@ describe("journal filter", () => {
     assert.strictEqual(sourceOf(log({ source: "tunvless0" })), "tunnels");
     assert.strictEqual(sourceOf(log({ source: "tunvless12" })), "tunnels");
     assert.strictEqual(sourceOf(dns({})), "dns");
-    assert.strictEqual(sourceOf(bypass({})), "bypass");
+    assert.strictEqual(sourceOf(bypass({})), null);
+  });
+  // Catches «Утечки» left among the Events sources.
+  it("has the sources fircd, tunnels and DNS, and no leaks", () => {
+    assert.deepStrictEqual(SOURCES, ["fircd", "tunnels", "dns"]);
   });
   // Catches a source button that hides another source's rows, or none.
   it("keeps only the sources asked for", () => {
-    const only = (s: "fircd" | "tunnels" | "dns" | "bypass") => all({ sources: new Set([s]) });
+    const only = (s: "fircd" | "tunnels" | "dns") => all({ sources: new Set([s]) });
     assert.strictEqual(matches(log({}), only("fircd")), true);
     assert.strictEqual(matches(log({ source: "tunvless0" }), only("fircd")), false);
     assert.strictEqual(matches(log({ source: "tunvless0" }), only("tunnels")), true);
     assert.strictEqual(matches(log({}), only("tunnels")), false);
-    assert.strictEqual(matches(dns({}), only("bypass")), false);
-    assert.strictEqual(matches(bypass({}), only("bypass")), true);
+    assert.strictEqual(matches(dns({}), only("tunnels")), false);
     assert.strictEqual(matches(dns({}), only("dns")), true);
   });
   // Catches the level buttons read as a minimum instead of four independent switches.
@@ -99,11 +105,10 @@ describe("journal filter", () => {
     }
     assert.strictEqual(matches(log({ level: "warn" }), all({ levels: new Set() })), false);
   });
-  // Catches DNS or bypass rows hidden by the level buttons, which they have no level for.
+  // Catches DNS rows hidden by the level buttons, which they have no level for.
   it("applies the levels to log lines only", () => {
     const none = all({ levels: new Set() });
     assert.strictEqual(matches(dns({}), none), true);
-    assert.strictEqual(matches(bypass({}), none), true);
     assert.strictEqual(
       matches(log({ source: "tunvless0", level: "debug" }), all({ levels: new Set(["info"]) })),
       false,
@@ -118,9 +123,40 @@ describe("journal filter", () => {
     assert.strictEqual(matches(dns({ group: undefined }), all({ group: "g1" })), false);
     assert.strictEqual(matches(log({}), all({ group: "g1" })), false);
   });
-  it("applies the group filter to a bypass event too", () => {
-    assert.strictEqual(matches(bypass({}), all({ group: "g1" })), true);
-    assert.strictEqual(matches(bypass({ group: undefined }), all({ group: "g1" })), false);
+  // Catches a leak shown among the Events, which belong to the Capture tab.
+  it("never keeps a bypass event, whatever the filter", () => {
+    assert.strictEqual(matches(bypass({}), all()), false);
+    assert.strictEqual(matches(bypass({}), all({ group: "g1" })), false);
+    assert.strictEqual(matches(bypass({}), all({ levels: new Set() })), false);
+  });
+});
+
+describe("filtersHiding", () => {
+  // Catches a badge that counts filters showing everything, or misses the default hidden debug.
+  it("counts the sources, the levels and the group, each when it hides something", () => {
+    assert.strictEqual(filtersHiding(all()), 0);
+    assert.strictEqual(filtersHiding(all({ levels: new Set(DEFAULT_LEVELS) })), 1);
+    assert.strictEqual(filtersHiding(all({ sources: new Set(["dns"]) })), 1);
+    assert.strictEqual(filtersHiding(all({ sources: new Set() })), 1);
+    assert.strictEqual(filtersHiding(all({ group: "g1" })), 1);
+    assert.strictEqual(
+      filtersHiding({ sources: new Set(["fircd"]), levels: new Set(["warn"]), group: "g1" }),
+      3,
+    );
+  });
+});
+
+describe("compactCount", () => {
+  // Catches a 4-digit count shown in full, a short one shortened, or the decimal sign of the wrong locale.
+  it("shortens a count of a thousand or more to thousands, in the locale's own decimal sign", () => {
+    assert.strictEqual(compactCount(0, "en"), "0");
+    assert.strictEqual(compactCount(999, "ru"), "999");
+    assert.strictEqual(compactCount(1000, "en"), "1k");
+    assert.strictEqual(compactCount(1234, "en"), "1.2k");
+    assert.strictEqual(compactCount(1234, "ru"), "1,2k");
+    assert.strictEqual(compactCount(1960, "ru"), "2k");
+    assert.strictEqual(compactCount(4001, "en"), "4k");
+    assert.strictEqual(compactCount(12345, "ru"), "12k");
   });
 });
 
@@ -137,8 +173,8 @@ describe("sourceCounts", () => {
       bypass({}),
       bypass({ name: "x.example" }),
     ];
-    assert.deepStrictEqual(sourceCounts(held), { fircd: 2, tunnels: 3, dns: 1, bypass: 2 });
-    assert.deepStrictEqual(sourceCounts([]), { fircd: 0, tunnels: 0, dns: 0, bypass: 0 });
+    assert.deepStrictEqual(sourceCounts(held), { fircd: 2, tunnels: 3, dns: 1 });
+    assert.deepStrictEqual(sourceCounts([]), { fircd: 0, tunnels: 0, dns: 0 });
   });
 });
 

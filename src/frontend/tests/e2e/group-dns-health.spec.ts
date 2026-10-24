@@ -146,7 +146,7 @@ test.describe("The DNS health tag follows the poll", () => {
 });
 
 test.describe("The DNS health tag opens the journal", () => {
-  // Catches a tag that does not switch tabs, or an effect that undoes the user's own filter picks.
+  // Catches a tag that does not switch tabs or open Events, or an effect that undoes the user's own filter picks.
   test("focuses the group with DNS on, and leaves later picks alone", async ({ page }) => {
     await setup(page, [
       group("0a000021", "Flaky", {
@@ -157,12 +157,18 @@ test.describe("The DNS health tag opens the journal", () => {
       }),
       group("0a000024", "Other", {}),
     ]);
-    const dns = page.getByRole("group", { name: "Sources" }).getByRole("button", { name: /DNS/ });
-    const groupFilter = page.locator(".tb").getByText("Flaky");
+    const panel = page.locator(".jh-panel");
+    const filter = page.getByRole("button", { name: /^Filter/ });
+    const dns = panel.getByRole("group", { name: "Sources" }).getByRole("button", { name: /DNS/ });
+    const groupFilter = panel.getByRole("button", { name: "Group" });
+    const capture = page.getByRole("tab", { name: "Capture", exact: true });
 
     await page.getByRole("tab", { name: "Journal" }).click();
+    await filter.click();
     await dns.click();
     await expect(dns).toHaveAttribute("aria-pressed", "false");
+    await page.keyboard.press("Escape");
+    await capture.click();
     await page.getByRole("tab", { name: "Groups" }).click();
 
     await page.locator(".health-badge").click();
@@ -170,15 +176,21 @@ test.describe("The DNS health tag opens the journal", () => {
       "aria-selected",
       "true",
     );
+    await expect(page.getByRole("tab", { name: "Events", exact: true })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await filter.click();
     await expect(dns).toHaveAttribute("aria-pressed", "true");
-    await expect(groupFilter).toBeVisible();
+    await expect(groupFilter).toHaveText("Flaky");
 
     await dns.click();
     await expect(dns).toHaveAttribute("aria-pressed", "false");
-    await page.locator(".tb").getByText("Flaky").click();
+    await groupFilter.click();
     await page.getByRole("option", { name: "Other" }).click();
-    await expect(page.locator(".tb").getByText("Other")).toBeVisible();
+    await expect(groupFilter).toHaveText("Other");
     await expect(dns).toHaveAttribute("aria-pressed", "false");
+    await page.keyboard.press("Escape");
 
     await page.getByRole("tab", { name: "Groups" }).click();
     await page.locator(".health-badge").click();
@@ -186,8 +198,9 @@ test.describe("The DNS health tag opens the journal", () => {
       "aria-selected",
       "true",
     );
+    await filter.click();
     await expect(dns).toHaveAttribute("aria-pressed", "true");
-    await expect(page.locator(".tb").getByText("Flaky")).toBeVisible();
+    await expect(groupFilter).toHaveText("Flaky");
   });
 
   // Catches a spent focus request replaying after logout and login, past the user's own tab.
@@ -212,6 +225,9 @@ test.describe("The DNS health tag opens the journal", () => {
       "true",
     );
     await page.getByRole("tab", { name: "Journal" }).click();
-    await expect(page.locator(".tb").getByText("any group")).toBeVisible();
+    await page.getByRole("button", { name: /^Filter/ }).click();
+    await expect(page.locator(".jh-panel").getByRole("button", { name: "Group" })).toHaveText(
+      "any group",
+    );
   });
 });

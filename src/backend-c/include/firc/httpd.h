@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "firc/bytebuf.h"
 #include "firc/err.h"
 #include "firc/loop.h"
 
@@ -60,6 +61,8 @@ const char *firc_http_req_path(const firc_http_req_t *req); /* percent-decoded, 
 /* NULL if absent; a name is truncated to 63 bytes, a value to 511, silently; at most 16 params parsed per request */
 const char *firc_http_req_query(const firc_http_req_t *req, const char *key);
 bool firc_http_req_query_is_true(const firc_http_req_t *req, const char *key); /* true iff the value is exactly "true" */
+/* *out = the whole number in query `name`, dflt when absent or empty; false after writing a 400 for anything else */
+bool firc_http_req_size(const firc_http_req_t *req, firc_http_res_t *res, const char *name, size_t dflt, size_t *out);
 const char *firc_http_req_param(const firc_http_req_t *req, const char *name);
 const char *firc_http_req_header(const firc_http_req_t *req, const char *name);
 const uint8_t *firc_http_req_body(const firc_http_req_t *req, size_t *len);
@@ -72,6 +75,8 @@ void firc_http_res_write(firc_http_res_t *res, int status, const char *content_t
 void firc_http_res_take(firc_http_res_t *res, int status, const char *content_type,
                         uint8_t *body, size_t len);
 void firc_http_res_write_json(firc_http_res_t *res, int status, cJSON *obj); /* deletes obj */
+/* takes b's bytes as a 200 JSON body; when built failed, frees them and writes 507 (LIMIT) or 500 instead */
+void firc_http_res_take_json(firc_http_res_t *res, firc_bytebuf_t *b, firc_err_t built);
 void firc_http_res_write_error(firc_http_res_t *res, int status, const char *msg);
 /* NULL field writes the plain error */
 void firc_http_res_write_field_error(firc_http_res_t *res, int status, const char *msg,

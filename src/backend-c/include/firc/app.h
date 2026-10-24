@@ -355,6 +355,22 @@ typedef struct firc_capture_status {
     int64_t seconds_left; /* monotonic countdown, never below zero */
 } firc_capture_status_t;
 
+#define FIRC_CAPTURE_LAST_SENTENCES 13
+#define FIRC_CAPTURE_LAST_SENTENCE_BYTES 240
+
+/* the last finished capture, kept until the next one starts or the daemon restarts */
+typedef struct firc_capture_last {
+    int64_t started_at;
+    int64_t ended_at;
+    const char *ended; /* "reached-end" | "stopped" | "failed" */
+    uint64_t leaks;
+    size_t n_summary;
+    char summary[FIRC_CAPTURE_LAST_SENTENCES][FIRC_CAPTURE_LAST_SENTENCE_BYTES];
+} firc_capture_last_t;
+
+/* copies the last finished capture; false when none has finished since the start. Loop thread. */
+bool firc_app_capture_last(const firc_app_t *app, firc_capture_last_t *out);
+
 /* starts a FIRC_CAPTURE_SECONDS capture on the LAN interfaces of app.link; FIRC_ERR_EXIST one runs, FIRC_ERR_INVAL
  * bad/empty link, FIRC_ERR_STATE no pool, FIRC_ERR_NOSYS kernel lacks an extension or refuses the rules, FIRC_ERR_SYS NFLOG bind/watch
  * failed, FIRC_ERR_IO no token entropy, FIRC_ERR_AGAIN the extension probe went blind, FIRC_ERR_NOMEM deadline not armed. On success token_out holds the stop token. */

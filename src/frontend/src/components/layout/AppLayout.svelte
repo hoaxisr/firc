@@ -15,7 +15,7 @@
   import Toast from "../feedback/Toast.svelte";
   import HeaderSettings from "./HeaderSettings.svelte";
 
-  import { pathOfTab, tabFromPath } from "../../utils/tab-path";
+  import { journalViewFromPath, pathOfTab, tabFromPath } from "../../utils/tab-path";
   import { Cable, LayoutList, Logs, Menu, Settings } from "../ui/icons";
 
   const TAB_TITLES: Record<string, string> = {
@@ -25,18 +25,24 @@
     settings: "Settings",
   };
   let active_tab = $state(tabFromPath(location.pathname));
+  let journal_view = $state(journalViewFromPath(location.pathname));
   let isMenuOpen = $state(false);
   let isRenderCompleteGroups = $state(false);
   let isRenderComplete = $derived(isRenderCompleteGroups);
 
   $effect(() => {
-    if (tabFromPath(location.pathname) !== active_tab) {
-      history.pushState(null, "", pathOfTab(active_tab));
-    }
+    const path = location.pathname;
+    const moved =
+      tabFromPath(path) !== active_tab ||
+      (active_tab === "logs" && journalViewFromPath(path) !== journal_view);
+    if (moved) history.pushState(null, "", pathOfTab(active_tab, journal_view));
   });
 
   $effect(() => {
-    const onPop = () => (active_tab = tabFromPath(location.pathname));
+    const onPop = () => {
+      active_tab = tabFromPath(location.pathname);
+      if (active_tab === "logs") journal_view = journalViewFromPath(location.pathname);
+    };
     addEventListener("popstate", onPop);
     return () => removeEventListener("popstate", onPop);
   });
@@ -125,7 +131,7 @@
         <TunnelsView active={active_tab === "tunnels"} />
       </Tabs.Content>
       <Tabs.Content value="logs">
-        <JournalView />
+        <JournalView active={active_tab === "logs"} bind:view={journal_view} />
       </Tabs.Content>
       <Tabs.Content value="settings">
         <SettingsView active={active_tab === "settings"} />

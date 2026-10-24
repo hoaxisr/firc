@@ -75,6 +75,7 @@ CORE_SRCS := \
     src/dns/resolver_addr.c \
     src/dns/proxy.c \
     src/dns/anscache.c \
+    src/dns/dnsstat.c \
     src/dns/pktinfo.c \
     src/fakeip/addr.c \
     src/fakeip/pool.c \

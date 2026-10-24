@@ -26,7 +26,8 @@ static const char *content_type_for_ext(const char *path) {
 }
 
 static bool is_tab_path(const char *path) {
-    static const char *const tabs[] = {"/groups", "/tunnels", "/journal", "/settings"};
+    static const char *const tabs[] = {"/groups",        "/tunnels",         "/journal",
+                                       "/journal/stats", "/journal/capture", "/settings"};
     for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]); i++) {
         if (strcmp(path, tabs[i]) == 0) { return true; }
     }

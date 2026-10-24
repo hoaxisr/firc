@@ -582,6 +582,34 @@ TEST the_bypass_route_is_gone(void) {
 
 GREATEST_MAIN_DEFS();
 
+/* Catches: a finished capture's result not answered by GET, or answered while one runs. */
+TEST a_finished_capture_is_answered_as_last(void) {
+    rig_t r;
+    ASSERT(rig_up(&r));
+    char buf[4096], token[64];
+    ASSERT_EQ_FMT(200, req_unix("GET", CAPTURE_PATH, buf, sizeof(buf)), "%d");
+    ASSERTm("no capture, no last", strstr(buf, "\"last\"") == NULL);
+
+    ASSERT_EQ_FMT(200, req_unix("POST", CAPTURE_PATH, buf, sizeof(buf)), "%d");
+    ASSERT(token_of(buf, token, sizeof(token)));
+    ASSERT_EQ_FMT(200, stop_with(token, buf, sizeof(buf)), "%d");
+
+    ASSERT_EQ_FMT(200, req_tcp("GET", CAPTURE_PATH, buf, sizeof(buf)), "%d");
+    ASSERT(strstr(buf, "\"last\":{\"startedAt\":1000,\"endedAt\":1000,\"ended\"") != NULL);
+    ASSERT(strstr(buf, "\"ended\":\"stopped\",\"leaks\":0,\"summary\":[\"0 packets read, 0 "
+                       "bypasses reported.\",\"No packet reached the capture at all: nothing "
+                       "matched its rules.\",\"An interface this capture was watching does not "
+                       "exist: iptables takes a name no interface has, so its rules matched "
+                       "nothing and it watched nothing there, whatever the numbers say.\","
+                       "\"firc had recorded no real address when the capture started; bypasses "
+                       "were recognised by SNI only until clients asked.\"]}") != NULL);
+
+    ASSERT_EQ_FMT(200, req_unix("POST", CAPTURE_PATH, buf, sizeof(buf)), "%d");
+    ASSERTm("a running capture shows no last", strstr(buf, "\"last\"") == NULL);
+    rig_down(&r);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     GREATEST_MAIN_BEGIN();
@@ -600,5 +628,6 @@ int main(int argc, char **argv) {
     RUN_TEST(a_capture_needs_every_capture_extension);
     RUN_TEST(the_status_says_how_long_is_left);
     RUN_TEST(the_bypass_route_is_gone);
+    RUN_TEST(a_finished_capture_is_answered_as_last);
     GREATEST_MAIN_END();
 }

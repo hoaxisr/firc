@@ -120,6 +120,7 @@ struct daemon {
     firc_ifwatch_t *ifwatch;
     firc_httpd_t *http_tcp;
     firc_httpd_t *http_unix;
+    firc_dnsstat_t *dnsstat;
 
     /* Not owned by daemon_teardown: borrowed so the SIGHUP handler can reach them. */
     firc_config_t *cfg;
@@ -367,6 +368,8 @@ static void daemon_teardown(struct daemon *d)
     firc_stable_fields_release(&d->fields);
     firc_dnsproxy_destroy(d->proxy);
     d->proxy = NULL;
+    firc_dnsstat_free(d->dnsstat);
+    d->dnsstat = NULL;
     firc_resolve_router_free(d->router);
     d->router = NULL;
     firc_dns_pipeline_destroy(d->pipeline);
@@ -720,6 +723,26 @@ static void on_blocked(void *ud, const firc_dns_msg_t *query, const firc_ip_t *c
 {
     struct daemon *d = ud;
     firc_dns_pipeline_note_blocked(d->pipeline, query, client, answer);
+}
+
+static int64_t mono_s(void)
+{
+    return mono_ms() / 1000;
+}
+
+static void on_tally(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client, firc_id_t owner, bool blocked)
+{
+    struct daemon *d = ud;
+    char name[FIRC_DNS_MAX_NAME + 1];
+    if (!firc_dns_msg_queried_name(query, name, sizeof(name))) { return; }
+    firc_dnsstat_note(d->dnsstat, name, client, owner, blocked, mono_s());
+}
+
+static void on_dnsstat_sweep(firc_loop_t *loop, void *ud)
+{
+    (void)loop;
+    struct daemon *d = ud;
+    firc_dnsstat_sweep(d->dnsstat, mono_s());
 }
 
 static void on_iface_event(void *ud, const char *iface)
@@ -1442,6 +1465,20 @@ int main(int argc, char **argv)
     }
     firc_dnsproxy_set_router(d.proxy, firc_resolve_router_decide, d.router);
     firc_dnsproxy_set_blocked(d.proxy, on_blocked, &d);
+    int64_t dnsstat_since = mono_s();
+    d.dnsstat = firc_dnsstat_new(FIRC_DNSSTAT_KEYS);
+    if (d.dnsstat == NULL) {
+        FIRC_WARN("dns stats: no memory for the store, nothing is counted");
+    } else {
+        firc_dnsproxy_set_tally(d.proxy, on_tally, &d);
+        const uint64_t hour_ms = (uint64_t)FIRC_DNSSTAT_HOUR * 1000u;
+        uint64_t into = (uint64_t)mono_ms() % hour_ms;
+        int dnsstat_timer = 0;
+        if (firc_loop_add_timer(d.loop, hour_ms - into + 1000u, hour_ms, on_dnsstat_sweep, &d, &dnsstat_timer) !=
+            FIRC_OK) {
+            FIRC_WARN("dns stats: no hourly sweep, idle keys stay until evicted");
+        }
+    }
     firc_dns_pipeline_set_v6_fn(d.pipeline, firc_resolve_router_carries_v6, d.router);
 #ifdef FIRC_ENTWARE_KN
     /* Wait (3 s bound) for the first hotspot read: a policy host asking earlier would stay unrouted. */
@@ -1629,6 +1666,8 @@ int main(int argc, char **argv)
         .tunnels = firc_tunrun_config(d.tunrun),
         .iface_event = on_iface_event,
         .iface_event_ud = &d,
+        .dnsstat = d.dnsstat,
+        .dnsstat_since_mono = dnsstat_since,
     };
 #ifdef FIRC_ENTWARE_KN
     system_ctx.policies = d.policies;

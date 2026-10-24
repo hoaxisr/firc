@@ -186,6 +186,24 @@ bool firc_http_req_query_is_true(const firc_http_req_t *req, const char *key) {
     return v != NULL && strcmp(v, "true") == 0;
 }
 
+/* refused rather than guessed: strtoul silently wraps "-1" and parses "abc" to 0, so both are rejected explicitly */
+bool firc_http_req_size(const firc_http_req_t *req, firc_http_res_t *res, const char *name, size_t dflt, size_t *out) {
+    *out = dflt;
+    const char *s = firc_http_req_query(req, name);
+    if (s == NULL || s[0] == '\0') { return true; }
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE || strchr(s, '-') != NULL) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "invalid %s", name);
+        firc_http_res_write_error(res, 400, msg);
+        return false;
+    }
+    *out = (size_t)v;
+    return true;
+}
+
 const char *firc_http_req_param(const firc_http_req_t *req, const char *name) {
     for (size_t i = 0; i < req->n_params; i++) {
         if (strcmp(req->params[i].name, name) == 0) { return req->params[i].value; }
@@ -234,6 +252,17 @@ void firc_http_res_take(firc_http_res_t *res, int status, const char *content_ty
     res->status = status;
     if (content_type) { firc_http_res_set_header(res, "Content-Type", content_type); }
     res->responded = true;
+}
+
+void firc_http_res_take_json(firc_http_res_t *res, firc_bytebuf_t *b, firc_err_t built) {
+    if (built != FIRC_OK) {
+        firc_bytebuf_free(b);
+        firc_http_res_write_error(res, built == FIRC_ERR_LIMIT ? 507 : 500, "failed to encode response");
+        return;
+    }
+    firc_http_res_take(res, 200, "application/json; charset=utf-8", b->data, b->len);
+    b->data = NULL;
+    b->len = b->cap = 0;
 }
 
 void firc_http_res_write_json(firc_http_res_t *res, int status, cJSON *obj) {

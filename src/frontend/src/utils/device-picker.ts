@@ -32,7 +32,7 @@ export type Picked = {
   manual: { allow: string[]; deny: string[] };
 };
 
-function entryKey(entry: string): string | null {
+export function entryKey(entry: string): string | null {
   if (entry.startsWith(POLICY_PREFIX) && isValidDeviceEntry(entry)) return entry;
   const mac = entry.startsWith(MAC_PREFIX) ? normalizeMac(entry.slice(MAC_PREFIX.length)) : null;
   return mac === null ? null : `${MAC_PREFIX}${mac}`;

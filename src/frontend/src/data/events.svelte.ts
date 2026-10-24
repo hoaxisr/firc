@@ -138,8 +138,3 @@ function noteGroups(events: JournalEvent[]) {
   }
   if (next) journal.seenGroups = next;
 }
-
-export function clearJournal() {
-  journal.events = [];
-  journal.dropped = 0;
-}

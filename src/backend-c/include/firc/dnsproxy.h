@@ -102,6 +102,7 @@ typedef struct firc_dnsproxy_route {
     socklen_t server_lens[FIRC_RESOLVE_MAX_SERVERS];
     bool blocked; /* the proxy answers with `answer` itself */
     firc_block_answer_t answer;
+    firc_id_t owner;
 } firc_dnsproxy_route_t;
 
 /* True, with *out filled, when the query goes through a group's tunnel. */
@@ -117,6 +118,14 @@ typedef void (*firc_dnsproxy_blocked_cb)(void *ud, const firc_dns_msg_t *query, 
 
 /* NULL tells no one. Loop thread, or before start. */
 void firc_dnsproxy_set_blocked(firc_dnsproxy_t *p, firc_dnsproxy_blocked_cb fn, void *ud);
+
+/* Told once of every query the proxy parsed and answers, after the owner decision; owner is zero when none.
+ * Never for a query it dropped or could not parse, nor for a cache refresh. */
+typedef void (*firc_dnsproxy_tally_fn)(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client,
+                                       firc_id_t owner, bool blocked);
+
+/* NULL tells no one. Loop thread, or before start. */
+void firc_dnsproxy_set_tally(firc_dnsproxy_t *p, firc_dnsproxy_tally_fn fn, void *ud);
 
 /* A tunnel answer inside these is a sink. Copied; NULL = none. Before start. */
 void firc_dnsproxy_set_pool_prefixes(firc_dnsproxy_t *p, const firc_ip_t *v4, uint8_t v4_len,

@@ -397,6 +397,31 @@ static void live_blocked(void *ud, const firc_dns_msg_t *query, const firc_ip_t 
     atomic_store(&g_blocked_answer, (int)answer);
     atomic_store(&g_blocked_client, client != NULL && client->len == 4 ? client->b[3] : -1);
 }
+typedef struct {
+    char first;
+    uint8_t owner;
+    bool blocked;
+    bool client;
+} tally_t;
+
+static tally_t g_tallies[32];
+static _Atomic int g_tally_n;
+static const firc_fakeip_t *g_live_pool;
+static firc_dnsproxy_route_fn g_live_route_fn;
+static uint16_t g_tally_port;
+
+static void live_tally(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client, firc_id_t owner,
+                       bool blocked) {
+    (void)ud;
+    int n = atomic_load(&g_tally_n);
+    if (n >= (int)(sizeof(g_tallies) / sizeof(g_tallies[0]))) { return; }
+    char name[256];
+    g_tallies[n].first = firc_dns_msg_queried_name(query, name, sizeof(name)) ? name[0] : '?';
+    g_tallies[n].owner = owner.b[3];
+    g_tallies[n].blocked = blocked;
+    g_tallies[n].client = client != NULL;
+    atomic_store(&g_tally_n, n + 1);
+}
 static uint32_t g_live_timeout_ms;
 static uint16_t g_live_upstream_port;
 static uint32_t g_live_max_concurrent;
@@ -1056,11 +1081,16 @@ static bool live_start(live_t *lv) {
     atomic_store(&g_live_hook_calls, 0);
     if (g_live_route != NULL) { firc_dnsproxy_set_router(lv->proxy, test_route, g_live_route); }
     if (g_live_router != NULL) { firc_dnsproxy_set_router(lv->proxy, firc_resolve_router_decide, g_live_router); }
-    if (g_live_clamp != 0) { firc_dnsproxy_set_pool(lv->proxy, NULL, g_live_clamp); }
+    if (g_live_route_fn != NULL) { firc_dnsproxy_set_router(lv->proxy, g_live_route_fn, NULL); }
+    if (g_live_clamp != 0 || g_live_pool != NULL) {
+        firc_dnsproxy_set_pool(lv->proxy, g_live_pool, g_live_clamp != 0 ? g_live_clamp : 300);
+    }
     atomic_store(&g_blocked_calls, 0);
     atomic_store(&g_blocked_answer, -1);
     atomic_store(&g_blocked_client, -1);
     firc_dnsproxy_set_blocked(lv->proxy, live_blocked, NULL);
+    atomic_store(&g_tally_n, 0);
+    firc_dnsproxy_set_tally(lv->proxy, live_tally, NULL);
     firc_ip_t v4 = {.b = {198, 18, 0, 0}, .len = 4};
     firc_ip_t v6 = {.b = {0xfd, 0x00, 0x12, 0x34}, .len = 16};
     firc_dnsproxy_set_pool_prefixes(lv->proxy, &v4, 15, &v6, 48);
@@ -1090,6 +1120,8 @@ static void live_stop(live_t *lv) {
     g_live_route = NULL;
     g_live_router = NULL;
     g_live_clamp = 0;
+    g_live_pool = NULL;
+    g_live_route_fn = NULL;
     g_live_timeout_ms = 0;
     g_live_upstream_port = 0;
     g_live_max_concurrent = 0;
@@ -3249,12 +3281,12 @@ static void tcp_probe_add_listener(firc_loop_t *loop, void *ud) {
 }
 
 /* Binds a TCP listener and registers it on the running loop via a post; the caller closes `*lfd_out`. */
-static uint16_t tcp_probe_listen(firc_loop_t *loop, int *lfd_out) {
+static uint16_t tcp_probe_listen_on(firc_loop_t *loop, uint16_t want, int *lfd_out) {
     memset(&g_tcp_probe, 0, sizeof(g_tcp_probe));
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { return 0; }
     uint16_t port = 0;
-    if (!bind_loopback(lfd, 0, &port) || listen(lfd, 4) != 0) {
+    if (!bind_loopback(lfd, want, &port) || listen(lfd, 4) != 0) {
         close(lfd);
         return 0;
     }
@@ -3269,6 +3301,10 @@ static uint16_t tcp_probe_listen(firc_loop_t *loop, int *lfd_out) {
     }
     *lfd_out = lfd;
     return port;
+}
+
+static uint16_t tcp_probe_listen(firc_loop_t *loop, int *lfd_out) {
+    return tcp_probe_listen_on(loop, 0, lfd_out);
 }
 
 /* Catches: a probe ending without a verdict leaving the gate shut for ever. */
@@ -4955,6 +4991,135 @@ TEST health_counts_by_id_across_generations(void) {
 
 GREATEST_MAIN_DEFS();
 
+static bool tally_route(void *ud, const firc_dns_msg_t *q, const firc_ip_t *client, firc_dnsproxy_route_t *out) {
+    (void)ud;
+    (void)client;
+    char name[256];
+    if (!firc_dns_msg_queried_name(q, name, sizeof(name)) || name[0] == 'u') { return false; }
+    if (name[0] == 'd') {
+        out->owner.b[3] = 5;
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (name[0] == 'b') {
+        out->group_id.b[3] = 9;
+        out->owner.b[3] = 9;
+        out->blocked = true;
+        out->answer = FIRC_BLOCK_NULL;
+        return true;
+    }
+    out->group_id.b[3] = 7;
+    out->owner.b[3] = 7;
+    out->mark = 0x40010000u;
+    out->gen = 1;
+    out->n_servers = 1;
+    struct sockaddr_in *s4 = (struct sockaddr_in *)&out->servers[0];
+    s4->sin_family = AF_INET;
+    s4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    s4->sin_port = htons(g_tally_port);
+    out->server_lens[0] = sizeof(*s4);
+    return true;
+}
+
+static int ask_ptr_udp(uint16_t port, uint16_t id, const firc_ip_t *ip) {
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    if (c < 0) { return -1; }
+    struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in pa;
+    memset(&pa, 0, sizeof(pa));
+    pa.sin_family = AF_INET;
+    pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    pa.sin_port = htons(port);
+    uint8_t q[512];
+    size_t qlen = build_ptr_query(q, id, ip, false);
+    uint8_t r[2048];
+    ssize_t n = -1;
+    if (sendto(c, q, qlen, 0, (struct sockaddr *)&pa, sizeof(pa)) == (ssize_t)qlen) { n = recv(c, r, sizeof(r), 0); }
+    close(c);
+    return n > 0 ? 0 : -1;
+}
+
+/* Catches: an answering exit not tallied, one tallied twice, a declined owner lost, or blocked misreported. */
+TEST every_kind_of_query_is_tallied_once(void) {
+    firc_ip_t v4, v6;
+    firc_fakeip_t *pool = ptr_pool(&v4, &v6);
+    rec_reset();
+    g_live_ops = &REC_OPS;
+    g_live_cache = true;
+    g_live_pool = pool;
+    g_live_route_fn = tally_route;
+    live_t lv;
+    ASSERT(live_start(&lv));
+    g_tally_port = lv.b.port;
+    int lfd = -1;
+    ASSERT_EQ(lv.b.port, tcp_probe_listen_on(lv.loop, lv.b.port, &lfd));
+    atomic_store(&g_tcp_probe.go, 1);
+    ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0x7101));
+    ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0x7102, 0, 'c'));
+    ASSERT_EQ(2, ask_for(lv.proxy_port, 0x7103, 0, 'c'));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, ask_ptr_udp(lv.proxy_port, 0x7104, &v4));
+    ASSERT_EQ(0, ask_for(lv.proxy_port, 0x7105, 0, 'b'));
+    ASSERT_EQ(1, ask_for(lv.proxy_port, 0x7106, 0, 'u'));
+    ASSERT_EQ(1, ask_for(lv.proxy_port, 0x7107, 0, 'd'));
+    ASSERT_EQ(2, atomic_load(&lv.a.received));
+    pause_ms(50);
+    close(lfd);
+    live_stop(&lv);
+    firc_fakeip_free(pool);
+    char ptr_first[4];
+    snprintf(ptr_first, sizeof(ptr_first), "%u", v4.b[3]);
+    const tally_t want[] = {
+        {'a', 7, false, true}, {'c', 7, false, true}, {'c', 7, false, true}, {ptr_first[0], 0, false, true},
+        {'b', 9, true, true},  {'u', 0, false, true}, {'d', 5, false, true},
+    };
+    ASSERT_EQ((int)(sizeof(want) / sizeof(want[0])), atomic_load(&g_tally_n));
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        ASSERT_EQ_FMT(want[i].first, g_tallies[i].first, "%c");
+        ASSERT_EQ_FMT(want[i].owner, g_tallies[i].owner, "%u");
+        ASSERT_EQ(want[i].blocked, g_tallies[i].blocked);
+        ASSERT_EQ(want[i].client, g_tallies[i].client);
+    }
+    PASS();
+}
+
+/* Catches: a query dropped at the in-flight cap or one that does not parse counted. */
+TEST a_dropped_or_unparseable_query_is_not_counted(void) {
+    live_t lv;
+    g_live_timeout_ms = 5000;
+    g_live_max_concurrent = 1;
+    ASSERT(live_start(&lv));
+    int a = tcp_open(lv.proxy_port);
+    ASSERT(a >= 0);
+    ASSERT_EQ(1, send(a, "\0", 1, MSG_NOSIGNAL));
+    ASSERT_EQ((uint64_t)1, inflight_settled(lv.proxy, 1));
+    udp_fire(lv.proxy_port);
+    ASSERT_EQ((uint64_t)1, dropped_settled(lv.proxy, 1));
+    int b = tcp_open(lv.proxy_port);
+    ASSERT_EQ((uint64_t)2, dropped_settled(lv.proxy, 2));
+    close(b);
+    close(a);
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in pa;
+    memset(&pa, 0, sizeof(pa));
+    pa.sin_family = AF_INET;
+    pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    pa.sin_port = htons(lv.proxy_port);
+    static const uint8_t junk[5] = {0x12, 0x34, 0x01, 0x00, 0x00};
+    ASSERT_EQ(5, sendto(c, junk, sizeof(junk), 0, (struct sockaddr *)&pa, sizeof(pa)));
+    close(c);
+    pause_ms(50);
+    ASSERT_EQ(0, atomic_load(&g_tally_n));
+    ASSERT_EQ(1, ask(lv.proxy_port, 0x7201));
+    ASSERT_EQ(1, atomic_load(&g_tally_n));
+    live_stop(&lv);
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
@@ -5002,6 +5167,8 @@ int main(int argc, char **argv)
     RUN_TEST(a_blocked_name_over_tcp_is_answered_too);
     RUN_TEST(a_device_the_block_group_does_not_admit_is_answered_by_the_upstream);
     RUN_TEST(a_zeroed_route_is_not_blocked);
+    RUN_TEST(every_kind_of_query_is_tallied_once);
+    RUN_TEST(a_dropped_or_unparseable_query_is_not_counted);
     RUN_TEST(a_blocked_name_outside_an_in_query_is_not_answered_locally);
     RUN_TEST(a_mark_that_cannot_be_set_is_never_used);
     RUN_TEST(a_silent_common_upstream_warns_then_errs_after_a_minute);

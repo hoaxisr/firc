@@ -171,6 +171,8 @@ static void say(sentence_fn fn, void *ud, const char *fmt, ...) {
     if (n > 0) { fn(buf, ud); }
 }
 
+uint64_t firc_tap_report_printed(const firc_tap_report_t *r) { return r == NULL ? 0 : r->printed; }
+
 static const char *s_(uint64_t n) { return n == 1 ? "" : "s"; }
 
 void firc_tap_report_sentences(const firc_tap_report_t *r, bool final, sentence_fn fn,

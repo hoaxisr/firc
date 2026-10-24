@@ -2,18 +2,31 @@ import { persistedState } from "../utils/persisted-state.svelte";
 
 import { fetcher, HttpError } from "../utils/fetcher";
 
+export type CaptureLast = {
+  startedAt: number;
+  endedAt: number;
+  ended: "reached-end" | "stopped" | "failed";
+  leaks: number;
+  summary: string[];
+};
+
 type CaptureRes = {
   running: boolean;
   endsAt?: number;
   secondsLeft?: number;
   token?: string;
+  last?: CaptureLast;
 };
+
+export const CAPTURE_SECONDS = 300;
 
 const mine = persistedState<{ token: string } | null>("capture_token", null);
 
 export const capture = $state({
   running: false,
+  endsAt: 0,
   secondsLeft: 0,
+  last: null as CaptureLast | null,
   busy: false,
   failed: false,
   error: "",
@@ -52,7 +65,9 @@ function take(data: CaptureRes, gen: number) {
   capture.failed = false;
   capture.error = "";
   capture.running = data.running;
+  capture.endsAt = data.endsAt ?? 0;
   capture.secondsLeft = data.secondsLeft ?? 0;
+  capture.last = data.last ?? null;
   if (!data.running) mine.current = null;
 }
 

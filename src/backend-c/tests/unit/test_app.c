@@ -234,6 +234,8 @@ static int64_t g_capture_seconds;
 static firc_dnsproxy_t *g_app_proxy;
 static firc_kn_resolvers_t *g_app_resolvers;
 static uint64_t (*g_app_mono)(void);
+static uint64_t g_now_ms;
+static uint64_t test_clock(void) { return g_now_ms; }
 static char g_proxy_sentinel_byte;
 #define PROXY_SENTINEL ((firc_dnsproxy_t *)(void *)&g_proxy_sentinel_byte)
 
@@ -564,6 +566,67 @@ TEST a_capture_survives_the_firmware_rewriting_the_table(void) {
     ASSERT_FALSEm("an incremental pass does not resurrect a stopped capture", tap_chain_there(&l));
 
     locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the leak count or the summary of a finished capture not kept, or kept as another capture's. */
+TEST a_finished_capture_is_kept_as_last(void) {
+    g_now_ms = 5000;
+    g_app_mono = test_clock;
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    firc_capture_last_t last;
+    ASSERT_FALSEm("nothing finished yet", firc_app_capture_last(l.app, &last));
+
+    firc_group_t *g = make_group("media", true);
+    firc_group_add_rule(g, make_rule());
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT_EQ(FIRC_OK, firc_app_capture_start(l.app, 1000, NULL));
+    ASSERT(send_hello(k_client, k_real, "example.com"));
+    ASSERT(run_loop_for(loop, 300));
+    g_now_ms += 7000;
+    ASSERT_EQ(FIRC_OK, firc_app_capture_stop(l.app, NULL));
+
+    ASSERT(firc_app_capture_last(l.app, &last));
+    ASSERT_STR_EQ("stopped", last.ended);
+    ASSERT_EQ_FMT(1ull, (unsigned long long)last.leaks, "%llu");
+    ASSERT_EQ_FMT(1000ll, (long long)last.started_at, "%lld");
+    ASSERT_EQ_FMTm("it ran seven seconds", 1007ll, (long long)last.ended_at, "%lld");
+    ASSERT_EQ_FMT((size_t)3, last.n_summary, "%zu");
+    ASSERT_STR_EQ("1 packet read, 1 bypass reported.", last.summary[0]);
+
+    ASSERT_EQ(FIRC_OK, firc_app_capture_start(l.app, 2000, NULL));
+    ASSERTm("a new capture replaces the last", !firc_app_capture_last(l.app, &last));
+    ASSERT_EQ(FIRC_OK, firc_app_capture_stop(l.app, NULL));
+    ASSERT(firc_app_capture_last(l.app, &last));
+    ASSERT_EQ_FMT(2000ll, (long long)last.started_at, "%lld");
+    ASSERT_EQ_FMT(0ull, (unsigned long long)last.leaks, "%llu");
+    ASSERT_STR_EQ("No packet reached the capture at all: nothing matched its rules.",
+                  last.summary[1]);
+
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+/* Catches: a capture that ran to its deadline kept as one somebody stopped. */
+TEST a_capture_that_reached_its_end_says_so(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    g_capture_seconds = 1;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    ASSERT_EQ(FIRC_OK, firc_app_capture_start(l.app, 1000, NULL));
+    ASSERT(run_loop_for(loop, 1300));
+    firc_capture_last_t last;
+    ASSERT(firc_app_capture_last(l.app, &last));
+    ASSERT_STR_EQ("reached-end", last.ended);
+    ASSERT_EQ_FMTm("it ran its whole second", 1001ll, (long long)last.ended_at, "%lld");
+    ASSERT_EQ_FMT(1000ll, (long long)last.started_at, "%lld");
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
     PASS();
 }
 
@@ -1029,6 +1092,9 @@ TEST a_reader_that_breaks_ends_the_capture(void) {
     ASSERT(run_loop_for(loop, 300));
 
     ASSERT_FALSEm("the capture ended", running(&l));
+    firc_capture_last_t last;
+    ASSERTm("and its result is kept", firc_app_capture_last(l.app, &last));
+    ASSERT_STR_EQ("failed", last.ended);
     ASSERTm("and the journal names the reader that failed",
             journal_says(since, "ClientHello reader failed"));
     ASSERTm("and says the capture stopped", journal_says(since, "capture stopped"));
@@ -4184,8 +4250,6 @@ TEST a_lists_bookkeeping_does_not_interrupt_the_pass(void) {
     PASS();
 }
 
-static uint64_t g_now_ms;
-static uint64_t test_clock(void) { return g_now_ms; }
 
 static size_t journal_count_at(uint64_t since, firc_log_level_t level, const char *needle) {
     size_t n = journal(since), c = 0;
@@ -8788,6 +8852,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_pass_waits_for_the_netfilter_lock);
     RUN_TEST(a_capture_survives_the_firmware_rewriting_the_table);
     RUN_TEST(a_capture_has_a_deadline_and_only_one_exists);
+    RUN_TEST(a_finished_capture_is_kept_as_last);
+    RUN_TEST(a_capture_that_reached_its_end_says_so);
     RUN_TEST(a_group_the_api_made_is_what_the_capture_judges_by);
     RUN_TEST(a_capture_reads_both_sockets);
     RUN_TEST(a_policy_scoped_group_is_judged_with_the_daemons_resolvers);

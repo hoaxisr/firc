@@ -85,6 +85,8 @@ struct firc_dnsproxy {
     void *route_ud;
     firc_dnsproxy_blocked_cb blocked_fn;
     void *blocked_ud;
+    firc_dnsproxy_tally_fn tally_fn;
+    void *tally_ud;
     firc_ip_t pool4, pool6;
     uint8_t pool4_len, pool6_len;
     bool have_pool4, have_pool6;
@@ -215,6 +217,12 @@ void firc_dnsproxy_set_blocked(firc_dnsproxy_t *p, firc_dnsproxy_blocked_cb fn, 
 {
     p->blocked_fn = fn;
     p->blocked_ud = ud;
+}
+
+void firc_dnsproxy_set_tally(firc_dnsproxy_t *p, firc_dnsproxy_tally_fn fn, void *ud)
+{
+    p->tally_fn = fn;
+    p->tally_ud = ud;
 }
 
 typedef struct leg {
@@ -1574,6 +1582,12 @@ static request_disp_t reply_block(firc_dnsproxy_t *p, exchange_t *ex, const firc
     return disp;
 }
 
+static void tally(firc_dnsproxy_t *p, const firc_dns_msg_t *query, const firc_ip_t *client, firc_id_t owner,
+                  bool blocked)
+{
+    if (p->tally_fn != NULL && client != NULL) { p->tally_fn(p->tally_ud, query, client, owner, blocked); }
+}
+
 static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
 {
     firc_dns_msg_t *req_msg = NULL;
@@ -1584,10 +1598,14 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
     ex->qid = req_msg->id;
     ex->n_q = req_msg->n_questions;
     if (ex->n_q > 0) { ex->q = req_msg->questions[0]; }
+    firc_ip_t client;
+    const firc_ip_t *cp = client_ip(ex, &client) ? &client : NULL;
+    firc_id_t no_owner = {{0}};
 
     firc_ip_t ptr_addr;
     if (p->fakeip != NULL && firc_dns_ptr_query_addr(req_msg, &ptr_addr) &&
         firc_fakeip_overlaps(p->fakeip, &ptr_addr, (uint8_t)(ptr_addr.len * 8u))) {
+        tally(p, req_msg, cp, no_owner, false);
         request_disp_t disp = reply_ptr(p, ex, req_msg, firc_fakeip_name_of(p->fakeip, &ptr_addr));
         firc_dns_msg_free(req_msg);
         return disp;
@@ -1595,13 +1613,15 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
     /* The deadline starts here and is shared by both legs. */
     ex->deadline_ms = mono_ms() + p->cfg.timeout_ms;
     ex->resolver = FIRC_DNS_RESOLVER_UPSTREAM;
+    firc_id_t owner = no_owner;
     if (p->route_fn != NULL) {
-        firc_ip_t client;
-        const firc_ip_t *cp = client_ip(ex, &client) ? &client : NULL;
         firc_dnsproxy_route_t rt;
         rt.blocked = false;
+        rt.owner = no_owner;
         bool routed = p->route_fn(p->route_ud, req_msg, cp, &rt);
+        owner = rt.owner;
         if (routed && rt.blocked) {
+            tally(p, req_msg, cp, owner, true);
             request_disp_t disp = reply_block(p, ex, req_msg, cp, rt.answer);
             firc_dns_msg_free(req_msg);
             return disp;
@@ -1617,6 +1637,7 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
                     ex->cached_len = hit.len;
                     ex->want_prefetch = hit.prefetch;
                     ex->resolver = FIRC_DNS_RESOLVER_CACHE;
+                    tally(p, req_msg, cp, owner, false);
                     firc_dns_msg_free(req_msg);
                     return REQ_FORWARD;
                 }
@@ -1640,6 +1661,7 @@ static request_disp_t handle_request_common(firc_dnsproxy_t *p, exchange_t *ex)
             }
         }
     }
+    tally(p, req_msg, cp, owner, false);
     firc_dns_msg_free(req_msg);
     return REQ_FORWARD;
 }

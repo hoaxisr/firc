@@ -534,6 +534,7 @@ TEST a_block_owner_is_claimed_without_a_route(void)
     memset(&r, 0x5a, sizeof(r));
     ASSERT(firc_resolve_router_decide(router, q, &c, &r));
     ASSERT(r.blocked);
+    ASSERT(firc_id_equal(ads->id, r.owner));
     ASSERT_EQ(FIRC_BLOCK_NXDOMAIN, r.answer);
     ASSERT_EQ(0u, r.mark);
     ASSERT_EQ((size_t)0, r.n_servers);
@@ -542,6 +543,25 @@ TEST a_block_owner_is_claimed_without_a_route(void)
     firc_resolve_router_free(router);
     firc_dns_pipeline_destroy(pl);
     firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: the owner of a declined, routed or blocked query left unset, or another group's id reported. */
+TEST the_owner_is_reported_when_the_route_is_declined(void)
+{
+    decide_fx_t fx;
+    ASSERT(decide_fx_up(&fx));
+    firc_dnsproxy_route_t r;
+    memset(&r, 0x5a, sizeof(r));
+    ASSERT_FALSE(decide(&fx, "x.bh.test", 1, "192.168.1.5", &r));
+    ASSERT(firc_id_equal(fx.cfg.groups[4]->id, r.owner));
+    memset(&r, 0x5a, sizeof(r));
+    ASSERT_FALSE(decide(&fx, "x.off.test", 1, "192.168.1.5", &r));
+    ASSERT(firc_id_equal(fx.cfg.groups[1]->id, r.owner));
+    memset(&r, 0x5a, sizeof(r));
+    ASSERT(decide(&fx, "a.example.com", 1, "192.168.1.5", &r));
+    ASSERT(firc_id_equal(fx.cfg.groups[0]->id, r.owner));
+    decide_fx_down(&fx);
     PASS();
 }
 
@@ -797,5 +817,6 @@ int main(int argc, char **argv)
     RUN_TEST(a_published_v6_flag_reaches_the_answer_and_flips_with_the_next_publish);
     RUN_TEST(a_route_names_the_active_entry_not_the_first);
     RUN_TEST(a_block_owner_is_claimed_without_a_route);
+    RUN_TEST(the_owner_is_reported_when_the_route_is_declined);
     GREATEST_MAIN_END();
 }

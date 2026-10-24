@@ -18,6 +18,7 @@ export { default as Save } from "@lucide/svelte/icons/save";
 export { default as ScrollToBottom } from "@lucide/svelte/icons/arrow-down-to-line";
 export { default as Clear } from "@lucide/svelte/icons/eraser";
 export { default as Filter } from "@lucide/svelte/icons/filter";
+export { default as Ban } from "@lucide/svelte/icons/ban";
 export { default as Sigma } from "@lucide/svelte/icons/sigma";
 export { default as Bug } from "@lucide/svelte/icons/bug";
 export { default as MoveUp } from "@lucide/svelte/icons/chevron-up";

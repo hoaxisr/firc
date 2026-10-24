@@ -35,6 +35,12 @@ void firc_tap_report_saw_at(firc_tap_report_t *r, int which, int64_t sec);
 
 void firc_tap_report_saw_cold_recall(firc_tap_report_t *r);
 
+/* The bypasses reported so far: the leak count a summary opens with. */
+uint64_t firc_tap_report_printed(const firc_tap_report_t *r);
+
+/* Most sentences one summary hands over. */
+#define FIRC_TAP_SENTENCES_MAX 13
+
 /* Longest sentence firc_tap_report_sentences hands over, NUL excluded. */
 #define FIRC_TAP_SENTENCE_MAX 239
 

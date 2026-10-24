@@ -579,6 +579,112 @@ definitions:
         example: 0
         type: integer
     type: object
+  types.DnsStatsClient:
+    properties:
+      address:
+        example: 192.168.1.10
+        type: string
+      queries:
+        description: 'Queries of the name from this address in the window'
+        example: 12
+        type: integer
+    type: object
+  types.DnsStatsOwner:
+    properties:
+      id:
+        example: 0a1b2c3d
+        type: string
+      name:
+        description: 'The group''s name now, not when it was asked'
+        example: Ads
+        type: string
+      interface:
+        description: 'The group''s active interface now; `block` for a block group'
+        example: block
+        type: string
+      blocked:
+        description: 'Whether that last answer was a block answer'
+        example: true
+        type: boolean
+    type: object
+  types.DnsStatsRow:
+    properties:
+      name:
+        example: ads.example.com
+        type: string
+      queries:
+        example: 42
+        type: integer
+      blocked:
+        description: 'Of those, answered by a block group (never a blackhole one)'
+        example: 40
+        type: integer
+      last:
+        description: 'Unix time of the last query among the devices asked for'
+        example: 1761240000
+        type: integer
+      owner:
+        description: >-
+          The group that owned the last answer to the most recent device among
+          those asked for, looked up now: null when no group owned it or the
+          group is gone.
+        allOf:
+        - $ref: '#/definitions/types.DnsStatsOwner'
+        x-nullable: true
+      clients:
+        description: 'At most 16 addresses, the busiest first'
+        items:
+          $ref: '#/definitions/types.DnsStatsClient'
+        type: array
+      clientsTotal:
+        description: 'Every address that asked the name in the window'
+        example: 3
+        type: integer
+    type: object
+  types.DnsStatsRes:
+    properties:
+      window:
+        description: 'Seconds the counts cover'
+        example: 86400
+        type: integer
+      now:
+        description: >-
+          Unix time of this answer by the daemon's clock, the one `since` and
+          `last` are on
+        example: 1761240000
+        type: integer
+      since:
+        description: >-
+          Unix time the counts started (the daemon's start); a window shorter
+          than a day while it is less than a day ago.
+        example: 1761200000
+        type: integer
+      queries:
+        description: >-
+          Queries in the window: every address, keys the ceiling pushed out
+          included; with `device`, those addresses' queries the store still
+          holds.
+        example: 1500
+        type: integer
+      blocked:
+        example: 120
+        type: integer
+      domains:
+        description: 'Distinct names with a query in the window; `q` does not narrow it'
+        example: 300
+        type: integer
+      rows:
+        items:
+          $ref: '#/definitions/types.DnsStatsRow'
+        type: array
+      matched:
+        description: 'Names matching `q` (every name without it)'
+        example: 300
+        type: integer
+      offset:
+        example: 0
+        type: integer
+    type: object
   types.EventsRes:
     properties:
       boot:
@@ -613,6 +719,36 @@ definitions:
           a capture runs
         example: 1789591553
         type: integer
+      last:
+        description: >-
+          The capture that finished most recently; absent while one runs and
+          before the first finishes since the daemon started
+        properties:
+          ended:
+            description: 'How it ended'
+            enum: [reached-end, stopped, failed]
+            example: reached-end
+            type: string
+          endedAt:
+            description: 'Unix time it ended'
+            example: 1789591853
+            type: integer
+          leaks:
+            description: >-
+              Bypass events it reported: the number in the summary's "N
+              bypasses reported", re-reports after the dedup window included
+            example: 2
+            type: integer
+          startedAt:
+            description: 'Unix time it started'
+            example: 1789591553
+            type: integer
+          summary:
+            description: 'The result sentences the journal got'
+            items:
+              type: string
+            type: array
+        type: object
       running:
         description: 'Whether a capture is running'
         example: true
@@ -2857,6 +2993,52 @@ paths:
       summary: 'Daemon journal'
       tags:
       - system
+  /api/v1/system/dnsstats:
+    get:
+      description: >-
+        What the devices of the network asked the DNS proxy in the last day,
+        counted by name and address in memory only: every query it parsed,
+        any client, cached, local and blocked answers included. A restart
+        starts the counts again. Rows are sorted by queries, then by name;
+        counts move between pages, so paging may repeat or skip a row. Names
+        under `.arpa` are counted but left out of the rows, `domains` and the
+        totals unless `arpa=1`. The answer holds names clients asked for, so
+        the route is available only after a WebUI login.
+      parameters:
+      - description: 'At most 12 addresses, comma-separated; any that does not parse is a 400'
+        in: query
+        name: device
+        type: string
+      - description: 'Substring of the name, case-insensitive'
+        in: query
+        name: q
+        type: string
+      - description: 'Rows to skip; offset + limit is at most 550, a 400 above it'
+        in: query
+        name: offset
+        type: integer
+      - description: 'Rows to answer: 50 by default (also for 0), at most 500'
+        in: query
+        name: limit
+        type: integer
+      - description: 'Exactly 1 keeps names under .arpa; anything else hides them'
+        in: query
+        name: arpa
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.DnsStatsRes'
+        "400":
+          description: 'A bad offset or limit, offset + limit over 550, or a bad device address'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'DNS queries of the last day'
+      tags:
+      - system
   /api/v1/system/capture:
     delete:
       description: >-
@@ -2864,7 +3046,8 @@ paths:
         returned: another is rejected, so a second client cannot cut someone
         else's capture short. Stopping what is not running is not an error.
         The daemon writes the capture's result to the journal
-        (/api/v1/system/events) and keeps nothing else.
+        (/api/v1/system/events) and keeps it as `last` until the next capture
+        starts or the daemon restarts.
       parameters:
       - description: 'The token POST returned'
         in: query

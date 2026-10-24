@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "firc/app.h"
+#include "firc/dnsstat.h"
 #include "firc/httpd.h"
 #include "firc/tunnels.h"
 
@@ -27,6 +28,8 @@ typedef struct firc_system_ctx {
     struct ifaces_read *ifaces_read; /* the interface read in flight, NULL if none; loop thread only */
     void (*iface_event)(void *ud, const char *iface); /* an NDM layer event on iface; NULL ignores them */
     void *iface_event_ud;
+    firc_dnsstat_t *dnsstat; /* the day's DNS counts, loop thread only; NULL answers an empty day */
+    int64_t dnsstat_since_mono; /* monotonic seconds the counts started */
 } firc_system_ctx_t;
 
 void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx);

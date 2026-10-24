@@ -258,6 +258,58 @@ describe("GroupsStore mutations and validation", () => {
     assert.strictEqual(store.dataRevision, 1);
   });
 
+  // Catches the block group pushed last (below the owner it must beat), saved, closed, or a routing one.
+  it("createBlockGroup puts an unsaved block group first", async () => {
+    const store = createStore();
+    store.tracker.reset(structuredClone([makeGroup("g1", [makeRule("r1")])]) as any);
+    assert.strictEqual(store.tracker.isDirty, false, "fixture: clean");
+
+    const id = await store.createBlockGroup("Блокировка · Phone", {
+      allow: ["mac:aa:00:00:00:00:03"],
+      deny: [],
+    });
+
+    assert.deepStrictEqual(groupIds(store), [id, "g1"]);
+    const created = store.data[0] as any;
+    assert.strictEqual(created.name, "Блокировка · Phone");
+    assert.strictEqual(created.interface, "block");
+    assert.strictEqual(created.block, "null");
+    assert.strictEqual(created.enable, true);
+    assert.deepStrictEqual(created.devices, { allow: ["mac:aa:00:00:00:00:03"], deny: [] });
+    assert.deepStrictEqual(created.rules, []);
+    assert.strictEqual(store.open_state[id], true);
+    assert.strictEqual(store.tracker.isDirtyWithin(store.data[0]), true);
+    assert.strictEqual(store.tracker.isDirtyWithin(store.data[1]), false);
+    assert.strictEqual(store.canSave, true);
+
+    store.dataLoaded = false;
+    assert.strictEqual(await store.createBlockGroup("x", { allow: [], deny: [] }), "");
+    assert.strictEqual(store.data.length, 2);
+  });
+
+  // Catches a second copy of a held name, or a disabled copy left off instead of switched on.
+  it("blockName skips a name the group holds and switches a disabled one on", async () => {
+    const store = createStore([
+      makeGroup("g1", [makeRule("r1", "ya.ru"), { ...makeRule("r2", "vk.com"), enable: false }]),
+    ]);
+    await store.blockName("g1", "ya.ru");
+    assert.deepStrictEqual(ruleIds(store, 0), ["r1", "r2"]);
+    await store.blockName("g1", "vk.com");
+    assert.deepStrictEqual(ruleIds(store, 0), ["r1", "r2"]);
+    assert.strictEqual(store.data[0].rules[1].enable, true);
+    assert.strictEqual(store.dataRevision, 1);
+    await store.blockName("g1", "new.example");
+    assert.deepStrictEqual(store.data[0].rules[0], {
+      ...store.data[0].rules[0],
+      rule: "new.example",
+      type: "domain",
+      enable: true,
+    });
+    assert.strictEqual(store.data[0].rules.length, 3);
+    await store.blockName("nope", "x.example");
+    assert.strictEqual(store.data[0].rules.length, 3);
+  });
+
   it("deleteRuleFromGroup removes by index and keeps out-of-range behavior", () => {
     const store = createStore([makeGroup("g1", [makeRule("r1"), makeRule("r2"), makeRule("r3")])]);
 

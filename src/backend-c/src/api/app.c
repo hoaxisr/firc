@@ -139,6 +139,7 @@ struct firc_app {
     /* _Atomic/relaxed: committer reads it per pass while the loop writes it; a plain bool here is a data race */
     _Atomic bool tap_open;
     int64_t tap_ends_at;
+    int64_t tap_started_ms; /* monotonic, for how long a stopped capture ran */
     int64_t tap_ends_mono; /* the real deadline, on a clock no NTP step moves; tap_ends_at is for printing only */
     int64_t tap_seconds; /* FIRC_CAPTURE_SECONDS, or a test's */
     uint64_t (*mono_ms)(void); /* a failed group's retry spacing */
@@ -159,6 +160,8 @@ struct firc_app {
     char **tap_lan; /* capture's LAN interfaces, copied from app.link at start; read under nf_mu, like tap_open */
     size_t n_tap_lan;
     firc_tap_report_t *tap_report;
+    firc_capture_last_t tap_last;
+    bool tap_has_last;
     firc_tap_pool_t tap_pool;
     /* counted by the committer, folded into the report by the loop; atomic since the loop must not take nf_mu here */
     _Atomic uint32_t tap_failed_passes;
@@ -192,6 +195,7 @@ static void app_nf_leave(firc_app_t *app);
 static void on_tap_readable(firc_loop_t *loop, int fd, uint32_t events, void *ud);
 static void tap_reader_down(firc_app_t *app);
 static void on_tap_deadline(firc_loop_t *loop, void *ud);
+static firc_err_t capture_end(firc_app_t *app, const char *token, const char *how);
 static void report_committed(firc_app_t *app, uint64_t gen, bool full, uint64_t ticket, firc_ktcp_image_t *image,
                              const firc_xt_acl_t *skip, firc_ktcp_off_t off);
 static const firc_fakeip_snapshot_t *rules_snapshot(void *ud);
@@ -2930,6 +2934,16 @@ static void say_sentence(const char *sentence, void *ud) {
     FIRC_INFO("%s", sentence);
 }
 
+_Static_assert(FIRC_CAPTURE_LAST_SENTENCES == FIRC_TAP_SENTENCES_MAX, "a kept summary holds every sentence");
+_Static_assert(FIRC_CAPTURE_LAST_SENTENCE_BYTES > FIRC_TAP_SENTENCE_MAX, "a kept sentence fits");
+static void keep_sentence(const char *sentence, void *ud) {
+    firc_capture_last_t *last = ud;
+    say_sentence(sentence, NULL);
+    if (last->n_summary < FIRC_CAPTURE_LAST_SENTENCES) {
+        snprintf(last->summary[last->n_summary++], sizeof(last->summary[0]), "%s", sentence);
+    }
+}
+
 static void tap_lan_free(char **lan, size_t n) {
     for (size_t i = 0; i < n; i++) { free(lan[i]); }
     free(lan);
@@ -3027,7 +3041,7 @@ static void on_tap_readable(firc_loop_t *loop, int fd, uint32_t events, void *ud
         if (e != FIRC_OK) { /* the reader is broken; carrying on would report a false clean five minutes */
             FIRC_WARN("capture: its %s reader failed (%s), so the capture ends here",
                        r->which == 0 ? "new-connection" : "ClientHello", firc_err_str(e));
-            (void)firc_app_capture_stop(app, NULL);
+            (void)capture_end(app, NULL, "failed");
             return;
         }
     }
@@ -3307,6 +3321,7 @@ firc_err_t firc_app_capture_start(firc_app_t *app, int64_t now_unix,
     app->n_tap_lan = n_lan;
     app->tap_ends_at = now_unix + app->tap_seconds;
     app->tap_ends_mono = mono_secs() + app->tap_seconds;
+    app->tap_started_ms = (int64_t)app->mono_ms();
     app->tap_open = true;
     app_nf_leave(app);
 
@@ -3329,6 +3344,8 @@ firc_err_t firc_app_capture_start(firc_app_t *app, int64_t now_unix,
             return FIRC_ERR_NOMEM;
         }
     }
+
+    app->tap_has_last = false;
 
     /* a recall with no real address yet recognises nothing by address; noted now, said at the capture's end */
     firc_recall_t *recall = app->pipeline != NULL ? firc_dns_pipeline_recall(app->pipeline) : NULL;
@@ -3356,10 +3373,20 @@ static void on_tap_deadline(firc_loop_t *loop, void *ud) {
     firc_app_t *app = ud;
     app->tap_timer = 0; /* the timer has fired and is dead; saying so first keeps the stop from deleting an id that names nothing */
     FIRC_INFO("capture reached its end");
-    (void)firc_app_capture_stop(app, NULL);
+    (void)capture_end(app, NULL, "reached-end");
 }
 
 firc_err_t firc_app_capture_stop(firc_app_t *app, const char *token) {
+    return capture_end(app, token, "stopped");
+}
+
+bool firc_app_capture_last(const firc_app_t *app, firc_capture_last_t *out) {
+    if (app == NULL || out == NULL || !app->tap_has_last) { return false; }
+    *out = app->tap_last;
+    return true;
+}
+
+static firc_err_t capture_end(firc_app_t *app, const char *token, const char *how) {
     if (app == NULL) { return FIRC_ERR_INVAL; }
 
     app_nf_enter(app);
@@ -3385,7 +3412,16 @@ firc_err_t firc_app_capture_stop(firc_app_t *app, const char *token) {
     if (timer != 0 && app->loop != NULL) { (void)firc_loop_del_timer(app->loop, timer); }
 
     FIRC_INFO("capture stopped");
-    firc_tap_report_sentences(app->tap_report, true, say_sentence, NULL); /* one sentence per line; nothing of the capture is kept after this */
+    memset(&app->tap_last, 0, sizeof(app->tap_last));
+    app->tap_last.started_at = app->tap_ends_at - app->tap_seconds;
+    int64_t ran = strcmp(how, "reached-end") == 0
+                      ? app->tap_seconds
+                      : ((int64_t)app->mono_ms() - app->tap_started_ms) / 1000;
+    app->tap_last.ended_at = app->tap_last.started_at + (ran < 0 ? 0 : ran > app->tap_seconds ? app->tap_seconds : ran);
+    app->tap_last.ended = how;
+    app->tap_last.leaks = firc_tap_report_printed(app->tap_report);
+    firc_tap_report_sentences(app->tap_report, true, keep_sentence, &app->tap_last);
+    app->tap_has_last = true;
     tap_reader_down(app);
     if (app->committer != NULL) { firc_nfcommit_request(app->committer); }
     return FIRC_OK;

@@ -8,9 +8,9 @@ import type {
 
 import type { Host } from "../../utils/device-picker";
 
-export type Source = "fircd" | "tunnels" | "dns" | "bypass";
+export type Source = "fircd" | "tunnels" | "dns";
 
-export const SOURCES: Source[] = ["fircd", "tunnels", "dns", "bypass"];
+export const SOURCES: Source[] = ["fircd", "tunnels", "dns"];
 export const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
 export const DEFAULT_LEVELS: LogLevel[] = ["info", "warn", "error"];
 
@@ -20,15 +20,33 @@ export type JournalFilter = {
   group: string;
 };
 
-export function sourceOf(e: JournalEvent): Source {
+export function sourceOf(e: JournalEvent): Source | null {
   if (e.kind === "log") return e.source === "fircd" ? "fircd" : "tunnels";
-  return e.kind;
+  return e.kind === "dns" ? "dns" : null;
 }
 
 export function sourceCounts(events: JournalEvent[]): Record<Source, number> {
-  const out: Record<Source, number> = { fircd: 0, tunnels: 0, dns: 0, bypass: 0 };
-  for (const e of events) out[sourceOf(e)] += 1;
+  const out: Record<Source, number> = { fircd: 0, tunnels: 0, dns: 0 };
+  for (const e of events) {
+    const s = sourceOf(e);
+    if (s) out[s] += 1;
+  }
   return out;
+}
+
+export function compactCount(n: number, locale: string): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  const shown = k < 10 ? String(Math.round(k * 10) / 10) : String(Math.round(k));
+  return `${locale === "ru" ? shown.replace(".", ",") : shown}k`;
+}
+
+export function filtersHiding(f: JournalFilter): number {
+  return (
+    Number(SOURCES.some((s) => !f.sources.has(s))) +
+    Number(LEVELS.some((l) => !f.levels.has(l))) +
+    Number(f.group !== "")
+  );
 }
 
 export type GroupRef = { id: string; name: string };
@@ -56,7 +74,8 @@ export function groupFilterOptions(
 }
 
 export function matches(e: JournalEvent, f: JournalFilter): boolean {
-  if (!f.sources.has(sourceOf(e))) return false;
+  const s = sourceOf(e);
+  if (!s || !f.sources.has(s)) return false;
   if (e.kind === "log") {
     if (f.group) return false;
     return f.levels.has(e.level);

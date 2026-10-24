@@ -35,6 +35,25 @@ static void write_status(firc_http_res_t *res, firc_app_t *app, const char *toke
         cJSON_AddNumberToObject(out, "secondsLeft", (double)st.seconds_left);
         if (token != NULL) { cJSON_AddStringToObject(out, "token", token); }
     }
+    firc_capture_last_t last;
+    if (firc_app_capture_last(app, &last)) {
+        cJSON *obj = cJSON_AddObjectToObject(out, "last");
+        cJSON *summary = obj != NULL ? cJSON_CreateArray() : NULL;
+        if (obj == NULL || summary == NULL) {
+            cJSON_Delete(summary);
+            cJSON_Delete(out);
+            firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
+            return;
+        }
+        cJSON_AddNumberToObject(obj, "startedAt", (double)last.started_at);
+        cJSON_AddNumberToObject(obj, "endedAt", (double)last.ended_at);
+        cJSON_AddStringToObject(obj, "ended", last.ended);
+        cJSON_AddNumberToObject(obj, "leaks", (double)last.leaks);
+        cJSON_AddItemToObject(obj, "summary", summary);
+        for (size_t i = 0; i < last.n_summary; i++) {
+            cJSON_AddItemToArray(summary, cJSON_CreateString(last.summary[i]));
+        }
+    }
     firc_http_res_write_json(res, 200, out);
 }
 

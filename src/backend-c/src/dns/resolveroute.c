@@ -260,8 +260,10 @@ bool firc_resolve_router_decide(void *ud, const firc_dns_msg_t *query, const fir
     if (r == NULL || r->pipeline == NULL) { return false; }
     const firc_group_snapshot_t *owner = firc_dns_pipeline_owner(r->pipeline, query, client);
     if (owner == NULL) { return false; }
+    out->owner = owner->id;
     if (owner->block >= 0 && firc_dns_blockable(query)) {
         memset(out, 0, sizeof(*out));
+        out->owner = owner->id;
         out->group_id = owner->id;
         out->blocked = true;
         out->answer = (firc_block_answer_t)owner->block;
@@ -270,6 +272,7 @@ bool firc_resolve_router_decide(void *ud, const firc_dns_msg_t *query, const fir
     const firc_resolve_route_t *rt = firc_resolve_table_find(&r->table, owner->id);
     if (!firc_resolve_route_usable(rt)) { return false; }
     memset(out, 0, sizeof(*out));
+    out->owner = owner->id;
     out->group_id = rt->group_id;
     out->mark = rt->mark;
     out->gen = rt->gen;
