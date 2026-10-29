@@ -812,6 +812,8 @@ TEST state_lists_every_tunnel_with_its_nodes_groups_and_subscriptions(void)
     ASSERT_EQ(0, at(sub, "nodes")->valueint);
     ASSERT_EQ(0, at(sub, "lastOk")->valueint);
     ASSERT(cJSON_IsNumber(at(sub, "lastTry")) && cJSON_IsString(at(sub, "error")) && cJSON_IsBool(at(sub, "fetching")));
+    /* catches: a subscription the provider said nothing about given made-up numbers instead of null */
+    ASSERT(cJSON_IsNull(at(sub, "usage")));
     cJSON_Delete(ans);
     PASS();
 }

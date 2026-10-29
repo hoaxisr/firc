@@ -1004,6 +1004,14 @@ const tunnelState = (tn: any) => {
           src.name === "Reborn VPN"
             ? "the server answered: Please turn on HWID in your app, or find the new one"
             : "",
+        usage:
+          src.name === "Reborn VPN"
+            ? null
+            : {
+                used: 87 * 2 ** 30,
+                total: 100 * 2 ** 30,
+                expire: Math.floor(Date.now() / 1000) + 2 * 86400,
+              },
       })),
     rxBps: status === "up" ? 1200 : 0,
     txBps: status === "up" ? 300 : 0,

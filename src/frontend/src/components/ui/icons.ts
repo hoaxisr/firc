@@ -72,6 +72,7 @@ export { default as CircleHelp } from "@lucide/svelte/icons/circle-help";
 export { default as PowerOff } from "@lucide/svelte/icons/power-off";
 export { default as Unplug } from "@lucide/svelte/icons/unplug";
 export { default as ArrowDownUp } from "@lucide/svelte/icons/arrow-down-up";
+export { default as Calendar } from "@lucide/svelte/icons/calendar-clock";
 export { default as RotateCcw } from "@lucide/svelte/icons/rotate-ccw";
 export { default as Activity } from "@lucide/svelte/icons/activity";
 export { default as SortByLatency } from "@lucide/svelte/icons/arrow-down-wide-narrow";

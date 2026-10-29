@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@ static int g_hits;
 static int g_status = 200;
 static int g_delay_ms;
 static char g_body[512] = BODY_AB;
+static char g_userinfo[160];
 static const char *const SEEN[] = {"User-Agent", "X-HWID", "X-Device-OS", "X-Ver-OS", "X-Device-Model", "X-Extra"};
 #define N_SEEN (sizeof SEEN / sizeof SEEN[0])
 static char g_seen[N_SEEN][128];
@@ -55,10 +57,15 @@ static void h_sub(firc_http_req_t *req, firc_http_res_t *res, void *ud)
     int status = g_status;
     char body[512];
     snprintf(body, sizeof body, "%s", hwid_less ? g_body_without_hwid : g_body);
+    char userinfo[sizeof g_userinfo];
+    snprintf(userinfo, sizeof userinfo, "%s", g_userinfo);
     pthread_mutex_unlock(&g_mu);
     if (delay > 0) {
         struct timespec ts = {delay / 1000, (long)(delay % 1000) * 1000000L};
         nanosleep(&ts, NULL);
+    }
+    if (userinfo[0] != '\0') {
+        firc_http_res_set_header(res, "Subscription-Userinfo", userinfo);
     }
     firc_http_res_write(res, status, "text/plain", (const uint8_t *)body, strlen(body));
 }
@@ -179,6 +186,7 @@ static void reset_server(void)
     g_status = 200;
     g_delay_ms = 0;
     snprintf(g_body, sizeof g_body, "%s", BODY_AB);
+    g_userinfo[0] = 0;
     g_n_marks = 0;
     g_sockopt_fail = 0;
     g_body_without_hwid[0] = 0;
@@ -1170,6 +1178,138 @@ TEST a_placeholder_answer_keeps_the_body_and_says_what_the_server_said(void)
     PASS();
 }
 
+static void set_userinfo(const char *value)
+{
+    pthread_mutex_lock(&g_mu);
+    snprintf(g_userinfo, sizeof g_userinfo, "%s", value);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static bool info_path(fx_t *f, char *buf, size_t cap)
+{
+    if (!cache_path(f, URL, "auto", buf, cap - 5)) {
+        return false;
+    }
+    strcat(buf, ".info");
+    return true;
+}
+
+/* Catches: the provider's traffic and end date dropped, read in the wrong fields, or lost on a restart before the
+   next fetch. */
+TEST the_provider_userinfo_is_kept_across_a_restart(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    set_userinfo("upload=100; download=2000; total=107374182400; expire=1767225600");
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT(st.info.have);
+    ASSERT_EQ_FMT((uint64_t)100, st.info.upload, "%" PRIu64);
+    ASSERT_EQ_FMT((uint64_t)2000, st.info.download, "%" PRIu64);
+    ASSERT_EQ_FMT((uint64_t)107374182400, st.info.total, "%" PRIu64);
+    ASSERT_EQ_FMT((int64_t)1767225600, st.info.expire, "%" PRId64);
+    char path[176], buf[256];
+    ASSERT(info_path(&f, path, sizeof path));
+    slurp(path, buf, sizeof buf);
+    ASSERT_STR_EQ("upload=100; download=2000; total=107374182400; expire=1767225600\n", buf);
+    server_stop();
+    firc_tunsubs_free(f.subs);
+    f.subs = firc_tunsubs_new(f.loop, f.cache, on_changed, &f);
+    ASSERT(f.subs != NULL);
+    want(&f, marks);
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT(st.info.have);
+    ASSERT_EQ_FMT((uint64_t)2000, st.info.download, "%" PRIu64);
+    ASSERT_EQ_FMT((int64_t)1767225600, st.info.expire, "%" PRId64);
+    fx_down(&f);
+    PASS();
+}
+
+/* Catches: an ended plan's placeholder dropping the end date the server sent with it, or an answer without the
+   header leaving the old numbers and their file behind. */
+TEST the_userinfo_follows_a_placeholder_and_goes_with_the_header(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    set_userinfo("upload=0; download=10; total=100; expire=1767225600");
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    set_body(PLACEHOLDER);
+    set_userinfo("upload=0; download=100; total=100; expire=1700000000");
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    int two = 2;
+    ASSERT(run_until(&f, settled_after, &two, 3000));
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT(st.error[0] != 0);
+    ASSERT(st.info.have);
+    ASSERT_EQ_FMT((uint64_t)100, st.info.download, "%" PRIu64);
+    ASSERT_EQ_FMT((int64_t)1700000000, st.info.expire, "%" PRId64);
+    set_body(BODY_AB);
+    set_userinfo("");
+    ASSERT_EQ(FIRC_OK, firc_tunsubs_refresh(f.subs, "t0"));
+    int three = 3;
+    ASSERT(run_until(&f, settled_after, &three, 3000));
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT_STR_EQ("", st.error);
+    ASSERT(!st.info.have);
+    char path[176];
+    ASSERT(info_path(&f, path, sizeof path));
+    ASSERT_EQ(-1, access(path, F_OK));
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: a provider that writes the line into the body instead of a header going unread. */
+TEST the_userinfo_line_at_the_top_of_the_body_is_read(void)
+{
+    static fx_t f;
+    ASSERT(server_start());
+    ASSERT(fx_up(&f));
+    set_body("#profile-title: P\n#subscription-userinfo: upload=1; download=2; total=3; expire=4\n" BODY_AB);
+    ASSERT(load(&f, TUN("t0", "0", URL, "6h")));
+    const uint32_t marks[] = {0};
+    want(&f, marks);
+    ASSERT(run_until(&f, changed_once, NULL, 3000));
+    firc_tun_sub_state_t st;
+    ASSERT_EQ_FMT((size_t)1, firc_tunsubs_state(f.subs, URL, 0, 0, &st), "%zu");
+    ASSERT_EQ_FMT((size_t)2, st.nodes, "%zu");
+    ASSERT(st.info.have);
+    ASSERT_EQ_FMT((uint64_t)3, st.info.total, "%" PRIu64);
+    ASSERT_EQ_FMT((int64_t)4, st.info.expire, "%" PRId64);
+    fx_down(&f);
+    server_stop();
+    PASS();
+}
+
+/* Catches: the sweep leaving a dropped subscription's .info behind, or taking a kept one's. */
+TEST the_sweep_removes_an_unused_info_file(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f));
+    ASSERT(load(&f, TUN("t0", "0", URL, "0s")));
+    char kept[176], stale[176];
+    ASSERT(info_path(&f, kept, sizeof kept));
+    ASSERT(cache_path(&f, URL, "iface:eth8", stale, sizeof stale - 5));
+    strcat(stale, ".info");
+    ASSERT(write_padded(kept, 10));
+    ASSERT(write_padded(stale, 10));
+    firc_tunsubs_sweep(f.subs, &f.cfg);
+    ASSERT_EQ(0, access(kept, F_OK));
+    ASSERT_EQ(-1, access(stale, F_OK));
+    fx_down(&f);
+    PASS();
+}
+
 /* Catches: a long name in Cyrillic cut inside a character, so the state's error is not UTF-8 and breaks the JSON. */
 TEST a_long_placeholder_name_is_cut_on_a_character(void)
 {
@@ -1450,6 +1590,10 @@ SUITE(tunsubs)
     RUN_TEST(a_header_value_never_reaches_the_log);
     RUN_TEST(a_placeholder_answer_keeps_the_body_and_says_what_the_server_said);
     RUN_TEST(a_long_placeholder_name_is_cut_on_a_character);
+    RUN_TEST(the_provider_userinfo_is_kept_across_a_restart);
+    RUN_TEST(the_userinfo_follows_a_placeholder_and_goes_with_the_header);
+    RUN_TEST(the_userinfo_line_at_the_top_of_the_body_is_read);
+    RUN_TEST(the_sweep_removes_an_unused_info_file);
 }
 
 GREATEST_MAIN_DEFS();

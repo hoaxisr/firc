@@ -8,6 +8,7 @@
 #include "firc/err.h"
 #include "firc/loop.h"
 #include "firc/subhdr.h"
+#include "firc/subinfo.h"
 #include "firc/tunnels.h"
 #include "firc/tunnodes.h"
 
@@ -19,6 +20,7 @@ typedef struct {
     char error[160];
     bool fetching;
     size_t nodes;
+    firc_subinfo_t info;  /* of the last good fetch; have is false when the provider gave none */
 } firc_tun_sub_state_t;
 
 /* Loop thread only, like every call below; fetches run on a thread of its own. changed(ud) runs on the

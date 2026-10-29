@@ -237,6 +237,74 @@ test.describe("Tunnels page", () => {
     await expect(tunnels.card("t3")).toContainText("(last good)");
   });
 
+  // Catches the provider's traffic and end date missing from the source row, an ending plan not warned about on the
+  // card's head line, or a warning shown for a subscription the provider said nothing about.
+  test("a subscription shows its traffic and end date and warns before it ends", async ({
+    page,
+  }) => {
+    const sub = {
+      name: "Provider",
+      url: "https://sub.example/feed",
+      kind: "subscription",
+      id: "s1",
+      interval: 21600,
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const GiB = 2 ** 30;
+    const subState = (usage: object | null) => ({
+      name: "Provider",
+      nodes: 2,
+      lastOk: now - 60,
+      lastTry: now - 60,
+      fetching: false,
+      error: "",
+      usage,
+    });
+    await stubDaemon(page, {
+      tunnels: [
+        tunnel("a", "tunvless0", { sources: [sub] }),
+        tunnel("b", "tunvless1", { sources: [sub] }),
+        tunnel("c", "tunvless2", { sources: [sub] }),
+      ],
+      states: [
+        state("a", "tunvless0", {
+          subscriptions: [
+            subState({ used: 12.5 * GiB, total: 100 * GiB, expire: now + 30 * 86400 }),
+          ],
+        }),
+        state("b", "tunvless1", {
+          subscriptions: [subState({ used: 95 * GiB, total: 0, expire: now - 3600 })],
+        }),
+        state("c", "tunvless2", { subscriptions: [subState(null)] }),
+      ],
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+
+    await expect(tunnels.card("a").locator("[data-sub-alert]")).toHaveCount(0);
+    await expect(tunnels.card("b").locator('[data-sub-alert="Provider"]')).toHaveText(
+      "«Provider»: has ended",
+    );
+    await expect(tunnels.card("c").locator("[data-sub-alert]")).toHaveCount(0);
+
+    await tunnels.expand("a");
+    const traffic = tunnels.card("a").locator('[data-usage="traffic"]');
+    await expect(traffic).toHaveText("Traffic: 12.5 GB of 100 GB");
+    await expect(traffic).not.toHaveClass(/orange|red/);
+    await expect(tunnels.card("a").locator('[data-usage="expiry"]')).toContainText("until ");
+
+    await tunnels.expand("b");
+    await expect(tunnels.card("b").locator('[data-usage="traffic"]')).toHaveText(
+      "Traffic: 95 GB, no limit",
+    );
+    const ended = tunnels.card("b").locator('[data-usage="expiry"]');
+    await expect(ended).toContainText("ended ");
+    await expect(ended).toHaveClass(/red/);
+
+    await tunnels.expand("c");
+    await expect(tunnels.card("c").locator("[data-usage]")).toHaveCount(0);
+  });
+
   // Catches the IPv6 tag missing on an active v6 node, or shown on a v4-only one or a node that is not active.
   test("an active node that carries IPv6 shows the tag and the others do not", async ({ page }) => {
     const node = (name: string, nodeState: string, v6?: boolean) => ({

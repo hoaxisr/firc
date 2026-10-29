@@ -82,6 +82,12 @@ firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, const cha
                                        char **out_body, size_t *out_len, int *out_http_status,
                                        firc_sub_fetch_progress_fn progress, void *ud);
 
+/* firc_sub_fetch_list_mark_ex that also hands every response header of every hop to on_header (NULL for none). */
+firc_err_t firc_sub_fetch_list_mark_hdr(const char *url, uint32_t mark, const char *const *headers,
+                                        char **out_body, size_t *out_len, int *out_http_status,
+                                        firc_sub_fetch_progress_fn progress, void *ud,
+                                        firc_sub_fetch_header_fn on_header, void *header_ud);
+
 /* Writes url as scheme://host/… into buf: paths and queries may carry tokens. */
 void firc_sub_url_redact(const char *url, char *buf, size_t cap);
 

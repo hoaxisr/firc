@@ -418,11 +418,13 @@ static bool mem_sink_write(void *ud, const uint8_t *data, size_t n) {
 
 static firc_err_t fetch(const char *url, uint32_t mark, const char *const *headers, size_t max, char **out_body,
                         size_t *out_len, firc_sub_fetch_progress_fn progress, void *ud, long *out_http_status,
-                        char *errbuf, size_t errbuf_cap) {
+                        char *errbuf, size_t errbuf_cap, firc_sub_fetch_header_fn on_header, void *header_ud) {
     *out_body = NULL;
     *out_len = 0;
     firc_sub_fetch_opts_t o = {.mark = mark,
                                .headers = headers,
+                               .on_header = on_header,
+                               .header_ud = header_ud,
                                .progress = progress,
                                .progress_ud = ud,
                                .errbuf = errbuf,
@@ -466,7 +468,7 @@ firc_err_t firc_sub_fetch_list_ex(const char *url, char **out_body, size_t *out_
 firc_err_t firc_sub_fetch_list_opts(const char *url, size_t cap, char **out_body, size_t *out_len,
                                     firc_sub_fetch_progress_fn progress, void *ud, long *out_status, char *errbuf,
                                     size_t errbuf_cap) {
-    return fetch(url, 0, NULL, cap, out_body, out_len, progress, ud, out_status, errbuf, errbuf_cap);
+    return fetch(url, 0, NULL, cap, out_body, out_len, progress, ud, out_status, errbuf, errbuf_cap, NULL, NULL);
 }
 
 void firc_sub_fetch_reason(firc_err_t err, long http_status, const char *errbuf, char *out, size_t cap) {
@@ -489,8 +491,17 @@ void firc_sub_fetch_reason(firc_err_t err, long http_status, const char *errbuf,
 firc_err_t firc_sub_fetch_list_mark_ex(const char *url, uint32_t mark, const char *const *headers,
                                        char **out_body, size_t *out_len, int *out_http_status,
                                        firc_sub_fetch_progress_fn progress, void *ud) {
+    return firc_sub_fetch_list_mark_hdr(url, mark, headers, out_body, out_len, out_http_status, progress, ud, NULL,
+                                        NULL);
+}
+
+firc_err_t firc_sub_fetch_list_mark_hdr(const char *url, uint32_t mark, const char *const *headers,
+                                        char **out_body, size_t *out_len, int *out_http_status,
+                                        firc_sub_fetch_progress_fn progress, void *ud,
+                                        firc_sub_fetch_header_fn on_header, void *header_ud) {
     long status = 0;
-    firc_err_t err = fetch(url, mark, headers, FIRC_SUB_FETCH_MAX_BODY_BYTES, out_body, out_len, progress, ud, &status, NULL, 0);
+    firc_err_t err = fetch(url, mark, headers, FIRC_SUB_FETCH_MAX_BODY_BYTES, out_body, out_len, progress, ud, &status,
+                           NULL, 0, on_header, header_ud);
     if (out_http_status != NULL) { *out_http_status = (int)status; }
     return err;
 }

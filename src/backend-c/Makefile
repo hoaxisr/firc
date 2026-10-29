@@ -180,6 +180,7 @@ TUNVLESS_CFLAGS = -std=gnu11 $(OPT) -Wall -Wextra $(filter-out -Werror%,$(CFLAGS
 SUBSCRIPTIONS_SRCS := \
     src/subscriptions/fetch.c \
     src/subscriptions/subhdr.c \
+    src/subscriptions/subinfo.c \
     src/subscriptions/worker.c
 
 # Needs cJSON and libcurl.

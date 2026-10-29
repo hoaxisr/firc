@@ -33,6 +33,7 @@
     Unplug,
   } from "../../../components/ui/icons";
   import { counted } from "../../../utils/plural";
+  import { usageAlert } from "../sub-usage";
   import { descriptionProblem, formatRate } from "../tunnel-editor";
   import { tunnelLook } from "../tunnel-state";
   import type { ClientTunnel } from "../tunnels-data";
@@ -71,6 +72,13 @@
   const links = $derived(tunnel.sources.filter((s) => s.kind === "link"));
   const listening = $derived((live?.inbounds ?? []).filter((ib) => ib.state === "up"));
   const toned = $derived(Boolean(look) && look?.color !== "var(--text-2)");
+  const alerts = $derived.by(() => {
+    const now = Date.now() / 1000;
+    return (live?.subscriptions ?? []).flatMap((s) => {
+      const a = usageAlert(s.usage, now, t);
+      return a ? [{ name: s.name, ...a }] : [];
+    });
+  });
 
   const sourcesText = $derived(
     [
@@ -170,6 +178,13 @@
           {:else if look}
             <span class="badge" class:toned style:--tone={look.color}>{look.label}</span>
           {/if}
+          {#each alerts as a (a.name)}
+            <span class="badge toned" style:--tone="var(--{a.tone})" data-sub-alert={a.name}>
+              {t("«{name}»: {what}")
+                .replace("{name}", () => a.name)
+                .replace("{what}", () => a.text)}
+            </span>
+          {/each}
         </div>
         {#if descriptionBad}
           <div class="description-error">{descriptionBad}</div>

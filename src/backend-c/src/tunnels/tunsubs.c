@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include "firc/logrep.h"
 #include "firc/sub_fetch.h"
 #include "firc/subhdr.h"
+#include "firc/subinfo.h"
 
 #define RETRY_MS 60000
 #define IDENT_MAX 32
@@ -49,6 +51,7 @@ typedef struct {
     firc_logrep_t failing;
     bool fetching;
     size_t nodes;
+    firc_subinfo_t info;
     bool kept, was_wanted;
 } entry_t;
 
@@ -64,6 +67,7 @@ typedef struct result {
     char *body;
     size_t len;
     size_t nodes;
+    firc_subinfo_t info;
     uint8_t sha[FIRC_SHA256_DIGEST_LEN];
     bool wrote;
     firc_err_t write_err;
@@ -211,8 +215,45 @@ static size_t count_nodes(const char *url, const char *body, size_t len, bool *p
     return n;
 }
 
+/* The provider's traffic and expiry of the last good fetch sit next to the body, in <key>.info. */
+static void load_info(const firc_tunsubs_t *s, entry_t *e)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.info", s->dir, e->key);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return;
+    }
+    char line[FIRC_SUBINFO_LINE_MAX + 1];
+    ssize_t n = read(fd, line, sizeof line - 1);
+    close(fd);
+    if (n <= 0) {
+        return;
+    }
+    line[n] = 0;
+    line[strcspn(line, "\r\n")] = 0;
+    (void)firc_subinfo_parse(line, &e->info);
+}
+
+static void save_info(const char *body_path, const firc_subinfo_t *info)
+{
+    char path[520];
+    snprintf(path, sizeof path, "%s.info", body_path);
+    if (!info->have) {
+        (void)unlink(path);
+        return;
+    }
+    char line[FIRC_SUBINFO_LINE_MAX + 2];
+    firc_subinfo_format(info, line, sizeof line - 1);
+    strcat(line, "\n");
+    if (firc_atomic_write(path, line, strlen(line)) != FIRC_OK) {
+        FIRC_WARN("tunnel subscriptions: traffic and expiry not kept in %s", path);
+    }
+}
+
 static void load_cache(firc_tunsubs_t *s, entry_t *e)
 {
+    load_info(s, e);
     char path[512];
     snprintf(path, sizeof path, "%s/%s", s->dir, e->key);
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -267,12 +308,24 @@ static bool keep_going(void *ud, size_t bytes, size_t total)
     return !atomic_load(&((firc_tunsubs_t *)ud)->abort);
 }
 
+static void on_header(void *ud, const char *name, const char *value)
+{
+    firc_subinfo_t info;
+    if (strcasecmp(name, FIRC_SUBINFO_HEADER) == 0 && firc_subinfo_parse(value, &info)) {
+        ((result_t *)ud)->info = info;
+    }
+}
+
 static void run_job(firc_tunsubs_t *s, job_t *j)
 {
     result_t *r = j->r;
     j->r = NULL;
-    r->err = firc_sub_fetch_list_mark_ex(r->url, j->mark, (const char *const *)j->lines, &r->body, &r->len, &r->status, keep_going, s);
+    r->err = firc_sub_fetch_list_mark_hdr(r->url, j->mark, (const char *const *)j->lines, &r->body, &r->len,
+                                          &r->status, keep_going, s, on_header, r);
     r->at_ms = wall_ms();
+    if (r->err == FIRC_OK && !r->info.have) {
+        (void)firc_subinfo_from_body(r->body, r->len, &r->info);
+    }
     if (r->err == FIRC_OK) {
         r->nodes = count_nodes(r->url, r->body, r->len, &r->placeholder, r->said, sizeof r->said);
         if (r->placeholder) {
@@ -288,6 +341,10 @@ static void run_job(firc_tunsubs_t *s, job_t *j)
             r->write_err = firc_atomic_write(j->path, r->body, r->len);
             r->wrote = true;
         }
+    }
+    /* A provider that stops serving nodes once the plan runs out still tells how and when it did. */
+    if (r->err == FIRC_OK || r->info.have) {
+        save_info(j->path, &r->info);
     }
     post_result(s, r);
 }
@@ -440,6 +497,9 @@ static void on_result(firc_loop_t *loop, void *ud)
     e->last_try_ms = r->at_ms;
     e->done_mono = mono_ms(s);
     if (r->err != FIRC_OK) {
+        if (r->info.have) {
+            e->info = r->info;
+        }
         describe(r, e->error, sizeof e->error);
         firc_logrep_fail(&e->failing, FIRC_LOG_WARN, NULL, "tunnel subscription %s: fetch failed: %s", shown, e->error);
         free_result(r);
@@ -448,6 +508,7 @@ static void on_result(firc_loop_t *loop, void *ud)
     e->error[0] = 0;
     (void)firc_logrep_ok(&e->failing, NULL, "tunnel subscription %s", shown);
     e->last_ok_ms = r->at_ms;
+    e->info = r->info;
     if (r->wrote && r->write_err != FIRC_OK) {
         FIRC_WARN("tunnel subscription %s: cache not written: %s", shown, firc_err_str(r->write_err));
     } else if (r->wrote) {
@@ -736,7 +797,13 @@ void firc_tunsubs_sweep(firc_tunsubs_t *s, const firc_tunnels_t *all)
     }
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
-        if (!is_key_name(de->d_name) || key_kept(all, de->d_name)) {
+        char key[sizeof de->d_name];
+        snprintf(key, sizeof key, "%s", de->d_name);
+        char *dot = strchr(key, '.');
+        if (dot != NULL && strcmp(dot, ".info") == 0) {
+            *dot = 0;
+        }
+        if (!is_key_name(key) || key_kept(all, key)) {
             continue;
         }
         char path[sizeof s->dir + sizeof de->d_name + 1];
@@ -843,6 +910,7 @@ size_t firc_tunsubs_state(const firc_tunsubs_t *s, const char *url, uint32_t mar
     snprintf(out->error, sizeof out->error, "%s", e->error);
     out->fetching = e->fetching;
     out->nodes = e->nodes;
+    out->info = e->info;
     return 1;
 }
 

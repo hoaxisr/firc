@@ -8,6 +8,8 @@
   import AddSourceDialog from "./AddSourceDialog.svelte";
 
   import {
+    ArrowDownUp,
+    Calendar,
     CloudDownload,
     Delete,
     Eye,
@@ -19,6 +21,7 @@
   } from "../../../components/ui/icons";
   import type { TunnelSource } from "../../../types";
   import { counted } from "../../../utils/plural";
+  import { expiryText, expiryTone, trafficText, trafficTone } from "../sub-usage";
   import {
     linkName,
     middleEllipsis,
@@ -35,6 +38,7 @@
 
   const live = $derived(store.stateOf(tunnel.id));
   const saved = $derived(store.isSaved(tunnel.id));
+  const now = $derived(live ? Date.now() / 1000 : 0);
 
   function subState(name: string | undefined) {
     return live?.subscriptions.find((s) => s.name === name);
@@ -132,6 +136,17 @@
               onValueChange={(v: string) => (source.interval = Number(v))}
             />
           </span>
+          {#if sub?.usage}
+            {@const u = sub.usage}
+            <span class="line usage">
+              <span class="it {trafficTone(u)}" data-usage="traffic"
+                ><ArrowDownUp size={15} />{t("Traffic:")} {trafficText(u, t)}</span
+              >
+              <span class="it {expiryTone(u, now)}" data-usage="expiry"
+                ><Calendar size={15} />{expiryText(u, now, t)}</span
+              >
+            </span>
+          {/if}
         </div>
         <div class="acts">
           {@render reveal(index)}
@@ -270,6 +285,20 @@
   }
   .url {
     flex-wrap: nowrap;
+  }
+  .usage {
+    column-gap: 12px;
+  }
+  .usage .it {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .usage .orange {
+    color: var(--orange);
+  }
+  .usage .red {
+    color: var(--red);
   }
   .cut {
     overflow: hidden;

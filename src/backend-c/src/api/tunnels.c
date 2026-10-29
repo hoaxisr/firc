@@ -929,6 +929,17 @@ static cJSON *sub_state_json(firc_tunnels_ctx_t *ctx, const firc_tun_src_t *src,
         cJSON_Delete(o);
         return NULL;
     }
+    cJSON *usage = ss.info.have ? cJSON_CreateObject() : cJSON_CreateNull();
+    bool ok = usage != NULL &&
+              (!ss.info.have ||
+               (cJSON_AddNumberToObject(usage, "used", (double)(ss.info.upload + ss.info.download)) != NULL &&
+                cJSON_AddNumberToObject(usage, "total", (double)ss.info.total) != NULL &&
+                cJSON_AddNumberToObject(usage, "expire", (double)ss.info.expire) != NULL));
+    if (!ok || !cJSON_AddItemToObject(o, "usage", usage)) {
+        cJSON_Delete(usage);
+        cJSON_Delete(o);
+        return NULL;
+    }
     return o;
 }
 

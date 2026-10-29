@@ -1660,6 +1660,25 @@ definitions:
         description: 'Nodes in the held body'
         example: 12
         type: integer
+      usage:
+        $ref: '#/definitions/types.TunnelSubUsage'
+        description: 'The provider''s subscription-userinfo (a response header, or a "#subscription-userinfo:" line at the top of the body) of the last answer that carried it; null when the last good answer had none'
+        x-nullable: true
+    type: object
+  types.TunnelSubUsage:
+    properties:
+      expire:
+        description: 'Unix seconds the subscription ends; 0 never'
+        example: 1767225600
+        type: integer
+      total:
+        description: 'Traffic limit in bytes; 0 none'
+        example: 107374182400
+        type: integer
+      used:
+        description: 'Traffic used in bytes, upload plus download'
+        example: 93415538688
+        type: integer
     type: object
   types.TunnelState:
     properties:
