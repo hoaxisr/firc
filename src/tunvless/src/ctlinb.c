@@ -118,6 +118,10 @@ static int parse_line(char *l, struct ib_cfg *c, char **host) {
         c->node = -1;
         return 0;
     }
+    if (len[3] == 1 && f[3][0] == '*') {
+        c->node = IB_NODE_POOL;
+        return 0;
+    }
     struct vless_node nd;
     memset(&nd, 0, sizeof(nd));
     if (vless_parse_url(f[3], &nd) != 0) return -2;

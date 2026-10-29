@@ -111,6 +111,13 @@ int main(void) {
     /* catches: a dash link taking a node index */
     check("a dash link is node minus one", -1, c[0].node);
 
+    int nodes0 = nodes_count();
+    check("a star line taken", 1, feed("192.168.1.1:1081 - - *\n\n"));
+    ctlinb_take(c, 20, &gen);
+    /* catches: a star taken as a link, or as no node at all */
+    check("a star is the whole pool", IB_NODE_POOL, c[0].node);
+    check("a star adds no node", nodes0, nodes_count());
+
     feed("192.168.1.1:1081 - - " LA "\n192.168.1.1:1082 - - " LA "\n\n");
     ctlinb_take(c, 20, &gen);
     /* catches: one link added as two nodes */

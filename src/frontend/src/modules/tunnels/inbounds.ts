@@ -1,6 +1,8 @@
 import type { Tunnel, TunnelInbound, TunnelInboundState } from "../../types";
 
 export const MAX_INBOUNDS = 16 as const;
+/* An inbound's node "*": the whole group, whichever active node the tunnel picks. */
+export const WHOLE_GROUP = "*" as const;
 const FIRST_PORT = 1080 as const;
 
 type T = (key: string) => string;

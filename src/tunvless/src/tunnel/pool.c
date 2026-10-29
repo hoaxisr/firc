@@ -637,10 +637,25 @@ static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host) {
     struct pl_sess *s = sess;
-    s->node = pl_node(node);
-    s->slot = -1;
-    s->gen = 0;
-    s->pinned = 1;
+    if (node < 0) {
+        /* A request by name has no address: "by site" spreads over the name instead. */
+        struct flow_key pk = *k;
+        if (!pk.v6 && !pk.dst.v4 && host && host[0]) {
+            pk.dst.v4 = 0x811c9dc5u;
+            for (const unsigned char *p = (const unsigned char *)host; *p; p++)
+                pk.dst.v4 = (pk.dst.v4 ^ *p) * 0x01000193u;
+        }
+        pthread_mutex_lock(&g_pl.mu);
+        pl_bind(s, pl_pick(&pk));
+        pthread_mutex_unlock(&g_pl.mu);
+        if (!s->node) return -1;
+        s->pinned = 0;
+    } else {
+        s->node = pl_node(node);
+        s->slot = -1;
+        s->gen = 0;
+        s->pinned = 1;
+    }
     s->k = *k;
     s->udp = (uint8_t)udp;
     s->opened = 1;

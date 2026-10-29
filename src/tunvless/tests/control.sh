@@ -297,10 +297,12 @@ HX "$BIN" --control -d tvi0 -A 1 --interval 5 < "$W/ini" > "$W/evi" 2> "$W/tuni.
 exec 6> "$W/ini"
 printf '%s\n%s\n\n' "$LA" "$LB" >&6
 wait_in "$W/evi" '"ready"'
-printf 'inbounds\n%s:1081 - - %s\n%s:1082 alice pw %s\n%s:1083 - - %s\n\n' "$IP" "$LB" "$IP" "$LB" "$IP" "$LB" >&6
+printf 'inbounds\n%s:1081 - - %s\n%s:1082 alice pw %s\n%s:1083 - - %s\n%s:1084 - - *\n\n' "$IP" "$LB" "$IP" "$LB" "$IP" "$LB" "$IP" >&6
 wait_in "$W/evi" '"type":"inbounds"'
-check "inbounds: acknowledged with the line count" '{"type":"inbounds","count":3}' "$(grep '"type":"inbounds"' "$W/evi" | head -1)"
+check "inbounds: acknowledged with the line count" '{"type":"inbounds","count":4}' "$(grep '"type":"inbounds"' "$W/evi" | head -1)"
 check "inbounds: the free port is up" 1 "$(grep -c '"type":"inbound","port":1081,"state":"up"' "$W/evi")"
+# catches: a whole-pool port taken for one with no node
+check "inbounds: the whole-pool port is up" 1 "$(grep -c '"type":"inbound","port":1084,"state":"up"' "$W/evi")"
 # catches: a port someone else holds reported as up, or not reported at all
 check "inbounds: the held port is busy" 1 "$(grep -c '"type":"inbound","port":1083,"state":"busy"' "$W/evi")"
 check "inbounds: the busy port is logged without the line" 0 "$(grep -c "pw\|$UUID" "$W/tuni.log")"
@@ -363,6 +365,10 @@ wait_in "$W/evi" '"type":"ibytes","port":1081'
 check "ibytes: reported for the used port" 1 "$(grep -q '"type":"ibytes","port":1081,"rx":[0-9]*[1-9][0-9]*,"tx":[0-9]*[1-9][0-9]*' "$W/evi" && echo 1 || echo 0)"
 check "ibytes: not for the idle port" 0 "$(grep -c '"type":"ibytes","port":1083' "$W/evi")"
 check "inbounds: node A got no inbound request at all" 0 "$(grep -c "example.test\|:5353" "$W/dst-A")"
+# catches: a whole-pool port that dials no node, or a node outside the active set (-A 1: only A is active)
+check "whole pool: the request is answered" 200 "$(sc --socks5-hostname $IP:1084 http://pool.example.test/)"
+check "whole pool: the active node A got the domain" 1 "$(grep -cxF 'domain pool.example.test:80' "$W/dst-A")"
+check "whole pool: the reserve node B got nothing" 0 "$(grep -c 'pool.example.test' "$W/dst-B")"
 check "inbounds: no password or link in stderr" 0 "$(grep -c "pw\|$UUID\|vless://" "$W/tuni.log")"
 check "inbounds: no password or link in stdout" 0 "$(grep -c "pw\|$UUID\|vless://" "$W/evi")"
 exec 6>&-

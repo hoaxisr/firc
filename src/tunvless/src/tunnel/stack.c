@@ -2669,7 +2669,8 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
     /* During the handshake the connection's node stopped being active (it was replaced): there is
      * nothing to carry through it, and the client reconnects to a live one. */
     if (d->stale && d->stale(g_dl->ctx, SESS(c))) {
-        conn_reset(c, tun);
+        if (c->ib_reply) ib_refuse(c, IBHS_END_DIAL);
+        else conn_reset(c, tun);
         return 1;
     }
     if (c->ib_reply) {
@@ -2936,14 +2937,17 @@ static void ib_hs_end(struct ib_hs *s, enum ibhs_end end) {
     ib_hs_free(s, 0);
 }
 
+/* The inbound's node index, IB_NODE_POOL for the whole pool, or -1 — none. */
 static int ib_node_of(uint8_t ib) {
     int node = ib && ib <= IB_MAX ? g_ib[ib - 1].cfg.node : -1;
-    return node < 0 || node >= nodes_count() || !g_dl->ops->flow_open_on ? -1 : node;
+    if (!g_dl->ops->flow_open_on) return -1;
+    if (node == IB_NODE_POOL) return node;
+    return node < 0 || node >= nodes_count() ? -1 : node;
 }
 
 static void ib_connect(struct loop *L, struct ib_hs *s) {
     int node = ib_node_of(s->ib);
-    if (node < 0) {
+    if (node == -1) {
         ib_hs_end(s, IBHS_END_GONE);
         return;
     }
@@ -2998,7 +3002,7 @@ static void ib_connect(struct loop *L, struct ib_hs *s) {
 }
 
 static void ib_associate(struct loop *L, struct ib_hs *s) {
-    if (ib_node_of(s->ib) < 0) {
+    if (ib_node_of(s->ib) == -1) {
         ib_hs_end(s, IBHS_END_GONE);
         return;
     }
@@ -3094,7 +3098,7 @@ static void ib_udp_out(struct loop *L, struct ib_assoc *a, uint32_t dst, uint16_
     if (k < 0) return;
     if (!c) {
         int node = ib_node_of(a->ib);
-        if (node < 0 || ib_live() >= IB_CONNS_MAX || g_free_n < IB_RESERVE || !(c = conn_new(&L->tun))) return;
+        if (node == -1 || ib_live() >= IB_CONNS_MAX || g_free_n < IB_RESERVE || !(c = conn_new(&L->tun))) return;
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->is_udp = 1;
@@ -3272,7 +3276,7 @@ static void ib_listen(struct loop *L, int i, const struct ib_cfg *c) {
         return;
     }
     ib->lerr = 0;
-    ctl_emit_inbound(c->port, c->node < 0 ? "no-node" : "up", "");
+    ctl_emit_inbound(c->port, c->node == -1 ? "no-node" : "up", "");
 }
 
 static void ib_apply(struct loop *L) {

@@ -56,6 +56,27 @@ test.describe("Tunnel inbounds", () => {
     ]);
   });
 
+  // Catches the whole group missing from the node list, or sent as anything but "*".
+  test("a port can carry the whole group", async ({ page }) => {
+    const { daemon, tunnels } = await open(page);
+    await tunnels.card("a").getByRole("button", { name: "Add port" }).click();
+    const row = tunnels.inboundRows("a").first();
+    await row.getByRole("button", { name: "Node" }).click();
+    await page.getByRole("option", { name: "Whole group" }).click();
+    await tunnels.save.click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(daemon.puts[0].tunnels[0].inbounds).toEqual([
+      { port: 1080, listen: "br0", node: "*", user: "", password: "" },
+    ]);
+  });
+
+  // Catches a saved whole-group port shown as a raw "*" instead of its name.
+  test("a saved whole-group port names the group", async ({ page }) => {
+    const { tunnels } = await open(page, [saved({ node: "*" })]);
+    const row = tunnels.inboundRows("a").first();
+    await expect(row.getByRole("button", { name: "Node" })).toContainText("Whole group");
+  });
+
   // Catches a password shown in clear before the eye is pressed, or the eye not revealing it.
   test("the password is masked until the eye is pressed", async ({ page }) => {
     const { tunnels } = await open(page, [saved({ user: "bob", password: "s3cret" })]);

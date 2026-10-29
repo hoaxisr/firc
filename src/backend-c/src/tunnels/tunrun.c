@@ -530,6 +530,9 @@ static bool put_line(firc_tunrun_t *t, size_t i, size_t k, const char *link, FIL
         set_ib(s, "no-address", "");
         return false;
     }
+    if (strcmp(b->node, FIRC_TUN_NODE_POOL) == 0) {
+        link = FIRC_TUN_NODE_POOL;
+    }
     judge(tun, b, s, link != NULL ? IB_OK : IB_GONE);
     fprintf(fp, "%s:%u ", addr, (unsigned)b->port);
     put_field(fp, b->user);

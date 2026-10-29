@@ -1450,7 +1450,7 @@ definitions:
         example: br0
         type: string
       node:
-        description: 'Node key, <source id>:<name>; an excluded or filtered node still serves it'
+        description: 'Node key, <source id>:<name>; an excluded or filtered node still serves it. "*" — the whole group: each connection goes to an active node the way the tunnel spreads its own traffic (active, by)'
         example: 0000000a:NL-1
         type: string
       password:

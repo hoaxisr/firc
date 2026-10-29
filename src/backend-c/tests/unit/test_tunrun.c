@@ -2393,6 +2393,21 @@ TEST inbounds_go_out_after_ready(void)
     PASS();
 }
 
+/* catches: a whole-group inbound looked up as a node key and sent as a dash, or journalled as a gone node */
+TEST a_whole_group_inbound_sends_a_star(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    ib_env(&f);
+    apply_yaml(&f, "tunnels:\n" KT_TUN("a", "0", IB_HEAD IB_ITEM("1081", "lo", "*", "")));
+    ASSERT(run_until_tail(&f, "tunvless0", "inbounds\n127.0.0.1:1081 - - *\n\n", 3000));
+    firc_tunrun_refresh_inbounds(f.run);
+    ASSERT_STR_EQ("starting", ib_state(&f, 1081));
+    ASSERT_EQ(0, journal_at(FIRC_LOG_WARN, "tunvless0", "inbound :1081: node * is gone"));
+    fx_down(&f);
+    PASS();
+}
+
 /* catches: the inbounds a child got kept as sent across its restart, so the new child never gets them */
 TEST a_restarted_child_gets_them_again(void)
 {
@@ -2966,6 +2981,7 @@ SUITE(tunrun)
     RUN_TEST(attaching_the_hooks_publishes_the_ports_held);
     RUN_TEST(the_pool_set_on_the_runner_reaches_the_child);
     RUN_TEST(inbounds_go_out_after_ready);
+    RUN_TEST(a_whole_group_inbound_sends_a_star);
     RUN_TEST(a_restarted_child_gets_them_again);
     RUN_TEST(an_unchanged_save_sends_nothing);
     RUN_TEST(a_changed_port_sends_once);

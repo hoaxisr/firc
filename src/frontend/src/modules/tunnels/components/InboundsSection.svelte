@@ -9,7 +9,13 @@
 
   import { Add, Delete, Eye, EyeOff } from "../../../components/ui/icons";
   import { ifaceTitle } from "../../../data/iface-choices";
-  import { inboundLook, inboundRefusal, MAX_INBOUNDS, nextInboundPort } from "../inbounds";
+  import {
+    inboundLook,
+    inboundRefusal,
+    MAX_INBOUNDS,
+    nextInboundPort,
+    WHOLE_GROUP,
+  } from "../inbounds";
   import type { ClientTunnel } from "../tunnels-data";
 
   let { store, tunnel = $bindable() }: { store: TunnelsStore; tunnel: ClientTunnel } = $props();
@@ -48,11 +54,12 @@
     }));
 
   const nodeOptions = (current: string) => [
+    { value: WHOLE_GROUP, label: t("Whole group") },
     ...rows.map((r) => ({
       value: r.key,
       label: `${r.name} · ${r.source === "link" ? t("link") : r.source}`,
     })),
-    ...(current && !rows.some((r) => r.key === current)
+    ...(current && current !== WHOLE_GROUP && !rows.some((r) => r.key === current)
       ? [{ value: current, label: current }]
       : []),
   ];
@@ -95,7 +102,7 @@
   </div>
   <div class="hint">
     {t(
-      "SOCKS5 and HTTP CONNECT on the router's address; traffic goes only through the chosen node",
+      "SOCKS5 and HTTP CONNECT on the router's address; traffic goes only through the chosen node, or through the whole group as the tunnel spreads it",
     )}
   </div>
 
