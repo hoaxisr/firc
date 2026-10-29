@@ -215,7 +215,6 @@ static size_t count_nodes(const char *url, const char *body, size_t len, bool *p
     return n;
 }
 
-/* The provider's traffic and expiry of the last good fetch sit next to the body, in <key>.info. */
 static void load_info(const firc_tunsubs_t *s, entry_t *e)
 {
     char path[512];
@@ -342,7 +341,6 @@ static void run_job(firc_tunsubs_t *s, job_t *j)
             r->wrote = true;
         }
     }
-    /* A provider that stops serving nodes once the plan runs out still tells how and when it did. */
     if (r->err == FIRC_OK || r->info.have) {
         save_info(j->path, &r->info);
     }

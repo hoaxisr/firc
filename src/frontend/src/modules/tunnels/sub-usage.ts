@@ -3,7 +3,6 @@ import type { TunnelSubUsage } from "../../types";
 type T = (key: string) => string;
 export type UsageTone = "" | "orange" | "red";
 
-/* How close to the end a subscription may come before the card warns. */
 export const EXPIRE_SOON_S = 3 * 86400;
 export const USED_HIGH = 0.9;
 
@@ -11,7 +10,6 @@ function oneDecimal(n: number): string {
   return n.toFixed(1).replace(/\.0$/, "");
 }
 
-/* Providers count in powers of 1024, and so do their apps: "100 GB" is 100 × 2^30 bytes. */
 export function formatSize(bytes: number, t: T): string {
   const b = Math.max(0, bytes);
   if (b >= 2 ** 40) return t("{n} TB").replace("{n}", () => oneDecimal(b / 2 ** 40));
@@ -53,7 +51,6 @@ export function expiryTone(u: TunnelSubUsage, now: number): UsageTone {
   return u.expire - now <= EXPIRE_SOON_S ? "orange" : "";
 }
 
-/* The one thing worth a warning on the card's head line, the worse of the two first; null when all is well. */
 export function usageAlert(
   u: TunnelSubUsage | null | undefined,
   now: number,

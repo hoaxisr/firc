@@ -254,7 +254,6 @@ export type TunnelNodeState = {
   v6?: boolean;
 };
 
-/* The provider's subscription-userinfo: bytes used and the limit (0: none), the end in Unix seconds (0: none). */
 export type TunnelSubUsage = {
   used: number;
   total: number;

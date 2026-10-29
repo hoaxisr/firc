@@ -5,13 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The provider's account of a subscription: the subscription-userinfo header (or a "#subscription-userinfo:"
-   line at the top of the body), "upload=N; download=N; total=N; expire=N" in bytes and Unix seconds. */
 typedef struct {
     bool have;
     uint64_t upload, download;
-    uint64_t total;  /* 0: no limit */
-    int64_t expire;  /* 0: never */
+    uint64_t total;
+    int64_t expire;
 } firc_subinfo_t;
 
 #define FIRC_SUBINFO_HEADER "subscription-userinfo"

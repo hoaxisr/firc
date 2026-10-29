@@ -9,8 +9,6 @@
 
 static bool space(char c) { return c == ' ' || c == '\t'; }
 
-/* A whole number, maybe written with a fractional part some panels add ("1.5E9" is refused); the fraction is
-   dropped. */
 static bool number(const char *s, size_t n, uint64_t *out)
 {
     uint64_t v = 0;
