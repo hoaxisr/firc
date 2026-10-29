@@ -2937,7 +2937,6 @@ static void ib_hs_end(struct ib_hs *s, enum ibhs_end end) {
     ib_hs_free(s, 0);
 }
 
-/* The inbound's node index, IB_NODE_POOL for the whole pool, or -1 — none. */
 static int ib_node_of(uint8_t ib) {
     int node = ib && ib <= IB_MAX ? g_ib[ib - 1].cfg.node : -1;
     if (!g_dl->ops->flow_open_on) return -1;

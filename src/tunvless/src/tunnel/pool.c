@@ -638,7 +638,6 @@ static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host) {
     struct pl_sess *s = sess;
     if (node < 0) {
-        /* A request by name has no address: "by site" spreads over the name instead. */
         struct flow_key pk = *k;
         if (!pk.v6 && !pk.dst.v4 && host && host[0]) {
             pk.dst.v4 = 0x811c9dc5u;

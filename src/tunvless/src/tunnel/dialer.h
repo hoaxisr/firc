@@ -175,8 +175,6 @@ struct dialer_ops {
      * now. */
     void (*lost)(const void *ctx, const void *sess);
     int (*set_host)(void *sess, const char *host);
-    /* Open the flow on node index node (an inbound pinned to one node), or, node < 0, on whichever
-     * active node the pool would pick for k, as for the tunnel's own traffic. */
     int (*flow_open_on)(void *sess, int node, const struct flow_key *k, int udp, const char *host);
 };
 

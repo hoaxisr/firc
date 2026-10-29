@@ -3829,6 +3829,7 @@ static int header_is(const unsigned char *w, size_t n, uint32_t a, uint16_t p) {
 
 static void k_vless(void) {
     k_reset();
+    g_miss.since = now_ns();
     __atomic_store_n(&g_own_fd, 1, __ATOMIC_RELEASE);
     g_spare_want = 0;
     stack_setup(&g_dial);

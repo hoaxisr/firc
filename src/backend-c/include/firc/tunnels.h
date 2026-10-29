@@ -35,7 +35,6 @@ typedef struct {
     firc_tun_sub_t sub;
 } firc_tun_src_t;
 
-/* An inbound's node "*": the whole group, whichever active node the tunnel's pool picks. */
 #define FIRC_TUN_NODE_POOL "*"
 
 typedef struct {
