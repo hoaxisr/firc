@@ -5,6 +5,7 @@
   import Button from "../../components/ui/Button.svelte";
   import Select from "../../components/ui/Select.svelte";
   import Tooltip from "../../components/ui/Tooltip.svelte";
+  import { autolist, AUTOLIST_BUSY_MS, AUTOLIST_REFRESH_MS } from "../../data/autolist.svelte";
   import { capture, pollCapture, startCapture, stopCapture } from "../../data/capture.svelte";
   import { dnsStats } from "../../data/dnsstats.svelte";
   import {
@@ -20,6 +21,7 @@
   import { locale, t } from "../../data/locale.svelte";
   import CaptureTab from "./CaptureTab.svelte";
   import StatsTab from "./StatsTab.svelte";
+  import UnopenedTab from "./UnopenedTab.svelte";
 
   import { Clear, Filter, Pause, Play, Search } from "../../components/ui/icons";
   import { counted } from "../../utils/plural";
@@ -48,7 +50,7 @@
   }: { onRenderComplete?: () => void; active?: boolean; view?: JournalView } = $props();
 
   const POLL_MS = 2000;
-  const VIEWS: JournalView[] = ["events", "stats", "capture"];
+  const VIEWS: JournalView[] = ["events", "stats", "unopened", "capture"];
   const SOURCE_COLOR: Record<Source, string> = {
     fircd: "var(--src-fircd)",
     tunnels: "var(--src-tun)",
@@ -101,6 +103,7 @@
   function viewLabel(v: JournalView): string {
     if (v === "events") return t("Events");
     if (v === "capture") return t("Capture");
+    if (v === "unopened") return t("Not opening");
     return narrow ? t("Stats") : t("DNS stats");
   }
 
@@ -171,6 +174,23 @@
     scheduleCaptureTick();
   }
 
+  const autolistWanted = $derived(
+    autolist.data?.enabled === true || view === "unopened" || autolist.asking,
+  );
+
+  $effect(() => {
+    if (!autolistWanted) return;
+    const timer = setInterval(
+      () => void autolist.poll(),
+      autolist.busy ? AUTOLIST_BUSY_MS : AUTOLIST_REFRESH_MS,
+    );
+    return () => clearInterval(timer);
+  });
+
+  $effect(() => {
+    if (active) untrack(() => void autolist.poll());
+  });
+
   async function onCaptureStart() {
     await startCapture();
     scheduleCaptureTick();
@@ -187,6 +207,7 @@
     void pollEvents();
     timer = setInterval(() => void pollEvents(), POLL_MS);
     void captureTick();
+    if (!active) void autolist.poll();
     onRenderComplete?.();
   });
 
@@ -305,6 +326,9 @@
           >{:else if v === "stats" && !narrow && dnsStats.data?.enabled}<span
             class="mct"
             aria-hidden="true">{dnsStats.data.domains}</span
+          >{:else if v === "unopened" && !narrow && autolist.data?.enabled && autolist.data.candidates.length > 0}<span
+            class="mct"
+            aria-hidden="true">{autolist.data.candidates.length}</span
           >{:else if v === "capture" && capture.running}<span class="tab-clock" aria-hidden="true"
             ><span class="cdot"></span>{captureClock}</span
           >{:else if v === "capture" && capture.last && !narrow}<span class="mct" aria-hidden="true"
@@ -454,6 +478,8 @@
       onStart={() => void onCaptureStart()}
       onStop={() => void onCaptureStop()}
     />
+  {:else if view === "unopened"}
+    <UnopenedTab active={active && view === "unopened"} />
   {:else}
     <StatsTab active={active && view === "stats"} />
   {/if}
@@ -767,10 +793,16 @@
       gap: 0.3rem;
     }
     .subtabs {
-      gap: 1rem;
+      gap: 0.6rem;
+      overflow-x: auto;
+      scrollbar-width: none;
     }
     .subtabs button[role="tab"] {
-      font-size: 0.98rem;
+      flex: 0 0 auto;
+      font-size: 0.88rem;
+    }
+    .cdot {
+      display: none;
     }
   }
   .status {

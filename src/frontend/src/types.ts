@@ -49,6 +49,8 @@ export const RuleSchema = object({
   proto: fallback(optional(picklist(["tcp", "udp"])), undefined),
   ports: fallback(optional(string()), undefined),
   comment: fallback(optional(string()), undefined),
+  autolist: fallback(optional(string()), undefined),
+  autolistByDomain: fallback(optional(boolean()), undefined),
 });
 export type Rule = InferOutput<typeof RuleSchema>;
 
@@ -313,4 +315,54 @@ export type TunnelProbeRow = {
   why: string;
   handshakeMs: number | null;
   firstByteMs: number | null;
+};
+
+export type AutolistWhy = "no-answer" | "reset" | "freeze" | "no-connect";
+
+export type AutolistCandidateState = "candidate" | "checking" | "added" | "off";
+
+export type AutolistCandidate = {
+  domain: string;
+  host: string;
+  why: string;
+  fails: number;
+  clients: string[];
+  lastAt: number;
+  state: AutolistCandidateState;
+  notes: number;
+};
+
+export type AutolistProbeResult = {
+  host: string;
+  verdict: "open" | "short" | "blocked" | "unknown";
+  why: string;
+  bytes: number;
+  at: number;
+  error: string;
+};
+
+export type AutolistRes = {
+  enabled: boolean;
+  running: boolean;
+  whyOff?: string;
+  mode: "candidates" | "add";
+  group: string | null;
+  failures: number;
+  failuresDay: number;
+  ambiguousDay: number;
+  wanWarning?: string;
+  listed: number;
+  addedHour: number;
+  checking: boolean;
+  checkedAt: number;
+  switchedOff: number;
+  switchedOn: number;
+  bypassed: { client: string; fails: number }[];
+  candidates: AutolistCandidate[];
+  probes: {
+    usedHour: number;
+    queued: number;
+    running: string | null;
+    results: AutolistProbeResult[];
+  };
 };

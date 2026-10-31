@@ -1,3 +1,14 @@
+<script module lang="ts">
+  let asked = false;
+
+  function askOnce() {
+    if (asked) return;
+    asked = true;
+    void autolist.ensure();
+    if (!hosts.loaded) void fetchHosts();
+  }
+</script>
+
 <script lang="ts">
   import { getContext, tick } from "svelte";
 
@@ -5,7 +16,9 @@
   import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
-  import { t } from "../../../data/locale.svelte";
+  import { autolist } from "../../../data/autolist.svelte";
+  import { fetchHosts, hosts } from "../../../data/hosts.svelte";
+  import { locale, t } from "../../../data/locale.svelte";
   import {
     GROUPS_STORE_CONTEXT,
     RULE_SEARCH_MATCH_COMMENT,
@@ -18,7 +31,9 @@
   import { Delete, Grip, TriangleAlert } from "../../../components/ui/icons";
   import { draggable, droppable, type Chip, type Edge } from "../../../lib/dnd";
   import { RULE_TYPES, ruleTakesPorts, type Rule } from "../../../types";
+  import { autolistTip } from "../../../utils/autolist-tip";
   import { isValidPorts, VALIDATOP_MAP } from "../../../utils/rule-validators";
+  import { deviceNames } from "../../logs/journal";
 
   type Props = {
     rule: Rule;
@@ -44,6 +59,24 @@
   if (!store) {
     throw new Error("GroupsStore context is missing");
   }
+
+  const autoRule = $derived(Boolean(rule.autolist));
+  const autoOff = $derived(autoRule && !rule.enable);
+  const autoTip = $derived(
+    autoRule
+      ? autolistTip(
+          rule.rule,
+          autolist.data?.candidates ?? [],
+          deviceNames(hosts.list),
+          t,
+          locale.current,
+        )
+      : "",
+  );
+
+  $effect(() => {
+    if (autoRule) askOnce();
+  });
 
   let overlap = $derived(store.ruleOverlap(rule.id));
 
@@ -174,7 +207,7 @@
     onDrop: handlerDrop,
   }}
 >
-  <div class="rule-row" role="presentation">
+  <div class="rule-row" class:autolist-off={autoOff} role="presentation">
     <div class="grip" data-index={rule_index} data-group-index={group_index} title={t("Drag Rule")}>
       <Grip />
     </div>
@@ -184,7 +217,7 @@
     </div>
     <div class="pattern">
       <div class="label">{t("Pattern")}</div>
-      <div class="pattern-fields" class:with-ports={showsPorts}>
+      <div class="pattern-fields" class:with-ports={showsPorts} class:with-badge={autoRule}>
         <div class="search-highlight-field">
           <input
             type="text"
@@ -208,6 +241,14 @@
             </div>
           {/if}
         </div>
+        {#if autoRule}
+          <Tooltip value={autoTip}>
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+            <span class="autolist-badge" role="note" class:off={autoOff} tabindex="0">
+              {autoOff ? t("auto · off by recheck") : t("auto")}
+            </span>
+          </Tooltip>
+        {/if}
         {#if showsPorts}
           <RulePorts
             proto={rule.proto}
@@ -273,6 +314,28 @@
     animation: duplicate-focus-apple 2.2s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
 
+  .autolist-badge {
+    flex: none;
+    padding: 0.05rem 0.45rem;
+    border-radius: 0.4rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: help;
+    color: var(--accent);
+    background: color-mix(in oklab, var(--accent) 16%, transparent);
+  }
+  .autolist-badge:focus-visible {
+    outline: 1px solid var(--accent);
+  }
+  .autolist-badge.off {
+    color: var(--text-2);
+    background: color-mix(in oklab, var(--text-2) 16%, transparent);
+  }
+  .rule-row.autolist-off {
+    opacity: 0.55;
+  }
+
   .search-highlight-field {
     position: relative;
     width: 100%;
@@ -289,6 +352,10 @@
 
   .pattern-fields > .search-highlight-field {
     flex: 1 1 6rem;
+  }
+
+  .pattern-fields.with-badge:not(.with-ports) > .search-highlight-field {
+    flex: 0 1 19rem;
   }
 
   .pattern-fields.with-ports > .search-highlight-field {
@@ -514,6 +581,7 @@
       align-self: start;
     }
     .pattern-fields > .search-highlight-field,
+    .pattern-fields.with-badge:not(.with-ports) > .search-highlight-field,
     .pattern-fields.with-ports > .search-highlight-field {
       flex: 1 0 100%;
     }

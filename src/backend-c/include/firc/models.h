@@ -25,6 +25,8 @@ typedef struct firc_rule {
     char *proto; /* subnet/subnet6 only; NULL/"" = any protocol */
     char *ports; /* NULL/"" = all ports */
     char *comment;
+    char *autolist;
+    bool autolist_by_domain;
 } firc_rule_t;
 
 /* Which client devices a group applies to; empty = every device. */
@@ -235,6 +237,19 @@ typedef struct firc_app_config {
         firc_duration_t interval;
         firc_duration_t timeout;
     } check;
+    struct {
+        bool enabled;
+        char *group;
+        uint32_t fail_threshold;
+        firc_duration_t fail_time;
+        uint32_t retrans_threshold;
+        char **exclude;
+        size_t n_exclude;
+        bool recheck;
+        firc_duration_t recheck_interval;
+        char *check_iface;
+        char *mode;
+    } autolist;
 } firc_app_config_t;
 
 /* Whole-application state produced by config load (defaults + overlay). */

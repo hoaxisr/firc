@@ -43,6 +43,17 @@ app:
     wanUrl: ""
     interval: 30s
     timeout: 5s
+  autolist:
+    enabled: false
+    group: ""
+    mode: candidates
+    failThreshold: 3
+    failTime: 1m0s
+    retransThreshold: 3
+    exclude: []
+    recheck: false
+    recheckInterval: 6h0m0s
+    checkInterface: ""
 groups:
 - id: 0a0b0c0d
   name: ""

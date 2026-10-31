@@ -2,8 +2,10 @@
   import { Tabs } from "bits-ui";
   import { untrack } from "svelte";
 
+  import { groupsBridge } from "../../data/groups-bridge.svelte";
   import { journalFocus } from "../../data/journal-focus.svelte";
   import { t } from "../../data/locale.svelte";
+  import { tabRequest } from "../../data/tab-request.svelte";
   import GroupsView from "../../modules/groups/GroupsView.svelte";
   import JournalView from "../../modules/logs/JournalView.svelte";
   import RestartOverlay from "../../modules/settings/RestartOverlay.svelte";
@@ -55,6 +57,18 @@
     if (!request || request.seq <= seenFocus) return;
     seenFocus = request.seq;
     active_tab = "logs";
+  });
+
+  let seenTab = untrack(() => tabRequest.request?.seq ?? 0);
+  $effect(() => {
+    const request = tabRequest.request;
+    if (!request || request.seq <= seenTab) return;
+    seenTab = request.seq;
+    active_tab = request.tab;
+    if (request.tab === "logs" && request.view) journal_view = request.view;
+    if (request.tab === "groups" && groupsBridge.store) {
+      groupsBridge.store.searchValue = request.search;
+    }
   });
 
   const toggleMenu = () => (isMenuOpen = !isMenuOpen);

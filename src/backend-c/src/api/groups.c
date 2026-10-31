@@ -184,7 +184,27 @@ static bool rule_ids_has(const rule_ids_t *k, firc_id_t id) {
 }
 
 /* an id in known keeps that identity; any other case silently gets a fresh random id */
-static firc_err_t rule_from_req(const cJSON *req, const rule_ids_t *known, firc_rule_t **out, const char **why) {
+static bool same_text(const char *a, const char *b) {
+    return strcmp(a != NULL ? a : "", b != NULL ? b : "") == 0;
+}
+
+static firc_err_t carry_marker(firc_rule_t *built, const firc_group_t *stored) {
+    if (stored == NULL) { return FIRC_OK; }
+    for (size_t i = 0; i < stored->n_rules; i++) {
+        const firc_rule_t *old = stored->rules[i];
+        if (!firc_id_equal(old->id, built->id)) { continue; }
+        if (old->autolist == NULL || old->enable != built->enable || !same_text(old->type, built->type) ||
+            !same_text(old->rule, built->rule)) {
+            return FIRC_OK;
+        }
+        built->autolist_by_domain = old->autolist_by_domain;
+        return firc_strset(&built->autolist, old->autolist);
+    }
+    return FIRC_OK;
+}
+
+static firc_err_t rule_from_req(const cJSON *req, const rule_ids_t *known, const firc_group_t *stored,
+                                firc_rule_t **out, const char **why) {
     firc_id_t id;
     bool has_id;
     bool found = false;
@@ -198,6 +218,7 @@ static firc_err_t rule_from_req(const cJSON *req, const rule_ids_t *known, firc_
     if (!rule) { return FIRC_ERR_NOMEM; }
     rule->id = id;
     firc_err_t err = fill_rule_fields(rule, req, why);
+    if (err == FIRC_OK) { err = carry_marker(rule, stored); }
     if (err != FIRC_OK) {
         firc_rule_free(rule);
         return err;
@@ -207,8 +228,8 @@ static firc_err_t rule_from_req(const cJSON *req, const rule_ids_t *known, firc_
 }
 
 /* unlike rule_from_req, an explicit id not in known is FIRC_ERR_NOENT */
-static firc_err_t rule_from_req_strict(const cJSON *req, const rule_ids_t *known, firc_rule_t **out,
-                                       const char **why) {
+static firc_err_t rule_from_req_strict(const cJSON *req, const rule_ids_t *known, const firc_group_t *stored,
+                                       firc_rule_t **out, const char **why) {
     firc_id_t id;
     bool has_id;
     if (parse_optional_id(req, "id", &id, &has_id) != FIRC_OK) { return FIRC_ERR_INVAL; }
@@ -224,6 +245,7 @@ static firc_err_t rule_from_req_strict(const cJSON *req, const rule_ids_t *known
     if (!rule) { return FIRC_ERR_NOMEM; }
     rule->id = final_id;
     firc_err_t err = fill_rule_fields(rule, req, why);
+    if (err == FIRC_OK) { err = carry_marker(rule, stored); }
     if (err != FIRC_OK) {
         firc_rule_free(rule);
         return err;
@@ -466,7 +488,7 @@ static firc_err_t group_from_req(const cJSON *req, const firc_group_t *existing,
             const char *rule_why = NULL;
             cJSON *rule_j = cJSON_GetArrayItem(rules_j, i);
             firc_rule_t *r = NULL;
-            err = rule_from_req(rule_j, &baseline, &r, &rule_why);
+            err = rule_from_req(rule_j, &baseline, existing, &r, &rule_why);
             if (err == FIRC_ERR_INVAL && rule_why != NULL) {
                 /* falls back to existing->name when the PUT left "name" out, which is the one the operator is looking at */
                 const char *gname = (group->name != NULL && group->name[0] != '\0')
@@ -498,6 +520,8 @@ static firc_err_t group_from_req(const cJSON *req, const firc_group_t *existing,
             if (e == FIRC_OK) { e = firc_strset(&r->proto, existing->rules[i]->proto); }
             if (e == FIRC_OK) { e = firc_strset(&r->ports, existing->rules[i]->ports); }
             if (e == FIRC_OK) { e = firc_strset(&r->comment, existing->rules[i]->comment); }
+            if (e == FIRC_OK) { e = firc_strset(&r->autolist, existing->rules[i]->autolist); }
+            if (e == FIRC_OK) { r->autolist_by_domain = existing->rules[i]->autolist_by_domain; }
             if (e == FIRC_OK) { r->enable = existing->rules[i]->enable; }
             if (e != FIRC_OK || firc_group_add_rule(group, r) != FIRC_OK) {
                 firc_rule_free(r);
@@ -522,6 +546,10 @@ static cJSON *rule_to_json(const firc_rule_t *r) {
     if (r->proto != NULL && *r->proto != '\0') { cJSON_AddStringToObject(obj, "proto", r->proto); }
     if (r->ports != NULL && *r->ports != '\0') { cJSON_AddStringToObject(obj, "ports", r->ports); }
     if (r->comment != NULL && *r->comment != '\0') { cJSON_AddStringToObject(obj, "comment", r->comment); }
+    if (r->autolist != NULL && *r->autolist != '\0') {
+        cJSON_AddStringToObject(obj, "autolist", r->autolist);
+        if (r->autolist_by_domain) { cJSON_AddTrueToObject(obj, "autolistByDomain"); }
+    }
     return obj;
 }
 
@@ -982,7 +1010,7 @@ static void handle_put_rules(firc_http_req_t *req, firc_http_res_t *res, void *u
         const char *why = NULL;
         cJSON *rule_j = cJSON_GetArrayItem(rules_j, i);
         firc_rule_t *rule = NULL;
-        firc_err_t err = rule_from_req_strict(rule_j, &known, &rule, &why);
+        firc_err_t err = rule_from_req_strict(rule_j, &known, group, &rule, &why);
         if (err == FIRC_OK) {
             err = firc_group_add_rule(&built, rule);
             if (err != FIRC_OK) { firc_rule_free(rule); }
@@ -1048,7 +1076,7 @@ static void handle_create_rule(firc_http_req_t *req, firc_http_res_t *res, void 
     rule_ids_t known;
     firc_err_t err = rule_ids_of(group->rules, group->n_rules, &known);
     if (err == FIRC_OK) {
-        err = rule_from_req(json, &known, &rule, &why);
+        err = rule_from_req(json, &known, NULL, &rule, &why);
         firc_id_set_free(&known.ids);
     }
     if (err == FIRC_ERR_INVAL && why != NULL) {
@@ -1126,8 +1154,21 @@ static void handle_put_rule(firc_http_req_t *req, firc_http_res_t *res, void *ud
         firc_http_res_write_error(res, 400, msg);
         return;
     }
-    firc_err_t err = fill_rule_fields(rule, json, NULL);
+    firc_rule_t *fresh = firc_rule_new();
+    firc_err_t err = fresh != NULL ? FIRC_OK : FIRC_ERR_NOMEM;
+    if (err == FIRC_OK) {
+        fresh->id = rule->id;
+        err = fill_rule_fields(fresh, json, NULL);
+    }
+    if (err == FIRC_OK) { err = carry_marker(fresh, firc_ruleset_group_mut(rs)); }
     cJSON_Delete(json);
+    if (err == FIRC_OK) {
+        firc_ruleset_group_mut(rs)->rules[idx] = fresh;
+        firc_rule_free(rule);
+        rule = fresh;
+    } else {
+        firc_rule_free(fresh);
+    }
     if (err == FIRC_ERR_INVAL) { /* unreachable while the pre-check above stands */
         firc_http_res_write_error(res, 400, why != NULL ? why : "the rule is unusable");
         return;

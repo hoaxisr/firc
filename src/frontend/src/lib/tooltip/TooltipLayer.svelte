@@ -9,6 +9,7 @@
     role="tooltip"
     class="tooltip-content"
     class:with-keys={tooltip.keys.length > 0}
+    class:multiline={tooltip.text.includes("\n")}
     style:left="{tooltip.x}px"
     style:top="{tooltip.y}px"
     style:opacity={tooltip.opacity}
@@ -31,6 +32,12 @@
     font-size: smaller;
     white-space: nowrap;
     transition: opacity 0.1s ease-out;
+  }
+
+  .tooltip-content.multiline {
+    max-width: min(24rem, calc(100vw - 1rem));
+    white-space: pre-line;
+    padding: 0.4rem 0.6rem;
   }
 
   .tooltip-content.with-keys {

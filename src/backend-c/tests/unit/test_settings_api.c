@@ -243,7 +243,7 @@ TEST get_answers_every_setting_typed(void) {
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/settings", NULL, &out));
     ASSERT(out != NULL);
     const cJSON *s = item(out, "settings"), *c = item(out, "classes");
-    ASSERT_EQ(29, cJSON_GetArraySize(s));
+    ASSERT_EQ(39, cJSON_GetArraySize(s));
     ASSERT_EQ(NULL, item(s, "app.logLevel"));
     ASSERT_EQ(NULL, item(s, "app.showAllInterfaces"));
     ASSERT(cJSON_IsFalse(item(s, "app.update.check")));
@@ -270,7 +270,7 @@ TEST get_answers_every_setting_typed(void) {
     int live = 0;
     const cJSON *e;
     cJSON_ArrayForEach(e, c) { live += strcmp(e->valuestring, "live") == 0; }
-    ASSERT_EQ(10, live);
+    ASSERT_EQ(20, live);
     ASSERT(strings_are(item(out, "pendingRestart"), NONE, 0));
     cJSON_Delete(out);
     harness_stop(h);

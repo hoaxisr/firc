@@ -16,6 +16,8 @@
 #include "firc/pool_reject.h"
 #include "firc/rtnl.h"
 #include "firc/taprules.h"
+#include "firc/autolistrules.h"
+#include "firc/regdomain.h"
 
 #define AT(f) offsetof(firc_app_config_t, f)
 #define LIVE FIRC_SETTING_LIVE
@@ -55,6 +57,17 @@ const firc_setting_t firc_settings[] = {
     {"app.check.wanUrl", FIRC_SK_STRING, LIVE, AT(check.wan_url), 0, FIRC_APPLY_CHECK},
     {"app.check.interval", FIRC_SK_SEC, LIVE, AT(check.interval), 0, FIRC_APPLY_CHECK},
     {"app.check.timeout", FIRC_SK_SEC, LIVE, AT(check.timeout), 0, FIRC_APPLY_CHECK},
+    {"app.autolist.enabled", FIRC_SK_BOOL, LIVE, AT(autolist.enabled), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.group", FIRC_SK_STRING, LIVE, AT(autolist.group), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.failThreshold", FIRC_SK_U32, LIVE, AT(autolist.fail_threshold), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.failTime", FIRC_SK_SEC, LIVE, AT(autolist.fail_time), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.retransThreshold", FIRC_SK_U32, LIVE, AT(autolist.retrans_threshold), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.exclude", FIRC_SK_LIST, LIVE, AT(autolist.exclude), AT(autolist.n_exclude),
+     FIRC_APPLY_AUTOLIST},
+    {"app.autolist.recheck", FIRC_SK_BOOL, LIVE, AT(autolist.recheck), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.recheckInterval", FIRC_SK_SEC, LIVE, AT(autolist.recheck_interval), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.checkInterface", FIRC_SK_STRING, LIVE, AT(autolist.check_iface), 0, FIRC_APPLY_AUTOLIST},
+    {"app.autolist.mode", FIRC_SK_STRING, LIVE, AT(autolist.mode), 0, FIRC_APPLY_AUTOLIST},
 };
 _Static_assert(sizeof(firc_settings) / sizeof(firc_settings[0]) == FIRC_SETTINGS_COUNT,
                "FIRC_SETTINGS_COUNT is the number of rows");
@@ -212,6 +225,7 @@ static size_t longest_chain_suffix(void)
         sizeof(FIRC_DNAT_CHAIN_SUFFIX) - 1,
         sizeof(FIRC_POOL_REJECT_CHAIN_SUFFIX) - 1,
         sizeof(FIRC_TAP_CHAIN_SUFFIX FIRC_TAP_PROBE_SUFFIX) - 1,
+        sizeof(FIRC_AUTOLIST_CHAIN_SUFFIX FIRC_AUTOLIST_PROBE_SUFFIX) - 1,
         sizeof("DNSOR") - 1,
     };
     size_t max = 0;
@@ -367,6 +381,54 @@ firc_err_t firc_app_config_check(const firc_app_config_t *c, const char **field,
     }
     if (c->check.timeout < 1 * FIRC_DURATION_SEC || c->check.timeout > 30 * FIRC_DURATION_SEC) {
         REFUSE("app.check.timeout", "1 to 30 seconds");
+    }
+    if (c->autolist.group != NULL && c->autolist.group[0] != '\0') {
+        firc_id_t gid;
+        if (firc_id_parse(c->autolist.group, &gid) != FIRC_OK) {
+            REFUSE("app.autolist.group", "empty, or a group's id: 8 hex digits");
+        }
+    }
+    if (c->autolist.mode == NULL ||
+        (strcmp(c->autolist.mode, "candidates") != 0 && strcmp(c->autolist.mode, "add") != 0)) {
+        REFUSE("app.autolist.mode", "candidates or add");
+    }
+    if (c->autolist.enabled && (c->autolist.group == NULL || c->autolist.group[0] == '\0')) {
+        REFUSE("app.autolist.group", "a group is needed while the automatic list is on");
+    }
+    if (c->autolist.enabled && c->dns_proxy.unmatched_ttl == 0) {
+        REFUSE("app.autolist.enabled",
+               "needs app.dnsProxy.unmatchedTtl above 0: without it devices keep the old address");
+    }
+    if (c->autolist.fail_threshold < 1 || c->autolist.fail_threshold > 20) {
+        REFUSE("app.autolist.failThreshold", "1 to 20 failures");
+    }
+    if (c->autolist.fail_time < 10 * FIRC_DURATION_SEC || c->autolist.fail_time > 3600 * FIRC_DURATION_SEC) {
+        REFUSE("app.autolist.failTime", "10 to 3600 seconds");
+    }
+    if (c->autolist.retrans_threshold < 1 || c->autolist.retrans_threshold > 8) {
+        REFUSE("app.autolist.retransThreshold", "1 to 8 sendings again");
+    }
+    if (c->autolist.recheck_interval < 600 * FIRC_DURATION_SEC ||
+        c->autolist.recheck_interval > 7 * 86400 * FIRC_DURATION_SEC) {
+        REFUSE("app.autolist.recheckInterval", "600 seconds to 7 days");
+    }
+    if (c->autolist.check_iface != NULL && c->autolist.check_iface[0] != '\0' &&
+        !firc_is_interface_name(c->autolist.check_iface)) {
+        REFUSE("app.autolist.checkInterface", "empty for the default route, or an interface name");
+    }
+    if (c->autolist.n_exclude > FIRC_AUTOLIST_EXCLUDE_MAX) {
+        REFUSE("app.autolist.exclude", "at most 1000 names");
+    }
+    for (size_t i = 0; i < c->autolist.n_exclude; i++) {
+        if (!firc_autolist_exclude_ok(c->autolist.exclude[i])) {
+            REFUSE("app.autolist.exclude",
+                   "a domain name in lower case: letters, digits, '-', '_' and dots between labels");
+        }
+        for (size_t k = 0; k < i; k++) {
+            if (strcmp(c->autolist.exclude[k], c->autolist.exclude[i]) == 0) {
+                REFUSE("app.autolist.exclude", "a name is listed twice");
+            }
+        }
     }
     return FIRC_OK;
 }

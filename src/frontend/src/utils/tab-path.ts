@@ -5,11 +5,12 @@ const PATHS: Record<string, string> = {
   settings: "/settings",
 };
 
-export type JournalView = "events" | "stats" | "capture";
+export type JournalView = "events" | "stats" | "unopened" | "capture";
 
 const JOURNAL_VIEWS: Record<JournalView, string> = {
   events: "/journal",
   stats: "/journal/stats",
+  unopened: "/journal/unopened",
   capture: "/journal/capture",
 };
 

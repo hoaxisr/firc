@@ -2,15 +2,23 @@ import assert from "node:assert";
 import { describe, it } from "jsr:@std/testing@1.0.19/bdd";
 
 import {
+  AUTOLIST_MODES,
+  autolistGroupMissing,
+  autolistTtlWarning,
   changedKeys,
   followUrl,
   groupChanges,
+  groupInterfaces,
+  hasGroupNamed,
+  hoursToSeconds,
+  parseNames,
   pluralForm,
   putBody,
   rebaseDraft,
   restartFailure,
   restartPhase,
   restartSettled,
+  secondsToHours,
   type SettingsRes,
 } from "../../src/modules/settings/settings";
 
@@ -165,5 +173,91 @@ describe("followUrl", () => {
   it("brackets an IPv6 literal host", () => {
     const v6 = { protocol: "http:", hostname: "fd00::1", port: "8080", pathname: "/" };
     assert.strictEqual(followUrl(v6, { [port]: 8081 }, [port]), "http://[fd00::1]:8081/");
+  });
+});
+
+describe("parseNames", () => {
+  it("takes one name a line, or a pasted list split any way", () => {
+    assert.deepStrictEqual(parseNames("example.com\nOther.org.\n\n a.net, b.net;c.net"), [
+      "example.com",
+      "other.org",
+      "a.net",
+      "b.net",
+      "c.net",
+    ]);
+  });
+  it("keeps a name once", () => {
+    assert.deepStrictEqual(parseNames("x.com\nX.com"), ["x.com"]);
+  });
+  it("an empty text is no names", () => {
+    assert.deepStrictEqual(parseNames("  \n"), []);
+  });
+});
+
+describe("hasGroupNamed", () => {
+  it("finds the group in either language, whatever its case", () => {
+    const groups = [{ name: "Ads" }, { name: " автолист " }];
+    assert.strictEqual(hasGroupNamed(groups, ["Autolist", "Автолист"]), true);
+  });
+  it("another name is not it", () => {
+    assert.strictEqual(hasGroupNamed([{ name: "Autolist 2" }], ["Autolist"]), false);
+  });
+});
+
+describe("autolist settings", () => {
+  it("mode_segment_maps_values", () => {
+    assert.deepStrictEqual([...AUTOLIST_MODES], ["candidates", "add"]);
+  });
+
+  it("group_required_message_when_enabled", () => {
+    assert.strictEqual(
+      autolistGroupMissing({ "app.autolist.enabled": true, "app.autolist.group": "" }),
+      true,
+    );
+    assert.strictEqual(
+      autolistGroupMissing({ "app.autolist.enabled": true, "app.autolist.group": "b10c4ed0" }),
+      false,
+    );
+    assert.strictEqual(
+      autolistGroupMissing({ "app.autolist.enabled": false, "app.autolist.group": "" }),
+      false,
+    );
+    assert.strictEqual(autolistGroupMissing({ "app.autolist.enabled": true }), true);
+  });
+
+  it("ttl_zero_warning", () => {
+    const on = { "app.autolist.enabled": true };
+    assert.strictEqual(autolistTtlWarning({ ...on, "app.dnsProxy.unmatchedTtl": 0 }), true);
+    assert.strictEqual(autolistTtlWarning({ ...on, "app.dnsProxy.unmatchedTtl": 60 }), false);
+    assert.strictEqual(
+      autolistTtlWarning({ "app.autolist.enabled": false, "app.dnsProxy.unmatchedTtl": 0 }),
+      false,
+    );
+    assert.strictEqual(autolistTtlWarning(on), false);
+  });
+
+  it("groupInterfaces reads a string and a list alike", () => {
+    assert.deepStrictEqual(groupInterfaces({ interface: "nwg0" }), ["nwg0"]);
+    assert.deepStrictEqual(groupInterfaces({ interface: ["nwg0", "nwg1"] }), ["nwg0", "nwg1"]);
+    assert.deepStrictEqual(groupInterfaces({}), []);
+    assert.deepStrictEqual(groupInterfaces({ interface: "" }), []);
+  });
+});
+
+describe("recheck interval in hours", () => {
+  it("shows whole hours as integers and the rest as hours to two places", () => {
+    assert.strictEqual(secondsToHours(21600), 6);
+    assert.strictEqual(secondsToHours(3600), 1);
+    assert.strictEqual(secondsToHours(604800), 168);
+    assert.strictEqual(secondsToHours(5400), 1.5);
+    assert.strictEqual(secondsToHours(600), 0.17);
+    assert.strictEqual(secondsToHours(4000), 1.11);
+  });
+  it("stores the hours typed as whole seconds", () => {
+    assert.strictEqual(hoursToSeconds(6), 21600);
+    assert.strictEqual(hoursToSeconds(1), 3600);
+    assert.strictEqual(hoursToSeconds(168), 604800);
+    assert.strictEqual(hoursToSeconds(1.5), 5400);
+    assert.strictEqual(hoursToSeconds(0.17), 612);
   });
 });

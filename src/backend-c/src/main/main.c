@@ -1807,6 +1807,7 @@ int main(int argc, char **argv)
     if (err == FIRC_OK) {
         /* One pass now: restored pairs have no kernel rule, and a rewrite during startup would go unrepaired. */
         firc_app_pool_changed(d.app);
+        (void)firc_app_autolist_apply(d.app);
     }
     if (err != FIRC_OK) {
         FIRC_ERROR("failed to start netfilter committer: %s", firc_err_str(err));

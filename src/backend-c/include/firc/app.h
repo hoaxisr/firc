@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "firc/autolistcand.h"
+#include "firc/autolistcheck.h"
+#include "firc/autolistprobes.h"
 #include "firc/cancel.h"
 #include "firc/fakeip.h"
 #include "firc/dnspipeline.h"
@@ -407,6 +410,62 @@ void firc_app_devices_changed(firc_app_t *app);
 
 /* stages the capture's chain when one runs; every pass does this */
 firc_err_t firc_app_stage_tap(firc_app_t *app);
+
+firc_err_t firc_app_stage_autolist(firc_app_t *app);
+
+firc_err_t firc_app_autolist_apply(firc_app_t *app);
+
+typedef struct firc_autolist_status {
+    bool enabled;
+    bool running;
+    const char *why_off;
+    const char *mode;
+    const char *group;
+    uint64_t failures;
+    uint64_t listed;
+    uint32_t failures_day;
+    uint32_t ambiguous_day;
+    uint32_t added_hour;
+    const char *wan_warning;
+    bool checking;
+    int64_t checked_at;
+    uint64_t switched_off;
+    uint64_t switched_on;
+    size_t n_bypassed;
+    firc_ip_t bypassed[FIRC_AUTOLIST_BYPASS_CLIENTS];
+    uint32_t bypassed_fails[FIRC_AUTOLIST_BYPASS_CLIENTS];
+    size_t n_candidates;
+    firc_al_cand_t candidates[FIRC_AUTOLIST_CANDIDATES];
+    uint32_t probes_used_hour;
+    uint32_t probes_queued;
+    bool probe_running;
+    char probe_host[FIRC_AUTOLIST_NAME_MAX];
+    size_t n_results;
+    firc_al_probe_seen_t results[FIRC_AUTOLIST_PROBE_CACHE];
+} firc_autolist_status_t;
+
+/* Loop thread; the status is large, keep it off the stack. */
+void firc_app_autolist_status(const firc_app_t *app, firc_autolist_status_t *out);
+
+/* Queues a user probe: STATE not running, CLOSED check interface in the group, INVAL bad name, LIMIT queue full;
+ * otherwise OK with *ask BUSY or FULL (the hour spent). */
+firc_err_t firc_app_autolist_probe(firc_app_t *app, const char *host, firc_al_ask_t *ask);
+
+/* Adds the candidate's domain to the target group: STATE when not running, NOENT for no such candidate. */
+firc_err_t firc_app_autolist_candidate_add(firc_app_t *app, const char *domain);
+
+/* Hides a candidate for a day: NOENT for no such candidate. */
+firc_err_t firc_app_autolist_candidate_dismiss(firc_app_t *app, const char *domain);
+
+/* Queues the recheck: STATE when not running, CLOSED when the check interface belongs to the group. */
+firc_err_t firc_app_autolist_recheck_now(firc_app_t *app);
+
+void firc_app_set_autolist_probe_for_test(firc_app_t *app, firc_autolist_probe_fn probe);
+void firc_app_autolist_tick_for_test(firc_app_t *app); /* test seam: what the probe queue's timer does when it fires */
+
+/* What the DNS pipeline tells the automatic list about an unmatched answer; loop thread. */
+void firc_app_autolist_hint_for_test(firc_app_t *app, const firc_ip_t *client, const char *name,
+                                     const firc_ip_t *reals, size_t n_reals);
 
 firc_err_t firc_app_rebuild_netfilter(firc_app_t *app, firc_cancel_t *cancel);
 

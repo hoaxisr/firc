@@ -435,6 +435,14 @@ static int l4_option(ext_t *x, const char *opt, char *const *a, size_t na, bool 
         x->seen |= 1u;
         return 1;
     }
+    if (strcmp(opt, "--sport") == 0) {
+        uint16_t lo = 0, hi = 0;
+        if (na < 1 || inv || (x->seen & 4u) || !parse_ports(a[0], ':', &lo, &hi)) { return BAD; }
+        memcpy(x->p, &lo, 2);
+        memcpy(x->p + 2, &hi, 2);
+        x->seen |= 4u;
+        return 1;
+    }
     if (x->bit == FIRC_XT_EXT_TCP && strcmp(opt, "--tcp-flags") == 0) {
         uint8_t mask = 0, cmp = 0;
         if (na < 2 || inv || (x->seen & 2u) || !parse_tcp_flags(a[0], &mask) || !parse_tcp_flags(a[1], &cmp)) {
@@ -722,7 +730,7 @@ static ext_t *l4_of(want_t *w) {
 static int any_match_option(want_t *w, const char *opt, char *const *a, size_t na, bool inv) {
     int used = match_option(w, w->cur, opt, a, na, inv);
     if (used != NOT_MINE) { return used; }
-    bool l4opt = strcmp(opt, "--dport") == 0 || strcmp(opt, "--tcp-flags") == 0;
+    bool l4opt = strcmp(opt, "--dport") == 0 || strcmp(opt, "--sport") == 0 || strcmp(opt, "--tcp-flags") == 0;
     if (!l4opt || (w->proto != 6 && w->proto != 17)) { return BAD; }
     ext_t *l4 = l4_of(w);
     if (l4 == NULL) { l4 = open_l4(w, w->proto); }

@@ -499,7 +499,7 @@ for (const locale of ["ru", "en"]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(page.locator('[data-section="pool"] header .whole')).toBeVisible();
       expect(await lineCounts(page.locator("section.panel header .title"))).toEqual([
-        1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1,
       ]);
       const clear = await page.locator("section.panel header:has(.whole)").evaluateAll((els) =>
         els.map((h) => {
@@ -508,7 +508,7 @@ for (const locale of ["ru", "en"]) {
           return w.top >= t.bottom - 1 || w.left - t.right >= 6;
         }),
       );
-      expect(clear).toEqual([true, true, true]);
+      expect(clear).toEqual([true, true, true, true]);
     });
   }
 }

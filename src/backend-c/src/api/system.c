@@ -337,6 +337,254 @@ static void handle_netfilter(firc_http_req_t *req, firc_http_res_t *res, void *u
     firc_http_res_write_json(res, 200, out);
 }
 
+static const char *autolist_why_name(uint8_t why) {
+    switch (why) {
+    case FIRC_AL_WHY_NO_ANSWER: return "no-answer";
+    case FIRC_AL_WHY_RESET: return "reset";
+    case FIRC_AL_WHY_FREEZE: return "freeze";
+    case FIRC_AL_WHY_NO_CONNECT: return "no-connect";
+    default: return "";
+    }
+}
+
+static const char *autolist_state_name(uint8_t state) {
+    switch (state) {
+    case FIRC_AL_CHECKING: return "checking";
+    case FIRC_AL_ADDED: return "added";
+    case FIRC_AL_OFF: return "off";
+    default: return "candidate";
+    }
+}
+
+static const char *autolist_verdict_name(const firc_autolist_result_t *r) {
+    if (r->verdict == FIRC_AUTOLIST_BLOCKED) { return "blocked"; }
+    if (r->verdict == FIRC_AUTOLIST_REACHABLE) { return r->short_body ? "short" : "open"; }
+    return "unknown";
+}
+
+static bool ip_text(const firc_ip_t *ip, char *out, size_t cap) {
+    return ip->len != 0 && inet_ntop(ip->len == 4 ? AF_INET : AF_INET6, ip->b, out, (socklen_t)cap) != NULL;
+}
+
+static bool autolist_candidates_json(cJSON *out, const firc_autolist_status_t *st) {
+    cJSON *arr = cJSON_AddArrayToObject(out, "candidates");
+    if (arr == NULL) { return false; }
+    for (size_t i = 0; i < st->n_candidates; i++) {
+        const firc_al_cand_t *c = &st->candidates[i];
+        cJSON *o = cJSON_CreateObject();
+        if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
+            cJSON_Delete(o);
+            return false;
+        }
+        cJSON *clients = NULL;
+        if (cJSON_AddStringToObject(o, "domain", c->domain) == NULL ||
+            cJSON_AddStringToObject(o, "host", c->host) == NULL ||
+            cJSON_AddStringToObject(o, "why", autolist_why_name(c->why)) == NULL ||
+            cJSON_AddNumberToObject(o, "fails", (double)c->fails) == NULL ||
+            (clients = cJSON_AddArrayToObject(o, "clients")) == NULL ||
+            cJSON_AddNumberToObject(o, "lastAt", (double)c->last_at) == NULL ||
+            cJSON_AddStringToObject(o, "state", autolist_state_name(c->state)) == NULL ||
+            cJSON_AddNumberToObject(o, "notes", (double)c->notes) == NULL) {
+            return false;
+        }
+        for (uint8_t k = 0; k < c->n_clients; k++) {
+            char addr[INET6_ADDRSTRLEN];
+            if (!ip_text(&c->clients[k], addr, sizeof(addr))) { continue; }
+            cJSON *one = cJSON_CreateString(addr);
+            if (one == NULL || !cJSON_AddItemToArray(clients, one)) {
+                cJSON_Delete(one);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool autolist_bypassed_json(cJSON *out, const firc_autolist_status_t *st) {
+    cJSON *arr = cJSON_AddArrayToObject(out, "bypassed");
+    if (arr == NULL) { return false; }
+    for (size_t i = 0; i < st->n_bypassed; i++) {
+        char addr[INET6_ADDRSTRLEN];
+        if (!ip_text(&st->bypassed[i], addr, sizeof(addr))) { continue; }
+        cJSON *o = cJSON_CreateObject();
+        if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
+            cJSON_Delete(o);
+            return false;
+        }
+        if (cJSON_AddStringToObject(o, "client", addr) == NULL ||
+            cJSON_AddNumberToObject(o, "fails", (double)st->bypassed_fails[i]) == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool autolist_probes_json(cJSON *out, const firc_autolist_status_t *st) {
+    cJSON *p = cJSON_AddObjectToObject(out, "probes");
+    cJSON *arr = NULL;
+    if (p == NULL || cJSON_AddNumberToObject(p, "usedHour", (double)st->probes_used_hour) == NULL ||
+        cJSON_AddNumberToObject(p, "queued", (double)st->probes_queued) == NULL ||
+        (st->probe_running ? cJSON_AddStringToObject(p, "running", st->probe_host)
+                           : cJSON_AddNullToObject(p, "running")) == NULL ||
+        (arr = cJSON_AddArrayToObject(p, "results")) == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < st->n_results; i++) {
+        const firc_al_probe_seen_t *r = &st->results[i];
+        cJSON *o = cJSON_CreateObject();
+        if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
+            cJSON_Delete(o);
+            return false;
+        }
+        if (cJSON_AddStringToObject(o, "host", r->host) == NULL ||
+            cJSON_AddStringToObject(o, "verdict", autolist_verdict_name(&r->result)) == NULL ||
+            cJSON_AddStringToObject(o, "why",
+                                    autolist_why_name(r->result.verdict == FIRC_AUTOLIST_BLOCKED ? r->result.why : 0)) ==
+                NULL ||
+            cJSON_AddNumberToObject(o, "bytes", (double)r->result.bytes) == NULL ||
+            cJSON_AddNumberToObject(o, "at", (double)r->at) == NULL ||
+            cJSON_AddStringToObject(o, "error", r->result.error) == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void write_autolist(firc_system_ctx_t *ctx, firc_http_res_t *res, int code) {
+    firc_autolist_status_t *st = malloc(sizeof(*st));
+    cJSON *out = st != NULL ? cJSON_CreateObject() : NULL;
+    if (out == NULL) {
+        free(st);
+        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
+        return;
+    }
+    firc_app_autolist_status(ctx->app, st);
+    bool ok = cJSON_AddBoolToObject(out, "enabled", st->enabled) != NULL &&
+              cJSON_AddBoolToObject(out, "running", st->running) != NULL &&
+              cJSON_AddNumberToObject(out, "failures", (double)st->failures) != NULL &&
+              cJSON_AddNumberToObject(out, "listed", (double)st->listed) != NULL &&
+              (st->why_off == NULL || cJSON_AddStringToObject(out, "whyOff", st->why_off) != NULL) &&
+              cJSON_AddBoolToObject(out, "checking", st->checking) != NULL &&
+              cJSON_AddNumberToObject(out, "checkedAt", (double)st->checked_at) != NULL &&
+              cJSON_AddNumberToObject(out, "switchedOff", (double)st->switched_off) != NULL &&
+              cJSON_AddNumberToObject(out, "switchedOn", (double)st->switched_on) != NULL &&
+              cJSON_AddStringToObject(out, "mode", st->mode) != NULL &&
+              (st->group != NULL ? cJSON_AddStringToObject(out, "group", st->group)
+                                 : cJSON_AddNullToObject(out, "group")) != NULL &&
+              cJSON_AddNumberToObject(out, "failuresDay", (double)st->failures_day) != NULL &&
+              cJSON_AddNumberToObject(out, "ambiguousDay", (double)st->ambiguous_day) != NULL &&
+              (st->wan_warning == NULL || cJSON_AddStringToObject(out, "wanWarning", st->wan_warning) != NULL) &&
+              cJSON_AddNumberToObject(out, "addedHour", (double)st->added_hour) != NULL &&
+              autolist_bypassed_json(out, st) && autolist_candidates_json(out, st) && autolist_probes_json(out, st);
+    free(st);
+    if (!ok) {
+        cJSON_Delete(out);
+        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
+        return;
+    }
+    firc_http_res_write_json(res, code, out);
+}
+
+static void handle_autolist(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    write_autolist(ud, res, 200);
+}
+
+static const char autolist_not_running[] = "the automatic list is not running";
+static const char autolist_iface_in_group[] = "the check interface belongs to the group";
+
+static void handle_autolist_check(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    firc_system_ctx_t *ctx = ud;
+    firc_err_t err = firc_app_autolist_recheck_now(ctx->app);
+    if (err == FIRC_ERR_STATE) {
+        firc_http_res_write_error(res, 409, autolist_not_running);
+        return;
+    }
+    if (err == FIRC_ERR_CLOSED) {
+        firc_http_res_write_error(res, 409, autolist_iface_in_group);
+        return;
+    }
+    if (err != FIRC_OK) {
+        firc_http_res_write_error(res, 500, firc_err_str(err));
+        return;
+    }
+    write_autolist(ctx, res, 200);
+}
+
+static void handle_autolist_probe(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    firc_system_ctx_t *ctx = ud;
+    size_t body_len;
+    const uint8_t *body = firc_http_req_body(req, &body_len);
+    cJSON *json = body_len > 0 ? cJSON_ParseWithLength((const char *)body, body_len) : NULL;
+    const cJSON *host = cJSON_GetObjectItemCaseSensitive(json, "host");
+    firc_al_ask_t ask = FIRC_AL_ASK_QUEUED;
+    firc_err_t err = cJSON_IsString(host) ? firc_app_autolist_probe(ctx->app, host->valuestring, &ask)
+                                          : FIRC_ERR_INVAL;
+    cJSON_Delete(json);
+    if (err == FIRC_ERR_STATE) {
+        firc_http_res_write_error(res, 409, autolist_not_running);
+        return;
+    }
+    if (err == FIRC_ERR_CLOSED) {
+        firc_http_res_write_error(res, 409, autolist_iface_in_group);
+        return;
+    }
+    if (err == FIRC_ERR_INVAL) {
+        firc_http_res_write_error(res, 400, "not a host name");
+        return;
+    }
+    if (err == FIRC_ERR_LIMIT) {
+        firc_http_res_write_error(res, 429, "the check queue is full");
+        return;
+    }
+    if (err != FIRC_OK) {
+        firc_http_res_write_error(res, 500, firc_err_str(err));
+        return;
+    }
+    if (ask == FIRC_AL_ASK_FULL) {
+        firc_http_res_write_error(res, 429, "the hour's 30 checks are spent");
+        return;
+    }
+    if (ask == FIRC_AL_ASK_BUSY) {
+        firc_http_res_write_error(res, 429, "this host was checked within 10 minutes");
+        return;
+    }
+    write_autolist(ctx, res, 202);
+}
+
+static void handle_autolist_candidate(firc_http_req_t *req, firc_http_res_t *res, firc_system_ctx_t *ctx,
+                                      bool add) {
+    const char *domain = firc_http_req_param(req, "domain");
+    firc_err_t err = add ? firc_app_autolist_candidate_add(ctx->app, domain)
+                         : firc_app_autolist_candidate_dismiss(ctx->app, domain);
+    if (err == FIRC_ERR_STATE) {
+        firc_http_res_write_error(res, 409, autolist_not_running);
+        return;
+    }
+    if (err == FIRC_ERR_NOENT || err == FIRC_ERR_INVAL) {
+        firc_http_res_write_error(res, 404, "no such candidate");
+        return;
+    }
+    if (err == FIRC_ERR_EXIST) {
+        firc_http_res_write_error(res, 409, "the domain is already a rule of the group");
+        return;
+    }
+    if (err != FIRC_OK) {
+        firc_http_res_write_error(res, 500, firc_err_str(err));
+        return;
+    }
+    write_autolist(ctx, res, 200);
+}
+
+static void handle_autolist_add(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    handle_autolist_candidate(req, res, ud, true);
+}
+
+static void handle_autolist_dismiss(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    handle_autolist_candidate(req, res, ud, false);
+}
+
 void firc_system_name_tunnels(firc_iface_info_t *ifaces, size_t n, const firc_tunnels_t *ts) {
     for (size_t i = 0; ts != NULL && i < ts->n; i++) {
         if (ts->t[i].description[0] == '\0') { continue; }
@@ -1108,6 +1356,11 @@ void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/system/hosts", handle_hosts, ctx);
     must_route(h, "GET", "/api/v1/system/resolvers", handle_resolvers, ctx);
     must_route(h, "GET", "/api/v1/system/netfilter", handle_netfilter, ctx);
+    must_route(h, "GET", "/api/v1/system/autolist", handle_autolist, ctx);
+    must_route(h, "POST", "/api/v1/system/autolist/check", handle_autolist_check, ctx);
+    must_route(h, "POST", "/api/v1/system/autolist/probe", handle_autolist_probe, ctx);
+    must_route(h, "POST", "/api/v1/system/autolist/candidates/{domain}/add", handle_autolist_add, ctx);
+    must_route(h, "POST", "/api/v1/system/autolist/candidates/{domain}/dismiss", handle_autolist_dismiss, ctx);
     must_route(h, "POST", "/api/v1/system/config/save", handle_save_config, ctx);
     must_route(h, "POST", "/api/v1/system/hooks/netfilterd", handle_netfilterd_hook, ctx);
     must_route(h, "POST", "/api/v1/system/hooks/iflayer", handle_iflayer_hook, ctx);

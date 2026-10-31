@@ -271,6 +271,15 @@ jobs:
                   ;;
               esac
             done
+
+            # not covered: the DNS hint reaches the watcher by a function pointer, its writes go through api/app.c
+            objs=$(make -s BUILD=$build $kn print-AUTOLIST_OBJS)
+            test -n "$objs" || { echo "no autolist objects found: the check is empty"; exit 1; }
+            nm --undefined-only $objs > "$RUNNER_TEMP/autolist.$build"
+            if grep -E ' (firc_nfcommit_|firc_ct_|firc_ipset_|firc_rtnl_)' "$RUNNER_TEMP/autolist.$build"; then
+              echo "the automatic list calls a routing writer: its output must be configuration only"
+              exit 1
+            fi
           done
           # not covered: decisions outside these four dirs, static inline readers, data passed instead of calls
 
@@ -294,9 +303,11 @@ jobs:
         working-directory: src/backend-c
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          sudo apt-get install -y python3 iproute2 curl
+          sudo apt-get install -y python3 iproute2 curl openssl
           make -C ../tunvless fetch
           sh tests/e2e/tunnels.sh
+          sudo modprobe -a xt_string xt_connbytes xt_length xt_NFLOG nfnetlink_log
+          sh tests/e2e/autolist.sh
           sh tests/routing/run_uplink_routing.sh
 
       - name: Sanitizers (ASan+UBSan)

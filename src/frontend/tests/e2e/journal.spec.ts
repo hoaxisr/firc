@@ -1087,7 +1087,7 @@ test("Events has no Утечки source", async ({ page }) => {
 });
 
 // Catches a sub-tab label that wraps or spills past a phone's width, the long Russian label kept there, or the English names wrong.
-test("at 360 px the three tabs fit and the second reads Статистика", async ({ page }) => {
+test("at 360 px the four tabs fit and the second reads Статистика", async ({ page }) => {
   await page.addInitScript(() => {
     if (!localStorage.getItem("locale")) {
       localStorage.setItem("locale", JSON.stringify({ value: "ru" }));
@@ -1097,9 +1097,10 @@ test("at 360 px the three tabs fit and the second reads Статистика", a
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/journal");
   const tabs = page.locator(".subtabs").getByRole("tab");
-  await expect(tabs).toHaveCount(3);
+  await expect(tabs).toHaveCount(4);
   await expect(tabs.nth(1)).toHaveText("Статистика запросов");
-  await expect(tabs.nth(2)).toHaveText("Захват");
+  await expect(tabs.nth(2)).toHaveText("Не открываются");
+  await expect(tabs.nth(3)).toHaveText("Захват");
   await page.setViewportSize({ width: 360, height: 740 });
   await expect(tabs.nth(1)).toHaveText("Статистика");
   await expect(tabs.nth(0)).toHaveText("События");
@@ -1117,9 +1118,9 @@ test("at 360 px the three tabs fit and the second reads Статистика", a
   expect(wide).toBeLessThanOrEqual(0);
   await page.evaluate(() => localStorage.setItem("locale", JSON.stringify({ value: "en" })));
   await page.reload();
-  await expect(tabs).toHaveText(["Events", "Stats", "Capture"]);
+  await expect(tabs).toHaveText(["Events", "Stats", "Not opening", "Capture"]);
   await page.setViewportSize({ width: 1280, height: 800 });
-  await expect(tabs).toHaveText(["Events4", "DNS stats", "Capture"]);
+  await expect(tabs).toHaveText(["Events4", "DNS stats", "Not opening", "Capture"]);
 });
 
 // Catches Clear view leaving the rows it was asked to drop.

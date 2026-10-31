@@ -32,7 +32,15 @@ struct firc_dns_pipeline {
     firc_lograte_t said_reals, said_collapse, said_refused;
     bool someone_covers_all;
     firc_recall_t *recall;
+    firc_dns_unmatched_fn unmatched_fn;
+    void *unmatched_ud;
 };
+
+void firc_dns_pipeline_set_unmatched_fn(firc_dns_pipeline_t *p, firc_dns_unmatched_fn fn, void *ud)
+{
+    p->unmatched_fn = fn;
+    p->unmatched_ud = ud;
+}
 
 firc_dns_pipeline_t *firc_dns_pipeline_create(void)
 {
@@ -161,6 +169,31 @@ static void chain_build(chain_t *c, const firc_dns_msg_t *msg, const char *qname
         }
         if (c->n == before) { break; }
     }
+}
+
+static void tell_unmatched(const firc_dns_pipeline_t *p, const firc_dns_msg_t *msg, const firc_ip_t *client,
+                           const char *qname, const chain_t *chain)
+{
+    if (p->unmatched_fn == NULL || client == NULL || qname == NULL) { return; }
+    firc_ip_t reals[16];
+    size_t n = 0;
+    for (size_t i = 0; i < msg->n_answers && n < sizeof(reals) / sizeof(reals[0]); i++) {
+        const firc_dns_rr_t *rr = &msg->answers[i];
+        if (rr->rtype != FIRC_DNS_TYPE_A && rr->rtype != FIRC_DNS_TYPE_AAAA) { continue; }
+        uint8_t len = rr->rtype == FIRC_DNS_TYPE_A ? 4 : 16;
+        if (rr->rdata_len != len) { continue; }
+        char rr_owner[1100];
+        if (firc_dns_name_to_string(rr->name, rr->name_len, rr_owner, sizeof(rr_owner), NULL) != FIRC_OK) {
+            continue;
+        }
+        trim_fqdn(rr_owner);
+        fold_ascii(rr_owner);
+        if (!chain_has(chain, rr_owner)) { continue; }
+        memcpy(reals[n].b, rr->rdata, len);
+        reals[n].len = len;
+        n++;
+    }
+    if (n > 0) { p->unmatched_fn(p->unmatched_ud, client, qname, reals, n); }
 }
 
 static bool covered(const firc_dns_pipeline_t *p, const firc_ip_t *client)
@@ -396,6 +429,7 @@ firc_dns_verdict_t firc_dns_pipeline_handle_message_from(firc_dns_pipeline_t *p,
         (msg->questions[0].qtype == FIRC_DNS_TYPE_A || msg->questions[0].qtype == FIRC_DNS_TYPE_AAAA);
 
     if (matched == NULL) {
+        if (addr_question) { tell_unmatched(p, msg, client, qname, &chain); }
         if (p->snapshot != NULL && p->snapshot->provisional && p->pool != NULL && addr_question) {
             /* RETIMED, not REWRITTEN: the address is real, so AAAA stripping must still apply. */
             uint32_t clamp = p->clamp_secs;
@@ -418,6 +452,7 @@ firc_dns_verdict_t firc_dns_pipeline_handle_message_from(firc_dns_pipeline_t *p,
     }
     if (owner == NULL) {
         journal_put(p, ev, FIRC_DNS_NOT_COVERED);
+        if (addr_question) { tell_unmatched(p, msg, client, qname, &chain); }
         if (p->unmatched_ttl_secs > 0 && addr_question) {
             if (firc_dns_msg_clamp_ttl(msg, p->unmatched_ttl_secs)) { return FIRC_DNS_RETIMED; }
         }

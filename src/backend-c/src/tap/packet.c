@@ -13,7 +13,11 @@ static bool tcp_after(const uint8_t *buf, size_t len, firc_tap_packet_t *out) {
     if (len < TCP_MIN_HDR) { return false; }
     size_t hdr = (size_t)(buf[12] >> 4) * 4u;
     if (hdr < TCP_MIN_HDR || hdr > len) { return false; }
+    out->src_port = be16(buf);
     out->dst_port = be16(buf + 2);
+    out->seq = ((uint32_t)be16(buf + 4) << 16) | be16(buf + 6);
+    out->ack = ((uint32_t)be16(buf + 8) << 16) | be16(buf + 10);
+    out->flags = buf[13];
     out->payload_len = len - hdr;
     out->payload = out->payload_len > 0 ? buf + hdr : NULL;
     return true;

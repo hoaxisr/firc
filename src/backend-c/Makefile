@@ -100,6 +100,7 @@ CONFIG_SRCS := \
     src/config/yaml_scalar.c \
     src/config/yaml_load.c \
     src/config/yaml_save.c \
+    src/autolist/regdomain.c \
     src/rules/wildcard.c \
     src/rules/match.c \
     src/rules/snapshot.c \
@@ -205,6 +206,14 @@ TAP_CFG_SRCS := \
     src/tap/judge.c \
     src/tap/window.c
 
+AUTOLIST_SRCS := \
+    src/autolist/judge.c \
+    src/autolist/svc.c \
+    src/autolist/alrules.c \
+    src/autolist/recheck.c \
+    src/autolist/candidates.c \
+    src/autolist/probes.c
+
 INTERFACES_SRCS := \
     src/interfaces/ifchoose.c \
     src/interfaces/ifcheck.c \
@@ -217,7 +226,7 @@ INTERFACES_SRCS := \
 
 LIB_SRCS := $(CORE_SRCS) $(CONFIG_SRCS) $(NETFILTER_SRCS) $(API_SRCS) $(SUBSCRIPTIONS_SRCS) \
             $(TUNNELS_SRCS) $(INTERFACES_SRCS) $(TAP_RULES_SRCS) $(TAP_SRCS) $(TAP_CFG_SRCS) \
-            $(UPDATE_SRCS)
+            $(UPDATE_SRCS) $(AUTOLIST_SRCS)
 
 MAIN_SRC := src/main/main.c
 CONFIGTOOL_SRC := src/tools/configtool.c
@@ -234,8 +243,10 @@ TUNNELS_OBJS := $(TUNNELS_SRCS:%.c=$(BUILDDIR)/%.o) \
 INTERFACES_OBJS := $(INTERFACES_SRCS:%.c=$(BUILDDIR)/%.o)
 TAP_RULES_OBJS := $(TAP_RULES_SRCS:%.c=$(BUILDDIR)/%.o)
 TAP_OBJS := $(TAP_SRCS:%.c=$(BUILDDIR)/%.o) $(TAP_CFG_SRCS:%.c=$(BUILDDIR)/%.o)
+AUTOLIST_OBJS := $(AUTOLIST_SRCS:%.c=$(BUILDDIR)/%.o)
 LIB_OBJS := $(CORE_OBJS) $(CONFIG_OBJS) $(NETFILTER_OBJS) $(API_OBJS) $(SUBSCRIPTIONS_OBJS) \
-            $(TUNNELS_OBJS) $(INTERFACES_OBJS) $(TAP_RULES_OBJS) $(TAP_OBJS) $(UPDATE_OBJS)
+            $(TUNNELS_OBJS) $(INTERFACES_OBJS) $(TAP_RULES_OBJS) $(TAP_OBJS) $(UPDATE_OBJS) \
+            $(AUTOLIST_OBJS)
 MAIN_OBJ := $(MAIN_SRC:%.c=$(BUILDDIR)/%.o)
 CONFIGTOOL_OBJ := $(CONFIGTOOL_SRC:%.c=$(BUILDDIR)/%.o)
 DNSTOOL_OBJ := $(DNSTOOL_SRC:%.c=$(BUILDDIR)/%.o)

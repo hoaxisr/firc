@@ -38,6 +38,7 @@ void firc_rule_free(firc_rule_t *r)
     free(r->proto);
     free(r->ports);
     free(r->comment);
+    free(r->autolist);
     free(r);
 }
 
@@ -661,6 +662,12 @@ firc_err_t firc_app_config_init_defaults(firc_app_config_t *c)
     c->update.check = false;
     c->check.interval = 30 * FIRC_DURATION_SEC;
     c->check.timeout = 5 * FIRC_DURATION_SEC;
+    c->autolist.enabled = false;
+    c->autolist.fail_threshold = 3;
+    c->autolist.fail_time = 60 * FIRC_DURATION_SEC;
+    c->autolist.retrans_threshold = 3;
+    c->autolist.recheck = false;
+    c->autolist.recheck_interval = 6 * 3600 * FIRC_DURATION_SEC;
 
     firc_err_t err;
     if ((err = firc_strset(&c->http_web.host.address, "[::]")) != FIRC_OK ||
@@ -672,7 +679,10 @@ firc_err_t firc_app_config_init_defaults(firc_app_config_t *c)
         (err = firc_strset(&c->fakeip.v4.pool, "198.18.0.0/15")) != FIRC_OK ||
         (err = firc_strset(&c->fakeip.v6.pool, "")) != FIRC_OK ||
         (err = firc_strset(&c->check.url, "http://cp.cloudflare.com/generate_204")) != FIRC_OK ||
-        (err = firc_strset(&c->check.wan_url, "")) != FIRC_OK) {
+        (err = firc_strset(&c->check.wan_url, "")) != FIRC_OK ||
+        (err = firc_strset(&c->autolist.group, "")) != FIRC_OK ||
+        (err = firc_strset(&c->autolist.mode, "candidates")) != FIRC_OK ||
+        (err = firc_strset(&c->autolist.check_iface, "")) != FIRC_OK) {
         firc_app_config_clear(c);
         return err;
     }
@@ -710,6 +720,13 @@ void firc_app_config_clear(firc_app_config_t *c)
         free(c->link[i]);
     }
     free(c->link);
+    free(c->autolist.group);
+    free(c->autolist.check_iface);
+    free(c->autolist.mode);
+    for (size_t i = 0; i < c->autolist.n_exclude; i++) {
+        free(c->autolist.exclude[i]);
+    }
+    free(c->autolist.exclude);
     memset(c, 0, sizeof(*c));
 }
 

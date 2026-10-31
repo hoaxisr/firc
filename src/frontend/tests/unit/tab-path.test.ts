@@ -31,15 +31,15 @@ describe("a tab's address", () => {
   // Catches a Journal sub-tab with no address of its own, or a sub-tab suffix on another tab.
   it("gives each Journal sub-tab its own address under /journal", () => {
     assert.deepStrictEqual(
-      (["events", "stats", "capture"] as const).map((v) => pathOfTab("logs", v)),
-      ["/journal", "/journal/stats", "/journal/capture"],
+      (["events", "stats", "unopened", "capture"] as const).map((v) => pathOfTab("logs", v)),
+      ["/journal", "/journal/stats", "/journal/unopened", "/journal/capture"],
     );
     assert.strictEqual(pathOfTab("settings", "stats"), "/settings");
   });
 
   // Catches a sub-tab address opening Groups, or the wrong sub-tab.
   it("reads the Journal and its sub-tab back from a sub-tab's address", () => {
-    for (const view of ["events", "stats", "capture"] as const) {
+    for (const view of ["events", "stats", "unopened", "capture"] as const) {
       assert.strictEqual(tabFromPath(pathOfTab("logs", view)), "logs");
       assert.strictEqual(journalViewFromPath(pathOfTab("logs", view)), view);
     }

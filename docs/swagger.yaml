@@ -91,7 +91,22 @@ definitions:
           array of strings; startMarkTableIndex is a string like 0x66697263.
           app.dnsProxy.disableStats (live, false by default) turns the DNS
           stats off: nothing is counted and the counts are dropped; turned on
-          again, they start empty.
+          again, they start empty. app.autolist.* (all live) is the automatic
+          list: enabled switches it, group is the id of the group blocked
+          domains are added to ("" none), failThreshold (1-20) failed
+          connections in a row with at most failTime (10-3600 s) between two
+          add a host, retransThreshold (1-8) is how many times a ClientHello
+          is sent again before the connection counts as failed, exclude lists
+          names never added (each with its subdomains), mode is candidates
+          (the default) or add. Turning enabled on needs a group and
+          app.dnsProxy.unmatchedTtl above 0. What is added is the
+          host's registrable domain as a namespace rule. app.autolist.recheck
+          (false by default) queues a probe of each enabled rule's autolist
+          host every recheckInterval (600 s to 7 days, 6 h by default); every
+          probe goes through checkInterface ("" is the default route), one at
+          a time and at most 30 an hour. A rule whose host opens is switched
+          off with its marker kept, and switched on again when its host is
+          blocked again.
         example:
           app.dnsProxy.upstream.address: 127.0.0.1
           app.dnsProxy.upstream.port: 53
@@ -101,6 +116,16 @@ definitions:
           app.check.wanUrl: ""
           app.check.interval: 30
           app.check.timeout: 5
+          app.autolist.enabled: false
+          app.autolist.group: ""
+          app.autolist.mode: candidates
+          app.autolist.failThreshold: 3
+          app.autolist.failTime: 60
+          app.autolist.retransThreshold: 3
+          app.autolist.exclude: []
+          app.autolist.recheck: false
+          app.autolist.recheckInterval: 21600
+          app.autolist.checkInterface: ""
         type: object
       classes:
         additionalProperties:
@@ -1118,6 +1143,201 @@ definitions:
           $ref: '#/definitions/types.InterfaceResolvers'
         type: array
     type: object
+  types.AutolistProbeReq:
+    properties:
+      host:
+        description: 'A host name, as a client would ask for it'
+        example: www.example.com
+        type: string
+    required:
+    - host
+    type: object
+  types.AutolistBypassed:
+    properties:
+      client:
+        description: 'A device whose failures were not counted: it never asked firc for the name (DoH or its own resolver)'
+        example: 192.168.1.60
+        type: string
+      fails:
+        description: 'Its failures in the last 24 hours'
+        example: 6
+        type: integer
+    type: object
+  types.AutolistCandidate:
+    properties:
+      domain:
+        description: 'The registrable domain that would be added'
+        example: example.com
+        type: string
+      host:
+        description: 'The host that failed or was probed'
+        example: cdn.example.com
+        type: string
+      why:
+        description: 'no-answer (the ClientHello went unanswered), reset (a reset before the server answered), freeze (the router''s probe stalled) or no-connect (the SYNs went unanswered, and the router''s probe could not connect while its WAN check passed)'
+        example: reset
+        type: string
+      fails:
+        description: 'Failed connections in a row; 0 for a stall the probe has yet to judge'
+        example: 3
+        type: integer
+      clients:
+        description: 'Up to four devices it failed for'
+        items:
+          type: string
+        type: array
+      lastAt:
+        description: 'Unix time it was last noted'
+        example: 1793368532
+        type: integer
+      state:
+        description: 'candidate, checking (a probe is queued or running), added, or off (switched off by the recheck)'
+        example: candidate
+        type: string
+      notes:
+        description: 'Stalled connections that queued a probe'
+        example: 2
+        type: integer
+    type: object
+  types.AutolistProbeResult:
+    properties:
+      host:
+        type: string
+        example: cdn.example.com
+      verdict:
+        description: 'open, short (opened, a page too small to say anything about a freeze), blocked or unknown'
+        example: blocked
+        type: string
+      why:
+        description: 'For blocked: no-answer, reset, freeze or no-connect; otherwise empty'
+        example: freeze
+        type: string
+      bytes:
+        description: 'Body bytes read'
+        example: 15360
+        type: integer
+      at:
+        description: 'Unix time it was probed'
+        example: 1793368532
+        type: integer
+      error:
+        description: 'What the probe ran into, as it said it; may be empty'
+        example: 'no byte for 5 s after 15360 bytes'
+        type: string
+    type: object
+  types.AutolistProbes:
+    properties:
+      usedHour:
+        description: 'Probes started in the last hour, of 30'
+        example: 4
+        type: integer
+      queued:
+        description: 'Hosts waiting for a probe'
+        example: 2
+        type: integer
+      running:
+        description: 'The host being probed, or null'
+        example: cdn.example.com
+        type: string
+        x-nullable: true
+      results:
+        description: 'Every result still shown (an hour at least), newest first'
+        items:
+          $ref: '#/definitions/types.AutolistProbeResult'
+        type: array
+    type: object
+  types.AutolistRes:
+    properties:
+      enabled:
+        description: 'The app.autolist.enabled setting'
+        example: true
+        type: boolean
+      running:
+        description: 'Its readers and kernel rules are up, connections are watched, and the target group can take rules'
+        example: true
+        type: boolean
+      whyOff:
+        description: 'Present only when enabled but not running: why'
+        example: 'the group blocks by DNS: nothing to route its names into'
+        type: string
+      mode:
+        description: 'The app.autolist.mode setting: candidates or add'
+        example: candidates
+        type: string
+      group:
+        description: 'The app.autolist.group setting, or null'
+        example: 0a0b0c0d
+        type: string
+        x-nullable: true
+      failures:
+        description: 'Failed connections seen since it started'
+        example: 12
+        type: integer
+      failuresDay:
+        description: 'Failed connections in the last 24 hours'
+        example: 23
+        type: integer
+      ambiguousDay:
+        description: 'No-connect flows and SNI-less hellos in the last 24 hours whose address carried names of several domains'
+        example: 1
+        type: integer
+      wanWarning:
+        description: 'Present only while the last WAN check found no route through the check interface, until a check passes'
+        example: 'the check interface has no route: the WAN check cannot pass'
+        type: string
+      listed:
+        description: 'Hosts that failed failThreshold times in a row since it started'
+        example: 2
+        type: integer
+      addedHour:
+        description: 'Domains added in the last hour, of 30'
+        example: 2
+        type: integer
+      checking:
+        description: 'The recheck has probes left'
+        example: false
+        type: boolean
+      checkedAt:
+        description: 'Unix time the last recheck ended; 0 before the first'
+        example: 1793368532
+        type: integer
+      switchedOff:
+        description: 'Rules switched off since it started because their host opened past the tunnel'
+        example: 1
+        type: integer
+      switchedOn:
+        description: 'Rules switched on again since it started because their host was blocked again'
+        example: 0
+        type: integer
+      bypassed:
+        items:
+          $ref: '#/definitions/types.AutolistBypassed'
+        type: array
+      candidates:
+        description: 'Newest first, at most 64'
+        items:
+          $ref: '#/definitions/types.AutolistCandidate'
+        type: array
+      probes:
+        $ref: '#/definitions/types.AutolistProbes'
+    required:
+    - enabled
+    - running
+    - mode
+    - group
+    - failures
+    - failuresDay
+    - ambiguousDay
+    - listed
+    - addedHour
+    - checking
+    - checkedAt
+    - switchedOff
+    - switchedOn
+    - bypassed
+    - candidates
+    - probes
+    type: object
   types.NetfilterRes:
     properties:
       ok:
@@ -1183,6 +1403,14 @@ definitions:
   types.RuleReq:
     description: 'A rule the daemon can actually route with. `type` is one of domain, namespace, wildcard, regex, subnet, subnet6; `rule` must be usable for that type -- a prefix for subnet/subnet6, a regex that compiles, never empty. Anything else is 400: a rule that matches nothing would otherwise be stored, listed and shown enabled while doing nothing.'
     properties:
+      autolist:
+        description: 'Ignored on input. The daemon carries the marker over from the stored rule with the same id, and drops it when the request changes that rule''s enable, type or pattern.'
+        example: www.example.com
+        type: string
+      autolistByDomain:
+        description: 'Ignored on input. Carried over with the marker, and dropped with it.'
+        example: true
+        type: boolean
       comment:
         description: 'One line about the rule, for people only. Spaces around it are trimmed; empty or only spaces means none. At most 256 bytes of UTF-8 after trimming, no control characters (C0, DEL, C1) and no U+2028 or U+2029. Anything else is 400, naming the rule (and the group, where the request carries one).'
         example: 'Meta: CDN'
@@ -1210,6 +1438,14 @@ definitions:
     type: object
   types.RuleRes:
     properties:
+      autolist:
+        description: 'Present only on a rule the automatic list added: the host it was added for, which the checks open.'
+        example: www.example.com
+        type: string
+      autolistByDomain:
+        description: 'Present (true) only on a rule the automatic list added because hosts of its domain failed; a short page from its host then keeps the rule on.'
+        example: true
+        type: boolean
       comment:
         description: Present only when set.
         example: 'Meta: CDN'
@@ -3004,6 +3240,155 @@ paths:
           schema:
             $ref: '#/definitions/types.NetfilterRes'
       summary: 'Netfilter write state'
+      tags:
+      - system
+  /api/v1/system/autolist:
+    get:
+      description: >-
+        The automatic list's state. While it runs, TLS connections from the
+        devices the chosen group covers are watched: a ClientHello sent again
+        and again with no answer, or a reset before the server answers, is a
+        failure. A host that fails failThreshold times in a row becomes a
+        candidate under its registrable domain (cdn.example.com ->
+        example.com); in mode add the domain is also added to the group as a
+        namespace rule, at most 30 an hour, and groups.yaml is saved. A host
+        whose connections stall twice is queued for a probe from the router;
+        a blocked probe makes it a candidate (or adds it). Candidates,
+        probe results and the counts live in memory only and are empty after
+        a restart. running is false with whyOff when the target group is
+        missing or blocks by DNS.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.AutolistRes'
+      summary: 'Automatic list state'
+      tags:
+      - system
+  /api/v1/system/autolist/candidates/{domain}/add:
+    post:
+      description: >-
+        Adds the candidate's domain to the target group as a namespace rule
+        marked with its host, through the same helper as mode add, and
+        answers the state. A domain the automatic list already added is not
+        added twice; a rule of the same text set by hand is left alone.
+      parameters:
+      - description: 'The candidate domain'
+        in: path
+        name: domain
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.AutolistRes'
+        "404":
+          description: 'Not Found -- "no such candidate"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'Conflict -- "the automatic list is not running", or "the domain is already a rule of the group" (a rule set by hand; the candidate stays)'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: 'Internal Server Error -- the rule could not be added'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Add a candidate to the group'
+      tags:
+      - system
+  /api/v1/system/autolist/candidates/{domain}/dismiss:
+    post:
+      description: >-
+        Drops the candidate and keeps the domain from being proposed again
+        for 24 hours (memory only); a rule already added stays. Answers the
+        state.
+      parameters:
+      - description: 'The candidate domain'
+        in: path
+        name: domain
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.AutolistRes'
+        "404":
+          description: 'Not Found -- "no such candidate"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Dismiss a candidate for a day'
+      tags:
+      - system
+  /api/v1/system/autolist/probe:
+    post:
+      description: >-
+        Queues a probe of https://host/ from the router through
+        app.autolist.checkInterface ahead of every other queued probe and
+        answers the state. One probe runs at a time, 30 an hour in all; a
+        blocked verdict makes the host's domain a candidate, or adds it in
+        mode add. While checkInterface is an entry of the target group's
+        interface list no probe runs at all and nothing of the budget is
+        spent. A request may push a queued recheck out of a full queue.
+      parameters:
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.AutolistProbeReq'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.AutolistRes'
+        "400":
+          description: 'Bad Request -- "not a host name"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'Conflict -- "the automatic list is not running", or "the check interface belongs to the group"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "429":
+          description: 'Too Many Requests -- "the hour''s 30 checks are spent", "this host was checked within 10 minutes", or "the check queue is full" (64 requests wait already)'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Probe a host from the router'
+      tags:
+      - system
+  /api/v1/system/autolist/check:
+    post:
+      description: >-
+        Starts the recheck now, as the timer would: the hosts of the enabled
+        rules with an autolist host are queued for a probe, at most 32 per
+        run, each run starting where the previous one stopped; each probe
+        takes its turn and its share of the 30 an hour. A host that opens switches its rules
+        off (marker kept), unless the page was short and the rule was added
+        for a freeze; a blocked host keeps them; an unknown result changes
+        nothing. Answers the state with checking true while probes are left.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.AutolistRes'
+        "409":
+          description: 'Conflict -- "the automatic list is not running", or "the check interface belongs to the group"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Recheck the added domains now'
       tags:
       - system
   /api/v1/system/events:

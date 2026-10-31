@@ -1,3 +1,4 @@
+import { autolist } from "../../data/autolist.svelte";
 import { t } from "../../data/locale.svelte";
 
 import { toast } from "../../utils/events";
@@ -108,6 +109,7 @@ export async function saveSettings(): Promise<boolean> {
     for (const k of keys) settings.saved[k] = JSON.parse(JSON.stringify(settings.draft[k]));
     settings.pendingRestart = res.pendingRestart;
     toast.success(t("Settings saved"));
+    if (keys.some((k) => k.startsWith("app.autolist."))) void autolist.poll();
     return true;
   } catch (error) {
     if (gen !== generation) return false;

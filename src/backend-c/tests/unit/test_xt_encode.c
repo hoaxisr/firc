@@ -458,6 +458,26 @@ TEST entry_same_ignores_only_the_verdict_of_a_jump(void) {
 }
 
 /* Catches: a multiport list cut short or overrun: 15 slots fit, a sixteenth or a range starting in the last slot is refused. */
+TEST a_source_port_fills_the_source_range(void) {
+    firc_xt_entry_t e;
+    uint32_t exts = 0;
+    ASSERT_EQ_FMT(FIRC_OK, enc(FIRC_IPT_PROTO_IPV4, "-p tcp --sport 443 --tcp-flags RST RST -j RETURN", &e, &exts),
+                  "%d");
+    xt_tcp_t t;
+    memcpy(&t, match_named(FIRC_IPT_PROTO_IPV4, &e, "tcp"), sizeof(t));
+    ASSERT_EQ_FMT(443, (int)t.spts[0], "%d");
+    ASSERT_EQ_FMT(443, (int)t.spts[1], "%d");
+    ASSERT_EQ_FMT(0, (int)t.dpts[0], "%d");
+    ASSERT_EQ_FMT(0xffff, (int)t.dpts[1], "%d");
+    ASSERT_EQ_FMT(0x04, (int)t.flg_mask, "%d");
+    firc_xt_entry_clear(&e);
+    ASSERT_EQ_FMT(FIRC_OK, enc(FIRC_IPT_PROTO_IPV6, "-p udp --sport 1000:2000 -j RETURN", &e, &exts), "%d");
+    firc_xt_entry_clear(&e);
+    ASSERT_EQ_FMT(FIRC_ERR_INVAL, enc(FIRC_IPT_PROTO_IPV4, "-p tcp --sport 1 --sport 2 -j RETURN", &e, &exts), "%d");
+    ASSERT_EQ_FMT(FIRC_ERR_INVAL, enc(FIRC_IPT_PROTO_IPV4, "-p tcp ! --sport 1 -j RETURN", &e, &exts), "%d");
+    PASS();
+}
+
 TEST multiport_holds_fifteen_slots_and_refuses_a_sixteenth(void) {
     firc_xt_entry_t e;
     uint32_t exts = 0;
@@ -925,6 +945,7 @@ int main(int argc, char **argv) {
     RUN_TEST(entry_same_ignores_only_the_verdict_of_a_jump);
     RUN_TEST(a_prefix_clears_the_host_bits);
     RUN_TEST(matches_follow_the_order_of_the_words);
+    RUN_TEST(a_source_port_fills_the_source_range);
     RUN_TEST(multiport_holds_fifteen_slots_and_refuses_a_sixteenth);
     RUN_TEST(the_mangle_and_filter_refusals);
     RUN_TEST(matches_keep_the_order_the_rule_names_them);

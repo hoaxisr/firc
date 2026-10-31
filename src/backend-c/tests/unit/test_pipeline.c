@@ -395,6 +395,52 @@ TEST an_unmatched_name_passes_untouched(void) {
     PASS();
 }
 
+typedef struct {
+    int calls;
+    char name[128];
+    firc_ip_t client, real;
+    size_t n;
+} told_t;
+
+static void tell(void *ud, const firc_ip_t *client, const char *name, const firc_ip_t *reals, size_t n) {
+    told_t *t = ud;
+    t->calls++;
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    t->client = *client;
+    t->real = reals[0];
+    t->n = n;
+}
+
+TEST an_unmatched_answer_is_told_with_its_chain_s_address(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    told_t told;
+    memset(&told, 0, sizeof(told));
+    firc_dns_pipeline_set_unmatched_fn(f.p, tell, &told);
+    uint8_t buf[512];
+    static const char *q[] = {"other", "example", "org"};
+    static const char *t[] = {"cdn", "example", "net"};
+    size_t len = build_response(buf, q, 3, t, 3);
+    firc_dns_msg_t *msg = NULL;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(buf, len, &msg));
+    const firc_ip_t client = {{192, 168, 1, 5}, 4};
+    (void)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL);
+    ASSERT_EQ(1, told.calls);
+    ASSERT_STR_EQ("other.example.org", told.name);
+    ASSERT_EQ_FMT((size_t)1, told.n, "%zu");
+    static const uint8_t real[4] = {93, 184, 216, 34};
+    ASSERT_MEM_EQ(real, told.real.b, 4);
+    ASSERT_MEM_EQ(client.b, told.client.b, 4);
+    firc_dns_msg_free(msg);
+
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_parse(buf, len, &msg));
+    (void)firc_dns_pipeline_handle_message(f.p, msg, 1001, NULL, NULL);
+    ASSERTm("an answer with no client to name is not told", told.calls == 1);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
 /* An unmatched answer: one A record for other.example.org with TTL `ttl`. */
 static firc_dns_msg_t *unmatched_answer(uint32_t ttl) {
     uint8_t buf[512];
@@ -2224,6 +2270,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_matched_name_gets_an_address_of_its_own_and_waits_for_its_rule);
     RUN_TEST(a_repeat_answer_for_a_committed_pair_is_not_held);
     RUN_TEST(an_unmatched_name_passes_untouched);
+    RUN_TEST(an_unmatched_answer_is_told_with_its_chain_s_address);
     RUN_TEST(an_unmatched_answer_is_clamped_to_unmatched_ttl);
     RUN_TEST(an_unmatched_answer_already_short_is_passed_not_rewritten);
     RUN_TEST(unmatched_ttl_zero_leaves_the_answer_untouched);

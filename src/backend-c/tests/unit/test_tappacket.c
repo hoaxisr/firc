@@ -95,6 +95,21 @@ TEST an_ipv6_tcp_packet_is_read_too(void) {
     PASS();
 }
 
+TEST packet_parse_reads_ack(void) {
+    uint8_t buf[256];
+    static const uint8_t body[] = {0x16};
+    size_t n = v4_tcp(buf, 5, 5, 0, body, sizeof(body));
+    buf[20 + 8] = 0x01; buf[20 + 9] = 0x02; buf[20 + 10] = 0x03; buf[20 + 11] = 0x04;
+    firc_tap_packet_t p;
+    ASSERT(firc_tap_packet_parse(buf, n, &p));
+    ASSERT_EQ_FMT(0x01020304u, p.ack, "%#x");
+    n = v6_tcp(buf, body, sizeof(body));
+    buf[40 + 8] = 0x01; buf[40 + 9] = 0x02; buf[40 + 10] = 0x03; buf[40 + 11] = 0x04;
+    ASSERT(firc_tap_packet_parse(buf, n, &p));
+    ASSERT_EQ_FMT(0x01020304u, p.ack, "%#x");
+    PASS();
+}
+
 /* Catches: a fragment parsed instead of refused. */
 TEST a_fragment_is_refused(void) {
     uint8_t buf[256];
@@ -407,6 +422,7 @@ int main(int argc, char **argv) {
     RUN_TEST(tcp_options_are_stepped_over);
     RUN_TEST(ipv4_options_are_stepped_over);
     RUN_TEST(an_ipv6_tcp_packet_is_read_too);
+    RUN_TEST(packet_parse_reads_ack);
     RUN_TEST(a_fragment_is_refused);
     RUN_TEST(anything_that_is_not_ipv4_or_ipv6_tcp_is_refused);
     RUN_TEST(a_header_length_past_the_buffer_is_refused);

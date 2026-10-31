@@ -5,6 +5,7 @@
   import Button from "../../components/ui/Button.svelte";
   import Checkbox from "../../components/ui/Checkbox.svelte";
   import Select from "../../components/ui/Select.svelte";
+  import { autolist, whyLabel } from "../../data/autolist.svelte";
   import {
     DEVICE_ADDRESSES_MAX,
     deviceAddresses,
@@ -21,12 +22,15 @@
   } from "../../data/dnsstats.svelte";
   import { groupsBridge } from "../../data/groups-bridge.svelte";
   import { hosts } from "../../data/hosts.svelte";
+  import { knownGroups } from "../../data/known-groups.svelte";
   import { locale, t } from "../../data/locale.svelte";
+  import { settings } from "../settings/settings.svelte";
   import BlockPopover from "./BlockPopover.svelte";
   import DomainsTable from "./DomainsTable.svelte";
 
   import { Ban, Filter, Search } from "../../components/ui/icons";
-  import type { Group } from "../../types";
+  import type { AutolistCandidate, AutolistProbeResult, Group } from "../../types";
+  import { toast } from "../../utils/events";
   import { fetcher } from "../../utils/fetcher";
   import { pluralForm } from "../../utils/plural";
   import { isValidDomain } from "../../utils/rule-validators";
@@ -78,6 +82,54 @@
     for (const r of data.rows) for (const c of r.clients) known.add(c.address.toLowerCase());
     if (known.size > before) statsFilter.seen = [...known];
   });
+
+  const listRuns = $derived(autolist.data?.running === true);
+  const autoGroup = $derived(
+    knownGroups.list.find((g) => g.id === autolist.data?.group)?.name ?? "",
+  );
+  const isPending = (host: string) => autolist.pending(host);
+
+  const candidateOf = (host: string): AutolistCandidate | null =>
+    autolist.data?.candidates.find((c) => c.host === host) ?? null;
+
+  async function ask(host: string) {
+    await autolist.ask(host);
+  }
+
+  async function addCandidate(c: AutolistCandidate) {
+    try {
+      await autolist.add(c.domain);
+      const ttl = Number(settings.saved["app.dnsProxy.unmatchedTtl"] ?? 0);
+      toast.success(
+        t("{domain} added to «{group}». It will open within {n} s — refresh the page.")
+          .replace("{domain}", c.domain)
+          .replace("{group}", autoGroup)
+          .replace("{n}", String(ttl)),
+      );
+      const st = groupsBridge.store;
+      if (st?.dataLoaded && !st.tracker.isDirty) void st.mount();
+    } catch {}
+  }
+
+  function verdictText(r: AutolistProbeResult): string {
+    const kb = String(Math.round(r.bytes / 1024));
+    if (r.verdict === "blocked") {
+      return t("blocked: {why} → in the «Not opening» list").replace(
+        "{why}",
+        whyLabel(r.why, r.bytes, t),
+      );
+    }
+    if (r.verdict === "open") {
+      return t("opens directly (answer {n} KB) — not a block").replace("{n}", kb);
+    }
+    if (r.verdict === "short") {
+      return t("opened with a short answer ({n} KB): a freeze cannot be checked this way").replace(
+        "{n}",
+        kb,
+      );
+    }
+    return t("could not check: {error}").replace("{error}", r.error);
+  }
 
   let turning = $state(false);
 
@@ -142,28 +194,59 @@
   {#if name}<span class="above">{t("«{group}» above").replace("{group}", name)}</span>{/if}
 {/snippet}
 
+{#snippet note(r: DnsStatsRow)}
+  {@const result = autolist.resultFor(r.name)}
+  {#if isPending(r.name)}
+    <span class="verdict"
+      ><span class="spin" aria-hidden="true"></span>{t(
+        "the router is checking the site directly…",
+      )}</span
+    >
+  {:else if result}
+    <span class="verdict {result.verdict}">{verdictText(result)}</span>
+  {/if}
+{/snippet}
+
 {#snippet action(r: DnsStatsRow)}
   {@const s = status(r)}
   {@const above = store?.dataLoaded ? rowAbove(r, groups, device?.entry ?? null, held) : ""}
-  {#if s}
-    <span class="added">
-      <span class="already"
-        ><Ban size={14} aria-hidden="true" />{t("in «{group}»").replace("{group}", s.group)}</span
-      >
-      {#if s.unsaved}<span class="uns">{t("not saved yet")}</span>{@render aboveHint(above)}{/if}
-    </span>
-  {:else if store?.canAdd && isValidDomain(r.name)}
-    <span class="added">
-      <BlockPopover
-        name={r.name}
-        device={device ? { label: device.label, entry: device.entry } : null}
-        {groups}
-        ownerId={r.owner?.id ?? null}
-        onadd={(scope, target) => void addBlock(r.name, scope, target)}
-      />
-      {@render aboveHint(above)}
-    </span>
-  {/if}
+  {@const cand = candidateOf(r.name)}
+  {@const verdict = autolist.resultFor(r.name)?.verdict}
+  <span class="btns">
+    {#if listRuns && !r.owner && !s && isValidDomain(r.name)}
+      {#if cand && cand.state === "candidate" && verdict === "blocked" && !isPending(r.name)}
+        <button type="button" class="bp-trigger wo add" onclick={() => void addCandidate(cand)}
+          >{t("To «{group}»").replace("{group}", autoGroup)}</button
+        >
+      {:else if !cand || cand.state !== "added"}
+        <button
+          type="button"
+          class="bp-trigger wo"
+          onclick={() => void ask(r.name)}
+          disabled={isPending(r.name)}>{t("Won't open")}</button
+        >
+      {/if}
+    {/if}
+    {#if s}
+      <span class="added">
+        <span class="already"
+          ><Ban size={14} aria-hidden="true" />{t("in «{group}»").replace("{group}", s.group)}</span
+        >
+        {#if s.unsaved}<span class="uns">{t("not saved yet")}</span>{@render aboveHint(above)}{/if}
+      </span>
+    {:else if store?.canAdd && isValidDomain(r.name)}
+      <span class="added">
+        <BlockPopover
+          name={r.name}
+          device={device ? { label: device.label, entry: device.entry } : null}
+          {groups}
+          ownerId={r.owner?.id ?? null}
+          onadd={(scope, target) => void addBlock(r.name, scope, target)}
+        />
+        {@render aboveHint(above)}
+      </span>
+    {/if}
+  </span>
 {/snippet}
 
 {#if data && !data.enabled}
@@ -261,6 +344,7 @@
     empty={t("No queries in the last day match these filters.")}
     onpick={(name) => (query = name)}
     {action}
+    {note}
   />
   {#if data && data.matched > data.rows.length}
     <p class="st-more">
@@ -393,6 +477,50 @@
     margin: 0.5rem 0 0;
     font-size: 0.8rem;
     color: var(--text-2);
+  }
+  .btns {
+    display: inline-flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+  .wo:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .wo.add {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .verdict {
+    display: block;
+    font-size: 0.76rem;
+    line-height: 1.3;
+    color: var(--text-2);
+  }
+  .verdict.blocked {
+    color: var(--blue);
+  }
+  .verdict.open {
+    color: var(--green);
+  }
+  .spin {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    margin-right: 0.4rem;
+    vertical-align: -0.1rem;
+    border: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: turn 0.9s linear infinite;
+  }
+  @keyframes turn {
+    to {
+      transform: rotate(1turn);
+    }
   }
   .added {
     display: inline-flex;

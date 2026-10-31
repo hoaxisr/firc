@@ -1,6 +1,7 @@
+import { knownGroups } from "../../data/known-groups.svelte";
 import { t } from "../../data/locale.svelte";
 
-import type { SettingValue } from "./settings";
+import { AUTOLIST_MODES, secondsToHours, type SettingValue } from "./settings";
 
 export type Control =
   | {
@@ -10,8 +11,13 @@ export type Control =
       suggest?: { label: () => string; value: string };
     }
   | { kind: "number"; unit?: () => string; width?: string }
+  | { kind: "hours" }
   | { kind: "switch"; invert?: boolean; caption?: string }
-  | { kind: "tags" };
+  | { kind: "segment"; options: { value: string; label: () => string }[] }
+  | { kind: "tags" }
+  | { kind: "group" }
+  | { kind: "iface" }
+  | { kind: "names"; placeholder?: () => string };
 
 export type Field = { key: string; label: () => string; control: Control };
 export type Row = { label: () => string; hint: () => string; fields: Field[]; joiner?: string };
@@ -258,6 +264,140 @@ export const SECTIONS: Section[] = [
     ],
   },
   {
+    id: "autolist",
+    title: () => t("Automatic list"),
+    rows: [
+      row(
+        () => t("Look for sites that do not open"),
+        () =>
+          t(
+            "Watches the TLS connections of the devices of the chosen group that go around the tunnel",
+          ),
+        [
+          {
+            key: "app.autolist.enabled",
+            label: () => t("Look for sites that do not open"),
+            control: { kind: "switch" },
+          },
+        ],
+      ),
+      row(
+        () => t("What to do with what is found"),
+        () => t("Suggest waits for your decision; Add by itself adds a site once it keeps failing"),
+        [
+          {
+            key: "app.autolist.mode",
+            label: () => t("What to do with what is found"),
+            control: {
+              kind: "segment",
+              options: [
+                { value: AUTOLIST_MODES[0], label: () => t("Suggest") },
+                { value: AUTOLIST_MODES[1], label: () => t("Add by itself") },
+              ],
+            },
+          },
+        ],
+      ),
+      row(
+        () => t("Group"),
+        () =>
+          t(
+            "Where to add; watches only the devices it covers. A domain is added as example.com with its subdomains",
+          ),
+        [
+          {
+            key: "app.autolist.group",
+            label: () => t("Group"),
+            control: { kind: "group" },
+          },
+        ],
+      ),
+      row(
+        () => t("Failures in a row"),
+        () => t("How many failed connections make a domain a candidate, 1 to 20"),
+        [
+          {
+            key: "app.autolist.failThreshold",
+            label: () => t("Failures in a row"),
+            control: { kind: "number", width: "5.5rem" },
+          },
+        ],
+      ),
+      row(
+        () => t("Time between failures"),
+        () => t("A longer pause starts the count over, 10 to 3600 seconds"),
+        [
+          {
+            key: "app.autolist.failTime",
+            label: () => t("Time between failures"),
+            control: { kind: "number", unit: () => t("s") },
+          },
+        ],
+      ),
+      row(
+        () => t("ClientHello resent"),
+        () => t("How many repeats with no answer count as a failure, 1 to 8"),
+        [
+          {
+            key: "app.autolist.retransThreshold",
+            label: () => t("ClientHello resent"),
+            control: { kind: "number", width: "5.5rem" },
+          },
+        ],
+      ),
+      row(
+        () => t("Never add"),
+        () => t("One domain a line; its subdomains are kept out too"),
+        [
+          {
+            key: "app.autolist.exclude",
+            label: () => t("Never add"),
+            control: { kind: "names", placeholder: () => "example.com" },
+          },
+        ],
+      ),
+      row(
+        () => t("Recheck added sites"),
+        () =>
+          t(
+            "The router opens each added domain itself; one that opens is switched off until it is blocked again",
+          ),
+        [
+          {
+            key: "app.autolist.recheck",
+            label: () => t("Recheck added sites"),
+            control: { kind: "switch" },
+          },
+        ],
+      ),
+      row(
+        () => t("Recheck every"),
+        () => t("From 1 to 168 hours"),
+        [
+          {
+            key: "app.autolist.recheckInterval",
+            label: () => t("Recheck every"),
+            control: { kind: "hours" },
+          },
+        ],
+      ),
+      row(
+        () => t("Check through"),
+        () =>
+          t(
+            "Which interface the router opens sites through: when rechecking, on the Not opening button and when a freeze is suspected",
+          ),
+        [
+          {
+            key: "app.autolist.checkInterface",
+            label: () => t("Check through"),
+            control: { kind: "iface" },
+          },
+        ],
+      ),
+    ],
+  },
+  {
     id: "check",
     title: () => t("Interface check"),
     rows: [
@@ -377,7 +517,15 @@ export function formatValue(key: string, value: SettingValue | undefined): strin
     const shown = control?.kind === "switch" && control.invert ? !value : value;
     return shown ? t("on") : t("off");
   }
-  if (Array.isArray(value)) return value.join(", ");
+  if (Array.isArray(value))
+    return value.length === 0 && control?.kind === "names" ? t("none") : value.join(", ");
+  if (control?.kind === "group") {
+    if (value === "") return t("not chosen");
+    return knownGroups.list.find((g) => g.id === value)?.name || String(value);
+  }
+  if (control?.kind === "iface" && value === "") return t("Default route");
+  if (control?.kind === "hours" && typeof value === "number")
+    return `${secondsToHours(value)} ${t("h")}`;
   if (value === "" && key === "app.addressPool.v6.pool") return t("auto");
   const unit = control?.kind === "number" && control.unit ? ` ${control.unit()}` : "";
   return `${value}${unit}`;

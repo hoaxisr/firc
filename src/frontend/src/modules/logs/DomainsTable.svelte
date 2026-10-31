@@ -17,6 +17,7 @@
     empty,
     onpick,
     action,
+    note,
   }: {
     rows: DnsStatsRow[];
     devices: StatsDevice[];
@@ -24,6 +25,7 @@
     empty: string;
     onpick: (name: string) => void;
     action: Snippet<[DnsStatsRow]>;
+    note?: Snippet<[DnsStatsRow]>;
   } = $props();
 
   const pct = (r: DnsStatsRow) => (r.queries > 0 ? Math.round((r.blocked / r.queries) * 100) : 0);
@@ -46,9 +48,12 @@
       {@const devs = rowDevices(r.clients, devices)}
       {@const more = devs.length - 2 + (r.clientsTotal - r.clients.length)}
       <div class="stats-row">
-        <button type="button" class="dom" title={r.name} onclick={() => onpick(r.name)}
-          >{r.name}</button
-        >
+        <span class="domcell">
+          <button type="button" class="dom" title={r.name} onclick={() => onpick(r.name)}
+            >{r.name}</button
+          >
+          {#if note}{@render note(r)}{/if}
+        </span>
         <span class="num qcell"
           ><span class="total">{r.queries}</span><span class="unit">{t("q.")}</span></span
         >
@@ -123,7 +128,7 @@
   .head,
   .stats-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 4.5rem 7rem 19rem 5.5rem 7.5rem;
+    grid-template-columns: minmax(0, 1fr) 4.5rem 7rem 12rem 5.5rem 15.5rem;
     gap: 0.8rem;
     align-items: center;
     padding: 0.45rem 0.9rem;
@@ -154,6 +159,12 @@
   }
   .unit {
     display: none;
+  }
+  .domcell {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
   }
   .dom {
     all: unset;
@@ -202,7 +213,7 @@
   }
   .devs {
     display: grid;
-    grid-template-columns: 6.5rem 6.5rem auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
     gap: 0.6rem;
     align-items: start;
     min-width: 0;
@@ -303,7 +314,7 @@
     .stats-row {
       grid-template-columns: minmax(0, 1fr) auto;
       grid-template-areas:
-        "dom total"
+        "dom dom"
         "share share"
         "devs devs"
         "last act";
@@ -315,11 +326,14 @@
       min-height: 0;
       overflow: visible;
     }
-    .dom {
+    .domcell {
       grid-area: dom;
+      padding-right: 5rem;
     }
     .qcell {
-      grid-area: total;
+      grid-area: dom;
+      justify-self: end;
+      align-self: start;
     }
     .unit {
       display: inline;

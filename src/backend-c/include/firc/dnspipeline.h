@@ -28,6 +28,10 @@ void firc_dns_pipeline_set_pool(firc_dns_pipeline_t *p, firc_fakeip_t *pool, uin
 typedef bool (*firc_dns_v6_fn)(void *ud, firc_id_t group_id);
 void firc_dns_pipeline_set_v6_fn(firc_dns_pipeline_t *p, firc_dns_v6_fn fn, void *ud);
 
+typedef void (*firc_dns_unmatched_fn)(void *ud, const firc_ip_t *client, const char *name, const firc_ip_t *reals,
+                                      size_t n_reals);
+void firc_dns_pipeline_set_unmatched_fn(firc_dns_pipeline_t *p, firc_dns_unmatched_fn fn, void *ud);
+
 /* TTL ceiling for a real (unmatched) A/AAAA answer; 0 = off. Loop thread. */
 void firc_dns_pipeline_set_unmatched_ttl(firc_dns_pipeline_t *p, uint32_t secs);
 

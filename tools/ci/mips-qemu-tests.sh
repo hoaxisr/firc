@@ -27,6 +27,10 @@ rm -rf "$root"
 mkdir -p "$root/opt/lib"
 cp -a "$toolchain_lib"/*.so* "$root/opt/lib/"
 cp -a "$SYSROOT"/opt/lib/*.so* "$root/opt/lib/"
+ca_bundle=${CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
+[ -r "$ca_bundle" ] || { echo "no CA bundle at $ca_bundle; set CA_BUNDLE" >&2; exit 1; }
+mkdir -p "$root/opt/etc/ssl/certs"
+cp "$ca_bundle" "$root/opt/etc/ssl/certs/ca-certificates.crt"
 
 mk() {
     make -C "$backend" CROSS_COMPILE="$CROSS_COMPILE" SYSROOT="$SYSROOT" \

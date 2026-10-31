@@ -26,6 +26,17 @@ typedef bool (*firc_sub_fetch_sink_fn)(void *ud, const uint8_t *data, size_t len
 typedef bool (*firc_sub_fetch_url_fn)(void *ud, const char *url);
 typedef void (*firc_sub_fetch_header_fn)(void *ud, const char *name, const char *value);
 
+/* What the last hop got to: a TCP connect, a finished TLS handshake, a reset by the peer, the call's timeout,
+ * a refused or unroutable connect. */
+typedef struct firc_sub_fetch_info {
+    bool connected;
+    bool tls_done;
+    bool reset;
+    bool timed_out;
+    bool refused;
+    bool unreachable;
+} firc_sub_fetch_info_t;
+
 typedef struct firc_sub_fetch_opts {
     uint32_t mark;
     const char *const *headers;
@@ -42,6 +53,8 @@ typedef struct firc_sub_fetch_opts {
     size_t errbuf_cap;
     bool no_redirects;
     const char *resolve;
+    const char *interface;
+    firc_sub_fetch_info_t *info;
 } firc_sub_fetch_opts_t;
 
 /* Streams url's 2xx body into sink; every URL must pass firc_sub_url_is_supported and url_ok (which only narrows

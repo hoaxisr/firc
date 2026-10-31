@@ -11,6 +11,10 @@ typedef struct {
     firc_ip_t src;
     firc_ip_t dst;
     uint16_t dst_port;
+    uint16_t src_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t flags;
     const uint8_t *payload; /* into the caller's buffer; NULL when empty */
     size_t payload_len;
 } firc_tap_packet_t;
