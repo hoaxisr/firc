@@ -18,16 +18,31 @@ static int g_dials, g_hs, g_last_pq;
 static size_t g_last_n;
 static int g_all_silent;
 
+static char g_fd_host[1024][64];
+static int g_peer[4] = { -1, -1, -1, -1 };
+static unsigned g_peer_at;
+
 int tr_dial(const char *host, uint16_t port, int timeout_s) {
     (void)port; (void)timeout_s;
     g_dials++;
     snprintf(g_cur, sizeof g_cur, "%s", host);
+    if (!strncmp(host, "nodial", 6)) return TR_ECONNECT;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return TR_ECONNECT;
-    static int peer = -1;
-    if (peer >= 0) close(peer);
-    peer = sv[1];
+    if (sv[0] >= 1024 || sv[1] >= 1024) { close(sv[0]); close(sv[1]); return TR_ECONNECT; }
+    if (g_peer[g_peer_at] >= 0) close(g_peer[g_peer_at]);
+    g_peer[g_peer_at] = sv[1];
+    g_peer_at = (g_peer_at + 1) % 4;
+    snprintf(g_fd_host[sv[0]], sizeof g_fd_host[0], "%s", host);
+    if (strncmp(host, "mute", 4) && write(sv[1], "", 1) != 1) { close(sv[0]); return TR_ECONNECT; }
     return sv[0];
+}
+
+static int g_closes;
+void tr_link_close(struct tr_link *l) {
+    if (l->fd >= 0) close(l->fd);
+    l->fd = -1;
+    g_closes++;
 }
 
 static const void *g_st_at;
@@ -65,9 +80,10 @@ static int long_dropped(const char *h) {
 
 int tls13_handshake_auth(struct tls13 *t, int fd, const unsigned char *ch, size_t n,
                          const unsigned char *ss, const struct tls13_auth *auth) {
-    (void)t; (void)fd; (void)ch; (void)ss; (void)auth;
+    (void)t; (void)ch; (void)ss; (void)auth;
     g_hs++;
     g_last_n = n;
+    if (fd >= 0 && fd < 1024) snprintf(g_cur, sizeof g_cur, "%s", g_fd_host[fd]);
     if (g_all_silent || !strncmp(g_cur, "dead", 4)) return TLS13_ETIMEOUT;
     if (!strncmp(g_cur, "rej", 3)) return TLS13_ECERT;
     if (long_dropped(g_cur) && n > 1400) return TLS13_ETIMEOUT;
@@ -117,6 +133,28 @@ static int open_at(const char *host, uint16_t port, const char *sec) {
 }
 
 static int open_to(const char *host, const char *sec) { return open_at(host, 443, sec); }
+
+static int g_fa, g_fb;
+static const char *g_sec2 = "reality";
+
+static int open_two(const char *ha, const char *hb) {
+    struct tr_node na = { .host = ha, .port = 443, .type = "xhttp", .security = g_sec2,
+                          .sni = "www.example.com", .fp = g_fp,
+                          .pbk = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA", .sid = "0123456789abcdef" };
+    struct tr_node nb = na;
+    nb.host = hb;
+    struct tr_link a, b;
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    g_dials = g_hs = g_closes = g_st_wipes = 0;
+    int rc = tr_link_open2(&a, &na, &b, &nb, "h2", 1);
+    g_fa = a.fd;
+    g_fb = b.fd;
+    if (rc == 0) { close(a.fd); close(b.fd); }
+    g_d = g_dials;
+    g_h = g_hs;
+    return rc;
+}
 
 static char g_err[4096];
 
@@ -293,5 +331,44 @@ int main(void) {
         check("wipe: the ECH buffers wiped", 1, g_other_wipes);
         check("wipe: the state wiped after the ECH failure", 1, g_st_wipes);
     }
+    g_fp = "chrome";
+    tr_nopq_skip_s = 0;
+    unsetenv("STEER_NOPQ");
+    /* catches: the first of two links not retried with the short Hello after a timeout */
+    check("two links, first behind the middlebox: both open", 0, open_two("dpi-2a.invalid", "ok.invalid"));
+    check("two links, first behind the middlebox: three connections", 3, g_d);
+    /* catches: the second of two links not retried with the short Hello after a timeout */
+    check("two links, second behind the middlebox: both open", 0, open_two("ok.invalid", "dpi-2b.invalid"));
+    check("two links, second behind the middlebox: three connections", 3, g_d);
+    /* catches: the second handshake finished although the first was refused */
+    check("two links, first refused: the refusal", TLS13_ECERT, open_two("rej.invalid", "ok.invalid"));
+    check("two links, first refused: one handshake", 1, g_h);
+    /* catches: the second link left open when the first is refused */
+    check("two links, first refused: both closed", 1, g_fa == -1 && g_fb == -1);
+    /* catches: the second link's Reality state left unwiped when the first is refused */
+    check("two links, first refused: the second's state wiped", 1, g_st_wipes);
+    /* catches: the first link left open when the second is refused */
+    check("two links, second refused: the refusal", TLS13_ECERT, open_two("ok.invalid", "rej.invalid"));
+    check("two links, second refused: the first closed once", 1, g_fa == -1 && g_fb == -1 && g_closes == 1);
+    /* catches: the first link left open when the second cannot be dialled */
+    check("two links, second not dialled: the dial's error", TR_ECONNECT, open_two("ok.invalid", "nodial.invalid"));
+    check("two links, second not dialled: the first closed", 1, g_fa == -1 && g_fb == -1);
+    check("two links, second not dialled: no handshake finished", 0, g_h);
+    /* catches: a link finished although neither answered within the timeout */
+    check("two links, neither answers: both open on the retry", 0, open_two("mute-a.invalid", "mute-b.invalid"));
+    check("two links, neither answers: two retries, four connections, two handshakes", 42, g_d * 10 + g_h);
+    /* catches: links without a handshake to finish waited on as if their answer were late */
+    g_sec2 = "none";
+    check("two links, security none: both open", 0, open_two("mute-c.invalid", "mute-d.invalid"));
+    check("two links, security none: two connections, no handshake", 20, g_d * 10 + g_h);
+    g_sec2 = "reality";
+    /* catches: a timed-out link retried although the other link was refused */
+    check("two links, first silent, second refused: the timeout", TLS13_ETIMEOUT, open_two("dead-2c.invalid", "rej.invalid"));
+    check("two links, first silent, second refused: no retry, two connections", 2, g_d);
+    check("two links, first silent, second refused: both closed", 1, g_fa == -1 && g_fb == -1);
+    /* catches: the second link left open when the first stays silent after its retry */
+    check("two links, first silent: the timeout", TLS13_ETIMEOUT, open_two("dead-2a.invalid", "ok.invalid"));
+    check("two links, first silent: the second closed once", 1, g_fa == -1 && g_fb == -1 && g_closes == 1);
+    check("two links, first silent: the first retried, three connections", 3, g_d);
     return unit_done("pqfallbackmatch");
 }

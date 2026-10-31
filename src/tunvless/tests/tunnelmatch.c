@@ -4185,11 +4185,11 @@ static void t_k_fd_table(void) {
     struct rlimit save, rl;
     getrlimit(RLIMIT_NOFILE, &save);
     rl = save;
-    rl.rlim_cur = 780;
+    rl.rlim_cur = 844;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
     int cap100 = g_park_cap;
-    rl.rlim_cur = 680;
+    rl.rlim_cur = 744;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
     int cap0 = g_park_cap;

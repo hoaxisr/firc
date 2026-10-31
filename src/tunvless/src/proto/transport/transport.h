@@ -13,8 +13,8 @@
  * tls, tcp with no security). One chain would need rules on which layer may sit on which, a
  * second way of saying what the two fields already say. Security kinds differ only in the
  * handshake: after it tls and reality carry the same TLS 1.3 records, and none is the bare
- * socket. So security_ops has one function, and after the handshake the stream goes through the
- * shared link code (tr_link_* in transport.c).
+ * socket. So security_ops has only the handshake, in two halves, and after it the stream goes
+ * through the shared link code (tr_link_* in transport.c).
  *
  * Users: the VLESS client (proto/vless/client.c: vless_connect and the node probe) and, through
  * it, the tunnel dialer (proto/vless/vldial.c). The transport knows nothing of the protocol: it
@@ -305,11 +305,14 @@ struct transport_ops {
 };
 
 /* Security, the link's security= field. The kinds differ only in the handshake (see the head). */
+struct sec_pend;
 struct security_ops {
     const char *name;          /* none | tls | reality */
-    /* Handshake over l->fd; alpn comes from the transport. On failure it does NOT close the
-     * socket: the caller does, the same way for the main link and the second one. */
-    int (*handshake)(struct tr_link *l, const struct tr_node *n, const char *alpn);
+    /* Handshake over l->fd, sent by hello and completed by finish (NULL: nothing to wait for);
+     * alpn comes from the transport. On failure neither closes the socket: the caller does, the
+     * same way for the main link and the second one. */
+    int (*hello)(struct tr_link *l, const struct tr_node *n, const char *alpn, struct sec_pend *p);
+    int (*finish)(struct tr_link *l, const struct tr_node *n, struct sec_pend *p);
 };
 
 /* A connection to a node: the main link, the transport over it and its state. */
@@ -406,6 +409,7 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 
 extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
+int tr_xhttp_two(const struct tr_node *n);
 
 /* ---- ws and httpupgrade: the shared Upgrade request (trupgrade.c) and frames (trws.c) ------ */
 
@@ -484,6 +488,10 @@ const struct security_ops *tr_security(const char *name);
 /* A whole link: socket and security handshake. On failure the socket is closed and fd == -1.
  * Shared by the main link and the xhttp second link precisely so that they cannot diverge. */
 int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s);
+/* Two links at once: both Hellos go out before either answer is read. On failure both are
+ * closed. */
+int tr_link_open2(struct tr_link *a, const struct tr_node *na, struct tr_link *b,
+                  const struct tr_node *nb, const char *alpn, int timeout_s);
 #define TR_NOPQ_MAX 256
 
 /* I/O of a link in the struct h2_io form (ctx is a struct tr_link). */

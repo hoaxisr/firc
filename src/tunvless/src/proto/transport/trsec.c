@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <pthread.h>
+#include <poll.h>
 
 #include "transport.h"
 #include "reality.h"
@@ -27,8 +28,9 @@
 /* security=none — a bare stream, no TLS at all (for a trusted network). Without TLS there is no
  * ALPN negotiation, so an HTTP/2 transport starts HTTP/2 at once: the server either accepts bare
  * h2 over TCP (h2c) or answers with garbage, and the probe sees it. */
-static int sec_none(struct tr_link *l, const struct tr_node *n, const char *alpn) {
-    (void)n; (void)alpn;
+static int sec_none(struct tr_link *l, const struct tr_node *n, const char *alpn,
+                    struct sec_pend *p) {
+    (void)n; (void)alpn; (void)p;
     l->plain = 1;
     return 0;
 }
@@ -47,6 +49,23 @@ static void ech_heap_free(struct ech_heap *eh) {
     free(eh);
 }
 
+struct sec_pend {
+    struct reality_state rst;
+    struct ech_heap *eh;
+    struct tls13_ech te;
+    const unsigned char *sent;
+    size_t sent_n;
+    int is_tls, have_pqv;
+    unsigned char pqv[SC_MLDSA65_PK];
+    unsigned char hello[2560];
+};
+
+static void pend_drop(struct sec_pend *p) {
+    ech_heap_free(p->eh);
+    p->eh = NULL;
+    sc_wipe(&p->rst, sizeof p->rst);
+}
+
 /* security=tls (plain TLS) and security=reality.
  *
  * They differ in exactly three things, all required. Plain TLS sends a ClientHello without the
@@ -60,10 +79,13 @@ static void ech_heap_free(struct ech_heap *eh) {
  * address, as in Xray; certificates are almost never issued to an IP, so the subscription parser
  * (sublink.c) skips such a node before it gets here.
  *
- * The Reality state (our ephemeral key and the authenticator key) lives on sec_tls_like's stack,
- * not in the connection, and is wiped there: nothing needs it after the handshake. */
-static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *alpn, int is_tls,
-                       struct reality_state *rst) {
+ * The Reality state (our ephemeral key and the authenticator key) lives in struct sec_pend, not
+ * in the connection, and is wiped by pend_drop: nothing needs it after the handshake. */
+static int sec_tls_hello(struct tr_link *l, const struct tr_node *n, const char *alpn, int is_tls,
+                         struct sec_pend *p) {
+    struct reality_state *rst = &p->rst;
+    p->is_tls = is_tls;
+    p->eh = NULL;
     const char *verify_host = n->sni[0] ? n->sni : n->host;
     struct reality_cfg cfg = {
         .sni = is_tls ? verify_host : n->sni,
@@ -82,10 +104,10 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
     /* pqv: an ML-DSA-65 key, base64url. Decoded BEFORE the Hello is sent: a broken key fails the
      * node rather than letting the handshake go on without checking the signature. The
      * subscription parser (sublink.c) already rejects such keys; this is the second line. */
-    unsigned char pqv[SC_MLDSA65_PK];
-    const int have_pqv = !is_tls && n->pqv && n->pqv[0];
-    if (have_pqv && xc_b64url_decode(n->pqv, pqv, sizeof pqv) != SC_MLDSA65_PK) return REALITY_EBADKEY;
-    unsigned char hello[2560];
+    p->have_pqv = !is_tls && n->pqv && n->pqv[0];
+    if (p->have_pqv && xc_b64url_decode(n->pqv, p->pqv, sizeof p->pqv) != SC_MLDSA65_PK)
+        return REALITY_EBADKEY;
+    unsigned char *hello = p->hello;
     size_t hello_n = 0;
     /* ws and httpupgrade offer ONLY http/1.1 in ALPN, as Xray does (uTLS
      * WebsocketHandshakeContext rewrites the fingerprint's ALPN to http/1.1 alone) and as Chrome
@@ -95,8 +117,8 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
      * only for these two. */
     struct reality_carrier car = { .alpn_http11 = 1 };
     const int h11 = alpn && !strcmp(alpn, "http/1.1");
-    int rc = h11 ? reality_build_hello_carry(&cfg, rst, &car, hello, sizeof(hello), &hello_n)
-                 : reality_build_hello(&cfg, rst, hello, sizeof(hello), &hello_n);
+    int rc = h11 ? reality_build_hello_carry(&cfg, rst, &car, hello, sizeof(p->hello), &hello_n)
+                 : reality_build_hello(&cfg, rst, hello, sizeof(p->hello), &hello_n);
     if (rc) return rc;
 
     /* ECH (security=tls, the node's `ech=`): the Hello built above, with the real SNI, becomes the
@@ -104,7 +126,8 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
      * buffers are on the heap: the outer Hello holds an encrypted copy of the inner one, twice the
      * usual size, and the threads that run handshakes have small stacks (connectors: 128 KB). */
     struct ech_heap *eh = NULL;
-    struct tls13_ech te = { 0 };
+    struct tls13_ech *te = &p->te;
+    *te = (struct tls13_ech){ 0 };
     const unsigned char *send_hello = hello;
     size_t send_n = hello_n;
     if (is_tls && n->ech && n->ech[0]) {
@@ -119,9 +142,10 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
         }
         send_hello = eh->outer;
         send_n = eh->outer_n;
-        te.inner = eh->st.inner;
-        te.inner_n = eh->st.inner_n;
-        te.random = eh->st.random;
+        te->inner = eh->st.inner;
+        te->inner_n = eh->st.inner_n;
+        te->random = eh->st.random;
+        p->eh = eh;
     }
 
     size_t sent = 0;
@@ -131,11 +155,19 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
         ssize_t w = send(l->fd, send_hello + sent, send_n - sent, MSG_NOSIGNAL);
         if (w <= 0) {
             if (w < 0 && errno == EINTR) continue;
-            ech_heap_free(eh);
             return TR_EIO;
         }
         sent += (size_t)w;
     }
+    p->sent = send_hello;
+    p->sent_n = send_n;
+    return 0;
+}
+
+static int sec_tls_finish(struct tr_link *l, const struct tr_node *n, struct sec_pend *p) {
+    struct reality_state *rst = &p->rst;
+    const int is_tls = p->is_tls;
+    const char *verify_host = n->sni[0] ? n->sni : n->host;
 
     /* Our PRIVATE key is passed, not a ready secret: the TLS key schedule needs the server's
      * ephemeral key, which only arrives in the ServerHello. */
@@ -150,37 +182,28 @@ static int sec_tls_run(struct tr_link *l, const struct tr_node *n, const char *a
     if (is_tls) {
         auth.host = verify_host;
         auth.roots = tls_cert_roots();
-        auth.cert_algs = reality_cert_algs(reality_fp_of(cfg.fp));
+        auth.cert_algs = reality_cert_algs(reality_fp_of(n->fp));
         if (pol.pcs || pol.pks || pol.vcn || pol.insecure) auth.policy = &pol;
     } else auth.reality_key = rst->authkey;
     if (rst->pq) auth.mlkem_dk = rst->mlkem_dk;
-    auth.mldsa_pk = have_pqv ? pqv : NULL;
+    auth.mldsa_pk = p->have_pqv ? p->pqv : NULL;
 
-    if (eh) auth.ech = &te;
-    int hrc = tls13_handshake_auth(&l->tls, l->fd, send_hello, send_n, rst->priv, &auth);
-    ech_heap_free(eh);
-    return hrc;
+    if (p->eh) auth.ech = &p->te;
+    return tls13_handshake_auth(&l->tls, l->fd, p->sent, p->sent_n, rst->priv, &auth);
 }
 
-static int sec_tls_like(struct tr_link *l, const struct tr_node *n, const char *alpn,
-                        int is_tls) {
-    struct reality_state rst;
-    int rc = sec_tls_run(l, n, alpn, is_tls, &rst);
-    sc_wipe(&rst, sizeof rst);
-    return rc;
+static int sec_tls(struct tr_link *l, const struct tr_node *n, const char *alpn, struct sec_pend *p) {
+    return sec_tls_hello(l, n, alpn, 1, p);
 }
 
-static int sec_tls(struct tr_link *l, const struct tr_node *n, const char *alpn) {
-    return sec_tls_like(l, n, alpn, 1);
+static int sec_reality(struct tr_link *l, const struct tr_node *n, const char *alpn,
+                       struct sec_pend *p) {
+    return sec_tls_hello(l, n, alpn, 0, p);
 }
 
-static int sec_reality(struct tr_link *l, const struct tr_node *n, const char *alpn) {
-    return sec_tls_like(l, n, alpn, 0);
-}
-
-const struct security_ops tr_sec_none    = { .name = "none",    .handshake = sec_none };
-const struct security_ops tr_sec_tls     = { .name = "tls",     .handshake = sec_tls };
-const struct security_ops tr_sec_reality = { .name = "reality", .handshake = sec_reality };
+const struct security_ops tr_sec_none    = { .name = "none",    .hello = sec_none };
+const struct security_ops tr_sec_tls     = { .name = "tls",     .hello = sec_tls, .finish = sec_tls_finish };
+const struct security_ops tr_sec_reality = { .name = "reality", .hello = sec_reality, .finish = sec_tls_finish };
 
 /* Anything that is not none or tls is reality: the subscription parser (sublink.c) rejects an
  * unsupported value before the node gets here. */
@@ -273,26 +296,58 @@ static void nopq_remember(const struct tr_node *n) {
                 n->host, (unsigned)n->port, tr_nopq_ttl_s / 60);
 }
 
-static int link_try(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s, int nopq) {
+static int link_hello(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s,
+                      int nopq, struct sec_pend *p) {
     l->fd = -1;
     l->nopq = nopq;
+    p->eh = NULL;
     int fd = tr_dial(n->host, n->port, timeout_s);
     if (fd < 0) return fd;
     l->fd = fd;
-    /* On a failed handshake only close(), not tr_link_close: tls13_handshake_auth frees its own
-     * heap state on failure, and tests/vlessmatch.c checks that under AddressSanitizer for every
-     * failure branch. */
-    int rc = tr_security(n->security)->handshake(l, n, alpn);
-    if (rc) { close(fd); l->fd = -1; return rc; }
-    return 0;
+    int rc = tr_security(n->security)->hello(l, n, alpn, p);
+    if (rc) {
+        pend_drop(p);
+        close(fd);
+        l->fd = -1;
+    }
+    return rc;
 }
 
-int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s) {
-    if (reality_fp_of(n->fp) == REALITY_FP_FIREFOX) return link_try(l, n, alpn, timeout_s, 0);
+static void link_drop(struct tr_link *l, struct sec_pend *p) {
+    pend_drop(p);
+    close(l->fd);
+    l->fd = -1;
+}
+
+/* On a failed handshake only close(), not tr_link_close: tls13_handshake_auth frees its own heap
+ * state on failure, and tests/vlessmatch.c checks that under AddressSanitizer for every failure
+ * branch. */
+static int link_finish(struct tr_link *l, const struct tr_node *n, struct sec_pend *p) {
+    const struct security_ops *s = tr_security(n->security);
+    int rc = s->finish ? s->finish(l, n, p) : 0;
+    if (rc) link_drop(l, p);
+    else pend_drop(p);
+    return rc;
+}
+
+static int link_try(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s, int nopq) {
+    struct sec_pend p;
+    int rc = link_hello(l, n, alpn, timeout_s, nopq, &p);
+    return rc ? rc : link_finish(l, n, &p);
+}
+
+static int link_nopq(const struct tr_node *n, int *retry) {
+    *retry = 0;
+    if (reality_fp_of(n->fp) == REALITY_FP_FIREFOX) return 0;
     const int pq_able = !getenv("STEER_NOPQ");
     const int st = pq_able ? nopq_state(n) : NOPQ_NONE;
-    int rc = link_try(l, n, alpn, timeout_s, st == NOPQ_SHORT || !pq_able);
-    if (rc != TLS13_ETIMEOUT || !pq_able || st != NOPQ_NONE) return rc;
+    *retry = pq_able && st == NOPQ_NONE;
+    return st == NOPQ_SHORT || !pq_able;
+}
+
+static int link_retry(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s,
+                      int rc, int retry) {
+    if (rc != TLS13_ETIMEOUT || !retry) return rc;
     int rc2 = link_try(l, n, alpn, timeout_s, 1);
     if (rc2 == 0) {
         nopq_remember(n);
@@ -300,4 +355,55 @@ int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, i
     }
     if (rc2 == TLS13_ETIMEOUT) nopq_useless(n);
     return rc;
+}
+
+int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s) {
+    int retry;
+    const int nopq = link_nopq(n, &retry);
+    return link_retry(l, n, alpn, timeout_s, link_try(l, n, alpn, timeout_s, nopq), retry);
+}
+
+static int link_first(const struct tr_link *a, const struct tr_node *na, const struct tr_link *b,
+                      const struct tr_node *nb, int timeout_s) {
+    if (!tr_security(na->security)->finish) return 0;
+    if (!tr_security(nb->security)->finish) return 1;
+    struct pollfd pv[2] = { { .fd = a->fd, .events = POLLIN }, { .fd = b->fd, .events = POLLIN } };
+    int r;
+    do r = poll(pv, 2, timeout_s * 1000); while (r < 0 && errno == EINTR);
+    if (r <= 0) return -1;
+    return pv[0].revents ? 0 : 1;
+}
+
+int tr_link_open2(struct tr_link *a, const struct tr_node *na, struct tr_link *b,
+                  const struct tr_node *nb, const char *alpn, int timeout_s) {
+    struct tr_link *l[2] = { a, b };
+    const struct tr_node *n[2] = { na, nb };
+    int rc[2] = { 0, 0 }, retry[2], q[2];
+    a->fd = b->fd = -1;
+    struct sec_pend *p = calloc(2, sizeof *p);
+    if (!p) return TR_EIO;
+    for (int i = 0; i < 2; i++) q[i] = link_nopq(n[i], &retry[i]);
+    rc[0] = link_hello(a, na, alpn, timeout_s, q[0], &p[0]);
+    if (!rc[0]) rc[1] = link_hello(b, nb, alpn, timeout_s, q[1], &p[1]);
+    if (rc[1]) link_drop(a, &p[0]);
+    if (!rc[0] && !rc[1]) {
+        int f = link_first(a, na, b, nb, timeout_s), s = f == 1 ? 0 : 1;
+        if (f < 0) {
+            f = 0;
+            rc[0] = rc[1] = TLS13_ETIMEOUT;
+            link_drop(a, &p[0]);
+            link_drop(b, &p[1]);
+        } else {
+            rc[f] = link_finish(l[f], n[f], &p[f]);
+            if (rc[f] && !(rc[f] == TLS13_ETIMEOUT && retry[f])) link_drop(l[s], &p[s]);
+            else rc[s] = link_finish(l[s], n[s], &p[s]);
+        }
+        if (!rc[s] || (rc[s] == TLS13_ETIMEOUT && retry[s]))
+            rc[f] = link_retry(l[f], n[f], alpn, timeout_s, rc[f], retry[f]);
+        if (!rc[f]) rc[s] = link_retry(l[s], n[s], alpn, timeout_s, rc[s], retry[s]);
+        for (int i = 0; i < 2; i++)
+            if ((rc[0] || rc[1]) && !rc[i] && l[i]->fd >= 0) tr_link_close(l[i]);
+    }
+    free(p);
+    return rc[0] ? rc[0] : rc[1];
 }

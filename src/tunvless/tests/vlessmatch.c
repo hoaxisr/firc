@@ -165,6 +165,9 @@ struct plan {
     unsigned keyshare_group;
     int hrr;
     int dc;
+    int hold;
+    int after_peer;
+    int tell_peer;
 };
 
 struct srv {
@@ -182,7 +185,50 @@ struct srv {
     int alpn_h11;                      /* the ClientHello ALPN is http/1.1 alone */
     char req[4096];                    /* the Upgrade request as received */
     int got_hello;                     /* the client's "hello" arrived and parsed */
+    int overlap;
 };
+
+#define HOLD_MS 3000
+static pthread_mutex_t g_meet_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_meet_cv = PTHREAD_COND_INITIALIZER;
+static int g_meet;
+
+static int g_peer_fin;
+
+static int peer_wait(void) {
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += HOLD_MS / 1000;
+    dl.tv_nsec += (long)(HOLD_MS % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_meet_mu);
+    while (!g_peer_fin && pthread_cond_timedwait(&g_meet_cv, &g_meet_mu, &dl) == 0) {}
+    int done = g_peer_fin;
+    pthread_mutex_unlock(&g_meet_mu);
+    return done;
+}
+
+static void peer_tell(void) {
+    pthread_mutex_lock(&g_meet_mu);
+    g_peer_fin = 1;
+    pthread_cond_broadcast(&g_meet_cv);
+    pthread_mutex_unlock(&g_meet_mu);
+}
+
+static int hello_meet(void) {
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += HOLD_MS / 1000;
+    dl.tv_nsec += (long)(HOLD_MS % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_meet_mu);
+    g_meet++;
+    pthread_cond_broadcast(&g_meet_cv);
+    while (g_meet < 2 && pthread_cond_timedwait(&g_meet_cv, &g_meet_mu, &dl) == 0) {}
+    int both = g_meet >= 2;
+    pthread_mutex_unlock(&g_meet_mu);
+    return both;
+}
 
 /* Static key pair of the Reality server for plan.reality_ok: the node's pbk is its public half. */
 static unsigned char g_rs_priv[32], g_rs_pub[32];
@@ -732,6 +778,8 @@ static void *server_half(void *arg) {
 
     s->rc = -1;
     if (rd_rec(s->fd, &type, ch, sizeof(ch), &ch_n) || type != 0x16) return NULL;
+    if (pl->hold) s->overlap = hello_meet();
+    if (pl->after_peer) s->overlap = peer_wait();
     if (pl->hangup) { s->rc = 0; close(s->fd); s->fd = -1; return NULL; }
     /* ALPN exactly "http/1.1": extension 0x0010 of length 11, list of length 9 (ws and
      * httpupgrade; the other transports send "h2, http/1.1"). All 15 bytes are compared, the
@@ -960,6 +1008,13 @@ finished:;
     if (send_enc(s, fin, sizeof(fin))) return NULL;
     sc_hash_update(&s->tr, fin, sizeof(fin));
     s->fin_sent = 1;
+    if (pl->tell_peer) {
+        struct dir *d = calloc(1, sizeof(*d));
+        s->overlap = d && client_finished(s, d) == 1;
+        if (d && d->ready) sc_aead_free(&d->g);
+        free(d);
+        peer_tell();
+    }
 
     if (pl->upg) { s->rc = app_phase(s); return NULL; }
     s->rc = 0;
@@ -977,6 +1032,22 @@ static int fake_dial(const char *host, uint16_t port, int timeout_s) {
     if (fd < 0) return TR_ECONNECT;
     /* What tcp_connect does with the winning socket: read and write timeouts. Without them a
      * bug in the server half would hang the test instead of failing it. */
+    sock_ready(fd, timeout_s);
+    return fd;
+}
+
+static int g_give2[2] = { -1, -1 };
+static char g_dialed[2][64];
+static int g_dial_n;
+
+static int fake_dial2(const char *host, uint16_t port, int timeout_s) {
+    (void)port;
+    if (g_dial_n >= 2) return TR_ECONNECT;
+    int i = g_dial_n++;
+    snprintf(g_dialed[i], sizeof g_dialed[i], "%s", host);
+    int fd = g_give2[i];
+    g_give2[i] = -1;
+    if (fd < 0) return TR_ECONNECT;
     sock_ready(fd, timeout_s);
     return fd;
 }
@@ -1101,6 +1172,45 @@ static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
     }
     pthread_join(th, NULL);
     if (s->fd >= 0) close(s->fd);
+    return rc;
+}
+
+static int run_two(const struct plan *pa, const struct plan *pb, const struct vless_node *n,
+                   long *ms, int over[2]) {
+    int sp[2][2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp[0]) != 0) return -100;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp[1]) != 0) { close(sp[0][0]); close(sp[0][1]); return -100; }
+    static struct srv s[2];
+    pthread_t th[2];
+    const struct plan *pl[2] = { pa, pb };
+    g_meet = 0;
+    g_peer_fin = 0;
+    int made = 0;
+    for (int i = 0; i < 2; i++) {
+        memset(&s[i], 0, sizeof s[i]);
+        s[i].fd = sp[i][1];
+        s[i].plan = pl[i];
+        if (pthread_create(&th[i], NULL, server_half, &s[i]) == 0) made++;
+    }
+    int rc = -101;
+    if (made == 2) {
+        g_give2[0] = sp[0][0];
+        g_give2[1] = sp[1][0];
+        g_dial_n = 0;
+        g_tcp_dial = fake_dial2;
+        int64_t t0 = now_ms();
+        struct transport c;
+        rc = vless_connect(n, &c, 8);
+        *ms = (long)(now_ms() - t0);
+        if (rc == 0) transport_close(&c);
+        g_tcp_dial = NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (g_give2[i] >= 0) { close(g_give2[i]); g_give2[i] = -1; }
+        if (i < made) pthread_join(th[i], NULL);
+        if (s[i].fd >= 0) close(s[i].fd);
+        over[i] = s[i].overlap;
+    }
     return rc;
 }
 
@@ -1325,6 +1435,69 @@ int main(void) {
             snprintf(what, sizeof(what), "reality + %s: nothing left on the heap", rtype[u]);
             check(what, 0, LEAK_CHECK());
         }
+    }
+
+    {
+        struct plan ok = { .name = "two links", .reality_ok = 1, .hold = 1 };
+        struct plan cut = { .name = "two links, hangup", .hangup = 1, .hold = 1 };
+        struct vless_node xn, dn;
+        node_reality(&xn, "xhttp");
+        b64url(g_rs_pub, 32, xn.pbk);
+        snprintf(xn.path, sizeof(xn.path), "%s", "/x");
+        snprintf(xn.mode, sizeof(xn.mode), "%s", "packet-up");
+        long ms = 0;
+        int over[2], fd0 = fd_count();
+        int rc = run_two(&ok, &ok, &xn, &ms, over);
+        check("xhttp packet-up: both links open", 0, rc);
+        /* catches: the upload link dialled only after the download link's handshake */
+        check("xhttp packet-up: both Hellos out before either answer", 1, over[0] && over[1]);
+        /* catches: the second handshake waiting out the first one's answer */
+        check("xhttp packet-up: open within one held answer", 1, ms < HOLD_MS);
+        check("xhttp packet-up: both links to the node", 1,
+              g_dial_n == 2 && !strcmp(g_dialed[0], "node.invalid") && !strcmp(g_dialed[1], "node.invalid"));
+        check("xhttp packet-up: descriptor count restored", fd0, fd_count());
+        check("xhttp packet-up: nothing left on the heap", 0, LEAK_CHECK());
+
+        struct plan late = { .name = "answers after the other link", .reality_ok = 1, .after_peer = 1 };
+        struct plan early = { .name = "answers at once", .reality_ok = 1, .tell_peer = 1 };
+        rc = run_two(&late, &early, &xn, &ms, over);
+        check("xhttp, the upload link answers first: both links open", 0, rc);
+        /* catches: the download link's answer awaited before the upload link that already answered */
+        check("xhttp, the upload link answers first: finished first", 1, over[0] && over[1] && ms < HOLD_MS);
+        check("xhttp, the upload link answers first: descriptor count restored", fd0, fd_count());
+
+        dn = xn;
+        snprintf(dn.host, sizeof(dn.host), "%s", "down.invalid");
+        xn.mode[0] = '\0';
+        xn.dl = &dn;
+        rc = run_two(&ok, &ok, &xn, &ms, over);
+        check("xhttp downloadSettings: both links open", 0, rc);
+        check("xhttp downloadSettings: both Hellos out before either answer", 1, over[0] && over[1]);
+        /* catches: the download link sent to the main node or the upload to the download host */
+        check("xhttp downloadSettings: GET to the download host, upload to the node", 1,
+              g_dial_n == 2 && !strcmp(g_dialed[0], "down.invalid") && !strcmp(g_dialed[1], "node.invalid"));
+        check("xhttp downloadSettings: descriptor count restored", fd0, fd_count());
+        xn.dl = NULL;
+        snprintf(xn.mode, sizeof(xn.mode), "%s", "packet-up");
+
+        rc = run_two(&ok, &cut, &xn, &ms, over);
+        check("xhttp, upload link cut: the second link's error", TLS13_ECLOSED, rc);
+        /* catches: the download link left open when the upload link fails */
+        check("xhttp, upload link cut: descriptor count restored", fd0, fd_count());
+        check("xhttp, upload link cut: nothing left on the heap", 0, LEAK_CHECK());
+        rc = run_two(&cut, &ok, &xn, &ms, over);
+        check("xhttp, download link cut: the first link's error", TLS13_ECLOSED, rc);
+        /* catches: the upload link left open when the download link fails */
+        check("xhttp, download link cut: descriptor count restored", fd0, fd_count());
+        check("xhttp, download link cut: nothing left on the heap", 0, LEAK_CHECK());
+
+        xn.mode[0] = '\0';
+        struct plan one = { .name = "stream-one", .reality_ok = 1 };
+        rc = run_two(&one, &one, &xn, &ms, over);
+        check("xhttp stream-one: the link opens", 0, rc);
+        /* catches: stream-one dialling a second link */
+        check("xhttp stream-one: one link", 1, g_dial_n);
+        check("xhttp stream-one: descriptor count restored", fd0, fd_count());
     }
 
     /* ---- security=tls with our own roots -------------------------------------------

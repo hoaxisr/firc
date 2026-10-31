@@ -108,19 +108,11 @@ static int up_drain(struct xh_up *u) {
     return 0;
 }
 
-/* Open the second link the same way as the main one: TCP, then nothing (security=none), Reality,
- * or TLS with verification. ALPN is always h2. */
-static int up_connect(struct transport *t, const struct tr_node *n, int timeout_s) {
-    struct xh_up *u = &t->xh.up;
-    memset(u, 0, sizeof(*u));
-    int rc = tr_link_open(&u->link, n, "h2", timeout_s);
-    if (rc) return rc;
-    if (!u->link.plain && u->link.tls.alpn[0] && strcmp(u->link.tls.alpn, "h2") != 0) {
-        tls13_free(&u->link.tls); close(u->link.fd); u->link.fd = -1;
-        return TR_ENOH2;
-    }
-    return 0;
+static int up_alpn(const struct xh_up *u) {
+    return !u->link.plain && u->link.tls.alpn[0] && strcmp(u->link.tls.alpn, "h2") ? TR_ENOH2 : 0;
 }
+
+int tr_xhttp_two(const struct tr_node *n) { return xhttp_mode_of(n) != XH_STREAM_ONE; }
 
 #define XH_BLOCK 16384
 #define XH_MAIN 72
@@ -617,10 +609,11 @@ static int up_start(struct transport *t) {
 }
 
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
+    (void)timeout_s;
     int rc = xh_init(t, n);
     if (!rc) rc = down_request(t);
     if (rc || t->xh.mode == XH_STREAM_ONE) return rc;
-    rc = up_connect(t, n, timeout_s);
+    rc = up_alpn(&t->xh.up);
     return rc ? rc : up_start(t);
 }
 
@@ -772,9 +765,8 @@ static void xhttp_moved(struct transport *t) {
     t->xh.up.h2.io.ctx = &t->xh.up;
 }
 
-/* The second link exists only in stream-up and packet-up. Otherwise (stream-one, or an open that
- * failed before up_connect) its fd is still 0 from transport_open's memset, hence "> 0", not
- * "!= -1". */
+/* The second link exists only in stream-up and packet-up. Otherwise (stream-one) its fd is still
+ * 0 from transport_open's memset, hence "> 0", not "!= -1". */
 static void xhttp_close(struct transport *t) {
     struct xh_up *u = &t->xh.up;
     if (u->link.fd > 0) close(u->link.fd);

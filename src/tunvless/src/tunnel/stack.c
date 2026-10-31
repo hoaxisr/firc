@@ -809,9 +809,9 @@ static int g_trace;
  * The queue is short ON PURPOSE. A full queue means "this CPU cannot digest more handshakes at
  * once", and the honest answer is to refuse the SYN: the client retries in a second, when there
  * is room. Accepting more than we can serve only makes the queue invisible. */
-/* Four. Eight gave nothing (the twelfth connection came at 1798 ms against 1693 with four): the
- * limit is the CPU (X25519 and the handshake's AEAD), not the network wait threads overlap. */
-#define CONNECTORS 4
+/* A handshake mostly waits on the node, so connectors outnumber the cores. */
+#define CONNECTORS 16
+#define CONNECTOR_FDS 4
 #define CONNQ 32
 /* How long a connector waits for the link to the node; also the link's read and write timeout
  * (SO_RCVTIMEO, SO_SNDTIMEO). Eight seconds, the default of the startup probe (--timeout): a node
@@ -2863,7 +2863,7 @@ _Static_assert(IB_LST_BASE >= CFD_BASE + MAX_CONNS && IB_HS_BASE >= IB_LST_BASE 
 #define ACCEPT_MAX 64
 #define PARK_MAX 256
 #define PARK_MS 300
-#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + 32)
+#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + CONNECTORS * CONNECTOR_FDS + 32)
 #define MISS_WINDOW_NS 60000000000ull
 
 struct loop {

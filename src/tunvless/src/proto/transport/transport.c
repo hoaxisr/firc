@@ -116,7 +116,10 @@ static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeo
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     memset(t, 0, sizeof(*t));
     t->fr = transport_of(n->type);
-    int rc = tr_link_open(&t->link, t->fr == &tr_xhttp && n->dl ? n->dl : n, t->fr->alpn, timeout_s);
+    const struct tr_node *ln = t->fr == &tr_xhttp && n->dl ? n->dl : n;
+    int rc = t->fr == &tr_xhttp && tr_xhttp_two(n)
+                 ? tr_link_open2(&t->link, ln, &t->xh.up.link, n, t->fr->alpn, timeout_s)
+                 : tr_link_open(&t->link, ln, t->fr->alpn, timeout_s);
     if (rc) return rc;
     if (!t->fr->open) return tr_venc_after(t, n, timeout_s);
 
