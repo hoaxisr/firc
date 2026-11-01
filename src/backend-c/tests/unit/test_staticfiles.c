@@ -206,7 +206,7 @@ TEST serves_index_at_each_tab_path(void) {
     ASSERT(h != NULL);
     char resp[4096];
     const char *tabs[] = {"/groups",        "/tunnels",         "/journal",
-                          "/journal/stats", "/journal/capture", "/settings"};
+                          "/journal/stats", "/journal/unopened", "/journal/capture", "/settings"};
     for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]); i++) {
         ASSERT_EQm(tabs[i], 200, do_get(tabs[i], resp, sizeof(resp)));
         ASSERT_STR_EQm(tabs[i], "<html>index</html>", body_of(resp));
