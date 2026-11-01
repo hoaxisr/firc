@@ -64,6 +64,7 @@ typedef struct firc_autolist_failure {
     char host[FIRC_AUTOLIST_NAME_MAX];
     char domain[FIRC_AUTOLIST_NAME_MAX];
     firc_ip_t client;
+    firc_ip_t server;
     uint32_t fails;
     uint8_t why;
     bool listed;
@@ -74,6 +75,7 @@ typedef struct {
     char host[FIRC_AUTOLIST_NAME_MAX];
     char domain[FIRC_AUTOLIST_NAME_MAX];
     firc_ip_t client;
+    firc_ip_t server;
     uint32_t received;
     uint8_t kind;
     bool bypass;

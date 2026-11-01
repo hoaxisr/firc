@@ -49,7 +49,10 @@ static void failed(firc_autolist_svc_t *s, const firc_autolist_failure_t *f) {
     char client[INET6_ADDRSTRLEN];
     addr_text(&f->client, client, sizeof(client));
     if (f->bypass) {
-        FIRC_DEBUG("autolist: %s, which never asked firc for the name, failed: %s", client, why_name(f->why));
+        char server[INET6_ADDRSTRLEN];
+        addr_text(&f->server, server, sizeof(server));
+        FIRC_DEBUG("autolist: %s, which never asked firc for %s at %s, failed: %s", client,
+                   f->host[0] != '\0' ? f->host : "the name", server, why_name(f->why));
         if (s->deps.bypassed != NULL) { s->deps.bypassed(s->deps.ud, f); }
         return;
     }
@@ -126,6 +129,7 @@ static void on_syn(firc_autolist_svc_t *s, const uint8_t *pkt, size_t len, int64
     firc_autolist_failure_t f;
     memset(&f, 0, sizeof(f));
     f.client = n.client;
+    f.server = n.server;
     f.why = FIRC_AUTOLIST_NO_CONNECT;
     f.bypass = true;
     failed(s, &f);

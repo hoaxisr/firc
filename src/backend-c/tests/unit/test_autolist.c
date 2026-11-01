@@ -251,6 +251,9 @@ TEST no_hint_is_bypass_not_failure(void) {
     ASSERT(bare_hello_times(a, &f, "a.test", 4, 100, &out));
     ASSERT(out.bypass);
     ASSERT_FALSE(out.listed);
+    ASSERT_STR_EQ("a.test", out.host);
+    ASSERT_EQ(4, out.server.len);
+    ASSERT_EQ(0, memcmp(out.server.b, f.server.b, 4));
     ASSERT_EQ(0u, firc_autolist_failures_day(a, 104));
     firc_ip_t clients[4];
     uint32_t fails[4];
@@ -564,6 +567,8 @@ TEST syn_without_hint_is_bypass(void) {
     ASSERT(syns(a, &f, times, 2, &nom));
     ASSERT(nom.bypass);
     ASSERT_EQ(10, nom.client.b[3]);
+    ASSERT_EQ(4, nom.server.len);
+    ASSERT_EQ(0, memcmp(nom.server.b, f.server.b, 4));
     uint32_t fails[4] = {0};
     ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 103, NULL, fails, 4));
     ASSERT_EQ(1u, fails[0]);

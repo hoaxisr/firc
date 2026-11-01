@@ -24,6 +24,7 @@ typedef struct {
     int32_t host;
     uint32_t host_serial;
     firc_autolist_flow_t key;
+    char sni[FIRC_AUTOLIST_NAME_MAX];
 } flow_t;
 
 #define BAD_ADDRS 8
@@ -595,6 +596,8 @@ static bool fail(firc_autolist_t *a, flow_t *f, firc_autolist_why_t why, int64_t
         if (out != NULL) {
             memset(out, 0, sizeof(*out));
             out->client = f->key.client;
+            out->server = f->key.server;
+            snprintf(out->host, sizeof(out->host), "%s", f->sni);
             out->fails = fails;
             out->why = (uint8_t)why;
             out->bypass = true;
@@ -667,6 +670,7 @@ static void flow_start(flow_t *f, const firc_autolist_flow_t *key, uint32_t hash
 
 static void flow_name(firc_autolist_t *a, flow_t *f, const char *sni, int64_t now) {
     const char *name = NULL;
+    snprintf(f->sni, sizeof(f->sni), "%s", sni != NULL ? sni : "");
     if (sni != NULL && sni[0] != '\0') {
         name = hint_named(a, &f->key.client, &f->key.server, sni, now);
         f->bypass = name == NULL;
@@ -714,6 +718,7 @@ static bool no_connect(firc_autolist_t *a, flow_t *f, int64_t now, firc_autolist
         if (out != NULL) {
             memset(out, 0, sizeof(*out));
             out->client = f->key.client;
+            out->server = f->key.server;
             out->kind = FIRC_AL_NOM_NO_CONNECT;
             out->bypass = true;
         }
