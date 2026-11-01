@@ -30,6 +30,13 @@
 
   let now = $state(Math.floor(Date.now() / 1000));
   let busy = $state<Set<string>>(new Set());
+  let shown = $state<Set<string>>(new Set());
+
+  function toggleShown(client: string) {
+    const next = new Set(shown);
+    if (!next.delete(client)) next.add(client);
+    shown = next;
+  }
 
   const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), CLOCK_MS);
   onDestroy(() => clearInterval(clock));
@@ -402,6 +409,27 @@
     {#each data.bypassed as b (b.client)}
       <div class="note">
         {bypassNote(b.fails, names.get(b.client.toLowerCase()) ?? b.client)}
+        {#if b.recent.length > 0}
+          <button
+            type="button"
+            class="toggle"
+            aria-expanded={shown.has(b.client)}
+            onclick={() => toggleShown(b.client)}
+            >{shown.has(b.client) ? t("hide addresses") : t("show addresses")}</button
+          >
+          {#if shown.has(b.client)}
+            <ul class="recent">
+              {#each b.recent as r, i (i)}
+                <li>
+                  <span class="rname">{r.name || "—"}</span>
+                  <span class="raddr">{r.server}</span>
+                  {@render pill(whyClass(r.why), whyLabel(r.why, 0, t))}
+                  <span class="rwhen">{relativeTime(r.at, now, t)}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        {/if}
       </div>
     {/each}
   {/if}
@@ -610,6 +638,49 @@
     border-radius: 0.5rem;
     color: var(--yellow-bright);
     font-size: 0.85rem;
+  }
+  .toggle {
+    margin-left: 0.4rem;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .recent {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin: 0.5rem 0 0.1rem;
+    padding: 0;
+    list-style: none;
+    color: var(--text);
+  }
+  .recent li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.2rem 0.8rem;
+    min-width: 0;
+  }
+  .rname {
+    flex: 0 1 12rem;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+  .raddr {
+    flex: 0 0 8.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+  }
+  .rwhen {
+    color: var(--text-2);
+    font-size: 0.78rem;
   }
   @container (max-width: 760px) {
     .head {

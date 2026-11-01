@@ -255,12 +255,16 @@ TEST no_hint_is_bypass_not_failure(void) {
     ASSERT_EQ(4, out.server.len);
     ASSERT_EQ(0, memcmp(out.server.b, f.server.b, 4));
     ASSERT_EQ(0u, firc_autolist_failures_day(a, 104));
-    firc_ip_t clients[4];
-    uint32_t fails[4];
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 104, clients, fails, 4));
-    ASSERT_EQ(4, clients[0].len);
-    ASSERT_EQ(0, memcmp(clients[0].b, f.client.b, 4));
-    ASSERT_EQ(1u, fails[0]);
+    firc_autolist_bypass_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 104, b, 4));
+    ASSERT_EQ(4, b[0].client.len);
+    ASSERT_EQ(0, memcmp(b[0].client.b, f.client.b, 4));
+    ASSERT_EQ(1u, b[0].fails);
+    ASSERT_EQ(1, b[0].n_recent);
+    ASSERT_STR_EQ("a.test", b[0].recent[0].name);
+    ASSERT_EQ(0, memcmp(b[0].recent[0].server.b, f.server.b, 4));
+    ASSERT_EQ(FIRC_AUTOLIST_RETRANS, b[0].recent[0].why);
+    ASSERT_EQ(103, b[0].recent[0].at);
     firc_autolist_free(a);
     PASS();
 }
@@ -552,7 +556,7 @@ TEST syn_with_two_names_is_ambiguous(void) {
     const int64_t times[] = {101, 103};
     ASSERT_FALSE(syns(a, &f, times, 2, &nom));
     ASSERT_EQ(1u, firc_autolist_ambiguous_day(a, 103));
-    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 103, NULL, NULL, 4));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 103, NULL, 4));
     firc_autolist_free(a);
     PASS();
 }
@@ -569,10 +573,51 @@ TEST syn_without_hint_is_bypass(void) {
     ASSERT_EQ(10, nom.client.b[3]);
     ASSERT_EQ(4, nom.server.len);
     ASSERT_EQ(0, memcmp(nom.server.b, f.server.b, 4));
-    uint32_t fails[4] = {0};
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 103, NULL, fails, 4));
-    ASSERT_EQ(1u, fails[0]);
+    firc_autolist_bypass_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 103, b, 4));
+    ASSERT_EQ(1u, b[0].fails);
+    ASSERT_EQ(1, b[0].n_recent);
+    ASSERT_STR_EQ("", b[0].recent[0].name);
+    ASSERT_EQ(FIRC_AUTOLIST_NO_CONNECT, b[0].recent[0].why);
     ASSERT_EQ(0u, firc_autolist_ambiguous_day(a, 103));
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_bypass_keeps_the_newest_eight_newest_first(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    char sni[16];
+    for (int i = 0; i < 10; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), (uint8_t)(20 + i));
+        snprintf(sni, sizeof(sni), "n%d.test", i);
+        ASSERT(bare_hello_times(a, &f, sni, 4, 100 + 10 * i, &out));
+    }
+    firc_autolist_bypass_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 200, b, 2));
+    ASSERT_EQ(10u, b[0].fails);
+    ASSERT_EQ(8, b[0].n_recent);
+    ASSERT_STR_EQ("n9.test", b[0].recent[0].name);
+    ASSERT_EQ(29, b[0].recent[0].server.b[3]);
+    ASSERT_EQ(193, b[0].recent[0].at);
+    ASSERT_STR_EQ("n2.test", b[0].recent[7].name);
+    ASSERT_EQ(22, b[0].recent[7].server.b[3]);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_quiet_day_forgets_the_recent_bypasses(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    ASSERT(bare_hello_times(a, &f, "old.test", 4, 100, &out));
+    firc_autolist_flow_t g = flow_to(50001, 21);
+    ASSERT(bare_hello_times(a, &g, "new.test", 4, 100 + 86400, &out));
+    firc_autolist_bypass_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 100 + 86403, b, 2));
+    ASSERT_EQ(1u, b[0].fails);
+    ASSERT_EQ(1, b[0].n_recent);
+    ASSERT_STR_EQ("new.test", b[0].recent[0].name);
     firc_autolist_free(a);
     PASS();
 }
@@ -597,7 +642,7 @@ TEST sniless_with_two_hints_is_ambiguous_not_newest(void) {
     ASSERT_FALSE(bare_hello_times(a, &f, "", 4, 100, &out));
     ASSERT_EQ(1u, firc_autolist_ambiguous_day(a, 104));
     ASSERT_EQ(0u, firc_autolist_failures_day(a, 104));
-    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 104, NULL, NULL, 4));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 104, NULL, 4));
     firc_autolist_free(a);
     PASS();
 }
@@ -1249,6 +1294,8 @@ int main(int argc, char **argv) {
     RUN_TEST(syn_named_by_the_only_hint);
     RUN_TEST(syn_with_two_names_is_ambiguous);
     RUN_TEST(syn_without_hint_is_bypass);
+    RUN_TEST(a_bypass_keeps_the_newest_eight_newest_first);
+    RUN_TEST(a_quiet_day_forgets_the_recent_bypasses);
     RUN_TEST(sniless_without_hint_is_bypass);
     RUN_TEST(sniless_with_two_hints_is_ambiguous_not_newest);
     RUN_TEST(ambiguous_day_expires);

@@ -27,6 +27,7 @@
 #define FIRC_AUTOLIST_NOTE_SECS 120
 
 #define FIRC_AUTOLIST_BYPASS_CLIENTS 16
+#define FIRC_AUTOLIST_BYPASS_RECENT 8
 #define FIRC_AUTOLIST_DAY_SECS 86400
 #define FIRC_AUTOLIST_DAY_HOURS 24
 #define FIRC_AUTOLIST_POOLS 2
@@ -54,6 +55,20 @@ typedef enum {
     FIRC_AUTOLIST_RESET,
     FIRC_AUTOLIST_NO_CONNECT,
 } firc_autolist_why_t;
+
+typedef struct {
+    firc_ip_t server;
+    char name[FIRC_AUTOLIST_NAME_MAX];
+    uint8_t why;
+    int64_t at;
+} firc_autolist_bypass_conn_t;
+
+typedef struct {
+    firc_ip_t client;
+    uint32_t fails;
+    uint8_t n_recent;
+    firc_autolist_bypass_conn_t recent[FIRC_AUTOLIST_BYPASS_RECENT];
+} firc_autolist_bypass_t;
 
 typedef enum {
     FIRC_AL_NOM_STALL = 1,
@@ -105,8 +120,7 @@ bool firc_autolist_fin(firc_autolist_t *a, const firc_autolist_flow_t *f, uint32
 bool firc_autolist_syn(firc_autolist_t *a, const firc_autolist_flow_t *f, uint32_t seq, int64_t now,
                        firc_autolist_nomination_t *out);
 
-size_t firc_autolist_bypassed(const firc_autolist_t *a, int64_t now, firc_ip_t *clients, uint32_t *fails,
-                              size_t cap);
+size_t firc_autolist_bypassed(const firc_autolist_t *a, int64_t now, firc_autolist_bypass_t *out, size_t cap);
 
 uint32_t firc_autolist_failures_day(const firc_autolist_t *a, int64_t now);
 

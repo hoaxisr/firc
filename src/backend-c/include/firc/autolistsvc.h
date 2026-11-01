@@ -39,7 +39,7 @@ firc_err_t firc_autolist_svc_drain(firc_autolist_svc_t *s, int which);
 
 void firc_autolist_svc_counts(const firc_autolist_svc_t *s, uint64_t *failures, uint64_t *listed);
 
-size_t firc_autolist_svc_bypassed(const firc_autolist_svc_t *s, firc_ip_t *clients, uint32_t *fails, size_t cap);
+size_t firc_autolist_svc_bypassed(const firc_autolist_svc_t *s, firc_autolist_bypass_t *out, size_t cap);
 
 uint32_t firc_autolist_svc_failures_day(const firc_autolist_svc_t *s);
 

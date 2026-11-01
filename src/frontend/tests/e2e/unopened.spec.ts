@@ -67,7 +67,16 @@ function state(fake: Fake) {
     checkedAt: 0,
     switchedOff: 0,
     switchedOn: 0,
-    bypassed: [{ client: "192.168.1.5", fails: 6 }],
+    bypassed: [
+      {
+        client: "192.168.1.5",
+        fails: 6,
+        recent: [
+          { server: "172.64.150.28", name: "chat.openai.com", why: "no-answer", at: NOW - 120 },
+          { server: "34.107.243.93", name: "", why: "no-connect", at: NOW - 400 },
+        ],
+      },
+    ],
     candidates: fake.candidates,
     probes: {
       usedHour: 4,
@@ -234,6 +243,25 @@ test("a device that asks DNS around firc is named in the note, not blamed on a d
   await open(page);
   await expect(page.locator(".note")).toContainText("Not counted: 6 failures at Living room TV");
   await expect(page.locator(".note")).not.toContainText("24 h");
+});
+
+test("a bypass note unfolds the addresses the device went to", async ({ page }) => {
+  await shell(page, a1());
+  await open(page);
+  const note = page.locator(".note");
+  await expect(note).not.toContainText("172.64.150.28");
+  await note.getByRole("button", { name: "show addresses" }).click();
+  const rows = note.locator(".recent li");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText("chat.openai.com");
+  await expect(rows.nth(0)).toContainText("172.64.150.28");
+  await expect(rows.nth(0)).toContainText("no answer to ClientHello");
+  await expect(rows.nth(0)).toContainText("2 min ago");
+  await expect(rows.nth(1)).toContainText("—");
+  await expect(rows.nth(1)).toContainText("34.107.243.93");
+  await expect(rows.nth(1)).toContainText("no connection (SYN unanswered)");
+  await note.getByRole("button", { name: "hide addresses" }).click();
+  await expect(rows).toHaveCount(0);
 });
 
 test("adding a candidate moves its row to added and says when it will open", async ({ page }) => {

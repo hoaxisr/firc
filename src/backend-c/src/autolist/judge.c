@@ -91,9 +91,8 @@ typedef struct {
 
 typedef struct {
     bool used;
-    uint32_t fails;
     int64_t last;
-    firc_ip_t ip;
+    firc_autolist_bypass_t pub;
 } bypass_t;
 
 struct firc_autolist {
@@ -555,11 +554,12 @@ static uint32_t day_sum(const int64_t *hours, const uint32_t *counts, int64_t no
     return n;
 }
 
-static uint32_t bypass_count(firc_autolist_t *a, const firc_ip_t *client, int64_t now) {
+static uint32_t bypass_count(firc_autolist_t *a, const flow_t *f, uint8_t why, int64_t now) {
+    const firc_ip_t *client = &f->key.client;
     bypass_t *slot = NULL, *spare = NULL;
     for (size_t i = 0; i < FIRC_AUTOLIST_BYPASS_CLIENTS; i++) {
         bypass_t *e = &a->bypass[i];
-        if (e->used && ip_eq(&e->ip, client)) {
+        if (e->used && ip_eq(&e->pub.client, client)) {
             slot = e;
             break;
         }
@@ -570,14 +570,23 @@ static uint32_t bypass_count(firc_autolist_t *a, const firc_ip_t *client, int64_
         }
     }
     if (slot == NULL) { slot = spare; }
-    if (!slot->used || !ip_eq(&slot->ip, client) || now - slot->last >= FIRC_AUTOLIST_DAY_SECS) {
+    if (!slot->used || !ip_eq(&slot->pub.client, client) || now - slot->last >= FIRC_AUTOLIST_DAY_SECS) {
         slot->used = true;
-        slot->ip = *client;
-        slot->fails = 0;
+        slot->pub.client = *client;
+        slot->pub.fails = 0;
+        slot->pub.n_recent = 0;
     }
-    slot->fails++;
+    firc_autolist_bypass_t *b = &slot->pub;
+    size_t keep = b->n_recent < FIRC_AUTOLIST_BYPASS_RECENT ? b->n_recent : FIRC_AUTOLIST_BYPASS_RECENT - 1;
+    memmove(&b->recent[1], &b->recent[0], keep * sizeof(b->recent[0]));
+    b->recent[0].server = f->key.server;
+    snprintf(b->recent[0].name, sizeof(b->recent[0].name), "%s", f->sni);
+    b->recent[0].why = why;
+    b->recent[0].at = now;
+    b->n_recent = (uint8_t)(keep + 1);
+    b->fails++;
     slot->last = now;
-    return slot->fails;
+    return b->fails;
 }
 
 static bool unnamed(firc_autolist_t *a, const flow_t *f, int64_t now) {
@@ -592,7 +601,7 @@ static bool fail(firc_autolist_t *a, flow_t *f, firc_autolist_why_t why, int64_t
         return false;
     }
     if (f->bypass) {
-        uint32_t fails = bypass_count(a, &f->key.client, now);
+        uint32_t fails = bypass_count(a, f, (uint8_t)why, now);
         if (out != NULL) {
             memset(out, 0, sizeof(*out));
             out->client = f->key.client;
@@ -714,7 +723,7 @@ static bool no_connect(firc_autolist_t *a, flow_t *f, int64_t now, firc_autolist
         return false;
     }
     if (f->bypass) {
-        (void)bypass_count(a, &f->key.client, now);
+        (void)bypass_count(a, f, FIRC_AUTOLIST_NO_CONNECT, now);
         if (out != NULL) {
             memset(out, 0, sizeof(*out));
             out->client = f->key.client;
@@ -786,15 +795,13 @@ bool firc_autolist_fin(firc_autolist_t *a, const firc_autolist_flow_t *key, uint
     return nominate(a, f, h, d, by_host, by_domain, FIRC_AL_NOM_STALL, received, out);
 }
 
-size_t firc_autolist_bypassed(const firc_autolist_t *a, int64_t now, firc_ip_t *clients, uint32_t *fails,
-                              size_t cap) {
+size_t firc_autolist_bypassed(const firc_autolist_t *a, int64_t now, firc_autolist_bypass_t *out, size_t cap) {
     if (a == NULL) { return 0; }
     size_t n = 0;
     for (size_t i = 0; i < FIRC_AUTOLIST_BYPASS_CLIENTS && n < cap; i++) {
         const bypass_t *e = &a->bypass[i];
         if (!e->used || now - e->last >= FIRC_AUTOLIST_DAY_SECS) { continue; }
-        if (clients != NULL) { clients[n] = e->ip; }
-        if (fails != NULL) { fails[n] = e->fails; }
+        if (out != NULL) { out[n] = e->pub; }
         n++;
     }
     return n;

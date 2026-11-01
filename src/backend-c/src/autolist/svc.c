@@ -268,8 +268,8 @@ void firc_autolist_svc_counts(const firc_autolist_svc_t *s, uint64_t *failures, 
     if (listed != NULL) { *listed = s != NULL ? s->listed : 0; }
 }
 
-size_t firc_autolist_svc_bypassed(const firc_autolist_svc_t *s, firc_ip_t *clients, uint32_t *fails, size_t cap) {
-    return s != NULL ? firc_autolist_bypassed(s->judge, svc_now(s), clients, fails, cap) : 0;
+size_t firc_autolist_svc_bypassed(const firc_autolist_svc_t *s, firc_autolist_bypass_t *out, size_t cap) {
+    return s != NULL ? firc_autolist_bypassed(s->judge, svc_now(s), out, cap) : 0;
 }
 
 uint32_t firc_autolist_svc_failures_day(const firc_autolist_svc_t *s) {

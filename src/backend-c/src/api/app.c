@@ -3904,7 +3904,7 @@ void firc_app_autolist_status(const firc_app_t *app, firc_autolist_status_t *out
     out->switched_off = app->al_switched_off;
     out->switched_on = app->al_switched_on;
     out->n_bypassed =
-        firc_autolist_svc_bypassed(app->al_svc, out->bypassed, out->bypassed_fails, FIRC_AUTOLIST_BYPASS_CLIENTS);
+        firc_autolist_svc_bypassed(app->al_svc, out->bypassed, FIRC_AUTOLIST_BYPASS_CLIENTS);
     const firc_al_cand_t *cands[FIRC_AUTOLIST_CANDIDATES];
     out->n_candidates = firc_al_cands_list(app->al_cands, cands, FIRC_AUTOLIST_CANDIDATES);
     for (size_t i = 0; i < out->n_candidates; i++) { out->candidates[i] = *cands[i]; }

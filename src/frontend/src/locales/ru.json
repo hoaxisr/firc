@@ -936,5 +936,7 @@
   "{n} times in a row (2-4)": "{n} раза подряд",
   "{n} times in a row": "{n} раз подряд",
   "auto": "авто",
-  "auto · off by recheck": "авто · выкл. перепроверкой"
+  "auto · off by recheck": "авто · выкл. перепроверкой",
+  "show addresses": "показать адреса",
+  "hide addresses": "скрыть адреса"
 }

@@ -341,6 +341,19 @@ export type AutolistProbeResult = {
   error: string;
 };
 
+export type AutolistBypassConn = {
+  server: string;
+  name: string;
+  why: string;
+  at: number;
+};
+
+export type AutolistBypassed = {
+  client: string;
+  fails: number;
+  recent: AutolistBypassConn[];
+};
+
 export type AutolistRes = {
   enabled: boolean;
   running: boolean;
@@ -357,7 +370,7 @@ export type AutolistRes = {
   checkedAt: number;
   switchedOff: number;
   switchedOn: number;
-  bypassed: { client: string; fails: number }[];
+  bypassed: AutolistBypassed[];
   candidates: AutolistCandidate[];
   probes: {
     usedHour: number;

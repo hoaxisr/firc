@@ -400,19 +400,46 @@ static bool autolist_candidates_json(cJSON *out, const firc_autolist_status_t *s
     return true;
 }
 
+static const char *bypass_why_name(uint8_t why) {
+    if (why == FIRC_AUTOLIST_RESET) { return "reset"; }
+    return why == FIRC_AUTOLIST_NO_CONNECT ? "no-connect" : "no-answer";
+}
+
+static bool bypass_recent_json(cJSON *o, const firc_autolist_bypass_t *b) {
+    cJSON *arr = cJSON_AddArrayToObject(o, "recent");
+    if (arr == NULL) { return false; }
+    for (size_t i = 0; i < b->n_recent; i++) {
+        const firc_autolist_bypass_conn_t *c = &b->recent[i];
+        char addr[INET6_ADDRSTRLEN];
+        if (!ip_text(&c->server, addr, sizeof(addr))) { continue; }
+        cJSON *e = cJSON_CreateObject();
+        if (e == NULL || !cJSON_AddItemToArray(arr, e)) {
+            cJSON_Delete(e);
+            return false;
+        }
+        if (cJSON_AddStringToObject(e, "server", addr) == NULL || cJSON_AddStringToObject(e, "name", c->name) == NULL ||
+            cJSON_AddStringToObject(e, "why", bypass_why_name(c->why)) == NULL ||
+            cJSON_AddNumberToObject(e, "at", (double)c->at) == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool autolist_bypassed_json(cJSON *out, const firc_autolist_status_t *st) {
     cJSON *arr = cJSON_AddArrayToObject(out, "bypassed");
     if (arr == NULL) { return false; }
     for (size_t i = 0; i < st->n_bypassed; i++) {
         char addr[INET6_ADDRSTRLEN];
-        if (!ip_text(&st->bypassed[i], addr, sizeof(addr))) { continue; }
+        if (!ip_text(&st->bypassed[i].client, addr, sizeof(addr))) { continue; }
         cJSON *o = cJSON_CreateObject();
         if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
             cJSON_Delete(o);
             return false;
         }
         if (cJSON_AddStringToObject(o, "client", addr) == NULL ||
-            cJSON_AddNumberToObject(o, "fails", (double)st->bypassed_fails[i]) == NULL) {
+            cJSON_AddNumberToObject(o, "fails", (double)st->bypassed[i].fails) == NULL ||
+            !bypass_recent_json(o, &st->bypassed[i])) {
             return false;
         }
     }

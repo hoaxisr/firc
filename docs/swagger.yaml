@@ -1152,16 +1152,40 @@ definitions:
     required:
     - host
     type: object
+  types.AutolistBypassConn:
+    properties:
+      server:
+        description: 'The address the device connected to'
+        example: 172.64.150.28
+        type: string
+      name:
+        description: 'The SNI of its ClientHello; empty when it sent none or never got past the SYN'
+        example: chat.openai.com
+        type: string
+      why:
+        description: 'no-answer | reset | no-connect'
+        example: no-answer
+        type: string
+      at:
+        description: 'When it failed, Unix seconds'
+        example: 1793536103
+        type: integer
+    type: object
   types.AutolistBypassed:
     properties:
       client:
-        description: 'A device whose failures were not counted: it never asked firc for the name (DoH or its own resolver)'
+        description: 'A device whose failures were not counted: firc gave it no answer for that address and name (an address built into an app, its own DNS or DoH)'
         example: 192.168.1.60
         type: string
       fails:
         description: 'Its failures in the last 24 hours'
         example: 6
         type: integer
+      recent:
+        description: 'Its last failures, newest first, at most 8'
+        items:
+          $ref: '#/definitions/types.AutolistBypassConn'
+        type: array
     type: object
   types.AutolistCandidate:
     properties:

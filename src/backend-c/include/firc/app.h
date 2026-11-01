@@ -432,8 +432,7 @@ typedef struct firc_autolist_status {
     uint64_t switched_off;
     uint64_t switched_on;
     size_t n_bypassed;
-    firc_ip_t bypassed[FIRC_AUTOLIST_BYPASS_CLIENTS];
-    uint32_t bypassed_fails[FIRC_AUTOLIST_BYPASS_CLIENTS];
+    firc_autolist_bypass_t bypassed[FIRC_AUTOLIST_BYPASS_CLIENTS];
     size_t n_candidates;
     firc_al_cand_t candidates[FIRC_AUTOLIST_CANDIDATES];
     uint32_t probes_used_hour;

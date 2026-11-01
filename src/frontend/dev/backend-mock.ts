@@ -1855,7 +1855,24 @@ const autolistState = () => ({
   checkedAt: AUTOLIST_CHECKED_AT,
   switchedOff: 0,
   switchedOn: 0,
-  bypassed: autolistOn() ? [{ client: "192.168.1.5", fails: 6 }] : [],
+  bypassed: autolistOn()
+    ? [
+        {
+          client: "192.168.1.5",
+          fails: 6,
+          recent: [
+            {
+              server: "172.64.150.28",
+              name: "chat.openai.com",
+              why: "no-answer",
+              at: autolistAgo(120),
+            },
+            { server: "172.64.150.28", name: "", why: "no-answer", at: autolistAgo(130) },
+            { server: "34.107.243.93", name: "", why: "no-connect", at: autolistAgo(400) },
+          ],
+        },
+      ]
+    : [],
   candidates: autolistOn() ? AUTOLIST_CANDS : [],
   probes: {
     usedHour: autolistOn() ? 4 : 0,

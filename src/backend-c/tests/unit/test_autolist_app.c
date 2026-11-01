@@ -668,6 +668,13 @@ TEST a_device_that_never_asked_is_counted_apart(void) {
     ASSERT(b != NULL);
     ASSERT_STR_EQ("192.168.1.10", str_of(b, "client"));
     ASSERT_EQ(2, (int)num_of(b, "fails"));
+    const cJSON *recent = cJSON_GetObjectItemCaseSensitive(b, "recent");
+    ASSERT_EQ(2, cJSON_GetArraySize(recent));
+    const cJSON *c = cJSON_GetArrayItem(recent, 0);
+    ASSERT_STR_EQ("doh.example.com", str_of(c, "name"));
+    ASSERT_STR_EQ("reset", str_of(c, "why"));
+    ASSERT_STR_EQ("203.0.113.7", str_of(c, "server"));
+    ASSERT(num_of(c, "at") > 0);
     ASSERT_EQ(NULL, candidate(st, "example.com"));
     cJSON_Delete(st);
     rig_stop_loop(&r);
