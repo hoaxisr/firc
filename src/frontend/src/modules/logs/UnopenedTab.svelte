@@ -92,13 +92,13 @@
       n,
       locale.current,
       t(
-        "Not counted: {n} failure at {device}: the device asks DNS around firc (DoH or its own DNS) — adding a domain will not help it.",
+        "Not counted: {n} failure at {device}: a connection to an address firc did not give the device (an address built into an app, its own DNS or DoH).",
       ),
       t(
-        "Not counted: {n} failures at {device}: the device asks DNS around firc (DoH or its own DNS) — adding a domain will not help it. (2-4)",
+        "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH). (2-4)",
       ),
       t(
-        "Not counted: {n} failures at {device}: the device asks DNS around firc (DoH or its own DNS) — adding a domain will not help it.",
+        "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH).",
       ),
     ).replace("{device}", device);
   }
@@ -513,7 +513,7 @@
     border-radius: 0.4rem;
     font-size: 0.76rem;
     font-weight: 600;
-    white-space: nowrap;
+    line-height: 1.3;
     background: color-mix(in srgb, var(--c) 18%, var(--bg-light));
     color: var(--c);
     --c: var(--text-2);
