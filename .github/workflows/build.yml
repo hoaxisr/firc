@@ -60,6 +60,8 @@ jobs:
     name: Build packages (${{ matrix.label }})
     needs: prepare
     runs-on: ubuntu-latest
+    env:
+      ENTWARE_SDK_RELEASE: v2026.10.19
     permissions:
       contents: write
     strategy:
@@ -135,19 +137,65 @@ jobs:
           echo "feed_dir=$feed_dir" >> "$GITHUB_OUTPUT"
           echo "artifacts_dir=$artifacts_dir" >> "$GITHUB_OUTPUT"
 
-      - name: Build with prebuilt Entware SDK
+      - name: Locate the pinned Entware SDK
+        id: sdk
+        if: steps.toolchain.outputs.entware_config != ''
+        env:
+          ARCH: ${{ steps.toolchain.outputs.entware_config }}
+        run: |
+          set -eu
+          asset=$(awk -v p="entware-sdk-${ARCH}_" 'index($2, p) == 1 { print $2 }' tools/ci/entware-sdk/SHA256SUMS)
+          if [ -z "$asset" ]; then
+            echo "::error title=Entware SDK::no pinned SDK for ${ARCH} in tools/ci/entware-sdk/SHA256SUMS" >&2
+            exit 1
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "path=${RUNNER_TEMP}/$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Entware SDK from cache
+        id: sdk_cache
+        if: steps.toolchain.outputs.entware_config != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.sdk.outputs.path }}
+          key: ${{ env.ENTWARE_SDK_RELEASE }}-${{ steps.sdk.outputs.asset }}
+
+      - name: Download the Entware SDK
+        if: steps.toolchain.outputs.entware_config != '' && steps.sdk_cache.outputs.cache-hit != 'true'
+        run: >-
+          curl -fsSL --retry 3 -o "${{ steps.sdk.outputs.path }}"
+          "https://github.com/ownik/entware-sdk/releases/download/${ENTWARE_SDK_RELEASE}/${{ steps.sdk.outputs.asset }}"
+
+      - name: Verify the Entware SDK
+        if: steps.toolchain.outputs.entware_config != ''
+        run: |
+          set -eu
+          grep -F "  ${{ steps.sdk.outputs.asset }}" tools/ci/entware-sdk/SHA256SUMS |
+            sed "s|  |  ${RUNNER_TEMP}/|" | sha256sum --check
+
+      - name: Save the Entware SDK to cache
+        if: steps.toolchain.outputs.entware_config != '' && steps.sdk_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.sdk.outputs.path }}
+          key: ${{ env.ENTWARE_SDK_RELEASE }}-${{ steps.sdk.outputs.asset }}
+
+      - name: Build with the Entware SDK
         id: entware_sdk
         if: steps.toolchain.outputs.entware_config != ''
         continue-on-error: true
-        # v1, pinned to a commit
-        uses: ownik/gh-action-entware-sdk@003ddc33bb3b12a2f96e0c4689c56351614cf01a
-        env:
-          ARCH: ${{ steps.toolchain.outputs.entware_config }}
-          ARTIFACTS_DIR: ${{ steps.entware_feed.outputs.artifacts_dir }}
-          BUILD_LOG: 1
-          FEED_DIR: ${{ steps.entware_feed.outputs.feed_dir }}
-          PACKAGES: firc
-          V: s
+        run: |
+          set -eu
+          sudo chown -R 1000:1000 "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}"
+          trap 'sudo chown -R --reference="$RUNNER_TEMP" "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}"' EXIT
+          docker run --rm \
+            -v "$PWD/tools/ci/entware-sdk/build.sh:/bin/entrypoint:ro" \
+            -v "${{ steps.sdk.outputs.path }}:/sdk/sdk.tar.zst:ro" \
+            -v "${{ steps.entware_feed.outputs.artifacts_dir }}:/artifacts" \
+            -v "${{ steps.entware_feed.outputs.feed_dir }}:/feed" \
+            -w /builder \
+            ghcr.io/openwrt/buildbot/buildworker-v3.11.3:latest \
+            /bin/entrypoint
 
       - name: Report Entware SDK build failure
         if: steps.entware_sdk.outcome == 'failure'
@@ -289,20 +337,13 @@ jobs:
             control_archive=$(mktemp)
             ipk_member "$package" control.tar.gz > "$control_archive"
             control_list=$(tar -tzf "$control_archive")
-            # an SDK that wraps the scripts writes ours as <script>-pkg behind a generated stub
+            # opkg runs only <script>; an SDK stub in its place needs /opt/lib/functions.sh, which Keenetic Entware lacks
             for script in prerm postinst; do
-              member=""
-              echo "$control_list" | grep -Eq "(^|/)$script\$" && member="$script"
-              echo "$control_list" | grep -Eq "(^|/)$script-pkg\$" && member="$script-pkg"
-              [ -n "$member" ] || { echo "control.tar.gz has neither $script nor $script-pkg" >&2; exit 1; }
-              if [ "$member" = "$script-pkg" ]; then
-                # opkg runs $script, never $script-pkg: without a stub ours never runs
-                echo "$control_list" | grep -Eq "(^|/)$script\$" \
-                  || { echo "control.tar.gz has $script-pkg but no $script to run it" >&2; exit 1; }
-                # the SDK's stub must hand over to ours, or ours never runs
-                tar -xzOf "$control_archive" --wildcards "*$script" | grep -v '^[[:space:]]*#' | grep -Eq "$script-pkg|default_$script" \
-                  || { echo "the $script stub does not chain to $script-pkg" >&2; exit 1; }
-              fi
+              member="$script"
+              echo "$control_list" | grep -Eq "(^|/)$script-pkg\$" \
+                && { echo "control.tar.gz wraps $script behind an SDK stub, so ours never runs on the router" >&2; exit 1; }
+              echo "$control_list" | grep -Eq "(^|/)$script\$" \
+                || { echo "control.tar.gz has no $script" >&2; exit 1; }
               tar -tvzf "$control_archive" | grep -Eq "^-rwx.*[ /]$member\$" \
                 || { echo "$member is not executable in the package" >&2; exit 1; }
               text=$(tar -xzOf "$control_archive" --wildcards "*$member")
