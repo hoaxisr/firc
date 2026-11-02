@@ -28,7 +28,7 @@
   import BlockPopover from "./BlockPopover.svelte";
   import DomainsTable from "./DomainsTable.svelte";
 
-  import { Ban, Filter, Search } from "../../components/ui/icons";
+  import { Ban, Filter, Search, Stats } from "../../components/ui/icons";
   import type { AutolistCandidate, AutolistProbeResult, Group } from "../../types";
   import { toast } from "../../utils/events";
   import { fetcher } from "../../utils/fetcher";
@@ -251,13 +251,16 @@
 
 {#if data && !data.enabled}
   <div class="st-off">
+    <Stats size={34} class="st-off-icon" />
     <div class="st-off-title">{t("DNS stats are off")}</div>
     <p>
       {t(
         "While off, the daemon counts nothing and holds no memory for it. Turning it on starts a new 24 h window.",
       )}
     </p>
-    <Button class="primary" onclick={() => void turnOn()} inactive={turning}>{t("Turn on")}</Button>
+    <Button class="primary" onclick={() => void turnOn()} inactive={turning}
+      ><Stats size={18} />{t("Turn on")}</Button
+    >
   </div>
 {:else}
   <div class="st-bar">
@@ -359,20 +362,28 @@
   .st-off {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 0.6rem;
-    padding: 0.6rem 0.8rem;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 2.2rem 1.2rem;
+    margin-bottom: 0.6rem;
+    text-align: center;
     border: 1px solid var(--bg-light-extra);
-    border-radius: 0.5rem;
+    border-radius: 0.6rem;
     background: var(--bg-light);
+  }
+  .st-off :global(.st-off-icon) {
+    color: var(--text-2);
   }
   .st-off-title {
     font-size: 1.05rem;
+    font-weight: 600;
   }
   .st-off p {
-    margin: 0;
+    max-width: 36rem;
+    margin: 0 0 0.4rem;
     color: var(--text-2);
-    font-size: 0.9rem;
+    font-size: 0.88rem;
+    line-height: 1.4;
   }
   .st-bar {
     container-type: inline-size;

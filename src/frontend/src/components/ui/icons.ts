@@ -67,6 +67,7 @@ export { default as RotateCw } from "@lucide/svelte/icons/rotate-cw";
 export { default as Undo2 } from "@lucide/svelte/icons/undo-2";
 export { default as Capture } from "@lucide/svelte/icons/radar";
 export { default as CaptureStop } from "@lucide/svelte/icons/circle-stop";
+export { default as Stats } from "@lucide/svelte/icons/chart-bar";
 export { default as Cable } from "@lucide/svelte/icons/cable";
 export { default as CircleHelp } from "@lucide/svelte/icons/circle-help";
 export { default as PowerOff } from "@lucide/svelte/icons/power-off";
