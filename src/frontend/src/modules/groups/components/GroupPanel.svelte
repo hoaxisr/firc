@@ -1070,7 +1070,7 @@
     .iface-stack :global(.iface-select) {
       display: flex;
       justify-content: flex-end;
-      width: 9.5rem;
+      width: 12rem;
     }
 
     .iface-stack :global(.iface-select [data-select-trigger]),
@@ -1082,14 +1082,9 @@
       justify-content: space-between;
     }
 
-    .iface-stack.block :global(.iface-select) {
-      width: max-content;
-      min-width: 9.5rem;
-    }
-
     .iface-stack :global(.block-answer) {
-      margin-left: 0;
-      margin-right: calc(16px + 0.65rem);
+      align-self: flex-start;
+      margin-left: 0.5rem;
     }
   }
 

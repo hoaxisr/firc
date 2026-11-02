@@ -361,9 +361,7 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 0.6rem;
-    max-width: 36rem;
-    margin: 1.5rem auto;
-    padding: 1.25rem;
+    padding: 0.6rem 0.8rem;
     border: 1px solid var(--bg-light-extra);
     border-radius: 0.5rem;
     background: var(--bg-light);
