@@ -9,7 +9,7 @@ keep_output() {
 trap keep_output EXIT
 
 tar xf /sdk/sdk.tar.zst --strip=1 --no-same-owner -C .
-cp feeds.conf.default feeds.conf
+cp /sdk/feeds.conf feeds.conf
 echo "src-link firc /feed/" >> feeds.conf
 ./scripts/feeds update -a
 make defconfig

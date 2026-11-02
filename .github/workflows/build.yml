@@ -191,6 +191,7 @@ jobs:
           docker run --rm \
             -v "$PWD/tools/ci/entware-sdk/build.sh:/bin/entrypoint:ro" \
             -v "${{ steps.sdk.outputs.path }}:/sdk/sdk.tar.zst:ro" \
+            -v "$PWD/tools/ci/entware-sdk/feeds.conf:/sdk/feeds.conf:ro" \
             -v "${{ steps.entware_feed.outputs.artifacts_dir }}:/artifacts" \
             -v "${{ steps.entware_feed.outputs.feed_dir }}:/feed" \
             -w /builder \
