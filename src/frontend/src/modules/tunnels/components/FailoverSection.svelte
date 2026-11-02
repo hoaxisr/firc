@@ -2,13 +2,16 @@
   import { Collapsible } from "bits-ui";
   import { slide } from "svelte/transition";
 
+  import Button from "../../../components/ui/Button.svelte";
   import Select from "../../../components/ui/Select.svelte";
+  import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { t } from "../../../data/locale.svelte";
+  import { persistedState } from "../../../utils/persisted-state.svelte";
   import type { TunnelsStore } from "../tunnels.svelte";
   import AdvancedSection from "./AdvancedSection.svelte";
   import UplinkSelect from "./UplinkSelect.svelte";
 
-  import { ChevronRight, GroupCollapse } from "../../../components/ui/icons";
+  import { ChevronRight, GroupCollapse, GroupExpand } from "../../../components/ui/icons";
   import type { Tunnel } from "../../../types";
   import { plain, type ClientTunnel } from "../tunnels-data";
 
@@ -24,6 +27,10 @@
 
   let more = $state(false);
 
+  const foldKey = $derived(tunnel.id || tunnel.key);
+  const folds = persistedState<Record<string, boolean>>("failover_folded", {});
+  const folded = $derived(folds.current[foldKey] ?? false);
+
   const bad = (value: number, min: number, max: number) =>
     !Number.isInteger(value) || value < min || value > max;
 
@@ -36,112 +43,130 @@
 </script>
 
 <section class="sec">
-  <div class="sec-h">{t("Failover")}</div>
-  <div class="row">
-    <div class="label">
-      <div class="name">{t("Active nodes")}</div>
-      <div class="hint">
-        {t("How many nodes carry traffic at once; the rest wait in reserve, in order")}
-      </div>
-    </div>
-    <div class="controls">
-      <input
-        type="number"
-        min="1"
-        max="8"
-        aria-label={t("Active nodes")}
-        class:invalid={bad(tunnel.active, 1, 8)}
-        aria-invalid={bad(tunnel.active, 1, 8)}
-        bind:value={tunnel.active}
-      />
-    </div>
+  <div class="sec-h">
+    <span>{t("Failover")}</span>
+    <span class="sp"></span>
+    <Tooltip value={t(folded ? "Show the failover settings" : "Hide the failover settings")}>
+      <Button
+        small
+        class="fold-btn"
+        aria-expanded={!folded}
+        aria-label={t(folded ? "Show the failover settings" : "Hide the failover settings")}
+        onclick={() => (folds.current = { ...folds.current, [foldKey]: !folded })}
+      >
+        {#if folded}<GroupExpand size={18} />{:else}<GroupCollapse size={18} />{/if}
+      </Button>
+    </Tooltip>
   </div>
-  <div class="row">
-    <div class="label">
-      <div class="name">{t("Distribution")}</div>
-      <div class="hint">{t("How new connections are shared among the active nodes")}</div>
-    </div>
-    <div class="controls">
-      <span class="field">
-        <Select
-          ariaLabel={t("Distribution")}
-          options={byOptions}
-          selected={tunnel.by}
-          onValueChange={(v: string) => (tunnel.by = v as Tunnel["by"])}
-        />
-      </span>
-    </div>
-  </div>
-  <div class="row">
-    <div class="label">
-      <div class="name">{t("Node check")}</div>
-      <div class="hint">{t("How often to check that an active node answers")}</div>
-    </div>
-    <div class="controls">
-      <input
-        type="number"
-        min="5"
-        max="86400"
-        aria-label={t("Node check")}
-        class:invalid={bad(tunnel.interval, 5, 86400)}
-        aria-invalid={bad(tunnel.interval, 5, 86400)}
-        bind:value={tunnel.interval}
-      />
-      <span class="unit">{t("s")}</span>
-    </div>
-  </div>
-  <div class="row">
-    <div class="label">
-      <div class="name">{t("Silence")}</div>
-      <div class="hint">
-        {t("A connection silent this long counts as broken and its node is checked at once")}
-      </div>
-    </div>
-    <div class="controls">
-      <input
-        type="number"
-        min="0"
-        max="3600"
-        aria-label={t("Silence")}
-        class:invalid={bad(tunnel.silence, 0, 3600)}
-        aria-invalid={bad(tunnel.silence, 0, 3600)}
-        bind:value={tunnel.silence}
-      />
-      <span class="unit">{t("s")}</span>
-    </div>
-  </div>
-
-  <Collapsible.Root bind:open={more}>
-    <Collapsible.Trigger class="more">
-      {#if more}<GroupCollapse size={15} />{:else}<ChevronRight size={15} />{/if}
-      {t(
-        "More: connect timeout, certificate check, TCP through the kernel, own CA, device name",
-      )}{helloNote ? `, ${helloNote}` : ""}
-    </Collapsible.Trigger>
-    <Collapsible.Content>
-      {#if more}
-        <div transition:slide>
-          <AdvancedSection {store} bind:tunnel />
+  {#if !folded}
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Active nodes")}</div>
+        <div class="hint">
+          {t("How many nodes carry traffic at once; the rest wait in reserve, in order")}
         </div>
-      {/if}
-    </Collapsible.Content>
-  </Collapsible.Root>
-
-  <div class="row">
-    <div class="label">
-      <div class="name">{t("Way out to the internet")}</div>
-      <div class="hint">
-        {t("Where the tunnel's own connections to its servers and subscriptions go")}
+      </div>
+      <div class="controls">
+        <input
+          type="number"
+          min="1"
+          max="8"
+          aria-label={t("Active nodes")}
+          class:invalid={bad(tunnel.active, 1, 8)}
+          aria-invalid={bad(tunnel.active, 1, 8)}
+          bind:value={tunnel.active}
+        />
       </div>
     </div>
-    <div class="controls">
-      <span class="field"><UplinkSelect bind:tunnel {tunnels} /></span>
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Distribution")}</div>
+        <div class="hint">{t("How new connections are shared among the active nodes")}</div>
+      </div>
+      <div class="controls">
+        <span class="field">
+          <Select
+            ariaLabel={t("Distribution")}
+            options={byOptions}
+            selected={tunnel.by}
+            onValueChange={(v: string) => (tunnel.by = v as Tunnel["by"])}
+          />
+        </span>
+      </div>
     </div>
-  </div>
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Node check")}</div>
+        <div class="hint">{t("How often to check that an active node answers")}</div>
+      </div>
+      <div class="controls">
+        <input
+          type="number"
+          min="5"
+          max="86400"
+          aria-label={t("Node check")}
+          class:invalid={bad(tunnel.interval, 5, 86400)}
+          aria-invalid={bad(tunnel.interval, 5, 86400)}
+          bind:value={tunnel.interval}
+        />
+        <span class="unit">{t("s")}</span>
+      </div>
+    </div>
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Silence")}</div>
+        <div class="hint">
+          {t("A connection silent this long counts as broken and its node is checked at once")}
+        </div>
+      </div>
+      <div class="controls">
+        <input
+          type="number"
+          min="0"
+          max="3600"
+          aria-label={t("Silence")}
+          class:invalid={bad(tunnel.silence, 0, 3600)}
+          aria-invalid={bad(tunnel.silence, 0, 3600)}
+          bind:value={tunnel.silence}
+        />
+        <span class="unit">{t("s")}</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Way out to the internet")}</div>
+        <div class="hint">
+          {t("Where the tunnel's own connections to its servers and subscriptions go")}
+        </div>
+      </div>
+      <div class="controls">
+        <span class="field"><UplinkSelect bind:tunnel {tunnels} /></span>
+      </div>
+    </div>
+    <Collapsible.Root bind:open={more}>
+      <Collapsible.Trigger class="more">
+        {#if more}<GroupCollapse size={15} />{:else}<ChevronRight size={15} />{/if}
+        {t(
+          "More: connect timeout, certificate check, TCP through the kernel, own CA, device name",
+        )}{helloNote ? `, ${helloNote}` : ""}
+      </Collapsible.Trigger>
+      <Collapsible.Content>
+        {#if more}
+          <div transition:slide>
+            <AdvancedSection {store} bind:tunnel />
+          </div>
+        {/if}
+      </Collapsible.Content>
+    </Collapsible.Root>
+  {/if}
 </section>
 
 <style>
   .sec-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 8px 14px;
     font-weight: 600;
     font-size: 1.05rem;
@@ -190,6 +215,9 @@
   }
   .sec :global(input.invalid) {
     border-color: var(--danger);
+  }
+  .sp {
+    flex: 1;
   }
   .sec :global(.more) {
     display: flex;

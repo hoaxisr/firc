@@ -830,6 +830,8 @@
   "Turn on": "Включить",
   "Show the nodes": "Показать узлы",
   "Hide the nodes": "Скрыть узлы",
+  "Show the failover settings": "Показать настройки отказоустойчивости",
+  "Hide the failover settings": "Скрыть настройки отказоустойчивости",
   "{n} more addresses asked less often": "ещё адресов, спрашивавших реже: {n}",
   "Documentation": "Документация",
   "{n} group blocks, its DNS is unchanged": "{n} группа блокирует, её DNS не меняется",

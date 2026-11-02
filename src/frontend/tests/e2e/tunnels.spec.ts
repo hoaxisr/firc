@@ -33,6 +33,34 @@ test.describe("Tunnels page", () => {
   });
 
   // Catches a link or subscription address, which carry the account secret, shown before it is asked for.
+  // Catches the failover settings without a fold, a fold the next visit forgets, or «More» left between the rows.
+  test("the failover settings fold, stay folded when the page is opened again, and end with More", async ({
+    page,
+  }) => {
+    await stubDaemon(page, {
+      tunnels: [tunnel("a", "tunvless0")],
+      states: [state("a", "tunvless0")],
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.expand("a");
+    const failover = tunnels.card("a").locator("section.sec", { hasText: "Failover" });
+    const last = failover.locator(":scope > *").last();
+    await expect(last).toContainText("More: connect timeout");
+    await expect(failover.getByLabel("Active nodes")).toBeVisible();
+    await failover.getByRole("button", { name: "Hide the failover settings" }).click();
+    await expect(failover.getByLabel("Active nodes")).toHaveCount(0);
+    await expect(failover).not.toContainText("More: connect timeout");
+    await tunnels.open();
+    await tunnels.expand("a");
+    await expect(
+      failover.getByRole("button", { name: "Show the failover settings" }),
+    ).toBeVisible();
+    await expect(failover.getByLabel("Active nodes")).toHaveCount(0);
+    await failover.getByRole("button", { name: "Show the failover settings" }).click();
+    await expect(failover.getByLabel("Active nodes")).toBeVisible();
+  });
+
   test("source addresses stay hidden until shown", async ({ page }) => {
     await stubDaemon(page, {});
     const tunnels = new TunnelsPage(page);
