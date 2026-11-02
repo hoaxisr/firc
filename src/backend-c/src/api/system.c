@@ -405,43 +405,61 @@ static const char *bypass_why_name(uint8_t why) {
     return why == FIRC_AUTOLIST_NO_CONNECT ? "no-connect" : "no-answer";
 }
 
-static bool bypass_recent_json(cJSON *o, const firc_autolist_bypass_t *b) {
-    cJSON *arr = cJSON_AddArrayToObject(o, "recent");
-    if (arr == NULL) { return false; }
-    for (size_t i = 0; i < b->n_recent; i++) {
-        const firc_autolist_bypass_conn_t *c = &b->recent[i];
-        char addr[INET6_ADDRSTRLEN];
-        if (!ip_text(&c->server, addr, sizeof(addr))) { continue; }
-        cJSON *e = cJSON_CreateObject();
-        if (e == NULL || !cJSON_AddItemToArray(arr, e)) {
-            cJSON_Delete(e);
-            return false;
-        }
-        if (cJSON_AddStringToObject(e, "server", addr) == NULL || cJSON_AddStringToObject(e, "name", c->name) == NULL ||
-            cJSON_AddStringToObject(e, "why", bypass_why_name(c->why)) == NULL ||
-            cJSON_AddNumberToObject(e, "at", (double)c->at) == NULL) {
-            return false;
-        }
+static const char *ptr_state_name(firc_ptr_state_t st) {
+    if (st == FIRC_PTR_NAME) { return "name"; }
+    return st == FIRC_PTR_NONE ? "none" : "pending";
+}
+
+static bool string_to_array(cJSON *arr, const char *text) {
+    cJSON *one = cJSON_CreateString(text);
+    if (one == NULL || !cJSON_AddItemToArray(arr, one)) {
+        cJSON_Delete(one);
+        return false;
     }
     return true;
 }
 
-static bool autolist_bypassed_json(cJSON *out, const firc_autolist_status_t *st) {
-    cJSON *arr = cJSON_AddArrayToObject(out, "bypassed");
+static bool autolist_address_json(cJSON *arr, const firc_autolist_status_t *st, size_t i) {
+    const firc_autolist_addr_t *a = &st->addresses[i];
+    char addr[INET6_ADDRSTRLEN];
+    if (!ip_text(&a->server, addr, sizeof(addr))) { return true; }
+    cJSON *o = cJSON_CreateObject();
+    if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
+        cJSON_Delete(o);
+        return false;
+    }
+    cJSON *clients = NULL, *groups = NULL;
+    if (cJSON_AddStringToObject(o, "address", addr) == NULL ||
+        cJSON_AddStringToObject(o, "proto", a->proto == IPPROTO_UDP ? "udp" : "tcp") == NULL ||
+        cJSON_AddNumberToObject(o, "port", (double)a->port) == NULL ||
+        cJSON_AddStringToObject(o, "name", a->name) == NULL ||
+        cJSON_AddStringToObject(o, "ptr", st->ptr_state[i] == FIRC_PTR_NAME ? st->ptr[i] : "") == NULL ||
+        cJSON_AddStringToObject(o, "ptrState", ptr_state_name(st->ptr_state[i])) == NULL ||
+        cJSON_AddStringToObject(o, "why", bypass_why_name(a->why)) == NULL ||
+        cJSON_AddNumberToObject(o, "fails", (double)a->fails) == NULL ||
+        (clients = cJSON_AddArrayToObject(o, "clients")) == NULL ||
+        cJSON_AddNumberToObject(o, "firstAt", (double)a->first_at) == NULL ||
+        cJSON_AddNumberToObject(o, "lastAt", (double)a->last_at) == NULL ||
+        (groups = cJSON_AddArrayToObject(o, "groups")) == NULL) {
+        return false;
+    }
+    for (uint8_t k = 0; k < a->n_clients; k++) {
+        char client[INET6_ADDRSTRLEN];
+        if (ip_text(&a->clients[k], client, sizeof(client)) && !string_to_array(clients, client)) { return false; }
+    }
+    for (size_t k = 0; k < st->n_groups[i]; k++) {
+        char id[FIRC_ID_STR_LEN];
+        firc_id_format(st->groups[i][k], id);
+        if (!string_to_array(groups, id)) { return false; }
+    }
+    return true;
+}
+
+static bool autolist_addresses_json(cJSON *out, const firc_autolist_status_t *st) {
+    cJSON *arr = cJSON_AddArrayToObject(out, "addresses");
     if (arr == NULL) { return false; }
-    for (size_t i = 0; i < st->n_bypassed; i++) {
-        char addr[INET6_ADDRSTRLEN];
-        if (!ip_text(&st->bypassed[i].client, addr, sizeof(addr))) { continue; }
-        cJSON *o = cJSON_CreateObject();
-        if (o == NULL || !cJSON_AddItemToArray(arr, o)) {
-            cJSON_Delete(o);
-            return false;
-        }
-        if (cJSON_AddStringToObject(o, "client", addr) == NULL ||
-            cJSON_AddNumberToObject(o, "fails", (double)st->bypassed[i].fails) == NULL ||
-            !bypass_recent_json(o, &st->bypassed[i])) {
-            return false;
-        }
+    for (size_t i = 0; i < st->n_addresses; i++) {
+        if (!autolist_address_json(arr, st, i)) { return false; }
     }
     return true;
 }
@@ -502,7 +520,7 @@ static void write_autolist(firc_system_ctx_t *ctx, firc_http_res_t *res, int cod
               cJSON_AddNumberToObject(out, "ambiguousDay", (double)st->ambiguous_day) != NULL &&
               (st->wan_warning == NULL || cJSON_AddStringToObject(out, "wanWarning", st->wan_warning) != NULL) &&
               cJSON_AddNumberToObject(out, "addedHour", (double)st->added_hour) != NULL &&
-              autolist_bypassed_json(out, st) && autolist_candidates_json(out, st) && autolist_probes_json(out, st);
+              autolist_addresses_json(out, st) && autolist_candidates_json(out, st) && autolist_probes_json(out, st);
     free(st);
     if (!ok) {
         cJSON_Delete(out);
@@ -610,6 +628,66 @@ static void handle_autolist_add(firc_http_req_t *req, firc_http_res_t *res, void
 
 static void handle_autolist_dismiss(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     handle_autolist_candidate(req, res, ud, false);
+}
+
+static bool parse_address_key(firc_http_req_t *req, firc_ip_t *server, uint8_t *proto, uint16_t *port) {
+    const char *text = firc_http_req_param(req, "address");
+    memset(server, 0, sizeof(*server));
+    if (text == NULL) { return false; }
+    if (inet_pton(AF_INET, text, server->b) == 1) {
+        server->len = 4;
+    } else if (inet_pton(AF_INET6, text, server->b) == 1) {
+        server->len = 16;
+    } else {
+        return false;
+    }
+    size_t body_len;
+    const uint8_t *body = firc_http_req_body(req, &body_len);
+    cJSON *json = body_len > 0 ? cJSON_ParseWithLength((const char *)body, body_len) : NULL;
+    const cJSON *p = cJSON_GetObjectItemCaseSensitive(json, "proto");
+    const cJSON *n = cJSON_GetObjectItemCaseSensitive(json, "port");
+    bool ok = cJSON_IsString(p) && cJSON_IsNumber(n) && n->valuedouble >= 1 && n->valuedouble <= 65535 &&
+              n->valuedouble == (double)(uint16_t)n->valuedouble;
+    if (ok && strcmp(p->valuestring, "tcp") == 0) {
+        *proto = IPPROTO_TCP;
+    } else if (ok && strcmp(p->valuestring, "udp") == 0) {
+        *proto = IPPROTO_UDP;
+    } else {
+        ok = false;
+    }
+    if (ok) { *port = (uint16_t)n->valuedouble; }
+    cJSON_Delete(json);
+    return ok;
+}
+
+static void handle_autolist_address_dismiss(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    firc_system_ctx_t *ctx = ud;
+    firc_ip_t server;
+    uint8_t proto = 0;
+    uint16_t port = 0;
+    if (!parse_address_key(req, &server, &proto, &port)) {
+        firc_http_res_write_error(res, 400, "not an address, proto and port");
+        return;
+    }
+    firc_err_t err = firc_app_autolist_address_dismiss(ctx->app, &server, proto, port);
+    if (err == FIRC_ERR_STATE) {
+        firc_http_res_write_error(res, 409, autolist_not_running);
+        return;
+    }
+    if (err == FIRC_ERR_NOENT) {
+        firc_http_res_write_error(res, 404, "no such address");
+        return;
+    }
+    if (err != FIRC_OK) {
+        firc_http_res_write_error(res, 500, firc_err_str(err));
+        return;
+    }
+    cJSON *out = cJSON_CreateObject();
+    if (out == NULL) {
+        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
+        return;
+    }
+    firc_http_res_write_json(res, 200, out);
 }
 
 void firc_system_name_tunnels(firc_iface_info_t *ifaces, size_t n, const firc_tunnels_t *ts) {
@@ -1388,6 +1466,7 @@ void firc_system_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx) {
     must_route(h, "POST", "/api/v1/system/autolist/probe", handle_autolist_probe, ctx);
     must_route(h, "POST", "/api/v1/system/autolist/candidates/{domain}/add", handle_autolist_add, ctx);
     must_route(h, "POST", "/api/v1/system/autolist/candidates/{domain}/dismiss", handle_autolist_dismiss, ctx);
+    must_route(h, "POST", "/api/v1/system/autolist/addresses/{address}/dismiss", handle_autolist_address_dismiss, ctx);
     must_route(h, "POST", "/api/v1/system/config/save", handle_save_config, ctx);
     must_route(h, "POST", "/api/v1/system/hooks/netfilterd", handle_netfilterd_hook, ctx);
     must_route(h, "POST", "/api/v1/system/hooks/iflayer", handle_iflayer_hook, ctx);

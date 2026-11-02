@@ -201,6 +201,7 @@ struct firc_app {
     bool al_wan_url_said;
     uint64_t al_switched_off, al_switched_on;
     firc_autolist_probe_fn al_probe;
+    firc_ptr_t *al_ptr;
     firc_app_tunnel_down_fn tunnel_down;
     void *tunnel_down_ud;
     firc_app_ifaces_t ifaces;
@@ -1115,6 +1116,10 @@ firc_app_t *firc_app_create(const firc_app_deps_t *deps) {
     app->config_path = deps->config_path;
     app->config_version = deps->config_version;
     app->start_idx = deps->start_idx;
+    if (app->loop != NULL && (app->al_ptr = firc_ptr_new(app->loop, 3000)) == NULL) {
+        firc_app_destroy(app);
+        return NULL;
+    }
 
     firc_ruleset_deps_t rdeps = ruleset_deps(app);
     for (size_t i = 0; i < app->cfg->n_groups; i++) {
@@ -1175,6 +1180,8 @@ void firc_app_destroy(firc_app_t *app) {
     firc_app_stop_list_worker(app); /* before the config it reports about goes: a result it posts could reach a loop whose app no longer exists */
     (void)firc_app_capture_stop(app, NULL);
     autolist_stop(app);
+    firc_ptr_free(app->al_ptr);
+    app->al_ptr = NULL;
     firc_err_t stopped = write_stop_state(app); /* no pass will run again, so write directly; before the flushes, so a flushed flow meets no chain to re-mark it */
     for (size_t i = 0; stopped != FIRC_OK && i < app->n_held; i++) { firc_ipset_to_link_free(app->held[i].link); }
     if (stopped != FIRC_OK) { app->n_held = 0; }
@@ -3356,6 +3363,16 @@ static void autolist_listed(void *ud, const firc_autolist_failure_t *f) {
     if (c->state != FIRC_AL_CHECKING && c->state != FIRC_AL_ADDED) { c->state = FIRC_AL_CAND; }
 }
 
+static void autolist_bypassed(void *ud, const firc_autolist_failure_t *f) {
+    firc_app_t *app = ud;
+    if (app->al_ptr == NULL) { return; }
+    firc_ifcheck_settings_t s;
+    firc_ifcheck_settings_from(&app->cfg->app, &s);
+    char name[FIRC_AUTOLIST_NAME_MAX];
+    (void)firc_ptr_get(app->al_ptr, &f->server, s.upstream, s.upstream_port, (int64_t)app->mono_ms(), name,
+                       sizeof(name));
+}
+
 static void autolist_nominated(void *ud, const firc_autolist_nomination_t *n) {
     firc_app_t *app = ud;
     if (!autolist_running(app)) { return; }
@@ -3700,6 +3717,12 @@ firc_err_t firc_app_autolist_candidate_add(firc_app_t *app, const char *domain) 
     return FIRC_OK;
 }
 
+firc_err_t firc_app_autolist_address_dismiss(firc_app_t *app, const firc_ip_t *server, uint8_t proto, uint16_t port) {
+    if (app == NULL || server == NULL) { return FIRC_ERR_INVAL; }
+    if (!autolist_running(app)) { return FIRC_ERR_STATE; }
+    return firc_autolist_svc_addr_dismiss(app->al_svc, server, proto, port) ? FIRC_OK : FIRC_ERR_NOENT;
+}
+
 firc_err_t firc_app_autolist_candidate_dismiss(firc_app_t *app, const char *domain) {
     if (app == NULL || domain == NULL) { return FIRC_ERR_INVAL; }
     return firc_al_cands_dismiss(app->al_cands, domain, autolist_now(app)) ? FIRC_OK : FIRC_ERR_NOENT;
@@ -3812,6 +3835,7 @@ firc_err_t firc_app_autolist_apply(firc_app_t *app) {
         .now = app->wall_s,
         .eligible = autolist_eligible,
         .listed = autolist_listed,
+        .bypassed = autolist_bypassed,
         .nominated = autolist_nominated,
         .ud = app,
     };
@@ -3883,6 +3907,33 @@ firc_err_t firc_app_autolist_apply(firc_app_t *app) {
     return FIRC_OK;
 }
 
+static bool autolist_admits_all(const firc_app_t *app, const firc_group_snapshot_t *g, const firc_autolist_addr_t *a) {
+    if (g->block >= 0) { return false; }
+    for (uint8_t i = 0; g->devices != NULL && i < a->n_clients; i++) {
+        if (!firc_devsel_allows(g->devices, &a->clients[i], app->tap_policy, app->tap_device, app->tap_resolver_ud)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t autolist_covering(const firc_app_t *app, const firc_autolist_addr_t *a, firc_id_t *out) {
+    const firc_ruleset_snapshot_t *snap = app->pipeline != NULL ? firc_dns_pipeline_snapshot(app->pipeline) : NULL;
+    const char *gid = app->cfg->app.autolist.group;
+    firc_id_t target;
+    bool has_target = gid != NULL && firc_id_parse(gid, &target) == FIRC_OK;
+    size_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; snap != NULL && i < snap->n_groups && n < FIRC_AUTOLIST_GROUPS_MAX; i++) {
+            const firc_group_snapshot_t *g = snap->groups[i];
+            bool is_target = has_target && firc_id_equal(g->id, target);
+            if (is_target != (pass == 0) || !autolist_admits_all(app, g, a)) { continue; }
+            out[n++] = g->id;
+        }
+    }
+    return n;
+}
+
 void firc_app_autolist_status(const firc_app_t *app, firc_autolist_status_t *out) {
     if (out == NULL) { return; }
     memset(out, 0, sizeof(*out));
@@ -3903,8 +3954,14 @@ void firc_app_autolist_status(const firc_app_t *app, firc_autolist_status_t *out
     out->checked_at = app->al_checked_at;
     out->switched_off = app->al_switched_off;
     out->switched_on = app->al_switched_on;
-    out->n_bypassed =
-        firc_autolist_svc_bypassed(app->al_svc, out->bypassed, FIRC_AUTOLIST_BYPASS_CLIENTS);
+    out->n_addresses = firc_autolist_svc_addresses(app->al_svc, out->addresses, FIRC_AUTOLIST_ADDRS);
+    int64_t now_ms = (int64_t)app->mono_ms();
+    for (size_t i = 0; i < out->n_addresses; i++) {
+        out->ptr_state[i] = app->al_ptr != NULL ? firc_ptr_peek(app->al_ptr, &out->addresses[i].server, now_ms,
+                                                                out->ptr[i], sizeof(out->ptr[i]))
+                                                : FIRC_PTR_NONE;
+        out->n_groups[i] = autolist_covering(app, &out->addresses[i], out->groups[i]);
+    }
     const firc_al_cand_t *cands[FIRC_AUTOLIST_CANDIDATES];
     out->n_candidates = firc_al_cands_list(app->al_cands, cands, FIRC_AUTOLIST_CANDIDATES);
     for (size_t i = 0; i < out->n_candidates; i++) { out->candidates[i] = *cands[i]; }

@@ -1834,6 +1834,50 @@ const AUTOLIST_VERDICTS: Record<string, [string, string, number, string]> = {
     "Connection timed out after 30001 milliseconds · wan cp.cloudflare.com: 204",
   ],
 };
+let AUTOLIST_ADDRESSES: any[] = [
+  {
+    address: "172.64.150.28",
+    proto: "tcp",
+    port: 443,
+    name: "chat.openai.com",
+    ptr: "",
+    ptrState: "none",
+    why: "no-answer",
+    fails: 4,
+    clients: ["192.168.1.5"],
+    firstAt: autolistAgo(900),
+    lastAt: autolistAgo(120),
+    groups: ["g1g1g1g1"],
+  },
+  {
+    address: "34.107.243.93",
+    proto: "tcp",
+    port: 443,
+    name: "",
+    ptr: "93.243.107.34.bc.googleusercontent.com",
+    ptrState: "name",
+    why: "no-connect",
+    fails: 2,
+    clients: ["192.168.1.5", "192.168.1.42"],
+    firstAt: autolistAgo(1200),
+    lastAt: autolistAgo(400),
+    groups: ["g1g1g1g1"],
+  },
+  {
+    address: "2606:4700::6810:84e5",
+    proto: "tcp",
+    port: 443,
+    name: "",
+    ptr: "",
+    ptrState: "pending",
+    why: "reset",
+    fails: 1,
+    clients: ["192.168.1.7"],
+    firstAt: autolistAgo(800),
+    lastAt: autolistAgo(800),
+    groups: ["g1g1g1g1"],
+  },
+];
 const AUTOLIST_PROBE_MS = 2500;
 let AUTOLIST_RUNNING: string | null = null;
 let AUTOLIST_WAN_WARNING = false;
@@ -1855,24 +1899,7 @@ const autolistState = () => ({
   checkedAt: AUTOLIST_CHECKED_AT,
   switchedOff: 0,
   switchedOn: 0,
-  bypassed: autolistOn()
-    ? [
-        {
-          client: "192.168.1.5",
-          fails: 6,
-          recent: [
-            {
-              server: "172.64.150.28",
-              name: "chat.openai.com",
-              why: "no-answer",
-              at: autolistAgo(120),
-            },
-            { server: "172.64.150.28", name: "", why: "no-answer", at: autolistAgo(130) },
-            { server: "34.107.243.93", name: "", why: "no-connect", at: autolistAgo(400) },
-          ],
-        },
-      ]
-    : [],
+  addresses: autolistOn() ? AUTOLIST_ADDRESSES : [],
   candidates: autolistOn() ? AUTOLIST_CANDS : [],
   probes: {
     usedHour: autolistOn() ? 4 : 0,
@@ -1917,6 +1944,18 @@ app.post(`${API_BASE}/system/autolist/candidates/:domain/:action{add|dismiss}`, 
   cand.state = "added";
   cand.lastAt = NOW();
   return c.json(autolistState());
+});
+
+app.post(`${API_BASE}/system/autolist/addresses/:address/dismiss`, async (c) => {
+  if (!autolistOn()) return c.json({ error: "the automatic list is not running" }, 409);
+  const address = decodeURIComponent(c.req.param("address"));
+  const body = await c.req.json().catch(() => null);
+  const before = AUTOLIST_ADDRESSES.length;
+  AUTOLIST_ADDRESSES = AUTOLIST_ADDRESSES.filter(
+    (x) => !(x.address === address && x.proto === body?.proto && x.port === body?.port),
+  );
+  if (AUTOLIST_ADDRESSES.length === before) return c.json({ error: "no such address" }, 404);
+  return c.json({});
 });
 
 app.post(`${API_BASE}/system/autolist/probe`, async (c) => {

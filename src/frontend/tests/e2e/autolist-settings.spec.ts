@@ -248,7 +248,7 @@ async function groupWithRules(page: Page, candidates: unknown[]) {
         checkedAt: 0,
         switchedOff: 0,
         switchedOn: 0,
-        bypassed: [],
+        addresses: [],
         candidates,
         probes: { usedHour: 0, queued: 0, running: null, results: [] },
       },

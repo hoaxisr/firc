@@ -16,13 +16,13 @@
   import { locale, t } from "../../data/locale.svelte";
   import { tabRequest } from "../../data/tab-request.svelte";
   import { loadSettings, settings } from "../settings/settings.svelte";
+  import BypassTable from "./BypassTable.svelte";
 
   import { X } from "../../components/ui/icons";
   import type { AutolistCandidate, Group } from "../../types";
   import { toast } from "../../utils/events";
   import { fetcher } from "../../utils/fetcher";
   import { counted } from "../../utils/plural";
-  import { deviceNames } from "./journal";
 
   let { active = false }: { active?: boolean } = $props();
 
@@ -30,14 +30,6 @@
 
   let now = $state(Math.floor(Date.now() / 1000));
   let busy = $state<Set<string>>(new Set());
-  let shown = $state<Set<string>>(new Set());
-
-  function toggleShown(client: string) {
-    const next = new Set(shown);
-    if (!next.delete(client)) next.add(client);
-    shown = next;
-  }
-
   const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), CLOCK_MS);
   onDestroy(() => clearInterval(clock));
 
@@ -49,7 +41,6 @@
 
   const data = $derived(autolist.data);
   const devices = $derived(statsDevices(hosts.list, []));
-  const names = $derived(deviceNames(hosts.list));
   const groupName = $derived(knownGroups.list.find((g) => g.id === data?.group)?.name ?? "");
   const ttl = $derived(Number(settings.saved["app.dnsProxy.unmatchedTtl"] ?? 0));
   const recheck = $derived(settings.saved["app.autolist.recheck"] === true);
@@ -92,22 +83,6 @@
       t("freeze suspected: {n} connections stalled (2-4)"),
       t("freeze suspected: {n} connections stalled"),
     );
-  }
-
-  function bypassNote(n: number, device: string): string {
-    return counted(
-      n,
-      locale.current,
-      t(
-        "Not counted: {n} failure at {device}: a connection to an address firc did not give the device (an address built into an app, its own DNS or DoH).",
-      ),
-      t(
-        "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH). (2-4)",
-      ),
-      t(
-        "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH).",
-      ),
-    ).replace("{device}", device);
   }
 
   function devicesOf(c: AutolistCandidate) {
@@ -301,15 +276,17 @@
     </div>
 
     {#if candidates.length === 0}
-      <div class="strip">
-        {groupName
-          ? t(
-              "No failures yet. firc watches the TLS connections of the devices of group «{group}» that go around the tunnel.",
-            ).replace("{group}", groupName)
-          : t(
-              "No failures yet. firc watches the TLS connections of the devices of the chosen group that go around the tunnel.",
-            )}
-      </div>
+      {#if data.addresses.length === 0}
+        <div class="strip">
+          {groupName
+            ? t(
+                "No failures yet. firc watches the TLS connections of the devices of group «{group}» that go around the tunnel.",
+              ).replace("{group}", groupName)
+            : t(
+                "No failures yet. firc watches the TLS connections of the devices of the chosen group that go around the tunnel.",
+              )}
+        </div>
+      {/if}
     {:else}
       <div class="card">
         <div class="head" aria-hidden="true">
@@ -406,32 +383,7 @@
       </div>
     {/if}
 
-    {#each data.bypassed as b (b.client)}
-      <div class="note">
-        {bypassNote(b.fails, names.get(b.client.toLowerCase()) ?? b.client)}
-        {#if b.recent.length > 0}
-          <button
-            type="button"
-            class="toggle"
-            aria-expanded={shown.has(b.client)}
-            onclick={() => toggleShown(b.client)}
-            >{shown.has(b.client) ? t("hide addresses") : t("show addresses")}</button
-          >
-          {#if shown.has(b.client)}
-            <ul class="recent">
-              {#each b.recent as r, i (i)}
-                <li>
-                  <span class="rname">{r.name || "—"}</span>
-                  <span class="raddr">{r.server}</span>
-                  {@render pill(whyClass(r.why), whyLabel(r.why, 0, t))}
-                  <span class="rwhen">{relativeTime(r.at, now, t)}</span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        {/if}
-      </div>
-    {/each}
+    <BypassTable addresses={data.addresses} />
   {/if}
 {/if}
 
@@ -629,58 +581,6 @@
   }
   .act :global(button[aria-label]) {
     padding: 0.4rem 0.5rem;
-  }
-  .note {
-    margin-top: 0.6rem;
-    padding: 0.5rem 0.8rem;
-    background: color-mix(in srgb, var(--yellow-bright) 10%, var(--bg-dark));
-    border: 1px solid color-mix(in srgb, var(--yellow-bright) 28%, transparent);
-    border-radius: 0.5rem;
-    color: var(--yellow-bright);
-    font-size: 0.85rem;
-  }
-  .toggle {
-    margin-left: 0.4rem;
-    padding: 0;
-    border: 0;
-    background: none;
-    color: inherit;
-    font: inherit;
-    text-decoration: underline;
-    cursor: pointer;
-  }
-  .recent {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    margin: 0.5rem 0 0.1rem;
-    padding: 0;
-    list-style: none;
-    color: var(--text);
-  }
-  .recent li {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.2rem 0.8rem;
-    min-width: 0;
-  }
-  .rname {
-    flex: 0 1 12rem;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 600;
-  }
-  .raddr {
-    flex: 0 0 8.5rem;
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
-  }
-  .rwhen {
-    color: var(--text-2);
-    font-size: 0.78rem;
   }
   @container (max-width: 760px) {
     .head {

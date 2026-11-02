@@ -329,8 +329,8 @@ for i in 1 2 3; do around www.drop.test 198.51.100.2 & J="$J $!"; done
 wait $J
 J=
 sleep 1
-check "a client that never asked firc is counted apart" "10.70.0.2:3" \
-    "$(al st "','.join('%s:%s' % (b['client'], b['fails']) for b in j['bypassed'])")"
+check "a client that never asked firc shows as one address row" "198.51.100.2:3:10.70.0.2" \
+    "$(al st "' '.join('%s:%s:%s' % (a['address'], a['fails'], ','.join(a['clients'])) for a in j['addresses'])")"
 check "and its failures list nothing" 0 "$(status listed)"
 check "nor add anything" "" "$(added drop.test)"
 

@@ -90,10 +90,11 @@ typedef struct {
 } hint_t;
 
 typedef struct {
-    bool used;
-    int64_t last;
-    firc_autolist_bypass_t pub;
-} bypass_t;
+    firc_ip_t server;
+    uint8_t proto;
+    uint16_t port;
+    int64_t until;
+} hidden_t;
 
 struct firc_autolist {
     firc_autolist_params_t p;
@@ -102,7 +103,10 @@ struct firc_autolist {
     host_t hosts[FIRC_AUTOLIST_HOSTS];
     domain_t domains[FIRC_AUTOLIST_DOMAINS];
     hint_t hints[FIRC_AUTOLIST_HINTS];
-    bypass_t bypass[FIRC_AUTOLIST_BYPASS_CLIENTS];
+    firc_autolist_addr_t addr[FIRC_AUTOLIST_ADDRS];
+    bool addr_used[FIRC_AUTOLIST_ADDRS];
+    hidden_t hidden[FIRC_AUTOLIST_ADDRS];
+    size_t hidden_next;
     int64_t day_hour[FIRC_AUTOLIST_DAY_HOURS];
     uint32_t day_count[FIRC_AUTOLIST_DAY_HOURS];
     int64_t ambiguous_hour[FIRC_AUTOLIST_DAY_HOURS];
@@ -554,39 +558,45 @@ static uint32_t day_sum(const int64_t *hours, const uint32_t *counts, int64_t no
     return n;
 }
 
+static bool addr_key(const firc_autolist_addr_t *r, const firc_ip_t *server, uint8_t proto, uint16_t port) {
+    return r->proto == proto && r->port == port && ip_eq(&r->server, server);
+}
+
+static bool addr_live(const firc_autolist_t *a, size_t i, int64_t now) {
+    return a->addr_used[i] && now - a->addr[i].last_at < FIRC_AUTOLIST_DAY_SECS;
+}
+
 static uint32_t bypass_count(firc_autolist_t *a, const flow_t *f, uint8_t why, int64_t now) {
-    const firc_ip_t *client = &f->key.client;
-    bypass_t *slot = NULL, *spare = NULL;
-    for (size_t i = 0; i < FIRC_AUTOLIST_BYPASS_CLIENTS; i++) {
-        bypass_t *e = &a->bypass[i];
-        if (e->used && ip_eq(&e->pub.client, client)) {
-            slot = e;
-            break;
-        }
-        if (!e->used) {
-            if (spare == NULL || spare->used) { spare = e; }
-        } else if (spare == NULL || (spare->used && e->last < spare->last)) {
-            spare = e;
+    size_t at = FIRC_AUTOLIST_ADDRS, spare = 0;
+    bool found = false;
+    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS && !found; i++) {
+        if (a->addr_used[i] && addr_key(&a->addr[i], &f->key.server, FIRC_AUTOLIST_PROTO_TCP, f->key.server_port)) {
+            at = i;
+            found = true;
+        } else if (!addr_live(a, i, now)) {
+            if (addr_live(a, spare, now)) { spare = i; }
+        } else if (addr_live(a, spare, now) && a->addr[i].last_at < a->addr[spare].last_at) {
+            spare = i;
         }
     }
-    if (slot == NULL) { slot = spare; }
-    if (!slot->used || !ip_eq(&slot->pub.client, client) || now - slot->last >= FIRC_AUTOLIST_DAY_SECS) {
-        slot->used = true;
-        slot->pub.client = *client;
-        slot->pub.fails = 0;
-        slot->pub.n_recent = 0;
+    if (!found) { at = spare; }
+    firc_autolist_addr_t *r = &a->addr[at];
+    if (!found || !addr_live(a, at, now)) {
+        memset(r, 0, sizeof(*r));
+        r->server = f->key.server;
+        r->proto = FIRC_AUTOLIST_PROTO_TCP;
+        r->port = f->key.server_port;
+        r->first_at = now;
+        a->addr_used[at] = true;
     }
-    firc_autolist_bypass_t *b = &slot->pub;
-    size_t keep = b->n_recent < FIRC_AUTOLIST_BYPASS_RECENT ? b->n_recent : FIRC_AUTOLIST_BYPASS_RECENT - 1;
-    memmove(&b->recent[1], &b->recent[0], keep * sizeof(b->recent[0]));
-    b->recent[0].server = f->key.server;
-    snprintf(b->recent[0].name, sizeof(b->recent[0].name), "%s", f->sni);
-    b->recent[0].why = why;
-    b->recent[0].at = now;
-    b->n_recent = (uint8_t)(keep + 1);
-    b->fails++;
-    slot->last = now;
-    return b->fails;
+    r->fails++;
+    r->last_at = now;
+    r->why = why;
+    if (f->sni[0] != '\0') { snprintf(r->name, sizeof(r->name), "%s", f->sni); }
+    bool known = false;
+    for (uint8_t k = 0; k < r->n_clients; k++) { known = known || ip_eq(&r->clients[k], &f->key.client); }
+    if (!known && r->n_clients < FIRC_AUTOLIST_ADDR_CLIENTS) { r->clients[r->n_clients++] = f->key.client; }
+    return r->fails;
 }
 
 static bool unnamed(firc_autolist_t *a, const flow_t *f, int64_t now) {
@@ -795,16 +805,52 @@ bool firc_autolist_fin(firc_autolist_t *a, const firc_autolist_flow_t *key, uint
     return nominate(a, f, h, d, by_host, by_domain, FIRC_AL_NOM_STALL, received, out);
 }
 
-size_t firc_autolist_bypassed(const firc_autolist_t *a, int64_t now, firc_autolist_bypass_t *out, size_t cap) {
+static bool addr_hidden(const firc_autolist_t *a, const firc_autolist_addr_t *r, int64_t now) {
+    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS; i++) {
+        const hidden_t *h = &a->hidden[i];
+        if (h->until > now && h->proto == r->proto && h->port == r->port && ip_eq(&h->server, &r->server)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t firc_autolist_addresses(const firc_autolist_t *a, int64_t now, firc_autolist_addr_t *out, size_t cap) {
     if (a == NULL) { return 0; }
+    size_t order[FIRC_AUTOLIST_ADDRS];
     size_t n = 0;
-    for (size_t i = 0; i < FIRC_AUTOLIST_BYPASS_CLIENTS && n < cap; i++) {
-        const bypass_t *e = &a->bypass[i];
-        if (!e->used || now - e->last >= FIRC_AUTOLIST_DAY_SECS) { continue; }
-        if (out != NULL) { out[n] = e->pub; }
-        n++;
+    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS; i++) {
+        if (!addr_live(a, i, now) || addr_hidden(a, &a->addr[i], now)) { continue; }
+        size_t k = n++;
+        while (k > 0 && a->addr[order[k - 1]].last_at < a->addr[i].last_at) {
+            order[k] = order[k - 1];
+            k--;
+        }
+        order[k] = i;
+    }
+    if (n > cap) { n = cap; }
+    if (out != NULL) {
+        for (size_t k = 0; k < n; k++) { out[k] = a->addr[order[k]]; }
     }
     return n;
+}
+
+bool firc_autolist_addr_dismiss(firc_autolist_t *a, const firc_ip_t *server, uint8_t proto, uint16_t port,
+                                int64_t now) {
+    if (a == NULL || server == NULL) { return false; }
+    bool visible = false;
+    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS && !visible; i++) {
+        visible = addr_live(a, i, now) && addr_key(&a->addr[i], server, proto, port) &&
+                  !addr_hidden(a, &a->addr[i], now);
+    }
+    if (!visible) { return false; }
+    hidden_t *h = &a->hidden[a->hidden_next];
+    a->hidden_next = (a->hidden_next + 1) % FIRC_AUTOLIST_ADDRS;
+    h->server = *server;
+    h->proto = proto;
+    h->port = port;
+    h->until = now + FIRC_AUTOLIST_DAY_SECS;
+    return true;
 }
 
 uint32_t firc_autolist_failures_day(const firc_autolist_t *a, int64_t now) {

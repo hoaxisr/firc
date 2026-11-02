@@ -77,6 +77,7 @@ CORE_SRCS := \
     src/dns/anscache.c \
     src/dns/dnsstat.c \
     src/dns/pktinfo.c \
+    src/dns/ptr.c \
     src/fakeip/addr.c \
     src/fakeip/pool.c \
     src/fakeip/ula.c \

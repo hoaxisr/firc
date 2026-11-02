@@ -255,16 +255,15 @@ TEST no_hint_is_bypass_not_failure(void) {
     ASSERT_EQ(4, out.server.len);
     ASSERT_EQ(0, memcmp(out.server.b, f.server.b, 4));
     ASSERT_EQ(0u, firc_autolist_failures_day(a, 104));
-    firc_autolist_bypass_t b[4];
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 104, b, 4));
-    ASSERT_EQ(4, b[0].client.len);
-    ASSERT_EQ(0, memcmp(b[0].client.b, f.client.b, 4));
+    firc_autolist_addr_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 104, b, 4));
+    ASSERT_EQ(0, memcmp(b[0].server.b, f.server.b, 4));
     ASSERT_EQ(1u, b[0].fails);
-    ASSERT_EQ(1, b[0].n_recent);
-    ASSERT_STR_EQ("a.test", b[0].recent[0].name);
-    ASSERT_EQ(0, memcmp(b[0].recent[0].server.b, f.server.b, 4));
-    ASSERT_EQ(FIRC_AUTOLIST_RETRANS, b[0].recent[0].why);
-    ASSERT_EQ(103, b[0].recent[0].at);
+    ASSERT_EQ(1, b[0].n_clients);
+    ASSERT_EQ(0, memcmp(b[0].clients[0].b, f.client.b, 4));
+    ASSERT_STR_EQ("a.test", b[0].name);
+    ASSERT_EQ(FIRC_AUTOLIST_RETRANS, b[0].why);
+    ASSERT_EQ(103, b[0].last_at);
     firc_autolist_free(a);
     PASS();
 }
@@ -556,7 +555,7 @@ TEST syn_with_two_names_is_ambiguous(void) {
     const int64_t times[] = {101, 103};
     ASSERT_FALSE(syns(a, &f, times, 2, &nom));
     ASSERT_EQ(1u, firc_autolist_ambiguous_day(a, 103));
-    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 103, NULL, 4));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 103, NULL, 4));
     firc_autolist_free(a);
     PASS();
 }
@@ -573,51 +572,157 @@ TEST syn_without_hint_is_bypass(void) {
     ASSERT_EQ(10, nom.client.b[3]);
     ASSERT_EQ(4, nom.server.len);
     ASSERT_EQ(0, memcmp(nom.server.b, f.server.b, 4));
-    firc_autolist_bypass_t b[4];
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 103, b, 4));
+    firc_autolist_addr_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 103, b, 4));
     ASSERT_EQ(1u, b[0].fails);
-    ASSERT_EQ(1, b[0].n_recent);
-    ASSERT_STR_EQ("", b[0].recent[0].name);
-    ASSERT_EQ(FIRC_AUTOLIST_NO_CONNECT, b[0].recent[0].why);
+    ASSERT_STR_EQ("", b[0].name);
+    ASSERT_EQ(FIRC_AUTOLIST_NO_CONNECT, b[0].why);
     ASSERT_EQ(0u, firc_autolist_ambiguous_day(a, 103));
     firc_autolist_free(a);
     PASS();
 }
 
-TEST a_bypass_keeps_the_newest_eight_newest_first(void) {
+TEST a_bypass_makes_one_row_per_address(void) {
     firc_autolist_t *a = firc_autolist_new();
     firc_autolist_failure_t out;
-    char sni[16];
-    for (int i = 0; i < 10; i++) {
-        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), (uint8_t)(20 + i));
-        snprintf(sni, sizeof(sni), "n%d.test", i);
-        ASSERT(bare_hello_times(a, &f, sni, 4, 100 + 10 * i, &out));
-    }
-    firc_autolist_bypass_t b[2];
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 200, b, 2));
-    ASSERT_EQ(10u, b[0].fails);
-    ASSERT_EQ(8, b[0].n_recent);
-    ASSERT_STR_EQ("n9.test", b[0].recent[0].name);
-    ASSERT_EQ(29, b[0].recent[0].server.b[3]);
-    ASSERT_EQ(193, b[0].recent[0].at);
-    ASSERT_STR_EQ("n2.test", b[0].recent[7].name);
-    ASSERT_EQ(22, b[0].recent[7].server.b[3]);
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    ASSERT(bare_hello_times(a, &f, "a.test", 4, 100, &out));
+    firc_autolist_flow_t g = flow_to(50001, 20);
+    g.client.b[3] = 11;
+    ASSERT(bare_hello_times(a, &g, "", 4, 200, &out));
+    firc_autolist_addr_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 204, b, 4));
+    ASSERT_EQ(2u, b[0].fails);
+    ASSERT_EQ(2, b[0].n_clients);
+    ASSERT_STR_EQ("a.test", b[0].name);
+    ASSERT_EQ(443, b[0].port);
+    ASSERT_EQ(FIRC_AUTOLIST_PROTO_TCP, b[0].proto);
+    ASSERT_EQ(103, b[0].first_at);
+    ASSERT_EQ(203, b[0].last_at);
     firc_autolist_free(a);
     PASS();
 }
 
-TEST a_quiet_day_forgets_the_recent_bypasses(void) {
+TEST rows_come_newest_first_and_a_full_table_drops_the_oldest(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    for (int i = 1; i <= 65; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), (uint8_t)i);
+        ASSERT(bare_hello_times(a, &f, "x.test", 4, 100 + 10 * i, &out));
+    }
+    firc_autolist_addr_t b[80];
+    ASSERT_EQ(64u, (unsigned)firc_autolist_addresses(a, 800, b, 80));
+    ASSERT_EQ(65, b[0].server.b[3]);
+    ASSERT_EQ(64, b[1].server.b[3]);
+    for (size_t i = 0; i < 64; i++) { ASSERT(b[i].server.b[3] != 1); }
+    ASSERT_EQ(2, b[63].server.b[3]);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_quiet_day_starts_the_row_again(void) {
     firc_autolist_t *a = firc_autolist_new();
     firc_autolist_failure_t out;
     firc_autolist_flow_t f = flow_to(50000, 20);
     ASSERT(bare_hello_times(a, &f, "old.test", 4, 100, &out));
-    firc_autolist_flow_t g = flow_to(50001, 21);
+    firc_autolist_flow_t g = flow_to(50001, 20);
     ASSERT(bare_hello_times(a, &g, "new.test", 4, 100 + 86400, &out));
-    firc_autolist_bypass_t b[2];
-    ASSERT_EQ(1u, (unsigned)firc_autolist_bypassed(a, 100 + 86403, b, 2));
+    ASSERT_EQ(1u, out.fails);
+    firc_autolist_addr_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 100 + 86403, b, 2));
     ASSERT_EQ(1u, b[0].fails);
-    ASSERT_EQ(1, b[0].n_recent);
-    ASSERT_STR_EQ("new.test", b[0].recent[0].name);
+    ASSERT_EQ(100 + 86403, b[0].first_at);
+    ASSERT_STR_EQ("new.test", b[0].name);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_syn_bypass_has_no_name_and_no_connect(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    set_threshold(a, 1);
+    firc_autolist_nomination_t nom;
+    firc_autolist_flow_t f = flow_at(50001, 1);
+    const int64_t times[] = {101, 103};
+    ASSERT(syns(a, &f, times, 2, &nom));
+    firc_autolist_addr_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 103, b, 2));
+    ASSERT_EQ(FIRC_AUTOLIST_NO_CONNECT, b[0].why);
+    ASSERT_STR_EQ("", b[0].name);
+    ASSERT_EQ(103, b[0].last_at);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_dismissed_row_counts_but_stays_hidden_for_a_day(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    ASSERT(bare_hello_times(a, &f, "a.test", 4, 100, &out));
+    firc_autolist_flow_t k = flow_to(0, 21);
+    ASSERT_FALSE(firc_autolist_addr_dismiss(a, &k.server, FIRC_AUTOLIST_PROTO_TCP, 443, 110));
+    ASSERT(firc_autolist_addr_dismiss(a, &f.server, FIRC_AUTOLIST_PROTO_TCP, 443, 110));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 111, NULL, 4));
+    firc_autolist_flow_t g = flow_to(50001, 20);
+    ASSERT(bare_hello_times(a, &g, "a.test", 4, 120, &out));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 130, NULL, 4));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 110 + 86399, NULL, 4));
+    firc_autolist_addr_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 110 + 86400, b, 2));
+    ASSERT_EQ(2u, b[0].fails);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_device_is_listed_once_however_often_it_fails(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    for (int i = 0; i < 3; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), 20);
+        ASSERT(bare_hello_times(a, &f, "a.test", 4, 100 + 10 * i, &out));
+    }
+    firc_autolist_addr_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 200, b, 2));
+    ASSERT_EQ(3u, b[0].fails);
+    ASSERT_EQ(1, b[0].n_clients);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_ninth_device_is_not_listed(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    for (int i = 0; i < 9; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), 20);
+        f.client.b[3] = (uint8_t)(10 + i);
+        ASSERT(bare_hello_times(a, &f, "a.test", 4, 100 + 10 * i, &out));
+    }
+    firc_autolist_addr_t b[2];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 300, b, 2));
+    ASSERT_EQ(8, b[0].n_clients);
+    ASSERT_EQ(9u, b[0].fails);
+    ASSERT_EQ(17, b[0].clients[7].b[3]);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST an_ipv6_bypass_gets_its_own_row(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    firc_autolist_flow_t v6 = flow(10, 50001);
+    v6.client.len = 16;
+    v6.server.len = 16;
+    v6.client.b[0] = 0x20;
+    v6.client.b[15] = 1;
+    v6.server.b[0] = 0x26;
+    v6.server.b[15] = 9;
+    ASSERT(bare_hello_times(a, &f, "a.test", 4, 100, &out));
+    ASSERT(bare_hello_times(a, &v6, "a.test", 4, 200, &out));
+    firc_autolist_addr_t b[4];
+    ASSERT_EQ(2u, (unsigned)firc_autolist_addresses(a, 204, b, 4));
+    ASSERT_EQ(16, b[0].server.len);
+    ASSERT_EQ(9, b[0].server.b[15]);
+    ASSERT_EQ(4, b[1].server.len);
     firc_autolist_free(a);
     PASS();
 }
@@ -642,7 +747,7 @@ TEST sniless_with_two_hints_is_ambiguous_not_newest(void) {
     ASSERT_FALSE(bare_hello_times(a, &f, "", 4, 100, &out));
     ASSERT_EQ(1u, firc_autolist_ambiguous_day(a, 104));
     ASSERT_EQ(0u, firc_autolist_failures_day(a, 104));
-    ASSERT_EQ(0u, (unsigned)firc_autolist_bypassed(a, 104, NULL, 4));
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 104, NULL, 4));
     firc_autolist_free(a);
     PASS();
 }
@@ -1294,8 +1399,14 @@ int main(int argc, char **argv) {
     RUN_TEST(syn_named_by_the_only_hint);
     RUN_TEST(syn_with_two_names_is_ambiguous);
     RUN_TEST(syn_without_hint_is_bypass);
-    RUN_TEST(a_bypass_keeps_the_newest_eight_newest_first);
-    RUN_TEST(a_quiet_day_forgets_the_recent_bypasses);
+    RUN_TEST(a_bypass_makes_one_row_per_address);
+    RUN_TEST(rows_come_newest_first_and_a_full_table_drops_the_oldest);
+    RUN_TEST(a_quiet_day_starts_the_row_again);
+    RUN_TEST(a_syn_bypass_has_no_name_and_no_connect);
+    RUN_TEST(a_dismissed_row_counts_but_stays_hidden_for_a_day);
+    RUN_TEST(a_device_is_listed_once_however_often_it_fails);
+    RUN_TEST(a_ninth_device_is_not_listed);
+    RUN_TEST(an_ipv6_bypass_gets_its_own_row);
     RUN_TEST(sniless_without_hint_is_bypass);
     RUN_TEST(sniless_with_two_hints_is_ambiguous_not_newest);
     RUN_TEST(ambiguous_day_expires);

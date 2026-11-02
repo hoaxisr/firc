@@ -1152,40 +1152,85 @@ definitions:
     required:
     - host
     type: object
-  types.AutolistBypassConn:
+  types.AutolistAddress:
     properties:
-      server:
-        description: 'The address the device connected to'
-        example: 172.64.150.28
+      address:
+        description: 'The server address devices failed to reach without asking firc for it (an address built into an app, its own DNS or DoH)'
+        example: 34.107.243.93
         type: string
+      proto:
+        description: 'tcp | udp'
+        example: tcp
+        type: string
+      port:
+        example: 443
+        type: integer
       name:
-        description: 'The SNI of its ClientHello; empty when it sent none or never got past the SYN'
-        example: chat.openai.com
+        description: 'The SNI of the last ClientHello; empty when none was sent or the SYN went unanswered'
+        example: ""
+        type: string
+      ptr:
+        description: 'The address''s PTR name in presentation form, lower case, no trailing dot; empty unless ptrState is name'
+        example: ""
+        type: string
+      ptrState:
+        description: 'pending | name | none'
+        example: pending
         type: string
       why:
         description: 'no-answer | reset | no-connect'
         example: no-answer
         type: string
-      at:
-        description: 'When it failed, Unix seconds'
+      fails:
+        description: 'Failures since firstAt; a row with no failure for 24 h starts again'
+        example: 4
+        type: integer
+      clients:
+        description: 'Devices that failed, at most 8'
+        items:
+          type: string
+        example: ["192.168.0.104"]
+        type: array
+      firstAt:
+        description: 'First failure, Unix seconds'
+        example: 1793536100
+        type: integer
+      lastAt:
+        description: 'Last failure, Unix seconds'
         example: 1793536103
         type: integer
-    type: object
-  types.AutolistBypassed:
-    properties:
-      client:
-        description: 'A device whose failures were not counted: firc gave it no answer for that address and name (an address built into an app, its own DNS or DoH)'
-        example: 192.168.1.60
-        type: string
-      fails:
-        description: 'Its failures in the last 24 hours'
-        example: 6
-        type: integer
-      recent:
-        description: 'Its last failures, newest first, at most 8'
+      groups:
+        description: 'Ids of the groups, not blocking by DNS, whose selector admits every device of the row, the autolist target first; at most 32'
         items:
-          $ref: '#/definitions/types.AutolistBypassConn'
+          type: string
+        example: ["cb6cbe5f"]
         type: array
+    required:
+    - address
+    - proto
+    - port
+    - name
+    - ptr
+    - ptrState
+    - why
+    - fails
+    - clients
+    - firstAt
+    - lastAt
+    - groups
+    type: object
+  types.AutolistAddressKey:
+    properties:
+      proto:
+        description: 'tcp | udp'
+        example: tcp
+        type: string
+      port:
+        example: 443
+        type: integer
+    required:
+    - proto
+    - port
     type: object
   types.AutolistCandidate:
     properties:
@@ -1333,9 +1378,10 @@ definitions:
         description: 'Rules switched on again since it started because their host was blocked again'
         example: 0
         type: integer
-      bypassed:
+      addresses:
+        description: 'Newest first, at most 64'
         items:
-          $ref: '#/definitions/types.AutolistBypassed'
+          $ref: '#/definitions/types.AutolistAddress'
         type: array
       candidates:
         description: 'Newest first, at most 64'
@@ -1358,7 +1404,7 @@ definitions:
     - checkedAt
     - switchedOff
     - switchedOn
-    - bypassed
+    - addresses
     - candidates
     - probes
     type: object
@@ -3350,6 +3396,45 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Dismiss a candidate for a day'
+      tags:
+      - system
+  /api/v1/system/autolist/addresses/{address}/dismiss:
+    post:
+      description: >-
+        Hides the address row with this proto and port for 24 hours (memory
+        only); a new failure within the day counts but does not show it.
+      parameters:
+      - description: 'The server address; an IPv6 address percent-encoded'
+        in: path
+        name: address
+        required: true
+        type: string
+      - description: 'Request body'
+        in: body
+        name: json
+        required: true
+        schema:
+          $ref: '#/definitions/types.AutolistAddressKey'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: object
+        "400":
+          description: 'Bad Request -- "not an address, proto and port"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- "no such address"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "409":
+          description: 'Conflict -- "the automatic list is not running"'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Dismiss an address row for a day'
       tags:
       - system
   /api/v1/system/autolist/probe:

@@ -7,7 +7,8 @@ import { installSvelteRunesMocks } from "../mocks/setup-svelte-runes";
 installSvelteRunesMocks();
 
 const { autolistTip } = await import("../../src/utils/autolist-tip");
-const { latestResult, ruleOf, whyClass, whyLabel } = await import("../../src/data/autolist.svelte");
+const { latestResult, prefixContains, ruleCovering, ruleOf, whyClass, whyLabel } =
+  await import("../../src/data/autolist.svelte");
 
 const say = (key: string) => (ru as Record<string, string>)[key] ?? key;
 
@@ -77,6 +78,53 @@ describe("ruleOf", () => {
     assert.strictEqual(ruleOf(groups, "g2", "rutracker.org")?.id, "r2");
     assert.strictEqual(ruleOf(groups, "g1", "linkedin.com"), null);
     assert.strictEqual(ruleOf(groups, "nope", "rutracker.org"), null);
+  });
+});
+
+describe("prefixContains", () => {
+  it("matches an IPv6 address inside a /32 by its first 32 bits", () => {
+    assert.strictEqual(prefixContains("2606:4700::/32", "2606:4700::6810:84e5"), true);
+    assert.strictEqual(prefixContains("2606:4700::/32", "2606:4701::1"), false);
+    assert.strictEqual(prefixContains("2a00::/16", "2b00::1"), false);
+    assert.strictEqual(prefixContains("2a00::/16", "2A00:ffff::1"), true);
+  });
+
+  it("never matches across families", () => {
+    assert.strictEqual(prefixContains("0.0.0.0/0", "2606:4700::1"), false);
+    assert.strictEqual(prefixContains("::/0", "104.16.132.229"), false);
+  });
+
+  it("lets 0.0.0.0/0 hold any IPv4 address", () => {
+    assert.strictEqual(prefixContains("0.0.0.0/0", "104.16.132.229"), true);
+    assert.strictEqual(prefixContains("0.0.0.0/0", "255.255.255.255"), true);
+  });
+
+  it("refuses a length past the family or not a number", () => {
+    assert.strictEqual(prefixContains("10.0.0.0/33", "10.0.0.0"), false);
+    assert.strictEqual(prefixContains("10.0.0.0/x", "10.0.0.0"), false);
+  });
+
+  it("takes a bare address as a full-length prefix", () => {
+    assert.strictEqual(prefixContains("10.0.0.1", "10.0.0.1"), true);
+    assert.strictEqual(prefixContains("10.0.0.1", "10.0.0.2"), false);
+  });
+});
+
+describe("ruleCovering", () => {
+  const groups = [
+    {
+      id: "g1",
+      rules: [{ id: "off", rule: "104.16.0.0/12", type: "subnet", enable: false }],
+    },
+    {
+      id: "g2",
+      rules: [{ id: "on", rule: "104.16.0.0/13", type: "subnet", enable: true }],
+    },
+  ] as never;
+
+  it("skips a switched-off rule that holds the address", () => {
+    assert.strictEqual(ruleCovering(groups, ["g1"], "104.16.132.229"), null);
+    assert.strictEqual(ruleCovering(groups, ["g1", "g2"], "104.16.132.229")?.id, "on");
   });
 });
 

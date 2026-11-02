@@ -21,6 +21,7 @@
 #include "firc/models.h"
 #include "firc/sub_worker.h"
 #include "firc/port_remap.h"
+#include "firc/ptr.h"
 #include "firc/conntrack.h"
 #include "firc/rtnl.h"
 #include "firc/ruleset.h"
@@ -415,6 +416,8 @@ firc_err_t firc_app_stage_autolist(firc_app_t *app);
 
 firc_err_t firc_app_autolist_apply(firc_app_t *app);
 
+#define FIRC_AUTOLIST_GROUPS_MAX 32
+
 typedef struct firc_autolist_status {
     bool enabled;
     bool running;
@@ -431,8 +434,12 @@ typedef struct firc_autolist_status {
     int64_t checked_at;
     uint64_t switched_off;
     uint64_t switched_on;
-    size_t n_bypassed;
-    firc_autolist_bypass_t bypassed[FIRC_AUTOLIST_BYPASS_CLIENTS];
+    size_t n_addresses;
+    firc_autolist_addr_t addresses[FIRC_AUTOLIST_ADDRS];
+    firc_ptr_state_t ptr_state[FIRC_AUTOLIST_ADDRS];
+    char ptr[FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_NAME_MAX];
+    size_t n_groups[FIRC_AUTOLIST_ADDRS];
+    firc_id_t groups[FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_GROUPS_MAX];
     size_t n_candidates;
     firc_al_cand_t candidates[FIRC_AUTOLIST_CANDIDATES];
     uint32_t probes_used_hour;
@@ -455,6 +462,9 @@ firc_err_t firc_app_autolist_candidate_add(firc_app_t *app, const char *domain);
 
 /* Hides a candidate for a day: NOENT for no such candidate. */
 firc_err_t firc_app_autolist_candidate_dismiss(firc_app_t *app, const char *domain);
+
+/* Hides an address row for a day: STATE when not running, NOENT for no visible row. */
+firc_err_t firc_app_autolist_address_dismiss(firc_app_t *app, const firc_ip_t *server, uint8_t proto, uint16_t port);
 
 /* Queues the recheck: STATE when not running, CLOSED when the check interface belongs to the group. */
 firc_err_t firc_app_autolist_recheck_now(firc_app_t *app);

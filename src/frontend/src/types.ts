@@ -341,17 +341,19 @@ export type AutolistProbeResult = {
   error: string;
 };
 
-export type AutolistBypassConn = {
-  server: string;
+export type AutolistAddress = {
+  address: string;
+  proto: string;
+  port: number;
   name: string;
+  ptr: string;
+  ptrState: "pending" | "name" | "none";
   why: string;
-  at: number;
-};
-
-export type AutolistBypassed = {
-  client: string;
   fails: number;
-  recent: AutolistBypassConn[];
+  clients: string[];
+  firstAt: number;
+  lastAt: number;
+  groups: string[];
 };
 
 export type AutolistRes = {
@@ -370,7 +372,7 @@ export type AutolistRes = {
   checkedAt: number;
   switchedOff: number;
   switchedOn: number;
-  bypassed: AutolistBypassed[];
+  addresses: AutolistAddress[];
   candidates: AutolistCandidate[];
   probes: {
     usedHour: number;

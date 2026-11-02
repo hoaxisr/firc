@@ -29,6 +29,24 @@ function candidate(domain: string, hostName: string, why: string, extra = {}) {
   };
 }
 
+function address(addr: string, extra = {}) {
+  return {
+    address: addr,
+    proto: "tcp",
+    port: 443,
+    name: "",
+    ptr: "",
+    ptrState: "none",
+    why: "no-answer",
+    fails: 4,
+    clients: ["192.168.1.5"],
+    firstAt: NOW - 900,
+    lastAt: NOW - 120,
+    groups: ["b10c4ed0"],
+    ...extra,
+  };
+}
+
 type ProbeResult = {
   host: string;
   verdict: string;
@@ -41,7 +59,10 @@ type ProbeResult = {
 type Fake = {
   mode: string;
   candidates: ReturnType<typeof candidate>[];
+  addresses: ReturnType<typeof address>[];
   calls: string[];
+  adds: { search: string; body: unknown }[];
+  dismissBody?: unknown;
   running?: string | null;
   results?: ProbeResult[];
   probeFail?: string;
@@ -67,16 +88,7 @@ function state(fake: Fake) {
     checkedAt: 0,
     switchedOff: 0,
     switchedOn: 0,
-    bypassed: [
-      {
-        client: "192.168.1.5",
-        fails: 6,
-        recent: [
-          { server: "172.64.150.28", name: "chat.openai.com", why: "no-answer", at: NOW - 120 },
-          { server: "34.107.243.93", name: "", why: "no-connect", at: NOW - 400 },
-        ],
-      },
-    ],
+    addresses: fake.addresses,
     candidates: fake.candidates,
     probes: {
       usedHour: 4,
@@ -113,6 +125,11 @@ async function shell(page: Page, fake: Fake) {
     route.fulfill({ json: { groups: [GROUP] } }),
   );
   await page.route(/\/groups(\?.*)?$/, (route) => route.fulfill({ json: { groups: [GROUP] } }));
+  await page.route(/\/groups\/b10c4ed0\/rules(\?.*)?$/, (route) => {
+    const req = route.request();
+    fake.adds.push({ search: new URL(req.url()).search, body: req.postDataJSON() });
+    return route.fulfill({ json: { id: "ee00ee00" } });
+  });
   await page.route(/\/groups\/b10c4ed0\/rules\/ab12cd34/, (route) => {
     fake.calls.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
     return route.fulfill({ json: {} });
@@ -150,6 +167,13 @@ async function shell(page: Page, fake: Fake) {
       if (!fake.queueOnly) fake.running = req.postDataJSON().host;
       return route.fulfill({ status: 202, json: state(fake) });
     }
+    const d = path.match(/addresses\/([^/]+)\/dismiss$/);
+    if (d) {
+      const addr = decodeURIComponent(d[1]);
+      fake.dismissBody = req.postDataJSON();
+      fake.addresses = fake.addresses.filter((a) => a.address !== addr);
+      return route.fulfill({ json: {} });
+    }
     const m = path.match(/candidates\/([^/]+)\/(add|dismiss)$/);
     if (m) {
       const domain = decodeURIComponent(m[1]);
@@ -169,6 +193,17 @@ function a1(): Fake {
   return {
     mode: "candidates",
     calls: [],
+    adds: [],
+    addresses: [
+      address("172.64.150.28", { name: "chat.openai.com" }),
+      address("34.107.243.93", {
+        why: "no-connect",
+        ptr: "93.243.107.34.bc.googleusercontent.com",
+        ptrState: "name",
+        lastAt: NOW - 400,
+      }),
+      address("2606:4700::6810:84e5", { ptrState: "pending", lastAt: NOW - 800 }),
+    ],
     candidates: [
       candidate("rutracker.org", "rutracker.org", "no-answer"),
       candidate("linkedin.com", "www.linkedin.com", "reset", {
@@ -236,32 +271,180 @@ test("an unanswered-SYN candidate wears the no-answer colour, not the grey of a 
   ).toHaveClass(/\bdrop\b/);
 });
 
-test("a device that asks DNS around firc is named in the note, not blamed on a domain", async ({
-  page,
-}) => {
+test("bypass addresses show as a table", async ({ page }) => {
   await shell(page, a1());
   await open(page);
-  await expect(page.locator(".note")).toContainText("Not counted: 6 failures at Living room TV");
-  await expect(page.locator(".note")).not.toContainText("24 h");
+  const rows = page.locator("[data-address]");
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0)).toContainText("172.64.150.28");
+  await expect(rows.nth(0)).toContainText("chat.openai.com");
+  await expect(rows.nth(0)).toContainText("tcp/443");
+  await expect(rows.nth(0)).toContainText("PTR: —");
+  await expect(rows.nth(0)).toContainText("Living room TV");
+  await expect(rows.nth(1)).toContainText("34.107.243.93");
+  await expect(rows.nth(1)).toContainText("PTR: 93.243.107.34.bc.googleusercontent.com");
+  await expect(rows.nth(2)).toContainText("PTR: …");
+  await expect(page.getByText("Addresses past firc")).toBeVisible();
+  await expect(page.locator(".note")).toHaveCount(0);
 });
 
-test("a bypass note unfolds the addresses the device went to", async ({ page }) => {
-  await shell(page, a1());
+test("the addresses table is absent when there are none", async ({ page }) => {
+  const fake = a1();
+  fake.addresses = [];
+  await shell(page, fake);
   await open(page);
-  const note = page.locator(".note");
-  await expect(note).not.toContainText("172.64.150.28");
-  await note.getByRole("button", { name: "show addresses" }).click();
-  const rows = note.locator(".recent li");
-  await expect(rows).toHaveCount(2);
-  await expect(rows.nth(0)).toContainText("chat.openai.com");
-  await expect(rows.nth(0)).toContainText("172.64.150.28");
-  await expect(rows.nth(0)).toContainText("no answer to ClientHello");
-  await expect(rows.nth(0)).toContainText("2 min ago");
-  await expect(rows.nth(1)).toContainText("—");
-  await expect(rows.nth(1)).toContainText("34.107.243.93");
-  await expect(rows.nth(1)).toContainText("no connection (SYN unanswered)");
-  await note.getByRole("button", { name: "hide addresses" }).click();
-  await expect(rows).toHaveCount(0);
+  await expect(page.locator("[data-domain]")).toHaveCount(4);
+  await expect(page.getByText("Addresses past firc")).toHaveCount(0);
+});
+
+test("to group adds the exact address", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  await open(page);
+  const row = page.locator("[data-address='34.107.243.93']");
+  await row.getByRole("button", { name: "To group" }).click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect.poll(() => fake.adds.length).toBe(1);
+  expect(fake.adds[0].search).toBe("?save=true");
+  expect(fake.adds[0].body).toEqual({
+    type: "subnet",
+    rule: "34.107.243.93/32",
+    enable: true,
+    proto: "tcp",
+    ports: "443",
+    comment: "93.243.107.34.bc.googleusercontent.com",
+  });
+  await expect(page.getByText("34.107.243.93 added to «Blocked»")).toBeVisible();
+});
+
+test("an ipv6 row adds a subnet6 rule", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  await open(page);
+  await page
+    .locator("[data-address='2606:4700::6810:84e5']")
+    .getByRole("button", { name: "To group" })
+    .click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect.poll(() => fake.adds.length).toBe(1);
+  expect(fake.adds[0].body).toMatchObject({ type: "subnet6", rule: "2606:4700::6810:84e5/128" });
+});
+
+test("a row with no covering group has no menu", async ({ page }) => {
+  const fake = a1();
+  fake.addresses = [address("172.64.150.28", { groups: [] })];
+  await shell(page, fake);
+  await open(page);
+  await expect(page.locator("[data-address]")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "To group" })).toHaveCount(0);
+});
+
+test("a routed address links to its rule", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  const routed = {
+    ...GROUP,
+    rules: [
+      ...GROUP.rules,
+      { id: "cd34ef56", enable: true, rule: "34.107.243.0/24", type: "subnet" },
+    ],
+  };
+  await page.route("**/groups?with_rules=true", (route) =>
+    route.fulfill({ json: { groups: [routed] } }),
+  );
+  await page.route(/\/groups(\?.*)?$/, (route) => route.fulfill({ json: { groups: [routed] } }));
+  await open(page);
+  const row = page.locator("[data-address='34.107.243.93']");
+  await expect(row.getByRole("button", { name: "To the rule" })).toBeVisible();
+  await expect(row.getByRole("button", { name: "To group" })).toHaveCount(0);
+  await expect(
+    page.locator("[data-address='172.64.150.28']").getByRole("button", { name: "To group" }),
+  ).toBeVisible();
+});
+
+test("dismiss hides an address", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  await open(page);
+  await page
+    .locator("[data-address='34.107.243.93']")
+    .getByRole("button", { name: "Dismiss for a day" })
+    .click();
+  await expect(page.locator("[data-address]")).toHaveCount(2);
+  await expect(page.locator("[data-address='34.107.243.93']")).toHaveCount(0);
+  await expect(page.locator("[data-domain]")).toHaveCount(4);
+  await expect(page.getByText("Automatic adding is off.")).toHaveCount(0);
+  const post = fake.calls.indexOf("POST /api/v1/system/autolist/addresses/34.107.243.93/dismiss");
+  expect(post).toBeGreaterThanOrEqual(0);
+  expect(fake.calls.slice(post + 1)).toContain("GET /api/v1/system/autolist");
+  expect(fake.dismissBody).toEqual({ proto: "tcp", port: 443 });
+});
+
+test("dismissing an ipv6 address sends it percent-encoded with its proto and port", async ({
+  page,
+}) => {
+  const fake = a1();
+  await shell(page, fake);
+  await open(page);
+  await page
+    .locator("[data-address='2606:4700::6810:84e5']")
+    .getByRole("button", { name: "Dismiss for a day" })
+    .click();
+  await expect(page.locator("[data-address='2606:4700::6810:84e5']")).toHaveCount(0);
+  expect(fake.calls).toContain(
+    "POST /api/v1/system/autolist/addresses/2606%3A4700%3A%3A6810%3A84e5/dismiss",
+  );
+  expect(fake.dismissBody).toEqual({ proto: "tcp", port: 443 });
+});
+
+test("the added rule's comment is the name before the PTR, empty without both", async ({
+  page,
+}) => {
+  const fake = a1();
+  fake.addresses = [
+    address("2606:4700::6810:84e5", {
+      name: "chatgpt.com",
+      ptr: "edge.example.net",
+      ptrState: "name",
+    }),
+    address("172.64.150.28"),
+  ];
+  await shell(page, fake);
+  await open(page);
+  await page
+    .locator("[data-address='2606:4700::6810:84e5']")
+    .getByRole("button", { name: "To group" })
+    .click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect.poll(() => fake.adds.length).toBe(1);
+  expect(fake.adds[0].body).toMatchObject({ comment: "chatgpt.com" });
+  await page
+    .locator("[data-address='172.64.150.28']")
+    .getByRole("button", { name: "To group" })
+    .click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect.poll(() => fake.adds.length).toBe(2);
+  expect(fake.adds[1].body).toMatchObject({ rule: "172.64.150.28/32", comment: "" });
+});
+
+test("with no candidates but addresses the empty strip stays away", async ({ page }) => {
+  const fake = a1();
+  fake.candidates = [];
+  await shell(page, fake);
+  await open(page);
+  await expect(page.locator("[data-address]")).toHaveCount(3);
+  await expect(page.getByText(/^No failures yet\./)).toHaveCount(0);
+  await expect(page.locator("[data-domain]")).toHaveCount(0);
+  await expect(page.getByText("Domain", { exact: true })).toHaveCount(0);
+});
+
+test("with no candidates and no addresses the empty strip shows", async ({ page }) => {
+  const fake = a1();
+  fake.candidates = [];
+  fake.addresses = [];
+  await shell(page, fake);
+  await open(page);
+  await expect(page.getByText(/^No failures yet\./)).toBeVisible();
 });
 
 test("adding a candidate moves its row to added and says when it will open", async ({ page }) => {
@@ -350,7 +533,13 @@ test("at 390 px each candidate is a card without the column header", async ({ pa
   await open(page);
 
   await expect(page.locator("[data-domain]")).toHaveCount(4);
-  await expect(page.locator(".card .head")).toBeHidden();
+  await expect(page.locator(".head")).toHaveCount(2);
+  await expect(page.locator(".head").first()).toBeHidden();
+  await expect(page.locator(".head").last()).toBeHidden();
+  const addr = page.locator("[data-address]").first();
+  await expect(addr.locator(".devs")).toBeHidden();
+  await expect(addr.locator(".meta")).toHaveText("tcp/443 · 4 failures · Living room TV");
+  expect((await addr.boundingBox())!.width).toBeLessThanOrEqual(390);
   const row = page.locator("[data-domain]", { hasText: "rutracker.org" });
   await expect(row.locator(".meta")).toBeVisible();
   await expect(row.locator(".meta")).toContainText("3 failures");
@@ -396,6 +585,8 @@ function statsFake(): Fake {
   return {
     mode: "candidates",
     calls: [],
+    adds: [],
+    addresses: [],
     running: null,
     results: [],
     candidates: [candidate("some-vps.de", "cdn.some-vps.de", "freeze", { fails: 0 })],

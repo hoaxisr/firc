@@ -1,4 +1,4 @@
-import type { AutolistProbeResult, AutolistRes, Group, Rule } from "../types";
+import type { AutolistAddress, AutolistProbeResult, AutolistRes, Group, Rule } from "../types";
 import { fetcher } from "../utils/fetcher";
 
 export const AUTOLIST_REFRESH_MS = 5000;
@@ -58,6 +58,60 @@ export function ruleOf(groups: Group[], groupId: string | null, domain: string):
   return group?.rules.find((r) => r.rule === domain) ?? null;
 }
 
+function parseAddress(text: string): bigint[] | null {
+  if (!text.includes(":")) {
+    const parts = text.split(".");
+    if (parts.length !== 4) return null;
+    let n = 0n;
+    for (const p of parts) {
+      if (!/^\d{1,3}$/.test(p) || Number(p) > 255) return null;
+      n = (n << 8n) | BigInt(p);
+    }
+    return [n, 32n];
+  }
+  const halves = text.toLowerCase().split("::");
+  if (halves.length > 2) return null;
+  const side = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = side(halves[0]);
+  const tail = halves.length === 2 ? side(halves[1]) : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  const groups = [...head, ...Array<string>(Math.max(fill, 0)).fill("0"), ...tail];
+  if (groups.length !== 8) return null;
+  let n = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    n = (n << 16n) | BigInt(parseInt(g, 16));
+  }
+  return [n, 128n];
+}
+
+export function prefixContains(prefix: string, address: string): boolean {
+  const [net, lenText] = prefix.split("/");
+  const a = parseAddress(address);
+  const p = parseAddress(net);
+  if (!a || !p || a[1] !== p[1]) return false;
+  if (lenText !== undefined && !/^\d{1,3}$/.test(lenText)) return false;
+  const len = lenText === undefined ? p[1] : BigInt(lenText);
+  if (len > p[1]) return false;
+  const shift = p[1] - len;
+  return a[0] >> shift === p[0] >> shift;
+}
+
+export function ruleCovering(groups: Group[], ids: string[], address: string): Rule | null {
+  for (const id of ids) {
+    const rule = groups
+      .find((g) => g.id === id)
+      ?.rules.find(
+        (r) =>
+          r.enable &&
+          (r.type === "subnet" || r.type === "subnet6") &&
+          prefixContains(r.rule, address),
+      );
+    if (rule) return rule;
+  }
+  return null;
+}
+
 export const autolist = {
   get data() {
     return autolistState.data;
@@ -102,6 +156,13 @@ export const autolist = {
         undefined,
       ),
     );
+  },
+  async dismissAddress(a: AutolistAddress): Promise<void> {
+    await fetcher.post(`/system/autolist/addresses/${encodeURIComponent(a.address)}/dismiss`, {
+      proto: a.proto,
+      port: a.port,
+    });
+    await this.poll();
   },
   async probe(host: string): Promise<void> {
     take(await fetcher.post<AutolistRes>("/system/autolist/probe", { host }));

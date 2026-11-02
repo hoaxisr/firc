@@ -870,9 +870,6 @@
   "freeze suspected: {n} connection stalled": "подозрение на заморозку: {n} соединение встало",
   "freeze suspected: {n} connections stalled (2-4)": "подозрение на заморозку: {n} соединения встали",
   "freeze suspected: {n} connections stalled": "подозрение на заморозку: {n} соединений встали",
-  "Not counted: {n} failure at {device}: a connection to an address firc did not give the device (an address built into an app, its own DNS or DoH).": "Не засчитана {n} неудача у {device}: соединение к адресу, который устройство получило не от firc (адрес, зашитый в приложение, свой DNS или DoH).",
-  "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH). (2-4)": "Не засчитаны {n} неудачи у {device}: соединения к адресам, которые устройство получило не от firc (зашитые в приложения адреса, свой DNS или DoH).",
-  "Not counted: {n} failures at {device}: connections to addresses firc did not give the device (addresses built into apps, its own DNS or DoH).": "Не засчитано {n} неудач у {device}: соединения к адресам, которые устройство получило не от firc (зашитые в приложения адреса, свой DNS или DoH).",
   "{domain} added to «{group}». It will open within {n} s — refresh the page.": "{domain} добавлен в «{group}». Откроется в течение {n} с — обновите страницу.",
   "No failures yet. firc watches the TLS connections of the devices of group «{group}» that go around the tunnel.": "Неудач не было. firc следит за TLS-соединениями устройств группы «{group}», которые идут мимо туннеля.",
   "No failures yet. firc watches the TLS connections of the devices of the chosen group that go around the tunnel.": "Неудач не было. firc следит за TLS-соединениями устройств выбранной группы, которые идут мимо туннеля.",
@@ -937,6 +934,9 @@
   "{n} times in a row": "{n} раз подряд",
   "auto": "авто",
   "auto · off by recheck": "авто · выкл. перепроверкой",
-  "show addresses": "показать адреса",
-  "hide addresses": "скрыть адреса"
+  "Addresses past firc": "Адреса мимо firc",
+  "Address": "Адрес",
+  "Name ": "Имя",
+  "To group": "В группу",
+  "{address} added to «{group}»": "{address} добавлен в «{group}»"
 }

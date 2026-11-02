@@ -378,9 +378,40 @@ static bool probes_used(const cJSON *st, const void *arg) {
     return num_of(probes_of(st), "usedHour") == *(const double *)arg;
 }
 
-static bool has_bypassed(const cJSON *st, const void *arg) {
+static bool has_address(const cJSON *st, const void *arg) {
     (void)arg;
-    return cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "bypassed")) > 0;
+    return cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "addresses")) > 0;
+}
+
+static const cJSON *address_row(const cJSON *st) {
+    return cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(st, "addresses"), 0);
+}
+
+static const char *nth_str(const cJSON *o, const char *key, int i) {
+    const cJSON *v = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(o, key), i);
+    return cJSON_IsString(v) ? v->valuestring : "";
+}
+
+static bool ptr_named(const cJSON *st, const void *arg) {
+    (void)arg;
+    return strcmp(str_of(address_row(st), "ptrState"), "name") == 0;
+}
+
+static int udp_upstream(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(sa);
+    struct timeval tv = {2, 0};
+    if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+        getsockname(fd, (struct sockaddr *)&sa, &len) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        if (fd >= 0) { close(fd); }
+        return -1;
+    }
+    *port = ntohs(sa.sin_port);
+    return fd;
 }
 
 static const cJSON *result_of(const cJSON *st, const char *host) {
@@ -652,31 +683,235 @@ TEST uncovered_client_stores_no_hint(void) {
     double two = 2;
     cJSON *st = wait_status(failures_are, &two);
     ASSERTm("an uncovered device's hints pushed the covered one out", candidate(st, "example.com") != NULL);
-    ASSERT_EQ(0, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "bypassed")));
+    ASSERT_EQ(0, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "addresses")));
     cJSON_Delete(st);
     rig_stop_loop(&r);
     rig_down(&r);
     PASS();
 }
 
-TEST a_device_that_never_asked_is_counted_apart(void) {
+TEST a_bypass_shows_as_an_address_row(void) {
     rig_t r;
     ASSERT(rig_up(&r));
     ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
-    cJSON *st = wait_status(has_bypassed, NULL);
-    const cJSON *b = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(st, "bypassed"), 0);
-    ASSERT(b != NULL);
-    ASSERT_STR_EQ("192.168.1.10", str_of(b, "client"));
-    ASSERT_EQ(2, (int)num_of(b, "fails"));
-    const cJSON *recent = cJSON_GetObjectItemCaseSensitive(b, "recent");
-    ASSERT_EQ(2, cJSON_GetArraySize(recent));
-    const cJSON *c = cJSON_GetArrayItem(recent, 0);
-    ASSERT_STR_EQ("doh.example.com", str_of(c, "name"));
-    ASSERT_STR_EQ("reset", str_of(c, "why"));
-    ASSERT_STR_EQ("203.0.113.7", str_of(c, "server"));
-    ASSERT(num_of(c, "at") > 0);
+    cJSON *st = wait_status(has_address, NULL);
+    ASSERT_EQ(1, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "addresses")));
+    const cJSON *a = address_row(st);
+    ASSERT_STR_EQ("203.0.113.7", str_of(a, "address"));
+    ASSERT_STR_EQ("tcp", str_of(a, "proto"));
+    ASSERT_EQ(443, (int)num_of(a, "port"));
+    ASSERT_STR_EQ("doh.example.com", str_of(a, "name"));
+    ASSERT_STR_EQ("reset", str_of(a, "why"));
+    ASSERT_EQ(2, (int)num_of(a, "fails"));
+    ASSERT_EQ(1, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "clients")));
+    ASSERT_STR_EQ("192.168.1.10", nth_str(a, "clients", 0));
+    ASSERT_EQ(1800000000, (int64_t)num_of(a, "firstAt"));
+    ASSERT_EQ(1800000000, (int64_t)num_of(a, "lastAt"));
+    const char *ptr_state = str_of(a, "ptrState");
+    ASSERTm(ptr_state, strcmp(ptr_state, "pending") == 0 || strcmp(ptr_state, "none") == 0);
+    ASSERT(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(a, "ptr")));
+    ASSERT_EQ(1, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "groups")));
+    ASSERT_STR_EQ("0a0b0c0d", nth_str(a, "groups", 0));
+    ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(st, "bypassed"));
     ASSERT_EQ(NULL, candidate(st, "example.com"));
     cJSON_Delete(st);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+TEST a_bypass_address_is_named_by_its_ptr(void) {
+    uint16_t up = 0;
+    int fd = udp_upstream(&up);
+    ASSERT(fd >= 0);
+    char more[128];
+    snprintf(more, sizeof(more), "  dnsProxy: {upstream: {address: 127.0.0.1, port: %u}}\n", (unsigned)up);
+    rig_t r;
+    setup_t su = {.app_more = more};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    uint8_t q[512];
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    ssize_t n = recvfrom(fd, q, sizeof(q), 0, (struct sockaddr *)&peer, &plen);
+    static const uint8_t qname[] = "\0017\003113\0010\003203\007in-addr\004arpa";
+    ASSERT(n >= 12 + (ssize_t)sizeof(qname) + 4);
+    ASSERT_MEM_EQ(qname, q + 12, sizeof(qname));
+    ASSERT_EQ(12, q[12 + sizeof(qname) + 1]);
+    static const uint8_t target[] = "\005ev\"il\007example";
+    uint8_t a[600];
+    size_t len = (size_t)n;
+    memcpy(a, q, len);
+    a[2] = 0x81;
+    a[3] = 0x80;
+    a[7] = 1;
+    const uint8_t rr[] = {0xc0, 0x0c, 0, 12, 0, 1, 0, 0, 1, 44, 0, (uint8_t)sizeof(target)};
+    memcpy(a + len, rr, sizeof(rr));
+    memcpy(a + len + sizeof(rr), target, sizeof(target));
+    len += sizeof(rr) + sizeof(target);
+    ASSERT_EQ((ssize_t)len, sendto(fd, a, len, 0, (struct sockaddr *)&peer, plen));
+    cJSON *st = wait_status(ptr_named, NULL);
+    const cJSON *row = address_row(st);
+    ASSERT_STR_EQ("name", str_of(row, "ptrState"));
+    ASSERT_STR_EQ("ev\\\"il.example", str_of(row, "ptr"));
+    cJSON_Delete(st);
+    close(fd);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+TEST covering_groups_leave_out_a_group_that_misses_a_device(void) {
+    rig_t r;
+    static char groups[2048];
+    snprintf(groups, sizeof(groups),
+             "groups:\n"
+             "  - id: 03030303\n"
+             "    name: Blocker\n"
+             "    interface: block\n"
+             "    enable: true\n"
+             "  - id: 02020202\n"
+             "    name: Wide\n"
+             "    interface: nwg7\n"
+             "    enable: true\n"
+             "  - id: 01010101\n"
+             "    name: Narrow\n"
+             "    interface: nwg8\n"
+             "    enable: true\n"
+             "    devices: {allow: [192.168.1.99]}\n"
+             "  - id: 0a0b0c0d\n"
+             "    name: Autolist\n"
+             "    interface: nwg9\n"
+             "    enable: true\n"
+             "%s",
+             RULES);
+    setup_t su = {.groups = groups};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    cJSON *st = wait_status(has_address, NULL);
+    const cJSON *a = address_row(st);
+    ASSERT_EQ(2, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "groups")));
+    ASSERT_STR_EQ("0a0b0c0d", nth_str(a, "groups", 0));
+    ASSERT_STR_EQ("02020202", nth_str(a, "groups", 1));
+    cJSON_Delete(st);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+TEST an_ipv6_address_is_parsed_for_dismiss(void) {
+    rig_t r;
+    ASSERT(rig_up(&r));
+    ASSERT_EQ(404, request_body("POST", "/api/v1/system/autolist/addresses/2606%3A4700%3A%3A1/dismiss",
+                                "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
+    ASSERTm(g_buf, strstr(g_buf, "no such address") != NULL);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+static bool two_clients(const cJSON *st, const void *arg) {
+    (void)arg;
+    const cJSON *a = address_row(st);
+    return a != NULL && cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "clients")) == 2;
+}
+
+TEST covering_groups_admit_every_client_of_the_address(void) {
+    rig_t r;
+    static char groups[2048];
+    snprintf(groups, sizeof(groups),
+             "groups:\n"
+             "  - id: 01010101\n"
+             "    name: Narrow\n"
+             "    interface: nwg8\n"
+             "    enable: true\n"
+             "    devices: {allow: [192.168.1.10]}\n"
+             "  - id: 02020202\n"
+             "    name: Both\n"
+             "    interface: nwg7\n"
+             "    enable: true\n"
+             "    devices: {allow: [192.168.1.10, 192.168.1.99]}\n"
+             "  - id: 0a0b0c0d\n"
+             "    name: Autolist\n"
+             "    interface: nwg9\n"
+             "    enable: true\n"
+             "%s",
+             RULES);
+    setup_t su = {.groups = groups};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    ASSERT(resets(&r, OTHER, "doh.example.com", 50011));
+    cJSON *st = wait_status(two_clients, NULL);
+    ASSERT(st != NULL);
+    const cJSON *a = address_row(st);
+    ASSERT_EQ(2, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "groups")));
+    ASSERT_STR_EQ("0a0b0c0d", nth_str(a, "groups", 0));
+    ASSERT_STR_EQ("02020202", nth_str(a, "groups", 1));
+    cJSON_Delete(st);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+TEST covering_groups_stop_at_32_with_the_target_first(void) {
+    rig_t r;
+    static char groups[8192];
+    int used = snprintf(groups, sizeof(groups), "groups:\n");
+    for (int i = 0; i < 33; i++) {
+        used += snprintf(groups + used, sizeof(groups) - (size_t)used,
+                         "  - id: %08x\n"
+                         "    name: G%d\n"
+                         "    interface: nwg7\n"
+                         "    enable: true\n",
+                         0x100 + i, i);
+    }
+    snprintf(groups + used, sizeof(groups) - (size_t)used,
+             "  - id: 0a0b0c0d\n"
+             "    name: Autolist\n"
+             "    interface: nwg9\n"
+             "    enable: true\n"
+             "%s",
+             RULES);
+    setup_t su = {.groups = groups};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    cJSON *st = wait_status(has_address, NULL);
+    ASSERT(st != NULL);
+    const cJSON *a = address_row(st);
+    ASSERT_EQ(32, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(a, "groups")));
+    ASSERT_STR_EQ("0a0b0c0d", nth_str(a, "groups", 0));
+    ASSERT_STR_EQ("00000100", nth_str(a, "groups", 1));
+    ASSERT_STR_EQ("0000011e", nth_str(a, "groups", 31));
+    cJSON_Delete(st);
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
+TEST a_dismissed_address_is_gone_from_the_status(void) {
+    rig_t r;
+    ASSERT(rig_up(&r));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    cJSON_Delete(wait_status(has_address, NULL));
+    const char *path = "/api/v1/system/autolist/addresses/203.0.113.7/dismiss";
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"udp\"}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", "/api/v1/system/autolist/addresses/not-an-address/dismiss",
+                                "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"sctp\",\"port\":443}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":65536}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":0}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":443.5}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":\"443\"}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request("POST", path, g_buf, sizeof(g_buf)));
+    ASSERT_EQ(400, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":443", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(404, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":80}", g_buf, sizeof(g_buf)));
+    ASSERT_EQ(200, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
+    ASSERTm(g_buf, strstr(g_buf, "\r\n\r\n{}") != NULL);
+    cJSON *st = status();
+    ASSERT(st != NULL);
+    ASSERT_EQ(0, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "addresses")));
+    cJSON_Delete(st);
+    ASSERT_EQ(404, request_body("POST", path, "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
     rig_stop_loop(&r);
     rig_down(&r);
     PASS();
@@ -1139,6 +1374,8 @@ TEST block_group_is_not_running(void) {
     ASSERT_STR_EQ("the group blocks by DNS: nothing to route its names into", str_of(st, "whyOff"));
     cJSON_Delete(st);
     ASSERT_EQ(409, probe_host("x.example"));
+    ASSERT_EQ(409, request_body("POST", "/api/v1/system/autolist/addresses/203.0.113.7/dismiss",
+                                "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
     rig_stop_loop(&r);
     rig_down(&r);
     PASS();
@@ -1857,7 +2094,13 @@ int main(int argc, char **argv) {
     RUN_TEST(candidate_add_route_adds_once);
     RUN_TEST(dismiss_hides_for_a_day);
     RUN_TEST(uncovered_client_stores_no_hint);
-    RUN_TEST(a_device_that_never_asked_is_counted_apart);
+    RUN_TEST(a_bypass_shows_as_an_address_row);
+    RUN_TEST(a_bypass_address_is_named_by_its_ptr);
+    RUN_TEST(covering_groups_leave_out_a_group_that_misses_a_device);
+    RUN_TEST(a_dismissed_address_is_gone_from_the_status);
+    RUN_TEST(an_ipv6_address_is_parsed_for_dismiss);
+    RUN_TEST(covering_groups_admit_every_client_of_the_address);
+    RUN_TEST(covering_groups_stop_at_32_with_the_target_first);
     RUN_TEST(freeze_probe_makes_candidate);
     RUN_TEST(recheck_open_switches_off_keeps_marker);
     RUN_TEST(recheck_short_keeps_freeze_rule);
