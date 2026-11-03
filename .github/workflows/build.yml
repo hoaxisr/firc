@@ -180,16 +180,29 @@ jobs:
           path: ${{ steps.sdk.outputs.path }}
           key: ${{ env.ENTWARE_SDK_RELEASE }}-${{ steps.sdk.outputs.asset }}
 
+      - name: Restore the Entware sources from cache
+        id: dl_cache
+        if: steps.toolchain.outputs.entware_config != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.temp }}/entware-dl
+            !${{ runner.temp }}/entware-dl/firc-*
+          key: entware-dl-v2-${{ hashFiles('tools/ci/entware-sdk/feeds.conf') }}
+
       - name: Build with the Entware SDK
         id: entware_sdk
         if: steps.toolchain.outputs.entware_config != ''
         continue-on-error: true
         run: |
           set -eu
-          sudo chown -R 1000:1000 "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}"
-          trap 'sudo chown -R --reference="$RUNNER_TEMP" "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}"' EXIT
+          mkdir -p "$RUNNER_TEMP/entware-dl"
+          rm -f "$RUNNER_TEMP"/entware-dl/firc-*
+          sudo chown -R 1000:1000 "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}" "$RUNNER_TEMP/entware-dl"
+          trap 'sudo chown -R --reference="$RUNNER_TEMP" "${{ steps.entware_feed.outputs.artifacts_dir }}" "${{ steps.entware_feed.outputs.feed_dir }}" "$RUNNER_TEMP/entware-dl"' EXIT
           docker run --rm \
             -v "$PWD/tools/ci/entware-sdk/build.sh:/bin/entrypoint:ro" \
+            -v "$RUNNER_TEMP/entware-dl:/builder/dl" \
             -v "${{ steps.sdk.outputs.path }}:/sdk/sdk.tar.zst:ro" \
             -v "$PWD/tools/ci/entware-sdk/feeds.conf:/sdk/feeds.conf:ro" \
             -v "${{ steps.entware_feed.outputs.artifacts_dir }}:/artifacts" \
@@ -197,6 +210,15 @@ jobs:
             -w /builder \
             ghcr.io/openwrt/buildbot/buildworker-v3.11.3:latest \
             /bin/entrypoint
+
+      - name: Save the Entware sources to cache
+        if: steps.toolchain.outputs.entware_config != '' && steps.dl_cache.outputs.cache-hit != 'true' && steps.entware_sdk.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ runner.temp }}/entware-dl
+            !${{ runner.temp }}/entware-dl/firc-*
+          key: entware-dl-v2-${{ hashFiles('tools/ci/entware-sdk/feeds.conf') }}
 
       - name: Report Entware SDK build failure
         if: steps.entware_sdk.outcome == 'failure'
