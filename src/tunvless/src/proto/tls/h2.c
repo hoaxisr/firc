@@ -1,24 +1,21 @@
-/* A minimal HTTP/2 client: one stream open at a time, a body both ways.
+/* A minimal HTTP/2 client: one stream on a connection, a body both ways. The gRPC transport's;
+ * xhttp runs on the multi-stream engine (h2mux.c, xconn.c).
  *
- * The grpc and xhttp transports are HTTP/2: the server expects the preface, frames and flow
- * control, and without them the connection just hangs.
+ * gRPC is HTTP/2: the server expects the preface, frames and flow control, and without them the
+ * connection just hangs.
  *
  * Deliberately NOT here, and why that is fine:
  *
- *   - multiplexing. Requests on a connection follow one another, and every VLESS connection
- *     gets its own TCP+TLS (Xray instead shares one between many: a cached gRPC connection
- *     per node, XMUX for xhttp). Multiplexing would save handshakes but needs a window
- *     scheduler between streams, code that costs more to debug on a single-core router than
- *     it is worth;
+ *   - multiplexing. Every VLESS connection gets its own TCP+TLS (Xray instead caches one gRPC
+ *     connection per node);
  *   - HPACK on receive. Response headers are not parsed; only :status is extracted: a static
  *     index, or a literal with an indexed name as digits or Huffman code (a Go server sends
- *     502, 401, 301 this way, see status_huff). Full HPACK needs a dynamic table, i.e. memory
+ *     502, 401, 301 this way, see status_huff in h2wire.h). Full HPACK needs a dynamic table, i.e. memory
  *     per connection;
  *   - PUSH_PROMISE. Disabled in SETTINGS, so it cannot arrive;
  *   - priorities and trailers. The first decides nothing, the second only closes the stream.
  *
- * Memory: one state per VLESS connection (two for xhttp with an upload link), and a loop
- * thread holds hundreds of connections (MAX_CONNS in stack.c), so there is no frame buffer.
+ * Memory: one state per VLESS connection, and a loop thread holds hundreds of connections (MAX_CONNS in stack.c), so there is no frame buffer.
  * Records are read into a per-thread buffer, and only what cannot be parsed at once carries
  * over between calls: a split frame header (9 bytes), a control frame body (64) and the count
  * of unread body. A 16 KB frame buffer per connection would add up to megabytes.
@@ -30,131 +27,13 @@
 #include <sys/random.h>
 
 #include "h2.h"
+#include "h2wire.h"
 #include "tls13.h"
-
-#define FR_DATA          0x00
-#define FR_HEADERS       0x01
-#define FR_RST_STREAM    0x03
-#define FR_SETTINGS      0x04
-#define FR_PING          0x06
-#define FR_GOAWAY        0x07
-#define FR_WINDOW_UPDATE 0x08
-
-#define FLAG_END_STREAM  0x01
-#define FLAG_ACK         0x01
-#define FLAG_END_HEADERS 0x04
-#define FLAG_PADDED      0x08
-#define FLAG_PRIORITY    0x20
-
-
-/* Our receive window. Large on purpose: with the default 65535 every 64 KB of download waits
- * for a WINDOW_UPDATE, which on a 100 ms link caps speed at about 5 Mbit/s whatever the
- * bandwidth. A megabyte costs nothing: it only lets the server send; we hold no memory for it. */
-#define OUR_WINDOW       (1024 * 1024)
-/* Refill every 32 KB, not every frame: a refill per frame is an extra TLS record per 16 KB of
- * data, a visible pattern in the stream. */
-#define WINDOW_REFILL    (32 * 1024)
-
-/* The largest frame a server must accept by default (RFC 7540 §4.2); more only if the server
- * allows it in SETTINGS. */
-#define DEFAULT_MAX_FRAME 16384
 
 /* How the server last ended a stream, for h2_strerror. Per thread, like g_last_status. */
 static __thread char g_reset_why[64];
 
-static void put32(unsigned char *p, uint32_t v) {
-    p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
-    p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
-}
-static uint32_t get32(const unsigned char *p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-}
-
-/* ---- HPACK on send ----------------------------------------------------------
- *
- * :method and :scheme go as indexed fields; everything else as "literal without indexing":
- * the name by its static table index (or as a string when the table lacks it), the value as a
- * plain string. There is no dynamic table at all, which is legal: HPACK allows indexing
- * nothing. No Huffman either: it would save tens of bytes per connection and need the code
- * table.
- *
- * Static table indices (RFC 7541, appendix A) are plain numbers: the table is part of the
- * protocol and never changes. */
-#define HP_AUTHORITY   1
-#define HP_METHOD_GET  2
-#define HP_METHOD_POST 3
-#define HP_PATH        4
-#define HP_SCHEME_HTTPS 7
-#define HP_CONTENT_TYPE 31
-#define HP_REFERER     51
-#define HP_USER_AGENT  58
-#define HP_ACCEPT      19
-#define HP_ACCEPT_LANG 17
-#define HP_CACHE_CTRL  24
-
-/* ---- browser look for xhttp ---------------------------------------------------------
- *
- * xhttp is a plain HTTP request to an ordinary-looking path, and it should come from what the
- * ClientHello already claims to be: a browser. gRPC headers (`te: trailers`,
- * `user-agent: grpc-go/1.60.0`) give xhttp away: nodes with CDN-cache-like paths
- * (`/static/v1/cache/<hash>`) answered them with RST/GOAWAY even though Reality accepted us;
- * something in front of the server cut them.
- *
- * The set is Xray's (transport/internet/splithttp/config.go: GetRequestHeader →
- * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(chrome, fetch)), repeated
- * name by name. Xray derives the Chrome version from the date (144 on 2026-01-13, plus one per
- * 35 days, minus a CPU-seeded lag; see h2.h); 149 is its highest value for early September
- * 2026. sec-ch-ua follows its rule: three brands, one fake, shuffled by the version number
- * (seed 149 gives exactly this order).
- *
- * The strings (UA_CHROME, UA_CH_CHROME) are in h2.h: the Upgrade requests of ws and
- * httpupgrade (proto/transport/trupgrade.c) use the same look, and two transports of one node
- * must not disagree on the browser version. */
-
 struct wbuf { unsigned char *p; size_t n, cap; };
-
-static void wb(struct wbuf *b, const void *d, size_t n) {
-    if (b->n + n <= b->cap) memcpy(b->p + b->n, d, n);
-    b->n += n;
-}
-static void wb8(struct wbuf *b, unsigned v) {
-    unsigned char c = (unsigned char)v;
-    wb(b, &c, 1);
-}
-
-/* An HPACK integer with an N-bit prefix, for indices and string lengths: the xhttp Referer with
- * its padding runs to a thousand bytes and more, while seven bits hold only 126. */
-static void hp_int(struct wbuf *b, unsigned prefix, unsigned bits, uint32_t v) {
-    uint32_t max = (1u << bits) - 1;
-    if (v < max) { wb8(b, prefix | v); return; }
-    wb8(b, prefix | max);
-    v -= max;
-    while (v >= 128) { wb8(b, (v & 0x7F) | 0x80); v >>= 7; }
-    wb8(b, v);
-}
-
-static void hp_str(struct wbuf *b, const char *s, size_t n) {
-    hp_int(b, 0x00, 7, (uint32_t)n);     /* no Huffman: high bit clear */
-    wb(b, s, n);
-}
-
-/* A field with a name from the static table and our own value. */
-static void hp_field(struct wbuf *b, unsigned name_index, const char *value) {
-    hp_int(b, 0x00, 4, name_index);      /* 0000 — literal without indexing */
-    hp_str(b, value, strlen(value));
-}
-
-/* A field whose name is not in the table. */
-static void hp_new(struct wbuf *b, const char *name, const char *value) {
-    wb8(b, 0x00);
-    hp_str(b, name, strlen(name));
-    hp_str(b, value, strlen(value));
-}
-
-/* An indexed field: name AND value from the static table. */
-static void hp_indexed(struct wbuf *b, unsigned index) {
-    hp_int(b, 0x80, 7, index);
-}
 
 /* ---- frames ------------------------------------------------------------------ */
 static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint32_t sid,
@@ -173,215 +52,43 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     return h->io.write(h->io.ctx, one, 9 + n);
 }
 
-/* HEADERS of one request. Pseudo-headers must come before the other fields (RFC 7540
- * §8.1.2.1).
- *
- * One function for every request of a connection (packet-up sends a series of short POSTs):
- * two places building headers would drift apart, and the symptom would be a server that
- * answers the first request and not the second. */
-/* Track a stream's response: opened (open_add), ended (open_end). Ids past H2_OPEN_MAX are not
- * tracked: callers that bound the count never get there. */
-static void open_add(struct h2 *h, uint32_t sid) {
-    if (h->open_n < H2_OPEN_MAX) h->open_sid[h->open_n++] = sid;
-}
-
-static void open_end(struct h2 *h, uint32_t sid) {
-    for (unsigned i = 0; i < h->open_n; i++)
-        if (h->open_sid[i] == sid) { h->open_sid[i] = h->open_sid[--h->open_n]; return; }
-}
-
-int h2_open_streams(const struct h2 *h) { return h->open_n; }
-
-uint32_t h2_oldest_open(const struct h2 *h) {
-    uint32_t m = 0;
-    for (unsigned i = 0; i < h->open_n; i++)
-        if (!m || h->open_sid[i] < m) m = h->open_sid[i];
-    return m;
-}
-
-struct hf { unsigned idx; const char *name, *value; int soft; };
-
-static const struct hf br_head[] = {
-    { 0, "sec-ch-ua", UA_CH_CHROME, 0 },
-    { 0, "sec-ch-ua-mobile", "?0", 0 },
-    { 0, "sec-ch-ua-platform", "\"Windows\"", 0 },
-    { 0, "dnt", "1", 0 },
-    { HP_USER_AGENT, "user-agent", UA_CHROME, 0 },
-    { HP_ACCEPT, "accept", "*/*", 1 },
-    { 0, "sec-fetch-site", "same-origin", 0 },
-    { 0, "sec-fetch-mode", "cors", 0 },
-    { 0, "sec-fetch-dest", "empty", 0 },
-};
-static const struct hf br_tail[] = {
-    { HP_ACCEPT_LANG, "accept-language", "en-US,en;q=0.9", 0 },
-    { 0, "priority", "u=1, i", 1 },
-    { HP_CACHE_CTRL, "cache-control", "no-cache", 1 },
-    { 0, "pragma", "no-cache", 1 },
-};
-static const struct hf grpc_tail[] = {
-    { 0, "te", "trailers", 0 },
-    { HP_USER_AGENT, "user-agent", "grpc-go/1.60.0", 0 },
-};
-
+/* HEADERS of the request. Pseudo-headers must come before the other fields (RFC 7540
+ * §8.1.2.1). */
 #define H2_MAX_BLOCK DEFAULT_MAX_FRAME
-#define NELEM(a) (sizeof(a) / sizeof((a)[0]))
-#define H2_PREFACE_LEN (24 + 9 + 12 + 9 + 4)
 
 static __thread unsigned char g_req_out[H2_PREFACE_LEN + 9 + H2_MAX_BLOCK];
-
-static int hf_taken(const struct h2_req *r, const char *name) {
-    for (size_t i = 0; r && i < r->fields_n; i++)
-        if (strcasecmp(r->fields[i].name, name) == 0) return 1;
-    return 0;
-}
-
-static int hf_forced(const struct hf *l, size_t n, const char *name) {
-    for (size_t i = 0; i < n; i++)
-        if (!l[i].soft && strcasecmp(l[i].name, name) == 0) return 1;
-    return 0;
-}
-
-static int look_forced(const char *name) {
-    return hf_forced(br_head, NELEM(br_head), name) || hf_forced(br_tail, NELEM(br_tail), name);
-}
-
-static void hp_list(struct wbuf *b, const struct hf *l, size_t n, const struct h2_req *r) {
-    for (size_t i = 0; i < n; i++) {
-        if (l[i].soft && hf_taken(r, l[i].name)) continue;
-        if (l[i].idx) hp_field(b, l[i].idx, l[i].value);
-        else hp_new(b, l[i].name, l[i].value);
-    }
-}
-
-static size_t hf_size(const struct hf *l, size_t n, const struct h2_req *r) {
-    size_t s = 0;
-    for (size_t i = 0; i < n; i++)
-        if (!l[i].soft || !hf_taken(r, l[i].name)) s += strlen(l[i].name) + strlen(l[i].value) + 32;
-    return s;
-}
-
-static void hp_user(struct wbuf *b, const struct h2_field *f) {
-    size_t n = strlen(f->name);
-    if (n == 7 && strncasecmp(f->name, "referer", 7) == 0) {
-        hp_field(b, HP_REFERER, f->value);
-        return;
-    }
-    wb8(b, 0x00);
-    hp_int(b, 0x00, 7, (uint32_t)n);
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)f->name[i];
-        wb8(b, c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
-    }
-    hp_str(b, f->value, strlen(f->value));
-}
-
-size_t h2_list_size(const struct h2 *h, const struct h2_req *r) {
-    size_t s = strlen(":method") + strlen(r->method) + 32;
-    s += strlen(":scheme") + strlen("https") + 32;
-    s += strlen(":path") + strlen(r->path) + 32;
-    s += strlen(":authority") + strlen(r->authority) + 32;
-    if (r->content_type) s += strlen("content-type") + strlen(r->content_type) + 32;
-    int look = h->browser && !r->no_look;
-    for (size_t i = 0; i < r->fields_n; i++)
-        if (!look || !look_forced(r->fields[i].name))
-            s += strlen(r->fields[i].name) + strlen(r->fields[i].value) + 32;
-    if (look)
-        s += hf_size(br_head, NELEM(br_head), r) + hf_size(br_tail, NELEM(br_tail), r);
-    else if (!h->browser) s += hf_size(grpc_tail, NELEM(grpc_tail), NULL);
-    return s;
-}
-
-uint32_t h2_stream_cap(const struct h2 *h) {
-    return h->peer_max_streams && h->peer_max_streams < H2_OPEN_MAX ? h->peer_max_streams : H2_OPEN_MAX;
-}
-
-uint32_t h2_header_budget(const struct h2 *h, uint32_t server_max) {
-    if (h->peer_settings_seen) return h->peer_hdr_list;
-    return server_max && server_max < 8192 ? server_max : 8192;
-}
 
 static int put_headers(struct h2 *h, struct wbuf *b, const struct h2_req *r) {
     size_t at = b->n;
     if (at + 9 > b->cap) return H2_ETOOBIG;
-    struct wbuf hp = { b->p + at + 9, 0, b->cap - at - 9 };
-    if (strcmp(r->method, "GET") == 0) hp_indexed(&hp, HP_METHOD_GET);
-    else if (strcmp(r->method, "POST") == 0) hp_indexed(&hp, HP_METHOD_POST);
-    else hp_field(&hp, HP_METHOD_GET, r->method);
-    hp_indexed(&hp, HP_SCHEME_HTTPS);
-    hp_field(&hp, HP_PATH, r->path);
-    hp_field(&hp, HP_AUTHORITY, r->authority);
-    if (r->content_type) hp_field(&hp, HP_CONTENT_TYPE, r->content_type);
-    if (h->browser && r->no_look) {
-        for (size_t i = 0; i < r->fields_n; i++) hp_user(&hp, &r->fields[i]);
-    } else if (h->browser) {
-        /* Chrome's order: client hints, then who it is, then what it wants and where it came
-         * from. Referer carries the xhttp padding and stands where a browser puts it. */
-        size_t lead = r->lead_n < r->fields_n ? r->lead_n : r->fields_n;
-        for (size_t i = 0; i < lead; i++)
-            if (!look_forced(r->fields[i].name)) hp_user(&hp, &r->fields[i]);
-        hp_list(&hp, br_head, NELEM(br_head), r);
-        for (size_t i = lead; i < r->fields_n; i++)
-            if (!look_forced(r->fields[i].name)) hp_user(&hp, &r->fields[i]);
-        hp_list(&hp, br_tail, NELEM(br_tail), r);
-    } else {
-        for (size_t i = 0; i < r->fields_n; i++) hp_user(&hp, &r->fields[i]);
-        /* te: trailers is the one connection-specific header HTTP/2 explicitly allows, and
-         * gRPC requires it. */
-        hp_list(&hp, grpc_tail, NELEM(grpc_tail), NULL);
-    }
-    if (hp.n > H2_MAX_BLOCK || hp.n > hp.cap) return H2_ETOOBIG;
+    size_t room = b->cap - at - 9;
+    size_t n = h2w_headers(b->p + at + 9, room < H2_MAX_BLOCK ? room : H2_MAX_BLOCK, r, 0);
+    if (!n) return H2_ETOOBIG;
 
     /* END_STREAM as the caller asks. A long-lived stream has none: the request body is the
      * upstream channel and lives as long as the connection. A download GET has no body, and
      * the server waits for the close right here. END_HEADERS always: the headers are short and
      * need no CONTINUATION. */
     unsigned char *hdr = b->p + at;
-    hdr[0] = (unsigned char)(hp.n >> 16); hdr[1] = (unsigned char)(hp.n >> 8);
-    hdr[2] = (unsigned char)hp.n;
+    hdr[0] = (unsigned char)(n >> 16); hdr[1] = (unsigned char)(n >> 8);
+    hdr[2] = (unsigned char)n;
     hdr[3] = FR_HEADERS;
     hdr[4] = (unsigned char)(FLAG_END_HEADERS | (r->end_stream ? FLAG_END_STREAM : 0));
     put32(hdr + 5, h->sid);
-    b->n = at + 9 + hp.n;
+    b->n = at + 9 + n;
     return 0;
 }
 
-int h2_start_req(struct h2 *h, const struct h2_io *io, const struct h2_req *r, int browser) {
+static int h2_start_req(struct h2 *h, const struct h2_io *io, const struct h2_req *r) {
     memset(h, 0, sizeof(*h));
     h->io = *io;
-    h->browser = browser;
     h->sid = 1;                          /* a client's first stream: the first odd id */
-    h->open_n = 0;
-    open_add(h, h->sid);
     h->send_win = 65535;                 /* the default until the server's SETTINGS */
     h->send_win_conn = 65535;
     h->peer_init_win = 65535;            /* the same default; shifts count from it */
 
     struct wbuf b = { g_req_out, 0, sizeof(g_req_out) };
-
-    /* The preface, byte for byte from RFC 7540 §3.5: the server compares it literally. */
-    wb(&b, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24);
-
-    /* SETTINGS: disable push (not needed, it would only complicate parsing) and announce our
-     * stream window. */
-    {
-        unsigned char s[12];
-        s[0] = 0; s[1] = 0x02; put32(s + 2, 0);              /* ENABLE_PUSH = 0 */
-        s[6] = 0; s[7] = 0x04; put32(s + 8, OUR_WINDOW);     /* INITIAL_WINDOW_SIZE */
-        unsigned char hdr[9] = { 0, 0, 12, FR_SETTINGS, 0, 0, 0, 0, 0 };
-        wb(&b, hdr, 9);
-        wb(&b, s, 12);
-    }
-
-    /* The CONNECTION window is not set by SETTINGS, only by WINDOW_UPDATE on stream 0. Without
-     * this frame it stays at 65535 and caps the 1 MB stream window, the very limit OUR_WINDOW
-     * is there to lift. */
-    {
-        unsigned char wu[4];
-        put32(wu, OUR_WINDOW - 65535);
-        unsigned char hdr[9] = { 0, 0, 4, FR_WINDOW_UPDATE, 0, 0, 0, 0, 0 };
-        wb(&b, hdr, 9);
-        wb(&b, wu, 4);
-    }
+    b.n = h2w_preface(g_req_out, sizeof(g_req_out), 1);
 
     int rc = put_headers(h, &b, r);
     if (rc) return rc;
@@ -403,50 +110,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
     const struct h2_req r = { .authority = authority, .path = path,
                               .content_type = content_type, .method = "POST",
                               .fields = referer ? &ref : NULL, .fields_n = referer ? 1 : 0 };
-    return h2_start_req(h, io, &r, 0);
-}
-
-int h2_next_req(struct h2 *h, const struct h2_req *r) {
-    if (!h->started) return H2_EPROTO;
-    /* After GOAWAY the server takes no new streams (RFC 9113 §6.8): the request would get no
-     * answer. Refusing now means reconnecting now, not after a timeout. */
-    if (h->goaway) {
-        snprintf(h->why, sizeof(h->why), "GOAWAY: no new streams");
-        snprintf(g_reset_why, sizeof(g_reset_why), "%s", h->why);
-        return H2_ERESET;
-    }
-    struct wbuf b = { g_req_out, 0, sizeof(g_req_out) };
-    uint32_t sid = h->sid;
-    h->sid += 2;
-    int rc = put_headers(h, &b, r);
-    if (rc == 0 && b.n > sizeof(g_req_out)) rc = H2_ETOOBIG;
-    if (rc) { h->sid = sid; return rc; }
-
-    h->pend_err = 0;                 /* the previous chunk's end does not carry over */
-
-    /* The id grows by two: client streams are odd (RFC 7540 §5.1.1). Reusing a closed
-     * stream's id is a connection error, not a stream error: the whole connection drops. */
-    open_add(h, h->sid);
-
-    /* Fresh STREAM state, CONNECTION state untouched. The connection window and the server's
-     * settings are shared by all requests, while each stream's window is granted anew at the
-     * initial value from the server's SETTINGS. Resetting the shared state too would forget
-     * how much we were already allowed and overrun the connection window. */
-    h->status = 0;
-    h->done = 0;
-    h->send_win = h->peer_init_win;
-    /* The STREAM credit is dropped: the old stream is closed, its window need not grow.
-     * recv_credit_conn is NOT touched: it belongs to the connection, and zeroing it would never
-     * return window the server already spent. */
-    h->recv_credit = 0;
-    return h->io.write(h->io.ctx, g_req_out, b.n);
-}
-
-int h2_end_stream(struct h2 *h) {
-    if (!h->started) return H2_EPROTO;
-    /* An empty DATA with END_STREAM, a frame of its own: h2_write takes no flags and does not
-     * know which data is the last. */
-    return frame_out(h, FR_DATA, FLAG_END_STREAM, h->sid, NULL, 0);
+    return h2_start_req(h, io, &r);
 }
 
 /* Refills the receive windows when enough has accumulated. Both levels: connection and stream
@@ -496,10 +160,6 @@ static int ctl_handle(struct h2 *h) {
     switch (h->frame_type) {
         case FR_SETTINGS:
             if (h->frame_flags & FLAG_ACK) return 0;
-            if (!h->peer_settings_seen) {
-                h->peer_settings_seen = 1;
-                h->peer_hdr_list = 16384;
-            }
             /* INITIAL_WINDOW_SIZE shifts the SEND window of the open stream by the difference
              * (RFC 7540 §6.9.2); without it we either waste the window or overrun it. */
             for (size_t i = 0; i + 6 <= h->ctl_n; i += 6) {
@@ -508,8 +168,6 @@ static int ctl_handle(struct h2 *h) {
                 /* The server's MAX_FRAME_SIZE is ignored on purpose: it cannot be below
                  * 16384, and we never send more, which is legal under any setting. Larger
                  * frames would gain nothing and need a larger send buffer. */
-                if (id == 0x06) h->peer_hdr_list = v;
-                if (id == 0x03) h->peer_max_streams = v;
                 if (id == 0x04) {
                     /* Only the STREAM window shifts; SETTINGS never change the connection
                      * window, only WINDOW_UPDATE does. The difference is from the PREVIOUS
@@ -532,8 +190,8 @@ static int ctl_handle(struct h2 *h) {
 
         case FR_WINDOW_UPDATE: {
             if (h->ctl_n < 4) return 0;
-            /* A late one for an earlier stream (packet-up opens one per chunk) opens nothing of
-             * ours: adding it to the connection window would overrun the server's. */
+            /* One for another stream opens nothing of ours: adding it to the connection window
+             * would overrun the server's. */
             if (h->frame_sid != 0 && !h->frame_ours) return 0;
             int32_t inc = (int32_t)(get32(h->ctl) & 0x7FFFFFFF);
             /* The 2^31-1 limit is mandatory (RFC 7540 §6.9.1). Adding without the check is
@@ -551,22 +209,18 @@ static int ctl_handle(struct h2 *h) {
         }
 
         case FR_RST_STREAM:
-            open_end(h, h->frame_sid);
-            /* A reset of a CLOSED stream is not our end. A Go server sends
-             * RST_STREAM(NO_ERROR) on a stream whose handler has finished; with packet-up it
-             * arrives for an earlier chunk while the next one is open. */
+            /* A reset of another stream is not our end. */
             if (!h->frame_ours) return 0;
             return h2_reset(h, "RST_STREAM", h->ctl_n >= 4 ? get32(h->ctl) : 0);
 
         case FR_GOAWAY: {
-            /* The end of the CONNECTION: no new streams after it (h2_next_req refuses). The current
+            /* The end of the CONNECTION: no new streams after it. The current
              * stream is not necessarily over: last_stream_id says how far the server will go
              * (RFC 9113 §6.8). A Go server closes gracefully with GOAWAY(NO_ERROR, the highest
              * id), then PING and a second GOAWAY, and finishes the streams in progress. The
              * stream ends here only on an error code or when our id is past last_stream_id. */
             uint32_t last = h->ctl_n >= 4 ? get32(h->ctl) & 0x7FFFFFFFu : 0;
             uint32_t code = h->ctl_n >= 8 ? get32(h->ctl + 4) : 0;
-            h->goaway = 1;
             if (code != 0) return h2_reset(h, "GOAWAY", code);
             if (h->sid > last) {
                 snprintf(h->why, sizeof(h->why), "GOAWAY: stream not accepted");
@@ -582,76 +236,9 @@ static int ctl_handle(struct h2 *h) {
  * connections at once, and a shared one would be overwritten. */
 static __thread int g_last_status;
 
-/* Three status digits in HPACK Huffman code (RFC 7541, appendix B). A Go server (Xray)
- * Huffman-codes a value whenever that is shorter: "502", "401", "301" take two bytes instead of
- * three. Without this the status stays -1, and a refusal looks like an answer without data.
- *
- * Only digits are needed: "0", "1", "2" have 5-bit codes 00000…00010, "3"…"9" 6-bit codes
- * 011001…011111. Any other symbol means this is not a status: -1. After three digits only
- * padding of ones shorter than a byte is allowed (§5.2). */
-static int status_huff(const unsigned char *p, size_t n) {
-    uint32_t acc = 0;
-    unsigned bits = 0;
-    size_t i = 0;
-    int v = 0;
-    for (int d = 0; d < 3; d++) {
-        while (bits < 6 && i < n) { acc = (acc << 8) | p[i++]; bits += 8; }
-        if (bits < 5) return -1;
-        unsigned c5 = (acc >> (bits - 5)) & 0x1F;
-        if (c5 <= 2) { v = v * 10 + (int)c5; bits -= 5; }
-        else {
-            if (bits < 6) return -1;
-            unsigned c6 = (acc >> (bits - 6)) & 0x3F;
-            if (c6 < 0x19 || c6 > 0x1F) return -1;
-            v = v * 10 + (int)(c6 - 0x19 + 3);
-            bits -= 6;
-        }
-        acc &= (1u << bits) - 1;
-    }
-    if (i != n || bits >= 8 || acc != (1u << bits) - 1) return -1;
-    return v;
-}
-
-/* The response status from the first bytes of HEADERS, without the dynamic table. In practice
- * the server sends ":status 200" as index 8, the single byte 0x88. Anything unknown gives -1,
- * NOT an error: a guessed status is worse than none, and the read shows whether data came. */
 static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
-    size_t i = 0;
-    /* A dynamic table size update (001xxxxx) comes first, if at all. Its value is an integer
-     * with a 5-bit prefix: with 0x1F in the low bits it continues in the next bytes, high bit
-     * set. */
-    while (i < n && (p[i] & 0xE0) == 0x20) {
-        int cont = (p[i] & 0x1F) == 0x1F;
-        i++;
-        if (!cont) continue;
-        while (i < n && (p[i] & 0x80)) i++;
-        if (i < n) i++;
-    }
-    if (i >= n) { h->status = -1; return; }
-    switch (p[i]) {
-        case 0x88: h->status = 200; break;
-        case 0x89: h->status = 204; break;
-        case 0x8A: h->status = 206; break;
-        case 0x8B: h->status = 304; break;
-        case 0x8C: h->status = 400; break;
-        case 0x8D: h->status = 404; break;
-        case 0x8E: h->status = 500; break;
-        default:
-            /* A literal with the :status name (index 8): the value as three digits. */
-            if ((p[i] & 0x0F) == 0x08 && i + 2 < n) {
-                size_t len = p[i + 1] & 0x7F;
-                if (!(p[i + 1] & 0x80) && len == 3 && i + 4 < n) {
-                    h->status = (p[i + 2] - '0') * 100 + (p[i + 3] - '0') * 10 + (p[i + 4] - '0');
-                    break;
-                }
-                /* The same value in Huffman code: three digits take 15 to 18 bits. */
-                if ((p[i + 1] & 0x80) && len >= 2 && len <= 3 && i + 1 + len < n) {
-                    int v = status_huff(p + i + 2, len);
-                    if (v >= 100) { h->status = v; break; }
-                }
-            }
-            h->status = -1;
-    }
+    int s = h2w_status(p, n);
+    h->status = s ? s : -1;
 }
 
 /* Stop parsing the record with rc. Data this call has already put in out is RETURNED and rc
@@ -721,10 +308,10 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
             size_t body = h->frame_left > h->pad_left ? h->frame_left - h->pad_left : 0;
             size_t real = take < body ? take : body;
             if (h->frame_type == FR_DATA) {
-                /* The CONNECTION window is always credited, even for a frame of the closed
-                 * stream of an earlier chunk: the bytes came out of the shared window, and it
-                 * is on us to return them. Padding counts too: the window pays for the whole
-                 * frame (RFC 7540 §6.9.1). */
+                /* The CONNECTION window is always credited, even for a frame of another
+                 * stream: the bytes came out of the shared window, and it is on us to return
+                 * them. Padding counts too: the window pays for the whole frame (RFC 7540
+                 * §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
                     if (*got + real > cap) H2_STOP(H2_ETOOBIG);
@@ -734,18 +321,6 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                 }
             } else if (h->frame_type == FR_HEADERS) {
                 if (h->frame_ours && h->status == 0 && real) status_peek(h, rec + p, real);
-                else if (!h->frame_ours && !h->frame_peeked && real) {
-                    /* An answer on an earlier stream (packet-up: the previous chunk). Only
-                     * the start of the frame is looked at, as for our own: the status is the
-                     * first field. status_peek writes h->status, which the current stream must
-                     * not see. */
-                    int keep = h->status;
-                    h->status = 0;
-                    status_peek(h, rec + p, real);
-                    if (h->status > 0 && h->status != 200) h->old_status = h->status;
-                    h->status = keep;
-                }
-                if (real) h->frame_peeked = 1;
             } else {
                 /* A control frame: collect what fits of the body and drop the rest. Nothing
                  * that matters is lost except SETTINGS entries past the tenth; GOAWAY debug data
@@ -762,11 +337,9 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                     rc = ctl_handle(h);
                     if (rc) H2_STOP(rc);
                 }
-                if ((h->frame_flags & FLAG_END_STREAM) &&
-                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
-                    open_end(h, h->frame_sid);
-                    if (h->frame_ours) h->done = 1;
-                }
+                if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
+                    (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
+                    h->done = 1;
                 h->frame_type = 0xFF;
             }
             continue;
@@ -783,14 +356,10 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
         h->frame_type = rec[p + 3];
         h->frame_flags = rec[p + 4];
         uint32_t sid = get32(rec + p + 5) & 0x7FFFFFFF;
-        /* "Ours" is only the CURRENT stream. packet-up leaves the closed streams of earlier
-         * chunks behind, and the server may still send HEADERS and END_STREAM on them after
-         * we opened the next. Such frames count toward the connection window (the body
-         * parsing does that) and are dropped: their content is an empty 200 answer to an
-         * upload. A non-200 status there goes to old_status. */
+        /* "Ours" is only our stream. Frames of any other count toward the connection window
+         * (the body parsing does that) and are dropped. */
         h->frame_ours = (sid == h->sid);
         h->frame_sid = sid;
-        h->frame_peeked = 0;
         h->frame_left = len;
         h->ctl_n = 0;
         p += 9;
@@ -811,18 +380,15 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
                 rc = ctl_handle(h);
                 if (rc) H2_STOP(rc);
             }
-            if ((h->frame_flags & FLAG_END_STREAM) &&
-                (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS)) {
-                open_end(h, h->frame_sid);
-                if (h->frame_ours) h->done = 1;
-            }
+            if ((h->frame_flags & FLAG_END_STREAM) && h->frame_ours &&
+                (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS))
+                h->done = 1;
             h->frame_type = 0xFF;
         }
     }
 
 deliver:
     if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
-    if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
     if (h->pend_err) return 0;       /* the stream is over: no point growing its window */
     rc = window_refill(h);
     if (rc) return rc;
@@ -878,6 +444,11 @@ long h2_room(const struct h2 *h) {
     return w > 0 ? w : 0;
 }
 
+void h2_note_end(int rc, int status) {
+    if (rc == H2_ESTATUS) g_last_status = status;
+    if (rc == H2_ERESET) g_reset_why[0] = '\0';
+}
+
 const char *h2_strerror(int rc) {
     switch (rc) {
         case H2_EIO: return "HTTP/2 connection lost";
@@ -899,6 +470,8 @@ const char *h2_strerror(int rc) {
         }
         case H2_ETOOBIG: return "HTTP/2 frame too large";
         case H2_EWINDOW: return "HTTP/2 window closed";
+        case H2_EFULL: return "no free HTTP/2 stream on the connection";
+        case H2_EFLOW: return "HTTP/2 flow control window overrun by the server";
         default: return "unknown HTTP/2 error";
     }
 }

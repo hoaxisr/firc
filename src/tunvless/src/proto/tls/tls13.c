@@ -843,20 +843,37 @@ size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap) {
 
 /* ---- data ------------------------------------------------------------------ */
 
-int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
+int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap, size_t *out_n) {
     if (!t->ready) return TLS13_ESTATE;
+    size_t recs = (n + TLS13_MAX_PLAIN - 1) / TLS13_MAX_PLAIN;
+    if (n + recs * 22 > cap) return TLS13_ETOOBIG;
+    size_t o = 0;
     while (n) {
         size_t chunk = n > TLS13_MAX_PLAIN ? TLS13_MAX_PLAIN : n;
-        unsigned char out[TLS13_MAX_REC + 5];
         size_t total = chunk + 1 + 16;          /* + inner type + tag */
-        out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
-        out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
-        memcpy(out + 5, data, chunk);
-        out[5 + chunk] = 0x17;                  /* inner type: application_data */
-        if (tls13_aead_seal(&t->wr, t->wr_seq++, out, 5, out + 5, chunk + 1,
-                      out + 5 + chunk + 1) != 0)
+        unsigned char *r = out + o;
+        r[0] = 0x17; r[1] = 0x03; r[2] = 0x03;
+        r[3] = (unsigned char)(total >> 8); r[4] = (unsigned char)total;
+        memmove(r + 5, d, chunk);
+        r[5 + chunk] = 0x17;                    /* inner type: application_data */
+        if (tls13_aead_seal(&t->wr, t->wr_seq++, r, 5, r + 5, chunk + 1, r + 5 + chunk + 1) != 0)
             return TLS13_ECRYPTO;
-        size_t want = 5 + total, sent = 0;
+        o += 5 + total;
+        d += chunk;
+        n -= chunk;
+    }
+    *out_n = o;
+    return 0;
+}
+
+int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
+    if (!t->ready) return TLS13_ESTATE;
+    unsigned char out[TLS13_MAX_REC + 5];
+    while (n) {
+        size_t chunk = n > TLS13_MAX_PLAIN ? TLS13_MAX_PLAIN : n;
+        size_t want = 0, sent = 0;
+        int rc = tls13_seal(t, data, chunk, out, sizeof out, &want);
+        if (rc) return rc;
         while (sent < want) {
             ssize_t w = write(t->fd, out + sent, want - sent);
             if (w <= 0) {

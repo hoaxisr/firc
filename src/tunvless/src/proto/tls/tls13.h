@@ -188,6 +188,7 @@ size_t tls13_buffered(const struct tls13 *t);
  * then deliver zero bytes). */
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap);
 
+int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap, size_t *out_n);
 int tls13_write(struct tls13 *t, const unsigned char *data, size_t n);
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);
 

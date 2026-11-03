@@ -526,9 +526,9 @@ jobs:
           TUNVLESS_NO_SOCKOPT_READ: 1
         run: |
           set -eu
-          tests="h2match xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
-                 rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch xhoptsmatch tun6match vreqmatch \
-                 scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch dialmatch probematch"
+          tests="h2match h2muxmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
+                 rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch xhoptsmatch xmuxmatch tun6match vreqmatch \
+                 scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch dialmatch probematch xconnmatch"
           run=""
           for t in $tests; do
             case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac

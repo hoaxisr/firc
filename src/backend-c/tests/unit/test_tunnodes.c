@@ -457,6 +457,23 @@ TEST a_node_the_parser_skips_is_listed_with_its_reason(void)
     PASS();
 }
 
+/* catches: the xmux conflict not reaching the node row, or the node sent */
+TEST an_xmux_conflict_is_a_named_skip(void)
+{
+    static const char body[] = "vless://" U "@a.example:443?security=none#ok\n"
+                               "vless://" U "@b.example:443?type=xhttp&security=none&path=%2Fx&extra="
+                               "%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A4%2C%22maxConnections%22%3A2%7D%7D#both\n";
+    const firc_tunnel_t *t = tunnel(SUB_A, "");
+    ASSERT(t != NULL);
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
+    const char *want[] = {"aaaaaaaa:ok", "aaaaaaaa:both"};
+    ASSERT(keys_are(want, 2));
+    ASSERT(g_nodes.v[1].link == NULL);
+    ASSERT_STR_EQ("xhttp: maxConnections cannot be specified together with maxConcurrency", g_nodes.v[1].skip_reason);
+    PASS();
+}
+
 TEST an_ipv6_server_is_sent_as_a_bracketed_link(void)
 {
     /* catches: a node with an IPv6 server dropped, or its host written without brackets */
@@ -856,6 +873,7 @@ int main(int argc, char **argv)
     RUN_TEST(the_body_of_another_mark_is_not_used);
     RUN_TEST(the_body_of_other_headers_is_not_used);
     RUN_TEST(a_node_the_parser_skips_is_listed_with_its_reason);
+    RUN_TEST(an_xmux_conflict_is_a_named_skip);
     RUN_TEST(a_download_block_at_a_sink_counts_as_one);
     RUN_TEST(a_download_block_without_a_port_is_no_stub);
     RUN_TEST(a_node_with_a_download_block_is_sent_with_it);

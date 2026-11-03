@@ -39,6 +39,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sched.h>
 
 /* ---- connector thread stacks --------------------------------------------------- */
 
@@ -79,6 +80,7 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 
 #include "../src/tunnel/stack.c"
 #include "vldial.h"
+#include "trxmux.h"
 #include "client.h"
 #include "../src/tunnel/pool.c"
 
@@ -153,7 +155,8 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     g_recv_n = 0;
     return 0;
 }
-int transport_has_data(const struct transport *c) { (void)c; return 0; }
+static int g_held_on;
+int transport_has_data(const struct transport *c) { (void)c; return g_held_on && g_recv_n > 0; }
 long transport_room(struct transport *c) { (void)c; return g_room; }
 void transport_close(struct transport *c) {
     if (__atomic_load_n(&g_own_fd, __ATOMIC_ACQUIRE) && c->link.fd >= 0 && c->link.fd != g_sess_pipe[0])
@@ -162,6 +165,17 @@ void transport_close(struct transport *c) {
 }
 void transport_moved(struct transport *c) { (void)c; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
+int tr_xmux_shares(const struct tr_node *n) { (void)n; return 0; }
+int tr_xmux_attach(struct transport *t, const struct tr_node *n, const void *key, const void *dl_key,
+                   uint16_t owner, const struct xc_ref *ref)
+    { (void)t; (void)n; (void)key; (void)dl_key; (void)owner; (void)ref; return XA_NONE; }
+void tr_xmux_host(const struct mux_host *h, int (*stale)(const struct xc_ref *r)) { (void)h; (void)stale; }
+int tr_xmux_dial(void *link, int timeout_s) { (void)link; (void)timeout_s; return TR_ECONNECT; }
+int tr_xmux_event(unsigned idx, uint32_t ev) { (void)idx; (void)ev; return 0; }
+int tr_xmux_pass(uint64_t now_ms, int phase) { (void)now_ms; (void)phase; return 0; }
+int tr_xmux_cut(const struct transport *t) { (void)t; return 0; }
+int tr_xmux_busy(void) { return 0; }
+void tr_xmux_dropped(void *link) { (void)link; }
 const char *vless_strerror(int rc) { (void)rc; return "stub"; }
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n) {
     (void)node; (void)timeout_s; (void)why; (void)why_n; return -1;
@@ -948,8 +962,8 @@ static void t_dns_evict(void) {
 }
 
 /* Spare pool: a ready session is handed to a connection, and its slot is empty afterwards. The
- * self-pointers are fixed by the transport (xhttp_moved, through the dialer's take) and checked in
- * tests/takematch.c on the real transport; the pool slot is the stack's job, checked here. */
+ * move is the dialer's take, checked in tests/takematch.c on the real transport; the pool slot is
+ * the stack's job, checked here. */
 static void t_spare_slot(void) {
     static struct vl_sess spare;
     memset(&spare, 0, sizeof(spare));
@@ -1204,6 +1218,7 @@ static int f_probe(const void *node, int t, char *why, size_t n) {
 }
 static const char *f_name(const void *node) { return ((const struct fnode *)node)->name; }
 static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .name = f_name };
+static const struct pool_proto *g_pproto = &f_proto;
 
 static int g_cand[5] = { 0, 1, 2, 3, 4 };
 static const void *f_at(int i) { return &g_fn[i]; }
@@ -1220,7 +1235,7 @@ static void pool_new_ex(int active, int by, int ncand, int checked) {
     g_pl.any_v6 = 0;
     g_pl.sig6 = 0;
     struct pool_cfg pc = {
-        .proto = &f_proto, .node = f_at, .sel = g_cand,
+        .proto = g_pproto, .node = f_at, .sel = g_cand,
         .sel_n = (size_t)ncand, .first = 0, .checked = checked, .active = active, .by = by,
         .interval_s = 60, .silence_s = 20,
     };
@@ -3944,6 +3959,32 @@ static void t_k_room(void) {
     if (fd >= 0) close(fd);
 }
 
+/* catches: data a transport took off the socket outside a read left waiting for a socket event */
+static void t_k_held_data(void) {
+    k_vless();
+    int fd = k_dial(ip4(93, 184, 216, 42), 443, 1);
+    struct conn *c = k_ready(fd, 200);
+    if (fd >= 0 && send(fd, "GET", 3, 0) != 3) check(0, "fixture: client send failed");
+    unsigned char w[64];
+    size_t n = 0;
+    for (int i = 0; c && i < 100 && n < 29; i++) {
+        spin(1);
+        n = wire_of(c, w, sizeof w);
+    }
+    g_recv_buf[0] = 0;
+    g_recv_buf[1] = 0;
+    memcpy(g_recv_buf + 2, "pong", 4);
+    g_recv_n = 6;
+    g_held_on = 1;
+    char b[8] = { 0 };
+    int seen = k_wait(fd, 20);
+    ssize_t r = seen == 'D' ? recv(fd, b, sizeof b, MSG_DONTWAIT) : -1;
+    g_held_on = 0;
+    check(c && n == 29 && r == 4 && !memcmp(b, "pong", 4),
+          "data the transport holds goes to the client without a socket event");
+    if (fd >= 0) close(fd);
+}
+
 /* Catches an evicted socket connection reset on the TUN instead of on its socket. */
 static void t_k_evict(void) {
     k_vless();
@@ -4185,11 +4226,11 @@ static void t_k_fd_table(void) {
     struct rlimit save, rl;
     getrlimit(RLIMIT_NOFILE, &save);
     rl = save;
-    rl.rlim_cur = 844;
+    rl.rlim_cur = 908;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
     int cap100 = g_park_cap;
-    rl.rlim_cur = 744;
+    rl.rlim_cur = 808;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
     int cap0 = g_park_cap;
@@ -5842,6 +5883,735 @@ static void ib_part(void) {
     ib_fixture();
 }
 
+struct msess { const struct fnode *node; int udp; };
+
+static const struct mux_host *g_mh;
+static int g_m_attach_rc, g_m_attach_n, g_m_connect_n, g_m_lost, g_m_cut, g_m_read_rc, g_m_send_rc;
+static int g_m_send_n, g_m_dial_n, g_m_dial_in, g_m_release, g_m_dropped_n;
+static uint16_t g_m_owner;
+static struct xc_ref g_m_ref;
+static unsigned char g_m_sent[4096];
+static size_t g_m_sent_n, g_m_rn, g_m_wake_rn;
+static long g_m_room, g_m_wake_room;
+static unsigned g_m_wake_what;
+static int g_m_wake_rc;
+static struct xconn g_m_link[CONNECTORS + 1];
+static uint16_t g_m_link_owner[CONNECTORS + 1];
+static int g_m_link_gone[CONNECTORS + 1];
+static int g_m_link_n;
+static char g_m_log[64];
+static size_t g_m_log_n;
+static int g_m_sp[2] = { -1, -1 };
+static int g_m_watch_on, g_m_watch_rc, g_m_dial_rc;
+static unsigned g_m_watch_ev;
+static int g_m_ev_n;
+static unsigned g_m_ev_idx, g_m_ev_last;
+
+static void m_log(char ch) {
+    if (g_m_log_n + 1 < sizeof g_m_log) g_m_log[g_m_log_n++] = ch;
+    g_m_log[g_m_log_n] = 0;
+}
+
+static int m_connect(const void *ctx, void *sess, int t) {
+    (void)ctx; (void)sess; (void)t;
+    __atomic_add_fetch(&g_m_connect_n, 1, __ATOMIC_SEQ_CST);
+    return TR_ECONNECT;
+}
+static void m_take(void *dst, void *src) { (void)dst; (void)src; }
+static void m_close(void *sess) { (void)sess; }
+static void m_clear(void *sess) { memset(sess, 0, sizeof(struct msess)); }
+static int m_fd(const void *sess) { (void)sess; return -1; }
+static int m_has_data(const void *sess) { (void)sess; return g_m_rn > 0; }
+static int m_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
+    (void)k;
+    struct msess *s = sess;
+    s->node = ctx;
+    s->udp = udp;
+    return 0;
+}
+static int m_set_host(void *sess, const char *host) { (void)sess; (void)host; return 0; }
+static int m_send(const void *ctx, void *sess, const struct flow_key *k, int udp, const unsigned char *d, size_t n) {
+    (void)ctx; (void)sess; (void)k; (void)udp;
+    g_m_send_n++;
+    if (g_m_send_rc != SEND_OK) return g_m_send_rc;
+    if (g_m_sent_n + n > sizeof g_m_sent) return SEND_FATAL;
+    if (n) {
+        memcpy(g_m_sent + g_m_sent_n, d, n);
+        m_log('S');
+    }
+    g_m_sent_n += n;
+    return SEND_OK;
+}
+static long m_room(const void *ctx, void *sess) { (void)ctx; (void)sess; return g_m_room; }
+static int m_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
+    (void)sess;
+    *got = 0;
+    if (g_m_read_rc) return g_m_read_rc;
+    size_t n = g_m_rn < cap ? g_m_rn : cap;
+    memset(buf, 'r', n);
+    if (n) m_log('R');
+    *data = buf;
+    *got = n;
+    g_m_rn -= n;
+    return 0;
+}
+static void m_lost(const void *ctx, const void *sess) { (void)ctx; (void)sess; g_m_lost++; }
+
+static void m_host(const struct mux_host *h) { g_mh = h; }
+static int m_attach(const void *ctx, void *sess, uint16_t owner, const struct xc_ref *ref) {
+    (void)ctx; (void)sess;
+    g_m_attach_n++;
+    g_m_owner = owner;
+    if (ref) g_m_ref = *ref;
+    return g_m_attach_rc;
+}
+static int m_dial(const void *ctx, void *link, int t) {
+    (void)ctx; (void)link; (void)t;
+    __atomic_add_fetch(&g_m_dial_n, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_m_dial_in, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&g_m_release, __ATOMIC_ACQUIRE)) sched_yield();
+    return g_m_dial_rc;
+}
+static int m_event(unsigned idx, uint32_t ev) {
+    g_m_ev_n++;
+    g_m_ev_idx = idx;
+    g_m_ev_last = ev;
+    return 0;
+}
+static int g_m_due;
+static int m_pass(uint64_t now, int phase) {
+    (void)now;
+    m_log(phase == MUXP_EARLY ? 'E' : 'L');
+    if (phase == MUXP_LATE) return g_m_due;
+    if (phase == MUXP_EARLY && g_m_watch_on) {
+        g_m_watch_on = 0;
+        g_m_watch_rc = g_mh->watch(0, g_m_sp[0], g_m_watch_ev);
+    }
+    if (phase != MUXP_EARLY || !g_m_wake_what) return 0;
+    if (g_m_wake_rn) g_m_rn = g_m_wake_rn;
+    if (g_m_wake_room != -2) g_m_room = g_m_wake_room;
+    unsigned what = g_m_wake_what;
+    g_m_wake_what = 0;
+    g_m_wake_rn = 0;
+    g_m_wake_room = -2;
+    g_mh->wake(g_mh->arg, g_m_owner, what, g_m_wake_rc);
+    return 0;
+}
+static int m_cut(const void *sess) { (void)sess; return g_m_cut; }
+static int m_busy(void) {
+    int n = 0;
+    for (int i = 0; i < g_m_link_n; i++)
+        n += !g_m_link_gone[i] && !__atomic_load_n(&g_m_link[i].done, __ATOMIC_ACQUIRE);
+    return n;
+}
+static void m_dropped(void *link) {
+    int i = (int)((struct xconn *)link - g_m_link);
+    g_m_dropped_n++;
+    g_m_link_gone[i] = 1;
+    if (g_m_link_owner[i] != UINT16_MAX) g_mh->wake(g_mh->arg, g_m_link_owner[i], XW_DONE, TR_ECLOSED);
+}
+
+static const struct dialer_mux m_mux = {
+    .host = m_host, .attach = m_attach, .dial = m_dial, .event = m_event, .pass = m_pass, .cut = m_cut,
+    .busy = m_busy, .dropped = m_dropped,
+};
+static const struct dialer_ops m_ops = {
+    .name = "mux", .sess_size = sizeof(struct msess), .peer = f_peer, .describe = f_describe,
+    .strerror = tr_dial_strerror, .connect = m_connect, .take = m_take, .close = m_close, .clear = m_clear,
+    .fd = m_fd, .has_data = m_has_data, .flow_open = m_flow_open, .send = m_send, .room = m_room,
+    .dgram_frame = f_dgram_frame, .read = m_read, .deliver = f_deliver, .lost = m_lost, .set_host = m_set_host,
+    .mux = &m_mux,
+};
+static const struct pool_proto m_proto = { .ops = &m_ops, .probe = f_probe, .name = f_name };
+
+static void m_zero(void) {
+    g_m_attach_rc = XA_READY;
+    g_m_attach_n = g_m_lost = g_m_cut = g_m_read_rc = g_m_send_n = g_m_dial_n = g_m_dial_in = 0;
+    g_m_dropped_n = g_m_link_n = 0;
+    g_m_watch_on = g_m_watch_rc = g_m_dial_rc = g_m_ev_n = 0;
+    g_m_log_n = 0;
+    g_m_log[0] = 0;
+    g_m_send_rc = SEND_OK;
+    __atomic_store_n(&g_m_connect_n, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_m_release, 0, __ATOMIC_SEQ_CST);
+    g_m_sent_n = g_m_rn = g_m_wake_rn = 0;
+    g_m_room = -1;
+    g_m_wake_room = -2;
+    g_m_wake_what = 0;
+    g_m_wake_rc = 0;
+    g_m_due = 0;
+    memset(&g_m_ref, 0, sizeof g_m_ref);
+    memset(g_m_link_gone, 0, sizeof g_m_link_gone);
+    memset(g_m_link, 0, sizeof g_m_link);
+    pm_drain(NULL, NULL);
+}
+
+static void m_new(void) {
+    static struct dialer d = { .ops = &m_ops, .ctx = &g_fn[0], .silence_s = 20 };
+    k_reset();
+    g_spare_want = 0;
+    stack_setup(&d);
+    loop_mux(&g_L);
+    m_zero();
+}
+
+static void m_pool(void) {
+    k_reset();
+    ib_nodes();
+    ib_cmd_spin("\n");
+    srv_reset();
+    all_alive();
+    g_pproto = &m_proto;
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pproto = &f_proto;
+    loop_mux(&g_L);
+    m_zero();
+}
+
+static int m_queued(void) {
+    pthread_mutex_lock(&g_cq.mu);
+    int n = (int)g_cq.n;
+    pthread_mutex_unlock(&g_cq.mu);
+    return n;
+}
+
+static int m_drain(unsigned *flags, uint16_t *win) {
+    unsigned char p[70000];
+    int cnt = 0;
+    *flags = 0;
+    for (;;) {
+        ssize_t r = recv(g_dev_peer, p, sizeof(p), MSG_DONTWAIT);
+        if (r <= 0) break;
+        struct flow_key k;
+        size_t off;
+        if (ip_parse(p, (size_t)r, &k, &off) == 0) {
+            *flags |= k.tcp_flags;
+            if (win) *win = k.window;
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+static struct conn *m_flow(uint16_t sport) {
+    g_m_attach_rc = XA_READY;
+    pm_send(sport, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    pm_send(sport, SRV_IP, 1001, 2, TCP_ACK, NULL, 0);
+    pm_drain(NULL, NULL);
+    struct flow_key k = pm_key(sport, SRV_IP);
+    struct conn *c = conn_find(&k);
+    return c && c->mux && !c->pending && c->fd == -1 ? c : NULL;
+}
+
+static uint64_t m_turn_ms(int max_ms) {
+    uint64_t t0 = now_ns();
+    loop_turn(&g_L, max_ms);
+    return (now_ns() - t0) / 1000000;
+}
+
+static void m_turn(void *arg) { (void)arg; loop_turn(&g_L, 0); }
+
+/* catches: a shared flow queued for a connector */
+static void t_mux_ready_no_connector(void) {
+    m_new();
+    pm_send(41100, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    struct flow_key k = pm_key(41100, SRV_IP);
+    struct conn *c = conn_find(&k);
+    unsigned fl;
+    int n = m_drain(&fl, NULL);
+    check(c && c->mux && !c->pending && c->fd == -1 && g_m_attach_n == 1 && g_m_owner == c - g_conns &&
+              n == 1 && fl == (TCP_SYN | TCP_ACK) && m_queued() == 0 && g_m_connect_n == 0,
+          "mux READY: SYN-ACK at once, owner is the slot, no connector job");
+    pm_send(41100, SRV_IP, 1001, 2, TCP_ACK | TCP_PSH, (const unsigned char *)"hello", 5);
+    check(g_m_sent_n == 5 && !memcmp(g_m_sent, "hello", 5), "  the client's first data goes to the shared stream at once");
+}
+
+/* catches: waiters never released, or early data reordered */
+static void t_mux_wait_then_done(void) {
+    m_new();
+    g_m_attach_rc = XA_WAIT;
+    pm_send(41110, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    struct flow_key k = pm_key(41110, SRV_IP);
+    struct conn *c = conn_find(&k);
+    unsigned fl;
+    int n = m_drain(&fl, NULL);
+    unsigned char e[300], l[100];
+    memset(e, 'e', sizeof e);
+    memset(l, 'l', sizeof l);
+    pm_send(41110, SRV_IP, 1001, 2, TCP_ACK | TCP_PSH, e, sizeof e);
+    check(c && c->mux && c->pending && !c->done && n == 1 && fl == (TCP_SYN | TCP_ACK) && g_m_sent_n == 0 &&
+              m_queued() == 0,
+          "mux WAIT: SYN-ACK at once, the flow pends, early data held");
+    g_m_wake_what = XW_DONE;
+    loop_turn(&g_L, 0);
+    int same_turn = g_m_sent_n == 300 && !memcmp(g_m_sent, e, 300) && !c->pending;
+    pm_send(41110, SRV_IP, 1301, 2, TCP_ACK | TCP_PSH, l, sizeof l);
+    check(same_turn && g_m_sent_n == 400 && !memcmp(g_m_sent + 300, l, 100),
+          "mux WAIT then XW_DONE: the 300 early bytes go in that turn, before the next segment");
+}
+
+/* catches: a waiter resolved between turns left until the next second's wake */
+static void t_mux_done_between_turns(void) {
+    m_new();
+    g_m_attach_rc = XA_WAIT;
+    pm_send(41115, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    pm_drain(NULL, NULL);
+    struct flow_key k = pm_key(41115, SRV_IP);
+    struct conn *c = conn_find(&k);
+    if (c) g_mh->wake(g_mh->arg, (uint16_t)(c - g_conns), XW_DONE, 0);
+    uint64_t ms = m_turn_ms(300);
+    check(c && !c->pending && ms < 100, "mux WAIT resolved outside a pass: the next turn does not wait");
+}
+
+/* catches: a failed attach taken as ready or queued for a connector */
+static void t_mux_attach_fails(void) {
+    m_new();
+    g_m_attach_rc = TR_ECONNREFUSED;
+    pm_send(41125, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    struct flow_key k = pm_key(41125, SRV_IP);
+    struct conn *c = conn_find(&k);
+    int pend = c && c->mux && c->pending && c->done && m_queued() == 0;
+    memset(&g_said_open, 0, sizeof g_said_open);
+    char buf[4096];
+    stderr_of(m_turn, NULL, buf, sizeof buf);
+    unsigned fl;
+    m_drain(&fl, NULL);
+    check(pend && (fl & TCP_SYN) && (fl & TCP_RST) && !conn_find(&k) && g_m_connect_n == 0 &&
+              strstr(buf, "refused the TCP connection"),
+          "mux attach < 0: SYN-ACK, then RST in the next turn, no connector");
+}
+
+/* catches: link tokens never dispatched, or watch unable to add, change or remove a link */
+static void t_mux_link_events(void) {
+    m_new();
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, g_m_sp) != 0) {
+        check(0, "fixture: link socketpair");
+        return;
+    }
+    if (send(g_m_sp[1], "x", 1, 0) != 1) check(0, "fixture: link byte");
+    g_m_watch_ev = EPOLLIN;
+    g_m_watch_on = 1;
+    loop_turn(&g_L, 0);
+    int add_rc = g_m_watch_rc;
+    loop_turn(&g_L, 0);
+    check(add_rc == 0 && g_m_ev_n == 1 && g_m_ev_idx == 0 && g_m_ev_last == EPOLLIN,
+          "mux watch: a new link fd is added, its readiness reaches event(0) next turn");
+    g_m_watch_ev = EPOLLIN | EPOLLOUT;
+    g_m_watch_on = 1;
+    loop_turn(&g_L, 0);
+    int mod_rc = g_m_watch_rc;
+    loop_turn(&g_L, 0);
+    check(mod_rc == 0 && (g_m_ev_last & EPOLLOUT) && (g_m_ev_last & EPOLLIN), "  re-watched with EPOLLOUT: the next event carries it");
+    g_m_watch_ev = 0;
+    g_m_watch_on = 1;
+    loop_turn(&g_L, 0);
+    int del_rc = g_m_watch_rc, before = g_m_ev_n;
+    close(g_m_sp[1]);
+    loop_turn(&g_L, 0);
+    check(del_rc == 0 && g_m_ev_n == before, "  watched with 0: the fd is gone, not even a hang-up reaches event");
+    close(g_m_sp[0]);
+    g_m_sp[0] = g_m_sp[1] = -1;
+}
+
+/* catches: queued frames left unflushed after the TUN batch, the forced read or the deadlines */
+static void t_mux_phase_order(void) {
+    m_new();
+    struct conn *c = m_flow(41135);
+    unsigned char p[2048];
+    size_t l = tcp_build(p, sizeof p, CLI_IP, SRV_IP, 41135, 443, 1001, 2, TCP_ACK | TCP_PSH,
+                         (const unsigned char *)"data", 4, 65535, 0, -1);
+    g_m_log_n = 0;
+    if (send(g_dev_peer, p, l, 0) != (ssize_t)l) check(0, "fixture: device write");
+    loop_turn(&g_L, 0);
+    check(c && !strcmp(g_m_log, "ESLLL"), "mux phases: a TUN segment gives EARLY, the send, then LATE thrice");
+    g_m_log_n = 0;
+    g_m_wake_what = XW_READ;
+    g_m_wake_rn = 100;
+    loop_turn(&g_L, 0);
+    check(c && !strcmp(g_m_log, "ERLL"), "  a woken read gives EARLY, the read, then LATE after it and the deadlines");
+}
+
+/* catches: a mux deadline (packet-up's POST interval) left out of the loop's wait */
+static void t_mux_deadline_wakes_loop(void) {
+    m_new();
+    g_m_due = 40;
+    loop_turn(&g_L, 0);
+    uint64_t ms = m_turn_ms(2000);
+    check(ms >= 30 && ms < 500, "mux deadline: a quiet loop waits the 40 ms the mux asked for, not 2 s");
+    g_m_due = 0;
+    loop_turn(&g_L, 0);
+    ms = m_turn_ms(150);
+    check(ms >= 120, "  no deadline: the loop waits its own time");
+}
+
+static void *m_efd_later(void *arg) {
+    struct timespec ts = { 0, 80 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    __atomic_store_n((int *)arg, -1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* catches: a loop closing its eventfd while a connector is about to write it */
+static void t_mux_release_waits_efd(void) {
+    m_new();
+    int i = CONNECTORS - 1;
+    __atomic_store_n(&g_cq_efd[i], g_conn_efd, __ATOMIC_RELEASE);
+    pthread_t t;
+    int made = g_conn_efd >= 0 && pthread_create(&t, NULL, m_efd_later, &g_cq_efd[i]) == 0;
+    int rc = made ? connq_release(g_conns) : -2;
+    int held = __atomic_load_n(&g_cq_efd[i], __ATOMIC_ACQUIRE) == g_conn_efd;
+    if (made) pthread_join(t, NULL);
+    check(rc == 0 && !held, "connq_release waits while a connector holds the loop's eventfd");
+}
+
+/* catches: a failed dial leaving the flow hanging */
+static void t_mux_wait_fail(void) {
+    m_new();
+    g_m_attach_rc = XA_WAIT;
+    pm_send(41120, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    pm_drain(NULL, NULL);
+    g_m_wake_what = XW_DONE;
+    g_m_wake_rc = TR_ECONNREFUSED;
+    memset(&g_said_open, 0, sizeof g_said_open);
+    char buf[4096];
+    stderr_of(m_turn, NULL, buf, sizeof buf);
+    unsigned fl;
+    m_drain(&fl, NULL);
+    struct flow_key k = pm_key(41120, SRV_IP);
+    check((fl & TCP_RST) && !conn_find(&k) && strstr(buf, "flow to h0 did not open") &&
+              strstr(buf, "refused the TCP connection"),
+          "mux WAIT, the link fails: RST to the client, the log names the node and the refusal");
+}
+
+/* catches: a shared flow read only on a socket event it never gets */
+static void t_mux_read_wake(void) {
+    m_new();
+    struct conn *c = m_flow(41130);
+    g_m_wake_what = XW_READ;
+    g_m_wake_rn = 1000;
+    loop_turn(&g_L, 0);
+    unsigned fl;
+    int n = m_drain(&fl, NULL);
+    check(c && c->our_seq == 1002 && n >= 1 && g_m_rn == 0, "mux XW_READ: the 1000 bytes reach the client in that turn");
+    pm_send(41130, SRV_IP, 1001, 1002, TCP_ACK, NULL, 0);
+    uint64_t idle = m_turn_ms(300);
+    g_m_rn = 500;
+    uint64_t busy = m_turn_ms(300);
+    check(c && idle >= 200 && busy < 100 && c->our_seq == 1502,
+          "  the next wait is 0 only while the stream has data");
+}
+
+/* catches: a grown room announced twice */
+static void t_mux_room_wake(void) {
+    m_new();
+    g_m_room = 0;
+    struct conn *c = m_flow(41140);
+    loop_turn(&g_L, 0);
+    pm_drain(NULL, NULL);
+    int seen0 = c && c->room_seen == 0;
+    g_m_wake_what = XW_ROOM;
+    g_m_wake_room = 65536;
+    loop_turn(&g_L, 0);
+    unsigned fl;
+    uint16_t win = 0;
+    int n = m_drain(&fl, &win);
+    loop_turn(&g_L, 0);
+    unsigned fl2;
+    int again = m_drain(&fl2, NULL);
+    check(seen0 && n == 1 && fl == TCP_ACK && win > 0 && again == 0,
+          "mux XW_ROOM: one window update to the client, no second one");
+}
+
+/* catches: a cut shared link reported as a clean end */
+static void t_mux_cut_rst(void) {
+    m_new();
+    struct conn *c = m_flow(41150);
+    g_m_read_rc = -1;
+    g_m_cut = 1;
+    g_m_wake_what = XW_READ;
+    loop_turn(&g_L, 0);
+    unsigned fl;
+    m_drain(&fl, NULL);
+    struct flow_key k = pm_key(41150, SRV_IP);
+    check(c && (fl & TCP_RST) && !(fl & TCP_FIN) && !conn_find(&k) && g_m_lost == 1,
+          "mux link cut: RST to the client, lost told once");
+    g_m_read_rc = 0;
+    c = m_flow(41151);
+    g_m_read_rc = -1;
+    g_m_cut = 0;
+    g_m_wake_what = XW_READ;
+    loop_turn(&g_L, 0);
+    m_drain(&fl, NULL);
+    check(c && (fl & TCP_FIN) && !(fl & TCP_RST) && g_m_lost == 1, "  a stream that ended, not cut: FIN, no lost");
+    /* catches: a stream the server refused (GOAWAY) reported to the pool as a dead node */
+    g_m_read_rc = 0;
+    c = m_flow(41152);
+    g_m_read_rc = -1;
+    g_m_cut = 2;
+    g_m_wake_what = XW_READ;
+    loop_turn(&g_L, 0);
+    m_drain(&fl, NULL);
+    k = pm_key(41152, SRV_IP);
+    check(c && (fl & TCP_RST) && !(fl & TCP_FIN) && !conn_find(&k) && g_m_lost == 1,
+          "  a refused stream: RST to the client, no lost");
+}
+
+/* catches: poll(-1, 5 ms) per refused send */
+static void t_mux_send_does_not_poll(void) {
+    m_new();
+    struct conn *c = m_flow(41160);
+    g_m_send_rc = SEND_AGAIN;
+    unsigned char d[100];
+    memset(d, 'd', sizeof d);
+    uint64_t best = UINT64_MAX;
+    int sr = SEND_OK;
+    for (int i = 0; c && i < 3; i++) {
+        uint64_t t0 = now_ns();
+        sr = send_or_wait(c, &g_tun, d, sizeof d);
+        uint64_t dt = now_ns() - t0;
+        if (dt < best) best = dt;
+    }
+    check(c && sr == SEND_AGAIN && best < 1000000, "mux SEND_AGAIN: send_or_wait returns in under 1 ms");
+}
+
+/* catches: an entry point left on the per-flow path */
+static void t_mux_five_sites(void) {
+    m_pool();
+    g_pl.slot[0].gen = 7;
+    pm_send(41170, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    struct flow_key tk = pm_key(41170, SRV_IP);
+    struct conn *t = conn_find(&tk);
+    check(t && t->mux && !t->pending && g_m_attach_n == 1 && g_m_ref.node == &g_fn[0] && g_m_ref.slot == 0 &&
+              g_m_ref.gen == 7,
+          "mux sites: a TUN SYN attaches, the pool passes its node, slot and generation");
+
+    struct flow_key uk = pm_key(41171, SRV_IP);
+    uk.proto = 17;
+    udp_packet(&g_tun, NULL, &uk, (const unsigned char *)"abcd", 4, 0);
+    struct conn *u = conn_find(&uk);
+    check(u && u->mux && !u->pending && g_m_attach_n == 2 && g_m_sent_n == 6 && !memcmp(g_m_sent + 2, "abcd", 4),
+          "  a TUN datagram attaches and goes out");
+
+    int kfd = k_dial(ip4(93, 184, 216, 50), 80, 1);
+    struct conn *kc = NULL;
+    for (int i = 0; i < 200 && !(kc = k_conn_of(kfd)); i++) spin(1);
+    check(kc && kc->mux && !kc->pending && g_m_attach_n == 3, "  a redirected socket attaches");
+
+    uint16_t p = free_port(LO);
+    char cmd[512];
+    ib_line(cmd, sizeof cmd, LO, p, "- -", IB_L1);
+    ib_cmd_spin(cmd);
+    int ifd = ib_socks(p, ip4(10, 9, 8, 7));
+    int replied = ib_reply_is(ifd, 0);
+    struct conn *ic = k_conn_of(ifd);
+    check(replied && ic && ic->mux && !ic->pending && g_m_attach_n == 4 && g_m_ref.node == &g_fn[1] &&
+              g_m_ref.slot == -1,
+          "  an inbound CONNECT attaches pinned to its node and gets 05 00 at once");
+
+    uint16_t relay;
+    int tcp = ib_assoc_open(p, &relay);
+    int uc = ib_ucli(LO);
+    ib_to(uc, relay, ip4(10, 9, 8, 8), 443, "ping");
+    struct conn *iu = NULL;
+    for (int i = 0; i < 200 && !(iu = ib_ucon(ip4(10, 9, 8, 8), 443)); i++) spin(1);
+    check(iu && iu->mux && !iu->pending && g_m_attach_n == 5, "  an inbound datagram attaches");
+    check(g_m_connect_n == 0 && m_queued() == 0, "  and none of the five went to a connector");
+    if (kfd >= 0) close(kfd);
+    if (ifd >= 0) close(ifd);
+    if (tcp >= 0) close(tcp);
+    if (uc >= 0) close(uc);
+    spin(2);
+    ib_cmd_spin("\n");
+    g_pl.slot[0].gen = 0;
+}
+
+static void *m_release_later(void *arg) {
+    (void)arg;
+    struct timespec ts = { 0, 80 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    __atomic_store_n(&g_m_release, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static int g_m_rel_rc;
+static int g_m_rel_done;
+static void m_release(void *arg) {
+    (void)arg;
+    pthread_t t;
+    if (pthread_create(&t, NULL, m_release_later, NULL) != 0) return;
+    g_m_rel_rc = connq_release(g_conns);
+    g_m_rel_done = 1;
+    for (int i = 0; i < CONNECTORS; i++) g_m_rel_done &= __atomic_load_n(&g_m_link[i].done, __ATOMIC_ACQUIRE) == 1;
+    pthread_join(t, NULL);
+}
+
+/* catches: a link freed under a working connector, or waiters of a dropped job left pending */
+static void t_mux_release_waits(void) {
+    m_new();
+    g_m_attach_rc = XA_WAIT;
+    pm_send(41180, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    pm_drain(NULL, NULL);
+    struct flow_key k = pm_key(41180, SRV_IP);
+    struct conn *c = conn_find(&k);
+    uint16_t owner = c ? (uint16_t)(c - g_conns) : UINT16_MAX;
+    int pushed = 1;
+    for (int i = 0; i < CONNECTORS; i++) {
+        g_m_link_owner[i] = UINT16_MAX;
+        g_m_link_n = i + 1;
+        pushed &= g_mh->submit(&g_m_link[i], &g_m_link[i].done) == 0;
+    }
+    for (int i = 0; i < 2000 && __atomic_load_n(&g_m_dial_in, __ATOMIC_SEQ_CST) < CONNECTORS; i++) usleep(1000);
+    g_m_link_owner[CONNECTORS] = owner;
+    g_m_link_n = CONNECTORS + 1;
+    pushed &= g_mh->submit(&g_m_link[CONNECTORS], &g_m_link[CONNECTORS].done) == 0;
+    int queued = m_queued();
+    check(c && pushed && __atomic_load_n(&g_m_dial_in, __ATOMIC_SEQ_CST) == CONNECTORS && queued == 1,
+          "mux release: every connector busy on a link, one link job queued");
+    memset(&g_said_open, 0, sizeof g_said_open);
+    char buf[4096];
+    stderr_of(m_release, NULL, buf, sizeof buf);
+    int all_done = 1;
+    for (int i = 0; i < CONNECTORS; i++) all_done &= __atomic_load_n(&g_m_link[i].done, __ATOMIC_ACQUIRE) == 1;
+    check(g_m_rel_rc == 0 && g_m_rel_done && all_done && g_m_dial_n == CONNECTORS,
+          "  connq_release returns only after the taken link jobs are done");
+    unsigned fl;
+    m_drain(&fl, NULL);
+    check(g_m_dropped_n == 1 && g_m_link[CONNECTORS].done == 0 && m_queued() == 0 && (fl & TCP_RST) && !conn_find(&k),
+          "  the queued job is dropped and its waiting flow gets RST");
+}
+
+/* catches: a dial to a slot gone down, or a stale ref read as live */
+static void t_pool_ref_dead_slot(void) {
+    k_reset();
+    all_alive();
+    g_pproto = &m_proto;
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pproto = &f_proto;
+    m_zero();
+    __atomic_store_n(&g_m_release, 1, __ATOMIC_SEQ_CST);
+    static struct xconn x;
+    x.ref = (struct xc_ref){ &g_fn[0], 0, g_pl.slot[0].gen };
+    int live = g_pl_ops.mux->dial(&g_pl, &x, 1);
+    int fresh = pool_ref_stale(&x.ref);
+    g_pl.slot[0].up = 0;
+    int dead = g_pl_ops.mux->dial(&g_pl, &x, 1);
+    g_pl.slot[0].up = 1;
+    g_pl.slot[0].gen++;
+    int stale = pool_ref_stale(&x.ref);
+    g_pl.slot[0].drained[0] = x.ref.gen + 1;
+    int drained = pool_ref_stale(&x.ref);
+    g_pl.slot[0].drained[0] = 0;
+    g_pl.slot[0].gen--;
+    g_pl.slot[0].streak = 0;
+    g_m_dial_rc = TR_ECONNREFUSED;
+    int failed = g_pl_ops.mux->dial(&g_pl, &x, 1);
+    int streak = g_pl.slot[0].streak;
+    g_m_dial_rc = 0;
+    check(live == 0 && dead == TR_ENONODE && g_m_dial_n == 2, "pool mux dial: a dead slot is refused without dialling");
+    check(fresh == 0 && stale == 1, "  pool_ref_stale: the slot's generation moved on");
+    check(drained == 0, "  pool_ref_stale: a drained generation is not stale");
+    check(failed == TR_ECONNREFUSED && streak == 1, "  a failed shared dial counts in the slot's streak");
+}
+
+static int sh_shares(const void *ctx) { return ctx == &g_fn[0]; }
+static const struct dialer_mux sh_mux = {
+    .host = m_host, .attach = m_attach, .dial = m_dial, .event = m_event, .pass = m_pass, .cut = m_cut,
+    .busy = m_busy, .dropped = m_dropped, .shares = sh_shares,
+};
+static const struct dialer_ops sh_ops = {
+    .name = "shares", .caps = DC_PRECONNECT, .sess_size = sizeof(struct fsess),
+    .peer = f_peer, .describe = f_describe, .strerror = f_strerror, .connect = f_connect,
+    .take = f_take, .close = f_close, .clear = f_clear, .fd = f_fd, .has_data = f_has_data,
+    .flow_open = f_flow_open, .send = f_send, .dgram_frame = f_dgram_frame, .read = f_read,
+    .deliver = f_deliver, .lost = f_lost, .set_host = f_set_host, .mux = &sh_mux,
+};
+static const struct pool_proto sh_proto = { .ops = &sh_ops, .probe = f_probe, .name = f_name };
+
+static void sh_settle(void) {
+    for (int i = 0; i < 400; i++) {
+        pthread_mutex_lock(&g_cq.mu);
+        int n = (int)g_cq.n;
+        pthread_mutex_unlock(&g_cq.mu);
+        int filling = 0;
+        pthread_mutex_lock(&g_spare_mu);
+        for (int k = 0; k < SPARE_MAX; k++) filling += g_spares[k].state == SPARE_FILLING;
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!n && !filling) return;
+        usleep(5000);
+    }
+}
+
+static void sh_round(int *ready, int *on_shared) {
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].state = SPARE_EMPTY;
+    g_spare_fail_ns = 0;
+    g_spare_fail_n = 0;
+    g_spare_syn_ns = 0;
+    g_spare_clock_ns = 7000000000000ull;
+    spare_refill();
+    g_spare_clock_ns += 100000000ull;
+    spare_refill();
+    sh_settle();
+    *ready = *on_shared = 0;
+    for (int i = 0; i < SPARE_MAX; i++) {
+        if (g_spares[i].state != SPARE_READY) continue;
+        (*ready)++;
+        if (((const struct pl_sess *)g_spares[i].sess)->node == &g_fn[0]) (*on_shared)++;
+        g_dl->ops->close(g_spares[i].sess);
+        g_spares[i].state = SPARE_EMPTY;
+    }
+}
+
+static void sh_spares(int want) {
+    free(g_spares[0].sess);
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].sess = NULL;
+    g_spare_want = want;
+    if (want) stack_setup(g_dl);
+}
+
+/* catches: spares dialled for flows that never take them */
+static void t_spares_skip_shared_nodes(void) {
+    k_reset();
+    all_alive();
+    srv_reset();
+    g_pproto = &sh_proto;
+    pool_new(1, POOL_BY_CONNECTION, 1);
+    g_pproto = &f_proto;
+    sh_spares(4);
+    int ready, shared;
+    sh_round(&ready, &shared);
+    check(ready == 0 && g_spare_fail_n == 0, "spares: a node whose flows share gets no spare, and that is no failure");
+    g_pproto = &sh_proto;
+    pool_new(2, POOL_BY_CONNECTION, 2);
+    g_pproto = &f_proto;
+    pl_check(1);
+    sh_spares(4);
+    sh_round(&ready, &shared);
+    check(ready == 4 && shared == 0 && g_spare_fail_n == 0, "  with a tcp node beside it the spares go to the tcp node only");
+    g_spare_clock_ns = 0;
+    sh_spares(0);
+    srv_reset();
+}
+
+static void mux_part(void) {
+    t_mux_ready_no_connector();
+    t_mux_wait_then_done();
+    t_mux_done_between_turns();
+    t_mux_wait_fail();
+    t_mux_attach_fails();
+    t_mux_link_events();
+    t_mux_phase_order();
+    t_mux_deadline_wakes_loop();
+    t_mux_read_wake();
+    t_mux_room_wake();
+    t_mux_cut_rst();
+    t_mux_send_does_not_poll();
+    t_mux_five_sites();
+    t_mux_release_waits();
+    t_mux_release_waits_efd();
+    t_pool_ref_dead_slot();
+    t_spares_skip_shared_nodes();
+}
+
 static void sock_part(void) {
     int fl = fcntl(g_tun.fd, F_GETFL, 0);
     fcntl(g_tun.fd, F_SETFL, fl | O_NONBLOCK);
@@ -5885,6 +6655,7 @@ static void sock_part(void) {
     t_k_spare();
     t_k_spoke_early();
     t_k_room();
+    t_k_held_data();
     t_k_evict();
     t_k_half_close();
     t_k_ask_once(&a, &b);
@@ -5906,6 +6677,7 @@ static void sock_part(void) {
     t_k_two_loops();
     t_k_flush_error();
     t_k_prefixes();
+    mux_part();
     t_k_slot0_not_stop();
     t_k_stop_resets_sockets();
     ib_part();

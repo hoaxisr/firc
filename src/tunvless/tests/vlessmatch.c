@@ -1117,9 +1117,7 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
     g_tcp_dial = NULL;
 
     if (reason && rn) snprintf(reason, rn, "%s", tls13_verify_reason());
-    if (ctx_left) *ctx_left = (c.link.tls.rd.ctx_ready ? 1 : 0) + (c.link.tls.wr.ctx_ready ? 1 : 0) +
-                              (c.xh.up.link.tls.rd.ctx_ready ? 1 : 0) +
-                              (c.xh.up.link.tls.wr.ctx_ready ? 1 : 0);
+    if (ctx_left) *ctx_left = (c.link.tls.rd.ctx_ready ? 1 : 0) + (c.link.tls.wr.ctx_ready ? 1 : 0);
 
     pthread_join(th, NULL);
     /* What the client sent after the server Finished. vless_connect has returned, so a Finished
@@ -1445,6 +1443,9 @@ int main(void) {
         b64url(g_rs_pub, 32, xn.pbk);
         snprintf(xn.path, sizeof(xn.path), "%s", "/x");
         snprintf(xn.mode, sizeof(xn.mode), "%s", "packet-up");
+        dn = xn;
+        snprintf(dn.host, sizeof(dn.host), "%s", "down.invalid");
+        xn.dl = &dn;
         long ms = 0;
         int over[2], fd0 = fd_count();
         int rc = run_two(&ok, &ok, &xn, &ms, over);
@@ -1453,8 +1454,8 @@ int main(void) {
         check("xhttp packet-up: both Hellos out before either answer", 1, over[0] && over[1]);
         /* catches: the second handshake waiting out the first one's answer */
         check("xhttp packet-up: open within one held answer", 1, ms < HOLD_MS);
-        check("xhttp packet-up: both links to the node", 1,
-              g_dial_n == 2 && !strcmp(g_dialed[0], "node.invalid") && !strcmp(g_dialed[1], "node.invalid"));
+        check("xhttp packet-up: GET to the download host, upload to the node", 1,
+              g_dial_n == 2 && !strcmp(g_dialed[0], "down.invalid") && !strcmp(g_dialed[1], "node.invalid"));
         check("xhttp packet-up: descriptor count restored", fd0, fd_count());
         check("xhttp packet-up: nothing left on the heap", 0, LEAK_CHECK());
 
@@ -1466,10 +1467,7 @@ int main(void) {
         check("xhttp, the upload link answers first: finished first", 1, over[0] && over[1] && ms < HOLD_MS);
         check("xhttp, the upload link answers first: descriptor count restored", fd0, fd_count());
 
-        dn = xn;
-        snprintf(dn.host, sizeof(dn.host), "%s", "down.invalid");
         xn.mode[0] = '\0';
-        xn.dl = &dn;
         rc = run_two(&ok, &ok, &xn, &ms, over);
         check("xhttp downloadSettings: both links open", 0, rc);
         check("xhttp downloadSettings: both Hellos out before either answer", 1, over[0] && over[1]);
@@ -1477,7 +1475,6 @@ int main(void) {
         check("xhttp downloadSettings: GET to the download host, upload to the node", 1,
               g_dial_n == 2 && !strcmp(g_dialed[0], "down.invalid") && !strcmp(g_dialed[1], "node.invalid"));
         check("xhttp downloadSettings: descriptor count restored", fd0, fd_count());
-        xn.dl = NULL;
         snprintf(xn.mode, sizeof(xn.mode), "%s", "packet-up");
 
         rc = run_two(&ok, &cut, &xn, &ms, over);
@@ -1491,8 +1488,15 @@ int main(void) {
         check("xhttp, download link cut: descriptor count restored", fd0, fd_count());
         check("xhttp, download link cut: nothing left on the heap", 0, LEAK_CHECK());
 
+        xn.dl = NULL;
+        struct plan one = { .name = "one link", .reality_ok = 1 };
+        rc = run_two(&one, &one, &xn, &ms, over);
+        check("xhttp packet-up without a block: the link opens", 0, rc);
+        /* catches: packet-up dialling a second link for its POSTs */
+        check("xhttp packet-up without a block: one link", 1, g_dial_n);
+        check("xhttp packet-up without a block: descriptor count restored", fd0, fd_count());
+        check("xhttp packet-up without a block: nothing left on the heap", 0, LEAK_CHECK());
         xn.mode[0] = '\0';
-        struct plan one = { .name = "stream-one", .reality_ok = 1 };
         rc = run_two(&one, &one, &xn, &ms, over);
         check("xhttp stream-one: the link opens", 0, rc);
         /* catches: stream-one dialling a second link */

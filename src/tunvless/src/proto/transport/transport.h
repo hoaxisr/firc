@@ -104,10 +104,9 @@ struct tr_node {
     const struct tr_node *dl;
 };
 
-/* A link: the socket and the security over it, one protected byte stream.
- *
- * A struct of its own because a connection can have two: xhttp in stream-up and packet-up opens
- * a second one for the upload (trxhttp.c), with the same handshake. */
+/* A link: the socket and the security over it, one protected byte stream. A struct of its own
+ * because xhttp keeps its links in HTTP/2 connections of their own (xconn.h), with the same
+ * handshake. */
 struct tr_link {
     int fd;
     int plain;                 /* security=none: no TLS at all */
@@ -147,24 +146,6 @@ struct grpc_de {
  */
 enum xhttp_mode { XH_STREAM_ONE = 0, XH_STREAM_UP, XH_PACKET_UP };
 
-/* The second link, for the xhttp upload.
- *
- * A separate connection, not a second stream on the same one. stream-up and packet-up need the
- * download and the upload in different requests at the same time. In HTTP/2 that is two streams
- * on one connection, and Xray does exactly that, but our h2 client has no multiplexer by design
- * (see the head of h2.c). A window scheduler between streams, for two roles of which one only
- * reads and the other only writes, costs more than a second TCP connection.
- *
- * The protocol does not mind: the server ties the requests together by the session id in the
- * PATH, not by the connection (Xray hub.go), and over HTTP/1.1 the upload always has its own
- * connection anyway. The price is a second TLS handshake per connection, in these two modes
- * only. */
-struct xh_up {
-    struct tr_link link;
-    struct h2 h2;
-    int started;               /* HEADERS of the first request sent */
-};
-
 struct xh_side {
     char authority[128];       /* repeated in every request of the series */
     struct xh_opts opts;
@@ -177,10 +158,44 @@ struct xh_side {
     uint16_t pad_from, pad_to;
 };
 
-/* xhttp state. stream-one uses only mode. */
+struct xconn;
+struct xm_client;
+
+struct xs { struct xconn *x; uint16_t slot; uint32_t sid; };
+
+#define XH_POST_MAX 64
+
+struct xh_post { struct xs s; uint64_t seq; };
+
+struct xc_chunk;
+struct xc_q { struct xc_chunk *head, *tail; size_t n; };
+
+struct xm_mgr;
+struct transport;
+
+struct xh_flow {
+    struct xs one, down, up;
+    struct xh_post post[XH_POST_MAX];
+    uint8_t post_n;
+    struct xm_client *cl, *cl_dl, *cl_post;
+    struct xm_mgr *mgr, *mgr_dl;
+    struct xconn *wait, *post_x, *hold[2];
+    struct transport *wnext, *bnext, *hnext[2];
+    struct xc_q bat;
+    size_t bres, blim;
+    uint64_t post_at, bw_at, wait_until;
+    int end;
+    uint8_t wait_n, shared, post_dec, post_wait, blisted, bstarved;
+    uint16_t owner;
+};
+
+/* xhttp state. */
 struct xh_state {
     enum xhttp_mode mode;
-    struct xh_up up;           /* upload of stream-up and packet-up */
+    struct xh_flow f;
+    struct xconn *priv[2];
+    int err;
+    int wait_ms;
     uint64_t seq;              /* packet-up chunk number, from 0 */
     struct xh_side main_side, down_side;
     char sid[136];
@@ -276,17 +291,19 @@ struct transport_ops {
      * decrypted record instead of a copy (transport_read_zc). True for tcp and httpupgrade; grpc
      * and xhttp have HTTP/2 between TLS and the data, ws has frames, and the body is copied. */
     int zc;
-    /* Open the transport over the already protected link: HTTP/2, requests, the second link.
+    /* Open the transport over the already protected link: HTTP/2, requests.
      * NULL: nothing to open (tcp). On failure nothing needs closing: transport_open closes. */
     int  (*open)(struct transport *t, const struct tr_node *n, int timeout_s);
     int  (*write)(struct transport *t, const unsigned char *d, size_t n);
     /* 0 bytes with code 0 is valid: a record or frame without data arrived (an HTTP/2 control
      * frame, for one). End of stream is a code. */
     int  (*read)(struct transport *t, unsigned char *d, size_t cap, size_t *got);
+    int  (*dial)(struct transport *t, const struct tr_node *n, int timeout_s);
+    int  (*fd)(const struct transport *t);
     /* The struct moved in memory (a connection takes the link of a spare session, vl_take in
      * vldial.c): fix the pointers to itself. NULL: the transport has none. */
     void (*moved)(struct transport *t);
-    /* Free what the transport holds beyond the main link (the xhttp second link, the rest after
+    /* Free what the transport holds beyond the main link (xhttp's connections, the rest after
      * the 101). NULL: nothing. */
     void (*close)(struct transport *t);
     /* Whether the transport holds unread data that neither the kernel nor the link knows of: the
@@ -315,16 +332,21 @@ struct security_ops {
     int (*finish)(struct tr_link *l, const struct tr_node *n, struct sec_pend *p);
 };
 
-/* A connection to a node: the main link, the transport over it and its state. */
+/* A connection to a node: the main link, the transport over it and its state. xhttp has no main
+ * link: it keeps its own connections in xh, which shares the memory of the others. */
 struct transport {
-    struct tr_link link;
     const struct transport_ops *fr;
-    struct h2 h2;              /* grpc and xhttp only */
-    struct grpc_de de;         /* grpc only */
-    struct xh_state xh;        /* xhttp only */
-    struct h1_state h1;        /* ws and httpupgrade only */
     struct venc *enc;          /* VLESS encryption over the transport (trvenc.c), or NULL */
     const char *why;
+    union {
+        struct {
+            struct tr_link link;
+            struct h2 h2;      /* grpc only */
+            struct grpc_de de; /* grpc only */
+            struct h1_state h1; /* ws and httpupgrade only */
+        };
+        struct xh_state xh;
+    };
 };
 
 /* VLESS encryption (trvenc.c): a handshake over the open transport, then AEAD records in place of
@@ -374,9 +396,19 @@ void transport_direct(struct transport *t);
 /* The struct moved in memory: fix the pointers to itself (transport_ops.moved). */
 void transport_moved(struct transport *t);
 
-static inline int transport_fd(const struct transport *t) { return t->link.fd; }
+static inline int transport_fd(const struct transport *t) {
+    return t->fr && t->fr->fd ? t->fr->fd(t) : t->link.fd;
+}
 
-/* Close everything: the descriptors of both links and the cipher contexts on the heap. Also fine
+static inline int transport_rx_direct(const struct transport *t) {
+    return !(t->fr && t->fr->dial) && t->link.rx_direct;
+}
+
+static inline size_t transport_used(const struct transport *t) {
+    return t->fr && t->fr->dial ? offsetof(struct transport, xh) + sizeof t->xh : sizeof *t;
+}
+
+/* Close everything: the descriptors of every link and the cipher contexts on the heap. Also fine
  * for a struct that transport_open did not finish or never opened (fd -1). */
 void transport_close(struct transport *t);
 
@@ -409,7 +441,9 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 
 extern const struct transport_ops tr_tcp, tr_grpc, tr_xhttp, tr_ws, tr_httpupgrade;
 extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
-int tr_xhttp_two(const struct tr_node *n);
+int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
+int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);
+int xh_post_flush(struct transport *t);
 
 /* ---- ws and httpupgrade: the shared Upgrade request (trupgrade.c) and frames (trws.c) ------ */
 
@@ -486,7 +520,7 @@ int tr_dial(const char *host, uint16_t port, int timeout_s);
 const struct security_ops *tr_security(const char *name);
 
 /* A whole link: socket and security handshake. On failure the socket is closed and fd == -1.
- * Shared by the main link and the xhttp second link precisely so that they cannot diverge. */
+ * Shared by the main link and xhttp's connections precisely so that they cannot diverge. */
 int tr_link_open(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s);
 /* Two links at once: both Hellos go out before either answer is read. On failure both are
  * closed. */
@@ -500,5 +534,6 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
 
 /* Close a link: the socket and, for TLS, the keys on the heap. */
 void tr_link_close(struct tr_link *l);
+int tr_link_nonblock(struct tr_link *l);
 
 #endif

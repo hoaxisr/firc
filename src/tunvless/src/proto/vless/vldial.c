@@ -23,6 +23,8 @@
 #include "stack.h"
 #include "pool.h"
 #include "ratelog.h"
+#include "sublink.h"
+#include "trxmux.h"
 
 #define LOG_W  "tunvless[warn] tunnel: "
 
@@ -56,17 +58,17 @@ static int vl_connect(const void *ctx, void *sess, int timeout_s) {
     return vless_connect(ctx, &s->t, timeout_s);
 }
 
-/* Moves the link from a spare session into the connection's session. Only struct transport is
- * copied: the UUID and Vision state in dst are already set up (flow_open), and overwriting them
+/* Moves the link from a spare session into the connection's session. Only the part of struct
+ * transport its kind uses is copied (transport_used): the UUID and Vision state in dst are already set up (flow_open), and overwriting them
  * would lose the flow.
  *
- * h2 keeps a pointer to its own link (io.ctx), which after the move points into the abandoned
- * spare slot; xhttp has two such self-pointers (xhttp_moved in trxhttp.c). transport_moved
- * fixes them, not the dialer. */
+ * gRPC's h2 keeps a pointer to its own link (io.ctx), which after the move points into the
+ * abandoned spare slot. transport_moved fixes it, not the dialer. xhttp keeps its connections on
+ * the heap and needs nothing. */
 static void vl_take(void *dst, void *src) {
     struct vl_sess *d = dst;
     struct vl_sess *s = src;
-    memcpy(&d->t, &s->t, sizeof(d->t));
+    memcpy(&d->t, &s->t, transport_used(&s->t));
     transport_moved(&d->t);
 }
 
@@ -75,16 +77,16 @@ static void vl_close(void *sess) {
     transport_close(&s->t);
 }
 
-/* Clears only what the dialer itself reads. A memset of the transport (about 40 KB) on every
- * close would pull 40 KB of zeros through the cache, and transport_open overwrites them anyway
- * (it starts with a memset of its struct). Likewise only the datagram counters are reset, not
+/* Clears only what the dialer itself reads. A memset of the transport (about 21 KB) on every
+ * close would pull 21 KB of zeros through the cache, and transport_open overwrites them anyway
+ * (it starts with a memset of what its kind uses). Likewise only the datagram counters are reset, not
  * the 4 KB buffer. Everything touched here lies at the start of the session (field order in
  * vldial.h). */
 static void vl_clear(void *sess) {
     struct vl_sess *s = sess;
     s->header_sent = 0;
     s->established = 0;
-    s->t.link.fd = -1;
+    if (!(s->t.fr && s->t.fr->dial)) s->t.link.fd = -1;
     memset(&s->vis, 0, sizeof(s->vis));
     s->dg_want = s->dg_have = 0;
     s->dg_skip = 0;
@@ -606,7 +608,7 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
      * Under VLESS encryption there is no direct copy: the encryption layer's records stay
      * records to the end of the connection (Xray has CanSpliceCopy = 3 there, and the server
      * never sends the command). */
-    if (s->vis.recv_direct && !s->t.link.rx_direct && !s->t.enc) {
+    if (s->vis.recv_direct && !transport_rx_direct(&s->t) && !s->t.enc) {
         transport_direct(&s->t);
         TR("server switched to direct copy — reading the socket as is\n");
     }
@@ -644,6 +646,35 @@ static long vl_room(const void *ctx, void *sess) {
     return r > 0 ? r : 0;
 }
 
+static void vl_mux_host(const struct mux_host *h) { tr_xmux_host(h, pool_ref_stale); }
+
+static int vl_mux_attach(const void *ctx, void *sess, uint16_t owner, const struct xc_ref *ref) {
+    const struct vless_node *node = ctx;
+    struct vl_sess *s = sess;
+    struct tr_node tn, td;
+    sl_tr_nodes(node, &tn, &td);
+    return tr_xmux_attach(&s->t, &tn, node, node->dl, owner, ref);
+}
+
+static int vl_mux_dial(const void *ctx, void *link, int timeout_s) {
+    (void)ctx;
+    return tr_xmux_dial(link, timeout_s);
+}
+
+static int vl_mux_cut(const void *sess) { return tr_xmux_cut(&((const struct vl_sess *)sess)->t); }
+
+static int vl_mux_shares(const void *ctx) {
+    struct tr_node tn, td;
+    sl_tr_nodes(ctx, &tn, &td);
+    return tr_xmux_shares(&tn);
+}
+
+static const struct dialer_mux vless_mux = {
+    .host = vl_mux_host, .attach = vl_mux_attach, .dial = vl_mux_dial, .event = tr_xmux_event,
+    .pass = tr_xmux_pass, .cut = vl_mux_cut, .busy = tr_xmux_busy, .dropped = tr_xmux_dropped,
+    .shares = vl_mux_shares,
+};
+
 const struct dialer_ops vless_dialer = {
     .name = "vless",
     .caps = DC_PRECONNECT,
@@ -664,4 +695,5 @@ const struct dialer_ops vless_dialer = {
     .read = vl_read,
     .deliver = vl_deliver,
     .set_host = vl_set_host,
+    .mux = &vless_mux,
 };

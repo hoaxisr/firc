@@ -119,15 +119,21 @@ static void xh_members(struct jbuf *b, int *k, const struct vless_node *n) {
         range(r, sizeof r, n->post_from, n->post_to);
         js_field(b, k, "scMaxEachPostBytes", r);
     }
+    int xk = 0, *kk = k;
     for (const char *p = x; *p;) {
         const char *e = strchr(p, '\n'), *eq = e ? memchr(p, '=', (size_t)(e - p)) : NULL;
         if (!eq) { b->bad = 1; return; }
-        size_t vl = (size_t)(e - eq - 1);
-        js_key(b, k, p, (size_t)(eq - p));
-        if (xh_bare(eq + 1, vl)) jb_put(b, eq + 1, vl);
+        size_t vl = (size_t)(e - eq - 1), kl = (size_t)(eq - p);
+        if (kl > 5 && !memcmp(p, "xmux.", 5)) {
+            if (kk == k) { js_key(b, k, "xmux", 4); jb_put(b, "{", 1); kk = &xk; }
+            p += 5, kl -= 5;
+        }
+        js_key(b, kk, p, kl);
+        if (xh_bare(eq + 1, vl) || (kl == 16 && !memcmp(p, "hKeepAlivePeriod", 16))) jb_put(b, eq + 1, vl);
         else js_strn(b, eq + 1, vl);
         p = e + 1;
     }
+    if (kk != k) jb_put(b, "}", 1);
 }
 
 static void js_headers(struct jbuf *b, const char *h) {

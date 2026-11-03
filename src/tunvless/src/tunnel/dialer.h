@@ -18,8 +18,9 @@
  * their own UDP sockets or a bounded send queue, and no dialer here sets them. The node questions
  * (peer_of, match, stale, lost) are answered by the node pool (pool.c), which wraps the dialer.
  *
- * There is no multiplexing of several client flows on one link: the stack keeps one session per
- * flow (see udp_packet in stack.c). For a node with Vision the VLESS dialer does frame UDP as
+ * The stack keeps one session per flow (see udp_packet in stack.c). A dialer with mux may carry
+ * several of them as streams on one shared link the loop thread owns (struct dialer_mux); without
+ * it every flow has a link of its own. For a node with Vision the VLESS dialer does frame UDP as
  * Mux.Cool/XUDP, but still with one flow per link.
  */
 #ifndef STEER_DIALER_H
@@ -85,6 +86,36 @@ enum dialer_cap {
  * otherwise the connection ends (the device write failed, or the retransmit ring could not be
  * allocated or is full). */
 typedef int (*dialer_emit_fn)(void *arg, const unsigned char *p, size_t n);
+
+enum { XA_NONE = 0, XA_READY = 1, XA_WAIT = 2 };
+enum { XW_READ = 1, XW_ROOM = 2, XW_DONE = 4 };
+enum { MUXP_EARLY = 0, MUXP_LATE = 1, MUXP_EXIT = 2 };
+
+#define XC_MAX 64
+#define DIAL_NOSPARE 1
+
+struct xc_ref { const void *node; int slot; unsigned gen; };
+
+struct mux_host {
+    int (*submit)(void *link, int *done);
+    int (*watch)(unsigned idx, int fd, unsigned ev);
+    void (*wake)(void *arg, uint16_t owner, unsigned what, int rc);
+    void *arg;
+    unsigned loops;
+    unsigned wait_ms;
+};
+
+struct dialer_mux {
+    void (*host)(const struct mux_host *h);
+    int  (*attach)(const void *ctx, void *sess, uint16_t owner, const struct xc_ref *ref);
+    int  (*dial)(const void *ctx, void *link, int timeout_s);
+    int  (*event)(unsigned idx, uint32_t ev);
+    int  (*pass)(uint64_t now_ms, int phase);
+    int  (*cut)(const void *sess);
+    int  (*busy)(void);
+    void (*dropped)(void *link);
+    int  (*shares)(const void *ctx);
+};
 
 struct dialer_ops {
     const char *name;          /* for the log: vless */
@@ -176,6 +207,7 @@ struct dialer_ops {
     void (*lost)(const void *ctx, const void *sess);
     int (*set_host)(void *sess, const char *host);
     int (*flow_open_on)(void *sess, int node, const struct flow_key *k, int udp, const char *host);
+    const struct dialer_mux *mux;
 };
 
 /* An instance: the table and its ctx (for the VLESS dialer a node, for the node pool the pool).

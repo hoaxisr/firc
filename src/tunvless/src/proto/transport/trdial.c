@@ -527,6 +527,12 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
     return win;
 }
 
+int tr_link_nonblock(struct tr_link *l) {
+    int fl = fcntl(l->fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(l->fd, F_SETFL, fl | O_NONBLOCK) < 0) return TR_ESOCK;
+    return 0;
+}
+
 /* The TCP connect seam: a test runs the handshake against a peer it holds itself, with no
  * outside socket and no real node. tests/vlessmatch.c includes this file to reach the seam and
  * runs the handshake over a socketpair, so the failure branches (freeing keys and the fd) are

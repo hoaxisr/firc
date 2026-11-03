@@ -2,9 +2,10 @@
  * described in transport.h.
  *
  * Who closes what on each failure path is checked by tests/vlessmatch.c (descriptors and heap
- * after every failure, under LeakSanitizer); the xhttp upload responses by tests/xhupmatch.c.
+ * after every failure, under LeakSanitizer); the xhttp requests and answers by tests/xhupmatch.c.
  */
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 
 #include "transport.h"
+#include "xconn.h"
 #include "reality.h"
 #include "ech.h"
 
@@ -113,13 +115,13 @@ static int tr_venc_after(struct transport *t, const struct tr_node *n, int timeo
 
 /* ---- assembling the layers ----------------------------------------------------------- */
 
+static int own_links(const struct transport *t) { return t->fr && t->fr->dial; }
+
 int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) {
-    memset(t, 0, sizeof(*t));
     t->fr = transport_of(n->type);
-    const struct tr_node *ln = t->fr == &tr_xhttp && n->dl ? n->dl : n;
-    int rc = t->fr == &tr_xhttp && tr_xhttp_two(n)
-                 ? tr_link_open2(&t->link, ln, &t->xh.up.link, n, t->fr->alpn, timeout_s)
-                 : tr_link_open(&t->link, ln, t->fr->alpn, timeout_s);
+    memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
+    if (!own_links(t)) t->link.fd = -1;
+    int rc = t->fr->dial ? t->fr->dial(t, n, timeout_s) : tr_link_open(&t->link, n, t->fr->alpn, timeout_s);
     if (rc) return rc;
     if (!t->fr->open) return tr_venc_after(t, n, timeout_s);
 
@@ -140,7 +142,7 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
      * node with security=reality that Reality did not accept fails here on EVERY attempt (a
      * cover site without h2 picks http/1.1), and the spare pool refills on every SYN: a leak
      * here grows RSS until the OOM killer. */
-    if (!t->link.plain && t->fr->alpn && t->link.tls.alpn[0] &&
+    if (!own_links(t) && !t->link.plain && t->fr->alpn && t->link.tls.alpn[0] &&
         strcmp(t->link.tls.alpn, t->fr->alpn) != 0) {
         transport_close(t);
         /* The code follows WHAT was asked: ws and httpupgrade ask for http/1.1 only, and "did not
@@ -203,12 +205,15 @@ int transport_has_data(const struct transport *t) {
     /* Encrypted stream: decrypted data or a whole record in the layer's input (trvenc.c). */
     if (t->enc && tr_venc_pending(t)) return 1;
     if (fr_pending(t)) return 1;
+    if (own_links(t)) return 0;
     if (t->link.plain) return 0;
     if (t->link.rx_direct) return tls13_buffered(&t->link.tls) > 0;
     return tls13_has_record(&t->link.tls);
 }
 
-void transport_direct(struct transport *t) { t->link.rx_direct = 1; }
+void transport_direct(struct transport *t) {
+    if (!own_links(t)) t->link.rx_direct = 1;
+}
 
 void transport_moved(struct transport *t) {
     if (t->fr && t->fr->moved) t->fr->moved(t);
@@ -216,13 +221,13 @@ void transport_moved(struct transport *t) {
 
 void transport_close(struct transport *t) {
     /* The transport closes its part FIRST, while the link is alive: ws sends a close frame on
-     * closing, as Xray does, and after tr_link_close there is nothing to encrypt it with. The
-     * xhttp second link is closed here too (transport_ops.close); forgetting it leaks both a
+     * closing, as Xray does, and after tr_link_close there is nothing to encrypt it with. xhttp's
+     * connections are closed here too (transport_ops.close); forgetting them leaks both a
      * descriptor and a set of cipher contexts per connection. fr is NULL if opening did not get
-     * to choosing the transport; then there was no second link either. */
+     * to choosing the transport; then there were none either. */
     if (t->enc) tr_venc_close(t);
     if (t->fr && t->fr->close) t->fr->close(t);
-    tr_link_close(&t->link);
+    if (!own_links(t)) tr_link_close(&t->link);
 }
 
 const char *tr_host_literal(const char *host, char *buf, size_t cap) {
@@ -265,7 +270,10 @@ const char *transport_strerror(int rc) {
                                   "(check the encryption string)";
         case TR_EVENC0RTT: return "VLESS encryption: server rejected the 0-RTT ticket";
         case H2_EIO: case H2_EPROTO: case H2_ESTATUS:
-        case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW: return h2_strerror(rc);
+        case H2_ERESET: case H2_ETOOBIG: case H2_EWINDOW:
+        case H2_EFULL: case H2_EFLOW: return h2_strerror(rc);
+        case XC_EPING: return "HTTP/2 PING got no answer within 15 s";
+        case XC_EGOAWAY: return "server sent GOAWAY before this stream was served";
         case REALITY_EBADKEY: return "cannot parse pbk or sid";
         case REALITY_ECRYPTO: return "crypto failure";
         case REALITY_ETOOBIG: return "ClientHello does not fit";

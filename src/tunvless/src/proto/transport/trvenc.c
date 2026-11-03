@@ -260,7 +260,7 @@ static int raw_fill(struct transport *t, struct venc *e, size_t need, int block,
         if (transport_has_data(t)) continue;
         int64_t left = deadline - now_ms();
         if (left <= 0) return fail(TR_EVENC, "the server did not answer the handshake");
-        struct pollfd p = { .fd = t->link.fd, .events = POLLIN };
+        struct pollfd p = { .fd = transport_fd(t), .events = POLLIN };
         int pr = poll(&p, 1, left > 1000 ? 1000 : (int)left);
         if (pr < 0 && errno != EINTR) return TR_EIO;
     }

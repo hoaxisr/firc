@@ -373,6 +373,23 @@ static int xh_value(struct sj *j, struct sl_xh *a, const char *k) {
     return 0;
 }
 
+static int xh_xmux(struct sj *j, struct sl_xh *a) {
+    int f = 1, r;
+    char k[64], name[80];
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return 0; }
+    while ((r = sj_obj_key(j, &f, k, sizeof k)) == 0) {
+        snprintf(name, sizeof name, "xmux.%s", k);
+        sj_ws(j);
+        if (!strcmp(k, "hKeepAlivePeriod") && *j->p == '"') {
+            const char *b = j->p;
+            sj_skip(j);
+            if (j->p == b) return -1;
+            sl_xh_put(a, name, XH_NOT_A_STRING, 1);
+        } else if (xh_value(j, a, name)) return -1;
+    }
+    return r == 1 ? 0 : -1;
+}
+
 static int xh_dl(struct sj *j, struct xh_set *s, int dl_ok) {
     const char *b = j->p;
     if (!dl_ok) { sj_skip(j); return j->p == b ? -1 : 0; }
@@ -395,6 +412,7 @@ static int xh_obj(struct sj *j, struct xh_set *s, struct xh_set *ex, int *ex_on,
         else if (ex && !strcmp(k, "mode")) { if (sj_str(j, s->n.mode, sizeof s->n.mode)) return -1; }
         else if (ex && !strcmp(k, "host")) { if (sj_str(j, s->n.http_host, sizeof s->n.http_host)) return -1; }
         else if (!strcmp(k, "downloadSettings")) { if (xh_dl(j, s, dl_ok)) return -1; }
+        else if (!strcmp(k, "xmux")) { if (xh_xmux(j, &s->a)) return -1; }
         else if (!strcmp(k, "xPaddingBytes") || !strcmp(k, "scMaxEachPostBytes")) {
             if (*j->p == '{' ? xh_range_obj(j, v, sizeof v) < 0 : xh_token(j, v, sizeof v)) return -1;
             if (k[0] == 'x') sl_pad_range(&s->n, v); else sl_post_range(&s->n, v);
@@ -1197,6 +1215,33 @@ static int clash_alpn(const struct yflat *f, const char *key, uint8_t *code) {
     return 1;
 }
 
+static const char *const clash_reuse[][2] = {
+    { "max-concurrency", "xmux.maxConcurrency" }, { "max-connections", "xmux.maxConnections" },
+    { "c-max-reuse-times", "xmux.cMaxReuseTimes" }, { "h-max-request-times", "xmux.hMaxRequestTimes" },
+    { "h-max-reusable-secs", "xmux.hMaxReusableSecs" }, { "h-keep-alive-period", "xmux.hKeepAlivePeriod" },
+};
+
+static void clash_reuse_put(struct sl_xh *a, const char *k, const char *v) {
+    for (size_t m = 0; m < sizeof clash_reuse / sizeof *clash_reuse; m++)
+        if (!strcmp(k, clash_reuse[m][0])) sl_xh_put(a, clash_reuse[m][1], v, strlen(v));
+}
+
+static void clash_dl_reuse(const struct yflat *f, const char *main_xhx, struct vless_node *b) {
+    struct sl_xh a;
+    memset(&a, 0, sizeof a);
+    char key[64];
+    for (const char *l = main_xhx ? main_xhx : "", *e; (e = strchr(l, '\n')); l = e + 1) {
+        const char *eq = memchr(l, '=', (size_t)(e - l));
+        if (!eq || !strncmp(l, "xmux.", 5)) continue;
+        snprintf(key, sizeof key, "%.*s", (int)(eq - l), l);
+        sl_xh_put(&a, key, eq + 1, (size_t)(e - eq - 1));
+    }
+    size_t pl = strlen(DS "reuse-settings.");
+    for (size_t i = 0; i < f->n; i++)
+        if (!strncmp(f->kv[i].k, DS "reuse-settings.", pl)) clash_reuse_put(&a, f->kv[i].k + pl, f->kv[i].v);
+    sl_xh_done(b, &a);
+}
+
 static void clash_dl(const struct yflat *f, const struct vless_node *main, struct vless_node *n) {
     struct sl_dl *d = calloc(1, sizeof *d);
     if (!d) { n->dl = &SL_DL_FULL; return; }
@@ -1251,6 +1296,7 @@ static void clash_dl(const struct yflat *f, const struct vless_node *main, struc
     b->pad_from = main->pad_from;
     b->pad_to = main->pad_to;
     b->xhx = main->xhx;
+    if (ds_has(f, "reuse-settings") && main->xhx != SL_BAD_XHX && main->xhx != SL_FULL) clash_dl_reuse(f, main->xhx, b);
     sl_dl_done(n, d);
     free(d);
 }
@@ -1345,6 +1391,7 @@ static int clash_node(const struct yflat *f, struct vless_node *n) {
                     n->headers_bad = 1;
                 continue;
             }
+            if (!strncmp(k, "reuse-settings.", 15)) clash_reuse_put(&a, k + 15, f->kv[i].v);
             for (size_t m = 0; m < sizeof map / sizeof *map; m++)
                 if (!strcmp(k, map[m][0])) sl_xh_put(&a, map[m][1], f->kv[i].v, strlen(f->kv[i].v));
         }

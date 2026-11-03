@@ -52,4 +52,6 @@ int pool_select(const int *sel, size_t n);
 
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host);
 
+int pool_ref_stale(const struct xc_ref *r);
+
 #endif

@@ -16,7 +16,8 @@
  * hash of the destination address (if that slot is dead, the next live one round the circle, so
  * the sites of live slots do not move); site_client — by a hash of client and destination.
  *
- * SPARE CONNECTIONS of the stack (DC_PRECONNECT) are opened to live slots in turn. A connection
+ * SPARE CONNECTIONS of the stack (DC_PRECONNECT) are opened to live slots in turn, never to a node
+ * whose flows share links (dialer_mux.shares): those flows take no spare. A connection
  * takes a spare that suits its node (match): with connection, any — the connection moves to the
  * spare's node; with site, only its own slot's. A spare to a node no longer active is dropped.
  *
@@ -45,6 +46,7 @@
 #include "pool.h"
 #include "../control.h"
 #include "transport.h"
+#include "xconn.h"
 #include "osrand.h"
 
 #ifndef GRND_NONBLOCK
@@ -549,42 +551,53 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
 static const char *pl_strerror(int rc) { return g_pl.in->strerror(rc); }
 
 /* A connect outcome for the slot's health: a streak of failures brings its check forward. */
-static void pl_seen_at(const struct pl_sess *s, int rc, uint64_t started) {
-    if (s->slot < 0) return;
+static void pl_seen(int slot, unsigned gen, int rc, uint64_t started) {
+    if (slot < 0) return;
     pthread_mutex_lock(&g_pl.mu);
-    struct pl_slot *sl = &g_pl.slot[s->slot];
-    if (sl->gen == s->gen) {
+    struct pl_slot *sl = &g_pl.slot[slot];
+    if (sl->gen == gen) {
         if (rc == 0) sl->streak = sl->unproven = 0;
         else if (started >= sl->checked_at && ++sl->streak >= PL_STREAK) {
             sl->streak = 0;
-            pl_kick(s->slot);
+            pl_kick(slot);
         }
     }
     pthread_mutex_unlock(&g_pl.mu);
+}
+
+static void pl_seen_at(const struct pl_sess *s, int rc, uint64_t started) { pl_seen(s->slot, s->gen, rc, started); }
+
+static int pl_slot_dead(int slot) {
+    if (slot < 0) return 0;
+    pthread_mutex_lock(&g_pl.mu);
+    int dead = !g_pl.slot[slot].up;
+    pthread_mutex_unlock(&g_pl.mu);
+    return dead;
 }
 
 static int pl_connect(const void *ctx, void *sess, int timeout_s) {
     (void)ctx;
     struct pl_sess *s = sess;
     if (!s->node) {
-        /* A spare: to the live slots in turn. */
+        /* A spare: to the live slots in turn, past the nodes whose flows share links and never
+         * take one. */
+        const struct dialer_mux *mx = g_pl.in->mux;
         pthread_mutex_lock(&g_pl.mu);
-        int pick = -1;
+        int pick = -1, shared = 0;
         for (int d = 0; d < g_pl.n && pick < 0; d++) {
             int i = (int)((g_pl.rr + (unsigned)d) % (unsigned)g_pl.n);
-            if (g_pl.slot[i].node >= 0 && g_pl.slot[i].up) pick = i;
+            if (g_pl.slot[i].node < 0 || !g_pl.slot[i].up) continue;
+            if (mx && mx->shares && mx->shares(pl_node(g_pl.slot[i].node))) shared = 1;
+            else pick = i;
         }
         if (pick >= 0) {
             g_pl.rr = (unsigned)pick + 1;
             pl_bind(s, pick);
         }
         pthread_mutex_unlock(&g_pl.mu);
-        if (pick < 0) return TR_ENONODE;
-    } else {
-        pthread_mutex_lock(&g_pl.mu);
-        int dead = s->slot >= 0 && !g_pl.slot[s->slot].up;
-        pthread_mutex_unlock(&g_pl.mu);
-        if (dead) return TR_ENONODE;
+        if (pick < 0) return shared ? DIAL_NOSPARE : TR_ENONODE;
+    } else if (pl_slot_dead(s->slot)) {
+        return TR_ENONODE;
     }
     uint64_t started = pl_now_ms();
     int rc = g_pl.in->connect(s->node, INNER(s), timeout_s);
@@ -709,19 +722,46 @@ static int pl_match(const void *ctx, const void *dst, const void *src) {
     return d->slot == s->slot;
 }
 
-static int pl_stale(const void *ctx, const void *sess) {
-    (void)ctx;
-    const struct pl_sess *s = sess;
-    if (s->slot < 0 || !s->node) return 0;
-    const struct pl_slot *sl = &g_pl.slot[s->slot];
-    if (__atomic_load_n(&sl->gen, __ATOMIC_ACQUIRE) == s->gen) return 0;
+static int pl_gen_stale(const void *node, int slot, unsigned gen) {
+    if (slot < 0 || !node) return 0;
+    const struct pl_slot *sl = &g_pl.slot[slot];
+    if (__atomic_load_n(&sl->gen, __ATOMIC_ACQUIRE) == gen) return 0;
     for (int k = 0; k < PL_DRAINED; k++)
-        if (__atomic_load_n(&sl->drained[k], __ATOMIC_RELAXED) == s->gen + 1) {
-            ((struct pl_sess *)sess)->slot = -1;
-            return 0;
-        }
+        if (__atomic_load_n(&sl->drained[k], __ATOMIC_RELAXED) == gen + 1) return -1;
     return 1;
 }
+
+static int pl_stale(const void *ctx, const void *sess) {
+    (void)ctx;
+    struct pl_sess *s = (struct pl_sess *)sess;
+    int st = pl_gen_stale(s->node, s->slot, s->gen);
+    if (st < 0) s->slot = -1;
+    return st > 0;
+}
+
+int pool_ref_stale(const struct xc_ref *r) { return pl_gen_stale(r->node, r->slot, r->gen) > 0; }
+
+static int pl_mux_attach(const void *ctx, void *sess, uint16_t owner, const struct xc_ref *ref) {
+    (void)ctx;
+    (void)ref;
+    struct pl_sess *s = sess;
+    struct xc_ref r = { s->node, s->slot, s->gen };
+    return g_pl.in->mux->attach(s->node, INNER(s), owner, &r);
+}
+
+static int pl_mux_dial(const void *ctx, void *link, int timeout_s) {
+    (void)ctx;
+    struct xc_ref r = ((const struct xconn *)link)->ref;
+    if (pl_slot_dead(r.slot)) return TR_ENONODE;
+    uint64_t started = pl_now_ms();
+    int rc = g_pl.in->mux->dial(r.node, link, timeout_s);
+    pl_seen(r.slot, r.gen, rc, started);
+    return rc;
+}
+
+static int pl_mux_cut(const void *sess) { return g_pl.in->mux->cut(CINNER(sess)); }
+
+static struct dialer_mux g_pl_mux;
 
 static void pl_lost(const void *ctx, const void *sess) {
     (void)ctx;
@@ -833,6 +873,13 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.lost = pl_lost;
     g_pl_ops.set_host = g_pl.in->set_host ? pl_set_host : NULL;
     g_pl_ops.flow_open_on = pool_flow_open_on;
+    if (g_pl.in->mux) {
+        g_pl_mux = *g_pl.in->mux;
+        g_pl_mux.attach = pl_mux_attach;
+        g_pl_mux.dial = pl_mux_dial;
+        g_pl_mux.cut = pl_mux_cut;
+    }
+    g_pl_ops.mux = g_pl.in->mux ? &g_pl_mux : NULL;
 
     /* The stack keeps the pointer until the process ends. */
     static struct dialer d;

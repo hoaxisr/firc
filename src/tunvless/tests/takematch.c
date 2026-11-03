@@ -23,16 +23,14 @@ static void check(const char *what, long want, long got) {
 
 int main(void) {
     /* Taking a spare copies the link from the pool slot into the connection's session (memcpy),
-     * and the transport fixes its self-pointers (xhttp_moved). There are two: h2.io.ctx, and the
-     * xhttp upload's xh.up.h2.io.ctx, which up_request sets to &t->xh.up. In stream-up that
-     * happens while the link is still IN THE SLOT (up_open runs as the link opens). Left unfixed,
-     * it points into the abandoned slot, which the next spare reuses at once, and one
-     * connection's upload goes into another connection's socket.
+     * and the transport fixes its self-pointer (grpc_moved): h2.io.ctx. Left unfixed, it points
+     * into the abandoned slot, which the next spare reuses at once, and one connection's data
+     * goes into another connection's socket.
      *
-     * Both self-pointers are checked on the real transport, and so is that the move does not
+     * The self-pointer is checked on the real transport, and so is that the move does not
      * overwrite the connection's own state (UUID and Vision, set up before the take). Releasing
      * the pool slot is the stack's job and is checked in tests/tunnelmatch.c. */
-    printf("\n== spare pool: both self-pointers fixed after the move ==\n");
+    printf("\n== spare pool: the self-pointer fixed after the move ==\n");
     {
         static struct vl_sess spare, out, before;
         static struct transport want, got;
@@ -41,10 +39,8 @@ int main(void) {
         unsigned char *b = (unsigned char *)&spare;
         for (size_t i = 0; i < sizeof(spare); i++) b[i] = (unsigned char)(i * 31 + 7);
         spare.t.link.fd = -1;
-        spare.t.fr = &tr_xhttp;
+        spare.t.fr = &tr_grpc;
         spare.t.h2.io.ctx = &spare.t.link;
-        spare.t.xh.up.started = 1;
-        spare.t.xh.up.h2.io.ctx = &spare.t.xh.up;
         memcpy(&want, &spare.t, sizeof(want));
         memset(&out, 0, sizeof(out));
         out.uuid[0] = 0x5a;
@@ -53,14 +49,41 @@ int main(void) {
         vless_dialer.take(&out, &spare);
         /* The transport byte for byte, except the self-pointers, which are checked next. */
         memcpy(&got, &out.t, sizeof(got));
-        got.h2.io.ctx = got.xh.up.h2.io.ctx = NULL;
-        want.h2.io.ctx = want.xh.up.h2.io.ctx = NULL;
+        got.h2.io.ctx = NULL;
+        want.h2.io.ctx = NULL;
         check("transport state moved, byte for byte", 1, memcmp(&got, &want, sizeof(got)) == 0);
         check("h2.io.ctx points to the new struct", 1, out.t.h2.io.ctx == &out.t.link);
-        check("up.h2.io.ctx points to the new struct, not into the slot", 1,
-              out.t.xh.up.h2.io.ctx == &out.t.xh.up);
         check("UUID, Vision and the other flow fields kept", 1,
               memcmp(&out, &before, offsetof(struct vl_sess, t)) == 0);
+    }
+
+    printf("\n== spare pool: an xhttp spare moves only what xhttp uses ==\n");
+    {
+        static struct vl_sess spare, out;
+        unsigned char *b = (unsigned char *)&spare, *o = (unsigned char *)&out;
+        for (size_t i = 0; i < sizeof(spare); i++) b[i] = (unsigned char)(i * 31 + 7);
+        for (size_t i = 0; i < sizeof(out); i++) o[i] = (unsigned char)(i * 17 + 3);
+        spare.t.fr = &tr_xhttp;
+        vless_dialer.take(&out, &spare);
+        size_t used = offsetof(struct transport, xh) + sizeof(struct xh_state);
+        int tail = 1;
+        const unsigned char *ot = (const unsigned char *)&out.t;
+        for (size_t i = used; i < sizeof(out.t); i++)
+            if (ot[i] != (unsigned char)((offsetof(struct vl_sess, t) + i) * 17 + 3)) tail = 0;
+        /* catches: an xhttp move that misses part of the flow state */
+        check("xhttp: the flow state moved, byte for byte", 1, memcmp(&out.t, &spare.t, used) == 0);
+        /* catches: an xhttp move that still copies the whole transport */
+        check("xhttp: the bytes past it untouched", 1, tail);
+    }
+
+    {
+        static struct vl_sess sess;
+        memset(&sess, 0, sizeof(sess));
+        sess.t.fr = &tr_xhttp;
+        sess.t.xh.mode = XH_PACKET_UP;
+        vless_dialer.clear(&sess);
+        /* catches: a cleared xhttp session's state overwritten by the main link's descriptor */
+        check("xhttp: clearing the session leaves its mode", XH_PACKET_UP, sess.t.xh.mode);
     }
 
     printf(fails ? "\nFAILED: %d\n" : "\nall checks passed\n", fails);

@@ -25,6 +25,7 @@ ap.add_argument('--kb', type=int, default=30)
 ap.add_argument('--report', type=float, default=10)
 ap.add_argument('--page-timeout', type=float, default=15)
 ap.add_argument('--stall', type=float, default=15, help='seconds without movement that count as a stall')
+ap.add_argument('--each', action='store_true', help='the stall check per long flow')
 a = ap.parse_args()
 
 host, port = a.target.rsplit(':', 1)
@@ -34,6 +35,7 @@ t_start = time.time()
 t_end = t_start + a.dur
 cnt = {'down': 0, 'up': 0}                  # bytes in total
 last_move = {'down': time.time(), 'up': time.time()}
+flow_move = {}
 pages = {'ok': 0, 'fail': 0, 'why': collections.Counter()}
 long_dead = []                              # flows that broke before the end
 stalls = []
@@ -54,7 +56,7 @@ def down_flow(i):
                 raise OSError('EOF from the server')
             with lock:
                 cnt['down'] += len(d)
-                last_move['down'] = time.time()
+                last_move['down'] = flow_move[('down', i)] = time.time()
         s.close()
     except Exception as e:
         if time.time() < t_end - 1:
@@ -70,7 +72,7 @@ def up_flow(i):
             s.sendall(blk)
             with lock:
                 cnt['up'] += len(blk)
-                last_move['up'] = time.time()
+                last_move['up'] = flow_move[('up', i)] = time.time()
         s.close()
     except Exception as e:
         if time.time() < t_end - 1:
@@ -130,6 +132,10 @@ while time.time() < t_end:
                 n = a.down if k == 'down' else a.up
                 if n and now - last_move[k] > a.stall:
                     stalls.append('%s: no movement for %.0f s at second %.0f' % (k, now - last_move[k], now - t_start))
+                for j in range(n if a.each else 0):
+                    m = flow_move.get((k, j), t_start)
+                    if now - m > a.stall:
+                        stalls.append('%s#%d: no movement for %.0f s at second %.0f' % (k, j, now - m, now - t_start))
         next_rep += a.report
     time.sleep(0.005)
 
@@ -140,7 +146,7 @@ bad = []
 if pages['fail']:
     bad.append('failed pages: %d (%s)' % (pages['fail'], dict(pages['why'])))
 if long_dead:
-    bad.append('long flows broke: ' + '; '.join(long_dead[:4]))
+    bad.append('long flows broke (%d): ' % len(long_dead) + '; '.join(long_dead[:4]))
 if stalls:
     bad.append('a flow stalled: ' + '; '.join(stalls[:3]))
 if a.down and cnt['down'] == 0:

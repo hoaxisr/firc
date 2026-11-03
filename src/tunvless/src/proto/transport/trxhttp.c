@@ -1,5 +1,5 @@
-/* The xhttp transport: the protocol stream in HTTP/2 request bodies, over one request or two
- * links.
+/* The xhttp transport: the protocol stream in HTTP/2 request bodies, on HTTP/2 connections of
+ * the flow's own (xconn.h), or on connections the flows of a node share (trxmux.c).
  *
  * In stream-one mode xhttp wraps nothing: the request body is the stream up, the response body
  * the stream down. But it needs padding: the server checks the x_padding length in Referer and
@@ -16,8 +16,13 @@
 #include <poll.h>
 #include "osrand.h"
 
+#include <sys/epoll.h>
+#include <time.h>
+
 #include "transport.h"
+#include "xconn.h"
 #include "xhreq.h"
+#include "trxmux.h"
 
 /* The node's xhttp mode. Empty and "auto" resolve as in Xray's client (splithttp/dialer.go):
  * with reality stream-one, or stream-up when the download goes to its own endpoint; packet-up
@@ -32,87 +37,6 @@ static enum xhttp_mode xhttp_mode_of(const struct tr_node *n) {
     if (!n->security || strcmp(n->security, "reality")) return XH_PACKET_UP;
     return n->dl ? XH_STREAM_UP : XH_STREAM_ONE;
 }
-
-/* ---- the second link, for the upload -------------------------------------------------- */
-
-static int up_write(void *ctx, const unsigned char *d, size_t n) {
-    struct xh_up *u = ctx;
-    return tr_link_write(&u->link, d, n);
-}
-
-static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
-    struct xh_up *u = ctx;
-    /* No direct copy here: Vision lives on the DOWNLOAD stream, and this link only writes. The
-     * server's answers to the upload are empty 200s, read only to process the HTTP/2 control
-     * frames and keep the window from filling.
-     *
-     * NO WAITING HERE. The answers are drained along with sending, and a blocking read would
-     * stop the upload until an answer arrives, turning the stream into "send and wait". Over
-     * TLS there is no waiting: tls13_read polls the socket with a zero timeout and returns zero
-     * bytes when no record is there. A bare socket (security=none) does not behave like that,
-     * and we poll ourselves; hence this link has its own read, not tr_link_read of the main
-     * one. */
-    if (u->link.plain) {
-        struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
-        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
-        ssize_t r = read(u->link.fd, d, cap);
-        if (r == 0) return TR_ECLOSED;
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { *got = 0; return 0; }
-            return TR_EIO;
-        }
-        *got = (size_t)r;
-        return 0;
-    }
-    return tls13_read(&u->link.tls, d, cap, got);
-}
-
-/* Drain what the server answered to the upload.
- *
- * WHY. For each packet-up chunk the server answers an empty 200: headers, an empty DATA,
- * END_STREAM, tens of bytes. Not reading them piles them up in the socket receive buffer; once
- * it is full the server stops writing, and its side of the parsing stalls too: the upload
- * hangs, the later the bigger the buffer, so "sometimes, on big files". The same call also
- * takes the HTTP/2 control frames (SETTINGS, WINDOW_UPDATE, PING); without them the connection
- * window would never be replenished.
- *
- * It does not wait and returns no data: what it reads is dropped. It does return a FAILURE: the
- * xhttp server answers non-200 to a chunk it refused (for example 400 to a padding of the wrong
- * length), and that chunk is lost, so the stream after it cannot be whole. Without this the
- * node looks alive while no traffic flows. Other h2_read codes are not failures here: H2_ERESET
- * in packet-up is the normal end of a chunk's answer, and a broken link is reported by the next
- * write. */
-static int up_drain(struct xh_up *u) {
-    if (!u->started) return 0;
-    static __thread unsigned char sink[H2_MIN_READ_CAP];
-    /* Until the link is empty, bounded so one call cannot spin. NOT until a read returns no
-     * data: on this link no read ever does (the answers are bodiless 200s), and stopping there
-     * took one record per call, with a chunk's answer behind WINDOW_UPDATEs and SETTINGS. */
-    for (int i = 0; i < 64; i++) {
-        /* packet-up: the CURRENT chunk answered (done) says nothing of the older ones, whose
-         * answers may still be on the way: the server answers in any order. h2_read would refuse
-         * to read once done was set, and the oldest chunk's answer was never read: its window
-         * stayed full and the upload stalled for good (no new chunk, so no h2_next_req to clear it). */
-        if (u->h2.done && !u->h2.pend_err && h2_open_streams(&u->h2) > 0) u->h2.done = 0;
-        int more = !u->link.plain && tls13_has_record(&u->link.tls);
-        if (!more) {
-            struct pollfd p = { .fd = u->link.fd, .events = POLLIN };
-            more = poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
-        }
-        if (!more) return 0;
-        size_t got = 0;
-        int rc = h2_read(&u->h2, sink, sizeof(sink), &got);
-        if (rc == H2_ESTATUS) return rc;
-        if (rc) return 0;
-    }
-    return 0;
-}
-
-static int up_alpn(const struct xh_up *u) {
-    return !u->link.plain && u->link.tls.alpn[0] && strcmp(u->link.tls.alpn, "h2") ? TR_ENOH2 : 0;
-}
-
-int tr_xhttp_two(const struct tr_node *n) { return xhttp_mode_of(n) != XH_STREAM_ONE; }
 
 #define XH_BLOCK 16384
 #define XH_MAIN 72
@@ -448,20 +372,24 @@ static size_t data_fit(const struct xh_opts *o, size_t base, size_t budget, size
     return lo;
 }
 
-static size_t meta_budget(const struct xh_state *x) {
-    uint32_t b = h2_header_budget(&x->up.h2, x->main_side.opts.max_hdr);
+static struct xconn *x_post(const struct transport *t) {
+    return t->xh.f.shared ? t->xh.f.post_x : t->xh.priv[0];
+}
+
+static size_t meta_budget(const struct transport *t) {
+    const struct xconn *m = x_post(t);
+    uint32_t b = m ? h2m_header_budget(&m->h2, t->xh.main_side.opts.max_hdr) : 8192;
     return b < XH_BLOCK ? b : XH_BLOCK;
 }
 
 static size_t packet_cap(struct transport *t) {
     struct xh_state *x = &t->xh;
     if (!x->worst_base) {
-        const struct h2 look = { .browser = 1 };
         if (rq_build(t, XK_PACKET, XH_SEQ_WORST, 1)) return 0;
-        x->worst_base = h2_list_size(&look, &g_xs->q.r);
+        x->worst_base = h2w_list_size(&g_xs->q.r, 1);
     }
     size_t hi = x->post_max ? x->post_max : XH_BLOCK;
-    return data_fit(&x->main_side.opts, x->worst_base, meta_budget(x), hi, NULL);
+    return data_fit(&x->main_side.opts, x->worst_base, meta_budget(t), hi, NULL);
 }
 
 static void b64_put(struct xh_ar *a, const unsigned char *d, size_t m, size_t from, size_t cnt) {
@@ -482,9 +410,8 @@ static int rq_data(struct transport *t, const unsigned char *d, size_t n, size_t
     uint32_t span = o->chunk_to - o->chunk_from + 1;
     if (os_getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) memset(r, 0, sizeof r);
     for (size_t i = 0; i < XH_PIECES; i++) cs[i] = o->chunk_from + (span ? r[i] % span : 0);
-    const struct h2 look = { .browser = 1 };
     size_t hi = x->post_max && x->post_max < n ? x->post_max : n;
-    size_t m = data_fit(o, h2_list_size(&look, &q->r), meta_budget(x), hi, cs);
+    size_t m = data_fit(o, h2w_list_size(&q->r, 1), meta_budget(t), hi, cs);
     if (!m) {
         t->why = "xhttp: the server's header limit leaves no room for data";
         return TR_EIO;
@@ -511,41 +438,6 @@ static int rq_data(struct transport *t, const unsigned char *d, size_t n, size_t
     rq_join(q, 1);
     *took = m;
     return 0;
-}
-
-static int rq_send(struct h2 *h, const struct h2_io *io, int *started) {
-    if (*started) return h2_next_req(h, &g_xs->q.r);
-    int rc = h2_start_req(h, io, &g_xs->q.r, 1);
-    if (!rc) *started = 1;
-    return rc;
-}
-
-static int up_request_data(struct transport *t, const unsigned char *d, size_t n, size_t *took) {
-    struct xh_state *x = &t->xh;
-    struct h2_io io = { .ctx = &x->up, .write = up_write, .read = up_read };
-    char seq[24];
-    snprintf(seq, sizeof seq, "%llu", (unsigned long long)x->seq);
-    int rc = rq_build(t, XK_PACKET, seq, 0);
-    if (!rc && d) rc = rq_data(t, d, n, took);
-    return rc ? rc : rq_send(&x->up.h2, &io, &x->up.started);
-}
-
-static int up_request(struct transport *t, long long seq) {
-    struct xh_state *x = &t->xh;
-    struct h2_io io = { .ctx = &x->up, .write = up_write, .read = up_read };
-    if (seq >= 0) return up_request_data(t, NULL, 0, NULL);
-    int rc = rq_build(t, XK_UP, NULL, 0);
-    return rc ? rc : rq_send(&x->up.h2, &io, &x->up.started);
-}
-
-static int down_request(struct transport *t) {
-    /* THIS link is for the download, and its request is a GET without a body. The method
-     * matters: the server tells the upload from the download by it (hub.go: a GET without a
-     * chunk number is stream-down). The server would take a bodiless POST for an upload, wait
-     * for bytes that never come, and send nothing down. */
-    struct h2_io io = { .ctx = &t->link, .write = tr_link_write, .read = tr_link_read };
-    int rc = rq_build(t, t->xh.mode == XH_STREAM_ONE ? XK_ONE : XK_DOWN, NULL, 0);
-    return rc ? rc : h2_start_req(&t->h2, &io, &g_xs->q.r, 1);
 }
 
 static int side_init(struct xh_side *s, const struct tr_node *n, const char *mode) {
@@ -596,31 +488,137 @@ static int xh_init(struct transport *t, const struct tr_node *n) {
     return 0;
 }
 
-static int up_start(struct transport *t) {
-    /* stream-up opens its POST at once and keeps it open for the life of the connection: the
-     * body of that request is the upstream channel.
+static const struct xs *x_rd(const struct transport *t) {
+    return t->xh.mode == XH_STREAM_ONE ? &t->xh.f.one : &t->xh.f.down;
+}
+
+static struct xconn *x_rdconn(const struct transport *t) {
+    const struct xs *s = x_rd(t);
+    return s->x ? s->x : t->xh.priv[0];
+}
+
+static int out_wait(struct transport *t, struct xconn *x) {
+    if (x->shared) return x->state == XC_DEAD ? x->rc : 0;
+    while (xconn_wants_out(x)) {
+        struct pollfd p = { .fd = x->link.fd, .events = POLLOUT };
+        int pr = poll(&p, 1, t->xh.wait_ms);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) {
+            xconn_fail(x, TR_EIO);
+            return TR_EIO;
+        }
+        int rc = xconn_flush(x);
+        if (rc) return rc;
+    }
+    return x->state == XC_DEAD ? x->rc : 0;
+}
+
+static int xh_err(struct transport *t) {
+    int e = t->xh.err;
+    if (e > 0) {
+        h2_note_end(H2_ESTATUS, e);
+        return H2_ESTATUS;
+    }
+    return e;
+}
+
+static int sent(int rc, const struct xs *s) {
+    if (rc == H2_ESTATUS || rc == H2_ERESET) h2_note_end(rc, xs_status(s));
+    return rc;
+}
+
+static int post_reap(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    for (unsigned i = 0; i < f->post_n;) {
+        struct xh_post *p = &f->post[i];
+        unsigned char sink[64];
+        size_t got = 0;
+        int rc = 0;
+        while (xs_ready(&p->s) && !(rc = xs_read(&p->s, sink, sizeof sink, &got))) {}
+        if (!rc) {
+            i++;
+            continue;
+        }
+        int st = xs_status(&p->s);
+        if (!st && t->xh.f.shared) tr_xmux_post_failed(p->s.x);
+        if (st != 200 && !t->xh.err) t->xh.err = st ? (st > 0 ? st : -1) : rc;
+        if (t->xh.err == -1) t->xh.err = H2_ESTATUS;
+        xs_close(&p->s);
+        f->post[i] = f->post[--f->post_n];
+    }
+    return xh_err(t);
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int post_pull(struct transport *t) {
+    struct xconn *m = x_post(t);
+    if (m && !m->shared && m->state == XC_LIVE) xconn_io(m, EPOLLIN | EPOLLOUT, mono_ms());
+    return post_reap(t);
+}
+
+static int up_reap(struct transport *t) {
+    struct xs *u = &t->xh.f.up;
+    unsigned char sink[64];
+    size_t got = 1;
+    int rc = 0;
+    while (u->x && got && xs_ready(u) && !(rc = xs_read(u, sink, sizeof sink, &got))) {}
+    return rc && xs_failed(u) ? rc : 0;
+}
+
+static int up_open(struct transport *t, struct xconn *main) {
+    int rc = rq_build(t, XK_UP, NULL, 0);
+    return rc ? rc : xs_open(main, &g_xs->q.r, t->xh.f.owner, &t->xh.f.up);
+}
+
+int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner) {
+    struct xh_state *x = &t->xh;
+    memset(&x->f.one, 0, sizeof x->f.one);
+    memset(&x->f.down, 0, sizeof x->f.down);
+    memset(&x->f.up, 0, sizeof x->f.up);
+    x->f.post_n = 0;
+    x->f.owner = owner;
+    x->seq = 0;
+    x->err = 0;
+    /* stream-one sends its one POST on main. Otherwise the GET goes on down, and its request is a
+     * GET without a body. The method matters: the server tells the upload from the download by it
+     * (hub.go: a GET without a chunk number is stream-down). The server would take a bodiless POST
+     * for an upload, wait for bytes that never come, and send nothing down.
      *
-     * packet-up opens NOTHING in advance. A request there lives for exactly one chunk; opening
-     * it before the chunk exists would hold an empty upload on the server, with number 0, which
-     * would then have to be skipped. The first request opens on the first send. */
-    if (t->xh.mode == XH_STREAM_UP) return up_request(t, -1);
-    t->xh.seq = 0;
-    return 0;
+     * stream-up opens its POST at once and keeps it open for the life of the flow: the body of that
+     * request is the upstream channel. packet-up opens NOTHING in advance. A request there lives
+     * for exactly one chunk; opening it before the chunk exists would hold an empty upload on the
+     * server, with number 0, which would then have to be skipped. The first request opens on the
+     * first send. */
+    int one = x->mode == XH_STREAM_ONE;
+    int rc = rq_build(t, one ? XK_ONE : XK_DOWN, NULL, 0);
+    if (!rc) rc = xs_open(one ? main : down, &g_xs->q.r, owner, one ? &x->f.one : &x->f.down);
+    if (!rc && x->mode == XH_STREAM_UP) rc = up_open(t, main);
+    if (!rc) rc = out_wait(t, main);
+    if (!rc && down != main) rc = out_wait(t, down);
+    return rc;
+}
+
+static void xhttp_close(struct transport *t);
+
+int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner) {
+    t->fr = &tr_xhttp;
+    memset((char *)t + offsetof(struct transport, enc), 0, transport_used(t) - offsetof(struct transport, enc));
+    t->xh.wait_ms = 1000;
+    t->xh.f.owner = owner;
+    t->xh.f.shared = 1;
+    return xh_init(t, n);
 }
 
 static int xhttp_open(struct transport *t, const struct tr_node *n, int timeout_s) {
     (void)timeout_s;
     int rc = xh_init(t, n);
-    if (!rc) rc = down_request(t);
-    if (rc || t->xh.mode == XH_STREAM_ONE) return rc;
-    rc = up_alpn(&t->xh.up);
-    return rc ? rc : up_start(t);
-}
-
-/* packet-up: what all chunks of a write may carry together (the connection window). */
-static long packet_conn_room(const struct xh_up *u) {
-    if (!u->started) return 65535;
-    return u->h2.send_win_conn > 0 ? u->h2.send_win_conn : 0;
+    struct xconn *m = t->xh.priv[0];
+    return rc ? rc : xh_flow_start(t, m, t->xh.priv[1] ? t->xh.priv[1] : m, 0);
 }
 
 /* packet-up: how far ahead of the oldest unanswered chunk a new one may go, in chunks. The
@@ -632,42 +630,69 @@ static long packet_conn_room(const struct xh_up *u) {
  * chunks is not enough: later ones get answered and free their slots while the gap stays. So the
  * bound is a window over seq, as in TCP: no chunk more than PACKET_INFLIGHT past the oldest
  * unanswered one: the node's scMaxBufferedPosts when the link carries it, else PACKET_INFLIGHT,
- * and never more streams than the open table or the server's MAX_CONCURRENT_STREAMS. */
+ * and never more streams than the flow's ring or the server's MAX_CONCURRENT_STREAMS leave. */
 #define PACKET_INFLIGHT 24
 #define PACKET_SLOT 8192
 
-/* packet-up: what the next chunk's request can carry. Before the first request the windows are
- * the default 65535. */
-/* Chunks that may still be sent before the window over seq is full (see PACKET_INFLIGHT). The
- * stream ids go up by two per chunk. */
-static long packet_win(const struct xh_state *x) {
+/* Chunks that may still be sent before the window over seq is full (see PACKET_INFLIGHT). */
+static long packet_win(const struct transport *t) {
+    const struct xh_state *x = &t->xh;
     long w = x->main_side.opts.posts ? (long)x->main_side.opts.posts : PACKET_INFLIGHT;
-    long c = (long)h2_stream_cap(&x->up.h2);
+    const struct xconn *m = x_post(t);
+    long c = m ? (long)h2m_cap(&m->h2) - (m == x->f.down.x ? 1 : 0) : XH_POST_MAX;
+    if (c > XH_POST_MAX) c = XH_POST_MAX;
     return w < c ? w : c;
 }
 
-static long packet_slots(const struct xh_state *x) {
-    const struct xh_up *u = &x->up;
-    long win = packet_win(x);
-    if (!u->started) return win;
-    uint32_t oldest = h2_oldest_open(&u->h2);
-    if (!oldest) return win;
-    long ahead = (long)(u->h2.sid - oldest) / 2 + 1;   /* chunks from the oldest to the last */
-    return ahead >= win ? 0 : win - ahead;
+static long packet_slots(const struct transport *t) {
+    const struct xh_flow *f = &t->xh.f;
+    long win = packet_win(t);
+    uint64_t oldest = f->post_n ? f->post[0].seq : t->xh.seq;
+    for (unsigned i = 1; i < f->post_n; i++)
+        if (f->post[i].seq < oldest) oldest = f->post[i].seq;
+    long ahead = (long)(t->xh.seq - oldest);
+    long s = ahead >= win ? 0 : win - ahead;
+    const struct xconn *m = x_post(t);
+    if (!f->shared || !m) return s;
+    long free_n = (long)h2m_cap(&m->h2) - (long)h2m_open_n(&m->h2);
+    return free_n < s ? (free_n > 0 ? free_n : 0) : s;
 }
 
-static long packet_room(const struct xh_state *x) {
-    const struct xh_up *u = &x->up;
-    if (!u->started) return 65535;
-    if (packet_slots(x) <= 0) return 0;
-    const struct h2 *h = &u->h2;
-    int32_t r = h->send_win_conn < h->peer_init_win ? h->send_win_conn : h->peer_init_win;
+static long packet_room(const struct transport *t) {
+    if (packet_slots(t) <= 0) return 0;
+    const struct xconn *m = x_post(t);
+    if (!m) return 0;
+    int32_t r = m->h2.send_win_conn < m->h2.peer_init_win ? m->h2.send_win_conn : m->h2.peer_init_win;
     return r > 0 ? r : 0;
+}
+
+/* packet-up: what all chunks of a write may carry together (the connection window). */
+static long packet_conn_room(const struct transport *t) {
+    const struct xconn *m = x_post(t);
+    return m ? h2m_conn_room(&m->h2) : 0;
+}
+
+static int post_open(struct transport *t, const unsigned char *d, size_t n, int meta, size_t *took) {
+    struct xh_state *x = &t->xh;
+    struct xh_flow *f = &x->f;
+    if (f->post_n >= XH_POST_MAX) return H2_EWINDOW;
+    char seq[24];
+    snprintf(seq, sizeof seq, "%llu", (unsigned long long)x->seq);
+    int rc = rq_build(t, XK_PACKET, seq, 0);
+    if (!rc && meta) rc = rq_data(t, d, n, took);
+    struct xh_post *p = &f->post[f->post_n];
+    if (!rc) rc = xs_open(x_post(t), &g_xs->q.r, f->owner, &p->s);
+    if (rc) return rc;
+    p->seq = x->seq++;
+    f->post_n++;
+    if (meta) return 0;
+    *took = n;
+    return sent(xs_send(&p->s, d, n, 1), &p->s);
 }
 
 static int packet_meta_write(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_state *x = &t->xh;
-    int rc = up_drain(&x->up);
+    int rc = post_pull(t);
     if (rc) return rc;
     size_t w = packet_cap(t);
     if (!w) {
@@ -676,125 +701,184 @@ static int packet_meta_write(struct transport *t, const unsigned char *d, size_t
         return TR_EIO;
     }
     long pieces = (long)((n + w - 1) / w);
-#define META_FITS() (packet_slots(x) >= pieces || \
-                     (pieces > packet_win(x) && !h2_open_streams(&x->up.h2)))
-    if (!META_FITS()) up_drain(&x->up);
-    if (!META_FITS()) return H2_EWINDOW;
-#undef META_FITS
+    if (packet_slots(t) < pieces && !(pieces > packet_win(t) && !x->f.post_n)) return H2_EWINDOW;
     for (size_t off = 0; off < n && !rc;) {
         size_t took = 0;
-        rc = up_request_data(t, d + off, n - off, &took);
-        if (!rc) { x->seq++; off += took; }
+        rc = post_open(t, d + off, n - off, 1, &took);
+        if (!rc) off += took;
     }
-    int dr = up_drain(&x->up);
-    return rc ? rc : dr;
+    return rc ? rc : out_wait(t, x_post(t));
+}
+
+int (*tr_xh_send)(const struct xs *s, const unsigned char *d, size_t n, int end) = xs_send;
+
+int xh_post_flush(struct transport *t) {
+    struct xh_state *x = &t->xh;
+    struct xh_flow *f = &x->f;
+    struct xconn *m = f->post_x;
+    int rc = post_reap(t);
+    if (rc) return rc;
+    if (!m || f->post_n >= XH_POST_MAX || packet_slots(t) <= 0) return 0;
+    unsigned char buf[XH_BLOCK];
+    int meta = data_meta(&x->main_side.opts);
+    size_t n = f->bat.n;
+    if (meta) {
+        size_t w = packet_cap(t);
+        if (!w) return TR_EIO;
+        if (n > w) n = w;
+        if (n > sizeof buf) n = sizeof buf;
+    } else {
+        size_t cap = x->post_max ? x->post_max : 1000000;
+        long r = xc_room_new(m, f->owner);
+        if (n > cap) n = cap;
+        if ((long)n > r) {
+            if (r < XC_CHUNK) return 0;
+            n = (size_t)r;
+        }
+    }
+    char seq[24];
+    snprintf(seq, sizeof seq, "%llu", (unsigned long long)x->seq);
+    rc = rq_build(t, XK_PACKET, seq, 0);
+    size_t took = n;
+    if (!rc && meta) {
+        xc_q_peek(&f->bat, buf, n);
+        rc = rq_data(t, buf, n, &took);
+    }
+    struct xh_post *p = &f->post[f->post_n];
+    if (!rc) rc = xs_open(m, &g_xs->q.r, f->owner, &p->s);
+    if (rc) return rc;
+    p->seq = x->seq++;
+    f->post_n++;
+    if (meta) {
+        xc_q_pop(&f->bat, buf, took);
+        return (int)took;
+    }
+    for (size_t left = n; left;) {
+        size_t k = xc_q_pop(&f->bat, buf, left < sizeof buf ? left : sizeof buf);
+        left -= k;
+        rc = sent(tr_xh_send(&p->s, buf, k, !left), &p->s);
+        if (rc) return rc;
+    }
+    return (int)n;
 }
 
 static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
-        case XH_STREAM_ONE:
-            return h2_write(&t->h2, d, n);
+        case XH_STREAM_ONE: {
+            int rc = sent(xs_send(&x->f.one, d, n, 0), &x->f.one);
+            return rc ? rc : out_wait(t, x->f.one.x);
+        }
         case XH_STREAM_UP: {
-            /* One long POST for the whole connection: write into it and drain whatever the
-             * server has answered meanwhile. A closed window may only mean an unread
-             * WINDOW_UPDATE: drain and try once more before refusing. */
-            int rc = h2_write(&x->up.h2, d, n);
-            if (rc == H2_EWINDOW && up_drain(&x->up) == 0) rc = h2_write(&x->up.h2, d, n);
-            int dr = up_drain(&x->up);
-            return rc ? rc : dr;
+            /* One long POST for the whole flow. What the server answered meanwhile is read first:
+             * a refusal ends the stream, and a closed window may only mean an unread
+             * WINDOW_UPDATE. */
+            post_pull(t);
+            int rc = sent(xs_send(&x->f.up, d, n, 0), &x->f.up);
+            return rc ? rc : out_wait(t, x->f.up.x);
         }
         case XH_PACKET_UP: {
-            if (data_meta(&x->main_side.opts)) return packet_meta_write(t, d, n);
-            /* A chunk is a request of its own: open, write, close our half.
-             *
-             * NO BATCHING. Xray gathers small writes into chunks of up to a megabyte and says
-             * outright that without it the bandwidth is "extremely limited". We have nothing
-             * to batch with: a batcher needs a flush deadline, i.e. a timer or a thread per
-             * connection, while the tunnel calls send itself and knows nothing of time. So one
-             * request per call: the honest price of a mode chosen when the others do not pass
-             * at all. */
-            /* A chunk the windows cannot take now must not open its request: h2_write would
-             * refuse it after the HEADERS went out, leaving a stream without END_STREAM, and the
-             * retry would open another one for the same seq. Before the first request the
-             * windows are the default 65535. */
-            /* The server refuses a POST body over its scMaxEachPostBytes with 413: a write larger
-             * than post_max goes as several chunks. All or nothing still holds (h2_write's
-             * contract, which Vision above relies on): the windows are checked for the whole
-             * write before the first chunk opens, the connection window for the sum and each new
-             * stream's window for one chunk. */
-            size_t piece = x->post_max && x->post_max < n ? x->post_max : n;
-            /* The chunks this write needs must fit among the unanswered ones; a write that needs
-             * more than the whole window alone (a tiny scMaxEachPostBytes) waits for none. */
-            int pieces = (int)((n + piece - 1) / piece);
-#define PACKET_FITS() ((long)piece <= packet_room(x) && (long)n <= packet_conn_room(&x->up) && \
-                       (packet_slots(x) >= pieces || \
-                        (pieces > packet_win(x) && !h2_open_streams(&x->up.h2))))
-            if (!PACKET_FITS()) up_drain(&x->up);
-            if (!PACKET_FITS()) return H2_EWINDOW;
-#undef PACKET_FITS
-            int rc = 0;
-            for (size_t off = 0; off < n && !rc; off += piece) {
-                size_t m = n - off < piece ? n - off : piece;
-                rc = up_request(t, (long long)x->seq);
-                if (!rc) rc = h2_write(&x->up.h2, d + off, m);
-                if (!rc) rc = h2_end_stream(&x->up.h2);
-                if (!rc) x->seq++;
+            if (x->f.shared) {
+                int rc = post_reap(t);
+                return rc ? rc : tr_xmux_batch(t, d, n);
             }
-            int dr = up_drain(&x->up);
-            return rc ? rc : dr;
+            if (data_meta(&x->main_side.opts)) return packet_meta_write(t, d, n);
+            /* A chunk is a request of its own: open, write with END_STREAM. */
+            int rc = post_pull(t);
+            if (rc) return rc;
+            /* A chunk the windows cannot take now must not open its request: the send would be
+             * refused after the HEADERS went out, leaving a stream without END_STREAM, and the
+             * retry would open another one for the same seq.
+             *
+             * The server refuses a POST body over its scMaxEachPostBytes with 413: a write larger
+             * than post_max goes as several chunks. All or nothing still holds (Vision above relies
+             * on it): the windows are checked for the whole write before the first chunk opens,
+             * the connection window for the sum and each new stream's window for one chunk. The
+             * chunks this write needs must fit among the unanswered ones; a write that needs more
+             * than the whole window alone (a tiny scMaxEachPostBytes) waits for none. */
+            size_t piece = x->post_max && x->post_max < n ? x->post_max : n;
+            long pieces = (long)((n + piece - 1) / piece);
+            if ((long)piece > packet_room(t) || (long)n > packet_conn_room(t) ||
+                (packet_slots(t) < pieces && !(pieces > packet_win(t) && !x->f.post_n)))
+                return H2_EWINDOW;
+            for (size_t off = 0; off < n && !rc; off += piece) {
+                size_t took = 0;
+                rc = post_open(t, d + off, n - off < piece ? n - off : piece, 0, &took);
+            }
+            return rc ? rc : out_wait(t, x_post(t));
         }
     }
-    return h2_write(&t->h2, d, n);
+    return H2_EPROTO;
 }
 
 static int xhttp_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
-    return h2_read(&t->h2, d, cap, got);
+    if (t->xh.f.shared && t->xh.mode != XH_STREAM_ONE) {
+        int rc = t->xh.mode == XH_STREAM_UP ? up_reap(t) : post_reap(t);
+        if (rc) return rc;
+    }
+    const struct xs *s = x_rd(t);
+    int rc = sent(xs_read(s, d, cap, got), s);
+    if (rc) t->xh.f.end = rc;
+    return rc;
 }
 
-/* TWO self-pointers: the download's (h2.io.ctx, the main link) and the upload's (up.h2.io.ctx,
- * the second link; for stream-up it is set before the move, during open). Fixing only the first
- * sends the upload of a connection taken from the spare pool through the second link of another
- * spare session, set up in the same slot right after. */
-/* The download's end is known but only the next read can report it (see grpc_pending). Only
- * the download stream counts: the answers to upload chunks (up.h2) end with every chunk. */
-static int xhttp_pending(const struct transport *t) { return t->h2.done || t->h2.pend_err; }
-
-static void xhttp_moved(struct transport *t) {
-    t->h2.io.ctx = &t->link;
-    t->xh.up.h2.io.ctx = &t->xh.up;
+/* The download's end is known but only the next read can report it, and a record read with an
+ * earlier one sits in the TLS buffer where epoll does not see it. */
+static int xhttp_pending(const struct transport *t) {
+    if (t->xh.f.shared) return x_rd(t)->x && xs_ready(x_rd(t));
+    const struct xconn *x = x_rdconn(t);
+    if (!x) return 0;
+    if (x_rd(t)->x && xs_ready(x_rd(t))) return 1;
+    return !x->link.plain && tls13_has_record(&x->link.tls);
 }
 
-/* The second link exists only in stream-up and packet-up. Otherwise (stream-one) its fd is still
- * 0 from transport_open's memset, hence "> 0", not "!= -1". */
+static int xhttp_fd(const struct transport *t) {
+    if (t->xh.f.shared) return -1;
+    const struct xconn *x = x_rdconn(t);
+    return x ? x->link.fd : -1;
+}
+
+static int xhttp_dial(struct transport *t, const struct tr_node *n, int timeout_s) {
+    struct xh_state *x = &t->xh;
+    x->wait_ms = timeout_s > 0 ? timeout_s * 1000 : 1000;
+    x->priv[0] = xconn_new(n, 0, 0);
+    if (n->dl) x->priv[1] = xconn_new(n->dl, 0, 0);
+    int rc = !x->priv[0] || (n->dl && !x->priv[1]) ? TR_EIO
+           : n->dl ? xconn_dial2(x->priv[1], x->priv[0], timeout_s)
+           : xconn_dial(x->priv[0], timeout_s);
+    if (rc) xhttp_close(t);
+    return rc;
+}
+
 static void xhttp_close(struct transport *t) {
-    struct xh_up *u = &t->xh.up;
-    if (u->link.fd > 0) close(u->link.fd);
-    u->link.fd = -1;
-    if (!u->link.plain) tls13_free(&u->link.tls);
-    u->link.tls.ready = 0;
-    u->started = 0;
+    if (t->xh.f.shared) tr_xmux_detach(t);
+    for (int i = 0; i < 2; i++) {
+        xconn_free(t->xh.priv[i]);
+        t->xh.priv[i] = NULL;
+    }
+    memset(&t->xh.f, 0, sizeof t->xh.f);
 }
 
-/* What xhttp_write takes now, mode by mode: the same windows it checks.
- *
- * stream-up and packet-up upload over their own link, which the tunnel loop does not watch: it
- * reads only the download link. The server's WINDOW_UPDATEs for the upload were read only by
- * up_drain after a write, and once the client's window was sized by the room (dialer_ops.room),
- * a closed room meant no writes, so no reads, so the room stayed closed: stream-up uploads fell
- * from 3 GB to 14 MB in 20 s. So a low room drains the upload link before it is reported. */
+/* What xhttp_write takes now, mode by mode: the same windows it checks. The connection of the
+ * POSTs is read when the room runs low: the tunnel waits only on the download's descriptor, and
+ * once the client's window was sized by the room (dialer_ops.room), a closed room meant no writes,
+ * so no reads, so the room stayed closed: stream-up uploads fell from 3 GB to 14 MB in 20 s. */
 #define UP_ROOM_LOW 65536
 static long xhttp_room(struct transport *t) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
-        case XH_STREAM_ONE: return h2_room(&t->h2);
+        case XH_STREAM_ONE: return xs_room(&x->f.one);
         case XH_STREAM_UP:
-            if (h2_room(&x->up.h2) < UP_ROOM_LOW) up_drain(&x->up);
-            return h2_room(&x->up.h2);
+            if (xs_room(&x->f.up) < UP_ROOM_LOW) post_pull(t);
+            return xs_room(&x->f.up);
         case XH_PACKET_UP: {
+            if (x->f.shared) {
+                post_reap(t);
+                return tr_xmux_bat_room(t);
+            }
             if (data_meta(&x->main_side.opts)) {
-                if (packet_slots(x) <= packet_win(x) / 2) up_drain(&x->up);
-                long slots = packet_slots(x);
+                if (packet_slots(t) <= packet_win(t) / 2) post_pull(t);
+                long slots = packet_slots(t);
                 long per = (long)packet_cap(t);
                 if (slots < 0) slots = 0;
                 if (!per) per = 1;
@@ -807,22 +891,21 @@ static long xhttp_room(struct transport *t) {
              * waited out a retransmission timeout (11 MB uploaded in 20 s). A slot is counted
              * at PACKET_SLOT bytes, below what the stack gathers into one send (up to 16 KB),
              * so a granted window fills whole chunks; post_max when the node's is smaller. */
-            if (packet_room(x) < UP_ROOM_LOW || packet_slots(x) <= packet_win(x) / 2)
-                up_drain(&x->up);
-            long r = packet_room(x);
-            long slots = packet_slots(x);
+            if (packet_room(t) < UP_ROOM_LOW || packet_slots(t) <= packet_win(t) / 2) post_pull(t);
+            long r = packet_room(t);
+            long slots = packet_slots(t);
             long per = x->post_max && x->post_max < PACKET_SLOT ? (long)x->post_max : PACKET_SLOT;
             if (slots < 0) slots = 0;
             if (r > slots * per) r = slots * per;
-            if (r > packet_conn_room(&x->up)) r = packet_conn_room(&x->up);
+            if (r > packet_conn_room(t)) r = packet_conn_room(t);
             return r;
         }
     }
-    return h2_room(&t->h2);
+    return 0;
 }
 
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
-    .open = xhttp_open, .write = xhttp_write, .read = xhttp_read,
-    .moved = xhttp_moved, .close = xhttp_close, .pending = xhttp_pending, .room = xhttp_room,
+    .open = xhttp_open, .write = xhttp_write, .read = xhttp_read, .dial = xhttp_dial, .fd = xhttp_fd,
+    .close = xhttp_close, .pending = xhttp_pending, .room = xhttp_room,
 };

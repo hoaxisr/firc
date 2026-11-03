@@ -45,6 +45,9 @@ size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap)
     { (void)t; (void)out; (void)cap; return 0; }
 int tls13_write(struct tls13 *t, const unsigned char *d, size_t n)
     { (void)t; (void)d; (void)n; return -1; }
+int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap,
+               size_t *out_n)
+    { (void)t; (void)d; (void)n; (void)out; (void)cap; *out_n = 0; return -1; }
 int tls13_read(struct tls13 *t, unsigned char *o, size_t cap, size_t *got)
     { (void)t; (void)o; (void)cap; *got = 0; return -1; }
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)

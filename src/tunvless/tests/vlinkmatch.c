@@ -286,6 +286,40 @@ int main(void) {
               "%2C%22scMinPostsIntervalMs%22%3A%2250-10%22%7D#x") : -1);
     }
     {
+        const char *v[] = {
+            xlink("type=xhttp&security=tls&sni=m.example&path=%2Fx",
+                  "{\"xmux\":{\"maxConcurrency\":\"900-600\",\"cMaxReuseTimes\":8,\"hMaxRequestTimes\":\"600-900\","
+                  "\"hMaxReusableSecs\":\"1800-3000\",\"hKeepAlivePeriod\":-5}}"),
+            xlink("type=xhttp&security=tls&sni=m.example&path=%2Fx",
+                  "{\"seqKey\":\"q\",\"xmux\":{\"maxConnections\":\"20-40\"},\"downloadSettings\":{\"address\":\"d.example\","
+                  "\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"xmux\":{\"maxConnections\":\"20-40\","
+                  "\"cMaxReuseTimes\":\"1-2\",\"hMaxRequestTimes\":3,\"hMaxReusableSecs\":4,\"hKeepAlivePeriod\":-1}}}}"),
+            xlink("type=xhttp&security=tls&sni=m.example&path=%2Fx",
+                  "{\"downloadSettings\":{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":"
+                  "{\"xmux\":{\"maxConcurrency\":\"2-1\",\"hKeepAlivePeriod\":0}}}}"),
+        };
+        /* catches: an xmux key lost, flattened or rewritten on the way to tunvless */
+        links("xhttp-xmux", v, N(v));
+        struct vless_node n, m;
+        char buf[2048];
+        int rc = vless_parse_url(v[0], &n);
+        size_t l = rc ? 0 : vless_node_link(&n, buf, sizeof buf);
+        check("xhttp-xmux: one nested member, values as written", 0, l ? strcmp(buf,
+              "vless://" UUID "@m.example:443?type=xhttp&security=tls&sni=m.example&path=%2Fx"
+              "&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%22900-600%22%2C%22cMaxReuseTimes%22%3A%228%22"
+              "%2C%22hMaxRequestTimes%22%3A%22600-900%22%2C%22hMaxReusableSecs%22%3A%221800-3000%22"
+              "%2C%22hKeepAlivePeriod%22%3A-5%7D%7D#d") : -1);
+        rc = vless_parse_url(v[1], &n);
+        l = rc ? 0 : vless_node_link(&n, buf, sizeof buf);
+        rc = l ? vless_parse_url(buf, &m) : -1;
+        check("xhttp-xmux: block read back", 0, rc);
+        check_str("xhttp-xmux: block keeps every key", "xmux.maxConnections=20-40\nxmux.cMaxReuseTimes=1-2\n"
+                  "xmux.hMaxRequestTimes=3\nxmux.hMaxReusableSecs=4\nxmux.hKeepAlivePeriod=-1\n",
+                  !rc && m.dl && m.dl != &SL_DL_FULL && m.dl->xhx ? m.dl->xhx : "");
+        check_str("xhttp-xmux: main keeps its own", "seqKey=q\nxmux.maxConnections=20-40\n", !rc && m.xhx ? m.xhx : "");
+        for (size_t i = 0; i < N(v); i++) free((void *)v[i]);
+    }
+    {
         static char big[2048] = "%7B%22headers%22%3A%7B";
         for (int i = 0; i < 40; i++) {
             char kv[96];

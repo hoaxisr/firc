@@ -412,6 +412,24 @@ static void t_min_posts_interval_accepted_or_refused(void) {
     }
 }
 
+static void t_min_posts_interval_values(void) {
+    struct xh_opts o;
+    static const struct { const char *line; int32_t from, to; } c[] = {
+        { "", 30, 30 }, { "scMinPostsIntervalMs=0\n", 30, 30 }, { "scMinPostsIntervalMs=10-50\n", 10, 50 },
+        { "scMinPostsIntervalMs=50-10\n", 10, 50 }, { "scMinPostsIntervalMs=-1\n", -1, -1 },
+        { "scMinPostsIntervalMs=-5-0\n", 30, 30 }, { "scMinPostsIntervalMs=100\n", 100, 100 },
+    };
+    char what[96];
+    /* catches: the interval ignored, its absent or zero-ended default not 30 ms, or a range not swapped */
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+        parse(c[i].line, "packet-up", "", 0, &o);
+        snprintf(what, sizeof what, "interval '%.30s': from", c[i].line);
+        check(what, c[i].from, o.interval.from);
+        snprintf(what, sizeof what, "interval '%.30s': to", c[i].line);
+        check(what, c[i].to, o.interval.to);
+    }
+}
+
 static void t_query_padding_overflows_path(void) {
     struct xh_opts o;
     check("query pad 1368: parse", 0, parse("xPaddingObfsMode=true\nxPaddingPlacement=query\n", "", "", 1368, &o));
@@ -428,6 +446,121 @@ static void t_query_padding_overflows_path(void) {
           parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", "", 974, &o));
     check("tokenish query pad 975: refused", -1,
           parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", "", 975, &o));
+}
+
+static void t_xmux_parse(void) {
+    struct xh_opts o;
+    /* catches: an xmux key read into the wrong field, or one value read as a range */
+    check("xmux parse: rc", 0,
+          parse("xmux.maxConcurrency=16-32\nxmux.cMaxReuseTimes=8\nxmux.hKeepAlivePeriod=-1\n", "", "", 0, &o));
+    check("xmux parse: maxConcurrency from", 16, o.xmux.max_conc.from);
+    check("xmux parse: maxConcurrency to", 32, o.xmux.max_conc.to);
+    check("xmux parse: cMaxReuseTimes from", 8, o.xmux.c_reuse.from);
+    check("xmux parse: cMaxReuseTimes to", 8, o.xmux.c_reuse.to);
+    check("xmux parse: hKeepAlivePeriod", -1, (long)o.xmux.keepalive_s);
+    check("xmux parse: maxConnections from", 0, o.xmux.max_conns.from);
+    check("xmux parse: maxConnections to", 0, o.xmux.max_conns.to);
+    check("xmux parse: set", 1, o.xmux.set);
+    check("xmux parse: hMaxRequestTimes untouched", 0, o.xmux.h_reqs.to);
+    check("xmux parse: hMaxReusableSecs untouched", 0, o.xmux.h_secs.to);
+    check("xmux parse rest: rc", 0,
+          parse("xmux.hMaxRequestTimes=7\nxmux.hMaxReusableSecs=-3-9\n", "", "", 0, &o));
+    check("xmux parse rest: hMaxRequestTimes", 7, o.xmux.h_reqs.from);
+    check("xmux parse rest: hMaxReusableSecs from", -3, o.xmux.h_secs.from);
+    check("xmux parse rest: hMaxReusableSecs to", 9, o.xmux.h_secs.to);
+    check("xmux parse rest: maxConcurrency untouched", 0, o.xmux.max_conc.to);
+    check("xmux absent: rc", 0, parse("seqKey=q\n", "", "", 0, &o));
+    check("xmux absent: not set", 0, o.xmux.set);
+    check("xmux abc: refused", -1, parse("xmux.cMaxReuseTimes=abc\n", "", "", 0, &o));
+    check_why("xmux abc: reason", "xhttp: unsupported xmux.cMaxReuseTimes: abc");
+}
+
+static void t_xmux_swap(void) {
+    struct xh_opts o;
+    /* catches: Xray's swap missing */
+    check("xmux swap: rc", 0, parse("xmux.hMaxRequestTimes=900-600\n", "", "", 0, &o));
+    check("xmux swap: from", 600, o.xmux.h_reqs.from);
+    check("xmux swap: to", 900, o.xmux.h_reqs.to);
+}
+
+static void t_xmux_both_refused(void) {
+    struct xh_opts o;
+    /* catches: the refusal tested on from instead of to, or hidden by the clamp */
+    check("xmux 4 with 2: refused", -1, parse("xmux.maxConcurrency=4\nxmux.maxConnections=2\n", "", "", 0, &o));
+    check_why("xmux 4 with 2: reason", "xhttp: maxConnections cannot be specified together with maxConcurrency");
+    check("xmux 0-4 with 0-2: refused", -1, parse("xmux.maxConcurrency=0-4\nxmux.maxConnections=0-2\n", "", "", 0, &o));
+    check("xmux 0 with 3: parse", 0, parse("xmux.maxConcurrency=0\nxmux.maxConnections=3\n", "", "", 0, &o));
+    check("xmux 4 with 40: refused", -1, parse("xmux.maxConcurrency=4\nxmux.maxConnections=40\n", "", "", 0, &o));
+}
+
+static void t_xmux_cap(void) {
+    static const struct { const char *v; int32_t from, to; } rows[] = {
+        { "16", 16, 16 }, { "17", 16, 16 }, { "20-40", 16, 17 }, { "16-18", 16, 17 },
+    };
+    struct xh_opts o;
+    struct xm_cfg e;
+    char line[64], what[96];
+    /* catches: a refusal instead of the clamp, or a draw above 16 */
+    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) {
+        snprintf(line, sizeof line, "xmux.maxConnections=%s\n", rows[i].v);
+        snprintf(what, sizeof what, "xmux cap %s: usable", rows[i].v);
+        check(what, 0, parse(line, "", "", 0, &o));
+        xm_cfg_effective(&o.xmux, &e);
+        snprintf(what, sizeof what, "xmux cap %s: from", rows[i].v);
+        check(what, rows[i].from, e.max_conns.from);
+        snprintf(what, sizeof what, "xmux cap %s: to", rows[i].v);
+        check(what, rows[i].to, e.max_conns.to);
+    }
+}
+
+static void t_xmux_keepalive_one_number(void) {
+    struct xh_opts o;
+    /* catches: a range accepted where Xray has an int64 */
+    check("xmux keepalive 1-2: refused", -1, parse("xmux.hKeepAlivePeriod=1-2\n", "", "", 0, &o));
+    check_why("xmux keepalive 1-2: reason", "xhttp: unsupported xmux.hKeepAlivePeriod: 1-2");
+    check("xmux keepalive 30s: refused", -1, parse("xmux.hKeepAlivePeriod=30s\n", "", "", 0, &o));
+    check("xmux keepalive 45: parse", 0, parse("xmux.hKeepAlivePeriod=45\n", "", "", 0, &o));
+    check("xmux keepalive 45: kept", 45, (long)o.xmux.keepalive_s);
+}
+
+static void t_xmux_defaults(void) {
+    struct xh_opts o;
+    struct xm_cfg e;
+    /* catches: defaults applied over a set field, or not applied to an all-zero struct */
+    check("xmux defaults none: parse", 0, parse("", "", "", 0, &o));
+    xm_cfg_effective(&o.xmux, &e);
+    check("xmux defaults none: maxConnections from", 3, e.max_conns.from);
+    check("xmux defaults none: maxConnections to", 3, e.max_conns.to);
+    check("xmux defaults none: hMaxRequestTimes from", 600, e.h_reqs.from);
+    check("xmux defaults none: hMaxRequestTimes to", 900, e.h_reqs.to);
+    check("xmux defaults none: hMaxReusableSecs from", 1800, e.h_secs.from);
+    check("xmux defaults none: hMaxReusableSecs to", 3000, e.h_secs.to);
+    check("xmux defaults none: maxConcurrency from", 0, e.max_conc.from);
+    check("xmux defaults none: maxConcurrency to", 0, e.max_conc.to);
+    check("xmux defaults none: cMaxReuseTimes from", 0, e.c_reuse.from);
+    check("xmux defaults none: cMaxReuseTimes to", 0, e.c_reuse.to);
+    check("xmux defaults none: keepalive", 0, (long)e.keepalive_s);
+    check("xmux defaults reuse: parse", 0, parse("xmux.cMaxReuseTimes=5\n", "", "", 0, &o));
+    xm_cfg_effective(&o.xmux, &e);
+    check("xmux defaults reuse: maxConnections from", 0, e.max_conns.from);
+    check("xmux defaults reuse: maxConnections to", 0, e.max_conns.to);
+    check("xmux defaults reuse: hMaxRequestTimes from", 0, e.h_reqs.from);
+    check("xmux defaults reuse: hMaxRequestTimes to", 0, e.h_reqs.to);
+    check("xmux defaults reuse: hMaxReusableSecs to", 0, e.h_secs.to);
+    check("xmux defaults reuse: cMaxReuseTimes from", 5, e.c_reuse.from);
+    check("xmux defaults reuse: cMaxReuseTimes to", 5, e.c_reuse.to);
+    check("xmux defaults keepalive: parse", 0, parse("xmux.hKeepAlivePeriod=30\n", "", "", 0, &o));
+    xm_cfg_effective(&o.xmux, &e);
+    check("xmux defaults keepalive: maxConnections to", 0, e.max_conns.to);
+    check("xmux defaults keepalive: hMaxRequestTimes to", 0, e.h_reqs.to);
+    check("xmux defaults keepalive: kept", 30, (long)e.keepalive_s);
+    check("xmux defaults zero: parse", 0, parse("xmux.maxConnections=0\n", "", "", 0, &o));
+    check("xmux defaults zero: set", 1, o.xmux.set);
+    xm_cfg_effective(&o.xmux, &e);
+    check("xmux defaults zero: maxConnections from", 3, e.max_conns.from);
+    check("xmux defaults zero: maxConnections to", 3, e.max_conns.to);
+    check("xmux defaults zero: hMaxRequestTimes from", 600, e.h_reqs.from);
+    check("xmux defaults zero: hMaxReusableSecs to", 3000, e.h_secs.to);
 }
 
 int main(void) {
@@ -453,5 +586,12 @@ int main(void) {
     t_no_grpc_header_read_or_refused();
     t_server_max_header_bytes_read_or_refused();
     t_min_posts_interval_accepted_or_refused();
+    t_min_posts_interval_values();
+    t_xmux_parse();
+    t_xmux_swap();
+    t_xmux_both_refused();
+    t_xmux_cap();
+    t_xmux_keepalive_one_number();
+    t_xmux_defaults();
     return unit_done("xhoptsmatch");
 }

@@ -357,7 +357,8 @@ static const char *const xh_names[] = {
     "sessionIDLength", "seqPlacement", "seqKey", "uplinkDataPlacement", "uplinkDataKey",
     "uplinkChunkSize", "uplinkHTTPMethod", "xPaddingObfsMode", "xPaddingKey", "xPaddingHeader",
     "xPaddingPlacement", "xPaddingMethod", "scMaxBufferedPosts", "noGRPCHeader",
-    "serverMaxHeaderBytes", "scMinPostsIntervalMs",
+    "serverMaxHeaderBytes", "scMinPostsIntervalMs", "xmux.maxConcurrency", "xmux.maxConnections",
+    "xmux.cMaxReuseTimes", "xmux.hMaxRequestTimes", "xmux.hMaxReusableSecs", "xmux.hKeepAlivePeriod",
 };
 #define XH_NAMES (sizeof xh_names / sizeof *xh_names)
 

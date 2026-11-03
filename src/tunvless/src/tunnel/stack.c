@@ -241,6 +241,7 @@ struct conn {
     uint8_t ib;
     uint8_t ib_reply;
     uint8_t ib_udp;
+    uint8_t mux;
 };
 
 /* The hot record must stay small: that is the whole point of the split. A build check rather
@@ -826,7 +827,9 @@ static int g_trace;
  * possible because VLESS carries the destination in the request header, with the first data (see
  * upstream_send): until then the TLS session to the node belongs to nobody. For the stack this is
  * the dialer's DC_PRECONNECT (dialer.h); a protocol that needs the destination to connect gets no
- * pool.
+ * pool. A flow the dialer puts on a shared link (dialer_mux) takes no spare either: the node pool
+ * opens spares only to nodes whose flows do not share, and a connect that finds none returns
+ * DIAL_NOSPARE, which is no failure.
  *
  * The pool is refilled ONLY when a SYN arrives: a quiet router makes no background handshakes.
  * Browsers open connections in bursts: the first SYN after a quiet spell (SPARE_TTL_MS) goes the
@@ -874,7 +877,7 @@ static uint64_t g_spare_clock_ns;
  * there for the next SYN to find. efd is the eventfd of the requesting loop thread: when the job
  * is done the connector wakes that loop, so early data does not wait up to 20 ms for the poll.
  * The job carries no node: the dialer (g_dl) holds it. */
-struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; };
+struct connjob { struct conn *c; void *sess; struct spare *sp; int efd; void *link; int *done; };
 static struct {
     struct connjob q[CONNQ];
     unsigned head, n;
@@ -884,6 +887,7 @@ static struct {
 } g_cq = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
 static uint32_t g_conn_busy_ms[CONNECTORS];
+static int g_cq_efd[CONNECTORS];
 
 static uint32_t mono_ms(void) { return (uint32_t)(now_ns() / 1000000) | 1u; }
 
@@ -916,6 +920,13 @@ static void spare_note(int ok) {
     pthread_mutex_unlock(&g_spare_mu);
 }
 
+static void efd_wake(int efd) {
+    if (efd < 0) return;
+    uint64_t one = 1;
+    ssize_t wr = write(efd, &one, sizeof(one));
+    (void)wr;
+}
+
 static void *connector(void *arg) {
     int me = (int)(intptr_t)arg;
     for (;;) {
@@ -924,7 +935,19 @@ static void *connector(void *arg) {
         struct connjob j = g_cq.q[g_cq.head];
         g_cq.head = (g_cq.head + 1) % CONNQ;
         g_cq.n--;
+        __atomic_store_n(&g_cq_efd[me], j.efd, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&g_cq.mu);
+
+        if (j.link) {
+            __atomic_store_n(&g_conn_busy_ms[me], mono_ms(), __ATOMIC_RELAXED);
+            int rc = g_dl->ops->mux->dial(g_dl->ctx, j.link, CONNECT_TIMEOUT_S);
+            __atomic_store_n(&g_conn_busy_ms[me], 0, __ATOMIC_RELAXED);
+            __atomic_store_n(j.done, 1, __ATOMIC_RELEASE);
+            spare_note(rc == 0);
+            efd_wake(j.efd);
+            __atomic_store_n(&g_cq_efd[me], -1, __ATOMIC_RELEASE);
+            continue;
+        }
 
         if (!j.c) {
             /* Pool refill: the session stays in its g_spares slot, there is nobody to wake —
@@ -934,6 +957,12 @@ static void *connector(void *arg) {
             __atomic_store_n(&g_conn_busy_ms[me], mono_ms(), __ATOMIC_RELAXED);
             int rc = g_dl->ops->connect(g_dl->ctx, j.sess, CONNECT_TIMEOUT_S);
             __atomic_store_n(&g_conn_busy_ms[me], 0, __ATOMIC_RELAXED);
+            if (rc == DIAL_NOSPARE) {
+                pthread_mutex_lock(&g_spare_mu);
+                sp->state = SPARE_EMPTY;
+                pthread_mutex_unlock(&g_spare_mu);
+                continue;
+            }
             pthread_mutex_lock(&g_spare_mu);
             if (rc == 0) {
                 sp->born_ns = spare_now();
@@ -957,14 +986,11 @@ static void *connector(void *arg) {
          * above must be visible to it by then. */
         __atomic_store_n(&j.c->done, 1, __ATOMIC_RELEASE);
         /* Wake the requester's loop, or a finished handshake waits for its poll, up to 20 ms
-         * per connection. The descriptor lives as long as the loop: before exiting, the loop
-         * waits for its jobs (connq_release) and only then closes the eventfd, so we cannot
-         * write into a reused number. */
-        if (j.efd >= 0) {
-            uint64_t one = 1;
-            ssize_t wr = write(j.efd, &one, sizeof(one));
-            (void)wr;   /* an eventfd counter overflow means "already woken" anyway */
-        }
+         * per connection. The loop may see done before this write, so connq_release also waits
+         * until no connector holds its eventfd (g_cq_efd) before the loop closes it. An eventfd
+         * counter overflow means "already woken". */
+        efd_wake(j.efd);
+        __atomic_store_n(&g_cq_efd[me], -1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -985,6 +1011,7 @@ static int connq_push(const struct connjob *j) {
         pthread_attr_setstacksize(&a, 128 * 1024);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         int made = 0, err = 0;
+        for (int i = 0; i < CONNECTORS; i++) g_cq_efd[i] = -1;
         for (int i = 0; i < CONNECTORS; i++) {
             pthread_t t;
             err = pthread_create(&t, &a, connector, (void *)(intptr_t)i);
@@ -1057,8 +1084,8 @@ static int spare_checkout(void *out) {
         if (!best || sp->born_ns < best->born_ns) best = sp;
     }
     /* Moving the link is the dialer's job: it knows what in the session is the link and what is
-     * flow state, and which pointers in the link point into itself (HTTP/2 has two, see
-     * xhttp_moved in trxhttp.c). Under the lock: the slot becomes empty only after the move. */
+     * flow state, and which pointers in the link point into itself. Under the lock: the slot
+     * becomes empty only after the move. */
     if (best) {
         d->take(out, best->sess);
         best->state = SPARE_EMPTY;
@@ -1131,6 +1158,11 @@ static void spare_refill(void) {
     }
 }
 
+/* This loop thread's eventfd: a connector writes to it when a job is done. Lives from entering
+ * worker_loop to leaving it; -1 if the kernel gave no eventfd — then the loop polls every 20 ms
+ * while jobs are pending. */
+static __thread int g_conn_efd = -1;
+
 /* Remove this thread's jobs from the queue and wait for those already being worked on.
  *
  * Needed when the loop exits (epoll returned an error). Otherwise draining the table would close
@@ -1144,11 +1176,21 @@ static void spare_refill(void) {
  * 0 — all released; -1 — a connector never reported. On -1 the table must NOT be freed: freeing
  * it under a working connector is exactly what this guards against. Leaking is the lesser evil:
  * the loop leaves only on a fatal epoll error. */
+static int conn_ready(struct conn *c, const struct tun_dev *tun);
+static __thread const struct tun_dev *g_mux_tun;
+
 static int connq_release(struct conn *base) {
+    const struct dialer_mux *mx = g_dl->ops->mux;
+    void *gone[CONNQ];
+    unsigned ngone = 0;
     pthread_mutex_lock(&g_cq.mu);
     unsigned kept = 0;
     for (unsigned i = 0; i < g_cq.n; i++) {
         struct connjob j = g_cq.q[(g_cq.head + i) % CONNQ];
+        if (j.link && j.sess == (void *)base) {
+            gone[ngone++] = j.link;
+            continue;
+        }
         if (j.c >= base && j.c < base + MAX_CONNS) {
             j.c->pending = 0;            /* nobody will touch our record any more */
             continue;
@@ -1157,15 +1199,23 @@ static int connq_release(struct conn *base) {
     }
     g_cq.n = kept;
     pthread_mutex_unlock(&g_cq.mu);
+    for (unsigned i = 0; i < ngone; i++) mx->dropped(gone[i]);
+    for (int li = 0; g_mux_tun && li < g_live_n;) {
+        struct conn *c = &g_conns[g_live[li]];
+        if (c->mux && c->pending && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && conn_ready(c, g_mux_tun)) continue;
+        li++;
+    }
 
     /* Wait for the taken jobs to report. A generous limit: the connect timeout is eight seconds,
      * and waiting it out is cheaper than chasing memory corruption on a live router. The check
      * also runs AFTER the last sleep, so a report in the last 10 ms is not missed. */
     for (int spin = 0;; spin++) {
-        int busy = 0;
+        int busy = mx ? mx->busy() : 0;
         for (int i = 0; i < MAX_CONNS; i++)
-            if (base[i].used && base[i].pending &&
+            if (base[i].used && base[i].pending && !base[i].mux &&
                 !__atomic_load_n(&base[i].done, __ATOMIC_ACQUIRE)) busy++;
+        for (int i = 0; g_conn_efd >= 0 && i < CONNECTORS; i++)
+            busy += __atomic_load_n(&g_cq_efd[i], __ATOMIC_ACQUIRE) == g_conn_efd;
         if (!busy) return 0;
         if (spin == 1500) break;
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
@@ -1175,15 +1225,42 @@ static int connq_release(struct conn *base) {
     return -1;
 }
 
-/* This loop thread's eventfd: a connector writes to it when a job is done. Lives from entering
- * worker_loop to leaving it; -1 if the kernel gave no eventfd — then the loop polls every 20 ms
- * while jobs are pending. */
-static __thread int g_conn_efd = -1;
-
 /* Queue a job for this connection; the result is connq_push's. */
 static int conn_submit(struct conn *c) {
     struct connjob j = { .c = c, .sess = SESS(c), .sp = NULL, .efd = g_conn_efd };
     return connq_push(&j);
+}
+
+static int mux_submit(void *link, int *done) {
+    struct connjob j = { .sess = g_conns, .efd = g_conn_efd, .link = link, .done = done };
+    return connq_push(&j);
+}
+
+static int flow_link(struct conn *c, int spare_ok) {
+    const struct dialer_ops *d = g_dl->ops;
+    int a = d->mux ? d->mux->attach(g_dl->ctx, SESS(c), (uint16_t)(c - g_conns), NULL) : XA_NONE;
+    if (a == XA_READY) {
+        c->mux = 1;
+        c->fd = -1;
+        return 0;
+    }
+    if (a == XA_WAIT || a < 0) {
+        c->mux = 1;
+        c->fd = -1;
+        c->rc = a < 0 ? a : 0;
+        __atomic_store_n(&c->done, a < 0, __ATOMIC_RELEASE);
+        c->pending = 1;
+        return 1;
+    }
+    if (spare_ok && g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
+        c->fd = d->fd(SESS(c));
+        node_sock_silence(c->fd);
+        return 0;
+    }
+    int qr = conn_submit(c);
+    if (qr != 0) return qr;
+    c->pending = 1;
+    return 1;
 }
 
 /* Set up the table, once per thread: all slots free, buckets empty. 0 — ready, -1 — no memory.
@@ -1435,7 +1512,7 @@ static void conn_drop(struct conn *c) {
 /* dialer_ops.room for an established TCP connection; -1: no limit or does not apply (UDP, the
  * connector still working). */
 static long conn_room(const struct conn *c) {
-    if (c->is_udp || c->pending || c->fd < 0 || !g_dl->ops->room) return -1;
+    if (c->is_udp || c->pending || (c->fd < 0 && !c->mux) || !g_dl->ops->room) return -1;
     return g_dl->ops->room(g_dl->ctx, SESS(c));
 }
 
@@ -1485,10 +1562,13 @@ static void conn_reset(struct conn *c, const struct tun_dev *tun) {
 }
 
 /* The connection's link to the node ended with an error: if it was cut (node_sock_aborted), tell
- * the dialer, whose node health checking takes it as a reason to check the node now. 1 — cut. */
+ * the dialer, whose node health checking takes it as a reason to check the node now. 1 — cut. A
+ * shared link's cut of 2 (the server refused the stream) resets the client too, but says nothing
+ * about the node's health, so lost is not called. */
 static int conn_node_lost(struct conn *c) {
-    if (!node_sock_aborted(c->fd)) return 0;
-    if (g_dl->ops->lost) g_dl->ops->lost(g_dl->ctx, SESS(c));
+    int cut = c->mux ? g_dl->ops->mux->cut(SESS(c)) : node_sock_aborted(c->fd);
+    if (!cut) return 0;
+    if (cut == 1 && g_dl->ops->lost) g_dl->ops->lost(g_dl->ctx, SESS(c));
     return 1;
 }
 
@@ -1919,9 +1999,8 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
  * A handshake per flow is cheap: the first datagram waits for it in the early data buffer, and
  * the spare pool hands out a ready link at once, as for a SYN.
  *
- * "A session per flow" is the stack's rule, not only VLESS's: the dialer gets one whole flow, so
- * a multiplexing protocol would need a different model in the stack, not just another dialer
- * table (see dialer.h). */
+ * "A session per flow" is the stack's rule, not only VLESS's: the dialer gets one whole flow; a
+ * dialer with mux may put that flow on a stream of a shared link (see dialer.h). */
 static int udp_out(struct conn *c, const unsigned char *p, size_t dn);
 
 static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct flow_key *k,
@@ -1949,17 +2028,10 @@ static void udp_packet(const struct tun_dev *tun, struct conn *c, const struct f
             return;
         }
 
-        int qr;
         /* DC_UDP_OWN: the UDP flow has its own link, a UDP socket, while a spare session carries
          * a TCP flow (dialer.h). */
-        if (g_spare_want > 0 && !(g_dl->ops->caps & DC_UDP_OWN) && spare_checkout(SESS(c)) == 0) {
-            c->fd = g_dl->ops->fd(SESS(c));
-            node_sock_silence(c->fd);
-            TR("UDP: took a spare session\n");
-        } else if ((qr = conn_submit(c)) == 0) {
-            c->pending = 1;
-            TR("UDP: job queued for a connector\n");
-        } else {
+        int qr = flow_link(c, !(g_dl->ops->caps & DC_UDP_OWN));
+        if (qr < 0) {
             /* The connector queue is full. Say so: from outside it looks like "QUIC does not
              * work through the tunnel", while the cause is the CPU or a silent node, not the
              * protocol. connq_push has already logged -2 (no connector threads). */
@@ -2100,7 +2172,7 @@ static void drain_conn(struct conn *c, const struct tun_dev *tun);
 static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigned char *d,
                         size_t n) {
     int sr = upstream_send(c, d, n);
-    if (sr != SEND_AGAIN) return sr;
+    if (sr != SEND_AGAIN || c->mux) return sr;
     struct pollfd sp = { .fd = c->fd, .events = POLLIN };
     if (!(g_dl->ops->caps & DC_ACK_PACED) && client_can_take_record(c) &&
         poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
@@ -2277,19 +2349,8 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
          * buffer until the flow is ready, and a flow that fails is reported with RST after the
          * handshake. */
 
-        /* A spare session: the handshake is already done, the flow is ready now. */
-        if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
-            c->fd = g_dl->ops->fd(SESS(c));
-            node_sock_silence(c->fd);
-            send_synack(c, tun);
-            spare_refill();
-            TR("SYN: took a spare session\n");
-            return;
-        }
-
-        TR("SYN: job queued for a connector\n");
-        int qr = conn_submit(c);
-        if (qr != 0) {
+        int qr = flow_link(c, 1);
+        if (qr < 0) {
             /* Queue full: the CPU cannot digest that many handshakes at once, or the node holds
              * them. Do not drop the SYN silently: log it and free the record; the client retries
              * the SYN itself. connq_push has already logged -2 (no connector threads). */
@@ -2303,7 +2364,6 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
             conn_drop(c);
             return;
         }
-        c->pending = 1;
         send_synack(c, tun);
         spare_refill();
         return;
@@ -2478,7 +2538,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
  * flow (no ACKs), and when poll itself reports an error or a socket error: a broken connection
  * must break on its own path, not hang on an ACK. */
 static int ack_must_wait(struct conn *c) {
-    if (!(g_dl->ops->caps & DC_ACK_PACED) || c->is_udp || c->pending || c->fd < 0) return 0;
+    if (!(g_dl->ops->caps & DC_ACK_PACED) || c->is_udp || c->pending || c->mux || c->fd < 0) return 0;
     struct pollfd p = { .fd = c->fd, .events = POLLOUT };
     if (poll(&p, 1, 0) != 0) { c->ack_hold = 0; return 0; }
     if (!c->ack_hold && g_stats) g_st.acks_held++;
@@ -2577,6 +2637,7 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
         }
         /* A whole record is already read from the socket: no need to ask the kernel. */
         if (d->has_data(s)) continue;
+        if (c->mux) return;
         /* Anything more to read? Without this check the next read blocks for the socket timeout
          * (eight seconds) and stops the whole loop. */
         struct pollfd sp = { .fd = c->fd, .events = POLLIN };
@@ -2636,11 +2697,15 @@ static void ib_refuse(struct conn *c, enum ibhs_end end) {
 /* A connector reported on connection c (done): the link is ready or failed. Called by the loop's
  * pass over jobs (worker_loop); a separate function so tests/tunnelmatch.c can drive it. 1 — the
  * connection is closed (another took its place in g_live), 0 — the flow is ready. */
+static struct ratelog g_said_open;
+
 static int conn_ready(struct conn *c, const struct tun_dev *tun) {
     const struct dialer_ops *d = g_dl->ops;
     c->pending = 0;
-    c->fd = d->fd(SESS(c));
-    if (c->rc == 0) node_sock_silence(c->fd);
+    if (!c->mux) {
+        c->fd = d->fd(SESS(c));
+        if (c->rc == 0) node_sock_silence(c->fd);
+    }
     if (c->client_gone) {
         /* The client gave up during the handshake. Nobody to answer: close both the flow to the
          * node and the record. */
@@ -2650,10 +2715,9 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
     if (c->rc != 0) {
         /* With the reason, not just "did not open": the text tells "TCP did not connect", "the
          * server rejected the key" and "the server refused HTTP/2" apart. */
-        static struct ratelog said_open;
         unsigned held;
         char more[48];
-        if (ratelog_take(&said_open, ratelog_now(), 10, &held))
+        if (ratelog_take(&g_said_open, ratelog_now(), 10, &held))
             fprintf(stderr, LOG_W "flow to %s did not open: %s%s\n",
                     d->peer_of ? d->peer_of(g_dl->ctx, SESS(c)) : d->peer(g_dl->ctx),
                     d->strerror(c->rc), ratelog_more(more, sizeof more, held));
@@ -2853,7 +2917,9 @@ struct worker {
 #define IB_CTL_BASE (IB_HS_BASE + (uint32_t)IB_HS_MAX)
 #define IB_UDP_BASE (IB_CTL_BASE + (uint32_t)IB_ASSOC_MAX)
 #define IB_TOKEN_END (IB_UDP_BASE + (uint32_t)IB_ASSOC_MAX)
-#define EVS_MAX (2 * MAX_CONNS + 6 + 144)
+#define XC_BASE IB_TOKEN_END
+#define EVS_MAX (2 * MAX_CONNS + 6 + 144 + XC_MAX)
+_Static_assert(XC_BASE + XC_MAX < UINT32_MAX, "shared link tokens fit");
 _Static_assert(CFD_BASE > IBW_TOKEN && IBW_TOKEN > STOP_TOKEN, "socket slots start after the fixed tokens");
 _Static_assert(IB_LST_BASE >= CFD_BASE + MAX_CONNS && IB_HS_BASE >= IB_LST_BASE + IB_MAX &&
                    IB_CTL_BASE >= IB_HS_BASE + IB_HS_MAX && IB_UDP_BASE >= IB_CTL_BASE + IB_ASSOC_MAX &&
@@ -2863,7 +2929,7 @@ _Static_assert(IB_LST_BASE >= CFD_BASE + MAX_CONNS && IB_HS_BASE >= IB_LST_BASE 
 #define ACCEPT_MAX 64
 #define PARK_MAX 256
 #define PARK_MS 300
-#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + CONNECTORS * CONNECTOR_FDS + 32)
+#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + CONNECTORS * CONNECTOR_FDS + 32 + XC_MAX)
 #define MISS_WINDOW_NS 60000000000ull
 
 struct loop {
@@ -2872,6 +2938,7 @@ struct loop {
     uint8_t lst_off, own, stop_in, ib_off;
     uint64_t stats_at, loop_at, spare_at;
     unsigned nodes_seen;
+    struct mux_host mh;
     struct epoll_event evs[EVS_MAX];
     unsigned char pkt[TUNNEL_BUF];
 };
@@ -2993,11 +3060,9 @@ static void ib_connect(struct loop *L, struct ib_hs *s) {
         ib_refuse(c, IBHS_END_DIAL);
         return;
     }
-    if (conn_submit(c) != 0) {
-        ib_refuse(c, IBHS_END_FULL);
-        return;
-    }
-    c->pending = 1;
+    int qr = flow_link(c, 0);
+    if (qr < 0) ib_refuse(c, IBHS_END_FULL);
+    else if (qr == 0) conn_ready(c, &L->tun);
 }
 
 static void ib_associate(struct loop *L, struct ib_hs *s) {
@@ -3114,11 +3179,10 @@ static void ib_udp_out(struct loop *L, struct ib_assoc *a, uint32_t dst, uint16_
         c->livepos = (int16_t)g_live_n;
         g_live[g_live_n++] = (uint16_t)(c - g_conns);
         a->dst_conn[k] = (int)(c - g_conns);
-        if (g_dl->ops->flow_open_on(SESS(c), node, &c->key, 1, NULL) != 0 || conn_submit(c) != 0) {
+        if (g_dl->ops->flow_open_on(SESS(c), node, &c->key, 1, NULL) != 0 || flow_link(c, 0) < 0) {
             conn_drop(c);
             return;
         }
-        c->pending = 1;
     }
     a->last_ms[k] = g_now_ns / 1000000;
     c->last = g_now_s;
@@ -3409,14 +3473,7 @@ static void sock_open(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t
         conn_drop(c);
         return;
     }
-    if (g_spare_want > 0 && spare_checkout(SESS(c)) == 0) {
-        c->fd = g_dl->ops->fd(SESS(c));
-        node_sock_silence(c->fd);
-    } else if (conn_submit(c) == 0) {
-        c->pending = 1;
-    } else {
-        conn_drop(c);
-    }
+    if (flow_link(c, 1) < 0) conn_drop(c);
     spare_refill();
 }
 
@@ -3604,6 +3661,55 @@ static void sock_event(struct conn *c, uint32_t events, const struct tun_dev *tu
     if ((events & (EPOLLIN | EPOLLERR | EPOLLHUP)) && (c->carmed & ARM_IN)) sock_read(c, tun);
 }
 
+static __thread struct loop *g_loop;
+static __thread unsigned g_mux_woke;
+static unsigned g_loops = 1;
+
+static int mux_watch(unsigned idx, int fd, unsigned ev) {
+    if (!g_loop || idx >= XC_MAX) return -1;
+    if (!ev) return epoll_ctl(g_loop->ep, EPOLL_CTL_DEL, fd, NULL) == 0 || errno == ENOENT ? 0 : -1;
+    struct epoll_event e = { .events = ev, .data = { .u32 = XC_BASE + idx } };
+    if (epoll_ctl(g_loop->ep, EPOLL_CTL_MOD, fd, &e) == 0) return 0;
+    return errno == ENOENT && epoll_ctl(g_loop->ep, EPOLL_CTL_ADD, fd, &e) == 0 ? 0 : -1;
+}
+
+static void mux_wake(void *arg, uint16_t owner, unsigned what, int rc) {
+    (void)arg;
+    if (owner >= MAX_CONNS) return;
+    struct conn *c = &g_conns[owner];
+    if (!c->used || !c->mux) return;
+    if (c->pending) {
+        if (!(what & XW_DONE)) return;
+        c->rc = rc;
+        __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    if ((what & XW_READ) && !c->srv_closed && !c->rx_ready) {
+        c->rx_ready = 1;
+        g_mux_woke++;
+    }
+    if (what & XW_ROOM) room_watch(c);
+}
+
+static void loop_mux(struct loop *L) {
+    g_loop = L;
+    g_mux_tun = &L->tun;
+    const struct dialer_mux *mx = g_dl->ops->mux;
+    if (!mx) return;
+    L->mh = (struct mux_host){ .submit = mux_submit, .watch = mux_watch, .wake = mux_wake, .arg = L, .loops = g_loops,
+                              .wait_ms = CONNECT_TIMEOUT_S * 1000 };
+    mx->host(&L->mh);
+}
+
+static __thread int g_mux_due;
+
+static void mux_pass(int phase) {
+    const struct dialer_mux *mx = g_dl->ops->mux;
+    if (!mx) return;
+    int due = mx->pass(g_now_ns / 1000000, phase);
+    if (phase == MUXP_LATE) g_mux_due = due;
+}
+
 /* epoll, not poll. poll takes the whole descriptor LIST on every call: with 320 live
  * connections and two thousand turns a second that is 640 thousand descriptor checks a
  * second, of which a few matter, and on a router one poll over 320 descriptors costs hundreds
@@ -3655,10 +3761,15 @@ static int loop_open(struct loop *L, const struct tun_dev *tun, int own) {
         e.data.u32 = IBW_TOKEN;
         if (ifd >= 0 && epoll_ctl(L->ep, EPOLL_CTL_ADD, ifd, &e) == 0) L->ibw = ifd;
     }
+    loop_mux(L);
     return 0;
 }
 
 static void loop_close(struct loop *L) {
+    if (g_loop == L) {
+        g_loop = NULL;
+        g_mux_tun = NULL;
+    }
     if (L->stop_in) __atomic_sub_fetch(&g_stop_loops, 1, __ATOMIC_ACQ_REL);
     if (L->efd >= 0) close(L->efd);
     g_conn_efd = -1;
@@ -3695,7 +3806,11 @@ static int loop_turn(struct loop *L, int max_ms) {
     int wait_ms = max_ms;
     for (int li = 0; li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
-        if (c->pending) { pend++; continue; }
+        if (c->pending) {
+            pend++;
+            if (c->mux && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) wait_ms = 0;
+            continue;
+        }
 
         /* Window and in-flight are recorded ALWAYS, not only on a refused read: a flow can
          * also stall with the window open, and only both numbers tell the two cases
@@ -3726,7 +3841,7 @@ static int loop_turn(struct loop *L, int max_ms) {
          * EPOLLOUT on a writable descriptor would wake the loop on every turn for nothing. */
         if (c->ack_hold && !c->ack_due) c->ack_hold = 0;
         unsigned arm = (want ? ARM_IN : 0u) | (c->ack_hold ? ARM_OUT : 0u);
-        if (arm != c->armed) {
+        if (!c->mux && arm != c->armed) {
             struct epoll_event e = { .events = (arm & ARM_IN ? EPOLLIN : 0u) |
                                                (arm & ARM_OUT ? EPOLLOUT : 0u),
                                      .data = { .u32 = (uint32_t)(c - g_conns) } };
@@ -3736,7 +3851,8 @@ static int loop_turn(struct loop *L, int max_ms) {
         }
         if (c->sock) sock_arm(L, c);
         /* Data is already here and the kernel will not report it: process it without
-         * waiting. */
+         * waiting. A send or a room query may have read it off the socket too. */
+        if (want && !c->rx_ready && g_dl->ops->has_data(SESS(c))) c->rx_ready = 1;
         if (want && c->rx_ready) forced++;
 
         if (c->rtx.len && c->rtx_at) {
@@ -3751,6 +3867,7 @@ static int loop_turn(struct loop *L, int max_ms) {
      * eventfd, and the result is handled at once. Polling every 20 ms remains the FALLBACK
      * for when the kernel gave no eventfd, so its failure costs latency, not a hung
      * handshake. */
+    if (g_mux_due > 0 && g_mux_due < wait_ms) wait_ms = g_mux_due;
     if (pend && L->efd < 0 && wait_ms > 20) wait_ms = 20;
     if (L->own) wait_ms = park_wait_ms(wait_ms);
     if ((L->lst_off || L->ib_off) && wait_ms > 10) wait_ms = 10;
@@ -3774,6 +3891,7 @@ static int loop_turn(struct loop *L, int max_ms) {
         }
     }
     if (r < 0) return errno == EINTR ? 0 : -1;
+    mux_pass(MUXP_EARLY);
 
     /* Finished jobs. The SYN-ACK went to the client on SYN: here the flow to the node is
      * either ready (and gets the early data from the buffer) or failed (and the client gets
@@ -3836,6 +3954,7 @@ static int loop_turn(struct loop *L, int max_ms) {
         /* Before the ACKs of this batch, so they already carry the window it calls for. */
         g_tun_backlog = k == TUN_DRAIN_MAX;
         up_flush(tun);
+        mux_pass(MUXP_LATE);
         flush_acks(tun);
     }
     if (lst && g_lst_fd >= 0 && !L->lst_off) lst_accept(L);
@@ -3864,6 +3983,10 @@ static int loop_turn(struct loop *L, int max_ms) {
         }
         if (t >= IB_UDP_BASE && t < IB_UDP_BASE + IB_ASSOC_MAX) {
             ib_udp_event(L, &g_assoc[t - IB_UDP_BASE]);
+            continue;
+        }
+        if (t >= XC_BASE && t < XC_BASE + XC_MAX) {
+            if (g_dl->ops->mux) g_dl->ops->mux->event(t - XC_BASE, L->evs[i].events);
             continue;
         }
         if (t >= (uint32_t)MAX_CONNS) continue;  /* TUN and eventfd */
@@ -3898,12 +4021,16 @@ static int loop_turn(struct loop *L, int max_ms) {
     /* Connections with data already in the buffer: the kernel will not report them, and
      * without this pass the record would wait for new bytes from the server. Done only when
      * there are any; they were counted before the wait. */
+    forced += (int)g_mux_woke;
+    g_mux_woke = 0;
     for (int li = 0; forced && li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
         if (!c->rx_ready || c->pending) continue;
         forced--;
+        if (c->mux && (c->srv_closed || !conn_can_take(c))) continue;
         drain_conn(c, tun);
     }
+    mux_pass(MUXP_LATE);
     /* The node's room grew back (drain_conn): the window update to the client now, not with
      * the next TUN batch, which an upload stopped by a zero window will never send. */
     if (g_win_woke) {
@@ -3935,6 +4062,7 @@ static int loop_turn(struct loop *L, int max_ms) {
         /* A job in progress: the connector writes into the session, do not touch. */
         if (c->pending || !conn_deadlines(c, tun, now)) li++;
     }
+    mux_pass(MUXP_LATE);
     /* Window updates for rooms that grew without a read of ours (room_watch). */
     if (g_win_woke) {
         g_win_woke = 0;
@@ -3986,6 +4114,7 @@ static void *worker_loop(void *arg) {
         while (g_park_n) sock_rst(park_take(g_park_n - 1).fd);
     if (connq_release(g_conns) == 0) {
         while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+        mux_pass(MUXP_EXIT);
         conn_table_free();
     }
     loop_close(L);
@@ -4061,6 +4190,7 @@ int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn r
     int want = worker_count();
     int n = tun_open(queues, want, dev);
     g_one_worker = n == 1;
+    g_loops = n > 0 ? (unsigned)n : 1;
     /* Failure is 1, never a negative code: it becomes the process exit code, where -40 would read
      * as a meaningless 216. tun_open has already logged the reason. */
     if (n < 0) return 1;

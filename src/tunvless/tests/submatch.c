@@ -170,14 +170,14 @@ static void t_xhx_link_ranges_from_number_and_object(void) {
 static void t_xhx_long_extra_read_whole_and_cut_one_does_not_parse(void) {
     static char ex[4096];
     struct vless_node n;
-    size_t o = (size_t)snprintf(ex, sizeof ex, "{\"xmux\":{\"maxConcurrency\":\"16-32\",\"cMaxReuseTimes\":\"");
+    size_t o = (size_t)snprintf(ex, sizeof ex, "{\"scStreamUpServerSecs\":\"");
     while (o < 2900) ex[o++] = 'z';
     o += (size_t)snprintf(ex + o, sizeof ex - o,
-                          "\"},\"headers\":{\"X-A\":\"1\",\"X-B\":\"2\"},\"xPaddingBytes\":\"100-1000\","
+                          "\",\"headers\":{\"X-A\":\"1\",\"X-B\":\"2\"},\"xPaddingBytes\":\"100-1000\","
                           "\"xPaddingKey\":\"x_pad\",\"xPaddingMethod\":\"repeat-x\"}");
     check_n("xhx long extra: over 3 KB", 1, o > 3000);
     check_n("xhx long extra: usable", 0, xhx_link("", ex, &n));
-    check("xhx long extra: keys after xmux", "xPaddingKey=x_pad\nxPaddingMethod=repeat-x\n", xhx_of(&n));
+    check("xhx long extra: keys after the long member", "xPaddingKey=x_pad\nxPaddingMethod=repeat-x\n", xhx_of(&n));
     check("xhx long extra: headers", "X-A: 1\nX-B: 2\n", n.headers);
     check_n("xhx long extra: pad upper", 1000, n.pad_to);
     ex[o / 2] = '\0';
@@ -221,7 +221,8 @@ static void t_xhx_clash_maps_kebab_keys_and_download_settings(void) {
     got = xhx_clash("      x-padding-method: tokenish\n      seq-placement: query\n"
                     "      reuse-settings:\n        max-connections: 4\n", out, &st);
     check("xhx clash: usable", "(usable)", xhx_reason(got, &st));
-    check("xhx clash: canonical string", "seqPlacement=query\nxPaddingMethod=tokenish\n", got ? xhx_of(&out[0]) : "");
+    check("xhx clash: canonical string", "seqPlacement=query\nxPaddingMethod=tokenish\nxmux.maxConnections=4\n",
+          got ? xhx_of(&out[0]) : "");
 }
 
 static void t_xhx_clash_every_key_reaches_its_xray_name(void) {
@@ -848,7 +849,8 @@ static void t_dl_clash(void) {
     check("dl clash: block headers", "X-D: 1\n", d->headers);
     check_n("dl clash: pad from the main proxy, lower", 100, d->pad_from);
     check_n("dl clash: pad from the main proxy, upper", 200, d->pad_to);
-    check("dl clash: xhttp keys from the main proxy", "sessionIDPlacement=header\nseqKey=sq\n", xhx_of(d));
+    check("dl clash: xhttp keys from the main proxy", "sessionIDPlacement=header\nseqKey=sq\nxmux.maxConnections=4\n",
+          xhx_of(d));
     check("dl clash: block mode", "", d->mode);
     check("dl clash: block uuid", "", d->uuid);
     check("dl clash: block name", "", d->name);
@@ -1083,6 +1085,85 @@ static void t_dl_all(void) {
     t_dl_clash_inherits_headers();
     t_dl_clash_refusals();
     t_xhttp_host_main_clash();
+}
+
+static void t_xmux_link_extra(void) {
+    struct vless_node n;
+    /* catches: xmux still dropped, or lines in input order */
+    check_n("xmux link: usable", 0,
+            xhx_link("", "{\"xmux\":{\"cMaxReuseTimes\":\"8\",\"maxConcurrency\":\"16-32\",\"hKeepAlivePeriod\":-1}}", &n));
+    check("xmux link: canonical lines", "xmux.maxConcurrency=16-32\nxmux.cMaxReuseTimes=8\nxmux.hKeepAlivePeriod=-1\n",
+          xhx_of(&n));
+    xhx_link("", "{\"seqKey\":\"q\",\"xmux\":{\"hMaxReusableSecs\":\"10-20\",\"hMaxRequestTimes\":5,\"maxConnections\":2}}", &n);
+    check("xmux link: after the other keys, every name", "seqKey=q\nxmux.maxConnections=2\nxmux.hMaxRequestTimes=5\n"
+          "xmux.hMaxReusableSecs=10-20\n", xhx_of(&n));
+    xhx_link("", "{\"xmux\":{\"hKeepAlivePeriod\":\"30\"}}", &n);
+    check("xmux link: keepalive as a string refused", "xhttp: invalid extra value", n.skip_reason);
+    check_n("xmux link: not an object", 1, xhx_link("", "{\"xmux\":5}", &n));
+    check("xmux link: not an object, reason", "xhttp: extra does not parse", n.skip_reason);
+    check_n("xmux link: null", 0, xhx_link("", "{\"xmux\":null,\"seqKey\":\"q\"}", &n));
+    check("xmux link: null, nothing", "seqKey=q\n", xhx_of(&n));
+}
+
+static void t_xmux_xray_json(void) {
+    struct vless_node out[4];
+    struct vless_sub_stats st;
+    /* catches: Xray JSON xmux ignored, or the outer one kept over extra */
+    size_t got = xhx_xray("{\"path\":\"/x\",\"xmux\":{\"maxConnections\":2}}", out, &st);
+    check("xmux xray: outer", "xmux.maxConnections=2\n", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+    got = xhx_xray("{\"path\":\"/x\",\"xmux\":{\"maxConnections\":2},\"extra\":{\"xmux\":{\"maxConnections\":5}}}", out, &st);
+    check("xmux xray: extra replaces", "xmux.maxConnections=5\n", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+    got = xhx_xray("{\"path\":\"/x\",\"xmux\":{}}", out, &st);
+    check("xmux xray: empty", "(null)", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+}
+
+static void t_xmux_block(void) {
+    struct vless_node n;
+    /* catches: the block's own xmux dropped or put on the main side */
+    check_n("xmux block: usable", 0, dl_link(DL_X("{\"xmux\":{\"maxConnections\":1}}"), &n));
+    check("xmux block: in the block", "xmux.maxConnections=1\n", xhx_of(dl_of(&n)));
+    check("xmux block: not on the main side", "(null)", xhx_of(&n));
+}
+
+static void t_xmux_clash(void) {
+    struct vless_node out[4];
+    struct vless_sub_stats st;
+    /* catches: Clash reuse-settings still ignored */
+    size_t got = xhx_clash("      reuse-settings:\n        max-connections: \"2\"\n        h-keep-alive-period: 30\n", out, &st);
+    check("xmux clash: main", "xmux.maxConnections=2\nxmux.hKeepAlivePeriod=30\n", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+    got = xhx_clash("      reuse-settings:\n        max-concurrency: 1-4\n        c-max-reuse-times: 3\n"
+                    "        h-max-request-times: 9\n        h-max-reusable-secs: 5-6\n", out, &st);
+    check("xmux clash: every key", "xmux.maxConcurrency=1-4\nxmux.cMaxReuseTimes=3\nxmux.hMaxRequestTimes=9\n"
+          "xmux.hMaxReusableSecs=5-6\n", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+    got = xhx_clash("      mode: packet-up\n", out, &st);
+    check("xmux clash: none", "(null)", got ? xhx_of(&out[0]) : xhx_reason(got, &st));
+    check("xmux clash block: usable", "(usable)",
+          dl_clash(DLC_MAIN, "", DLC_B0 "        reuse-settings:\n          max-concurrency: \"8\"\n"));
+    check("xmux clash block: in the block", "xmux.maxConcurrency=8\n", xhx_of(dl_of(&g_dl_last)));
+    check("xmux clash block: not on the main side", "(null)", xhx_of(&g_dl_last));
+    dl_clash(DLC_MAIN, "      seq-key: sq\n      reuse-settings: {max-connections: 2}\n", DLC_B0);
+    check("xmux clash block: the main's when the block has none", "seqKey=sq\nxmux.maxConnections=2\n",
+          xhx_of(dl_of(&g_dl_last)));
+    dl_clash(DLC_MAIN, "      seq-key: sq\n      reuse-settings: {max-connections: 2}\n",
+             DLC_B0 "        reuse-settings: {h-max-request-times: 7}\n");
+    check("xmux clash block: its own replaces the main's", "seqKey=sq\nxmux.hMaxRequestTimes=7\n", xhx_of(dl_of(&g_dl_last)));
+    check("xmux clash block: the main keeps its own", "seqKey=sq\nxmux.maxConnections=2\n", xhx_of(&g_dl_last));
+}
+
+static void t_xmux_node_refused(void) {
+    struct vless_node n;
+    /* catches: the refusal not reaching the node row */
+    check_n("xmux both: skipped", 1, xhx_link("", "{\"xmux\":{\"maxConcurrency\":4,\"maxConnections\":2}}", &n));
+    check("xmux both: reason", "xhttp: maxConnections cannot be specified together with maxConcurrency", n.skip_reason);
+    check_n("xmux 40: usable", 0, xhx_link("", "{\"xmux\":{\"maxConnections\":40}}", &n));
+}
+
+static void t_xmux_all(void) {
+    t_xmux_link_extra();
+    t_xmux_xray_json();
+    t_xmux_block();
+    t_xmux_clash();
+    t_xmux_node_refused();
 }
 
 int main(void) {
@@ -2375,6 +2456,7 @@ int main(void) {
     t_intern_blob();
     t_intern_blob_full();
     t_dl_all();
+    t_xmux_all();
 
     printf("\n%d checks passed", g_pass);
     if (g_fail) {

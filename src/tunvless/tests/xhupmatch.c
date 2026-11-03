@@ -1,21 +1,22 @@
 /* A server's answer to an xhttp upload (stream-up and packet-up): a refusal must reach the sender.
  *
- * In stream-up and packet-up the upload goes over its own link, and its answers are read only by
- * up_drain, which runs as part of a write. The xhttp server answers 400 to a chunk with bad
- * padding; if up_drain drops that answer, the write reports success, and the node looks alive
- * while no data flows. packet-up is harder: the answer to a chunk arrives when the next chunk is
- * already open, so h2.c must not throw it away as a frame of another stream. The
- * tests/run-tunnel*.sh stands do not reach this: their fake server speaks bare TCP, not xhttp.
+ * The answers to the uploads are read as part of a write (post_pull). The xhttp server answers
+ * 400 to a chunk with bad padding; if that answer is dropped, the write reports success, and the
+ * node looks alive while no data flows. packet-up is harder: the answer to a chunk arrives when
+ * the next chunk is already open. The tests/run-tunnel*.sh stands do not reach this: their fake
+ * server speaks bare TCP, not xhttp.
  *
- * The file includes the xhttp transport whole (src/proto/transport/trxhttp.c: up_drain and
- * up_request are static) and links the real h2.c and the other transport layers as separate
- * objects. The upload link is plain (as with security=none) on a socket pair: what the client
+ * The file includes the xhttp transport whole (src/proto/transport/trxhttp.c: post_pull and
+ * up_open are static) and links the HTTP/2 engine and the other transport layers as separate
+ * objects. The connections are plain (as with security=none) on socket pairs: what the client
  * writes, the test reads (and looks for the request paths in), and the "server" writes HTTP/2
  * frames to the other end by hand. TLS and Reality are not needed and are stubbed out. No
  * header stubs are needed: tls13.h includes only src/lib/scrypto.h, which has no crypto library
  * types. No network and no privileges, so the test runs in `make test`. */
 #include "../src/proto/transport/trxhttp.c"
 
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -65,6 +66,9 @@ size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap)
     { (void)t; (void)out; (void)cap; return 0; }
 int tls13_write(struct tls13 *t, const unsigned char *d, size_t n)
     { (void)t; (void)d; (void)n; return -1; }
+int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap,
+               size_t *out_n)
+    { (void)t; (void)d; (void)n; (void)out; (void)cap; *out_n = 0; return -1; }
 int tls13_read(struct tls13 *t, unsigned char *o, size_t cap, size_t *got)
     { (void)t; (void)o; (void)cap; *got = 0; return -1; }
 int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)
@@ -82,7 +86,7 @@ static void check(int ok, const char *what) {
 static int g_srv = -1;                /* the "server" end of the socket pair */
 
 /* What the client has written since the pair was made: preface, HEADERS, DATA. Kept to look for
- * the request paths: HPACK sends them as plain literals (put_headers in h2.c). */
+ * the request paths: HPACK sends them as plain literals (h2w_headers in h2wire.c). */
 static unsigned char g_seen[1 << 20];
 static size_t g_seen_n;
 
@@ -96,7 +100,7 @@ static int seen(const char *s) {
     return memmem(g_seen, g_seen_n, s, strlen(s)) != NULL;
 }
 
-/* Whether the client left unread bytes on its end: an answer up_drain never took. */
+/* Whether the client left unread bytes on its end: an answer post_pull never took. */
 static int unread(int fd) {
     struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
     return poll(&p, 1, 0) > 0;
@@ -104,11 +108,15 @@ static int unread(int fd) {
 
 /* HEADERS from the server on stream sid with one HPACK byte, a static index of :status:
  * 0x88 is 200, 0x8C is 400 (RFC 7541, Appendix A). */
-static void srv_headers(uint32_t sid, unsigned char hpack, int end_stream) {
+static void srv_headers_fd(int fd, uint32_t sid, unsigned char hpack, int end_stream) {
     unsigned char f[10] = { 0, 0, 1, 0x01, (unsigned char)(0x04 | (end_stream ? 0x01 : 0)),
                             (unsigned char)(sid >> 24), (unsigned char)(sid >> 16),
                             (unsigned char)(sid >> 8), (unsigned char)sid, hpack };
-    if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
+    if (write(fd, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
+}
+
+static void srv_headers(uint32_t sid, unsigned char hpack, int end_stream) {
+    srv_headers_fd(g_srv, sid, hpack, end_stream);
 }
 
 /* RST_STREAM(NO_ERROR) from the server on stream sid. */
@@ -119,13 +127,28 @@ static void srv_rst(uint32_t sid) {
     if (write(g_srv, f, sizeof(f)) != (ssize_t)sizeof(f)) { perror("write"); exit(2); }
 }
 
+static struct xconn *pair_link(int fd) {
+    struct tr_node n;
+    memset(&n, 0, sizeof n);
+    n.host = "127.0.0.1";
+    n.type = "xhttp";
+    n.security = "none";
+    n.sni = "";
+    struct xconn *x = xconn_new(&n, 0, 0);
+    if (!x) { perror("xconn_new"); exit(2); }
+    x->link.fd = fd;
+    x->link.plain = 1;
+    if (xconn_start(x)) { perror("xconn_start"); exit(2); }
+    return x;
+}
+
 static void conn_init(struct transport *c, enum xhttp_mode xh, int fd) {
     memset(c, 0, sizeof(*c));
     c->link.fd = -1;
     c->fr = &tr_xhttp;
     c->xh.mode = xh;
-    c->xh.up.link.fd = fd;
-    c->xh.up.link.plain = 1;
+    c->xh.wait_ms = 1000;
+    c->xh.priv[0] = pair_link(fd);
     snprintf(c->xh.main_side.authority, sizeof(c->xh.main_side.authority), "stand.example");
     xh_opts_parse(NULL, "", NULL, 0, &c->xh.main_side.opts, NULL, 0);
     snprintf(c->xh.main_side.base_path, sizeof(c->xh.main_side.base_path), "/xh/");
@@ -163,12 +186,12 @@ static void t_packet_up(unsigned char hpack, int want_refused, const char *what)
     if (!want_refused)
         check(seen("/xh/0f1e2d3c/0") && seen("/xh/0f1e2d3c/1") && !seen("/xh/0f1e2d3c/2"),
               "packet-up: the two chunks go as requests numbered 0 and 1");
-    close(fd);
+    transport_close(&c);
 }
 
 /* packet-up: the answer to a chunk already in the socket when the chunk is written, ended by
- * RST_STREAM(NO_ERROR) as a Go server ends a finished handler's stream. up_drain then sees the
- * reset on the current stream: the normal end of an answer, not a failure of the write. */
+ * RST_STREAM(NO_ERROR) as a Go server ends a finished handler's stream: the normal end of an
+ * answer, not a failure of the write. */
 static void t_packet_up_rst(void) {
     int fd;
     if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
@@ -182,7 +205,7 @@ static void t_packet_up_rst(void) {
     srv_drain();
     check(rc0 == 0 && rc1 == 0 && !unread(fd),
           "packet-up: a chunk's 200 ended by RST_STREAM(NO_ERROR) is read, not a refusal");
-    close(fd);
+    transport_close(&c);
 }
 
 /* packet-up with the connection window too small for a chunk: the write is refused before its
@@ -195,19 +218,19 @@ static void t_packet_up_window(void) {
     int rc0 = transport_write(&c, piece, sizeof(piece));     /* chunk 0, stream 1 */
     srv_drain();
     srv_headers(1, 0x88, 1);
-    int32_t win = c.xh.up.h2.send_win_conn;
-    c.xh.up.h2.send_win_conn = (int32_t)sizeof(piece) - 1;
+    int32_t win = c.xh.priv[0]->h2.send_win_conn;
+    c.xh.priv[0]->h2.send_win_conn = (int32_t)sizeof(piece) - 1;
     int rc1 = transport_write(&c, piece, sizeof(piece));
     srv_drain();
     int opened = seen("/xh/0f1e2d3c/1");
-    c.xh.up.h2.send_win_conn = win;
+    c.xh.priv[0]->h2.send_win_conn = win;
     int rc2 = transport_write(&c, piece, sizeof(piece));
     srv_drain();
     check(rc0 == 0 && rc1 == H2_EWINDOW && !opened,
           "packet-up: a chunk the window cannot take opens no request");
     check(rc2 == 0 && seen("/xh/0f1e2d3c/1") && !seen("/xh/0f1e2d3c/2"),
           "packet-up: the retry sends it as chunk 1");
-    close(fd);
+    transport_close(&c);
 }
 
 /* stream-up: one long POST, and the refusal comes on that same stream. */
@@ -216,7 +239,7 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
     if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
     struct transport c;
     conn_init(&c, XH_STREAM_UP, fd);
-    int ro = up_request(&c, -1);                        /* as up_open does: the POST opens at once */
+    int ro = up_open(&c, c.xh.priv[0]);
     srv_drain();
     srv_headers(1, hpack, 0);
     int rc = transport_write(&c, piece, sizeof(piece));
@@ -225,12 +248,12 @@ static void t_stream_up(unsigned char hpack, int want_refused, const char *what)
         check(ro == 0 && rc == H2_ESTATUS && strstr(transport_strerror(rc), "400") != NULL, what);
     else
         check(ro == 0 && rc == 0 && !unread(fd), what);
-    close(fd);
+    transport_close(&c);
 }
 
 /* packet-up: the server answers chunks in any order. Here the CURRENT chunk (stream 3) is
- * answered first, and the older one (stream 1) in a later read. up_drain used to stop once the
- * current stream was done, so the older answer stayed unread: the chunk counted as unanswered for
+ * answered first, and the older one (stream 1) in a later read. A reader that stopped once the
+ * current stream was done left the older answer unread: the chunk counted as unanswered for
  * good, the window over seq filled, and the upload stalled with no chunk left to send. */
 static void t_packet_up_order(void) {
     int fd;
@@ -244,9 +267,9 @@ static void t_packet_up_order(void) {
     long r1 = transport_room(&c);
     srv_headers(1, 0x88, 1);                                 /* then the older one */
     long r2 = transport_room(&c);
-    check(rc0 == 0 && rc1 == 0 && r1 >= 0 && r2 > 0 && h2_open_streams(&c.xh.up.h2) == 0 &&
+    check(rc0 == 0 && rc1 == 0 && r1 >= 0 && r2 > 0 && c.xh.f.post_n == 0 &&
           !unread(fd), "packet-up: an older chunk's 200 after the current one's is read");
-    close(fd);
+    transport_close(&c);
 }
 
 static unsigned char g_down[1 << 20];
@@ -275,15 +298,18 @@ static struct tr_node xnode(const char *mode, const char *xhx, const char *heade
     return n;
 }
 
+static struct transport *g_xc;
+
 static int xopen(struct transport *c, const struct tr_node *n, int *fds) {
     int d[2], u[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, d) || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) return -1;
     memset(c, 0, sizeof *c);
+    g_xc = c;
     c->fr = &tr_xhttp;
-    c->link.fd = d[0];
-    c->link.plain = 1;
-    c->xh.up.link.fd = u[0];
-    c->xh.up.link.plain = 1;
+    c->link.fd = -1;
+    c->xh.wait_ms = 1000;
+    c->xh.priv[1] = pair_link(d[0]);
+    c->xh.priv[0] = pair_link(u[0]);
     if (g_dsrv >= 0) close(g_dsrv);
     if (g_srv >= 0) close(g_srv);
     g_dsrv = d[1];
@@ -293,14 +319,17 @@ static int xopen(struct transport *c, const struct tr_node *n, int *fds) {
     fds[0] = d[0];
     fds[1] = u[0];
     int rc = xh_init(c, n);
-    if (!rc) rc = down_request(c);
-    if (!rc && c->xh.mode != XH_STREAM_ONE) rc = up_start(c);
+    struct xconn *down = c->xh.priv[1], *main = c->xh.mode == XH_STREAM_ONE ? down : c->xh.priv[0];
+    if (!rc) rc = xh_flow_start(c, main, down, 0);
     slurp(g_dsrv, g_down, sizeof g_down, &g_down_n);
     srv_drain();
     return rc;
 }
 
-static void xclose(int *fds) { close(fds[0]); close(fds[1]); }
+static void xclose(int *fds) {
+    (void)fds;
+    transport_close(g_xc);
+}
 
 static const char *fval(const struct hr_block *b, const char *name) {
     int i = hr_find(b, name);
@@ -970,7 +999,7 @@ static void t_packet_window_follows_posts(void) {
     xclose(fds);
     n = xnode("packet-up", "scMaxBufferedPosts=500", NULL);
     rc = xopen(&c, &n, fds);
-    check(rc == 0 && unanswered_until_full(&c) == H2_OPEN_MAX, "packet-up: a large scMaxBufferedPosts stops at H2_OPEN_MAX");
+    check(rc == 0 && unanswered_until_full(&c) == XH_POST_MAX, "packet-up: a large scMaxBufferedPosts stops at XH_POST_MAX");
     xclose(fds);
     n = xnode("packet-up", "scMaxBufferedPosts=40", NULL);
     rc = xopen(&c, &n, fds);
@@ -1207,7 +1236,302 @@ static void t_dl_only_xhttp(void) {
     close(lb);
 }
 
+static uint32_t hdr_sid(const unsigned char *d, size_t n, int k) {
+    size_t p = 0;
+    if (n >= 24 && memcmp(d, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) p = 24;
+    while (p + 9 <= n) {
+        uint32_t len = ((uint32_t)d[p] << 16) | ((uint32_t)d[p + 1] << 8) | d[p + 2];
+        if (p + 9 + len > n) return 0;
+        if (d[p + 3] == 0x01 && k-- == 0)
+            return ((uint32_t)(d[p + 5] & 0x7f) << 24) | ((uint32_t)d[p + 6] << 16) |
+                   ((uint32_t)d[p + 7] << 8) | d[p + 8];
+        p += 9 + len;
+    }
+    return 0;
+}
+
+static int quiet(int ls) {
+    struct pollfd p = { .fd = ls, .events = POLLIN, .revents = 0 };
+    return poll(&p, 1, 200) == 0;
+}
+
+static int hdr_is(const unsigned char *d, size_t n, int k, const char *name, const char *want) {
+    const char *v = hr_nth_headers(d, n, k, &g_hb) ? NULL : fval(&g_hb, name);
+    return v && !strcmp(v, want);
+}
+
+static void t_packet_up_one_connection(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "one connection: loopback listener"); return; }
+    struct tr_node n = xnode("packet-up", "scMaxBufferedPosts=2", NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: the upload still on a second link */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la), one = quiet(la);
+    int w0 = rc ? -1 : transport_write(&c, piece, 10);
+    int w1 = rc ? -1 : transport_write(&c, piece, 10);
+    int w2 = rc ? -1 : transport_write(&c, piece, 10);
+    static unsigned char ab[1 << 16];
+    size_t an = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
+    char p0[200], p1[200], p2[200];
+    snprintf(p0, sizeof p0, "/xp/%s/0", c.xh.sid);
+    snprintf(p1, sizeof p1, "/xp/%s/1", c.xh.sid);
+    snprintf(p2, sizeof p2, "/xp/%s/2", c.xh.sid);
+    check(rc == 0 && fa >= 0 && one, "packet-up: one connection for the GET and the POSTs");
+    check(hdr_sid(ab, an, 0) == 1 && hdr_is(ab, an, 0, ":method", "GET"), "packet-up: the GET on stream 1");
+    check(w0 == 0 && w1 == 0 && hdr_sid(ab, an, 1) == 3 && hdr_is(ab, an, 1, ":path", p0) &&
+          hdr_sid(ab, an, 2) == 5 && hdr_is(ab, an, 2, ":path", p1),
+          "packet-up: seq 0 on stream 3, seq 1 on stream 5");
+    check(w2 == H2_EWINDOW, "packet-up: scMaxBufferedPosts 2: a third unanswered chunk waits");
+    if (fa >= 0) srv_headers_fd(fa, 3, 0x88, 1);
+    int w3 = rc ? -1 : transport_write(&c, piece, 10);
+    int w4 = rc ? -1 : transport_write(&c, piece, 10);
+    size_t bn = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
+    check(w3 == 0 && hdr_sid(ab, bn, 0) == 7 && hdr_is(ab, bn, 0, ":path", p2) && w4 == H2_EWINDOW,
+          "packet-up: the 200 to stream 3 frees one slot: seq 2 on stream 7, then full");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+static void t_stream_up_one_connection(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "one connection: loopback listener"); return; }
+    struct tr_node n = xnode("stream-up", NULL, NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: the stream-up POST still on a second link */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la), one = quiet(la);
+    static unsigned char ab[1 << 16];
+    size_t an = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
+    check(rc == 0 && fa >= 0 && one, "stream-up: one connection for the GET and the POST");
+    check(hdr_sid(ab, an, 0) == 1 && hdr_is(ab, an, 0, ":method", "GET") && hdr_sid(ab, an, 1) == 3 &&
+          hdr_is(ab, an, 1, ":method", "POST"), "stream-up: GET on stream 1, the long POST on stream 3");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+static void t_dl_two_connections(void) {
+    uint16_t pa = 0, pb = 0;
+    int la = listen_lo(&pa), lb = listen_lo(&pb);
+    if (la < 0 || lb < 0) { check(0, "dl: loopback listeners"); return; }
+    struct tr_node n = xnode("packet-up", NULL, NULL), d = dnode();
+    n.host = d.host = "127.0.0.1";
+    n.port = pa;
+    d.port = pb;
+    n.dl = &d;
+    struct transport c;
+    /* catches: the GET on the main endpoint, or a third link */
+    int rc = transport_open(&c, &n, 2);
+    int fb = accept_wait(lb), fa = accept_wait(la);
+    int wr = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    static unsigned char ab[1 << 16], bb[1 << 16];
+    size_t bn = fb < 0 ? 0 : read_wait(fb, bb, sizeof bb, 500);
+    size_t an = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
+    check(rc == 0 && wr == 0 && hdr_sid(bb, bn, 0) == 1 && hdr_is(bb, bn, 0, ":method", "GET") &&
+          hr_count_frames(bb, bn, 0x01) == 1, "dl: the download endpoint gets the GET on stream 1");
+    check(hdr_sid(ab, an, 0) == 1 && hdr_is(ab, an, 0, ":method", "POST") && hr_count_frames(ab, an, 0x01) == 1,
+          "dl: the main endpoint gets the POST on stream 1");
+    check(quiet(la) && quiet(lb), "dl: two connections, no third");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    if (fb >= 0) close(fb);
+    close(la);
+    close(lb);
+}
+
+static void t_post_refused_fails_flow(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "refused: loopback listener"); return; }
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: a refused chunk lost silently */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la);
+    int w0 = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    static unsigned char ab[1 << 16];
+    size_t an = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
+    if (fa >= 0) srv_headers_fd(fa, 3, 0x8C, 1);
+    int w1 = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    check(rc == 0 && w0 == 0 && hdr_sid(ab, an, 1) == 3, "refused: chunk 0 on stream 3");
+    check(w1 == H2_ESTATUS && strstr(transport_strerror(w1), "400") != NULL,
+          "refused: 400 to stream 3 fails the next write, naming 400");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+static void srv_settings_fd(int fd, uint16_t id, uint32_t v) {
+    unsigned char f[15] = { 0, 0, 6, 0x04, 0, 0, 0, 0, 0, (unsigned char)(id >> 8), (unsigned char)id,
+                            (unsigned char)(v >> 24), (unsigned char)(v >> 16), (unsigned char)(v >> 8),
+                            (unsigned char)v };
+    if (write(fd, f, sizeof f) != (ssize_t)sizeof f) { perror("write"); exit(2); }
+}
+
+static void t_packet_up_streams_share_the_cap(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "cap: loopback listener"); return; }
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: the GET on the same connection not counted against MAX_CONCURRENT_STREAMS */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la);
+    if (fa >= 0) srv_settings_fd(fa, 0x03, 3);
+    int w0 = rc ? -1 : transport_write(&c, piece, 10);
+    int w1 = rc ? -1 : transport_write(&c, piece, 10);
+    int w2 = rc ? -1 : transport_write(&c, piece, 10);
+    check(rc == 0 && w0 == 0 && w1 == 0 && w2 == H2_EWINDOW,
+          "packet-up, MAX_CONCURRENT_STREAMS 3: the GET and two chunks, the third waits");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+static void t_pulled_download_data_reported(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "pulled: loopback listener"); return; }
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: download bytes read by an upload's pull left where epoll cannot see them */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la);
+    unsigned char f[14] = { 0, 0, 5, 0x00, 0, 0, 0, 0, 1, 'h', 'e', 'l', 'l', 'o' };
+    if (fa >= 0) srv_headers_fd(fa, 1, 0x88, 0);
+    if (fa >= 0 && write(fa, f, sizeof f) != (ssize_t)sizeof f) { perror("write"); exit(2); }
+    struct pollfd p = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+    int ready = rc ? 0 : poll(&p, 1, 1000) > 0;
+    int w0 = rc ? -1 : transport_write(&c, piece, 10);
+    int left = rc ? 1 : unread(transport_fd(&c));
+    int has = rc ? 0 : transport_has_data(&c);
+    unsigned char out[TRANSPORT_MIN_READ_CAP];
+    size_t got = 0;
+    int r = rc ? -1 : transport_read(&c, out, sizeof out, &got);
+    check(rc == 0 && ready && w0 == 0 && !left && has,
+          "pulled: the GET's data read by a write is reported as held");
+    check(r == 0 && got == 5 && !memcmp(out, "hello", 5), "pulled: and read from the flow");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+struct slow_peer { int fd; size_t got; };
+
+static void *slow_read(void *arg) {
+    struct slow_peer *sp = arg;
+    static unsigned char b[1 << 16];
+    struct pollfd p = { .fd = sp->fd, .events = POLLIN, .revents = 0 };
+    usleep(100000);
+    while (poll(&p, 1, 300) > 0) {
+        ssize_t r = recv(sp->fd, b, sizeof b, 0);
+        if (r <= 0) break;
+        sp->got += (size_t)r;
+    }
+    return NULL;
+}
+
+static void t_write_flushed_before_return(void) {
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("stream-one", NULL, NULL);
+    int rc = xopen(&c, &n, fds);
+    int small = 4096;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(g_dsrv, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    struct slow_peer sp = { g_dsrv, 0 };
+    pthread_t th;
+    int made = pthread_create(&th, NULL, slow_read, &sp) == 0;
+    static unsigned char pl[60000];
+    memset(pl, 0x33, sizeof pl);
+    /* catches: a write returning while its bytes still wait in our queue */
+    int wr = rc ? -1 : transport_write(&c, pl, sizeof pl);
+    int queued = rc ? 1 : xconn_wants_out(c.xh.priv[1]);
+    if (made) pthread_join(th, NULL);
+    check(rc == 0 && made && wr == 0 && !queued && sp.got >= sizeof pl,
+          "stream-one: a write leaves only when the socket took all of it");
+    xclose(fds);
+}
+
+static void t_post_reset_fails_flow(void) {
+    uint16_t pa = 0;
+    int la = listen_lo(&pa);
+    if (la < 0) { check(0, "reset: loopback listener"); return; }
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    n.host = "127.0.0.1";
+    n.port = pa;
+    struct transport c;
+    /* catches: a chunk reset before any status taken as answered */
+    int rc = transport_open(&c, &n, 2);
+    int fa = accept_wait(la);
+    int w0 = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    unsigned char f[13] = { 0, 0, 4, 0x03, 0, 0, 0, 0, 3, 0, 0, 0, 8 };
+    if (fa >= 0 && write(fa, f, sizeof f) != (ssize_t)sizeof f) { perror("write"); exit(2); }
+    struct pollfd p = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+    if (!rc) poll(&p, 1, 1000);
+    int w1 = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    int w2 = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    check(rc == 0 && w0 == 0 && w1 == H2_ERESET && w2 == H2_ERESET,
+          "reset: RST_STREAM on stream 3 with no status fails this and every later write");
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    close(la);
+}
+
+static void t_close_keeps_the_flow_bytes(void) {
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    int rc = xopen(&c, &n, fds);
+    int saved = dup(2);
+    /* catches: an xhttp close closing the main link, whose descriptor shares xhttp's bytes */
+    check(rc == 0 && c.link.fd == 2, "close: the main link's descriptor reads as 2 under xhttp's mode");
+    transport_close(&c);
+    int open2 = fcntl(2, F_GETFD) != -1;
+    if (!open2 && saved >= 0) dup2(saved, 2);
+    if (saved >= 0) close(saved);
+    check(open2, "close: an xhttp transport leaves descriptor 2 alone");
+}
+
+static void t_direct_keeps_the_flow(void) {
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("stream-one", NULL, NULL);
+    int rc = xopen(&c, &n, fds);
+    static struct xh_state before;
+    memcpy(&before, &c.xh, sizeof before);
+    /* catches: the direct-copy switch written over xhttp's state */
+    transport_direct(&c);
+    check(rc == 0 && !memcmp(&before, &c.xh, sizeof before) && !transport_rx_direct(&c),
+          "direct copy: an xhttp flow's state stays as it was");
+    xclose(fds);
+}
+
 int main(void) {
+    t_post_reset_fails_flow();
+    t_close_keeps_the_flow_bytes();
+    t_direct_keeps_the_flow();
+    t_packet_up_streams_share_the_cap();
+    t_pulled_download_data_reported();
+    t_write_flushed_before_return();
+    t_packet_up_one_connection();
+    t_stream_up_one_connection();
+    t_dl_two_connections();
+    t_post_refused_fails_flow();
     t_dl_get_from_download_side();
     t_dl_sid_from_main_table();
     t_dl_authority();
