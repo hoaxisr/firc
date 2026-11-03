@@ -112,7 +112,7 @@ T_CFLAGS  = -O1 -g $(WARN) -Wno-unused-function $(INC) -Itests $(if $(SANITIZE),
 TW_LIB   := $(T)/wolfssl/libwolfssl.a
 TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
-UNIT := h2match xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch tun6match vreqmatch
+UNIT := h2match xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch tun6match vreqmatch addr6match
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch
 
 test: unit-test crypto-test
@@ -184,6 +184,10 @@ $(T)/vreqmatch: tests/vreqmatch.c src/proto/vless/vless_proto.c $(HDR)
 $(T)/tun6match: tests/tun6match.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/tun6match.c src/tunnel/tun.c
+
+$(T)/addr6match: tests/addr6match.c src/tunnel/ifcfg.c $(HDR)
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/addr6match.c src/tunnel/ifcfg.c
 
 $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)

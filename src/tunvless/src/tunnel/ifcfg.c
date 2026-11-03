@@ -261,6 +261,24 @@ static int ipv6_enable(const char *dev) {
     return rc;
 }
 
+/* ndm logs a backtrace for every main-table route on a device it did not create; the address needs none. */
+static int route6_unprefix(int ifindex, const unsigned char addr[16]) {
+    struct nlreq q;
+    memset(&q, 0, sizeof(q));
+    q.h.nlmsg_len = NLMSG_LENGTH(sizeof(q.u.rt));
+    q.h.nlmsg_type = RTM_DELROUTE;
+    q.u.rt.rtm_family = AF_INET6;
+    q.u.rt.rtm_dst_len = 128;
+    q.u.rt.rtm_table = RT_TABLE_MAIN;
+    q.u.rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    q.u.rt.rtm_type = RTN_UNICAST;
+    nl_attr(&q, RTA_DST, addr, 16);
+    uint32_t o = (uint32_t)ifindex;
+    nl_attr(&q, RTA_OIF, &o, sizeof(o));
+    int rc = nl_talk(&q.h, NULL, 0);
+    return rc == -ESRCH || rc == -ENOENT ? 0 : rc;
+}
+
 int ifcfg_addr6_set(int ifindex, const unsigned char addr[16], int on) {
     if (on) {
         char dev[IF_NAMESIZE];
@@ -282,5 +300,6 @@ int ifcfg_addr6_set(int ifindex, const unsigned char addr[16], int on) {
     nl_attr(&q, IFA_ADDRESS, addr, 16);
     int rc = nl_talk(&q.h, NULL, 0);
     if (!on && (rc == -ENOENT || rc == -EADDRNOTAVAIL)) return 0;
+    if (on && rc == 0) rc = route6_unprefix(ifindex, addr);
     return rc;
 }
