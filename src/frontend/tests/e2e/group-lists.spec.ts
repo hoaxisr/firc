@@ -268,6 +268,17 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
 }
 
 test.describe("Groups with a list", () => {
+  // Catches the list line showing when the content last changed instead of the last successful fetch, or nothing before the first fetch.
+  test("the list line shows the last fetch, else the last change", async ({ page }) => {
+    const fetched = makeListGroup("a1b2c3d4", "https://a.example/list.txt", "Fetched");
+    const unfetched = makeListGroup("e5f6a7b8", "https://b.example/list.txt", "Unfetched");
+    unfetched.list.sync.lastCheck = 0;
+    await setupGroupLists(page, [fetched, unfetched], { expand: false });
+    const lines = page.locator(".update-text");
+    await expect(lines.nth(0)).toContainText("15.01.2027");
+    await expect(lines.nth(1)).toContainText("14.11.2023");
+  });
+
   test("edits an existing list's URL and saves it", async ({ page }) => {
     const state = await setupGroupLists(page, [
       makeListGroup("a1b2c3d4", "https://old.example/list.txt"),

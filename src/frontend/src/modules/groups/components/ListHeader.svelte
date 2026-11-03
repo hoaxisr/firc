@@ -69,7 +69,9 @@
     <div class="update-line">
       <div class="update-line-row">
         <span class="icon-wrap"><CloudSync size={14} /></span>
-        <span class="update-text">{formatTime(group.list.lastUpdate)}</span>
+        <span class="update-text"
+          >{formatTime(group.list.sync?.lastCheck || group.list.lastUpdate)}</span
+        >
         <span class="update-interval">
           <span class="interval-label">{t("Update:")}</span>
           <Select
