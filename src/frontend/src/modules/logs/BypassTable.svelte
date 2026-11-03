@@ -383,6 +383,8 @@
   :global(.bp-menu) {
     min-width: 10rem;
     max-width: min(20rem, 90vw);
+    max-height: min(20rem, var(--bits-dropdown-menu-content-available-height, 20rem));
+    overflow-y: auto;
     padding: 0.2rem;
     background: var(--bg-dark-extra);
     border: 1px solid var(--bg-light-extra);

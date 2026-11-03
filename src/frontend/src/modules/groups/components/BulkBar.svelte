@@ -621,6 +621,8 @@
     z-index: 11;
     min-width: 13rem;
     max-width: calc(100vw - 1rem);
+    max-height: var(--bits-dropdown-menu-content-available-height, 70vh);
+    overflow-y: auto;
     box-sizing: border-box;
     padding: 0.35rem;
     border-radius: 0.6rem;
