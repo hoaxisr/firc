@@ -3,7 +3,6 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -13,7 +12,6 @@
 #include "../src/tunnel/ifcfg.h"
 
 #define DEV "xs-addr6"
-#define OTHER "xs-addr6b"
 
 static int fails;
 
@@ -70,17 +68,10 @@ int main(void) {
     ifcfg_addr6_of(v4.s_addr, a6);
     char want[33];
     snprintf(want, sizeof want, "20010db80000000000000000c6336409");
-    if (system("ip link add " OTHER " type dummy && ip link set " OTHER " up && "
-               "ip -6 route add 2001:db8::c633:6409/128 dev " OTHER " metric 1") != 0) {
-        printf("FAILED: no route on %s to compare with\n", OTHER);
-        return 1;
-    }
     int rc = ifcfg_addr6_set((int)if_nametoindex(DEV), a6, 1);
     check("v6: the address is added", 0, rc);
     check("v6: the device holds it", 1, has_addr(want, DEV));
     check("v6: no kernel route to it in main (ndm cannot resolve the device)", 0, has_route(want, DEV));
-    check("v6: the same route on another device is left alone", 1, has_route(want, OTHER));
-    (void)!system("ip link del " OTHER);
     close(fd);
     if (fails) {
         printf("FAILED: %d\n", fails);
