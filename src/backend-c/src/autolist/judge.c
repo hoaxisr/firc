@@ -1045,7 +1045,7 @@ static bool addr_hidden(const firc_autolist_t *a, const firc_autolist_addr_t *r,
 
 size_t firc_autolist_addresses(const firc_autolist_t *a, int64_t now, firc_autolist_addr_t *out, size_t cap) {
     if (a == NULL) { return 0; }
-    size_t order[ROWS];
+    size_t order[ROWS] = {0};
     size_t n = 0;
     for (size_t i = 0; i < ROWS; i++) {
         if (!addr_live(a, i, now) || addr_hidden(a, &a->addr[i], now)) { continue; }
