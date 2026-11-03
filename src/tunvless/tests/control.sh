@@ -122,7 +122,7 @@ sleep 4
 check "ready line" '{"type":"ready","dev":"tvc0","tcpPort":0}' "$(grep '"ready"' "$W/ev" | head -1)"
 check "first active" '{"type":"active","nodes":["A"],"index":[0],"v6":[false]}' "$(grep '"active"' "$W/ev" | head -1)"
 TV=$(tv_pid)
-check "inherited fd 9 closed" "${TV:-none} no" "${TV:-none} $([ -e "/proc/$TV/fd/9" ] && echo yes || echo no)"
+check "inherited fd 9 closed" "${TV:-none} no" "${TV:-none} $([ "$(readlink "/proc/$TV/fd/9" 2>/dev/null)" = "$W/nodes" ] && echo yes || echo no)"
 check "tunvless found" 1 "$([ -n "$TV" ] && echo 1 || echo 0)"
 kill "$SRV_A"; sleep 12
 check "A down reported" 1 "$(grep -c '"node_down","node":"A"' "$W/ev")"
@@ -169,9 +169,9 @@ check "the open file limit is raised to the hard limit" raised \
     "$(awk '/^Max open files/ { print ($4 == $5) ? "raised" : $4 " of " $5 }' "/proc/$TK/limits" 2>/dev/null)"
 check "a direct connection to the port is reset" reset "$(HX python3 -c '
 import socket
-s = socket.create_connection(("127.0.0.1", 3600), 3)
-s.settimeout(3)
 try:
+    s = socket.create_connection(("127.0.0.1", 3600), 3)
+    s.settimeout(3)
     print("eof" if s.recv(1) == b"" else "data")
 except ConnectionResetError:
     print("reset")
@@ -219,7 +219,7 @@ P2=10801 C=10.75.0.3
 ip netns exec $N ip addr add $C/32 dev lo
 srv2() {
     ip netns exec $N python3 tests/fake-vless.py --port $P2 --uuid $UUID --mb "$2" --kbps "$3" \
-        --bind "$1" > "$W/srv2-$4.log" 2>&1 &
+        --bind "$1" --log-req "$W/req-$4" > "$W/srv2-$4.log" 2>&1 &
 }
 srv2 $A 1 200 A; S2A=$!
 srv2 $B 2 0 B; S2B=$!
@@ -244,8 +244,9 @@ check "swap: first active A" '{"type":"active","nodes":["A"],"index":[0],"v6":[f
 IFX=$(HX cat /sys/class/net/tvs0/ifindex 2>/dev/null)
 case "$IFX" in ''|*[!0-9]*) IFX_OK=no ;; *) IFX_OK=yes ;; esac
 check "swap: the device has an ifindex" yes "$IFX_OK"
+: > "$W/req-A"
 ( fetch long > "$W/long.size" ) & LONG=$!
-sleep 1
+wait_in "$W/req-A" ' 203.0.113.7:80'
 { echo nodes; lnk B; echo "garbage-$UUID"; lnk C; echo; } >&8
 wait_ev '"type":"nodes"' 2
 check "swap: acknowledged with the usable count" '{"type":"nodes","count":2}' "$(grep '"type":"nodes"' "$W/ev2" | head -1)"

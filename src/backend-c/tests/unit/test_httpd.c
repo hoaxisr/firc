@@ -270,7 +270,9 @@ static void *loop_thread(void *ud) {
 }
 
 #define TEST_PORT 18080
-#define TEST_UNIX_PATH "/tmp/firc_httpd_test.sock"
+static char g_unix_dir[64];
+static char g_unix_path[96];
+#define TEST_UNIX_PATH g_unix_path
 
 static harness_t *harness_start(void) {
     harness_t *h = calloc(1, sizeof(*h));
@@ -1160,6 +1162,9 @@ TEST the_stream_buffer_keeps_room_for_its_own_terminator(void) {
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
+    snprintf(g_unix_dir, sizeof(g_unix_dir), "/tmp/firc_httpd_test_XXXXXX");
+    if (mkdtemp(g_unix_dir) == NULL) { return 1; }
+    snprintf(g_unix_path, sizeof(g_unix_path), "%s/httpd.sock", g_unix_dir);
     GREATEST_MAIN_BEGIN();
     RUN_TEST(get_with_query_param);
     RUN_TEST(path_param_extraction);
@@ -1189,5 +1194,7 @@ int main(int argc, char **argv) {
     RUN_TEST(after_sent_runs_when_the_client_leaves_first);
     RUN_TEST(after_sent_does_not_run_when_the_server_goes_away);
     RUN_TEST(an_answer_with_after_sent_closes_its_connection);
+    unlink(g_unix_path);
+    rmdir(g_unix_dir);
     GREATEST_MAIN_END();
 }

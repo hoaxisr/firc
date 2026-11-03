@@ -1577,9 +1577,8 @@ static request_disp_t reply_block(firc_dnsproxy_t *p, exchange_t *ex, const firc
     uint8_t *resp = NULL;
     size_t rlen = 0;
     if (firc_dns_make_block_response(query, answer, p->ptr_ttl, &resp, &rlen) != FIRC_OK) { return REQ_DROP; }
-    request_disp_t disp = reply_local(p, ex, resp, rlen);
     if (p->blocked_fn != NULL) { p->blocked_fn(p->blocked_ud, query, client, answer); }
-    return disp;
+    return reply_local(p, ex, resp, rlen);
 }
 
 static void tally(firc_dnsproxy_t *p, const firc_dns_msg_t *query, const firc_ip_t *client, firc_id_t owner,

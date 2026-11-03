@@ -47,8 +47,11 @@ static void write_file(const char *path, const char *content) {
     fclose(f);
 }
 
-#define SHADOW_FIXTURE "/tmp/firc_test_shadow"
-#define PASSWD_FIXTURE "/tmp/firc_test_passwd"
+static char g_fixture_dir[64];
+static char g_shadow_fixture[96];
+static char g_passwd_fixture[96];
+#define SHADOW_FIXTURE g_shadow_fixture
+#define PASSWD_FIXTURE g_passwd_fixture
 
 TEST load_password_hash_cases(void) {
     write_file(SHADOW_FIXTURE,
@@ -333,17 +336,21 @@ TEST the_other_refusals_are_said_once_a_minute_too(void) {
     g_say_ms = 1000;
     firc_logrep_set_clock_for_test(say_clock);
     firc_log_set_output_floor(FIRC_LOG_ERROR);
+    char unreadable[128];
+    char said[160];
+    snprintf(unreadable, sizeof(unreadable), "%s/x", SHADOW_FIXTURE);
+    snprintf(said, sizeof(said), "%s could not be read", unreadable);
     char *state_dir = mkdtemp_dup("/tmp/firc_auth_rate2_XXXXXX");
     ASSERT(state_dir != NULL);
     char token[FIRC_JWT_MAX_TOKEN];
     for (int i = 0; i < 3; i++) {
-        (void)firc_auth_authenticate_from(SHADOW_FIXTURE "/x", PASSWD_FIXTURE, state_dir, "admin", "pw", token,
+        (void)firc_auth_authenticate_from(unreadable, PASSWD_FIXTURE, state_dir, "admin", "pw", token,
                                           sizeof(token));
     }
     g_say_ms += 60000;
     struct timespec pause = {.tv_sec = 1, .tv_nsec = 100 * 1000 * 1000};
     nanosleep(&pause, NULL);
-    (void)firc_auth_authenticate_from(SHADOW_FIXTURE "/x", PASSWD_FIXTURE, state_dir, "admin", "pw", token,
+    (void)firc_auth_authenticate_from(unreadable, PASSWD_FIXTURE, state_dir, "admin", "pw", token,
                                       sizeof(token));
     firc_logrep_set_clock_for_test(NULL);
     firc_log_set_output_floor(FIRC_LOG_DEBUG);
@@ -355,8 +362,8 @@ TEST the_other_refusals_are_said_once_a_minute_too(void) {
     firc_auth_forget_cached_hash();
     firc_auth_reset_throttle_for_test();
     free(state_dir);
-    ASSERT_EQ_FMT(2, journal_starting(kept, n, SHADOW_FIXTURE "/x could not be read", NULL), "%d");
-    ASSERT_EQ_FMT(1, journal_starting(kept, n, SHADOW_FIXTURE "/x could not be read", " (2 more since the last)"), "%d");
+    ASSERT_EQ_FMT(2, journal_starting(kept, n, said, NULL), "%d");
+    ASSERT_EQ_FMT(1, journal_starting(kept, n, said, " (2 more since the last)"), "%d");
     ASSERT_EQ_FMT(2, journal_starting(kept, n, "login refused for \"admin\": this build cannot compute", NULL), "%d");
     ASSERT_EQ_FMT(1, journal_starting(kept, n, "login refused for \"admin\": this build cannot compute", " (2 more since the last)"),
                   "%d");
@@ -865,6 +872,10 @@ TEST a_secret_of_32_bytes_loads(void) {
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
+    snprintf(g_fixture_dir, sizeof(g_fixture_dir), "/tmp/firc_test_auth_XXXXXX");
+    if (mkdtemp(g_fixture_dir) == NULL) { return 1; }
+    snprintf(g_shadow_fixture, sizeof(g_shadow_fixture), "%s/shadow", g_fixture_dir);
+    snprintf(g_passwd_fixture, sizeof(g_passwd_fixture), "%s/passwd", g_fixture_dir);
     GREATEST_MAIN_BEGIN();
     RUN_TEST(add_years_matches_go);
     RUN_TEST(load_password_hash_cases);
@@ -892,5 +903,8 @@ int main(int argc, char **argv) {
     RUN_TEST(the_token_header_signs_in_beside_a_proxy_basic_auth);
     RUN_TEST(auth_path_itself_is_exempt_even_when_enabled);
     RUN_TEST(bare_lf_request_line_endings_are_accepted);
+    unlink(g_shadow_fixture);
+    unlink(g_passwd_fixture);
+    rmdir(g_fixture_dir);
     GREATEST_MAIN_END();
 }

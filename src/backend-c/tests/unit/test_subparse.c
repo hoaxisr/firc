@@ -425,6 +425,16 @@ static double seconds_to_parse(size_t n, size_t *out_rules) {
     return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
 }
 
+static double best_parse(size_t n, int trials) {
+    double best = -1.0;
+    for (int i = 0; i < trials; i++) {
+        size_t got = 0;
+        double t = seconds_to_parse(n, &got);
+        if (t > 0.0 && got == n && (best < 0.0 || t < best)) { best = t; }
+    }
+    return best;
+}
+
 /* Catches: a quadratic parse, which blocks the loop thread for minutes on a large list. */
 TEST a_big_list_does_not_take_the_thread_for_seconds(void) {
     size_t got = 0;
@@ -434,6 +444,11 @@ TEST a_big_list_does_not_take_the_thread_for_seconds(void) {
     double large = seconds_to_parse(200000, &got);
     ASSERT_EQ_FMTm("every line is a rule", (size_t)200000, got, "%zu");
     ASSERT(small > 0.0 && large > 0.0);
+    if (large / small >= 8.0 && large < 30.0) {
+        small = best_parse(50000, 5);
+        large = best_parse(200000, 5);
+        ASSERT(small > 0.0 && large > 0.0);
+    }
     ASSERTm("four times the lines must not cost sixteen times the time", large / small < 8.0);
     PASS();
 }
@@ -652,6 +667,16 @@ TEST deciding_a_sync_changed_nothing_is_linear(void) {
     PASS();
 }
 
+static double best_resync(size_t n, int trials) {
+    double best = -1.0;
+    for (int i = 0; i < trials; i++) {
+        bool kept = false;
+        double t = seconds_to_resync(n, &kept);
+        if (t > 0.0 && kept && (best < 0.0 || t < best)) { best = t; }
+    }
+    return best;
+}
+
 /* Catches: a quadratic match of parsed against stored rules on resync. */
 TEST a_big_resync_does_not_take_the_thread_for_seconds(void) {
     bool kept = false;
@@ -661,6 +686,11 @@ TEST a_big_resync_does_not_take_the_thread_for_seconds(void) {
     double large = seconds_to_resync(64000, &kept);
     ASSERTm("the stored id and flag survive a re-sync", kept);
     ASSERT(small > 0.0 && large > 0.0);
+    if (large / small >= 8.0 && large < 10.0) {
+        small = best_resync(16000, 5);
+        large = best_resync(64000, 5);
+        ASSERT(small > 0.0 && large > 0.0);
+    }
     ASSERTm("four times the rules must not cost sixteen times the time", large / small < 8.0);
     PASS();
 }

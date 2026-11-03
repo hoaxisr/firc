@@ -112,7 +112,7 @@ typedef bool (*firc_dnsproxy_route_fn)(void *ud, const firc_dns_msg_t *query, co
 /* NULL sends everything to the common upstream. Loop thread, or before start. */
 void firc_dnsproxy_set_router(firc_dnsproxy_t *p, firc_dnsproxy_route_fn fn, void *ud);
 
-/* Told of every query the proxy answered with a block answer, after the reply. */
+/* Told of every query the proxy answered with a block answer, before the reply. */
 typedef void (*firc_dnsproxy_blocked_cb)(void *ud, const firc_dns_msg_t *query, const firc_ip_t *client,
                                          firc_block_answer_t answer);
 

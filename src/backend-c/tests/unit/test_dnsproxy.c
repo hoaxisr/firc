@@ -1012,11 +1012,7 @@ static bool g_live_health_clock;
 static uint64_t health_clock(void) { return atomic_load(&g_health_ms); }
 static _Atomic int g_live_hook_calls;
 
-static uint64_t skewed_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + atomic_load(&g_cache_skew_ms);
-}
+static uint64_t skewed_ms(void) { return 1000000u + atomic_load(&g_cache_skew_ms); }
 
 static _Atomic int g_live_resolver = -1;
 

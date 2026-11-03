@@ -635,13 +635,51 @@ typedef struct {
     int calls;
     firc_err_t err[4];
     bool wan[4];
+    bool hold_first;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool holding;
 } wan_script_t;
+
+static void script_hold(wan_script_t *w) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 10;
+    pthread_mutex_lock(&w->mu);
+    w->holding = true;
+    pthread_cond_broadcast(&w->cv);
+    while (w->holding) {
+        if (pthread_cond_timedwait(&w->cv, &w->mu, &until) != 0) { break; }
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool script_wait_holding(wan_script_t *w) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 10;
+    pthread_mutex_lock(&w->mu);
+    while (!w->holding) {
+        if (pthread_cond_timedwait(&w->cv, &w->mu, &until) != 0) { break; }
+    }
+    bool holding = w->holding;
+    pthread_mutex_unlock(&w->mu);
+    return holding;
+}
+
+static void script_release(wan_script_t *w) {
+    pthread_mutex_lock(&w->mu);
+    w->holding = false;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+}
 
 static firc_err_t scripted_wan(const firc_ifcheck_job_t *jobs, size_t n, bool *wan, void *ud) {
     (void)jobs;
     wan_script_t *w = ud;
     int k = w->calls < 4 ? w->calls : 3;
     w->calls++;
+    if (w->hold_first && k == 0) { script_hold(w); }
     for (size_t i = 0; i < n; i++) { wan[i] = w->wan[k]; }
     return w->err[k];
 }
@@ -658,7 +696,7 @@ typedef struct {
     firc_ifcheck_t *c;
     firc_ifcheck_settings_t s;
     slice_t now;
-    bool ready, freed;
+    bool ready, queued, freed;
     firc_err_t err;
 } rounds_t;
 
@@ -683,6 +721,13 @@ static void rounds_setup(firc_loop_t *loop, void *ud) {
 static void rounds_queue(firc_loop_t *loop, void *ud) {
     (void)loop;
     queue_slice(ud);
+}
+
+static void rounds_queue_noted(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    rounds_t *o = ud;
+    queue_slice(o);
+    got_signal(o->got, &o->queued);
 }
 
 static void rounds_teardown(firc_loop_t *loop, void *ud) {
@@ -822,12 +867,27 @@ TEST a_failed_first_lookup_guards_the_round(void) {
 TEST a_job_never_seen_in_a_good_lookup_holds_the_round(void) {
     harness_t h;
     ASSERT(start(&h));
-    wan_script_t script = {.err = {FIRC_OK, FIRC_ERR_UPSTREAM}, .wan = {true, false}};
+    wan_script_t script = {.err = {FIRC_OK, FIRC_ERR_UPSTREAM},
+                           .wan = {true, false},
+                           .hold_first = true,
+                           .mu = PTHREAD_MUTEX_INITIALIZER,
+                           .cv = PTHREAD_COND_INITIALIZER};
     firc_ifcheck_set_wan_fn_for_test(scripted_wan, &script);
     firc_ifcheck_settings_t s = two_urls("http://127.0.0.1:18110/200", "http://127.0.0.1:18110/204");
     got_t got = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
-    const slice_t sl[2] = {{0, 1}, {0, 2}};
-    ASSERT(run_slices(&h, &got, &s, sl, 2));
+    rounds_t o = {.got = &got, .s = s, .now = {0, 1}};
+    ASSERT_EQ(FIRC_OK, firc_loop_post(h.loop, rounds_setup, &o));
+    got_wait(&got, &o.ready);
+    ASSERT(o.ready && o.err == FIRC_OK);
+    bool held = script_wait_holding(&script);
+    o.now = (slice_t){0, 2};
+    bool posted = firc_loop_post(h.loop, rounds_queue_noted, &o) == FIRC_OK;
+    if (posted) { got_wait(&got, &o.queued); }
+    script_release(&script);
+    bool two = got_rounds(&got, 2);
+    if (firc_loop_post(h.loop, rounds_teardown, &o) == FIRC_OK) { got_wait(&got, &o.freed); }
+    ASSERTm("round 1 held in its lookup while round 2 was queued", held && posted && o.queued);
+    ASSERT(two && o.freed);
     ASSERT_EQ_FMT(2, script.calls, "%d");
     ASSERT_EQ_FMT((size_t)2, got.n_last, "%zu");
     for (size_t i = 0; i < 2; i++) {
