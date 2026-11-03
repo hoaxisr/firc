@@ -42,13 +42,14 @@ firc_err_t firc_autolist_rules_build(const firc_fakeip_t *pool, const char *cons
     char handled[32];
     snprintf(handled, sizeof(handled), "0x%x/0x%x", FIRC_MARK_HANDLED, FIRC_MARK_HANDLED);
 
-    char group_hello[8], group_reset[8], group_answered[8], group_fin[8], group_close_rst[8], group_syn[8];
+    char group_hello[8], group_reset[8], group_answered[8], group_fin[8], group_close_rst[8], group_syn[8], group_new[8];
     snprintf(group_hello, sizeof(group_hello), "%u", (unsigned)FIRC_AUTOLIST_GROUP_HELLO);
     snprintf(group_reset, sizeof(group_reset), "%u", (unsigned)FIRC_AUTOLIST_GROUP_RESET);
     snprintf(group_answered, sizeof(group_answered), "%u", (unsigned)FIRC_AUTOLIST_GROUP_ANSWERED);
     snprintf(group_fin, sizeof(group_fin), "%u", (unsigned)FIRC_AUTOLIST_GROUP_FIN);
     snprintf(group_close_rst, sizeof(group_close_rst), "%u", (unsigned)FIRC_AUTOLIST_GROUP_CLOSE_RST);
     snprintf(group_syn, sizeof(group_syn), "%u", (unsigned)FIRC_AUTOLIST_GROUP_SYN);
+    snprintf(group_new, sizeof(group_new), "%u", (unsigned)FIRC_AUTOLIST_GROUP_NEW);
 
     static const unsigned families[2] = {FIRC_FAM_V4, FIRC_FAM_V6};
     static const int af[2] = {AF_INET, AF_INET6};
@@ -146,6 +147,15 @@ firc_err_t firc_autolist_rules_build(const firc_fakeip_t *pool, const char *cons
                 "-j", "NFLOG", "--nflog-group", group_syn, "--nflog-threshold", "1",
             };
             fn(ud, families[i], syn_args, sizeof(syn_args) / sizeof(syn_args[0]));
+
+            const char *new_args[] = {
+                "-i", lan[li],
+                "-m", "conntrack", "--ctstate", "NEW", "!", "--ctorigdst", cidr,
+                "-m", "mark", "!", "--mark", handled,
+                "-m", "limit", "--limit", AL_LIMIT_RATE, "--limit-burst", AL_LIMIT_BURST,
+                "-j", "NFLOG", "--nflog-group", group_new, "--nflog-threshold", "1",
+            };
+            fn(ud, families[i], new_args, sizeof(new_args) / sizeof(new_args[0]));
         }
     }
     return FIRC_OK;

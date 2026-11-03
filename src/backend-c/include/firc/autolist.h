@@ -6,11 +6,12 @@
 #include <stdint.h>
 
 #include "firc/fakeip.h"
+#include "firc/id.h"
 
 #define FIRC_AUTOLIST_FLOWS 1024
 #define FIRC_AUTOLIST_HOSTS 512
 #define FIRC_AUTOLIST_DOMAINS 512
-#define FIRC_AUTOLIST_HINTS 512
+#define FIRC_AUTOLIST_HINTS 4096
 #define FIRC_AUTOLIST_FLOW_SECS 300
 #define FIRC_AUTOLIST_HINT_SECS 600
 #define FIRC_AUTOLIST_NAME_MAX 254
@@ -57,12 +58,19 @@ typedef enum {
     FIRC_AUTOLIST_NO_CONNECT,
 } firc_autolist_why_t;
 
+typedef enum { FIRC_AL_OUTCOME_FAILED = 0, FIRC_AL_OUTCOME_BYPASS = 1 } firc_al_outcome_t;
+
+typedef enum { FIRC_AL_HOW_NONE = 0, FIRC_AL_HOW_ANSWER, FIRC_AL_HOW_SNI, FIRC_AL_HOW_PTR } firc_al_how_t;
+
 typedef struct {
     firc_ip_t server;
     uint8_t proto;
     uint16_t port;
     char name[FIRC_AUTOLIST_NAME_MAX];
     uint8_t why;
+    uint8_t outcome;
+    uint8_t how;
+    char group[FIRC_ID_STR_LEN];
     uint32_t fails;
     int64_t first_at, last_at;
     uint8_t n_clients;
@@ -119,7 +127,23 @@ bool firc_autolist_fin(firc_autolist_t *a, const firc_autolist_flow_t *f, uint32
 bool firc_autolist_syn(firc_autolist_t *a, const firc_autolist_flow_t *f, uint32_t seq, int64_t now,
                        firc_autolist_nomination_t *out);
 
-/* Visible bypass rows, newest last_at first; out may be NULL to count. */
+/* True for any unexpired hint of (client, server), whatever its name. */
+bool firc_autolist_hinted(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server, int64_t now);
+
+/* True for an unexpired hint of (client, server) under exactly name. */
+bool firc_autolist_hinted_name(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server,
+                               const char *name, int64_t now);
+
+/* True the first time the 5-tuple is seen within FIRC_AUTOLIST_FLOW_SECS of its last sighting. */
+bool firc_autolist_flow_first(firc_autolist_t *a, const firc_ip_t *client, uint16_t client_port,
+                              const firc_ip_t *server, uint8_t proto, uint16_t port, int64_t now);
+
+/* Counts a connection that went past firc: the failed row of the key if live, else the bypass quota. */
+void firc_autolist_bypass_seen(firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server, uint8_t proto,
+                               uint16_t port, const char *name, const char group[FIRC_ID_STR_LEN], uint8_t how,
+                               int64_t now);
+
+/* Visible rows of both quotas, newest last_at first; out may be NULL to count. */
 size_t firc_autolist_addresses(const firc_autolist_t *a, int64_t now, firc_autolist_addr_t *out, size_t cap);
 
 /* Hides the row for a day; false when no visible row has the key. */

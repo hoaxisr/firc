@@ -27,6 +27,7 @@ typedef struct {
     firc_ip_t src;
     firc_ip_t dst;
     uint8_t proto;     /* IPv4 protocol / IPv6 next header (no extension walk) */
+    uint16_t src_port; /* TCP or UDP source port; 0 otherwise */
     uint16_t dst_port; /* TCP or UDP destination port; 0 otherwise */
 } firc_tap_head_t;
 

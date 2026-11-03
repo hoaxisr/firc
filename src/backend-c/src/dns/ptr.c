@@ -13,7 +13,7 @@
 #include "firc/dnswire.h"
 #include "firc/rand.h"
 
-#define SLOTS 128
+#define SLOTS 1024
 #define KEEP_MS (24LL * 60 * 60 * 1000)
 #define RETRY_MS (5LL * 60 * 1000)
 #define QUERY_MAX (FIRC_DNS_HEADER_LEN + FIRC_DNS_MAX_NAME + 4)
@@ -262,7 +262,7 @@ static bool open_socket(firc_ptr_t *p, int family)
     return true;
 }
 
-static bool send_query(firc_ptr_t *p, slot_t *s, const char *upstream, uint16_t port)
+static bool send_query(firc_ptr_t *p, slot_t *s, const char *upstream, uint16_t port, bool *sent)
 {
     struct sockaddr_storage ss;
     memset(&ss, 0, sizeof(ss));
@@ -305,12 +305,15 @@ static bool send_query(firc_ptr_t *p, slot_t *s, const char *upstream, uint16_t 
 
     if (!open_socket(p, ss.ss_family)) { return false; }
     if (sendto(p->fd, q, len, 0, (const struct sockaddr *)&ss, ss_len) != (ssize_t)len) { return false; }
+    *sent = true;
     return firc_loop_add_timer(p->loop, p->timeout_ms, 0, on_timeout, s, &s->timer) == FIRC_OK;
 }
 
 firc_ptr_state_t firc_ptr_get(firc_ptr_t *p, const firc_ip_t *ip, const char *upstream, uint16_t port,
-                              int64_t now_ms, char *out, size_t cap)
+                              int64_t now_ms, char *out, size_t cap, bool *sent)
 {
+    bool went = false;
+    if (sent != NULL) { *sent = false; }
     slot_t *s = find(p, ip);
     if (s != NULL && !expired(s, now_ms)) { return answer(s, out, cap); }
     if (s == NULL) { s = victim(p); }
@@ -320,10 +323,11 @@ firc_ptr_state_t firc_ptr_get(firc_ptr_t *p, const firc_ip_t *ip, const char *up
     s->seq = ++p->seq;
     s->at_ms = now_ms;
     s->name[0] = '\0';
-    if (send_query(p, s, upstream, port)) {
+    if (send_query(p, s, upstream, port, &went)) {
         s->state = FIRC_PTR_PENDING;
     } else {
         settle(s, FIRC_PTR_NONE, RETRY_MS);
     }
+    if (sent != NULL) { *sent = went; }
     return answer(s, out, cap);
 }

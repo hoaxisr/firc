@@ -23,6 +23,7 @@
 #include "firc/autolistrules.h"
 #include "firc/dnspipeline.h"
 #include "firc/log.h"
+#include "firc/recall.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/system.h"
 #include "firc/yamlio.h"
@@ -42,11 +43,11 @@ typedef struct {
     pthread_t th;
 } rig_t;
 
-static fake_nflog_t *g_kernel[6];
+static fake_nflog_t *g_kernel[7];
 
 static firc_nflog_t *fake_open(uint16_t group, uint16_t copy_range) {
     int w = group - FIRC_AUTOLIST_GROUP_HELLO;
-    if (w < 0 || w > 5) { return NULL; }
+    if (w < 0 || w > 6) { return NULL; }
     fake_nflog_stop(g_kernel[w]);
     int fd = -1;
     g_kernel[w] = fake_nflog_start(&fd);
@@ -55,7 +56,7 @@ static firc_nflog_t *fake_open(uint16_t group, uint16_t copy_range) {
 }
 
 static void kernels_stop(void) {
-    for (int w = 0; w < 6; w++) {
+    for (int w = 0; w < 7; w++) {
         fake_nflog_stop(g_kernel[w]);
         g_kernel[w] = NULL;
     }
@@ -2085,6 +2086,468 @@ TEST a_user_probe_of_one_host_clears_the_domain_flag(void) {
     PASS();
 }
 
+static const char WATCH_GROUPS[] =
+    "groups:\n"
+    "  - id: 0b0b0b0b\n"
+    "    name: Blocker\n"
+    "    interface: block\n"
+    "    enable: true\n"
+    "    rules:\n"
+    "      - {id: 00000011, type: domain, rule: ads.example.com, enable: true}\n"
+    "  - id: 0c0c0c0c\n"
+    "    name: Narrow\n"
+    "    interface: nwg8\n"
+    "    enable: true\n"
+    "    devices: {allow: [192.168.1.99]}\n"
+    "    rules:\n"
+    "      - {id: 00000012, type: namespace, rule: narrow.test, enable: true}\n"
+    "  - id: 0a0b0c0d\n"
+    "    name: Autolist\n"
+    "    interface: nwg9\n"
+    "    enable: true\n"
+    "    rules:\n"
+    "      - {id: 00000013, type: namespace, rule: example.com, enable: true}\n";
+
+static bool watch_up(rig_t *r, int *fd) {
+    uint16_t up = 0;
+    *fd = udp_upstream(&up);
+    if (*fd < 0) { return false; }
+    static char more[128];
+    snprintf(more, sizeof(more), "  dnsProxy: {upstream: {address: 127.0.0.1, port: %u}}\n", (unsigned)up);
+    setup_t su = {.app_more = more, .groups = WATCH_GROUPS};
+    return rig_up_with(r, &su);
+}
+
+static void watch_down(rig_t *r, int fd) {
+    close(fd);
+    rig_stop_loop(r);
+    rig_down(r);
+}
+
+static int queries(int fd) {
+    uint8_t q[512];
+    int n = 0;
+    while (recv(fd, q, sizeof(q), MSG_DONTWAIT) > 0) { n++; }
+    return n;
+}
+
+static const uint8_t *addr4(uint8_t last) {
+    static uint8_t a[256][4];
+    a[last][0] = 203;
+    a[last][1] = 0;
+    a[last][2] = 113;
+    a[last][3] = last;
+    return a[last];
+}
+
+typedef struct {
+    firc_app_t *app;
+    firc_dns_pipeline_t *pipeline;
+    const uint8_t *server;
+    const char *name;
+    const char *group;
+    firc_autolist_status_t *st;
+    _Atomic bool done;
+} loop_job_t;
+
+static void recall_on_loop(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    loop_job_t *j = ud;
+    firc_ip_t real = {{0}, 4};
+    memcpy(real.b, j->server, 4);
+    char gid[FIRC_ID_STR_LEN];
+    snprintf(gid, sizeof(gid), "%s", j->group);
+    firc_recall_real(firc_dns_pipeline_recall(j->pipeline), &real, j->name, gid, atomic_load(&g_now));
+    atomic_store(&j->done, true);
+}
+
+static void status_on_loop(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    loop_job_t *j = ud;
+    firc_app_autolist_status(j->app, j->st);
+    atomic_store(&j->done, true);
+}
+
+static bool on_loop(rig_t *r, firc_post_cb cb, loop_job_t *j) {
+    atomic_init(&j->done, false);
+    if (firc_loop_post(r->loop, cb, j) != FIRC_OK) { return false; }
+    for (int i = 0; i < 2000 && !atomic_load(&j->done); i++) { nanosleep(&(struct timespec){0, 1000000}, NULL); }
+    return atomic_load(&j->done);
+}
+
+static bool recall(rig_t *r, const uint8_t *server, const char *name, const char *group) {
+    loop_job_t j = {.pipeline = r->pipeline, .server = server, .name = name, .group = group};
+    return on_loop(r, recall_on_loop, &j);
+}
+
+static int bypass_rows(rig_t *r, const uint8_t *server, firc_autolist_addr_t *out) {
+    firc_autolist_status_t *st = calloc(1, sizeof(*st));
+    if (st == NULL) { return -1; }
+    loop_job_t j = {.app = r->app, .st = st};
+    int n = -1;
+    if (on_loop(r, status_on_loop, &j)) {
+        n = 0;
+        for (size_t i = 0; i < st->n_addresses; i++) {
+            const firc_autolist_addr_t *a = &st->addresses[i];
+            if (a->outcome != FIRC_AL_OUTCOME_BYPASS) { continue; }
+            n++;
+            if (server != NULL && out != NULL && memcmp(a->server.b, server, 4) == 0) { *out = *a; }
+        }
+    }
+    free(st);
+    return n;
+}
+
+static bool flow_to(rig_t *r, const uint8_t *client, const uint8_t *server, uint8_t proto, uint16_t sport,
+                    uint16_t dport) {
+    static const uint8_t none[1];
+    uint8_t pkt[64];
+    size_t len = fake_nflog_packet(pkt, client, server, dport, none, 0);
+    set_ports(pkt, sport, dport);
+    if (proto == 17) {
+        pkt[3] = 28;
+        pkt[9] = 17;
+        pkt[24] = 0;
+        pkt[25] = 8;
+        len = 28;
+    }
+    return push(r, 6, pkt, len);
+}
+
+static bool answer_ptr(int fd, const uint8_t *target, size_t target_len) {
+    uint8_t q[512];
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    ssize_t n = recvfrom(fd, q, sizeof(q), 0, (struct sockaddr *)&peer, &plen);
+    if (n < 12) { return false; }
+    uint8_t a[700];
+    size_t len = (size_t)n;
+    memcpy(a, q, len);
+    a[2] = 0x81;
+    a[3] = 0x80;
+    a[7] = 1;
+    const uint8_t rr[] = {0xc0, 0x0c, 0, 12, 0, 1, 0, 0, 1, 44, 0, (uint8_t)target_len};
+    memcpy(a + len, rr, sizeof(rr));
+    memcpy(a + len + sizeof(rr), target, target_len);
+    len += sizeof(rr) + target_len;
+    return sendto(fd, a, len, 0, (struct sockaddr *)&peer, plen) == (ssize_t)len;
+}
+
+TEST a_recall_hit_is_a_bypass_by_answer(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0c0c0c0c"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 17, 40000, 3478));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(17, a.proto);
+    ASSERT_EQ(3478, a.port);
+    ASSERT_EQ(FIRC_AL_HOW_ANSWER, a.how);
+    ASSERT_STR_EQ("www.example.com", a.name);
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    ASSERT_EQ(1u, a.fails);
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+static bool has_two_addresses(const cJSON *st, const void *arg) {
+    (void)arg;
+    return cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(st, "addresses")) >= 2;
+}
+
+static const cJSON *row_at(const cJSON *st, const char *address) {
+    const cJSON *row = NULL;
+    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(st, "addresses")) {
+        if (strcmp(str_of(row, "address"), address) == 0) { return row; }
+    }
+    return NULL;
+}
+
+TEST an_address_row_says_its_outcome_how_and_group(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(resets(&r, CLIENT, "doh.example.com", 50001));
+    ASSERT(recall(&r, addr4(9), "www.example.com", "0c0c0c0c"));
+    ASSERT(flow_to(&r, CLIENT, addr4(9), 17, 40000, 3478));
+    cJSON *st = wait_status(has_two_addresses, NULL);
+    ASSERT(st != NULL);
+    const cJSON *failed = row_at(st, "203.0.113.7");
+    const cJSON *bypass = row_at(st, "203.0.113.9");
+    ASSERT(failed != NULL && bypass != NULL);
+    ASSERT_STR_EQ("failed", str_of(failed, "outcome"));
+    ASSERT_STR_EQ("", str_of(failed, "how"));
+    ASSERT_STR_EQ("", str_of(failed, "group"));
+    ASSERT_STR_EQ("reset", str_of(failed, "why"));
+    ASSERT_STR_EQ("bypass", str_of(bypass, "outcome"));
+    ASSERT_STR_EQ("answer", str_of(bypass, "how"));
+    ASSERT_STR_EQ("0a0b0c0d", str_of(bypass, "group"));
+    ASSERT_STR_EQ("", str_of(bypass, "why"));
+    cJSON_Delete(st);
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_hinted_pair_is_not_a_bypass(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(hint(&r, CLIENT, "x.cdn.test"));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 17, 40000, 3478));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT(flow_to(&r, OTHER, SERVER, 17, 40000, 3478));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(1, a.n_clients);
+    ASSERT_MEM_EQ(OTHER, a.clients[0].b, 4);
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_sni_with_another_hinted_name_is_still_a_bypass(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(hint(&r, CLIENT, "x.cdn.test"));
+    ASSERT(hello(&r, CLIENT, 50001, "www.example.com"));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(FIRC_AL_HOW_SNI, a.how);
+    ASSERT_STR_EQ("www.example.com", a.name);
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_tcp_443_syn_sends_no_ptr(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(flow_to(&r, CLIENT, addr4(70), 6, 40000, 443));
+    ASSERT_EQ(0, queries(fd));
+    ASSERT(flow_to(&r, CLIENT, addr4(71), 6, 40000, 5222));
+    ASSERT_EQ(1, queries(fd));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_block_or_uncovering_group_does_not_count(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, addr4(20), "ads.example.com", "0b0b0b0b"));
+    ASSERT(recall(&r, addr4(21), "cdn.narrow.test", "0c0c0c0c"));
+    ASSERT(recall(&r, addr4(22), "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, addr4(20), 17, 40000, 443));
+    ASSERT(flow_to(&r, CLIENT, addr4(21), 17, 40000, 443));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT(flow_to(&r, CLIENT, addr4(22), 17, 40000, 443));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, addr4(22), &a));
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_sni_of_a_group_name_is_a_bypass_by_sni(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(hello(&r, CLIENT, 50001, "www.example.com"));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(6, a.proto);
+    ASSERT_EQ(443, a.port);
+    ASSERT_EQ(FIRC_AL_HOW_SNI, a.how);
+    ASSERT_STR_EQ("www.example.com", a.name);
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_ptr_name_of_a_group_is_a_bypass_by_ptr(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(flow_to(&r, CLIENT, addr4(9), 17, 40000, 3478));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    static const uint8_t target[] = "\004edge\007example\003com";
+    ASSERT(answer_ptr(fd, target, sizeof(target)));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    int n = 0;
+    for (uint16_t port = 40001; port < 40200 && n == 0; port++) {
+        ASSERT(flow_to(&r, CLIENT, addr4(9), 17, port, 3478));
+        n = bypass_rows(&r, addr4(9), &a);
+        if (n == 0) { nanosleep(&(struct timespec){0, 5000000}, NULL); }
+    }
+    ASSERT_EQ(1, n);
+    ASSERT_EQ(FIRC_AL_HOW_PTR, a.how);
+    ASSERT_STR_EQ("edge.example.com", a.name);
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    ASSERT_EQ(17, a.proto);
+    ASSERT_EQ(3478, a.port);
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST ptr_lookups_stop_at_30_a_minute(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    for (uint8_t i = 0; i < 40; i++) { ASSERT(flow_to(&r, CLIENT, addr4((uint8_t)(100 + i)), 17, 40000, 3478)); }
+    ASSERT_EQ(30, queries(fd));
+    atomic_fetch_add(&g_now, 59);
+    ASSERT(flow_to(&r, CLIENT, addr4(200), 17, 40000, 3478));
+    ASSERT_EQ(0, queries(fd));
+    atomic_fetch_add(&g_now, 1);
+    ASSERT(flow_to(&r, CLIENT, addr4(201), 17, 40000, 3478));
+    ASSERT_EQ(1, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST flows_to_one_pending_address_spend_one_send(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    for (uint16_t i = 0; i < 40; i++) { ASSERT(flow_to(&r, CLIENT, addr4(50), 17, (uint16_t)(41000 + i), 3478)); }
+    ASSERT_EQ(1, queries(fd));
+    for (uint8_t i = 0; i < 30; i++) { ASSERT(flow_to(&r, CLIENT, addr4((uint8_t)(60 + i)), 17, 40000, 3478)); }
+    ASSERT_EQ(29, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_unowned_sni_on_a_recalled_address_is_no_row(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 6, 50001, 443));
+    ASSERT(hello(&r, CLIENT, 50001, "x.cdn.test"));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_unowned_sni_on_an_unknown_address_sends_no_ptr(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 6, 50001, 443));
+    ASSERT(hello(&r, CLIENT, 50001, "x.cdn.test"));
+    ASSERT_EQ(0, queries(fd));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_owned_sni_on_a_recalled_address_is_one_row_by_sni(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 6, 50001, 443));
+    ASSERT(hello(&r, CLIENT, 50001, "api.example.com"));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(FIRC_AL_HOW_SNI, a.how);
+    ASSERT_STR_EQ("api.example.com", a.name);
+    ASSERT_STR_EQ("0a0b0c0d", a.group);
+    ASSERT_EQ(1u, a.fails);
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_hello_without_sni_on_a_recalled_address_is_a_row_by_answer(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(hello(&r, CLIENT, 50001, ""));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(FIRC_AL_HOW_ANSWER, a.how);
+    ASSERT_STR_EQ("www.example.com", a.name);
+    ASSERT_EQ(6, a.proto);
+    ASSERT_EQ(443, a.port);
+    ASSERT_EQ(1u, a.fails);
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_owned_sni_the_device_asked_for_is_no_row(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(hint(&r, CLIENT, "www.example.com"));
+    ASSERT(hello(&r, CLIENT, 50001, "www.example.com"));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_tcp_443_syn_alone_records_nothing(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 6, 50001, 443));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT_EQ(0, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST a_clock_stepped_back_does_not_stop_ptr_lookups(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    for (uint8_t i = 0; i < 30; i++) { ASSERT(flow_to(&r, CLIENT, addr4((uint8_t)(100 + i)), 17, 40000, 3478)); }
+    ASSERT_EQ(30, queries(fd));
+    atomic_fetch_sub(&g_now, 3600);
+    ASSERT(flow_to(&r, CLIENT, addr4(200), 17, 40000, 3478));
+    ASSERT_EQ(1, queries(fd));
+    watch_down(&r, fd);
+    PASS();
+}
+
+TEST an_owned_sni_on_a_hinted_answered_address_is_a_bypass_by_sni(void) {
+    rig_t r;
+    int fd = -1;
+    ASSERT(watch_up(&r, &fd));
+    ASSERT(hint(&r, CLIENT, "x.cdn.test"));
+    ASSERT(recall(&r, SERVER, "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, SERVER, 6, 50001, 443));
+    ASSERT(hello(&r, CLIENT, 50001, "api.example.com"));
+    firc_autolist_addr_t a;
+    memset(&a, 0, sizeof(a));
+    ASSERT_EQ(1, bypass_rows(&r, SERVER, &a));
+    ASSERT_EQ(FIRC_AL_HOW_SNI, a.how);
+    ASSERT_STR_EQ("api.example.com", a.name);
+    ASSERT_EQ(1u, a.fails);
+    watch_down(&r, fd);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2142,5 +2605,23 @@ int main(int argc, char **argv) {
     RUN_TEST(an_empty_check_url_is_said_once);
     RUN_TEST(a_rule_switched_on_again_takes_the_new_marker);
     RUN_TEST(a_user_probe_of_one_host_clears_the_domain_flag);
+    RUN_TEST(a_recall_hit_is_a_bypass_by_answer);
+    RUN_TEST(an_address_row_says_its_outcome_how_and_group);
+    RUN_TEST(a_hinted_pair_is_not_a_bypass);
+    RUN_TEST(an_sni_with_another_hinted_name_is_still_a_bypass);
+    RUN_TEST(a_tcp_443_syn_sends_no_ptr);
+    RUN_TEST(a_block_or_uncovering_group_does_not_count);
+    RUN_TEST(an_sni_of_a_group_name_is_a_bypass_by_sni);
+    RUN_TEST(a_ptr_name_of_a_group_is_a_bypass_by_ptr);
+    RUN_TEST(ptr_lookups_stop_at_30_a_minute);
+    RUN_TEST(flows_to_one_pending_address_spend_one_send);
+    RUN_TEST(an_unowned_sni_on_a_recalled_address_is_no_row);
+    RUN_TEST(an_unowned_sni_on_an_unknown_address_sends_no_ptr);
+    RUN_TEST(an_owned_sni_on_a_recalled_address_is_one_row_by_sni);
+    RUN_TEST(a_hello_without_sni_on_a_recalled_address_is_a_row_by_answer);
+    RUN_TEST(a_tcp_443_syn_alone_records_nothing);
+    RUN_TEST(an_owned_sni_the_device_asked_for_is_no_row);
+    RUN_TEST(a_clock_stepped_back_does_not_stop_ptr_lookups);
+    RUN_TEST(an_owned_sni_on_a_hinted_answered_address_is_a_bypass_by_sni);
     GREATEST_MAIN_END();
 }

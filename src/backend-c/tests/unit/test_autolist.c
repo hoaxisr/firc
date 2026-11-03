@@ -727,6 +727,290 @@ TEST an_ipv6_bypass_gets_its_own_row(void) {
     PASS();
 }
 
+static firc_ip_t v4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    firc_ip_t ip;
+    memset(&ip, 0, sizeof(ip));
+    ip.len = 4;
+    ip.b[0] = a; ip.b[1] = b; ip.b[2] = c; ip.b[3] = d;
+    return ip;
+}
+
+static const char GROUP_A[FIRC_ID_STR_LEN] = "0000abcd";
+static const char GROUP_B[FIRC_ID_STR_LEN] = "0000beef";
+
+static const firc_autolist_addr_t *row_of(const firc_autolist_addr_t *b, size_t n, const firc_ip_t *server) {
+    for (size_t i = 0; i < n; i++) {
+        if (b[i].server.len == server->len && memcmp(b[i].server.b, server->b, server->len) == 0) { return &b[i]; }
+    }
+    return NULL;
+}
+
+TEST a_bypass_seen_makes_a_bypass_row(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t client = v4(192, 168, 1, 10), server = v4(203, 0, 113, 20);
+    firc_autolist_bypass_seen(a, &client, &server, 17, 3478, "stun.test", GROUP_A, FIRC_AL_HOW_SNI, 100);
+    firc_autolist_addr_t b[4];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 101, b, 4));
+    ASSERT_EQ(FIRC_AL_OUTCOME_BYPASS, b[0].outcome);
+    ASSERT_EQ(FIRC_AL_HOW_SNI, b[0].how);
+    ASSERT_STR_EQ("0000abcd", b[0].group);
+    ASSERT_STR_EQ("stun.test", b[0].name);
+    ASSERT_EQ(17, b[0].proto);
+    ASSERT_EQ(3478, b[0].port);
+    ASSERT_EQ(1u, b[0].fails);
+    ASSERT_EQ(1, b[0].n_clients);
+    ASSERT_EQ(10, b[0].clients[0].b[3]);
+    ASSERT_EQ(100, b[0].first_at);
+    ASSERT_EQ(100, b[0].last_at);
+    firc_ip_t other = v4(192, 168, 1, 11);
+    firc_autolist_bypass_seen(a, &other, &server, 17, 3478, "", GROUP_B, FIRC_AL_HOW_ANSWER, 110);
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 111, b, 4));
+    ASSERT_EQ(2u, b[0].fails);
+    ASSERT_EQ(2, b[0].n_clients);
+    ASSERT_EQ(FIRC_AL_HOW_ANSWER, b[0].how);
+    ASSERT_STR_EQ("0000beef", b[0].group);
+    ASSERTm("an empty name keeps the one known", strcmp(b[0].name, "stun.test") == 0);
+    ASSERT_EQ(100, b[0].first_at);
+    ASSERT_EQ(110, b[0].last_at);
+    firc_autolist_bypass_seen(a, &client, &server, 6, 3478, NULL, GROUP_A, FIRC_AL_HOW_PTR, 120);
+    ASSERTm("another protocol is another row", firc_autolist_addresses(a, 121, NULL, 4) == 2u);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST bypass_rows_never_push_out_failed_rows(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    for (int i = 1; i <= 64; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), (uint8_t)i);
+        ASSERT(bare_hello_times(a, &f, "x.test", 4, 100 + 10 * i, &out));
+    }
+    firc_ip_t client = v4(192, 168, 1, 10);
+    for (int i = 1; i <= 65; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        firc_autolist_bypass_seen(a, &client, &server, 17, 3478, "", GROUP_A, FIRC_AL_HOW_ANSWER, 1000 + i);
+    }
+    firc_autolist_addr_t b[130];
+    size_t n = firc_autolist_addresses(a, 2000, b, 130);
+    ASSERT_EQ(128u, (unsigned)n);
+    for (int i = 1; i <= 64; i++) {
+        firc_ip_t server = v4(203, 0, 113, (uint8_t)i);
+        const firc_autolist_addr_t *r = row_of(b, n, &server);
+        ASSERT(r != NULL);
+        ASSERT_EQ(FIRC_AL_OUTCOME_FAILED, r->outcome);
+    }
+    firc_ip_t gone = v4(198, 51, 100, 1);
+    ASSERT_EQ(NULL, row_of(b, n, &gone));
+    for (int i = 2; i <= 65; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        const firc_autolist_addr_t *r = row_of(b, n, &server);
+        ASSERT(r != NULL);
+        ASSERT_EQ(FIRC_AL_OUTCOME_BYPASS, r->outcome);
+    }
+    ASSERT_EQ(65, b[0].server.b[3]);
+    ASSERT_EQ(51, b[0].server.b[1]);
+    ASSERT_EQ(1, b[127].server.b[3]);
+    ASSERT_EQ(0, b[127].server.b[1]);
+    ASSERTm("the cap still bounds the copy", firc_autolist_addresses(a, 2000, b, 3) == 3u);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST every_row_dismissed_stays_hidden_for_the_day(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    for (int i = 1; i <= 64; i++) {
+        firc_autolist_flow_t f = flow_to((uint16_t)(50000 + i), (uint8_t)i);
+        ASSERT(bare_hello_times(a, &f, "x.test", 4, 100 + 10 * i, &out));
+    }
+    firc_ip_t client = v4(192, 168, 1, 10);
+    for (int i = 1; i <= 64; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        firc_autolist_bypass_seen(a, &client, &server, 17, 3478, "", GROUP_A, FIRC_AL_HOW_ANSWER, 1000 + i);
+    }
+    ASSERT_EQ(128u, (unsigned)firc_autolist_addresses(a, 2000, NULL, 130));
+    for (int i = 1; i <= 64; i++) {
+        firc_ip_t server = v4(203, 0, 113, (uint8_t)i);
+        ASSERT(firc_autolist_addr_dismiss(a, &server, FIRC_AUTOLIST_PROTO_TCP, 443, 2000));
+    }
+    firc_ip_t first = v4(198, 51, 100, 1);
+    ASSERT(firc_autolist_addr_dismiss(a, &first, 17, 3478, 2000));
+    ASSERT_EQ(63u, (unsigned)firc_autolist_addresses(a, 2001, NULL, 130));
+    for (int i = 2; i <= 64; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        ASSERT(firc_autolist_addr_dismiss(a, &server, 17, 3478, 2000));
+    }
+    ASSERT_EQ(0u, (unsigned)firc_autolist_addresses(a, 2001, NULL, 130));
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_failure_moves_a_bypass_key_to_the_failed_quota(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    firc_autolist_bypass_seen(a, &f.client, &f.server, FIRC_AUTOLIST_PROTO_TCP, 443, "seen.test", GROUP_A,
+                              FIRC_AL_HOW_SNI, 100);
+    firc_autolist_bypass_seen(a, &f.client, &f.server, FIRC_AUTOLIST_PROTO_TCP, 443, "", GROUP_A,
+                              FIRC_AL_HOW_SNI, 101);
+    ASSERT(bare_hello_times(a, &f, "a.test", 4, 200, &out));
+    firc_autolist_addr_t b[130];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 204, b, 130));
+    ASSERT_EQ(FIRC_AL_OUTCOME_FAILED, b[0].outcome);
+    ASSERT_EQ(3u, b[0].fails);
+    ASSERT_EQ(FIRC_AUTOLIST_RETRANS, b[0].why);
+    ASSERT_STR_EQ("a.test", b[0].name);
+    ASSERT_EQ(100, b[0].first_at);
+    ASSERT_EQ(203, b[0].last_at);
+    for (int i = 1; i <= 64; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        firc_autolist_bypass_seen(a, &f.client, &server, 17, 3478, "", GROUP_A, FIRC_AL_HOW_ANSWER, 300 + i);
+    }
+    size_t n = firc_autolist_addresses(a, 400, b, 130);
+    ASSERT_EQ(65u, (unsigned)n);
+    const firc_autolist_addr_t *r = row_of(b, n, &f.server);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_AL_OUTCOME_FAILED, r->outcome);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_bypass_on_a_failed_key_updates_that_row(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_autolist_failure_t out;
+    firc_autolist_flow_t f = flow_to(50000, 20);
+    ASSERT(bare_hello_times(a, &f, "a.test", 4, 100, &out));
+    firc_ip_t other = v4(192, 168, 1, 12);
+    firc_autolist_bypass_seen(a, &other, &f.server, FIRC_AUTOLIST_PROTO_TCP, 443, "b.test", GROUP_B,
+                              FIRC_AL_HOW_PTR, 200);
+    firc_autolist_addr_t b[130];
+    ASSERT_EQ(1u, (unsigned)firc_autolist_addresses(a, 201, b, 130));
+    ASSERT_EQ(FIRC_AL_OUTCOME_BYPASS, b[0].outcome);
+    ASSERT_EQ(FIRC_AL_HOW_PTR, b[0].how);
+    ASSERT_STR_EQ("0000beef", b[0].group);
+    ASSERT_STR_EQ("b.test", b[0].name);
+    ASSERT_EQ(2u, b[0].fails);
+    ASSERT_EQ(2, b[0].n_clients);
+    ASSERT_EQ(103, b[0].first_at);
+    ASSERT_EQ(200, b[0].last_at);
+    for (int i = 1; i <= 64; i++) {
+        firc_ip_t server = v4(198, 51, 100, (uint8_t)i);
+        firc_autolist_bypass_seen(a, &f.client, &server, 17, 3478, "", GROUP_A, FIRC_AL_HOW_ANSWER, 300 + i);
+    }
+    size_t n = firc_autolist_addresses(a, 400, b, 130);
+    ASSERT_EQ(65u, (unsigned)n);
+    ASSERTm("the row stays in the failed quota", row_of(b, n, &f.server) != NULL);
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST hinted_sees_any_name_for_the_pair(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t client = v4(192, 168, 1, 10), server = v4(203, 0, 113, 20);
+    firc_ip_t other_client = v4(192, 168, 1, 11), other_server = v4(203, 0, 113, 21);
+    ASSERT_FALSE(firc_autolist_hinted(a, &client, &server, 100));
+    firc_autolist_hint(a, &client, "a.test", &server, 1, 100);
+    ASSERT(firc_autolist_hinted(a, &client, &server, 101));
+    ASSERT_FALSE(firc_autolist_hinted(a, &other_client, &server, 101));
+    ASSERT_FALSE(firc_autolist_hinted(a, &client, &other_server, 101));
+    ASSERT(firc_autolist_hinted(a, &client, &server, 100 + FIRC_AUTOLIST_HINT_SECS));
+    ASSERT_FALSE(firc_autolist_hinted(a, &client, &server, 100 + FIRC_AUTOLIST_HINT_SECS + 1));
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST hinted_name_sees_only_that_name(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t client = v4(192, 168, 1, 10), server = v4(203, 0, 113, 20), other = v4(192, 168, 1, 11);
+    firc_autolist_hint(a, &client, "a.test", &server, 1, 100);
+    ASSERT(firc_autolist_hinted_name(a, &client, &server, "a.test", 101));
+    ASSERT_FALSE(firc_autolist_hinted_name(a, &client, &server, "b.test", 101));
+    ASSERT_FALSE(firc_autolist_hinted_name(a, &other, &server, "a.test", 101));
+    firc_autolist_hint(a, &client, "b.test", &server, 1, 102);
+    ASSERT(firc_autolist_hinted_name(a, &client, &server, "a.test", 103));
+    ASSERT(firc_autolist_hinted_name(a, &client, &server, "b.test", 103));
+    ASSERT_FALSE(firc_autolist_hinted_name(a, &client, &server, "a.test", 100 + FIRC_AUTOLIST_HINT_SECS + 1));
+    ASSERT(firc_autolist_hinted_name(a, &client, &server, "b.test", 100 + FIRC_AUTOLIST_HINT_SECS + 1));
+    firc_autolist_free(a);
+    PASS();
+}
+
+static firc_ip_t nth_client(uint32_t i) {
+    uint32_t x = i * 2654435761u;
+    return v4((uint8_t)(x >> 24), (uint8_t)(x >> 16), (uint8_t)(x >> 8), (uint8_t)x);
+}
+
+TEST the_hint_table_holds_4096(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t server = v4(203, 0, 113, 20);
+    for (uint32_t i = 0; i < 4096; i++) {
+        firc_ip_t c = nth_client(i);
+        firc_autolist_hint(a, &c, "a.test", &server, 1, 100 + (int64_t)(i / 16));
+    }
+    for (uint32_t i = 0; i < 4096; i++) {
+        firc_ip_t c = nth_client(i);
+        ASSERT(firc_autolist_hinted(a, &c, &server, 400));
+    }
+    firc_ip_t first = nth_client(0), second = nth_client(1), third = nth_client(2);
+    firc_autolist_hint(a, &first, "a.test", &server, 1, 400);
+    firc_ip_t extra = nth_client(4096);
+    firc_autolist_hint(a, &extra, "a.test", &server, 1, 400);
+    ASSERT(firc_autolist_hinted(a, &extra, &server, 400));
+    ASSERTm("a hint asked again is not the oldest", firc_autolist_hinted(a, &first, &server, 400));
+    ASSERT_FALSE(firc_autolist_hinted(a, &second, &server, 400));
+    ASSERT(firc_autolist_hinted(a, &third, &server, 400));
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST the_hint_index_survives_many_evictions(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t server = v4(203, 0, 113, 20);
+    for (uint32_t i = 0; i < 3 * 4096; i++) {
+        firc_ip_t c = nth_client(i);
+        firc_autolist_hint(a, &c, (i & 1) ? "a.test" : "b.test", &server, 1, 100);
+    }
+    for (uint32_t i = 0; i < 3 * 4096; i++) {
+        firc_ip_t c = nth_client(i);
+        ASSERT_EQ(i >= 2 * 4096, firc_autolist_hinted(a, &c, &server, 101));
+        ASSERT_EQ(i >= 2 * 4096, firc_autolist_hinted_name(a, &c, &server, (i & 1) ? "a.test" : "b.test", 101));
+    }
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST a_flow_is_first_once_per_five_tuple(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t client = v4(192, 168, 1, 10), server = v4(203, 0, 113, 20);
+    firc_ip_t other_client = v4(192, 168, 1, 11), other_server = v4(203, 0, 113, 21);
+    ASSERT(firc_autolist_flow_first(a, &client, 40000, &server, 17, 3478, 100));
+    ASSERT_FALSE(firc_autolist_flow_first(a, &client, 40000, &server, 17, 3478, 350));
+    ASSERT(firc_autolist_flow_first(a, &client, 40001, &server, 17, 3478, 350));
+    ASSERT(firc_autolist_flow_first(a, &client, 40000, &server, 6, 3478, 350));
+    ASSERT(firc_autolist_flow_first(a, &client, 40000, &server, 17, 3479, 350));
+    ASSERT(firc_autolist_flow_first(a, &other_client, 40000, &server, 17, 3478, 350));
+    ASSERT(firc_autolist_flow_first(a, &client, 40000, &other_server, 17, 3478, 350));
+    ASSERTm("a flow still seen stays one", !firc_autolist_flow_first(a, &client, 40000, &server, 17, 3478, 650));
+    ASSERT(firc_autolist_flow_first(a, &client, 40000, &server, 17, 3478, 650 + FIRC_AUTOLIST_FLOW_SECS + 1));
+    firc_autolist_free(a);
+    PASS();
+}
+
+TEST the_flow_table_reuses_the_oldest(void) {
+    firc_autolist_t *a = firc_autolist_new();
+    firc_ip_t server = v4(203, 0, 113, 20);
+    for (uint32_t i = 0; i < 1025; i++) {
+        firc_ip_t c = nth_client(i);
+        ASSERT(firc_autolist_flow_first(a, &c, 40000, &server, 17, 3478, 100));
+    }
+    firc_ip_t first = nth_client(0), second = nth_client(1), last = nth_client(1024);
+    ASSERT_FALSE(firc_autolist_flow_first(a, &last, 40000, &server, 17, 3478, 101));
+    ASSERT_FALSE(firc_autolist_flow_first(a, &second, 40000, &server, 17, 3478, 101));
+    ASSERT(firc_autolist_flow_first(a, &first, 40000, &server, 17, 3478, 101));
+    firc_autolist_free(a);
+    PASS();
+}
+
 TEST sniless_without_hint_is_bypass(void) {
     firc_autolist_t *a = firc_autolist_new();
     firc_autolist_flow_t f = flow(10, 50000);
@@ -1404,9 +1688,20 @@ int main(int argc, char **argv) {
     RUN_TEST(a_quiet_day_starts_the_row_again);
     RUN_TEST(a_syn_bypass_has_no_name_and_no_connect);
     RUN_TEST(a_dismissed_row_counts_but_stays_hidden_for_a_day);
+    RUN_TEST(every_row_dismissed_stays_hidden_for_the_day);
     RUN_TEST(a_device_is_listed_once_however_often_it_fails);
     RUN_TEST(a_ninth_device_is_not_listed);
     RUN_TEST(an_ipv6_bypass_gets_its_own_row);
+    RUN_TEST(a_bypass_seen_makes_a_bypass_row);
+    RUN_TEST(bypass_rows_never_push_out_failed_rows);
+    RUN_TEST(a_failure_moves_a_bypass_key_to_the_failed_quota);
+    RUN_TEST(a_bypass_on_a_failed_key_updates_that_row);
+    RUN_TEST(hinted_sees_any_name_for_the_pair);
+    RUN_TEST(hinted_name_sees_only_that_name);
+    RUN_TEST(the_hint_table_holds_4096);
+    RUN_TEST(the_hint_index_survives_many_evictions);
+    RUN_TEST(a_flow_is_first_once_per_five_tuple);
+    RUN_TEST(the_flow_table_reuses_the_oldest);
     RUN_TEST(sniless_without_hint_is_bypass);
     RUN_TEST(sniless_with_two_hints_is_ambiguous_not_newest);
     RUN_TEST(ambiguous_day_expires);

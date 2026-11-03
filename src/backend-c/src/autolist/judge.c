@@ -81,13 +81,40 @@ typedef struct {
     char name[FIRC_AUTOLIST_NAME_MAX];
 } domain_t;
 
+#define NIL UINT16_MAX
+
 typedef struct {
-    bool used;
+    uint16_t prev, next;
     uint32_t hash;
+} link_t;
+
+typedef struct {
+    unsigned char *slots;
+    size_t stride;
+    uint16_t *index;
+    uint32_t mask;
+    uint16_t max, count, head, tail;
+} lru_t;
+
+typedef struct {
+    link_t l;
     int64_t at;
     firc_ip_t client, real;
     char name[FIRC_AUTOLIST_NAME_MAX];
 } hint_t;
+
+typedef struct {
+    link_t l;
+    int64_t at;
+    firc_ip_t client, server;
+    uint16_t client_port, port;
+    uint8_t proto;
+} seen_t;
+
+#define ROWS (2 * FIRC_AUTOLIST_ADDRS)
+#define NO_ROW SIZE_MAX
+
+enum { QUOTA_FAILED = 0, QUOTA_BYPASS = 1 };
 
 typedef struct {
     firc_ip_t server;
@@ -103,9 +130,14 @@ struct firc_autolist {
     host_t hosts[FIRC_AUTOLIST_HOSTS];
     domain_t domains[FIRC_AUTOLIST_DOMAINS];
     hint_t hints[FIRC_AUTOLIST_HINTS];
-    firc_autolist_addr_t addr[FIRC_AUTOLIST_ADDRS];
-    bool addr_used[FIRC_AUTOLIST_ADDRS];
-    hidden_t hidden[FIRC_AUTOLIST_ADDRS];
+    uint16_t hint_index[2 * FIRC_AUTOLIST_HINTS];
+    lru_t hint_lru;
+    seen_t seen[FIRC_AUTOLIST_FLOWS];
+    uint16_t seen_index[2 * FIRC_AUTOLIST_FLOWS];
+    lru_t seen_lru;
+    firc_autolist_addr_t addr[ROWS];
+    bool addr_used[ROWS];
+    hidden_t hidden[ROWS];
     size_t hidden_next;
     int64_t day_hour[FIRC_AUTOLIST_DAY_HOURS];
     uint32_t day_count[FIRC_AUTOLIST_DAY_HOURS];
@@ -184,6 +216,93 @@ static bool flow_eq(const firc_autolist_flow_t *a, const firc_autolist_flow_t *b
 
 static uint32_t name_hash(const char *s) { return fnv(FNV_BASIS, s, strlen(s)); }
 
+static link_t *lnk(const lru_t *t, uint16_t s) { return (link_t *)(void *)(t->slots + (size_t)s * t->stride); }
+
+static void lru_init(lru_t *t, void *slots, size_t stride, uint16_t max, uint16_t *index, size_t index_len) {
+    t->slots = slots;
+    t->stride = stride;
+    t->max = max;
+    t->index = index;
+    t->mask = (uint32_t)(index_len - 1u);
+    t->count = 0;
+    t->head = t->tail = NIL;
+}
+
+static void lru_unlink(lru_t *t, uint16_t s) {
+    link_t *l = lnk(t, s);
+    if (l->prev != NIL) {
+        lnk(t, l->prev)->next = l->next;
+    } else {
+        t->head = l->next;
+    }
+    if (l->next != NIL) {
+        lnk(t, l->next)->prev = l->prev;
+    } else {
+        t->tail = l->prev;
+    }
+    l->prev = l->next = NIL;
+}
+
+static void lru_push_tail(lru_t *t, uint16_t s) {
+    link_t *l = lnk(t, s);
+    l->prev = t->tail;
+    l->next = NIL;
+    if (t->tail != NIL) {
+        lnk(t, t->tail)->next = s;
+    } else {
+        t->head = s;
+    }
+    t->tail = s;
+}
+
+static void lru_touch(lru_t *t, uint16_t s) {
+    lru_unlink(t, s);
+    lru_push_tail(t, s);
+}
+
+static void lru_unindex(lru_t *t, uint16_t s) {
+    uint32_t i = lnk(t, s)->hash & t->mask;
+    while (t->index[i] != s + 1u) { i = (i + 1u) & t->mask; }
+    t->index[i] = 0;
+    for (uint32_t j = (i + 1u) & t->mask; t->index[j] != 0; j = (j + 1u) & t->mask) {
+        uint32_t home = lnk(t, (uint16_t)(t->index[j] - 1u))->hash & t->mask;
+        bool stays = i <= j ? (home > i && home <= j) : (home > i || home <= j);
+        if (stays) { continue; }
+        t->index[i] = t->index[j];
+        t->index[j] = 0;
+        i = j;
+    }
+}
+
+static uint16_t lru_add(lru_t *t, uint32_t h) {
+    uint16_t s;
+    if (t->count < t->max) {
+        s = t->count++;
+    } else {
+        s = t->head;
+        lru_unindex(t, s);
+        lru_unlink(t, s);
+    }
+    memset(lnk(t, s), 0, t->stride);
+    lnk(t, s)->hash = h;
+    uint32_t pos = h & t->mask;
+    while (t->index[pos] != 0) { pos = (pos + 1u) & t->mask; }
+    t->index[pos] = (uint16_t)(s + 1u);
+    lru_push_tail(t, s);
+    return s;
+}
+
+static uint16_t lru_next(const lru_t *t, uint32_t h, uint32_t *pos) {
+    for (; t->index[*pos] != 0; *pos = (*pos + 1u) & t->mask) {
+        uint16_t s = (uint16_t)(t->index[*pos] - 1u);
+        if (lnk(t, s)->hash == h) {
+            *pos = (*pos + 1u) & t->mask;
+            return s;
+        }
+    }
+    return NIL;
+}
+
 static const firc_autolist_params_t defaults = {
     FIRC_AUTOLIST_FAIL_THRESHOLD,
     FIRC_AUTOLIST_FAIL_SECS,
@@ -194,6 +313,10 @@ firc_autolist_t *firc_autolist_new(void) {
     firc_autolist_t *a = calloc(1, sizeof(*a));
     if (a == NULL) { return NULL; }
     a->p = defaults;
+    lru_init(&a->hint_lru, a->hints, sizeof(a->hints[0]), FIRC_AUTOLIST_HINTS, a->hint_index,
+             sizeof(a->hint_index) / sizeof(a->hint_index[0]));
+    lru_init(&a->seen_lru, a->seen, sizeof(a->seen[0]), FIRC_AUTOLIST_FLOWS, a->seen_index,
+             sizeof(a->seen_index) / sizeof(a->seen_index[0]));
     return a;
 }
 
@@ -244,51 +367,106 @@ static bool domain_counting(const firc_autolist_t *a, const domain_t *d, int64_t
            (tally_live(a, &d->fails, now) || tally_live(a, &d->no_connect, now) || notes_live(&d->notes, now));
 }
 
+static uint32_t pair_hash(const firc_ip_t *client, const firc_ip_t *real) {
+    return ip_hash(ip_hash(FNV_BASIS, client), real);
+}
+
+static const hint_t *hint_next(const firc_autolist_t *a, uint32_t h, uint32_t *pos, const firc_ip_t *client,
+                               const firc_ip_t *real, int64_t now) {
+    for (uint16_t s = lru_next(&a->hint_lru, h, pos); s != NIL; s = lru_next(&a->hint_lru, h, pos)) {
+        const hint_t *e = &a->hints[s];
+        if (now - e->at <= FIRC_AUTOLIST_HINT_SECS && ip_eq(&e->client, client) && ip_eq(&e->real, real)) { return e; }
+    }
+    return NULL;
+}
+
+static uint16_t hint_find(const firc_autolist_t *a, uint32_t h, const firc_ip_t *client, const firc_ip_t *real,
+                          const char *name) {
+    uint32_t pos = h & a->hint_lru.mask;
+    for (uint16_t s = lru_next(&a->hint_lru, h, &pos); s != NIL; s = lru_next(&a->hint_lru, h, &pos)) {
+        const hint_t *e = &a->hints[s];
+        if (ip_eq(&e->client, client) && ip_eq(&e->real, real) && strcmp(e->name, name) == 0) { return s; }
+    }
+    return NIL;
+}
+
 void firc_autolist_hint(firc_autolist_t *a, const firc_ip_t *client, const char *name, const firc_ip_t *reals,
                         size_t n_reals, int64_t now) {
     if (a == NULL || client == NULL || name == NULL || reals == NULL) { return; }
     size_t len = strlen(name);
     if (len == 0 || len >= FIRC_AUTOLIST_NAME_MAX) { return; }
     for (size_t r = 0; r < n_reals; r++) {
-        uint32_t h = ip_hash(ip_hash(FNV_BASIS, client), &reals[r]);
-        hint_t *slot = NULL, *oldest = NULL;
-        for (size_t i = 0; i < FIRC_AUTOLIST_HINTS; i++) {
-            hint_t *e = &a->hints[i];
-            if (e->used && e->hash == h && ip_eq(&e->client, client) && ip_eq(&e->real, &reals[r]) &&
-                strcmp(e->name, name) == 0) {
-                slot = e;
-                break;
-            }
-            if (!e->used || now - e->at > FIRC_AUTOLIST_HINT_SECS) {
-                if (slot == NULL) { slot = e; }
-            } else if (oldest == NULL || e->at < oldest->at) {
-                oldest = e;
-            }
+        uint32_t h = pair_hash(client, &reals[r]);
+        uint16_t s = hint_find(a, h, client, &reals[r], name);
+        if (s != NIL) {
+            lru_touch(&a->hint_lru, s);
+        } else {
+            s = lru_add(&a->hint_lru, h);
+            a->hints[s].client = *client;
+            a->hints[s].real = reals[r];
+            memcpy(a->hints[s].name, name, len + 1);
         }
-        if (slot == NULL) { slot = oldest; }
-        if (slot == NULL) { return; }
-        slot->used = true;
-        slot->hash = h;
-        slot->at = now;
-        slot->client = *client;
-        slot->real = reals[r];
-        memcpy(slot->name, name, len + 1);
+        a->hints[s].at = now;
     }
-}
-
-static bool hint_matches(const hint_t *e, uint32_t h, const firc_ip_t *client, const firc_ip_t *real, int64_t now) {
-    return e->used && e->hash == h && now - e->at <= FIRC_AUTOLIST_HINT_SECS && ip_eq(&e->client, client) &&
-           ip_eq(&e->real, real);
 }
 
 static const char *hint_named(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *real,
                               const char *name, int64_t now) {
-    uint32_t h = ip_hash(ip_hash(FNV_BASIS, client), real);
-    for (size_t i = 0; i < FIRC_AUTOLIST_HINTS; i++) {
-        const hint_t *e = &a->hints[i];
-        if (hint_matches(e, h, client, real, now) && strcmp(e->name, name) == 0) { return e->name; }
+    uint32_t h = pair_hash(client, real);
+    uint32_t pos = h & a->hint_lru.mask;
+    for (const hint_t *e = hint_next(a, h, &pos, client, real, now); e != NULL;
+         e = hint_next(a, h, &pos, client, real, now)) {
+        if (strcmp(e->name, name) == 0) { return e->name; }
     }
     return NULL;
+}
+
+bool firc_autolist_hinted(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server, int64_t now) {
+    if (a == NULL || client == NULL || server == NULL) { return false; }
+    uint32_t h = pair_hash(client, server);
+    uint32_t pos = h & a->hint_lru.mask;
+    return hint_next(a, h, &pos, client, server, now) != NULL;
+}
+
+bool firc_autolist_hinted_name(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server,
+                               const char *name, int64_t now) {
+    if (a == NULL || client == NULL || server == NULL || name == NULL) { return false; }
+    return hint_named(a, client, server, name, now) != NULL;
+}
+
+static uint32_t seen_hash(const firc_ip_t *client, uint16_t client_port, const firc_ip_t *server, uint8_t proto,
+                          uint16_t port) {
+    uint32_t h = pair_hash(client, server);
+    h = fnv(h, &client_port, sizeof(client_port));
+    h = fnv(h, &proto, sizeof(proto));
+    return fnv(h, &port, sizeof(port));
+}
+
+bool firc_autolist_flow_first(firc_autolist_t *a, const firc_ip_t *client, uint16_t client_port,
+                              const firc_ip_t *server, uint8_t proto, uint16_t port, int64_t now) {
+    if (a == NULL || client == NULL || server == NULL) { return false; }
+    uint32_t h = seen_hash(client, client_port, server, proto, port);
+    uint32_t pos = h & a->seen_lru.mask;
+    for (uint16_t s = lru_next(&a->seen_lru, h, &pos); s != NIL; s = lru_next(&a->seen_lru, h, &pos)) {
+        seen_t *e = &a->seen[s];
+        if (e->client_port != client_port || e->port != port || e->proto != proto || !ip_eq(&e->client, client) ||
+            !ip_eq(&e->server, server)) {
+            continue;
+        }
+        bool first = now - e->at > FIRC_AUTOLIST_FLOW_SECS;
+        e->at = now;
+        lru_touch(&a->seen_lru, s);
+        return first;
+    }
+    uint16_t s = lru_add(&a->seen_lru, h);
+    seen_t *e = &a->seen[s];
+    e->at = now;
+    e->client = *client;
+    e->server = *server;
+    e->client_port = client_port;
+    e->port = port;
+    e->proto = proto;
+    return true;
 }
 
 typedef enum {
@@ -300,13 +478,13 @@ typedef enum {
 
 static hint_count_t hint_only(const firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *real, int64_t now,
                               const char **name, char *domain, size_t cap) {
-    uint32_t h = ip_hash(ip_hash(FNV_BASIS, client), real);
+    uint32_t h = pair_hash(client, real);
+    uint32_t pos = h & a->hint_lru.mask;
     const char *first = NULL;
     bool several = false;
     *name = NULL;
-    for (size_t i = 0; i < FIRC_AUTOLIST_HINTS; i++) {
-        const hint_t *e = &a->hints[i];
-        if (!hint_matches(e, h, client, real, now)) { continue; }
+    for (const hint_t *e = hint_next(a, h, &pos, client, real, now); e != NULL;
+         e = hint_next(a, h, &pos, client, real, now)) {
         if (first == NULL) {
             first = e->name;
             continue;
@@ -566,37 +744,87 @@ static bool addr_live(const firc_autolist_t *a, size_t i, int64_t now) {
     return a->addr_used[i] && now - a->addr[i].last_at < FIRC_AUTOLIST_DAY_SECS;
 }
 
-static uint32_t bypass_count(firc_autolist_t *a, const flow_t *f, uint8_t why, int64_t now) {
-    size_t at = FIRC_AUTOLIST_ADDRS, spare = 0;
-    bool found = false;
-    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS && !found; i++) {
-        if (a->addr_used[i] && addr_key(&a->addr[i], &f->key.server, FIRC_AUTOLIST_PROTO_TCP, f->key.server_port)) {
-            at = i;
-            found = true;
-        } else if (!addr_live(a, i, now)) {
-            if (addr_live(a, spare, now)) { spare = i; }
-        } else if (addr_live(a, spare, now) && a->addr[i].last_at < a->addr[spare].last_at) {
-            spare = i;
-        }
+static size_t addr_find(const firc_autolist_t *a, size_t quota, const firc_ip_t *server, uint8_t proto,
+                        uint16_t port) {
+    for (size_t i = quota * FIRC_AUTOLIST_ADDRS; i < (quota + 1) * FIRC_AUTOLIST_ADDRS; i++) {
+        if (a->addr_used[i] && addr_key(&a->addr[i], server, proto, port)) { return i; }
     }
-    if (!found) { at = spare; }
+    return NO_ROW;
+}
+
+static size_t addr_spare(const firc_autolist_t *a, size_t quota, int64_t now) {
+    size_t spare = quota * FIRC_AUTOLIST_ADDRS;
+    for (size_t i = spare; i < (quota + 1) * FIRC_AUTOLIST_ADDRS; i++) {
+        if (!addr_live(a, i, now)) { return i; }
+        if (a->addr[i].last_at < a->addr[spare].last_at) { spare = i; }
+    }
+    return spare;
+}
+
+static firc_autolist_addr_t *addr_start(firc_autolist_t *a, size_t at, const firc_ip_t *server, uint8_t proto,
+                                        uint16_t port, int64_t now) {
     firc_autolist_addr_t *r = &a->addr[at];
-    if (!found || !addr_live(a, at, now)) {
-        memset(r, 0, sizeof(*r));
-        r->server = f->key.server;
-        r->proto = FIRC_AUTOLIST_PROTO_TCP;
-        r->port = f->key.server_port;
-        r->first_at = now;
-        a->addr_used[at] = true;
-    }
+    memset(r, 0, sizeof(*r));
+    r->server = *server;
+    r->proto = proto;
+    r->port = port;
+    r->first_at = now;
+    a->addr_used[at] = true;
+    return r;
+}
+
+static size_t addr_take(firc_autolist_t *a, size_t quota, const firc_ip_t *server, uint8_t proto, uint16_t port,
+                        int64_t now, bool *fresh) {
+    size_t at = addr_find(a, quota, server, proto, port);
+    *fresh = at == NO_ROW || !addr_live(a, at, now);
+    if (at == NO_ROW) { at = addr_spare(a, quota, now); }
+    return at;
+}
+
+static uint32_t addr_note(firc_autolist_addr_t *r, const firc_ip_t *client, const char *name, int64_t now) {
     r->fails++;
     r->last_at = now;
-    r->why = why;
-    if (f->sni[0] != '\0') { snprintf(r->name, sizeof(r->name), "%s", f->sni); }
+    if (name != NULL && name[0] != '\0') { snprintf(r->name, sizeof(r->name), "%s", name); }
     bool known = false;
-    for (uint8_t k = 0; k < r->n_clients; k++) { known = known || ip_eq(&r->clients[k], &f->key.client); }
-    if (!known && r->n_clients < FIRC_AUTOLIST_ADDR_CLIENTS) { r->clients[r->n_clients++] = f->key.client; }
+    for (uint8_t k = 0; k < r->n_clients; k++) { known = known || ip_eq(&r->clients[k], client); }
+    if (!known && r->n_clients < FIRC_AUTOLIST_ADDR_CLIENTS) { r->clients[r->n_clients++] = *client; }
     return r->fails;
+}
+
+static uint32_t bypass_count(firc_autolist_t *a, const flow_t *f, uint8_t why, int64_t now) {
+    const firc_ip_t *server = &f->key.server;
+    uint16_t port = f->key.server_port;
+    size_t from = addr_find(a, QUOTA_BYPASS, server, FIRC_AUTOLIST_PROTO_TCP, port);
+    bool fresh = false;
+    size_t at = addr_take(a, QUOTA_FAILED, server, FIRC_AUTOLIST_PROTO_TCP, port, now, &fresh);
+    if (fresh && from != NO_ROW && addr_live(a, from, now)) {
+        a->addr[at] = a->addr[from];
+        a->addr_used[at] = true;
+    } else if (fresh) {
+        (void)addr_start(a, at, server, FIRC_AUTOLIST_PROTO_TCP, port, now);
+    }
+    if (from != NO_ROW) { a->addr_used[from] = false; }
+    firc_autolist_addr_t *r = &a->addr[at];
+    r->outcome = FIRC_AL_OUTCOME_FAILED;
+    r->why = why;
+    return addr_note(r, &f->key.client, f->sni, now);
+}
+
+void firc_autolist_bypass_seen(firc_autolist_t *a, const firc_ip_t *client, const firc_ip_t *server, uint8_t proto,
+                               uint16_t port, const char *name, const char group[FIRC_ID_STR_LEN], uint8_t how,
+                               int64_t now) {
+    if (a == NULL || client == NULL || server == NULL) { return; }
+    size_t at = addr_find(a, QUOTA_FAILED, server, proto, port);
+    if (at == NO_ROW || !addr_live(a, at, now)) {
+        bool fresh = false;
+        at = addr_take(a, QUOTA_BYPASS, server, proto, port, now, &fresh);
+        if (fresh) { (void)addr_start(a, at, server, proto, port, now); }
+    }
+    firc_autolist_addr_t *r = &a->addr[at];
+    r->outcome = FIRC_AL_OUTCOME_BYPASS;
+    r->how = how;
+    snprintf(r->group, sizeof(r->group), "%.*s", FIRC_ID_STR_LEN - 1, group != NULL ? group : "");
+    (void)addr_note(r, client, name, now);
 }
 
 static bool unnamed(firc_autolist_t *a, const flow_t *f, int64_t now) {
@@ -806,7 +1034,7 @@ bool firc_autolist_fin(firc_autolist_t *a, const firc_autolist_flow_t *key, uint
 }
 
 static bool addr_hidden(const firc_autolist_t *a, const firc_autolist_addr_t *r, int64_t now) {
-    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS; i++) {
+    for (size_t i = 0; i < ROWS; i++) {
         const hidden_t *h = &a->hidden[i];
         if (h->until > now && h->proto == r->proto && h->port == r->port && ip_eq(&h->server, &r->server)) {
             return true;
@@ -817,9 +1045,9 @@ static bool addr_hidden(const firc_autolist_t *a, const firc_autolist_addr_t *r,
 
 size_t firc_autolist_addresses(const firc_autolist_t *a, int64_t now, firc_autolist_addr_t *out, size_t cap) {
     if (a == NULL) { return 0; }
-    size_t order[FIRC_AUTOLIST_ADDRS];
+    size_t order[ROWS];
     size_t n = 0;
-    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS; i++) {
+    for (size_t i = 0; i < ROWS; i++) {
         if (!addr_live(a, i, now) || addr_hidden(a, &a->addr[i], now)) { continue; }
         size_t k = n++;
         while (k > 0 && a->addr[order[k - 1]].last_at < a->addr[i].last_at) {
@@ -839,13 +1067,13 @@ bool firc_autolist_addr_dismiss(firc_autolist_t *a, const firc_ip_t *server, uin
                                 int64_t now) {
     if (a == NULL || server == NULL) { return false; }
     bool visible = false;
-    for (size_t i = 0; i < FIRC_AUTOLIST_ADDRS && !visible; i++) {
+    for (size_t i = 0; i < ROWS && !visible; i++) {
         visible = addr_live(a, i, now) && addr_key(&a->addr[i], server, proto, port) &&
                   !addr_hidden(a, &a->addr[i], now);
     }
     if (!visible) { return false; }
     hidden_t *h = &a->hidden[a->hidden_next];
-    a->hidden_next = (a->hidden_next + 1) % FIRC_AUTOLIST_ADDRS;
+    a->hidden_next = (a->hidden_next + 1) % ROWS;
     h->server = *server;
     h->proto = proto;
     h->port = port;

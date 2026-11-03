@@ -195,6 +195,34 @@ static void run_until_settled(firc_loop_t *loop, firc_ptr_t *p, const firc_ip_t 
     (void)firc_loop_del_timer(loop, deadline);
 }
 
+typedef struct all_ctx {
+    firc_ptr_t *p;
+    const firc_ip_t *ips;
+    size_t n;
+} all_ctx_t;
+
+static void all_settled_cb(firc_loop_t *loop, void *ud)
+{
+    all_ctx_t *c = ud;
+    char name[256];
+    for (size_t i = 0; i < c->n; i++) {
+        if (firc_ptr_peek(c->p, &c->ips[i], NOW, name, sizeof(name)) == FIRC_PTR_PENDING) { return; }
+    }
+    firc_loop_stop(loop);
+}
+
+static void run_until_all_settled(firc_loop_t *loop, firc_ptr_t *p, const firc_ip_t *ips, size_t n)
+{
+    all_ctx_t c = {p, ips, n};
+    int tick = -1;
+    int deadline = -1;
+    (void)firc_loop_add_timer(loop, 1, 1, all_settled_cb, &c, &tick);
+    (void)firc_loop_add_timer(loop, 2000, 0, deadline_cb, NULL, &deadline);
+    (void)firc_loop_run(loop);
+    (void)firc_loop_del_timer(loop, tick);
+    (void)firc_loop_del_timer(loop, deadline);
+}
+
 static firc_ptr_state_t resolve(enum fake_mode mode, uint32_t timeout_ms, const firc_ip_t *ip, char *out, size_t cap,
                                 fake_t *seen)
 {
@@ -203,7 +231,7 @@ static firc_ptr_state_t resolve(enum fake_mode mode, uint32_t timeout_ms, const 
     if (firc_loop_create(&loop) != FIRC_OK || fake_open(&f, mode) != 0) { return FIRC_PTR_PENDING; }
     (void)firc_loop_add_fd(loop, f.fd, EPOLLIN, fake_cb, &f);
     firc_ptr_t *p = firc_ptr_new(loop, timeout_ms);
-    firc_ptr_state_t first = firc_ptr_get(p, ip, "127.0.0.1", f.port, NOW, out, cap);
+    firc_ptr_state_t first = firc_ptr_get(p, ip, "127.0.0.1", f.port, NOW, out, cap, NULL);
     firc_ptr_state_t got = FIRC_PTR_PENDING;
     if (first == FIRC_PTR_PENDING) {
         run_until_settled(loop, p, ip);
@@ -228,10 +256,10 @@ static int queries_by(enum fake_mode mode, uint32_t timeout_ms, int64_t later_ms
     firc_ptr_t *p = firc_ptr_new(loop, timeout_ms);
     char name[256] = "";
     int got = -1;
-    if (firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)) == FIRC_PTR_PENDING) {
+    if (firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL) == FIRC_PTR_PENDING) {
         run_until_settled(loop, p, &ip);
         if (firc_ptr_peek(p, &ip, NOW, name, sizeof(name)) == FIRC_PTR_NONE) {
-            if (firc_ptr_get(p, &ip, "127.0.0.1", f.port, later_ms, name, sizeof(name)) == FIRC_PTR_PENDING) {
+            if (firc_ptr_get(p, &ip, "127.0.0.1", f.port, later_ms, name, sizeof(name), NULL) == FIRC_PTR_PENDING) {
                 run_until_settled(loop, p, &ip);
             }
             got = f.queries + fake_drain(&f);
@@ -351,7 +379,7 @@ TEST a_failed_send_is_none_at_once(void)
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW, name, sizeof(name), NULL));
     ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &ip, NOW, name, sizeof(name)));
     firc_ptr_free(p);
     firc_loop_destroy(loop);
@@ -390,10 +418,10 @@ TEST a_known_address_is_not_asked_again(void)
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)));
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
     run_until_settled(loop, p, &ip);
-    ASSERT_EQ(FIRC_PTR_NAME, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW + 1000, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_NAME, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW + 1000, name, sizeof(name), NULL));
     ASSERT_STR_EQ("host.example.com", name);
     ASSERT_EQ(1, f.queries + fake_drain(&f));
     firc_ptr_free(p);
@@ -415,11 +443,11 @@ TEST a_name_is_kept_for_a_day(void)
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
     run_until_settled(loop, p, &ip);
     ASSERT_EQ(FIRC_PTR_NAME, firc_ptr_peek(p, &ip, NOW + 86399999, name, sizeof(name)));
     ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_peek(p, &ip, NOW + 86400000, name, sizeof(name)));
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW + 86400000, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW + 86400000, name, sizeof(name), NULL));
     run_until_settled(loop, p, &ip);
     ASSERT_EQ(2, f.queries + fake_drain(&f));
     firc_ptr_free(p);
@@ -429,25 +457,89 @@ TEST a_name_is_kept_for_a_day(void)
     PASS();
 }
 
-/* catches: a cache that grows past 128 or reuses a slot other than the oldest */
-TEST the_oldest_of_128_is_reused(void)
+/* catches: a cache that grows past 1024 or reuses a slot other than the oldest */
+TEST the_oldest_of_1024_is_reused(void)
 {
     firc_loop_t *loop = NULL;
     ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    for (int i = 0; i < 129; i++) {
-        firc_ip_t ip = v4(10, 0, 0, (uint8_t)i);
-        ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW + i, name, sizeof(name)));
+    for (int i = 0; i < 1025; i++) {
+        firc_ip_t ip = v4(10, 0, (uint8_t)(i >> 8), (uint8_t)(i & 0xff));
+        ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW + i, name, sizeof(name), NULL));
     }
     firc_ip_t first = v4(10, 0, 0, 0);
     firc_ip_t second = v4(10, 0, 0, 1);
-    firc_ip_t last = v4(10, 0, 0, 128);
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_peek(p, &first, NOW + 200, name, sizeof(name)));
-    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &second, NOW + 200, name, sizeof(name)));
-    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &last, NOW + 200, name, sizeof(name)));
+    firc_ip_t last = v4(10, 0, 4, 0);
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_peek(p, &first, NOW + 2000, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &second, NOW + 2000, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &last, NOW + 2000, name, sizeof(name)));
     firc_ptr_free(p);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST the_cache_holds_1024(void)
+{
+    static firc_ip_t ips[1024];
+    firc_loop_t *loop = NULL;
+    fake_t f;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    ASSERT_EQ(0, fake_open(&f, FAKE_ANSWER));
+    ASSERT_EQ(FIRC_OK, firc_loop_add_fd(loop, f.fd, EPOLLIN, fake_cb, &f));
+    firc_ptr_t *p = firc_ptr_new(loop, 3000);
+    ASSERT(p != NULL);
+    char name[256] = "";
+    for (size_t i = 0; i < 1024; i++) { ips[i] = v4(10, 1, (uint8_t)(i >> 8u), (uint8_t)(i & 0xffu)); }
+    for (size_t at = 0; at < 1024; at += 64) {
+        for (size_t i = at; i < at + 64; i++) {
+            ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ips[i], "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
+        }
+        run_until_all_settled(loop, p, ips + at, 64);
+    }
+    size_t named = 0;
+    for (size_t i = 0; i < 1024; i++) {
+        named += firc_ptr_peek(p, &ips[i], NOW, name, sizeof(name)) == FIRC_PTR_NAME;
+    }
+    ASSERT_EQ(1024u, (unsigned)named);
+    ASSERT_EQ(1024, f.queries + fake_drain(&f));
+    firc_ptr_free(p);
+    (void)firc_loop_del_fd(loop, f.fd);
+    close(f.fd);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST get_says_when_it_sent(void)
+{
+    firc_ip_t ip = v4(34, 107, 243, 93);
+    firc_ip_t other = v4(34, 107, 243, 94);
+    firc_loop_t *loop = NULL;
+    fake_t f;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    ASSERT_EQ(0, fake_open(&f, FAKE_ANSWER));
+    ASSERT_EQ(FIRC_OK, firc_loop_add_fd(loop, f.fd, EPOLLIN, fake_cb, &f));
+    firc_ptr_t *p = firc_ptr_new(loop, 3000);
+    ASSERT(p != NULL);
+    char name[256] = "";
+    bool sent = false;
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), &sent));
+    ASSERT(sent);
+    sent = true;
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), &sent));
+    ASSERT_FALSE(sent);
+    run_until_settled(loop, p, &ip);
+    sent = true;
+    ASSERT_EQ(FIRC_PTR_NAME, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), &sent));
+    ASSERT_FALSE(sent);
+    sent = true;
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &other, "not-an-address", f.port, NOW, name, sizeof(name), &sent));
+    ASSERT_FALSE(sent);
+    ASSERT_EQ(1, f.queries + fake_drain(&f));
+    firc_ptr_free(p);
+    (void)firc_loop_del_fd(loop, f.fd);
+    close(f.fd);
     firc_loop_destroy(loop);
     PASS();
 }
@@ -463,7 +555,7 @@ TEST free_while_pending_leaves_no_timer(void)
     firc_ptr_t *p = firc_ptr_new(loop, 10);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
     firc_ptr_free(p);
     ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 50, 0, deadline_cb, NULL, NULL));
     ASSERT_EQ(FIRC_OK, firc_loop_run(loop));
@@ -546,7 +638,7 @@ TEST a_failed_send_is_retried_after_5_min(void)
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", 0, NOW, name, sizeof(name), NULL));
     ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &ip, NOW + 299999, name, sizeof(name)));
     ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_peek(p, &ip, NOW + 300000, name, sizeof(name)));
     firc_ptr_free(p);
@@ -566,12 +658,12 @@ TEST a_name_longer_than_the_buffer_is_none(void)
     firc_ptr_t *p = firc_ptr_new(loop, 3000);
     ASSERT(p != NULL);
     char name[256] = "";
-    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name)));
+    ASSERT_EQ(FIRC_PTR_PENDING, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, name, sizeof(name), NULL));
     run_until_settled(loop, p, &ip);
     char cut[16] = "x";
     ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_peek(p, &ip, NOW, cut, sizeof(cut)));
     ASSERT_STR_EQ("", cut);
-    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, cut, sizeof(cut)));
+    ASSERT_EQ(FIRC_PTR_NONE, firc_ptr_get(p, &ip, "127.0.0.1", f.port, NOW, cut, sizeof(cut), NULL));
     ASSERT_STR_EQ("", cut);
     char fits[17] = "";
     ASSERT_EQ(FIRC_PTR_NAME, firc_ptr_peek(p, &ip, NOW, fits, sizeof(fits)));
@@ -602,7 +694,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_reply_for_another_question_is_ignored);
     RUN_TEST(a_known_address_is_not_asked_again);
     RUN_TEST(a_name_is_kept_for_a_day);
-    RUN_TEST(the_oldest_of_128_is_reused);
+    RUN_TEST(the_oldest_of_1024_is_reused);
+    RUN_TEST(the_cache_holds_1024);
+    RUN_TEST(get_says_when_it_sent);
     RUN_TEST(free_while_pending_leaves_no_timer);
     RUN_TEST(peek_never_asks);
     RUN_TEST(servfail_is_asked_again_after_5_min);

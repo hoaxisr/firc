@@ -55,9 +55,11 @@ bool firc_tap_packet_parse(const uint8_t *buf, size_t len, firc_tap_packet_t *ou
     return false;
 }
 
-/* Destination port at L4 byte 2, same offset for TCP and UDP; 0 otherwise or when l4_len does not reach it. */
-static void head_port(const uint8_t *l4, size_t l4_len, uint8_t proto, uint16_t *port_out) {
-    if ((proto == 6 || proto == 17) && l4_len >= 4) { *port_out = be16(l4 + 2); }
+static void head_ports(const uint8_t *l4, size_t l4_len, uint8_t proto, firc_tap_head_t *out) {
+    if ((proto == 6 || proto == 17) && l4_len >= 4) {
+        out->src_port = be16(l4);
+        out->dst_port = be16(l4 + 2);
+    }
 }
 
 bool firc_tap_head_parse(const uint8_t *buf, size_t len, firc_tap_head_t *out) {
@@ -79,7 +81,7 @@ bool firc_tap_head_parse(const uint8_t *buf, size_t len, firc_tap_head_t *out) {
 
         size_t hdr = (size_t)(buf[0] & 0x0fu) * 4u;
         if (hdr >= IPV4_MIN_HDR && hdr <= len) {
-            head_port(buf + hdr, len - hdr, out->proto, &out->dst_port);
+            head_ports(buf + hdr, len - hdr, out->proto, out);
         }
         return true;
     }
@@ -90,7 +92,7 @@ bool firc_tap_head_parse(const uint8_t *buf, size_t len, firc_tap_head_t *out) {
         memcpy(out->src.b, buf + 8, 16);
         out->dst.len = 16;
         memcpy(out->dst.b, buf + 24, 16);
-        head_port(buf + IPV6_HDR, len - IPV6_HDR, out->proto, &out->dst_port);
+        head_ports(buf + IPV6_HDR, len - IPV6_HDR, out->proto, out);
         return true;
     }
     return false;

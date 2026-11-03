@@ -272,6 +272,38 @@ TEST a_udp_head_gives_its_ports(void) {
     PASS();
 }
 
+/* Catches: the destination port returned for the source port, or a zero source port on TCP or UDP. */
+TEST head_parse_reads_the_source_port(void) {
+    uint8_t buf[64], l4[8];
+    memset(l4, 0, sizeof(l4));
+    l4[0] = 0xc3; l4[1] = 0x50;
+    l4[2] = 0x0d; l4[3] = 0x96;
+    firc_tap_head_t h;
+
+    size_t n = v4_head(buf, 17, 0, l4, sizeof(l4));
+    ASSERT(firc_tap_head_parse(buf, n, &h));
+    ASSERT_EQ_FMT(50000, (int)h.src_port, "%d");
+    ASSERT_EQ_FMT(3478, (int)h.dst_port, "%d");
+
+    n = v4_head(buf, 6, 0, l4, sizeof(l4));
+    ASSERT(firc_tap_head_parse(buf, n, &h));
+    ASSERT_EQ_FMT(50000, (int)h.src_port, "%d");
+
+    n = v6_head(buf, 17, l4, sizeof(l4));
+    ASSERT(firc_tap_head_parse(buf, n, &h));
+    ASSERT_EQ_FMT(50000, (int)h.src_port, "%d");
+
+    n = v6_head(buf, 6, l4, sizeof(l4));
+    ASSERT(firc_tap_head_parse(buf, n, &h));
+    ASSERT_EQ_FMT(50000, (int)h.src_port, "%d");
+    ASSERT_EQ_FMT(3478, (int)h.dst_port, "%d");
+
+    n = v4_head(buf, 1, 0, l4, sizeof(l4));
+    ASSERT(firc_tap_head_parse(buf, n, &h));
+    ASSERT_EQ_FMT(0, (int)h.src_port, "%d");
+    PASS();
+}
+
 /* Catches: a 64-byte copy whose TCP header fills it all refused instead of giving its port. */
 TEST a_tcp_head_gives_its_port_from_a_64_byte_copy(void) {
     uint8_t buf[64], tcp[44];
@@ -428,6 +460,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_header_length_past_the_buffer_is_refused);
     RUN_TEST(every_truncation_is_refused_or_harmless);
     RUN_TEST(a_udp_head_gives_its_ports);
+    RUN_TEST(head_parse_reads_the_source_port);
     RUN_TEST(a_tcp_head_gives_its_port_from_a_64_byte_copy);
     RUN_TEST(an_icmp_head_has_no_port);
     RUN_TEST(a_later_fragment_is_refused);

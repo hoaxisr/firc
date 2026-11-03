@@ -37,6 +37,9 @@ function address(addr: string, extra = {}) {
     name: "",
     ptr: "",
     ptrState: "none",
+    outcome: "failed",
+    how: "",
+    group: "",
     why: "no-answer",
     fails: 4,
     clients: ["192.168.1.5"],
@@ -943,4 +946,99 @@ test("the Journal reads the list again after it is enabled in Settings", async (
   await page.getByRole("tab", { name: "Journal" }).click();
   await page.getByRole("tab", { name: /DNS stats/ }).click();
   await expect(page.getByRole("button", { name: "Won't open" }).first()).toBeVisible();
+});
+
+function bypass(addr: string, extra = {}) {
+  return address(addr, {
+    outcome: "bypass",
+    how: "answer",
+    group: "b10c4ed0",
+    why: "",
+    proto: "udp",
+    port: 3478,
+    fails: 5,
+    ...extra,
+  });
+}
+
+test("a bypass row says past firc, its group and how", async ({ page }) => {
+  const fake = a1();
+  fake.addresses = [
+    bypass("203.0.113.9"),
+    bypass("203.0.113.10", { how: "sni", fails: 1, group: "gone0000" }),
+    bypass("203.0.113.11", { how: "ptr", fails: 22, port: 443 }),
+  ];
+  await shell(page, fake);
+  await open(page);
+  const row = page.locator("[data-address='203.0.113.9']");
+  await expect(row.locator(".pill")).toHaveText("past firc");
+  await expect(row).toContainText("→ «Blocked» · by firc's answer");
+  await expect(row.locator(".port")).toHaveText("udp/3478");
+  await expect(row.locator(".num")).toHaveText("5");
+  await expect(row).not.toContainText("no answer to ClientHello");
+  await expect(page.locator("[data-address='203.0.113.10']")).toContainText(
+    "→ «gone0000» · by SNI",
+  );
+  await expect(page.locator("[data-address='203.0.113.11']")).toContainText("· by PTR");
+});
+
+test("a bypass row counts connections in Russian", async ({ page }) => {
+  const fake = a1();
+  fake.addresses = [
+    bypass("203.0.113.9", { fails: 1 }),
+    bypass("203.0.113.10", { fails: 3 }),
+    bypass("203.0.113.11", { fails: 5 }),
+  ];
+  await page.addInitScript(() => {
+    localStorage.setItem("locale", JSON.stringify({ value: "ru" }));
+  });
+  await shell(page, fake);
+  await page.goto("/journal/unopened");
+  const meta = (a: string) => page.locator(`[data-address='${a}'] .meta`);
+  await expect(meta("203.0.113.9")).toContainText("1 соединение");
+  await expect(meta("203.0.113.10")).toContainText("3 соединения");
+  await expect(meta("203.0.113.11")).toContainText("5 соединений");
+  await expect(page.locator("[data-address='203.0.113.9'] .pill")).toHaveText("мимо firc");
+  await expect(page.locator("[data-address='203.0.113.9']")).toContainText(
+    "→ «Blocked» · по ответу firc",
+  );
+});
+
+test("a udp bypass adds its own proto and port", async ({ page }) => {
+  const fake = a1();
+  fake.addresses = [bypass("203.0.113.9", { name: "stun.example.net" })];
+  await shell(page, fake);
+  await open(page);
+  await page
+    .locator("[data-address='203.0.113.9']")
+    .getByRole("button", { name: "To group" })
+    .click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect.poll(() => fake.adds.length).toBe(1);
+  expect(fake.adds[0].body).toEqual({
+    type: "subnet",
+    rule: "203.0.113.9/32",
+    enable: true,
+    proto: "udp",
+    ports: "3478",
+    comment: "stun.example.net",
+  });
+});
+
+test("a failed row still shows its cause", async ({ page }) => {
+  await shell(page, a1());
+  await open(page);
+  const row = page.locator("[data-address='172.64.150.28']");
+  await expect(row.locator(".pill")).toHaveText("no answer to ClientHello");
+  await expect(row).not.toContainText("→ «");
+  await expect(row.locator(".meta")).toContainText("4 failures");
+});
+
+test("the addresses table counts attempts and the candidates table failures", async ({ page }) => {
+  await shell(page, a1());
+  await open(page);
+  const heads = page.locator(".card .head");
+  await expect(heads.nth(0)).toContainText("Failures");
+  await expect(heads.nth(1)).toContainText("Attempts");
+  await expect(heads.nth(1)).not.toContainText("Failures");
 });

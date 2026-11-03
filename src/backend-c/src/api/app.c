@@ -36,6 +36,7 @@
 
 #define AL_ADDS_PER_HOUR 30
 #define AL_RECHECK_HOSTS 32
+#define AL_PTR_PER_MINUTE 30
 #include "firc/tapwindow.h"
 #include "firc/events.h"
 #include "firc/recall.h"
@@ -202,6 +203,8 @@ struct firc_app {
     uint64_t al_switched_off, al_switched_on;
     firc_autolist_probe_fn al_probe;
     firc_ptr_t *al_ptr;
+    int64_t al_ptr_sent[AL_PTR_PER_MINUTE];
+    size_t al_ptr_sent_at;
     firc_app_tunnel_down_fn tunnel_down;
     void *tunnel_down_ud;
     firc_app_ifaces_t ifaces;
@@ -3363,14 +3366,64 @@ static void autolist_listed(void *ud, const firc_autolist_failure_t *f) {
     if (c->state != FIRC_AL_CHECKING && c->state != FIRC_AL_ADDED) { c->state = FIRC_AL_CAND; }
 }
 
-static void autolist_bypassed(void *ud, const firc_autolist_failure_t *f) {
-    firc_app_t *app = ud;
+static void autolist_ptr_ask(firc_app_t *app, const firc_ip_t *server) {
     if (app->al_ptr == NULL) { return; }
+    int64_t now = app->wall_s();
+    int64_t oldest = app->al_ptr_sent[app->al_ptr_sent_at];
+    if (oldest != 0 && oldest <= now && now - oldest < 60) { return; }
     firc_ifcheck_settings_t s;
     firc_ifcheck_settings_from(&app->cfg->app, &s);
     char name[FIRC_AUTOLIST_NAME_MAX];
-    (void)firc_ptr_get(app->al_ptr, &f->server, s.upstream, s.upstream_port, (int64_t)app->mono_ms(), name,
-                       sizeof(name));
+    bool sent = false;
+    (void)firc_ptr_get(app->al_ptr, server, s.upstream, s.upstream_port, (int64_t)app->mono_ms(), name, sizeof(name),
+                       &sent);
+    if (!sent) { return; }
+    app->al_ptr_sent[app->al_ptr_sent_at] = now != 0 ? now : 1;
+    app->al_ptr_sent_at = (app->al_ptr_sent_at + 1) % AL_PTR_PER_MINUTE;
+}
+
+static void autolist_bypassed(void *ud, const firc_autolist_failure_t *f) {
+    autolist_ptr_ask(ud, &f->server);
+}
+
+static bool autolist_counts(const firc_app_t *app, const firc_ip_t *client, const char *name,
+                            char group[FIRC_ID_STR_LEN]) {
+    const firc_ruleset_snapshot_t *snap = firc_dns_pipeline_snapshot(app->pipeline);
+    const firc_group_snapshot_t *owner = firc_ruleset_snapshot_owner(snap, name, client, app->tap_policy,
+                                                                     app->tap_device, app->tap_resolver_ud, NULL);
+    if (owner == NULL || owner->block >= 0) { return false; }
+    firc_id_format(owner->id, group);
+    return true;
+}
+
+static void autolist_flow(void *ud, const firc_ip_t *client, const firc_ip_t *server, uint8_t proto, uint16_t port,
+                          const char *sni) {
+    firc_app_t *app = ud;
+    if (app->pipeline == NULL || !autolist_running(app)) { return; }
+    if (sni == NULL && proto == 6 && port == 443) { return; }
+    char group[FIRC_ID_STR_LEN];
+    if (sni != NULL && sni[0] != '\0') {
+        if (firc_autolist_svc_hinted_name(app->al_svc, client, server, sni)) { return; }
+        if (autolist_counts(app, client, sni, group)) {
+            firc_autolist_svc_bypass_seen(app->al_svc, client, server, proto, port, sni, group, FIRC_AL_HOW_SNI);
+        }
+        return;
+    }
+    if (firc_autolist_svc_hinted(app->al_svc, client, server)) { return; }
+    char name[FIRC_AUTOLIST_NAME_MAX];
+    if (firc_recall_by_real(firc_dns_pipeline_recall(app->pipeline), server, name, sizeof(name), NULL)) {
+        if (autolist_counts(app, client, name, group)) {
+            firc_autolist_svc_bypass_seen(app->al_svc, client, server, proto, port, name, group, FIRC_AL_HOW_ANSWER);
+        }
+        return;
+    }
+    if (app->al_ptr == NULL) { return; }
+    firc_ptr_state_t st = firc_ptr_peek(app->al_ptr, server, (int64_t)app->mono_ms(), name, sizeof(name));
+    if (st == FIRC_PTR_PENDING) {
+        autolist_ptr_ask(app, server);
+    } else if (st == FIRC_PTR_NAME && autolist_counts(app, client, name, group)) {
+        firc_autolist_svc_bypass_seen(app->al_svc, client, server, proto, port, name, group, FIRC_AL_HOW_PTR);
+    }
 }
 
 static void autolist_nominated(void *ud, const firc_autolist_nomination_t *n) {
@@ -3837,6 +3890,7 @@ firc_err_t firc_app_autolist_apply(firc_app_t *app) {
         .listed = autolist_listed,
         .bypassed = autolist_bypassed,
         .nominated = autolist_nominated,
+        .flow = autolist_flow,
         .ud = app,
     };
     deps.n_pools = autolist_pools(app, deps.pools);
@@ -3847,7 +3901,7 @@ firc_err_t firc_app_autolist_apply(firc_app_t *app) {
         firc_al_cands_free(cands);
         firc_al_probes_free(probes);
         app->al_why_off = err == FIRC_ERR_SYS ? "its NFLOG readers would not start: another tool may hold groups "
-                                                "6-11, or the kernel has no nfnetlink_log; the daemon's log says which"
+                                                "6-12, or the kernel has no nfnetlink_log; the daemon's log says which"
                                               : "out of memory";
         FIRC_WARN("autolist not started: %s", app->al_why_off);
         return err;
@@ -3954,7 +4008,7 @@ void firc_app_autolist_status(const firc_app_t *app, firc_autolist_status_t *out
     out->checked_at = app->al_checked_at;
     out->switched_off = app->al_switched_off;
     out->switched_on = app->al_switched_on;
-    out->n_addresses = firc_autolist_svc_addresses(app->al_svc, out->addresses, FIRC_AUTOLIST_ADDRS);
+    out->n_addresses = firc_autolist_svc_addresses(app->al_svc, out->addresses, 2 * FIRC_AUTOLIST_ADDRS);
     int64_t now_ms = (int64_t)app->mono_ms();
     for (size_t i = 0; i < out->n_addresses; i++) {
         out->ptr_state[i] = app->al_ptr != NULL ? firc_ptr_peek(app->al_ptr, &out->addresses[i].server, now_ms,

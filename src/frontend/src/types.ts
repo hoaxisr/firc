@@ -348,6 +348,9 @@ export type AutolistAddress = {
   name: string;
   ptr: string;
   ptrState: "pending" | "name" | "none";
+  outcome: "failed" | "bypass";
+  how: "" | "answer" | "sni" | "ptr";
+  group: string;
   why: string;
   fails: number;
   clients: string[];

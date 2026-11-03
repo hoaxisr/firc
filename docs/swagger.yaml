@@ -1158,6 +1158,18 @@ definitions:
         description: 'The server address devices failed to reach without asking firc for it (an address built into an app, its own DNS or DoH)'
         example: 34.107.243.93
         type: string
+      outcome:
+        description: 'failed | bypass'
+        example: failed
+        type: string
+      how:
+        description: 'answer | sni | ptr; empty for failed'
+        example: ""
+        type: string
+      group:
+        description: 'Id of the group whose name the address was recognised by; empty for failed'
+        example: ""
+        type: string
       proto:
         description: 'tcp | udp'
         example: tcp
@@ -1178,11 +1190,11 @@ definitions:
         example: pending
         type: string
       why:
-        description: 'no-answer | reset | no-connect'
+        description: 'no-answer | reset | no-connect; empty for a bypass row'
         example: no-answer
         type: string
       fails:
-        description: 'Failures since firstAt; a row with no failure for 24 h starts again'
+        description: 'Failures, or for a bypass row the connections seen, since firstAt; a row with none for 24 h starts again'
         example: 4
         type: integer
       clients:
@@ -1207,6 +1219,9 @@ definitions:
         type: array
     required:
     - address
+    - outcome
+    - how
+    - group
     - proto
     - port
     - name

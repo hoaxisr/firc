@@ -435,11 +435,11 @@ typedef struct firc_autolist_status {
     uint64_t switched_off;
     uint64_t switched_on;
     size_t n_addresses;
-    firc_autolist_addr_t addresses[FIRC_AUTOLIST_ADDRS];
-    firc_ptr_state_t ptr_state[FIRC_AUTOLIST_ADDRS];
-    char ptr[FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_NAME_MAX];
-    size_t n_groups[FIRC_AUTOLIST_ADDRS];
-    firc_id_t groups[FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_GROUPS_MAX];
+    firc_autolist_addr_t addresses[2 * FIRC_AUTOLIST_ADDRS];
+    firc_ptr_state_t ptr_state[2 * FIRC_AUTOLIST_ADDRS];
+    char ptr[2 * FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_NAME_MAX];
+    size_t n_groups[2 * FIRC_AUTOLIST_ADDRS];
+    firc_id_t groups[2 * FIRC_AUTOLIST_ADDRS][FIRC_AUTOLIST_GROUPS_MAX];
     size_t n_candidates;
     firc_al_cand_t candidates[FIRC_AUTOLIST_CANDIDATES];
     uint32_t probes_used_hour;

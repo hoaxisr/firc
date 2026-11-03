@@ -20,6 +20,8 @@ typedef struct firc_autolist_deps {
     void (*listed)(void *ud, const firc_autolist_failure_t *f);
     void (*bypassed)(void *ud, const firc_autolist_failure_t *f);
     void (*nominated)(void *ud, const firc_autolist_nomination_t *n);
+    void (*flow)(void *ud, const firc_ip_t *client, const firc_ip_t *server, uint8_t proto, uint16_t port,
+                 const char *sni);
     void *ud;
     firc_autolist_net_t pools[FIRC_AUTOLIST_POOLS];
     size_t n_pools;
@@ -42,6 +44,15 @@ void firc_autolist_svc_counts(const firc_autolist_svc_t *s, uint64_t *failures, 
 size_t firc_autolist_svc_addresses(const firc_autolist_svc_t *s, firc_autolist_addr_t *out, size_t cap);
 
 bool firc_autolist_svc_addr_dismiss(firc_autolist_svc_t *s, const firc_ip_t *server, uint8_t proto, uint16_t port);
+
+void firc_autolist_svc_bypass_seen(firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server,
+                                   uint8_t proto, uint16_t port, const char *name,
+                                   const char group[FIRC_ID_STR_LEN], uint8_t how);
+
+bool firc_autolist_svc_hinted(const firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server);
+
+bool firc_autolist_svc_hinted_name(const firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server,
+                                   const char *name);
 
 uint32_t firc_autolist_svc_failures_day(const firc_autolist_svc_t *s);
 

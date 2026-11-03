@@ -320,7 +320,7 @@ T0=$(date +%s)
 check "the automatic list runs" True "$(status running)"
 check "it runs in mode add" add "$(status mode)"
 check "its chain hangs off mangle/FORWARD" 1 "$($IPT -t mangle -S FORWARD | grep -c -- '-j FIRC_AUTO')"
-check "its six rules are in the kernel" 6 "$($IPT -t mangle -S FIRC_AUTO | grep -c NFLOG)"
+check "its seven rules are in the kernel" 7 "$($IPT -t mangle -S FIRC_AUTO | grep -c NFLOG)"
 
 check "a probe on request is accepted" 202 "$(probe www.frost.test)"
 check "a second request waits its turn" 202 "$(probe www.ok.test)"

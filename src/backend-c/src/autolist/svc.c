@@ -12,7 +12,7 @@
 #include "firc/log.h"
 #include "firc/tappacket.h"
 
-#define READERS 6
+#define READERS 7
 
 struct firc_autolist_svc;
 
@@ -77,6 +77,7 @@ static void on_hello(firc_autolist_svc_t *s, const uint8_t *pkt, size_t len, int
     if (s->deps.eligible != NULL && !s->deps.eligible(s->deps.ud, &p.src)) { return; }
     char sni[FIRC_AUTOLIST_NAME_MAX];
     if (!firc_tls_client_hello_sni(p.payload, p.payload_len, sni, sizeof(sni))) { sni[0] = '\0'; }
+    if (s->deps.flow != NULL) { s->deps.flow(s->deps.ud, &p.src, &p.dst, 6, p.dst_port, sni); }
     firc_autolist_flow_t key = {p.src, p.dst, p.src_port, p.dst_port};
     firc_autolist_failure_t f;
     if (firc_autolist_hello(s->judge, &key, p.seq, p.ack, sni, now, &f)) { failed(s, &f); }
@@ -135,6 +136,16 @@ static void on_syn(firc_autolist_svc_t *s, const uint8_t *pkt, size_t len, int64
     failed(s, &f);
 }
 
+static void on_new(firc_autolist_svc_t *s, const uint8_t *pkt, size_t len, int64_t now) {
+    firc_tap_head_t h;
+    if (!firc_tap_head_parse(pkt, len, &h)) { return; }
+    if (h.proto != 6 && h.proto != 17) { return; }
+    if (firc_autolist_local(&h.dst, s->deps.pools, s->deps.n_pools)) { return; }
+    if (s->deps.eligible != NULL && !s->deps.eligible(s->deps.ud, &h.src)) { return; }
+    if (!firc_autolist_flow_first(s->judge, &h.src, h.src_port, &h.dst, h.proto, h.dst_port, now)) { return; }
+    if (s->deps.flow != NULL) { s->deps.flow(s->deps.ud, &h.src, &h.dst, h.proto, h.dst_port, NULL); }
+}
+
 void firc_autolist_svc_packet(firc_autolist_svc_t *s, int which, const uint8_t *pkt, size_t len) {
     if (s == NULL || pkt == NULL) { return; }
     int64_t now = svc_now(s);
@@ -148,6 +159,8 @@ void firc_autolist_svc_packet(firc_autolist_svc_t *s, int which, const uint8_t *
         on_close(s, 0x14u, pkt, len, now);
     } else if (which == 5) {
         on_syn(s, pkt, len, now);
+    } else if (which == 6) {
+        on_new(s, pkt, len, now);
     }
 }
 
@@ -212,9 +225,11 @@ firc_autolist_svc_t *firc_autolist_svc_start(const firc_autolist_deps_t *deps, f
 
     static const uint16_t groups[READERS] = {FIRC_AUTOLIST_GROUP_HELLO,     FIRC_AUTOLIST_GROUP_RESET,
                                              FIRC_AUTOLIST_GROUP_ANSWERED,  FIRC_AUTOLIST_GROUP_FIN,
-                                             FIRC_AUTOLIST_GROUP_CLOSE_RST, FIRC_AUTOLIST_GROUP_SYN};
+                                             FIRC_AUTOLIST_GROUP_CLOSE_RST, FIRC_AUTOLIST_GROUP_SYN,
+                                             FIRC_AUTOLIST_GROUP_NEW};
     static const uint16_t ranges[READERS] = {FIRC_TAP_COPY_RANGE, FIRC_TAP_HEAD_RANGE, FIRC_TAP_HEAD_RANGE,
-                                             FIRC_TAP_HEAD_RANGE, FIRC_TAP_HEAD_RANGE, FIRC_TAP_HEAD_RANGE};
+                                             FIRC_TAP_HEAD_RANGE, FIRC_TAP_HEAD_RANGE, FIRC_TAP_HEAD_RANGE,
+                                             FIRC_TAP_HEAD_RANGE};
     for (int w = 0; w < READERS; w++) {
         reader_t *r = &s->readers[w];
         r->svc = s;
@@ -282,4 +297,19 @@ uint32_t firc_autolist_svc_failures_day(const firc_autolist_svc_t *s) {
 
 uint32_t firc_autolist_svc_ambiguous_day(const firc_autolist_svc_t *s) {
     return s != NULL ? firc_autolist_ambiguous_day(s->judge, svc_now(s)) : 0;
+}
+
+void firc_autolist_svc_bypass_seen(firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server,
+                                   uint8_t proto, uint16_t port, const char *name,
+                                   const char group[FIRC_ID_STR_LEN], uint8_t how) {
+    if (s != NULL) { firc_autolist_bypass_seen(s->judge, client, server, proto, port, name, group, how, svc_now(s)); }
+}
+
+bool firc_autolist_svc_hinted(const firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server) {
+    return s != NULL && firc_autolist_hinted(s->judge, client, server, svc_now(s));
+}
+
+bool firc_autolist_svc_hinted_name(const firc_autolist_svc_t *s, const firc_ip_t *client, const firc_ip_t *server,
+                                   const char *name) {
+    return s != NULL && firc_autolist_hinted_name(s->judge, client, server, name, svc_now(s));
 }

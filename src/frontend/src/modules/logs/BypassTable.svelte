@@ -35,6 +35,35 @@
     return counted(n, locale.current, t("{n} failure"), t("{n} failures (2-4)"), t("{n} failures"));
   }
 
+  function connections(n: number): string {
+    return counted(
+      n,
+      locale.current,
+      t("{n} connection"),
+      t("{n} connections (2-4)"),
+      t("{n} connections"),
+    );
+  }
+
+  function countText(a: AutolistAddress): string {
+    return a.outcome === "bypass" ? connections(a.fails) : failures(a.fails);
+  }
+
+  function howText(a: AutolistAddress): string {
+    if (a.outcome !== "bypass") return "";
+    const how =
+      a.how === "answer"
+        ? t("by firc's answer")
+        : a.how === "sni"
+          ? t("by SNI")
+          : a.how === "ptr"
+            ? t("by PTR")
+            : "";
+    return [t("→ «{group}»").replace("{group}", groupName(a.group)), how]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
   function key(a: AutolistAddress): string {
     return `${a.address}/${a.proto}/${a.port}`;
   }
@@ -57,7 +86,7 @@
 
   function metaText(a: AutolistAddress): string {
     const names = devicesOf(a).map((d) => d.label);
-    return [`${a.proto}/${a.port}`, failures(a.fails), names.join(" · ")]
+    return [`${a.proto}/${a.port}`, howText(a), countText(a), names.join(" · ")]
       .filter(Boolean)
       .join(" · ");
   }
@@ -118,7 +147,7 @@
       <span>{t("Address")}</span>
       <span>{t("Name ")}</span>
       <span>{t("Port")}</span>
-      <span class="num">{t("Failures")}</span>
+      <span class="num">{t("Attempts")}</span>
       <span>{t("Devices")}</span>
       <span>{t("Last")}</span>
       <span></span>
@@ -134,7 +163,12 @@
         </span>
         <span class="nm">
           <span class="sni" title={a.name}>{a.name || "—"}</span>
-          <span class="pill {whyClass(a.why)}">{whyLabel(a.why, 0, t)}</span>
+          {#if a.outcome === "bypass"}
+            <span class="pill">{t("past firc")}</span>
+            <span class="how" title={howText(a)}>{howText(a)}</span>
+          {:else}
+            <span class="pill {whyClass(a.why)}">{whyLabel(a.why, 0, t)}</span>
+          {/if}
           <span class="meta">{metaText(a)}</span>
         </span>
         <span class="port">{a.proto}/{a.port}</span>
@@ -272,6 +306,12 @@
   .meta {
     display: none;
   }
+  .how {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: var(--text-2);
+    font-size: 0.76rem;
+  }
   .port {
     font-family: var(--font-mono);
     font-size: 0.8rem;
@@ -389,6 +429,7 @@
     }
     .port,
     .num,
+    .how,
     .devs {
       display: none;
     }

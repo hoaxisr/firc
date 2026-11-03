@@ -405,6 +405,12 @@ static const char *bypass_why_name(uint8_t why) {
     return why == FIRC_AUTOLIST_NO_CONNECT ? "no-connect" : "no-answer";
 }
 
+static const char *autolist_how_name(uint8_t how) {
+    if (how == FIRC_AL_HOW_ANSWER) { return "answer"; }
+    if (how == FIRC_AL_HOW_SNI) { return "sni"; }
+    return how == FIRC_AL_HOW_PTR ? "ptr" : "";
+}
+
 static const char *ptr_state_name(firc_ptr_state_t st) {
     if (st == FIRC_PTR_NAME) { return "name"; }
     return st == FIRC_PTR_NONE ? "none" : "pending";
@@ -429,13 +435,17 @@ static bool autolist_address_json(cJSON *arr, const firc_autolist_status_t *st, 
         return false;
     }
     cJSON *clients = NULL, *groups = NULL;
+    bool bypass = a->outcome == FIRC_AL_OUTCOME_BYPASS;
     if (cJSON_AddStringToObject(o, "address", addr) == NULL ||
+        cJSON_AddStringToObject(o, "outcome", bypass ? "bypass" : "failed") == NULL ||
+        cJSON_AddStringToObject(o, "how", bypass ? autolist_how_name(a->how) : "") == NULL ||
+        cJSON_AddStringToObject(o, "group", bypass ? a->group : "") == NULL ||
         cJSON_AddStringToObject(o, "proto", a->proto == IPPROTO_UDP ? "udp" : "tcp") == NULL ||
         cJSON_AddNumberToObject(o, "port", (double)a->port) == NULL ||
         cJSON_AddStringToObject(o, "name", a->name) == NULL ||
         cJSON_AddStringToObject(o, "ptr", st->ptr_state[i] == FIRC_PTR_NAME ? st->ptr[i] : "") == NULL ||
         cJSON_AddStringToObject(o, "ptrState", ptr_state_name(st->ptr_state[i])) == NULL ||
-        cJSON_AddStringToObject(o, "why", bypass_why_name(a->why)) == NULL ||
+        cJSON_AddStringToObject(o, "why", bypass ? "" : bypass_why_name(a->why)) == NULL ||
         cJSON_AddNumberToObject(o, "fails", (double)a->fails) == NULL ||
         (clients = cJSON_AddArrayToObject(o, "clients")) == NULL ||
         cJSON_AddNumberToObject(o, "firstAt", (double)a->first_at) == NULL ||

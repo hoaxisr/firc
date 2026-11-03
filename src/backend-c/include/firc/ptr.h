@@ -19,9 +19,10 @@ firc_ptr_t *firc_ptr_new(firc_loop_t *loop, uint32_t timeout_ms);
 void firc_ptr_free(firc_ptr_t *p);
 
 /* The cached state of ip; an unknown or expired address is asked of upstream:port once and is PENDING.
- * On NAME, out holds the lower-case target without the trailing dot. Loop thread only. */
+ * On NAME, out holds the lower-case target without the trailing dot; *sent (nullable) says a query went out.
+ * Loop thread only. */
 firc_ptr_state_t firc_ptr_get(firc_ptr_t *p, const firc_ip_t *ip, const char *upstream, uint16_t port,
-                              int64_t now_ms, char *out, size_t cap);
+                              int64_t now_ms, char *out, size_t cap, bool *sent);
 
 /* As firc_ptr_get, but never sends: an unknown address is PENDING. */
 firc_ptr_state_t firc_ptr_peek(const firc_ptr_t *p, const firc_ip_t *ip, int64_t now_ms, char *out, size_t cap);
