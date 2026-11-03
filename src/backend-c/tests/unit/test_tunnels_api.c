@@ -130,11 +130,17 @@ static void apply_text(hx_t *h, const char *doc)
     firc_tunnels_free(&t);
 }
 
+static bool lo_is_wan_when_named(const char *const *link, size_t n, bool *wan, void *ud)
+{
+    (void)ud;
+    for (size_t i = 0; i < n; i++) { wan[i] = g_wan_name != NULL && strcmp(link[i], g_wan_name) == 0; }
+    return true;
+}
+
 static void bring_up(hx_t *h)
 {
     static const char *const link[] = {"lo"};
-    const bool wan[] = {g_wan_name != NULL};
-    const firc_tunrun_lan_t lan = {link, wan, 1};
+    const firc_tunrun_lan_t lan = {link, 1, lo_is_wan_when_named, NULL};
     h->run = firc_tunrun_new(h->loop, h->rtnl, 4300u, FAKE, &lan);
     h->subs = firc_tunsubs_new(h->loop, h->cache, firc_tunrun_bodies_changed, h->run);
     firc_subhdr_set_t defaults;

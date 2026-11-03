@@ -749,15 +749,6 @@ static void on_iface_event(void *ud, const char *iface)
     if (d->ifwatch != NULL) { firc_ifwatch_nudge(d->ifwatch, iface); }
 }
 
-static bool *lan_wan_snapshot(const firc_app_config_t *running)
-{
-    bool *wan = calloc(running->n_link + 1, sizeof *wan);
-    if (wan != NULL && !firc_inbounds_wan_table(running, wan)) {
-        FIRC_INFO("tunnels: interface roles unknown, inbounds skip the WAN check");
-    }
-    return wan;
-}
-
 static void resync(struct daemon *d, const char *iface_name)
 {
     for (size_t i = 0; i < firc_app_user_group_count(d->app); i++) {
@@ -1476,7 +1467,7 @@ int main(int argc, char **argv)
     firc_dns_pipeline_set_v6_fn(d.pipeline, firc_resolve_router_carries_v6, d.router);
 #ifdef FIRC_ENTWARE_KN
     /* Wait (3 s bound) for the first hotspot read: a policy host asking earlier would stay unrouted. */
-    if (!firc_kn_policies_wait_first(d.policies, 3000)) {
+    if (firc_config_selects_devices(&cfg) && !firc_kn_policies_wait_first(d.policies, 3000)) {
         FIRC_WARN("keenetic policies: no hotspot table yet, devices are their addresses until it arrives");
     }
 #endif
@@ -1572,10 +1563,9 @@ int main(int argc, char **argv)
     if (tunvless_bin == NULL || tunvless_bin[0] == 0) { tunvless_bin = FIRC_TUNVLESS_BIN; }
     {
         const firc_app_config_t *running = firc_app_running_settings(d.app);
-        bool *wan = lan_wan_snapshot(running);
-        const firc_tunrun_lan_t lan = {(const char *const *)running->link, wan, running->n_link};
+        const firc_tunrun_lan_t lan = {(const char *const *)running->link, running->n_link, firc_inbounds_wan_table,
+                                       NULL};
         d.tunrun = firc_tunrun_new(d.loop, d.rtnl, cfg.app.netfilter.start_mark_table_index, tunvless_bin, &lan);
-        free(wan);
         if (d.tunrun == NULL) {
             FIRC_ERROR("failed to create the tunnel supervisor");
             daemon_teardown(&d);

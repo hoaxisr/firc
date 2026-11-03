@@ -86,6 +86,8 @@ struct firc_tunrun {
     char **link;
     bool *wan;
     size_t n_link;
+    firc_tunrun_wan_fn wan_of;
+    void *wan_ud;
     bool has_k;
     firc_tunrun_ktcp_t k;
     uint16_t ports[FIRC_KTCP_DEVICES];
@@ -481,8 +483,13 @@ static void judge(const firc_tunnel_t *tun, const firc_tun_inbound_t *b, ib_t *s
     s->verdict = v;
 }
 
-static bool lan_ok(const firc_tunrun_t *t, const char *name)
+static bool lan_ok(firc_tunrun_t *t, const char *name)
 {
+    if (t->wan_of != NULL) {
+        firc_tunrun_wan_fn f = t->wan_of;
+        t->wan_of = NULL;
+        (void)f((const char *const *)t->link, t->n_link, t->wan, t->wan_ud);
+    }
     for (size_t i = 0; i < t->n_link; i++) {
         if (strcmp(t->link[i], name) == 0) {
             return !t->wan[i];
@@ -491,7 +498,7 @@ static bool lan_ok(const firc_tunrun_t *t, const char *name)
     return false;
 }
 
-bool firc_tunrun_lan_ok(const firc_tunrun_t *t, const char *name)
+bool firc_tunrun_lan_ok(firc_tunrun_t *t, const char *name)
 {
     return lan_ok(t, name);
 }
@@ -793,9 +800,10 @@ static bool copy_lan(firc_tunrun_t *t, const firc_tunrun_lan_t *lan)
         if (t->link[i] == NULL) {
             return false;
         }
-        t->wan[i] = lan->wan != NULL && lan->wan[i];
         t->n_link++;
     }
+    t->wan_of = lan->wan_of;
+    t->wan_ud = lan->wan_ud;
     return true;
 }
 

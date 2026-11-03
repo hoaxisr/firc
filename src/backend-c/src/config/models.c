@@ -841,3 +841,12 @@ firc_err_t firc_group_set_ifaces(firc_group_t *g, const char *const *names, size
     g->n_iface_rest = n - 1;
     return FIRC_OK;
 }
+
+bool firc_config_selects_devices(const firc_config_t *c)
+{
+    for (size_t i = 0; i < c->n_groups; i++) {
+        const firc_group_t *g = c->groups[i];
+        if (g->enable && (g->devices.n_allow > 0 || g->devices.n_deny > 0)) { return true; }
+    }
+    return false;
+}

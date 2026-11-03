@@ -45,6 +45,8 @@ typedef struct {
 
 static fx_t *g_fx;
 static bool g_link_wan[2];
+static firc_tunrun_wan_fn g_wan_fn;
+static int g_wan_calls;
 static const char *const g_link[] = {"lo", "firc-noip0"};
 static firc_tunsubs_t *g_subs;
 static pid_t g_watch_pid;
@@ -84,6 +86,14 @@ static void tunnels_of(firc_tunnels_t *out, const spec_t *s, size_t n)
     }
 }
 
+static bool wan_from_globals(const char *const *link, size_t n, bool *wan, void *ud)
+{
+    (void)link;
+    (*(int *)ud)++;
+    for (size_t i = 0; i < n && i < 2; i++) { wan[i] = g_link_wan[i]; }
+    return true;
+}
+
 static bool fx_up(fx_t *f, unsigned link_flags)
 {
     memset(f, 0, sizeof *f);
@@ -112,15 +122,16 @@ static bool fx_up(fx_t *f, unsigned link_flags)
         return false;
     }
     fake_rtnl_set_link_flags(f->kernel, link_flags);
-    const firc_tunrun_lan_t lan = {g_link, g_link_wan, 2};
+    const firc_tunrun_lan_t lan = {g_link, 2, g_wan_fn != NULL ? g_wan_fn : wan_from_globals, &g_wan_calls};
     f->run = firc_tunrun_new(f->loop, f->rtnl, START, FAKE, &lan);
-    memset(g_link_wan, 0, sizeof g_link_wan);
+    g_wan_fn = NULL;
     g_fx = f;
     return f->run != NULL;
 }
 
 static void fx_down(fx_t *f)
 {
+    memset(g_link_wan, 0, sizeof g_link_wan);
     if (g_subs != NULL) {
         firc_tunrun_set_subs(f->run, NULL);
         firc_tunsubs_free(g_subs);
@@ -2585,7 +2596,7 @@ TEST a_listen_outside_app_link_sends_no_line(void)
     PASS();
 }
 
-/* catches: an app.link entry the firmware called a WAN at start listened on, its role read anew instead of from the snapshot */
+/* catches: an app.link entry the firmware calls a WAN listened on */
 TEST a_wan_listen_sends_no_line(void)
 {
     static fx_t f;
@@ -2599,6 +2610,50 @@ TEST a_wan_listen_sends_no_line(void)
     ASSERT_STR_EQ(KT_FIRST, stdin_of(&f, "tunvless0"));
     ASSERT_STR_EQ("not-lan", ib_state(&f, 1081));
     ASSERT_EQ(1, journal_at(FIRC_LOG_WARN, "tunvless0", "inbound :1081: lo is not a LAN interface of app.link"));
+    fx_down(&f);
+    PASS();
+}
+
+static bool first_link_is_wan(const char *const *link, size_t n, bool *wan, void *ud)
+{
+    (*(int *)ud)++;
+    if (n > 0 && strcmp(link[0], "lo") == 0) { wan[0] = true; }
+    return true;
+}
+
+/* catches: the WAN roles read at start (a blocking RCI round), read again per inbound, or their answer ignored */
+TEST the_wan_roles_are_read_once_when_an_inbound_is_first_judged(void)
+{
+    static fx_t f;
+    g_wan_calls = 0;
+    g_wan_fn = first_link_is_wan;
+    ASSERT(fx_up(&f, 0));
+    int at_start = g_wan_calls;
+    ib_env(&f);
+    apply_yaml(&f, "tunnels:\n" KT_TUN("a", "0", IB_A));
+    ASSERT(run_until_tail(&f, "tunvless0", KT_FIRST, 3000));
+    firc_tunrun_refresh_inbounds(f.run);
+    firc_tunrun_refresh_inbounds(f.run);
+    run_ms(&f, 300);
+    ASSERT_EQm("not at start", 0, at_start);
+    ASSERT_EQm("once", 1, g_wan_calls);
+    ASSERT_STR_EQ("not-lan", ib_state(&f, 1081));
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: the WAN roles read for a tunnel with no inbound (the start blocking again on any tunnel) */
+TEST no_inbound_reads_no_wan_roles(void)
+{
+    static fx_t f;
+    g_wan_calls = 0;
+    ASSERT(fx_up(&f, 0));
+    ib_env(&f);
+    apply_yaml(&f, "tunnels:\n" KT_TUN("a", "0", ""));
+    ASSERT(run_until_tail(&f, "tunvless0", KT_FIRST, 3000));
+    firc_tunrun_refresh_inbounds(f.run);
+    run_ms(&f, 300);
+    ASSERT_EQ(0, g_wan_calls);
     fx_down(&f);
     PASS();
 }
@@ -3190,6 +3245,8 @@ SUITE(tunrun)
     RUN_TEST(a_filtered_out_node_still_binds);
     RUN_TEST(a_listen_outside_app_link_sends_no_line);
     RUN_TEST(a_wan_listen_sends_no_line);
+    RUN_TEST(the_wan_roles_are_read_once_when_an_inbound_is_first_judged);
+    RUN_TEST(no_inbound_reads_no_wan_roles);
     RUN_TEST(a_listen_moved_into_app_link_sends_its_line_quietly);
     RUN_TEST(an_event_for_a_port_without_a_line_is_ignored);
     RUN_TEST(one_refresh_parses_once_for_three_inbounds);

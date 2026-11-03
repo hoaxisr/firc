@@ -18,20 +18,25 @@
 
 typedef struct firc_tunrun firc_tunrun_t;
 
+/* Fills wan[i] for link[i] from the firmware's interface roles; false when they cannot be read. */
+typedef bool (*firc_tunrun_wan_fn)(const char *const *link, size_t n, bool *wan, void *ud);
+
 typedef struct firc_tunrun_lan {
     const char *const *link;
-    const bool *wan;
     size_t n_link;
+    firc_tunrun_wan_fn wan_of;
+    void *wan_ud;
 } firc_tunrun_lan_t;
 
 /* Loop thread only, like every call below: tunvless children are spawned from this thread. lan holds the running
-   app.link and, per entry, whether the firmware called it a WAN at start (NULL: none); copied. NULL leaves every
-   inbound outside the LAN. */
+   app.link and wan_of, which reads once, when first needed, which entries are WAN (NULL: none is); copied. NULL leaves
+   every inbound outside the LAN. */
 firc_tunrun_t *firc_tunrun_new(firc_loop_t *loop, firc_rtnl_t *r, uint32_t start_table, const char *binary,
                                const firc_tunrun_lan_t *lan);
 
-/* True when name is in the running app.link and was not a WAN interface at start: what an inbound's listen is judged by. */
-bool firc_tunrun_lan_ok(const firc_tunrun_t *t, const char *name);
+/* True when name is in the running app.link and not a WAN interface: what an inbound's listen is judged by. The
+   roles are read through lan.wan_of on the first call, not at start. */
+bool firc_tunrun_lan_ok(firc_tunrun_t *t, const char *name);
 
 /* Rebuilds every tunnel's inbound lines from the interfaces as they are now and sends the ones that changed. */
 void firc_tunrun_refresh_inbounds(firc_tunrun_t *t);

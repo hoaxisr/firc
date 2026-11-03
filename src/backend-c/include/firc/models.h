@@ -352,6 +352,9 @@ void firc_config_remove_group_by_index(firc_config_t *c, size_t idx);
 /* Frees every group and empties c->groups (does not touch the app config). */
 void firc_config_clear_groups(firc_config_t *c);
 
+/* True when an enabled group names devices in its selector: only then is the router's device map worth waiting for. */
+bool firc_config_selects_devices(const firc_config_t *c);
+
 /* strdup that maps NULL input to NULL output and reports OOM. */
 firc_err_t firc_strset(char **dst, const char *src);
 

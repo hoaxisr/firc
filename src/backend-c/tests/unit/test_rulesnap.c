@@ -50,6 +50,43 @@ static firc_group_t *shared_group(firc_config_t *cfg, uint8_t id, const char *na
     return g;
 }
 
+/* Catches: the boot wait for the device map kept when no enabled group selects devices, or skipped when one does. */
+TEST only_an_enabled_group_with_a_selector_needs_the_device_map(void)
+{
+    firc_config_t cfg = make_cfg();
+    bool none = firc_config_selects_devices(&cfg);
+    firc_group_t *open = make_group((firc_id_t){{1, 0, 0, 0}}, "open", true);
+    firc_config_add_group(&cfg, open);
+    bool open_only = firc_config_selects_devices(&cfg);
+    firc_group_t *off = make_group((firc_id_t){{2, 0, 0, 0}}, "off", false);
+    add_entry(&off->devices.allow, &off->devices.n_allow, "policy:Kids");
+    firc_config_add_group(&cfg, off);
+    bool off_only = firc_config_selects_devices(&cfg);
+    firc_group_t *deny = make_group((firc_id_t){{3, 0, 0, 0}}, "deny", true);
+    add_entry(&deny->devices.deny, &deny->devices.n_deny, "192.168.0.5");
+    firc_config_add_group(&cfg, deny);
+    bool with_deny = firc_config_selects_devices(&cfg);
+    firc_config_clear(&cfg);
+    ASSERT_FALSE(none);
+    ASSERT_FALSEm("a group without a selector", open_only);
+    ASSERT_FALSEm("a selector on a disabled group", off_only);
+    ASSERTm("a deny entry", with_deny);
+    PASS();
+}
+
+/* Catches: an allow entry not counted. */
+TEST an_allow_entry_needs_the_device_map(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "kids", true);
+    add_entry(&g->devices.allow, &g->devices.n_allow, "mac:aa:bb:cc:dd:ee:ff");
+    firc_config_add_group(&cfg, g);
+    bool need = firc_config_selects_devices(&cfg);
+    firc_config_clear(&cfg);
+    ASSERT(need);
+    PASS();
+}
+
 static firc_ip_t client_at(const char *text)
 {
     firc_ip_t c = {{0}, 4};
@@ -586,5 +623,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_disabled_rule_or_group_is_skipped);
     RUN_TEST(a_policy_entry_is_resolved_by_the_callers_resolver);
     RUN_TEST(the_snapshot_carries_a_block_groups_answer);
+    RUN_TEST(only_an_enabled_group_with_a_selector_needs_the_device_map);
+    RUN_TEST(an_allow_entry_needs_the_device_map);
     GREATEST_MAIN_END();
 }

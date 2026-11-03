@@ -8,17 +8,20 @@
 #include "firc/ifaddr.h"
 #include "firc/keenetic_rci.h"
 #include "firc/listen.h"
+#include "firc/log.h"
 
-bool firc_inbounds_wan_table(const firc_app_config_t *app, bool *wan)
+bool firc_inbounds_wan_table(const char *const *link, size_t n, bool *wan, void *ud)
 {
+    (void)ud;
     firc_kn_aliases_t a = {0};
-    memset(wan, 0, (app->n_link + 1) * sizeof *wan);
+    memset(wan, 0, n * sizeof *wan);
     if (firc_kn_get_iface_aliases(&a) != FIRC_OK) {
         firc_kn_aliases_free(&a);
+        FIRC_INFO("tunnels: interface roles unknown, inbounds skip the WAN check");
         return false;
     }
-    for (size_t i = 0; i < app->n_link; i++) {
-        wan[i] = firc_kn_aliases_inet(&a, app->link[i]);
+    for (size_t i = 0; i < n; i++) {
+        wan[i] = firc_kn_aliases_inet(&a, link[i]);
     }
     firc_kn_aliases_free(&a);
     return true;
@@ -63,7 +66,7 @@ static bool busy(const firc_tun_inbound_t *b)
     return fd == -EADDRINUSE;
 }
 
-static firc_err_t check_one(const firc_tunrun_t *run, const firc_app_config_t *app, bool enabled,
+static firc_err_t check_one(firc_tunrun_t *run, const firc_app_config_t *app, bool enabled,
                             const firc_tun_inbound_t *b, size_t ti, size_t i, firc_tun_err_t *err)
 {
     if (!firc_tunrun_lan_ok(run, b->listen)) {
@@ -86,7 +89,7 @@ static firc_err_t check_one(const firc_tunrun_t *run, const firc_app_config_t *a
     return FIRC_OK;
 }
 
-firc_err_t firc_inbounds_check(const firc_tunnels_t *want, const firc_tunrun_t *run, const firc_app_config_t *app,
+firc_err_t firc_inbounds_check(const firc_tunnels_t *want, firc_tunrun_t *run, const firc_app_config_t *app,
                                firc_tun_err_t *err)
 {
     for (size_t ti = 0; ti < want->n; ti++) {
