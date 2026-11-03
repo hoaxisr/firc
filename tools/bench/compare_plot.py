@@ -11,7 +11,7 @@ W, H, L, R, T, B = 900, 420, 90, 800, 70, 350
 CHARTS = (
     ("rps", "Успешные DNS-запросы в секунду, UDP, 10 клиентов", "запросов/с", "benchmark-throughput.svg", True),
     ("cpu_ms", "Процессорное время демона на успешный запрос", "мс CPU", "benchmark-cpu.svg", True),
-    ("rss", "Память демона (RSS) после нагрузки", "МиБ", "benchmark-memory.svg", False),
+    ("rss", "Пиковая память демона (VmHWM) за прогон", "МиБ", "benchmark-memory.svg", False),
 )
 
 
@@ -24,7 +24,7 @@ def load(path):
         values = {
             "rps": d["rps"],
             "cpu_ms": d["cpu_pct"] * 10 / d["rps"],
-            "rss": d["after"]["VmRSS"] / 1024,
+            "rss": d["after"]["VmHWM"] / 1024,
         }
         for k, v in values.items():
             out.setdefault((k, d["backend"], d["rules"]), []).append(v)

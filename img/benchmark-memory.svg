@@ -1,56 +1,60 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" role="img">
-<title>Память демона (RSS) после нагрузки</title>
+<title>Пиковая память демона (VmHWM) за прогон</title>
 <style>text{font:14px sans-serif;fill:#57606a}.g{stroke:#8884;stroke-width:1}@media (prefers-color-scheme:dark){text{fill:#c9d1d9}}</style>
-<text x="90" y="30" style="font-size:17px;font-weight:600">Память демона (RSS) после нагрузки</text>
+<text x="90" y="30" style="font-size:17px;font-weight:600">Пиковая память демона (VmHWM) за прогон</text>
 <line class="g" x1="90" x2="800" y1="350.0" y2="350.0"/>
 <text x="82" y="355.0" text-anchor="end">0</text>
-<line class="g" x1="90" x2="800" y1="280.0" y2="280.0"/>
-<text x="82" y="285.0" text-anchor="end">5</text>
+<line class="g" x1="90" x2="800" y1="303.3" y2="303.3"/>
+<text x="82" y="308.3" text-anchor="end">5</text>
+<line class="g" x1="90" x2="800" y1="256.7" y2="256.7"/>
+<text x="82" y="261.7" text-anchor="end">10</text>
 <line class="g" x1="90" x2="800" y1="210.0" y2="210.0"/>
-<text x="82" y="215.0" text-anchor="end">10</text>
-<line class="g" x1="90" x2="800" y1="140.0" y2="140.0"/>
-<text x="82" y="145.0" text-anchor="end">15</text>
+<text x="82" y="215.0" text-anchor="end">15</text>
+<line class="g" x1="90" x2="800" y1="163.3" y2="163.3"/>
+<text x="82" y="168.3" text-anchor="end">20</text>
+<line class="g" x1="90" x2="800" y1="116.7" y2="116.7"/>
+<text x="82" y="121.7" text-anchor="end">25</text>
 <line class="g" x1="90" x2="800" y1="70.0" y2="70.0"/>
-<text x="82" y="75.0" text-anchor="end">20</text>
+<text x="82" y="75.0" text-anchor="end">30</text>
 <text x="90.0" y="374" text-anchor="middle">100</text>
 <text x="445.0" y="374" text-anchor="middle">1 000</text>
 <text x="800.0" y="374" text-anchor="middle">10 000</text>
 <text x="445.0" y="400" text-anchor="middle">число правил</text>
 <text x="20" y="210.0" transform="rotate(-90 20 210.0)" text-anchor="middle">МиБ</text>
-<polyline points="90.0,155.9 445.0,157.9 800.0,128.0" fill="none" stroke="#d9822b" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="157.9" y2="152.1" stroke="#d9822b" stroke-width="2"/>
-<circle cx="90.0" cy="155.9" r="5" fill="#d9822b"/>
-<text x="98.0" y="145.9">13.9</text>
-<line x1="445.0" x2="445.0" y1="157.9" y2="155.6" stroke="#d9822b" stroke-width="2"/>
-<circle cx="445.0" cy="157.9" r="5" fill="#d9822b"/>
-<text x="453.0" y="147.9">13.7</text>
-<line x1="800.0" x2="800.0" y1="129.1" y2="107.5" stroke="#d9822b" stroke-width="2"/>
-<circle cx="800.0" cy="128.0" r="5" fill="#d9822b"/>
-<text x="808.0" y="118.0">15.9</text>
+<polyline points="90.0,213.2 445.0,213.0 800.0,111.8" fill="none" stroke="#d9822b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="215.0" y2="212.8" stroke="#d9822b" stroke-width="2"/>
+<circle cx="90.0" cy="213.2" r="5" fill="#d9822b"/>
+<text x="98.0" y="203.2">14.7</text>
+<line x1="445.0" x2="445.0" y1="214.0" y2="212.6" stroke="#d9822b" stroke-width="2"/>
+<circle cx="445.0" cy="213.0" r="5" fill="#d9822b"/>
+<text x="453.0" y="203.0">14.7</text>
+<line x1="800.0" x2="800.0" y1="123.4" y2="105.5" stroke="#d9822b" stroke-width="2"/>
+<circle cx="800.0" cy="111.8" r="5" fill="#d9822b"/>
+<text x="808.0" y="101.8">25.5</text>
 <rect x="90" y="45" width="14" height="14" fill="#d9822b"/>
 <text x="110" y="57">оригинал (Go)</text>
-<polyline points="90.0,261.9 445.0,251.2 800.0,151.2" fill="none" stroke="#4f73c6" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="262.6" y2="261.9" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="90.0" cy="261.9" r="5" fill="#4f73c6"/>
-<text x="98.0" y="281.9">6.3</text>
-<line x1="445.0" x2="445.0" y1="253.4" y2="249.8" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="445.0" cy="251.2" r="5" fill="#4f73c6"/>
-<text x="453.0" y="271.2">7.1</text>
-<line x1="800.0" x2="800.0" y1="151.9" y2="150.3" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="800.0" cy="151.2" r="5" fill="#4f73c6"/>
-<text x="808.0" y="171.2">14.2</text>
+<polyline points="90.0,289.7 445.0,282.6 800.0,150.8" fill="none" stroke="#4f73c6" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="290.8" y2="289.5" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="90.0" cy="289.7" r="5" fill="#4f73c6"/>
+<text x="98.0" y="309.7">6.5</text>
+<line x1="445.0" x2="445.0" y1="283.1" y2="281.6" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="445.0" cy="282.6" r="5" fill="#4f73c6"/>
+<text x="453.0" y="302.6">7.2</text>
+<line x1="800.0" x2="800.0" y1="151.4" y2="150.1" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="800.0" cy="150.8" r="5" fill="#4f73c6"/>
+<text x="808.0" y="170.8">21.3</text>
 <rect x="250" y="45" width="14" height="14" fill="#4f73c6"/>
 <text x="270" y="57">mt-c</text>
-<polyline points="90.0,223.1 445.0,219.9 800.0,134.3" fill="none" stroke="#2e9e6b" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="226.0" y2="221.5" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="90.0" cy="223.1" r="5" fill="#2e9e6b"/>
-<text x="98.0" y="243.1">9.1</text>
-<line x1="445.0" x2="445.0" y1="221.0" y2="219.0" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="445.0" cy="219.9" r="5" fill="#2e9e6b"/>
-<text x="453.0" y="239.9">9.3</text>
-<line x1="800.0" x2="800.0" y1="136.4" y2="133.3" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="800.0" cy="134.3" r="5" fill="#2e9e6b"/>
-<text x="808.0" y="154.3">15.4</text>
+<polyline points="90.0,257.8 445.0,257.6 800.0,176.5" fill="none" stroke="#2e9e6b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="258.1" y2="256.3" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="90.0" cy="257.8" r="5" fill="#2e9e6b"/>
+<text x="98.0" y="277.8">9.9</text>
+<line x1="445.0" x2="445.0" y1="257.7" y2="256.8" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="445.0" cy="257.6" r="5" fill="#2e9e6b"/>
+<text x="453.0" y="277.6">9.9</text>
+<line x1="800.0" x2="800.0" y1="177.2" y2="175.7" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="800.0" cy="176.5" r="5" fill="#2e9e6b"/>
+<text x="808.0" y="196.5">18.6</text>
 <rect x="410" y="45" width="14" height="14" fill="#2e9e6b"/>
 <text x="430" y="57">firc</text>
 </svg>

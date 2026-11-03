@@ -15,40 +15,40 @@
 <text x="800.0" y="374" text-anchor="middle">10 000</text>
 <text x="445.0" y="400" text-anchor="middle">число правил</text>
 <text x="20" y="210.0" transform="rotate(-90 20 210.0)" text-anchor="middle">мс CPU</text>
-<polyline points="90.0,139.1 445.0,129.9 800.0,92.7" fill="none" stroke="#d9822b" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="139.7" y2="138.4" stroke="#d9822b" stroke-width="2"/>
-<circle cx="90.0" cy="139.1" r="5" fill="#d9822b"/>
-<text x="98.0" y="129.1">18.2</text>
-<line x1="445.0" x2="445.0" y1="130.9" y2="129.7" stroke="#d9822b" stroke-width="2"/>
-<circle cx="445.0" cy="129.9" r="5" fill="#d9822b"/>
-<text x="453.0" y="119.9">22.8</text>
-<line x1="800.0" x2="800.0" y1="93.0" y2="91.7" stroke="#d9822b" stroke-width="2"/>
-<circle cx="800.0" cy="92.7" r="5" fill="#d9822b"/>
-<text x="808.0" y="82.7">57.1</text>
+<polyline points="90.0,139.4 445.0,130.9 800.0,93.3" fill="none" stroke="#d9822b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="139.9" y2="138.6" stroke="#d9822b" stroke-width="2"/>
+<circle cx="90.0" cy="139.4" r="5" fill="#d9822b"/>
+<text x="98.0" y="129.4">18.1</text>
+<line x1="445.0" x2="445.0" y1="134.8" y2="130.7" stroke="#d9822b" stroke-width="2"/>
+<circle cx="445.0" cy="130.9" r="5" fill="#d9822b"/>
+<text x="453.0" y="120.9">22.3</text>
+<line x1="800.0" x2="800.0" y1="93.5" y2="93.0" stroke="#d9822b" stroke-width="2"/>
+<circle cx="800.0" cy="93.3" r="5" fill="#d9822b"/>
+<text x="808.0" y="83.3">56.3</text>
 <rect x="90" y="45" width="14" height="14" fill="#d9822b"/>
 <text x="110" y="57">оригинал (Go)</text>
-<polyline points="90.0,259.0 445.0,258.7 800.0,258.9" fill="none" stroke="#4f73c6" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="259.1" y2="259.0" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="90.0" cy="259.0" r="5" fill="#4f73c6"/>
-<text x="98.0" y="249.0">0.94</text>
-<line x1="445.0" x2="445.0" y1="258.7" y2="258.7" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="445.0" cy="258.7" r="5" fill="#4f73c6"/>
-<text x="453.0" y="248.7">0.95</text>
-<line x1="800.0" x2="800.0" y1="259.0" y2="258.8" stroke="#4f73c6" stroke-width="2"/>
-<circle cx="800.0" cy="258.9" r="5" fill="#4f73c6"/>
-<text x="808.0" y="248.9">0.95</text>
+<polyline points="90.0,261.6 445.0,261.5 800.0,261.2" fill="none" stroke="#4f73c6" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="261.6" y2="261.5" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="90.0" cy="261.6" r="5" fill="#4f73c6"/>
+<text x="98.0" y="251.6">0.89</text>
+<line x1="445.0" x2="445.0" y1="261.6" y2="261.5" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="445.0" cy="261.5" r="5" fill="#4f73c6"/>
+<text x="453.0" y="251.5">0.89</text>
+<line x1="800.0" x2="800.0" y1="261.7" y2="260.9" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="800.0" cy="261.2" r="5" fill="#4f73c6"/>
+<text x="808.0" y="251.2">0.89</text>
 <rect x="250" y="45" width="14" height="14" fill="#4f73c6"/>
 <text x="270" y="57">mt-c</text>
-<polyline points="90.0,266.2 445.0,266.5 800.0,266.3" fill="none" stroke="#2e9e6b" stroke-width="3"/>
-<line x1="90.0" x2="90.0" y1="266.6" y2="266.0" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="90.0" cy="266.2" r="5" fill="#2e9e6b"/>
-<text x="98.0" y="286.2">0.79</text>
-<line x1="445.0" x2="445.0" y1="266.5" y2="266.2" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="445.0" cy="266.5" r="5" fill="#2e9e6b"/>
-<text x="453.0" y="286.5">0.78</text>
-<line x1="800.0" x2="800.0" y1="266.3" y2="266.2" stroke="#2e9e6b" stroke-width="2"/>
-<circle cx="800.0" cy="266.3" r="5" fill="#2e9e6b"/>
-<text x="808.0" y="286.3">0.79</text>
+<polyline points="90.0,265.0 445.0,264.7 800.0,264.9" fill="none" stroke="#2e9e6b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="265.1" y2="264.8" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="90.0" cy="265.0" r="5" fill="#2e9e6b"/>
+<text x="98.0" y="285.0">0.81</text>
+<line x1="445.0" x2="445.0" y1="264.9" y2="264.6" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="445.0" cy="264.7" r="5" fill="#2e9e6b"/>
+<text x="453.0" y="284.7">0.82</text>
+<line x1="800.0" x2="800.0" y1="264.9" y2="264.7" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="800.0" cy="264.9" r="5" fill="#2e9e6b"/>
+<text x="808.0" y="284.9">0.82</text>
 <rect x="410" y="45" width="14" height="14" fill="#2e9e6b"/>
 <text x="430" y="57">firc</text>
 </svg>

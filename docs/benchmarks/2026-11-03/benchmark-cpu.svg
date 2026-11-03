@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" role="img">
+<title>Процессорное время демона на успешный запрос</title>
+<style>text{font:14px sans-serif;fill:#57606a}.g{stroke:#8884;stroke-width:1}@media (prefers-color-scheme:dark){text{fill:#c9d1d9}}</style>
+<text x="90" y="30" style="font-size:17px;font-weight:600">Процессорное время демона на успешный запрос</text>
+<line class="g" x1="90" x2="800" y1="350.0" y2="350.0"/>
+<text x="82" y="355.0" text-anchor="end">0.1</text>
+<line class="g" x1="90" x2="800" y1="256.7" y2="256.7"/>
+<text x="82" y="261.7" text-anchor="end">1</text>
+<line class="g" x1="90" x2="800" y1="163.3" y2="163.3"/>
+<text x="82" y="168.3" text-anchor="end">10</text>
+<line class="g" x1="90" x2="800" y1="70.0" y2="70.0"/>
+<text x="82" y="75.0" text-anchor="end">100</text>
+<text x="90.0" y="374" text-anchor="middle">100</text>
+<text x="445.0" y="374" text-anchor="middle">1 000</text>
+<text x="800.0" y="374" text-anchor="middle">10 000</text>
+<text x="445.0" y="400" text-anchor="middle">число правил</text>
+<text x="20" y="210.0" transform="rotate(-90 20 210.0)" text-anchor="middle">мс CPU</text>
+<polyline points="90.0,139.4 445.0,130.9 800.0,93.3" fill="none" stroke="#d9822b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="139.9" y2="138.6" stroke="#d9822b" stroke-width="2"/>
+<circle cx="90.0" cy="139.4" r="5" fill="#d9822b"/>
+<text x="98.0" y="129.4">18.1</text>
+<line x1="445.0" x2="445.0" y1="134.8" y2="130.7" stroke="#d9822b" stroke-width="2"/>
+<circle cx="445.0" cy="130.9" r="5" fill="#d9822b"/>
+<text x="453.0" y="120.9">22.3</text>
+<line x1="800.0" x2="800.0" y1="93.5" y2="93.0" stroke="#d9822b" stroke-width="2"/>
+<circle cx="800.0" cy="93.3" r="5" fill="#d9822b"/>
+<text x="808.0" y="83.3">56.3</text>
+<rect x="90" y="45" width="14" height="14" fill="#d9822b"/>
+<text x="110" y="57">оригинал (Go)</text>
+<polyline points="90.0,261.6 445.0,261.5 800.0,261.2" fill="none" stroke="#4f73c6" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="261.6" y2="261.5" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="90.0" cy="261.6" r="5" fill="#4f73c6"/>
+<text x="98.0" y="251.6">0.89</text>
+<line x1="445.0" x2="445.0" y1="261.6" y2="261.5" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="445.0" cy="261.5" r="5" fill="#4f73c6"/>
+<text x="453.0" y="251.5">0.89</text>
+<line x1="800.0" x2="800.0" y1="261.7" y2="260.9" stroke="#4f73c6" stroke-width="2"/>
+<circle cx="800.0" cy="261.2" r="5" fill="#4f73c6"/>
+<text x="808.0" y="251.2">0.89</text>
+<rect x="250" y="45" width="14" height="14" fill="#4f73c6"/>
+<text x="270" y="57">mt-c</text>
+<polyline points="90.0,265.0 445.0,264.7 800.0,264.9" fill="none" stroke="#2e9e6b" stroke-width="3"/>
+<line x1="90.0" x2="90.0" y1="265.1" y2="264.8" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="90.0" cy="265.0" r="5" fill="#2e9e6b"/>
+<text x="98.0" y="285.0">0.81</text>
+<line x1="445.0" x2="445.0" y1="264.9" y2="264.6" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="445.0" cy="264.7" r="5" fill="#2e9e6b"/>
+<text x="453.0" y="284.7">0.82</text>
+<line x1="800.0" x2="800.0" y1="264.9" y2="264.7" stroke="#2e9e6b" stroke-width="2"/>
+<circle cx="800.0" cy="264.9" r="5" fill="#2e9e6b"/>
+<text x="808.0" y="284.9">0.82</text>
+<rect x="410" y="45" width="14" height="14" fill="#2e9e6b"/>
+<text x="430" y="57">firc</text>
+</svg>
