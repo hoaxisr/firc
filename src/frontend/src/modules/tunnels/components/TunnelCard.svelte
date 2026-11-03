@@ -265,15 +265,17 @@
       </div>
     {/if}
 
-    <Collapsible.Content>
-      {#if open}
-        <div class="body" transition:slide>
-          <SourcesSection {store} bind:tunnel />
-          <NodesSection {store} bind:tunnel />
-          <FailoverSection {store} bind:tunnel />
-          <InboundsSection {store} bind:tunnel />
-        </div>
-      {/if}
+    <Collapsible.Content forceMount>
+      {#snippet child({ props, open })}
+        {#if open}
+          <div {...props} class="body" transition:slide>
+            <SourcesSection {store} bind:tunnel />
+            <NodesSection {store} bind:tunnel />
+            <FailoverSection {store} bind:tunnel />
+            <InboundsSection {store} bind:tunnel />
+          </div>
+        {/if}
+      {/snippet}
     </Collapsible.Content>
   </Collapsible.Root>
 </div>

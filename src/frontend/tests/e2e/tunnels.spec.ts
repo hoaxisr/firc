@@ -61,6 +61,30 @@ test.describe("Tunnels page", () => {
     await expect(failover.getByLabel("Active nodes")).toBeVisible();
   });
 
+  // Catches a slide measuring a hidden card or «More» body, which floods the console with NaN keyframes.
+  test("opening and closing a card and More animate without NaN heights", async ({ page }) => {
+    const nan: string[] = [];
+    page.on("console", (m) => {
+      if (m.text().includes("NaN")) nan.push(m.text());
+    });
+    await stubDaemon(page, {
+      tunnels: [tunnel("a", "tunvless0")],
+      states: [state("a", "tunvless0")],
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.expand("a");
+    const more = tunnels.card("a").getByRole("button", { name: /^More: connect timeout/ });
+    await more.click();
+    await page.waitForTimeout(500);
+    await more.click();
+    await page.waitForTimeout(500);
+    await tunnels.card("a").getByRole("button", { name: "Collapse", exact: true }).click();
+    await expect(tunnels.card("a").getByText(/^\d+ of \d+ match$/)).toHaveCount(0);
+    await page.waitForTimeout(500);
+    expect(nan).toEqual([]);
+  });
+
   test("source addresses stay hidden until shown", async ({ page }) => {
     await stubDaemon(page, {});
     const tunnels = new TunnelsPage(page);
@@ -573,7 +597,7 @@ test.describe("Tunnels page", () => {
     await tunnels.open();
     await tunnels.expand("a");
     await expect(tunnels.nodeRows("a")).toHaveCount(3);
-    await tunnels.card("a").getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
 
     const unnamed = await page.evaluate(() =>
       [...document.querySelectorAll('[data-tunnel] button, [data-tunnel] [role="switch"]')]

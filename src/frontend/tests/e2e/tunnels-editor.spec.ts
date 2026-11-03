@@ -42,7 +42,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.open();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     const sw = card.getByRole("switch", { name: "TCP through the kernel" });
     await expect(sw).not.toBeChecked();
     await sw.click();
@@ -67,7 +67,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.open();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     await expect(page.getByText("will restart on save")).toHaveCount(0);
     await card.getByRole("button", { name: "ClientHello fingerprint" }).click();
     await page.locator('[data-select-item][data-value="firefox"]').click();
@@ -87,7 +87,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.open();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     const hint = card.getByText("Firefox lists AES first", { exact: false });
     await expect(hint).toHaveCount(0);
     await card.getByRole("button", { name: "ClientHello fingerprint" }).click();
@@ -109,7 +109,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.openOnPhone();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     await card.getByRole("button", { name: "ClientHello fingerprint" }).click();
     await page.locator('[data-select-item][data-value="firefox"]').click();
     const hint = card.getByText("Firefox lists AES first", { exact: false });
@@ -166,7 +166,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.open();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     await expect(card).toContainText("Not used for: Home, nwg2 (access list denies)");
     await card.getByRole("switch", { name: "TCP through the kernel" }).click();
     await expect(card).not.toContainText("Not used for:");
@@ -191,7 +191,7 @@ test.describe("Tunnel editor", () => {
     await tunnels.open();
     await tunnels.expand("a");
     const card = tunnels.card("a");
-    await card.getByRole("button", { name: "More: connect timeout" }).click();
+    await tunnels.more("a");
     await expect(card).toContainText(
       "Not working now: an access list cannot be read or judged, TCP goes through the TUN. Details in the journal",
     );

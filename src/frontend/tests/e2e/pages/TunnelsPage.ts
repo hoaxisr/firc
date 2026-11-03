@@ -243,6 +243,21 @@ export class TunnelsPage {
   async expand(id: string) {
     await this.card(id).getByRole("button", { name: "Expand", exact: true }).click();
     await expect(this.card(id).getByText(/^\d+ of \d+ match$/)).toBeVisible();
+    await this.stillAfterAnimation(id);
+  }
+
+  async more(id: string) {
+    await this.card(id)
+      .getByRole("button", { name: /^More: connect timeout/ })
+      .click();
+    await this.stillAfterAnimation(id);
+  }
+
+  async stillAfterAnimation(id: string) {
+    await this.card(id).evaluate(async (el) => {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await Promise.all(el.getAnimations({ subtree: true }).map((a) => a.finished));
+    });
   }
 
   nodeRows(id: string): Locator {

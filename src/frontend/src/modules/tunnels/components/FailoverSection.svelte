@@ -151,12 +151,14 @@
           "More: connect timeout, certificate check, TCP through the kernel, own CA, device name",
         )}{helloNote ? `, ${helloNote}` : ""}
       </Collapsible.Trigger>
-      <Collapsible.Content>
-        {#if more}
-          <div transition:slide>
-            <AdvancedSection {store} bind:tunnel />
-          </div>
-        {/if}
+      <Collapsible.Content forceMount>
+        {#snippet child({ props, open })}
+          {#if open}
+            <div {...props} transition:slide>
+              <AdvancedSection {store} bind:tunnel />
+            </div>
+          {/if}
+        {/snippet}
       </Collapsible.Content>
     </Collapsible.Root>
   {/if}
