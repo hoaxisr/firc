@@ -320,6 +320,20 @@ test("to group adds the exact address", async ({ page }) => {
   await expect(page.getByText("34.107.243.93 added to «Blocked»")).toBeVisible();
 });
 
+// Catches the groups tab stuck on its loading placeholder after an address was added from here.
+test("after adding an address the groups tab shows its groups", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  await open(page);
+  const row = page.locator("[data-address='34.107.243.93']");
+  await row.getByRole("button", { name: "To group" }).click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect(page.getByText("34.107.243.93 added to «Blocked»")).toBeVisible();
+  await page.getByRole("tab", { name: "Groups" }).click();
+  await expect(page.getByText("Loading groups...")).toHaveCount(0, { timeout: 5000 });
+  await expect(page.getByText("Blocked").first()).toBeVisible();
+});
+
 test("an ipv6 row adds a subnet6 rule", async ({ page }) => {
   const fake = a1();
   await shell(page, fake);

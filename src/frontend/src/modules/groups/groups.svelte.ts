@@ -711,7 +711,7 @@ export class GroupsStore {
   }
 
   mount = async () => {
-    this.finishedGroupsCount = 0;
+    if (!this.dataLoaded) this.finishedGroupsCount = 0;
     this.fetchError = false;
     try {
       const ticket = this.#liveTicket();
