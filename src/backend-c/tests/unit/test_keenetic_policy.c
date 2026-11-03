@@ -1833,6 +1833,12 @@ static firc_err_t fake_get(void *ud, const char *path, char **body) {
     return *body != NULL ? FIRC_OK : FIRC_ERR_NOMEM;
 }
 
+static const char POLICIES_SPACED[] =
+    "{ \"Policy0\":{\"description\":\"Kids\",\"permit\":[]},"
+    "\"Policy1\":{\"description\":\"Work VPN\"},"
+    "\"Policy9\":{\"description\":\"Guests\"},"
+    "\"FircTest\":{\"description\":\"\"}}";
+
 static size_t count_hosts(const firc_kn_policy_map_t *m, const char *policy) {
     addrs_t x = {.n = 0};
     (void)firc_kn_policy_map_policy_hosts(m, policy, false, collect_addr, &x);
@@ -1882,14 +1888,15 @@ TEST a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried(void)
     g_changes = 0;
     firc_kn_policies_t *p = firc_kn_policies_start_notify(NULL, 0, count_changes, NULL);
     ASSERT(p != NULL);
-    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, NULL, NULL};
+    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL};
+    rci_fake_t ok_spaced = {NULL, 0, NULL, POLICIES_SPACED, NULL}, bad_plain = {"/rci/show/ip/policy", 0, NULL, NULL, NULL};
     int fd = log_file();
     if (fd < 0) { firc_kn_policies_stop(p); }
     ASSERT(fd >= 0);
     firc_log_set_fd(fd);
     int seen[5];
     uint32_t mark_live[5] = {0};
-    rci_fake_t *round[5] = {&ok, &bad, &bad, &ok, &bad};
+    rci_fake_t *round[5] = {&ok, &bad, &bad, &ok_spaced, &bad_plain};
     firc_err_t err = FIRC_OK;
     for (size_t i = 0; i < 5 && err == FIRC_OK; i++) {
         err = firc_kn_policies_round_for_test(p, fake_get, round[i]);
@@ -1902,7 +1909,7 @@ TEST a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried(void)
     size_t back = log != NULL ? count_of(log, " INF keenetic policies: the policy marks: recovered after 2 failures") : 99;
     free(log);
     ASSERT_EQ(FIRC_OK, err);
-    ASSERT_EQm("the failing read was asked for", 3, bad.asked_marks);
+    ASSERT_EQm("the failing reads were asked for", 3, bad.asked_marks + bad_plain.asked_marks);
     ASSERT_EQ_FMTm("said once per streak", (size_t)2, warned, "%zu");
     ASSERT_EQ_FMTm("and its return once", (size_t)1, back, "%zu");
     for (size_t i = 0; i < 5; i++) {
@@ -1912,13 +1919,57 @@ TEST a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried(void)
     PASS();
 }
 
+/* Catches: the marks document read every round (ndm walks every route for it), or not again after the list changed. */
+TEST the_marks_are_read_only_when_the_policy_list_changes(void) {
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    rci_fake_t r = {NULL, 0, NULL, NULL, NULL};
+    int asked[4];
+    uint32_t mark[4] = {0};
+    const char *lists[4] = {NULL, NULL, POLICIES_SPACED, POLICIES_SPACED};
+    firc_err_t err = FIRC_OK;
+    for (size_t i = 0; i < 4 && err == FIRC_OK; i++) {
+        r.policies = lists[i];
+        err = firc_kn_policies_round_for_test(p, fake_get, &r);
+        asked[i] = r.asked_marks;
+        (void)firc_kn_policy_map_mark(firc_kn_policies_live_for_test(p), "Kids", &mark[i]);
+    }
+    firc_kn_policies_stop(p);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQm("read at the first round", 1, asked[0]);
+    ASSERT_EQm("not again for the same list", 1, asked[1]);
+    ASSERT_EQm("again for a changed list", 2, asked[2]);
+    ASSERT_EQm("not again after it", 2, asked[3]);
+    for (size_t i = 0; i < 4; i++) { ASSERT_EQ_FMT(0x0ffffaabu, mark[i], "0x%x"); }
+    PASS();
+}
+
+/* Catches: a marks document with no mark yet (ndm still starting) taken as read for good. */
+TEST a_marks_document_without_marks_is_read_again(void) {
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    rci_fake_t r = {NULL, 0, "{\"Policy9\":{\"description\":\"Guests\"}}", NULL, NULL};
+    firc_err_t e1 = firc_kn_policies_round_for_test(p, fake_get, &r);
+    r.marks = NULL;
+    firc_err_t e2 = firc_kn_policies_round_for_test(p, fake_get, &r);
+    firc_err_t e3 = firc_kn_policies_round_for_test(p, fake_get, &r);
+    uint32_t mark = 0;
+    bool has = firc_kn_policy_map_mark(firc_kn_policies_live_for_test(p), "Kids", &mark);
+    firc_kn_policies_stop(p);
+    ASSERT(e1 == FIRC_OK && e2 == FIRC_OK && e3 == FIRC_OK);
+    ASSERT_EQm("asked again, then held", 2, r.asked_marks);
+    ASSERTm("the mark arrived", has);
+    ASSERT_EQ_FMT(0x0ffffaabu, mark, "0x%x");
+    PASS();
+}
+
 /* Catches: carried marks not checked for a clash, so it is said twice. */
 TEST a_clash_carried_across_a_failed_marks_read_is_said_once(void) {
     static const char CLASH[] = "{\"Policy0\":{\"mark\":\"ffffaab\"},\"Policy1\":{\"mark\":\"f01faab\"}}";
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
     rci_fake_t first = {NULL, 0, CLASH, NULL, NULL};
-    rci_fake_t moved = {"/rci/show/ip/policy", 0, NULL, NULL, QUIET_1};
+    rci_fake_t moved = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, QUIET_1};
     rci_fake_t back = {NULL, 0, CLASH, NULL, QUIET_OFF};
     int fd = log_file();
     if (fd < 0) { firc_kn_policies_stop(p); }
@@ -1964,7 +2015,7 @@ TEST a_deny_policy_keeps_its_mark_across_a_failed_marks_read(void) {
     static const char WITHOUT_KIDS[] = "{\"Policy1\":{\"description\":\"Work VPN\"}}";
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
-    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, NULL, NULL};
+    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL};
     rci_fake_t gone = {"/rci/show/ip/policy", 0, NULL, WITHOUT_KIDS, NULL};
     firc_log_set_output_floor(FIRC_LOG_ERROR);
     firc_err_t e1 = firc_kn_policies_round_for_test(p, fake_get, &ok);
@@ -2108,6 +2159,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried);
     RUN_TEST(a_deny_policy_keeps_its_mark_across_a_failed_marks_read);
     RUN_TEST(a_clash_carried_across_a_failed_marks_read_is_said_once);
+    RUN_TEST(the_marks_are_read_only_when_the_policy_list_changes);
+    RUN_TEST(a_marks_document_without_marks_is_read_again);
     RUN_TEST(the_loop_s_lookups_answer_from_the_latest_map);
     RUN_TEST(a_mark_for_a_name_the_router_lacks_is_said_as_unknown);
     RUN_TEST(a_policy_lists_every_address_of_its_hosts);

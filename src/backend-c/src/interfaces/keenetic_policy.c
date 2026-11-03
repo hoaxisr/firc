@@ -806,6 +806,7 @@ struct firc_kn_policies {
     void *on_change_ud;
     bool clash_said;
     firc_logrep_t marks_failing;
+    char *marks_list;
     mark_t *good_marks;
     size_t n_good_marks;
     bool announce_owed;
@@ -863,25 +864,32 @@ static firc_err_t fetch_segments(firc_kn_rci_get_fn get, void *ud, firc_kn_polic
     return err;
 }
 
-static firc_err_t fetch_with(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_map_t **out, firc_err_t *marks_err) {
+static firc_err_t fetch_with(firc_kn_rci_get_fn get, void *ud, const char *known, firc_kn_policy_map_t **out,
+                             firc_err_t *marks_err, bool *asked, char **list) {
     *out = NULL;
     if (marks_err != NULL) { *marks_err = FIRC_OK; }
     char *hosts = NULL, *policies = NULL, *marks = NULL;
     firc_err_t err = get(ud, "/rci/show/ip/hotspot", &hosts);
     /* Hosts, policy list and segments are all-or-nothing: a partial map would misroute whole sets of clients. */
     if (err == FIRC_OK) { err = get(ud, "/rci/show/rc/ip/policy", &policies); }
+    bool ask = err == FIRC_OK && (known == NULL || strcmp(known, policies) != 0);
     /* Marks are not all-or-nothing: without them the round still refreshes hosts and segments. */
-    firc_err_t merr = err == FIRC_OK ? get(ud, "/rci/show/ip/policy", &marks) : FIRC_OK;
+    firc_err_t merr = ask ? get(ud, "/rci/show/ip/policy", &marks) : FIRC_OK;
     if (err == FIRC_OK) { err = firc_kn_policy_map_parse(hosts, policies, out); }
-    if (err == FIRC_OK && merr == FIRC_OK) {
+    if (err == FIRC_OK && ask && merr == FIRC_OK) {
         merr = firc_kn_policy_map_add_marks(*out, marks);
         if (merr == FIRC_ERR_NOMEM) { err = merr; }
     }
     if (marks_err != NULL) { *marks_err = merr; }
+    if (asked != NULL) { *asked = ask; }
     free(hosts);
-    free(policies);
     free(marks);
     if (err == FIRC_OK) { err = fetch_segments(get, ud, *out); }
+    if (err == FIRC_OK && list != NULL) {
+        *list = policies;
+        policies = NULL;
+    }
+    free(policies);
     if (err != FIRC_OK && *out != NULL) {
         firc_kn_policy_map_free(*out);
         *out = NULL;
@@ -890,7 +898,7 @@ static firc_err_t fetch_with(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_ma
 }
 
 firc_err_t firc_kn_policy_map_fetch_for_test(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_map_t **out) {
-    return fetch_with(get, ud, out, NULL);
+    return fetch_with(get, ud, NULL, out, NULL, NULL, NULL);
 }
 
 static void marks_free(mark_t *v, size_t n) {
@@ -905,23 +913,24 @@ static bool listed(const firc_kn_policy_map_t *m, const char *policy) {
     return false;
 }
 
-static void keep_marks(firc_kn_policies_t *p, const firc_kn_policy_map_t *m) {
+static bool keep_marks(firc_kn_policies_t *p, const firc_kn_policy_map_t *m) {
     marks_free(p->good_marks, p->n_good_marks);
     p->good_marks = NULL;
     p->n_good_marks = 0;
-    if (m->n_marks == 0) { return; }
+    if (m->n_marks == 0) { return m->n_aliases == 0; }
     mark_t *v = calloc(m->n_marks, sizeof(*v));
-    if (v == NULL) { return; }
+    if (v == NULL) { return false; }
     for (size_t i = 0; i < m->n_marks; i++) {
         v[i].policy = strdup(m->marks[i].policy);
         v[i].mark = m->marks[i].mark;
         if (v[i].policy == NULL) {
             marks_free(v, i);
-            return;
+            return false;
         }
     }
     p->good_marks = v;
     p->n_good_marks = m->n_marks;
+    return true;
 }
 
 /* Carry the last marks only for policies the fresh list still names. */
@@ -938,11 +947,18 @@ static firc_err_t carry_marks(const firc_kn_policies_t *p, firc_kn_policy_map_t 
 static firc_err_t refresh_round(firc_kn_policies_t *p, firc_kn_rci_get_fn get, void *ud) {
     firc_kn_policy_map_t *m = NULL;
     firc_err_t merr = FIRC_OK;
-    firc_err_t err = fetch_with(get, ud, &m, &merr);
+    bool asked = false;
+    char *list = NULL;
+    /* ndm walks every route of both families to answer the marks document, so it is read only for a new list. */
+    firc_err_t err = fetch_with(get, ud, p->marks_list, &m, &merr, &asked, &list);
     if (err != FIRC_OK) { return err; }
-    if (merr == FIRC_OK) {
-        keep_marks(p, m);
-    } else {
+    bool held = asked && merr == FIRC_OK && keep_marks(p, m);
+    if (asked) {
+        free(p->marks_list);
+        p->marks_list = held ? list : NULL;
+    }
+    if (!held) { free(list); }
+    if (!asked || merr != FIRC_OK) {
         /* Without marks a deny would MARK unlisted IPv6 clients of the policy. */
         err = carry_marks(p, m);
         if (err != FIRC_OK) {
@@ -950,12 +966,12 @@ static firc_err_t refresh_round(firc_kn_policies_t *p, firc_kn_rci_get_fn get, v
             return err;
         }
     }
-    if (merr != FIRC_OK) {
+    if (asked && merr != FIRC_OK) {
         firc_logrep_fail(&p->marks_failing, FIRC_LOG_WARN, NULL,
                          "keenetic policies: the policy marks could not be read (%s); the last marks read are kept "
                          "until they can",
                          firc_err_str(merr));
-    } else {
+    } else if (asked) {
         (void)firc_logrep_ok(&p->marks_failing, NULL, "keenetic policies: the policy marks");
     }
     (void)firc_kn_policies_offer(p, m);
@@ -1043,6 +1059,7 @@ void firc_kn_policies_stop(firc_kn_policies_t *p) {
     pthread_mutex_unlock(&p->mu);
 
     marks_free(p->good_marks, p->n_good_marks);
+    free(p->marks_list);
     firc_kn_policy_map_free(p->pending);
     firc_kn_policy_map_free(p->live);
     free_retired(p->retired);
