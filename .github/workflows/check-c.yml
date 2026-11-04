@@ -407,7 +407,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.SDK_HOME }}
-          key: mips-sdk-${{ env.SDK_ASSET }}-${{ env.SDK_TAG }}-${{ hashFiles('tools/ci/entware-package/Makefile') }}-1
+          key: mips-sdk-${{ env.SDK_ASSET }}-${{ env.SDK_TAG }}-${{ hashFiles('tools/ci/entware-package/Makefile', 'tools/ci/entware-sdk/feeds.conf') }}-2
 
       - name: Fetch SDK
         if: steps.sdk_cache.outputs.cache-hit != 'true'
@@ -434,7 +434,7 @@ jobs:
           cp "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
           chmod +x "$SDK_HOME/shim/python2" "$SDK_HOME/shim/python2.7"
           cd "$SDK_HOME/$SDK_ASSET"
-          cp feeds.conf.default feeds.conf
+          cp "$GITHUB_WORKSPACE/tools/ci/entware-sdk/feeds.conf" feeds.conf
           echo "src-link action $feed/" >> feeds.conf
           export PATH="$SDK_HOME/shim:$PATH"
           ./scripts/feeds update -a
