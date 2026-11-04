@@ -45,7 +45,8 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-dl-reality-auto xhttp-dl-packet-tls xhttp-dl-none xhttp-dl-extra xhttp-dl-post-main
            xhttp-dl-name xhttp-dl-route xhttp-dl-neg-path xhttp-dl-neg-sess
            xmux-count-one xmux-count-packet xmux-count-up xmux-concurrency xmux-requests xmux-reuse
-           xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall"
+           xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall
+           h2-wire-reality h2-wire-tls h2-credit h2-speed"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -165,7 +166,7 @@ dl_cfg() {
 }
 neg() { EXPECT=fail; XP="{\"path\":\"/xp/\",\"mode\":\"packet-up\",$1}"; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up"; }
 case_cfg() {
-    SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""
+    SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""
     DL=""; DH="$S_IP2"; BP=/xp/
     XP='{"path":"/xp/"}'
     case "$1" in
@@ -250,17 +251,21 @@ case_cfg() {
     xmux-kill|xmux-up-parallel) xm stream-one '{"maxConnections":1}' ;;
     xmux-ping)               SEC=none; xm stream-one '{"hKeepAlivePeriod":2}' ;;
     xmux-dl)                 dl reality stream-up "" "" ;;
+    h2-wire-reality|h2-credit) xm stream-one ""; KEYLOG=1 ;;
+    h2-wire-tls)             SEC=tls; TUN_ARGS="--ca $W/mask.pem"; xm packet-up ""; KEYLOG=1 ;;
+    h2-speed)                xm stream-one "" ;;
     *) echo "run-xray: unknown case $1"; exit 2 ;;
     esac
     [ -z "$DL" ] || dl_cfg
-    case "$1" in xhttp-*|xmux-*|v6-carry-xhttp|node6-xhttp) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    case "$1" in xhttp-*|xmux-*|h2-*|v6-carry-xhttp|node6-xhttp) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    KL=""; [ -z "$KEYLOG" ] || { KL=",\"masterKeyLog\":\"$W/keys.log\""; LPORT=18444; }
     if [ "$SEC" = none ]; then
         SECJ='"security":"none"'; LSEC="security=none"
     elif [ "$SEC" = reality ]; then
-        SECJ="\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"$S_IP:8443\",\"xver\":0,\"serverNames\":[\"$MASK\"],\"privateKey\":\"$PRIV\",\"shortIds\":[\"$SID\"]}"
+        SECJ="\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"$S_IP:8443\",\"xver\":0,\"serverNames\":[\"$MASK\"],\"privateKey\":\"$PRIV\",\"shortIds\":[\"$SID\"]$KL}"
         LSEC="security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome"
     else
-        SECJ="\"security\":\"tls\",\"tlsSettings\":{\"alpn\":[\"h2\",\"http/1.1\"],\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"keyFile\":\"$W/mask.key\"}]}"
+        SECJ="\"security\":\"tls\",\"tlsSettings\":{\"alpn\":[\"h2\",\"http/1.1\"],\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"keyFile\":\"$W/mask.key\"}]$KL}"
         LSEC="security=tls&sni=$MASK&alpn=h2&fp=chrome"
     fi
 }
@@ -340,7 +345,7 @@ srv_v6() {
 }
 
 xm() { XMODE=$1; XMUX=$2; Q="type=xhttp&path=%2Fxp%2F&mode=$1${2:+&extra=$(enc "{\"xmux\":$2}")}"; }
-sub_write() { printf '%s\n' "vless://$UUID@$HOST:$PORT?encryption=none&$Q&$LSEC#$MODE" > "$W/sub.txt"; }
+sub_write() { printf '%s\n' "vless://$UUID@$HOST:${LPORT:-$PORT}?encryption=none&$Q&$LSEC#$MODE" > "$W/sub.txt"; }
 est() { ip netns exec "$NSS" ss -Htn state established "( sport = :$PORT )" | wc -l; }
 est_samp() {
     i=0; : > "$2"
@@ -386,7 +391,7 @@ xc_up() {
     cat > "$W/xc-$MODE.json" <<JSON
 {"log":{"loglevel":"warning"},
  "inbounds":[{"listen":"127.0.0.1","port":18080,"protocol":"dokodemo-door","settings":{"address":"$TARGET","port":8080,"network":"tcp"}}],
- "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$S_IP","port":$PORT,"users":[{"id":"$UUID","encryption":"none"}]}]},
+ "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$S_IP","port":${LPORT:-$PORT},"users":[{"id":"$UUID","encryption":"none"}]}]},
    "streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/xp/","mode":"$XMODE"$XMJ},$CS}}]}
 JSON
     ip netns exec "$NSC" "$XRAY" run -c "$W/xc-$MODE.json" > "$W/xc-$MODE.log" 2>&1 &
@@ -418,6 +423,7 @@ xcount() {
     [ "$lr" -eq 0 ] || { echo "run-xray: FAIL — the load failed ($1)"; XR=1; }
 }
 rss() { awk '/^VmRSS:/ { print $2 }' "/proc/$SPID/status"; }
+cpu() { sed 's/.*) //' "/proc/$SPID/stat" | awk '{ print $12 + $13 }'; }
 evwait() { i=0; while [ $i -lt 75 ] && ! grep -qF "$1" "$W/kev"; do sleep 0.2; i=$((i + 1)); done; grep -qF "$1" "$W/kev"; }
 socks_load() {
     ip netns exec "$NSC" python3 -c '
@@ -472,6 +478,65 @@ for i in range(int(sys.argv[2])):
 time.sleep(float(sys.argv[3]))
 print("holders: %d connections held unread" % len(ss))
 ' "$TARGET" 20 "$1"
+}
+tap_up() {
+    TAPD="$W/tap-$MODE-$1"
+    ip netns exec "$NSS" python3 tests/tlstap.py --listen "$S_IP:$LPORT" --to "$S_IP:$PORT" --dir "$TAPD" \
+        > "$W/tap-$MODE-$1.log" 2>&1 &
+    RPID=$!; PIDS="$PIDS $RPID"
+    for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " && break; sleep 0.25; done
+    ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " || { echo "run-xray: FAIL — the relay did not start"; return 1; }
+}
+tap_down() { [ -z "$RPID" ] || { kill "$RPID" 2>/dev/null || true; wait "$RPID" 2>/dev/null || true; }; RPID=""; }
+tap_conns() { ls "$1" 2>/dev/null | sed -n 's/\.c2s$//p' | sort -n; }
+h2t() { "$H2TAP" "$1" "$W/keys.log" "$2/$3.c2s" "$2/$3.s2c" ${4:+"$4"}; }
+tap_check() {
+    nc=0; NA=0
+    for n in $(tap_conns "$1"); do
+        nc=$((nc + 1))
+        o=$(h2t check "$1" "$n" 2>&1) && r=0 || r=$?
+        f=$(h2t first "$1" "$n" 2>/dev/null) || f=?
+        a=$(h2t afterack "$1" "$n" 2>/dev/null) || a=?
+        hb=$(h2t dump "$1" "$n" 2>/dev/null | grep -o '\[hb=[0-9a-f]*' | sed 's/\[hb=//' | tr '\n' ' ') || hb=
+        echo "run-xray: $2 connection $n: $o; $f; blocks start $hb; first after the ACK $a"
+        [ "$r" -eq 0 ] || { echo "run-xray: FAIL — $2 connection $n: h2tap check exit $r"; XR=1; }
+        [ "$a" = none ] || NA=$((NA + 1))
+        [ -n "${3:-}" ] || continue
+        [ "$f" = "$3" ] || { echo "run-xray: FAIL — $2 connection $n: $f, expected $3"; XR=1; }
+        [ "$a" = none ] || [ "$a" = 3fe11f ] || { echo "run-xray: FAIL — $2 connection $n: the first block after the ACK starts $a, expected 3fe11f"; XR=1; }
+    done
+    want "$2 connections through the tap" "$nc" ge 1
+}
+tap_names() { for n in $(tap_conns "$1"); do h2t names "$1" "$n" "$2" 2>/dev/null && return 0; done; echo none; }
+up200() {
+    ip netns exec "$NSC" python3 -c '
+import socket, sys
+h, p = sys.argv[1].rsplit(":", 1)
+s = socket.create_connection((h, int(p)), 20)
+s.settimeout(30)
+s.sendall(b"POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: 200000\r\nConnection: close\r\n\r\n" + b"u" * 200000)
+r = b""
+while True:
+    d = s.recv(65536)
+    if not d:
+        break
+    r += d
+print("upload: %s" % r.split(b"\r\n\r\n", 1)[-1].decode())
+sys.exit(0 if r.endswith(b"ok 200000") else 1)' "$TGT"
+}
+h2_load() {
+    case "$MODE" in
+    h2-wire-reality) lrun "$1" --dur 3 --down 0 --up 0 --rate 1 ;;
+    h2-wire-tls)     lrun "$1" --dur 3 --down 0 --up 0 --rate 1 && up200 ;;
+    h2-credit)       lrun "$1" --dur 5 --down 1 --up 0 --rate 0 --report 5 ;;
+    esac
+}
+h2_run() {
+    tap_down; tap_up "$1" || return 1
+    if [ "$1" = t ]; then tun_up "$BIN" t || return 1; else xc_up || return 1; fi
+    h2_load "$1" || { echo "run-xray: FAIL — the load failed ($1)"; XR=1; }
+    sleep 1
+    tun_down; xc_down; sleep 0.5; tap_down
 }
 xmux_case() {
     m=$1; XR=0
@@ -593,18 +658,74 @@ NFT
         want "redirected connections" "$(ip netns exec "$NSC" nft list table ip xredir | sed -n 's/.*packets \([0-9]*\) .*/\1/p')" eq 5
         grep -q '"type":"bytes"' "$W/kev" && echo "run-xray: tunvless reported redirected bytes" || {
             echo "run-xray: FAIL — no bytes event for the redirected flows"; XR=1; } ;;
+    h2-wire-reality|h2-wire-tls)
+        tap_down; tap_up q || return 1
+        out=$(probe); tap_down
+        is_ok "$out" || { echo "run-xray: FAIL — the probe through the tap: $out"; XR=1; }
+        h2_run t || return 1
+        h2_run x || return 1
+        tap_check "$W/tap-$MODE-q" "tunvless probe"
+        tap_check "$W/tap-$MODE-t" tunvless headers-first
+        [ "$m" != h2-wire-tls ] || want "tunvless connections with a block after the ACK" "$NA" ge 1
+        tap_check "$W/tap-$MODE-x" "Xray client"
+        ms=POST; [ "$m" = h2-wire-tls ] && ms="GET POST"
+        for me in $ms; do
+            nt=$(tap_names "$W/tap-$MODE-t" "$me"); nx=$(tap_names "$W/tap-$MODE-x" "$me")
+            echo "run-xray: $me names, tunvless:    $nt"
+            echo "run-xray: $me names, Xray client: $nx"
+            [ "$nt" != none ] && [ "$nt" = "$nx" ] || { echo "run-xray: FAIL — the $me names differ"; XR=1; }
+        done
+        if [ "$m" = h2-wire-tls ]; then
+            for c in t x; do
+                case " $(tap_names "$W/tap-$MODE-$c" POST) " in *" content-length "*) ;;
+                *) echo "run-xray: FAIL — no content-length in the first POST ($c)"; XR=1 ;; esac
+            done
+        fi ;;
+    h2-credit)
+        h2_run t || return 1
+        h2_run x || return 1
+        tap_check "$W/tap-$MODE-t" tunvless
+        tap_check "$W/tap-$MODE-x" "Xray client"
+        for c in t x; do
+            pa=0; l0=0; ls=0
+            for n in $(tap_conns "$W/tap-$MODE-$c"); do
+                w=$(h2t wu "$W/tap-$MODE-$c" "$n" 2>&1) || { echo "run-xray: FAIL — $c connection $n: h2tap wu: $w"; XR=1; continue; }
+                set -- $w
+                pa=$((pa + $2)); l0=$((l0 + $4)); ls=$((ls + $6))
+            done
+            mb=$(lres "$c" 3); d=${mb:-0}; [ "$d" -gt 0 ] || d=1
+            echo "run-xray: $c: ${mb:-?} MB down, pairs $pa, lone0 $l0, lonestream $ls, pairs per MB $((pa / d))"
+            eval "pm_$c=$((pa * 1000 / d)) ls_$c=$ls"
+        done
+        want "tunvless pairs per 1000 MB against Xray's $pm_x (x/1.5)" "$pm_t" ge "$((pm_x * 2 / 3))"
+        want "tunvless pairs per 1000 MB against Xray's $pm_x (x*1.5)" "$pm_t" le "$((pm_x * 3 / 2))"
+        want "tunvless lone stream WINDOW_UPDATEs" "$ls_t" eq 0 ;;
+    h2-speed)
+        for b in base cur; do
+            bin=$BIN; [ "$b" = base ] && bin=$TUNVLESS_BASE
+            tun_up "$bin" "$b" || return 1
+            lrun "$b" --dur 20 --down 2 --up 2 --rate 0 --report 5 || XR=1
+            tun_down
+        done
+        for k in 3 4; do
+            vb=$(lres base $k); vc=$(lres cur $k); d=down; [ $k = 4 ] && d=up
+            echo "run-xray: MB $d: base ${vb:-?}, this build ${vc:-?}"
+            want "MB $d, percent of the base" "$((${vc:-0} * 100 / (${vb:-0} + 1)))" ge 80
+        done ;;
     xmux-stall)
         tun_up "$BIN" t || return 1
-        lrun w --dur 3 --down 20 --up 0 --rate 0 --report 10 || XR=1
+        lrun w --dur 3 --down 0 --up 0 --rate 20 --report 10 || XR=1
         sleep 2
-        r0=$(rss); o0=$(nft_val dlcnt bytes out1)
+        r0=$(rss); o0=$(nft_val dlcnt bytes out1); c0=$(cpu)
         hold_load 10 > "$W/load-$MODE-hold.log" 2>&1 & HP=$!; PIDS="$PIDS $HP"
         mx=$r0; i=0
         while [ $i -lt 20 ]; do r=$(rss); [ "$r" -le "$mx" ] || mx=$r; i=$((i + 1)); sleep 0.5; done
-        o1=$(nft_val dlcnt bytes out1)
+        o1=$(nft_val dlcnt bytes out1); c1=$(cpu)
         wait "$HP" || XR=1; sed 's/^/    /' "$W/load-$MODE-hold.log"
-        want "VmRSS growth while 20 flows are not read, KiB (from $r0)" "$((mx - r0))" le 6144
-        want "bytes the node sent meanwhile" "$((o1 - o0))" ge 3145728 ;;
+        echo "run-xray: CPU time of tunvless while 20 flows are not read: $((c1 - c0)) ticks"
+        want "VmRSS growth while 20 flows are not read, KiB (from $r0)" "$((mx - r0))" le 36864
+        want "VmRSS growth while 20 flows are not read, KiB (from $r0)" "$((mx - r0))" ge 24576
+        want "bytes the node sent meanwhile" "$((o1 - o0))" ge 33554432 ;;
     esac
     if grep -E "does not answer|answers again|did not open|refused the data" "$W"/tun-"$MODE"-*.log 2>/dev/null | head -3 | grep .; then
         echo "run-xray: FAIL — the pool declared the node dead, a flow did not open, or data was refused"; XR=1
@@ -638,6 +759,16 @@ for MODE in $CASES; do
         fi ;;
     esac
     if [ "$MODE" = xmux-up-parallel ] && [ ! -x "${TUNVLESS_BASE:-}" ]; then
+        echo "run-xray: case $MODE — SKIPPED (no TUNVLESS_BASE binary; not passed)"
+        SKIPPED="$SKIPPED $MODE"; continue
+    fi
+    case "$MODE" in h2-*)
+        if [ ! -x "${H2TAP:-}" ]; then
+            echo "run-xray: case $MODE — SKIPPED (no H2TAP binary; not passed)"
+            SKIPPED="$SKIPPED $MODE"; continue
+        fi ;;
+    esac
+    if [ "$MODE" = h2-speed ] && [ ! -x "${TUNVLESS_BASE:-}" ]; then
         echo "run-xray: case $MODE — SKIPPED (no TUNVLESS_BASE binary; not passed)"
         SKIPPED="$SKIPPED $MODE"; continue
     fi
@@ -690,8 +821,9 @@ JSON
     for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
     ip netns exec "$NSS" ss -ltn 2>/dev/null | grep -q ":$PORT " || { echo "run-xray: Xray did not start:"; tail -5 "$W/xray-$MODE.log"; exit 1; }
     [ -z "$DL" ] || D0=$(dl_snap)
+    RPID=""; [ -z "$KEYLOG" ] || tap_up p || { FAIL=1; kill "$XPID" 2>/dev/null || true; continue; }
 
-    printf '%s\n' "vless://$UUID@$HOST:$PORT?encryption=none&$Q&$LSEC#$MODE" > "$W/sub.txt"
+    sub_write
     probe() { ip netns exec "$NSC" "$BIN" --probe --timeout 5 $TUN_ARGS "$W/sub.txt" 2>&1 || true; }
     is_ok() { printf '%s' "$1" | awk -F '\t' '$3 == "ok" { f = 1 } END { exit !f }'; }
 
@@ -723,11 +855,11 @@ EOF
         fi
         continue
     fi
-    [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; FAIL=1; kill "$XPID" 2>/dev/null || true; continue; }
-    case "$MODE" in xmux-*)
+    [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; FAIL=1; tap_down; kill "$XPID" 2>/dev/null || true; continue; }
+    case "$MODE" in xmux-*|h2-*)
         SPID=""; CPID=""; LPID=""
         rc=0; xmux_case "$MODE" || rc=1
-        tun_down; xc_down
+        tun_down; xc_down; tap_down
         kill "$XPID" 2>/dev/null || true
         sleep 0.5
         if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-xray: case $MODE — FAIL"; else echo "run-xray: case $MODE — ok"; fi

@@ -1,15 +1,15 @@
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
 #include "h2wire.h"
 
-/* ---- HPACK on send ----------------------------------------------------------
+/* ---- HPACK on send for gRPC ---------------------------------------------------------
  *
  * :method and :scheme go as indexed fields; everything else as "literal without indexing":
  * the name by its static table index (or as a string when the table lacks it), the value as a
  * plain string. There is no dynamic table at all, which is legal: HPACK allows indexing
- * nothing. No Huffman either: it would save tens of bytes per connection and need the code
- * table.
+ * nothing. No Huffman either. xhttp encodes its requests with hpack.c instead.
  *
  * Static table indices (RFC 7541, appendix A) are plain numbers: the table is part of the
  * protocol and never changes. */
@@ -21,9 +21,6 @@
 #define HP_CONTENT_TYPE 31
 #define HP_REFERER     51
 #define HP_USER_AGENT  58
-#define HP_ACCEPT      19
-#define HP_ACCEPT_LANG 17
-#define HP_CACHE_CTRL  24
 
 /* ---- browser look for xhttp ---------------------------------------------------------
  *
@@ -55,8 +52,7 @@ static void wb8(struct wbuf *b, unsigned v) {
     wb(b, &c, 1);
 }
 
-/* An HPACK integer with an N-bit prefix, for indices and string lengths: the xhttp Referer with
- * its padding runs to a thousand bytes and more, while seven bits hold only 126. */
+/* An HPACK integer with an N-bit prefix, for indices and string lengths. */
 static void hp_int(struct wbuf *b, unsigned prefix, unsigned bits, uint32_t v) {
     uint32_t max = (1u << bits) - 1;
     if (v < max) { wb8(b, prefix | v); return; }
@@ -89,28 +85,29 @@ static void hp_indexed(struct wbuf *b, unsigned index) {
     hp_int(b, 0x80, 7, index);
 }
 
-struct hf { unsigned idx; const char *name, *value; int soft; };
+struct hf { unsigned idx; const char *name, *value; };
+struct lf { const char *name, *value; int soft; };
 
-static const struct hf br_head[] = {
-    { 0, "sec-ch-ua", UA_CH_CHROME, 0 },
-    { 0, "sec-ch-ua-mobile", "?0", 0 },
-    { 0, "sec-ch-ua-platform", "\"Windows\"", 0 },
-    { 0, "dnt", "1", 0 },
-    { HP_USER_AGENT, "user-agent", UA_CHROME, 0 },
-    { HP_ACCEPT, "accept", "*/*", 1 },
-    { 0, "sec-fetch-site", "same-origin", 0 },
-    { 0, "sec-fetch-mode", "cors", 0 },
-    { 0, "sec-fetch-dest", "empty", 0 },
+static const struct lf br_head[] = {
+    { "sec-ch-ua", UA_CH_CHROME, 0 },
+    { "sec-ch-ua-mobile", "?0", 0 },
+    { "sec-ch-ua-platform", "\"Windows\"", 0 },
+    { "dnt", "1", 0 },
+    { "user-agent", UA_CHROME, 0 },
+    { "accept", "*/*", 1 },
+    { "sec-fetch-site", "same-origin", 0 },
+    { "sec-fetch-mode", "cors", 0 },
+    { "sec-fetch-dest", "empty", 0 },
 };
-static const struct hf br_tail[] = {
-    { HP_ACCEPT_LANG, "accept-language", "en-US,en;q=0.9", 0 },
-    { 0, "priority", "u=1, i", 1 },
-    { HP_CACHE_CTRL, "cache-control", "no-cache", 1 },
-    { 0, "pragma", "no-cache", 1 },
+static const struct lf br_tail[] = {
+    { "accept-language", "en-US,en;q=0.9", 0 },
+    { "priority", "u=1, i", 1 },
+    { "cache-control", "no-cache", 1 },
+    { "pragma", "no-cache", 1 },
 };
 static const struct hf grpc_tail[] = {
-    { 0, "te", "trailers", 0 },
-    { HP_USER_AGENT, "user-agent", "grpc-go/1.60.0", 0 },
+    { 0, "te", "trailers" },
+    { HP_USER_AGENT, "user-agent", "grpc-go/1.60.0" },
 };
 
 #define NELEM(a) (sizeof(a) / sizeof((a)[0]))
@@ -121,7 +118,7 @@ static int hf_taken(const struct h2_req *r, const char *name) {
     return 0;
 }
 
-static int hf_forced(const struct hf *l, size_t n, const char *name) {
+static int hf_forced(const struct lf *l, size_t n, const char *name) {
     for (size_t i = 0; i < n; i++)
         if (!l[i].soft && strcasecmp(l[i].name, name) == 0) return 1;
     return 0;
@@ -131,18 +128,16 @@ static int look_forced(const char *name) {
     return hf_forced(br_head, NELEM(br_head), name) || hf_forced(br_tail, NELEM(br_tail), name);
 }
 
-static void hp_list(struct wbuf *b, const struct hf *l, size_t n, const struct h2_req *r) {
+static void hp_list(struct wbuf *b, const struct hf *l, size_t n) {
     for (size_t i = 0; i < n; i++) {
-        if (l[i].soft && hf_taken(r, l[i].name)) continue;
         if (l[i].idx) hp_field(b, l[i].idx, l[i].value);
         else hp_new(b, l[i].name, l[i].value);
     }
 }
 
-static size_t hf_size(const struct hf *l, size_t n, const struct h2_req *r) {
+static size_t hf_size(const struct hf *l, size_t n) {
     size_t s = 0;
-    for (size_t i = 0; i < n; i++)
-        if (!l[i].soft || !hf_taken(r, l[i].name)) s += strlen(l[i].name) + strlen(l[i].value) + 32;
+    for (size_t i = 0; i < n; i++) s += strlen(l[i].name) + strlen(l[i].value) + 32;
     return s;
 }
 
@@ -161,23 +156,153 @@ static void hp_user(struct wbuf *b, const struct h2_field *f) {
     hp_str(b, f->value, strlen(f->value));
 }
 
+static const char *const go_drop[] = {
+    "host", "content-length", "connection", "proxy-connection", "transfer-encoding", "upgrade", "keep-alive",
+};
+
+static __thread struct h2_field g_rest[H2W_FIELDS_MAX];
+static __thread uint16_t g_unit[H2W_FIELDS_MAX], g_first[H2W_FIELDS_MAX], g_perm[H2W_FIELDS_MAX];
+
+struct gl { struct h2w_list *o; size_t rn, bn; int over; };
+
+uint64_t h2w_rng(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+static void gl_rest(struct gl *g, const char *name, const char *value) {
+    if (g->rn >= H2W_FIELDS_MAX) { g->over = 1; return; }
+    g_rest[g->rn++] = (struct h2_field){ name, value };
+}
+
+static const char *gl_copy(struct gl *g, const char *s, size_t n, int lower) {
+    if (g->bn + n + 1 > sizeof g->o->buf) { g->over = 1; return s; }
+    char *c = g->o->buf + g->bn;
+    for (size_t i = 0; i < n; i++) c[i] = (char)(lower && s[i] >= 'A' && s[i] <= 'Z' ? s[i] + ('a' - 'A') : s[i]);
+    c[n] = '\0';
+    g->bn += n + 1;
+    return c;
+}
+
+static const char *gl_lower(struct gl *g, const char *name) {
+    for (const char *c = name; *c; c++)
+        if (*c >= 'A' && *c <= 'Z') return gl_copy(g, name, strlen(name), 1);
+    return name;
+}
+
+static void gl_look(struct gl *g, const struct lf *l, size_t n, const struct h2_req *r) {
+    for (size_t i = 0; i < n; i++)
+        if (!l[i].soft || !hf_taken(r, l[i].name)) gl_rest(g, l[i].name, l[i].value);
+}
+
+static void gl_cookie(struct gl *g, const char *v) {
+    for (const char *p; (p = strchr(v, ';')); ) {
+        gl_rest(g, "cookie", gl_copy(g, v, (size_t)(p - v), 0));
+        for (v = p + 1; *v == ' '; v++) {}
+    }
+    if (*v) gl_rest(g, "cookie", v);
+}
+
+static void gl_user(struct gl *g, const struct h2_req *r, int look) {
+    int ua = 0;
+    for (size_t i = 0; i < r->fields_n; i++) {
+        const char *nm = r->fields[i].name, *v = r->fields[i].value;
+        int drop = look && look_forced(nm);
+        for (size_t k = 0; k < NELEM(go_drop); k++) drop |= strcasecmp(nm, go_drop[k]) == 0;
+        if (strcasecmp(nm, "user-agent") == 0) {
+            drop |= ua || !v[0];
+            ua = 1;
+        }
+        if (drop) continue;
+        if (strcasecmp(nm, "cookie") == 0) gl_cookie(g, v);
+        else gl_rest(g, gl_lower(g, nm), v);
+    }
+}
+
+static void gl_out(struct gl *g, const char *name, const char *value) {
+    if (g->o->n >= H2W_FIELDS_MAX) { g->over = 1; return; }
+    g->o->f[g->o->n++] = (struct h2_field){ name, value };
+}
+
+static int gl_has(const struct gl *g, const char *name) {
+    for (size_t i = 0; i < g->rn; i++)
+        if (strcmp(g_rest[i].name, name) == 0) return 1;
+    return 0;
+}
+
+static int go_cl(const struct h2_req *r) {
+    if (r->body_len > 0) return 1;
+    if (r->body_len < 0) return 0;
+    return !strcmp(r->method, "POST") || !strcmp(r->method, "PUT") || !strcmp(r->method, "PATCH");
+}
+
+int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
+    struct gl g = { out, 0, 0, 0 };
+    out->n = 0;
+    gl_out(&g, ":authority", r->authority);
+    gl_out(&g, ":method", r->method);
+    gl_out(&g, ":path", r->path);
+    gl_out(&g, ":scheme", "https");
+    if (r->no_look) {
+        gl_user(&g, r, 0);
+    } else {
+        gl_look(&g, br_head, NELEM(br_head), r);
+        gl_user(&g, r, 1);
+        gl_look(&g, br_tail, NELEM(br_tail), r);
+    }
+    if (r->content_type) gl_rest(&g, "content-type", r->content_type);
+    if (g.over) return H2_ETOOBIG;
+    size_t units = 0;
+    for (size_t i = 0; i < g.rn; i++) {
+        size_t u = 0;
+        while (u < units && strcmp(g_rest[g_first[u]].name, g_rest[i].name)) u++;
+        if (u == units) {
+            g_first[units] = (uint16_t)i;
+            g_perm[units] = (uint16_t)units;
+            units++;
+        }
+        g_unit[i] = (uint16_t)u;
+    }
+    for (size_t i = units; i > 1; i--) {
+        size_t j = (size_t)(h2w_rng(rng) % i);
+        uint16_t t = g_perm[i - 1];
+        g_perm[i - 1] = g_perm[j];
+        g_perm[j] = t;
+    }
+    for (size_t j = 0; j < units; j++)
+        for (size_t i = 0; i < g.rn; i++)
+            if (g_unit[i] == g_perm[j]) gl_out(&g, g_rest[i].name, g_rest[i].value);
+    if (go_cl(r)) {
+        char n[24];
+        int k = snprintf(n, sizeof n, "%lld", (long long)r->body_len);
+        gl_out(&g, "content-length", gl_copy(&g, n, (size_t)k, 0));
+    }
+    if (!gl_has(&g, "accept-encoding") && !gl_has(&g, "range") && strcmp(r->method, "HEAD"))
+        gl_out(&g, "accept-encoding", "gzip");
+    return g.over ? H2_ETOOBIG : 0;
+}
+
 size_t h2w_list_size(const struct h2_req *r, int browser) {
-    size_t s = strlen(":method") + strlen(r->method) + 32;
+    static __thread struct h2w_list l;
+    size_t s = 0;
+    if (browser) {
+        uint64_t rng = 0;
+        if (h2w_go_fields(r, &rng, &l)) return SIZE_MAX;
+        for (size_t i = 0; i < l.n; i++) s += strlen(l.f[i].name) + strlen(l.f[i].value) + 32;
+        return s;
+    }
+    s = strlen(":method") + strlen(r->method) + 32;
     s += strlen(":scheme") + strlen("https") + 32;
     s += strlen(":path") + strlen(r->path) + 32;
     s += strlen(":authority") + strlen(r->authority) + 32;
     if (r->content_type) s += strlen("content-type") + strlen(r->content_type) + 32;
-    int look = browser && !r->no_look;
-    for (size_t i = 0; i < r->fields_n; i++)
-        if (!look || !look_forced(r->fields[i].name))
-            s += strlen(r->fields[i].name) + strlen(r->fields[i].value) + 32;
-    if (look)
-        s += hf_size(br_head, NELEM(br_head), r) + hf_size(br_tail, NELEM(br_tail), r);
-    else if (!browser) s += hf_size(grpc_tail, NELEM(grpc_tail), NULL);
-    return s;
+    for (size_t i = 0; i < r->fields_n; i++) s += strlen(r->fields[i].name) + strlen(r->fields[i].value) + 32;
+    return s + hf_size(grpc_tail, NELEM(grpc_tail));
 }
 
-size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r, int browser) {
+size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r) {
     struct wbuf hp = { out, 0, cap };
     if (strcmp(r->method, "GET") == 0) hp_indexed(&hp, HP_METHOD_GET);
     else if (strcmp(r->method, "POST") == 0) hp_indexed(&hp, HP_METHOD_POST);
@@ -186,24 +311,10 @@ size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r, int b
     hp_field(&hp, HP_PATH, r->path);
     hp_field(&hp, HP_AUTHORITY, r->authority);
     if (r->content_type) hp_field(&hp, HP_CONTENT_TYPE, r->content_type);
-    if (browser && r->no_look) {
-        for (size_t i = 0; i < r->fields_n; i++) hp_user(&hp, &r->fields[i]);
-    } else if (browser) {
-        /* Chrome's order: client hints, then who it is, then what it wants and where it came
-         * from. Referer carries the xhttp padding and stands where a browser puts it. */
-        size_t lead = r->lead_n < r->fields_n ? r->lead_n : r->fields_n;
-        for (size_t i = 0; i < lead; i++)
-            if (!look_forced(r->fields[i].name)) hp_user(&hp, &r->fields[i]);
-        hp_list(&hp, br_head, NELEM(br_head), r);
-        for (size_t i = lead; i < r->fields_n; i++)
-            if (!look_forced(r->fields[i].name)) hp_user(&hp, &r->fields[i]);
-        hp_list(&hp, br_tail, NELEM(br_tail), r);
-    } else {
-        for (size_t i = 0; i < r->fields_n; i++) hp_user(&hp, &r->fields[i]);
-        /* te: trailers is the one connection-specific header HTTP/2 explicitly allows, and
-         * gRPC requires it. */
-        hp_list(&hp, grpc_tail, NELEM(grpc_tail), NULL);
-    }
+    for (size_t i = 0; i < r->fields_n; i++) hp_user(&hp, &r->fields[i]);
+    /* te: trailers is the one connection-specific header HTTP/2 explicitly allows, and
+     * gRPC requires it. */
+    hp_list(&hp, grpc_tail, NELEM(grpc_tail));
     return hp.n > hp.cap ? 0 : hp.n;
 }
 
@@ -281,4 +392,21 @@ size_t h2w_preface(unsigned char *out, size_t cap, int conn_update) {
         wb(&b, wu, 4);
     }
     return b.n > b.cap ? 0 : b.n;
+}
+
+size_t h2w_go_preface(unsigned char *out, size_t cap) {
+    static const uint16_t id[4] = { 0x02, 0x04, 0x05, 0x06 };
+    static const uint32_t val[4] = { 0, H2M_STREAM_WIN, H2M_FRAME_IN, H2M_HDR_LIST };
+    if (cap < H2W_GO_PREFACE_LEN) return 0;
+    memcpy(out, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24);
+    h2w_frame_hdr(out + 24, 24, FR_SETTINGS, 0, 0);
+    for (int i = 0; i < 4; i++) {
+        unsigned char *e = out + 33 + 6 * i;
+        e[0] = (unsigned char)(id[i] >> 8);
+        e[1] = (unsigned char)id[i];
+        put32(e + 2, val[i]);
+    }
+    h2w_frame_hdr(out + 57, 4, FR_WINDOW_UPDATE, 0, 0);
+    put32(out + 66, H2M_CONN_INC);
+    return H2W_GO_PREFACE_LEN;
 }

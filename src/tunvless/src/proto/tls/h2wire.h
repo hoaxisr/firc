@@ -34,6 +34,13 @@
 
 #define H2_PREFACE_LEN (24 + 9 + 12 + 9 + 4)
 
+#define H2W_GO_PREFACE_LEN 70
+#define H2M_STREAM_WIN  4194304
+#define H2M_CONN_INC    1073741824
+#define H2M_MIN_REFRESH 4096
+#define H2M_FRAME_IN    1048576
+#define H2M_HDR_LIST    10485760
+
 static inline void put32(unsigned char *p, uint32_t v) {
     p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
     p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
@@ -84,9 +91,20 @@ static inline int status_huff(const unsigned char *p, size_t n) {
     return v;
 }
 
-size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r, int browser);
+#define H2W_FIELDS_MAX 384
+
+struct h2w_list {
+    struct h2_field f[H2W_FIELDS_MAX];
+    size_t n;
+    char buf[2048];
+};
+
+uint64_t h2w_rng(uint64_t *state);
+int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out);
+size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r);
 size_t h2w_list_size(const struct h2_req *r, int browser);
 int h2w_status(const unsigned char *block, size_t n);
 size_t h2w_preface(unsigned char *out, size_t cap, int conn_update);
+size_t h2w_go_preface(unsigned char *out, size_t cap);
 
 #endif

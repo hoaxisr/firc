@@ -17,6 +17,18 @@
 ssize_t __real_send(int fd, const void *b, size_t n, int fl);
 static long g_send_ok, g_send_again;
 
+void *__real_malloc(size_t n);
+static int g_chunk_fail;
+
+void *__wrap_malloc(size_t n) {
+    if (g_chunk_fail && n >= XC_CHUNK) {
+        g_chunk_fail = 0;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_malloc(n);
+}
+
 ssize_t __wrap_send(int fd, const void *b, size_t n, int fl) {
     ssize_t r = __real_send(fd, b, n, fl);
     if (r >= 0) g_send_ok++;
@@ -290,17 +302,19 @@ static void *tp_run(void *a) {
     return server_half(&p->s);
 }
 
-static int tp_start(struct tp *p, const char *alpn) {
+static int tp_start_rcv(struct tp *p, const char *alpn, int rcvbuf) {
     memset(p, 0, sizeof *p);
     p->pl.name = "xconn";
     p->pl.reality_ok = 1;
     p->pl.alpn = alpn;
     p->s.plan = &p->pl;
     p->s.fd = -1;
-    p->lfd = listen_lo(0);
+    p->lfd = listen_lo(rcvbuf);
     if (p->lfd < 0) return -1;
     return pthread_create(&p->th, NULL, tp_run, p);
 }
+
+static int tp_start(struct tp *p, const char *alpn) { return tp_start_rcv(p, alpn, 0); }
 
 static int tp_finish(struct tp *p) {
     pthread_join(p->th, NULL);
@@ -404,14 +418,16 @@ static void t_seal_is_write(void) {
     tp_free(&p);
 }
 
-static const unsigned char PREFACE58[58] = {
-    'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n',
-    'S', 'M', '\r', '\n', '\r', '\n',
-    0x00, 0x00, 0x0c, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+static const unsigned char PREFACE70[70] = {
+    0x50, 0x52, 0x49, 0x20, 0x2a, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x32, 0x2e, 0x30, 0x0d, 0x0a, 0x0d, 0x0a,
+    0x53, 0x4d, 0x0d, 0x0a, 0x0d, 0x0a,
+    0x00, 0x00, 0x18, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x04, 0x00, 0x10, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x40, 0x00, 0x00,
+    0x00, 0x05, 0x00, 0x10, 0x00, 0x00,
+    0x00, 0x06, 0x00, 0xa0, 0x00, 0x00,
     0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x0f, 0x00, 0x01,
+    0x40, 0x00, 0x00, 0x00,
 };
 
 static size_t dial_on(struct xconn *x, int l, int *pfd) {
@@ -422,8 +438,7 @@ static size_t dial_on(struct xconn *x, int l, int *pfd) {
     unsigned char b[256];
     size_t n = peer_drain(*pfd, b, sizeof b, 30);
     if (rc) return 2000;
-    if (n == 58 && memcmp(b, PREFACE58, 58)) return 1000;
-    if (n == 45 && memcmp(b, PREFACE58, 45)) return 1001;
+    if (n == 70 && memcmp(b, PREFACE70, 70)) return 1000;
     return n;
 }
 
@@ -438,113 +453,37 @@ static void t_dial_preface(void) {
     close(l);
     unsigned char b[256];
     size_t got = peer_drain(pfd, b, sizeof b, 30);
-    check("dial: 58 preface bytes", 58, (long)got);
-    check("dial: preface by RFC 9113", 0, got == 58 ? memcmp(b, PREFACE58, 58) : -1);
+    check("dial: 70 preface bytes", 70, (long)got);
+    check("dial: Go's preface", 0, got == 70 ? memcmp(b, PREFACE70, 70) : -1);
     xconn_free(x);
     check("dial: nothing after the preface", 0, (long)peer_drain(pfd, b, sizeof b, 30));
     close(pfd);
-
-    struct tp p;
-    tp_start(&p, "http/1.1");
-    n = tls_node(g_port);
+    l = listen_lo(0);
+    n = plain_node(g_port);
     x = xconn_new(&n, 0, 1);
-    check("dial: ALPN http/1.1 refused", TR_ENOH2, xconn_dial(x, 3));
-    check("dial: link dead", XC_DEAD, x->state);
-    pthread_join(p.th, NULL);
-    close(p.lfd);
-    p.lfd = -1;
+    check("dial: shared link, Go's 70 B preface", 70, (long)dial_on(x, l, &pfd));
     xconn_free(x);
-    tp_free(&p);
+    close(pfd);
     check("dial: descriptors back to the start", fd0, fd_count());
 }
 
-/* catches: receive memory unbounded with many links, or today's preface lost for the first four */
-static void t_preface_past_budget(void) {
-    xc_budget_set(4u << 20);
-    struct xconn *x[6];
-    int l[6], pfd[6];
-    for (int i = 0; i < 5; i++) {
-        l[i] = listen_lo(0);
-        struct tr_node n = plain_node(g_port);
-        x[i] = xconn_new(&n, 0, 1);
-    }
-    static const long want[5] = { 58, 58, 58, 58, 45 };
-    for (int i = 0; i < 5; i++) {
-        char what[64];
-        snprintf(what, sizeof what, "budget: link %d preface bytes", i + 1);
-        check(what, want[i], (long)dial_on(x[i], l[i], &pfd[i]));
-    }
-    xconn_free(x[0]);
-    close(pfd[0]);
-    l[5] = listen_lo(0);
-    struct tr_node n = plain_node(g_port);
-    x[5] = xconn_new(&n, 0, 1);
-    check("budget: sixth after the first freed sends 58", 58, (long)dial_on(x[5], l[5], &pfd[5]));
-    for (int i = 1; i < 6; i++) {
-        xconn_free(x[i]);
-        close(pfd[i]);
-    }
-    xc_budget_set(XC_RX_BUDGET);
-}
-
-/* catches: a discard link made past the budget keeping the base of a link without a preface credit */
-static void t_discard_past_budget(void) {
-    xc_budget_set(0);
-    int l = listen_lo(0), pfd = -1;
-    struct tr_node n = plain_node(g_port);
+static void t_alpn_any(void) {
+    int fd0 = fd_count();
+    struct tp p;
+    check("alpn any: peer starts", 0, tp_start(&p, "http/1.1"));
+    struct tr_node n = tls_node(g_port);
     struct xconn *x = xconn_new(&n, 0, 1);
-    check("discard past budget: made without the credit", 65535, (long)x->base);
-    xconn_discard(x);
-    check("discard past budget: base back to 0", 0, (long)x->base);
-    check("discard past budget: full preface", 58, (long)dial_on(x, l, &pfd));
-    check("discard past budget: connection window 1 MiB", 1048576, (long)x->h2.recv_win_conn);
+    /* catches: the TR_ENOH2 close kept */
+    check("alpn any: http/1.1 dialled", 0, xconn_dial(x, 3));
+    check("alpn any: peer keys", 0, tp_finish(&p));
+    size_t got = 0;
+    unsigned char inner = 0;
+    check("alpn any: preface record opens", 0, rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &got, &inner));
+    check("alpn any: 70 B preface", 70, (long)got);
+    check("alpn any: Go's preface", 0, got == 70 ? memcmp(g_rec, PREFACE70, 70) : -1);
     xconn_free(x);
-    close(pfd);
-    xc_budget_set(XC_RX_BUDGET);
-}
-
-/* catches: a new link's preface credit admitted against outstanding credit only, ignoring bytes held unread */
-static void t_preface_counts_held(void) {
-    xc_budget_set(2u << 20);
-    struct pl p;
-    open_plain(&p, 1, 0, 0, 0);
-    check("held preface: first link credited", 58, (long)p.pre_n);
-    struct xs a;
-    xs_open(p.x, &RQ_GET, 1, &a);
-    xconn_flush(p.x);
-    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
-    unsigned char *buf = malloc(32 * (9 + 16384) + 16);
-    size_t m = frame(buf, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
-    for (int i = 0; i < 32; i++) m += frame(buf + m, 16384, FR_DATA, 0, 1, NULL);
-    struct bg g;
-    bg_start(&g, p.pfd, buf, m);
-    for (int i = 0; i < 200 && p.x->held_n < 524288; i++) {
-        struct pollfd q = { .fd = p.x->link.fd, .events = POLLIN };
-        if (poll(&q, 1, 30) <= 0) continue;
-        xconn_io(p.x, EPOLLIN, 0);
-    }
-    pthread_join(g.th, NULL);
-    check("held preface: 524288 held unread", 524288, (long)p.x->held_n);
-    int l = listen_lo(0), pfd = -1;
-    struct tr_node n = plain_node(g_port);
-    struct xconn *b = xconn_new(&n, 0, 1);
-    check("held preface: 524288 held + 1048576 out + 1048576 past 2 MiB, no credit", 45,
-          (long)dial_on(b, l, &pfd));
-    int end;
-    check("held preface: the held bytes read", 524288, (long)read_all_of(&a, NULL, 0, &end));
-    l = listen_lo(0);
-    int cfd = -1;
-    n = plain_node(g_port);
-    struct xconn *c = xconn_new(&n, 0, 1);
-    check("held preface: 0 held + 1048576 out + 1048576 fits 2 MiB exactly", 58, (long)dial_on(c, l, &cfd));
-    xconn_free(c);
-    close(cfd);
-    xconn_free(b);
-    close(pfd);
-    xs_close(&a);
-    free(buf);
-    close_plain(&p);
-    xc_budget_set(XC_RX_BUDGET);
+    tp_free(&p);
+    check("alpn any: descriptors back to the start", fd0, fd_count());
 }
 
 static int fill_windows(struct pl *p) {
@@ -801,20 +740,77 @@ static void t_control_flood_closes(void) {
 static void t_coalesced_credit_over_ceiling(void) {
     struct pl p;
     open_plain(&p, 1, 0, 0, 0);
+    xconn_discard(p.x);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
     p.x->q_ctl = XC_CTL_MAX - 4;
-    p.x->disc = 1u << 20;
+    p.x->st[u.slot].disc = 1u << 20;
     xconn_flush(p.x);
     check("ceiling: the link is dead in the same pass", XC_DEAD, p.x->state);
     close_plain(&p);
 }
 
-static int tls_link(struct tp *p, struct xconn **x) {
-    if (tp_start(p, "h2")) return -1;
+static int tls_link_rcv(struct tp *p, struct xconn **x, int rcvbuf) {
+    if (tp_start_rcv(p, "h2", rcvbuf)) return -1;
     struct tr_node n = tls_node(g_port);
     *x = xconn_new(&n, 0, 1);
     int rc = xconn_dial(*x, 3);
     if (tp_finish(p)) return rc ? rc : -2;
     return rc;
+}
+
+static int tls_link(struct tp *p, struct xconn **x) { return tls_link_rcv(p, x, 0); }
+
+/* catches: record overhead of control frames left out of the control ceiling on TLS */
+static void t_control_flood_tls(void) {
+    struct tp p;
+    struct xconn *x;
+    check("flood tls: link", 0, tls_link_rcv(&p, &x, 4096));
+    xconn_adopt(x, 0);
+    small_sndbuf(x);
+    static unsigned char msg[16384];
+    size_t m = 0;
+    while (m + 9 <= sizeof msg) m += frame(msg + m, 0, FR_SETTINGS, 0, 0, NULL);
+    long peak = 0, peak_ctl = 0, sent = 0;
+    uint64_t dl = mono_us() + 10000000;
+    while (mono_us() < dl && sent < (8L << 20) && x->state == XC_LIVE) {
+        if (tp_seal(p.sd, p.s.fd, msg, m)) break;
+        sent += (long)m;
+        xconn_io(x, EPOLLIN | EPOLLOUT, 0);
+        if ((long)x->out.n > peak) peak = (long)x->out.n;
+        if ((long)x->q_ctl > peak_ctl) peak_ctl = (long)x->q_ctl;
+    }
+    check("flood tls: SETTINGS flood closes the link", XC_DEAD, x->state);
+    check("flood tls: queued ACK records held to 262144", 1, peak <= 262144);
+    check("flood tls: control count held to the ceiling", 1, peak_ctl <= XC_CTL_MAX);
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: a control record charged as its plaintext on TLS, or a plain frame charged a record */
+static void t_control_ceiling_counts_records(void) {
+    static const unsigned char op[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    struct tp p;
+    struct xconn *x;
+    check("ceiling records: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    x->q_ctl = XC_CTL_MAX - 30;
+    unsigned char msg[32];
+    size_t m = frame(msg, 8, FR_PING, 0, 0, op);
+    tp_seal(p.sd, p.s.fd, msg, m);
+    io_in(x, 0);
+    check("ceiling records: a 39 B PING ACK record past 30 B left fails the link", XC_DEAD, x->state);
+    xconn_free(x);
+    tp_free(&p);
+    struct pl q;
+    open_plain(&q, 1, 0, 0, 0);
+    q.x->q_ctl = XC_CTL_MAX - 30;
+    pw(q.pfd, FR_PING, 0, 0, op, 8);
+    io_in(q.x, 0);
+    check("ceiling records: a 17 B plain PING ACK within 30 B left is taken", XC_LIVE, q.x->state);
+    xconn_flush(q.x);
+    check("ceiling records: the plain PING ACK went out", 17, (long)peer_drain(q.pfd, g_pb, sizeof g_pb, 30));
+    close_plain(&q);
 }
 
 /* catches: one staging buffer sealed with another link's keys */
@@ -833,7 +829,7 @@ static void t_staging_per_link(void) {
         unsigned char inner = 0;
         int rc = rec_open(p[i].cd, p[i].s.fd, g_rec, sizeof g_rec, &n, &inner);
         check("staging: preface record opens", 0, rc);
-        check("staging: preface record holds the preface", 58, (long)n);
+        check("staging: preface record holds the preface", 70, (long)n);
         rc = rec_open(p[i].cd, p[i].s.fd, g_rec, sizeof g_rec, &n, &inner);
         check("staging: frame record opens with this link's keys", 0, rc);
         struct fv f[4];
@@ -850,9 +846,62 @@ static void t_staging_per_link(void) {
     }
 }
 
-/* catches: backpressure by not reading the shared socket */
+static int next_rec(struct tp *p, struct fv *f, int max, size_t *n) {
+    unsigned char inner = 0;
+    *n = 0;
+    if (rec_open(p->cd, p->s.fd, g_rec, sizeof g_rec, n, &inner)) return -1;
+    return parse(g_rec, *n, f, max);
+}
+
+/* catches: ACK, HEADERS and DATA sealed together */
+static void t_records_alone(void) {
+    struct tp p;
+    struct xconn *x;
+    struct fv f[8];
+    size_t n = 0;
+    check("alone: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    struct xs g, u;
+    check("alone: GET opened", 0, xs_open(x, &RQ_GET, 1, &g));
+    xconn_flush(x);
+    unsigned char inner = 0;
+    check("alone: preface record opens", 0, rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &n, &inner));
+    check("alone: preface record 70 B", 70, (long)n);
+    int k = next_rec(&p, f, 8, &n);
+    check("alone: HEADERS record one frame", 1, k);
+    check("alone: HEADERS record is HEADERS", FR_HEADERS, k == 1 ? (long)f[0].type : -1);
+    check("alone: HEADERS record holds only it", (long)n, k == 1 ? (long)(9 + f[0].len) : -1);
+    static const unsigned char op[8] = { 9, 8, 7, 6, 5, 4, 3, 2 };
+    unsigned char msg[64];
+    size_t m = frame(msg, 0, FR_SETTINGS, 0, 0, NULL);
+    m += frame(msg + m, 8, FR_PING, 0, 0, op);
+    check("alone: peer writes SETTINGS and PING", 0, tp_seal(p.sd, p.s.fd, msg, m));
+    io_in(x, 0);
+    xconn_flush(x);
+    k = next_rec(&p, f, 8, &n);
+    check("alone: SETTINGS ACK record 9 B", 9, (long)n);
+    check("alone: SETTINGS ACK alone", 1, k == 1 && f[0].type == FR_SETTINGS && f[0].flags == FLAG_ACK);
+    k = next_rec(&p, f, 8, &n);
+    check("alone: PING ACK record 17 B", 17, (long)n);
+    check("alone: PING ACK alone", 1, k == 1 && f[0].type == FR_PING && f[0].flags == FLAG_ACK);
+    check("alone: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("alone: 100 B sent", 0, xs_send(&u, g_big, 100, 0));
+    xconn_flush(x);
+    k = next_rec(&p, f, 8, &n);
+    check("alone: POST HEADERS record one frame", 1, k);
+    check("alone: POST HEADERS record is HEADERS", FR_HEADERS, k == 1 ? (long)f[0].type : -1);
+    check("alone: POST HEADERS record holds only it", (long)n, k == 1 ? (long)(9 + f[0].len) : -1);
+    k = next_rec(&p, f, 8, &n);
+    check("alone: DATA record 109 B", 109, (long)n);
+    check("alone: DATA record is one DATA of 100", 1, k == 1 && f[0].type == FR_DATA && f[0].len == 100);
+    usleep(20000);
+    check("alone: nothing more", 0, fd_pending(p.s.fd));
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: backpressure by not reading the shared socket, or a 1 MiB stream window */
 static void t_slow_stream_does_not_stop_fast(void) {
-    xc_budget_set(4u << 20);
     struct pl p;
     open_plain(&p, 1, 0, 0, 0);
     struct xs a, b;
@@ -860,26 +909,27 @@ static void t_slow_stream_does_not_stop_fast(void) {
     xs_open(p.x, &RQ_GET, 2, &b);
     xconn_flush(p.x);
     peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
-    unsigned char *buf = malloc(64 * (9 + 16384) + 64);
+    unsigned char *buf = malloc(768 * (9 + 16384) + 64);
     size_t m = 0;
     m += frame(buf + m, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
     m += frame(buf + m, 1, FR_HEADERS, FLAG_END_HEADERS, 3, ST200);
     static unsigned char fa[16384], fb[16384];
     memset(fa, 'a', sizeof fa);
     memset(fb, 'b', sizeof fb);
-    for (int i = 0; i < 32; i++) {
-        m += frame(buf + m, 16384, FR_DATA, 0, 1, fa);
+    for (int i = 0; i < 512; i++) {
+        if (i < 256) m += frame(buf + m, 16384, FR_DATA, 0, 1, fa);
         m += frame(buf + m, 16384, FR_DATA, 0, 3, fb);
     }
     struct bg g;
     bg_start(&g, p.pfd, buf, m);
     size_t bgot = 0;
     int bad = 0, rc = 0;
-    uint64_t dl = mono_us() + 10000000;
-    while (mono_us() < dl && bgot < 524288) {
+    uint64_t dl = mono_us() + 20000000;
+    while (mono_us() < dl && bgot < 8388608) {
         struct pollfd q = { .fd = p.x->link.fd, .events = POLLIN };
         if (poll(&q, 1, 50) > 0) rc |= xconn_io(p.x, EPOLLIN, 0);
         xconn_flush(p.x);
+        peer_drain(p.pfd, g_pb, sizeof g_pb, 0);
         size_t got;
         while (!xs_read(&b, g_pb, sizeof g_pb, &got) && got) {
             for (size_t i = 0; i < got; i++) bad += g_pb[i] != 'b';
@@ -893,57 +943,14 @@ static void t_slow_stream_does_not_stop_fast(void) {
         rc |= xconn_io(p.x, EPOLLIN, 0);
     }
     check("slow: no link error", 0, rc);
-    check("slow: B read all 524288", 524288, (long)bgot);
+    check("slow: B read all 8 MiB", 8388608, (long)bgot);
     check("slow: B bytes are B's", 0, bad);
     check("slow: the socket was read to empty", 0, fd_pending(p.x->link.fd));
+    check("slow: A held its whole 4 MiB window", 4194304, (long)p.x->held_n);
     int end;
-    check("slow: A held all 524288", 524288, (long)read_all_of(&a, NULL, 0, &end));
+    check("slow: A held all 4194304", 4194304, (long)read_all_of(&a, NULL, 0, &end));
     free(buf);
     close_plain(&p);
-}
-
-/* catches: connection credit past the budget, or none under it */
-static void t_budget_exact(void) {
-    xc_budget_set(1179648);
-    struct pl p;
-    open_plain(&p, 1, 0, 0, 0);
-    check("budget exact: full preface", 58, (long)p.pre_n);
-    struct xs a;
-    xs_open(p.x, &RQ_GET, 1, &a);
-    xconn_flush(p.x);
-    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
-    unsigned char *buf = malloc(16 * (9 + 16384) + 16);
-    size_t m = frame(buf, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
-    for (int i = 0; i < 16; i++) m += frame(buf + m, 16384, FR_DATA, 0, 1, NULL);
-    struct bg g;
-    bg_start(&g, p.pfd, buf, m);
-    for (int i = 0; i < 200; i++) {
-        struct pollfd q = { .fd = p.x->link.fd, .events = POLLIN };
-        if (poll(&q, 1, 30) <= 0) break;
-        xconn_io(p.x, EPOLLIN, 0);
-    }
-    pthread_join(g.th, NULL);
-    xconn_io(p.x, EPOLLIN, 0);
-    xconn_flush(p.x);
-    int k = peer_frames(p.pfd, 20);
-    int nf = 0;
-    uint32_t mn = 0;
-    check("budget exact: connection credit sums to 131072", 131072, wu_sum(k, 0, &nf, &mn));
-    check("budget exact: in 4 updates", 4, nf);
-    check("budget exact: of 32768 each", 32768, (long)mn);
-    check("budget exact: no stream credit before reading", 0, count_type(k, FR_WINDOW_UPDATE, 1));
-    size_t got = 0;
-    check("budget exact: read 65536", 0, xs_read(&a, g_big, 65536, &got));
-    check("budget exact: got 65536", 65536, (long)got);
-    xconn_flush(p.x);
-    k = peer_frames(p.pfd, 20);
-    check("budget exact: two frames", 2, k);
-    check("budget exact: stream credit 65536", 65536, wu_sum(k, 1, NULL, NULL));
-    check("budget exact: connection credit 65536", 65536, wu_sum(k, 0, NULL, NULL));
-    check("budget exact: stream credit first", 1, k == 2 ? (long)g_fv[0].sid : -1);
-    free(buf);
-    close_plain(&p);
-    xc_budget_set(XC_RX_BUDGET);
 }
 
 /* catches: stream credit on arrival, which lets a slow client hold memory */
@@ -965,14 +972,378 @@ static void t_stream_credit_on_consumption(void) {
     }
     xconn_flush(p.x);
     int k = peer_frames(p.pfd, 20);
-    check("consumption: no stream credit on arrival", 0, count_type(k, FR_WINDOW_UPDATE, 1));
+    check("consumption: no credit on arrival", 0, count_type(k, FR_WINDOW_UPDATE, -1));
     size_t got = 0;
     xs_read(&a, g_big, sizeof g_big, &got);
     check("consumption: 40000 read", 40000, (long)got);
     xconn_flush(p.x);
     k = peer_frames(p.pfd, 20);
-    check("consumption: stream credit 40000", 40000, wu_sum(k, 1, NULL, NULL));
+    int nf = 0;
+    uint32_t mn = 0;
+    check("consumption: stream credit 40000", 40000, wu_sum(k, 1, &nf, &mn));
+    check("consumption: in five reads of at most 8192", 5, nf);
+    check("consumption: the last slice 7232", 7232, (long)mn);
+    check("consumption: connection credit 40000", 40000, wu_sum(k, 0, NULL, NULL));
+    check("consumption: connection first in each pair", 0, k >= 2 ? (long)g_fv[0].sid : -1);
     close_plain(&p);
+}
+
+/* catches: one credit per xs_read call instead of per 8 KiB read */
+static void t_credit_go_reads(void) {
+    struct tp p;
+    struct xconn *x;
+    struct fv f[8];
+    size_t n = 0;
+    check("go reads: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    struct xs g;
+    check("go reads: GET opened", 0, xs_open(x, &RQ_GET, 1, &g));
+    xconn_flush(x);
+    unsigned char inner = 0;
+    rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &n, &inner);
+    rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &n, &inner);
+    static unsigned char msg[16384];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(msg + m, 10000, FR_DATA, 0, 1, NULL);
+    tp_seal(p.sd, p.s.fd, msg, m);
+    m = frame(msg, 10000, FR_DATA, 0, 1, NULL);
+    tp_seal(p.sd, p.s.fd, msg, m);
+    for (int i = 0; i < 10 && xs_status(&g) != 200; i++) io_in(x, 0);
+    for (int i = 0; i < 10 && x->held_n < 20000; i++) io_in(x, 0);
+    check("go reads: 20000 held", 20000, (long)x->held_n);
+    size_t got = 0;
+    check("go reads: one read of 20000", 0, xs_read(&g, g_big, 20000, &got));
+    check("go reads: got 20000", 20000, (long)got);
+    xconn_flush(x);
+    int k = next_rec(&p, f, 8, &n);
+    check("go reads: first record a pair", 2, k);
+    check("go reads: WU(0, 8192)", 1, k == 2 && f[0].sid == 0 && be32(f[0].p) == 8192);
+    check("go reads: WU(1, 8192)", 1, k == 2 && f[1].sid == 1 && be32(f[1].p) == 8192);
+    k = next_rec(&p, f, 8, &n);
+    check("go reads: second record a pair", 2, k);
+    check("go reads: WU(0, 8192) again", 1, k == 2 && f[0].sid == 0 && be32(f[0].p) == 8192);
+    check("go reads: WU(1, 8192) again", 1, k == 2 && f[1].sid == 1 && be32(f[1].p) == 8192);
+    usleep(20000);
+    check("go reads: 3616 kept", 0, fd_pending(p.s.fd));
+    m = frame(msg, 1000, FR_DATA, 0, 1, NULL);
+    tp_seal(p.sd, p.s.fd, msg, m);
+    for (int i = 0; i < 10 && !x->held_n; i++) io_in(x, 0);
+    check("go reads: 1000 read", 0, xs_read(&g, g_big, 1000, &got));
+    xconn_flush(x);
+    k = next_rec(&p, f, 8, &n);
+    check("go reads: third record a pair", 2, k);
+    check("go reads: WU(0, 4616)", 1, k == 2 && f[0].sid == 0 && be32(f[0].p) == 4616);
+    check("go reads: WU(1, 4616)", 1, k == 2 && f[1].sid == 1 && be32(f[1].p) == 4616);
+    usleep(20000);
+    check("go reads: nothing more", 0, fd_pending(p.s.fd));
+    xs_close(&g);
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: an abandoned POST's answer eating the windows, or consumed inside the engine's callback */
+static void t_nowner_credit(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xs_send(&u, g_big, 10, 1);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    xs_close(&u);
+    check("nowner: the POST waits for its answer", 1, (long)xconn_streams(p.x));
+    xconn_flush(p.x);
+    check("nowner: nothing sent at the hand-off", 0, (long)peer_drain(p.pfd, g_pb, sizeof g_pb, 10));
+    static const unsigned char op[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    static unsigned char msg[9 + 1 + 9 + 8192 + 9 + 8];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(msg + m, 8192, FR_DATA, 0, 1, NULL);
+    m += frame(msg + m, 8, FR_PING, 0, 0, op);
+    wr_all(p.pfd, msg, m);
+    for (int i = 0; i < 10 && !xconn_wants_out(p.x); i++) io_in(p.x, 0);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("nowner: three frames", 3, k);
+    check("nowner: the PING ACK of the same read first", 1, k == 3 && g_fv[0].type == FR_PING);
+    check("nowner: then WU(0, 8192)", 1, k == 3 && g_fv[1].sid == 0 && be32(g_fv[1].p) == 8192);
+    check("nowner: then WU(1, 8192)", 1, k == 3 && g_fv[2].sid == 1 && be32(g_fv[2].p) == 8192);
+    check("nowner: nothing held", 0, (long)p.x->held_n);
+    pw(p.pfd, FR_DATA, FLAG_END_STREAM, 1, NULL, 8192);
+    for (int i = 0; i < 10 && xconn_streams(p.x); i++) io_in(p.x, 0);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("nowner: the ended answer still credited, conn", 8192, wu_sum(k, 0, NULL, NULL));
+    check("nowner: the ended answer still credited, stream", 8192, wu_sum(k, 1, NULL, NULL));
+    check("nowner: the entry freed after", 0, (long)xconn_streams(p.x));
+    close_plain(&p);
+}
+
+static void answer_20000(int fd, unsigned end) {
+    static unsigned char msg[9 + 1 + 9 + 16384 + 9 + 3616];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(msg + m, 16384, FR_DATA, 0, 1, NULL);
+    m += frame(msg + m, 3616, FR_DATA, end, 1, NULL);
+    wr_all(fd, msg, m);
+}
+
+/* catches: the connection window leaking the unread bytes of a closed stream */
+static void t_close_refund_open(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs g;
+    xs_open(p.x, &RQ_GET, 1, &g);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    answer_20000(p.pfd, 0);
+    for (int i = 0; i < 10 && p.x->held_n < 20000; i++) io_in(p.x, 0);
+    check("refund open: 20000 held", 20000, (long)p.x->held_n);
+    xconn_flush(p.x);
+    check("refund open: nothing sent on arrival", 0, (long)peer_drain(p.pfd, g_pb, sizeof g_pb, 10));
+    xs_close(&g);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("refund open: two frames", 2, k);
+    check("refund open: RST_STREAM(1, CANCEL) first", 1,
+          k == 2 && g_fv[0].type == FR_RST_STREAM && g_fv[0].sid == 1 && be32(g_fv[0].p) == 8);
+    check("refund open: then WU(0, 20000) alone", 1,
+          k == 2 && g_fv[1].type == FR_WINDOW_UPDATE && g_fv[1].sid == 0 && be32(g_fv[1].p) == 20000);
+    check("refund open: nothing held", 0, (long)p.x->held_n);
+    close_plain(&p);
+}
+
+/* catches: the ent_free drop of an ended stream not refunded */
+static void t_close_refund_ended(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs g;
+    xs_open(p.x, &RQ_GET, 1, &g);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    answer_20000(p.pfd, FLAG_END_STREAM);
+    for (int i = 0; i < 10 && !xs_ready(&g); i++) io_in(p.x, 0);
+    for (int i = 0; i < 10 && p.x->held_n < 20000; i++) io_in(p.x, 0);
+    check("refund ended: 20000 held", 20000, (long)p.x->held_n);
+    check("refund ended: the stream ended", 1, (long)p.x->st[g.slot].ended);
+    xs_close(&g);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("refund ended: one frame", 1, k);
+    check("refund ended: WU(0, 20000) alone, no RST", 1,
+          k == 1 && g_fv[0].type == FR_WINDOW_UPDATE && g_fv[0].sid == 0 && be32(g_fv[0].p) == 20000);
+    check("refund ended: nothing held", 0, (long)p.x->held_n);
+    check("refund ended: no stream left", 0, (long)xconn_streams(p.x));
+    close_plain(&p);
+}
+
+/* catches: bytes queued before the hand-off dropped without credit */
+static void t_close_refund_nowner(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xs_send(&u, g_big, 10, 1);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    pw(p.pfd, FR_DATA, 0, 1, NULL, 5000);
+    for (int i = 0; i < 10 && p.x->held_n < 5000; i++) io_in(p.x, 0);
+    check("refund nowner: 5000 held", 5000, (long)p.x->held_n);
+    xs_close(&u);
+    check("refund nowner: handed off", 1, (long)xconn_streams(p.x));
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("refund nowner: one frame", 1, k);
+    check("refund nowner: WU(0, 5000) alone, no RST", 1,
+          k == 1 && g_fv[0].type == FR_WINDOW_UPDATE && g_fv[0].sid == 0 && be32(g_fv[0].p) == 5000);
+    check("refund nowner: nothing held", 0, (long)p.x->held_n);
+    pw(p.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p.pfd, FR_DATA, 0, 1, NULL, 8192);
+    for (int i = 0; i < 10 && !xconn_wants_out(p.x); i++) io_in(p.x, 0);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("refund nowner: a later read two frames", 2, k);
+    check("refund nowner: WU(0, 8192)", 1, k == 2 && g_fv[0].sid == 0 && be32(g_fv[0].p) == 8192);
+    check("refund nowner: WU(1, 8192)", 1, k == 2 && g_fv[1].sid == 1 && be32(g_fv[1].p) == 8192);
+    close_plain(&p);
+}
+
+/* catches: a refund written to a dead link, or its held bytes never subtracted */
+static void t_dead_link_no_refund(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs g;
+    xs_open(p.x, &RQ_GET, 1, &g);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    answer_20000(p.pfd, 0);
+    shutdown(p.pfd, SHUT_WR);
+    for (int i = 0; i < 10 && p.x->state == XC_LIVE; i++) io_in(p.x, 0);
+    check("dead refund: the link died", XC_DEAD, p.x->state);
+    check("dead refund: 20000 still held", 20000, (long)p.x->held_n);
+    static unsigned char b[20000];
+    size_t got = 0;
+    check("dead refund: a read of 12000", 0, xs_read(&g, b, 12000, &got));
+    check("dead refund: 12000 read", 12000, (long)got);
+    check("dead refund: 8000 left", 8000, (long)p.x->held_n);
+    uint64_t q = p.x->pt_q;
+    xs_close(&g);
+    check("dead refund: nothing written", 0, (long)(p.x->pt_q - q));
+    check("dead refund: nothing queued", 0, (long)p.x->out.n);
+    check("dead refund: held back to 0", 0, (long)p.x->held_n);
+    xconn_flush(p.x);
+    check("dead refund: nothing on the wire", 0, (long)peer_drain(p.pfd, g_pb, sizeof g_pb, 10));
+    close_plain(&p);
+}
+
+/* catches: an ended ownerless answer left in the table when the link dies in the same read */
+static void t_nowner_freed_on_fail(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xs_send(&u, g_big, 10, 1);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    xs_close(&u);
+    unsigned char msg[256];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(msg + m, 100, FR_DATA, FLAG_END_STREAM, 1, NULL);
+    m += frame(msg + m, 1, FR_CONTINUATION, FLAG_END_HEADERS, 1, ST200);
+    wr_all(p.pfd, msg, m);
+    for (int i = 0; i < 10 && p.x->state == XC_LIVE; i++) io_in(p.x, 0);
+    check("nowner fail: the link died", XC_DEAD, p.x->state);
+    check("nowner fail: the ended answer freed", 0, (long)xconn_streams(p.x));
+    close_plain(&p);
+}
+
+/* catches: discarded bytes still waiting for the link's pending update lost when the stream closes */
+static void t_discard_close_credit(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    xconn_discard(p.x);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    unsigned char msg[16384];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(msg + m, 5000, FR_DATA, 0, 1, NULL);
+    m += frame(msg + m, 5000, FR_DATA, 0, 1, NULL);
+    wr_all(p.pfd, msg, m);
+    for (int i = 0; i < 10 && !xconn_wants_out(p.x); i++) io_in(p.x, 0);
+    xs_close(&u);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("discard close: four frames", 4, k);
+    check("discard close: WU(0, 5000) for the first", 1, k == 4 && g_fv[0].sid == 0 && be32(g_fv[0].p) == 5000);
+    check("discard close: WU(1, 5000) with it", 1, k == 4 && g_fv[1].sid == 1 && be32(g_fv[1].p) == 5000);
+    check("discard close: RST_STREAM(1, CANCEL)", 1, k == 4 && g_fv[2].type == FR_RST_STREAM && be32(g_fv[2].p) == 8);
+    check("discard close: the waiting 5000 on the connection", 1, k == 4 && g_fv[3].type == FR_WINDOW_UPDATE && g_fv[3].sid == 0 && be32(g_fv[3].p) == 5000);
+    close_plain(&p);
+}
+
+/* catches: an ownerless POST on a discard link credited past the link's one pending update */
+static void t_nowner_discard_gate(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    xconn_discard(p.x);
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xs_send(&u, g_big, 10, 1);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    uint16_t idx = u.slot;
+    xs_close(&u);
+    pw(p.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p.pfd, FR_DATA, 0, 1, NULL, 5000);
+    for (int i = 0; i < 10 && !xconn_wants_out(p.x); i++) io_in(p.x, 0);
+    check("nowner gate: one pair queued", 26, (long)(p.x->pt_q - p.x->pt_s));
+    pw(p.pfd, FR_DATA, FLAG_END_STREAM, 1, NULL, 5000);
+    for (int i = 0; i < 10 && !p.x->st[idx].ended; i++) io_in(p.x, 0);
+    check("nowner gate: still one pair queued", 26, (long)(p.x->pt_q - p.x->pt_s));
+    check("nowner gate: 5000 wait for it", 5000, (long)p.x->st[idx].disc);
+    check("nowner gate: the ended entry kept for its credit", 1, (long)xconn_streams(p.x));
+    xconn_flush(p.x);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("nowner gate: two pairs in all", 4, k);
+    check("nowner gate: connection 10000", 10000, wu_sum(k, 0, NULL, NULL));
+    check("nowner gate: stream 10000", 10000, wu_sum(k, 1, NULL, NULL));
+    check("nowner gate: the entry freed once paid", 0, (long)xconn_streams(p.x));
+    close_plain(&p);
+}
+
+/* catches: credit frames of honest downloads filling the control ceiling while the socket is blocked */
+static void t_credit_held_while_blocked(void) {
+    struct tp p;
+    struct xconn *x;
+    struct fv f[64];
+    size_t n = 0;
+    check("blocked: tls link", 0, tls_link_rcv(&p, &x, 4096));
+    xconn_adopt(x, 0);
+    struct xs s[16];
+    for (int i = 0; i < 16; i++) xs_open(x, &RQ_GET, (uint16_t)i, &s[i]);
+    xconn_flush(x);
+    unsigned char inner = 0;
+    usleep(20000);
+    while (fd_pending(p.s.fd) > 0 && !rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &n, &inner)) {}
+    small_sndbuf(x);
+    static unsigned char msg[16384];
+    size_t m = 0;
+    for (int i = 0; i < 16; i++) m += frame(msg + m, 1, FR_HEADERS, FLAG_END_HEADERS, (uint32_t)(2 * i + 1), ST200);
+    tp_seal(p.sd, p.s.fd, msg, m);
+    long left[16], peak = 0, got = 0;
+    for (int i = 0; i < 16; i++) left[i] = 4194304;
+    for (int more = 1; more && x->state == XC_LIVE;) {
+        more = 0;
+        for (int i = 0; i < 16 && x->state == XC_LIVE; i++) {
+            if (!left[i]) continue;
+            uint32_t k = left[i] < 16375 ? (uint32_t)left[i] : 16375;
+            left[i] -= k;
+            more = 1;
+            m = frame(msg, k, FR_DATA, left[i] ? 0 : FLAG_END_STREAM, (uint32_t)(2 * i + 1), NULL);
+            if (tp_seal(p.sd, p.s.fd, msg, m)) break;
+            xconn_io(x, EPOLLIN | EPOLLOUT, 0);
+            for (int j = 0; j < 16; j++) {
+                size_t r = 0;
+                while (!xs_read(&s[j], g_big, sizeof g_big, &r) && r) got += (long)r;
+            }
+            if ((long)x->q_ctl > peak) peak = (long)x->q_ctl;
+        }
+    }
+    for (int i = 0; i < 20 && got < 16L * 4194304; i++) {
+        io_in(x, 0);
+        for (int j = 0; j < 16; j++) {
+            size_t r = 0;
+            while (!xs_read(&s[j], g_big, sizeof g_big, &r) && r) got += (long)r;
+        }
+    }
+    check("blocked: no link error", 0, x->rc);
+    check("blocked: the link lives", XC_LIVE, x->state);
+    check("blocked: all 64 MiB read", 16L * 4194304, got);
+    check("blocked: the socket was blocked", 1, xconn_wants_out(x));
+    check("blocked: control stayed under the ceiling", 1, peak <= XC_CTL_MAX);
+    long sum[17] = { 0 };
+    uint64_t dl = mono_us() + 20000000;
+    while (mono_us() < dl && x->state == XC_LIVE) {
+        xconn_flush(x);
+        int all = sum[0] >= 16L * 4194304 - 4095;
+        for (int i = 1; i <= 16; i++) all &= sum[i] >= 4194304 - 4095;
+        if (all) break;
+        struct pollfd q = { .fd = p.s.fd, .events = POLLIN };
+        if (poll(&q, 1, 50) <= 0) continue;
+        if (rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &n, &inner)) break;
+        int k = parse(g_rec, n, f, 64);
+        for (int i = 0; i < k; i++)
+            if (f[i].type == FR_WINDOW_UPDATE && f[i].len == 4 && f[i].sid <= 31 && f[i].sid % 2 == (f[i].sid ? 1 : 0))
+                sum[f[i].sid ? (f[i].sid + 1) / 2 : 0] += be32(f[i].p);
+    }
+    check("blocked: connection credit once drained", 1, sum[0] >= 16L * 4194304 - 4095 && sum[0] <= 16L * 4194304);
+    int ok = 1;
+    for (int i = 1; i <= 16; i++) ok &= sum[i] >= 4194304 - 4095 && sum[i] <= 4194304;
+    check("blocked: every stream's credit once drained", 1, ok);
+    for (int i = 0; i < 16; i++) xs_close(&s[i]);
+    xconn_free(x);
+    tp_free(&p);
 }
 
 static int pings(int k, unsigned char op[8]) {
@@ -1128,8 +1499,11 @@ static void t_orphan_post_times_out(void) {
     size_t n = peer_drain(p.pfd, b, sizeof b, 10);
     static const unsigned char want[26] = { 0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8,
                                             0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8 };
-    check("orphan: RST_STREAM CANCEL on both", 26, (long)n);
-    check("orphan: bytes", 0, n == 26 ? memcmp(b, want, 26) : -1);
+    static const unsigned char ping[9] = { 0, 0, 8, 6, 0, 0, 0, 0, 0 };
+    check("orphan: RST_STREAM CANCEL on both, a PING after the first", 43, (long)n);
+    check("orphan: first RST", 0, n == 43 ? memcmp(b, want, 13) : -1);
+    check("orphan: PING", 0, n == 43 ? memcmp(b + 13, ping, 9) : -1);
+    check("orphan: second RST", 0, n == 43 ? memcmp(b + 30, want + 13, 13) : -1);
     check("orphan: released one gone", 1, xconn_streams(p.x));
     check("orphan: held one's owner woken", 1, wakes(4, XW_READ));
     size_t got;
@@ -1292,7 +1666,6 @@ static void t_close_maps_rst(void) {
 
 /* catches: a private link draining the socket ahead of its reader, or charged to the shared budget */
 static void t_private_reads_on_demand(void) {
-    xc_budget_set(0);
     struct tp p;
     tp_start(&p, "h2");
     struct tr_node n = tls_node(g_port);
@@ -1321,23 +1694,25 @@ static void t_private_reads_on_demand(void) {
         check("private: nothing else buffered", 0, xs_ready(&s));
         if (i < 2) check("private: the socket holds the rest", 1, fd_pending(x->link.fd) > 0);
     }
-    int k = 0, found0 = 0, found1 = 0;
+    int k = 0, recs = 0;
+    long sum0 = 0, sum1 = 0;
     usleep(20000);
     while (fd_pending(p.s.fd) > 0 && !rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &rn, &inner)) {
         struct fv f[16];
         k = parse(g_rec, rn, f, 16);
+        recs++;
         for (int i = 0; i < k; i++)
             if (f[i].type == FR_WINDOW_UPDATE && f[i].len == 4) {
-                if (f[i].sid == 0) found0 = (int)be32(f[i].p);
-                if (f[i].sid == 1) found1 = (int)be32(f[i].p);
+                if (f[i].sid == 0) sum0 += be32(f[i].p);
+                if (f[i].sid == 1) sum1 += be32(f[i].p);
             }
     }
-    check("private: connection credit on arrival, outside the budget", 36000, found0);
-    check("private: stream credit on consumption", 36000, found1);
+    check("private: connection credit on consumption, 8192 + 12000 + 12000", 32192, sum0);
+    check("private: stream credit on consumption, the same", 32192, sum1);
+    check("private: one record per credited slice", 3, recs);
     xs_close(&s);
     xconn_free(x);
     tp_free(&p);
-    xc_budget_set(XC_RX_BUDGET);
 }
 
 struct drv { int fd; long body; int bad, end; };
@@ -1537,8 +1912,10 @@ static void t_get_closed_early(void) {
     unsigned char b[64];
     size_t n = peer_drain(p.pfd, b, sizeof b, 10);
     static const unsigned char rst1[13] = { 0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8 };
-    check("early GET: RST_STREAM CANCEL at once", 13, (long)n);
-    check("early GET: RST bytes", 0, n == 13 ? memcmp(b, rst1, 13) : -1);
+    static const unsigned char ping[9] = { 0, 0, 8, 6, 0, 0, 0, 0, 0 };
+    check("early GET: RST_STREAM CANCEL and PING at once", 30, (long)n);
+    check("early GET: RST bytes", 0, n == 30 ? memcmp(b, rst1, 13) : -1);
+    check("early GET: PING", 0, n == 30 ? memcmp(b + 13, ping, 9) : -1);
     check("early GET: no stream left", 0, xconn_streams(p.x));
     struct xs h;
     xs_open(p.x, &RQ_GET, 2, &h);
@@ -1726,6 +2103,91 @@ static void t_headroom_from_a_pool(void) {
     close_plain(&p);
 }
 
+static void t_pend_one_frame(void) {
+    static const unsigned char mf[6] = { 0, 5, 0, 0x10, 0, 0 };
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    pw(p.pfd, FR_SETTINGS, 0, 0, mf, 6);
+    io_in(p.x, 0);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    struct xs s;
+    xs_open(p.x, &RQ_POST, 1, &s);
+    /* catches: held bytes sent in 16 KiB pieces once the window opens */
+    check("pend frame: 100,000 taken", 0, xs_send(&s, g_big, 100000, 0));
+    check("pend frame: 34,465 held", 34465, (long)p.x->pend_n);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("pend frame: one DATA now", 1, count_type(k, FR_DATA, 1));
+    check("pend frame: of 65,535", 65535, k > 1 ? (long)g_fv[k - 1].len : -1);
+    static const unsigned char inc[4] = { 0, 0x01, 0x86, 0xa0 };
+    unsigned char wu[26];
+    size_t m = frame(wu, 4, FR_WINDOW_UPDATE, 0, 1, inc);
+    m += frame(wu + m, 4, FR_WINDOW_UPDATE, 0, 0, inc);
+    check("pend frame: both windows opened in one write", (long)m, (long)write(p.pfd, wu, m));
+    io_in(p.x, 0);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("pend frame: the held bytes as one DATA", 1, count_type(k, FR_DATA, 1));
+    long len = -1;
+    for (int i = 0; i < k; i++)
+        if (g_fv[i].type == FR_DATA) len = (long)g_fv[i].len;
+    check("pend frame: of 34,465", 34465, len);
+    check("pend frame: nothing held", 0, (long)p.x->pend_n);
+    check("pend frame: the pool back", (long)xc_pend_limit(), (long)xc_pend_free());
+    xs_close(&s);
+    close_plain(&p);
+}
+
+/* catches: held bytes counted as sent when the write of their frame fails */
+static void t_pend_flush_write_fails(void) {
+    struct pl p;
+    open_plain(&p, 1, 0, 0, 0);
+    struct xs s, o;
+    xs_open(p.x, &RQ_POST, 66, &o);
+    xs_open(p.x, &RQ_POST, 67, &s);
+    check("held write fails: fill the connection window", 0, xs_send(&o, g_big, 65535, 0));
+    check("held write fails: 300000 held", 0, xs_send(&s, g_big, 300000, 0));
+    check("held write fails: the pool spent", (long)(xc_pend_limit() - 300000), (long)xc_pend_free());
+    pw_u32(p.pfd, FR_WINDOW_UPDATE, 0, 100000);
+    g_chunk_fail = 1;
+    io_in(p.x, 0);
+    int armed = g_chunk_fail;
+    g_chunk_fail = 0;
+    check("held write fails: the frame's chunk refused", 0, armed);
+    check("held write fails: the link dies", XC_DEAD, p.x->state);
+    check("held write fails: nothing held", 0, (long)p.x->pend_n);
+    check("held write fails: the pool whole again", (long)xc_pend_limit(), (long)xc_pend_free());
+    xs_close(&s);
+    xs_close(&o);
+    close_plain(&p);
+}
+
+static void t_cancel_ping_ceiling(void) {
+    struct tp p;
+    struct xconn *x;
+    struct xs s;
+    check("cancel ceiling: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    xs_open(x, &RQ_GET, 1, &s);
+    xconn_flush(x);
+    x->q_ctl = XC_CTL_MAX - 52;
+    /* catches: the cancel PING left out of the control ceiling, or charged a record of its own */
+    xs_close(&s);
+    check("cancel ceiling: RST + PING, one 52 B record, within 52 B left", XC_LIVE, x->state);
+    xconn_free(x);
+    tp_free(&p);
+    check("cancel ceiling: tls link again", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    xs_open(x, &RQ_GET, 1, &s);
+    xconn_flush(x);
+    x->q_ctl = XC_CTL_MAX - 51;
+    xs_close(&s);
+    check("cancel ceiling: past 51 B left fails the link", XC_DEAD, x->state);
+    xconn_free(x);
+    tp_free(&p);
+}
+
 /* catches: END_STREAM sent before the held bytes, or as an empty frame after them */
 static void t_held_keeps_order_and_end(void) {
     pat_fill();
@@ -1878,138 +2340,796 @@ static void t_fail_drops_held(void) {
     close_plain(&p);
 }
 
-static void feed_link(struct pl *p, uint32_t sid, size_t total) {
-    size_t frames = total / 16384;
-    unsigned char *buf = malloc(frames * (9 + 16384) + 16);
-    size_t m = frame(buf, 1, FR_HEADERS, FLAG_END_HEADERS, sid, ST200);
-    for (size_t i = 0; i < frames; i++) m += frame(buf + m, 16384, FR_DATA, 0, sid, NULL);
+static struct xconn *g_bx[4];
+
+static void held_ok(const char *what) {
+    int64_t s = 0;
+    for (int i = 0; i < 4; i++)
+        if (g_bx[i]) s += g_bx[i]->held_n;
+    check(what, (long)s, (long)xc_held());
+}
+
+static int wu_is(int k, int i, uint32_t sid, uint32_t v) {
+    return i < k && g_fv[i].type == FR_WINDOW_UPDATE && g_fv[i].sid == sid && be32(g_fv[i].p) == v;
+}
+
+static int rst_is(int k, int i, uint32_t sid) {
+    return i < k && g_fv[i].type == FR_RST_STREAM && g_fv[i].sid == sid && be32(g_fv[i].p) == 8;
+}
+
+static unsigned char g_pour[4][12 * (9 + 16384) + 64];
+
+static size_t pour_frames(unsigned char *b, uint32_t sid, int n16k, uint32_t tail) {
+    size_t m = 0;
+    for (int i = 0; i < n16k; i++) m += frame(b + m, 16384, FR_DATA, 0, sid, NULL);
+    if (tail) m += frame(b + m, tail, FR_DATA, 0, sid, NULL);
+    return m;
+}
+
+static void budget_off(void) {
+    xc_budget_set(XC_RX_BUDGET, XC_RX_HARD, XC_RX_RESUME);
+    memset(g_bx, 0, sizeof g_bx);
+}
+
+static void io_until_held(struct pl *p, int64_t n, uint64_t now) {
+    for (int i = 0; i < 100 && p->x->held_n < n; i++) io_in(p->x, now);
+}
+
+static void io_until_paused(struct xconn *w, struct pl *p, uint64_t now) {
+    for (int i = 0; i < 100 && xconn_wants_in(w); i++) io_in(p->x, now);
+}
+
+static void wait_pending(int fd) {
+    for (int i = 0; i < 100 && fd_pending(fd) <= 0; i++) usleep(2000);
+}
+
+static void soft3(struct pl *p, struct xs *a, struct xs *b, struct xs *c) {
+    xc_budget_set(65536, 1048576, 917504);
+    open_plain(p, 1, 0, 0, 0);
+    g_bx[0] = p->x;
+    xs_open(p->x, &RQ_GET, 1, a);
+    xs_open(p->x, &RQ_GET, 2, b);
+    xs_open(p->x, &RQ_GET, 3, c);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+    unsigned char *q = g_pour[0];
+    size_t m = frame(q, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, 3, ST200);
+    m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, 5, ST200);
+    m += pour_frames(q + m, 1, 4, 4464);
+    m += pour_frames(q + m, 3, 0, 8192);
+    m += pour_frames(q + m, 5, 0, 8192);
     struct bg g;
-    bg_start(&g, p->pfd, buf, m);
-    for (int i = 0; i < 400; i++) {
-        struct pollfd q = { .fd = p->x->link.fd, .events = POLLIN };
-        if (poll(&q, 1, 30) <= 0) break;
-        xconn_io(p->x, EPOLLIN, 0);
-    }
+    bg_start(&g, p->pfd, q, m);
+    io_until_held(p, 86384, 0);
     pthread_join(g.th, NULL);
-    xconn_io(p->x, EPOLLIN, 0);
-    free(buf);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
 }
 
-static size_t read_n(struct xs *s, size_t n) {
-    size_t got = 0, k = 0;
-    while (got < n && !xs_read(s, g_big, n - got < sizeof g_big ? n - got : sizeof g_big, &k) && k) got += k;
-    return got;
+/* catches: withholding every stream, or none, past the soft budget */
+static void t_soft_withholds_holders(void) {
+    struct pl p;
+    struct xs a, b, c;
+    soft3(&p, &a, &b, &c);
+    check("soft: 86384 held", 86384, (long)p.x->held_n);
+    held_ok("soft: xc_held is the links' sum");
+    long s0 = g_send_ok;
+    size_t got = 0;
+    xs_read(&c, g_big, 8192, &got);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("soft: C read all it held, credited", 1, k == 2 && wu_is(k, 0, 0, 8192) && wu_is(k, 1, 5, 8192));
+    held_ok("soft: sum after C");
+    xs_read(&b, g_big, 4096, &got);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("soft: B still holds, WU(0, 4096) alone", 1, k == 1 && wu_is(k, 0, 0, 4096));
+    held_ok("soft: sum after B");
+    xs_read(&b, g_big, 4096, &got);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("soft: B emptied, WU(0, 4096) + WU(3, 8192)", 1, k == 2 && wu_is(k, 0, 0, 4096) && wu_is(k, 1, 3, 8192));
+    xs_read(&a, g_big, 8192, &got);
+    xconn_flush(p.x);
+    k = peer_frames(p.pfd, 20);
+    check("soft: under the budget A credited", 1, k == 2 && wu_is(k, 0, 0, 8192) && wu_is(k, 1, 1, 8192));
+    check("soft: four sends", 4, g_send_ok - s0);
+    held_ok("soft: sum at the end");
+    close_plain(&p);
+    budget_off();
 }
 
-/* catches: the reading link or an arrival paid before a link owed for bytes it read */
-static void t_consumed_link_paid_first(void) {
-    xc_budget_set((2u << 20) + 65536);
-    struct pl a, b;
-    open_plain(&a, 1, 0, 0, 0);
-    open_plain(&b, 1, 0, 0, 0);
-    struct xs sa, sb;
-    xs_open(a.x, &RQ_GET, 1, &sa);
-    xs_open(b.x, &RQ_GET, 2, &sb);
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    peer_drain(a.pfd, g_pb, sizeof g_pb, 10);
-    peer_drain(b.pfd, g_pb, sizeof g_pb, 10);
-    feed_link(&a, 1, 1048576);
-    xconn_flush(a.x);
-    check("first: A paid on arrival what the budget had, 65536", 65536, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    xc_budget_set((1u << 20) + 65536);
-    check("first: A read all 1 MiB", 1048576, (long)read_n(&sa, 1048576));
-    xconn_flush(a.x);
-    check("first: no room left for A's 983040", 0, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    feed_link(&b, 1, 65536);
-    check("first: B read its 65536", 65536, (long)read_n(&sb, 65536));
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    check("first: the freed 65536 go to A, which owes for what it read", 65536, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    check("first: none to B, which owes less", 0, wu_sum(peer_frames(b.pfd, 20), 0, NULL, NULL));
-    xc_budget_set((2u << 20) + 65536);
-    feed_link(&b, 1, 65536);
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    check("first: the budget given back goes to A at B's next arrival", 917504, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    check("first: B gets what A leaves, its two 65536", 131072, wu_sum(peer_frames(b.pfd, 20), 0, NULL, NULL));
-    xs_close(&sa);
-    xs_close(&sb);
-    close_plain(&b);
-    close_plain(&a);
-    xc_budget_set(XC_RX_BUDGET);
+/* catches: withheld credit released only by the stream's own read, or A's unread bytes not refunded */
+static void t_release_on_close(void) {
+    struct pl p;
+    struct xs a, b, c;
+    soft3(&p, &a, &b, &c);
+    size_t got = 0;
+    xs_read(&c, g_big, 8192, &got);
+    xs_read(&b, g_big, 4096, &got);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 20);
+    xs_close(&a);
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("release: three frames", 3, k);
+    check("release: RST_STREAM(1, CANCEL)", 1, rst_is(k, 0, 1));
+    check("release: WU(0, 70000) alone", 1, wu_is(k, 1, 0, 70000));
+    check("release: WU(3, 4096) alone", 1, wu_is(k, 2, 3, 4096));
+    check("release: B holds its 4096", 4096, (long)p.x->held_n);
+    held_ok("release: sum");
+    close_plain(&p);
+    budget_off();
 }
 
-/* catches: credit by debt or without per-link held bytes, so unread data wins */
-static void t_owed_not_debt(void) {
-    xc_budget_set((2u << 20) + 65536);
-    struct pl a, b;
-    open_plain(&a, 1, 0, 0, 0);
-    open_plain(&b, 1, 0, 0, 0);
-    struct xs sa, sb;
-    xs_open(a.x, &RQ_GET, 1, &sa);
-    xs_open(b.x, &RQ_GET, 2, &sb);
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    peer_drain(a.pfd, g_pb, sizeof g_pb, 10);
-    peer_drain(b.pfd, g_pb, sizeof g_pb, 10);
-    feed_link(&b, 1, 1048576);
-    feed_link(&a, 1, 524288);
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    check("owed: B paid on arrival 65536", 65536, wu_sum(peer_frames(b.pfd, 20), 0, NULL, NULL));
-    check("owed: A paid nothing on arrival", 0, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    check("owed: A reads 131072", 131072, (long)read_n(&sa, 131072));
-    xconn_flush(a.x);
-    xconn_flush(b.x);
-    check("owed: the 131072 go to A, which read them", 131072, wu_sum(peer_frames(a.pfd, 20), 0, NULL, NULL));
-    check("owed: none to B, whose larger debt is unread", 0, wu_sum(peer_frames(b.pfd, 20), 0, NULL, NULL));
-    xs_close(&sa);
-    xs_close(&sb);
-    close_plain(&b);
-    close_plain(&a);
-    xc_budget_set(XC_RX_BUDGET);
+static void ceiling_at(struct pl *p, int slot, struct xs *a, uint16_t owner, uint64_t now) {
+    open_plain(p, 1, 0, 0, now);
+    g_bx[slot] = p->x;
+    xs_open(p->x, &RQ_GET, owner, a);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
 }
 
-/* catches: credit paid to one link per pass while others still owe */
-static void t_priority_pays_every_link(void) {
-    xc_budget_set((3u << 20) + 524288);
-    struct pl a, b, c;
-    open_plain(&a, 1, 0, 0, 0);
-    struct xs sa, sb, sc;
-    xs_open(a.x, &RQ_GET, 1, &sa);
-    xconn_flush(a.x);
-    peer_drain(a.pfd, g_pb, sizeof g_pb, 10);
-    feed_link(&a, 1, 524288);
-    open_plain(&b, 1, 0, 0, 0);
-    open_plain(&c, 1, 0, 0, 0);
-    check("every: B took its preface", 58, (long)b.pre_n);
-    check("every: C took its preface", 58, (long)c.pre_n);
-    xc_budget_set(3u << 20);
-    xs_open(b.x, &RQ_GET, 2, &sb);
-    xs_open(c.x, &RQ_GET, 3, &sc);
-    xconn_flush(b.x);
-    xconn_flush(c.x);
-    peer_drain(b.pfd, g_pb, sizeof g_pb, 10);
-    peer_drain(c.pfd, g_pb, sizeof g_pb, 10);
-    feed_link(&b, 1, 65536);
-    feed_link(&c, 1, 65536);
-    check("every: B read 65536", 65536, (long)read_n(&sb, 65536));
-    check("every: C read 65536", 65536, (long)read_n(&sc, 65536));
-    xconn_flush(a.x);
-    peer_drain(a.pfd, g_pb, sizeof g_pb, 20);
-    check("every: A read its 524288", 524288, (long)read_n(&sa, 524288));
-    xconn_flush(b.x);
-    xconn_flush(c.x);
-    check("every: B paid 65536", 65536, wu_sum(peer_frames(b.pfd, 20), 0, NULL, NULL));
-    check("every: C paid 65536", 65536, wu_sum(peer_frames(c.pfd, 20), 0, NULL, NULL));
-    xs_close(&sa);
-    xs_close(&sb);
-    xs_close(&sc);
-    close_plain(&c);
-    close_plain(&b);
-    close_plain(&a);
-    xc_budget_set(XC_RX_BUDGET);
+static void ceiling_link(struct pl *p, int slot, struct xs *a, uint16_t owner) { ceiling_at(p, slot, a, owner, 0); }
+
+static void pour_bg(struct pl *p, int slot, struct bg *g, uint32_t sid, int n16k, uint32_t tail, int hdr) {
+    unsigned char *q = g_pour[slot];
+    size_t m = hdr ? frame(q, 1, FR_HEADERS, FLAG_END_HEADERS, sid, ST200) : 0;
+    m += pour_frames(q + m, sid, n16k, tail);
+    bg_start(g, p->pfd, q, m);
+}
+
+/* catches: reading past the ceiling, or a paused link polled */
+static void t_hard_ceiling_pauses(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p1, p2;
+    struct xs a, b;
+    struct bg g;
+    ceiling_link(&p1, 0, &a, 1);
+    pour_bg(&p1, 0, &g, 1, 9, 0, 1);
+    io_until_paused(p1.x, &p1, 0);
+    check("ceiling: L1 stopped at the ceiling", 1, p1.x->held_n >= 131072 && p1.x->held_n < 147456);
+    check("ceiling: L1 paused", 0, xconn_wants_in(p1.x));
+    held_ok("ceiling: sum after L1");
+    pthread_join(g.th, NULL);
+    ceiling_link(&p2, 1, &b, 2);
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    int pend = fd_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("ceiling: L2 read nothing", 0, (long)p2.x->held_n);
+    check("ceiling: L2's socket untouched", pend, fd_pending(p2.x->link.fd));
+    check("ceiling: L2 paused", 0, xconn_wants_in(p2.x));
+    size_t got = 0;
+    xs_read(&a, g_big, 30000, &got);
+    check("ceiling: 30000 read", 30000, (long)got);
+    check("ceiling: held under resume", 1, xc_held() >= 101072 && xc_held() < 117456);
+    check("ceiling: L1 resumed", 1, xconn_wants_in(p1.x));
+    check("ceiling: L2 resumed", 1, xconn_wants_in(p2.x));
+    held_ok("ceiling: sum after the read");
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("ceiling: L2 delivers 1000", 1000, (long)p2.x->held_n);
+    held_ok("ceiling: sum at the end");
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
+}
+
+/* catches: only the reading link paused, or the largest not */
+static void t_ceiling_reader_paused(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p3, p4;
+    struct xs a, b;
+    struct bg g;
+    ceiling_link(&p3, 0, &a, 1);
+    pour_bg(&p3, 0, &g, 1, 6, 1696, 1);
+    io_until_held(&p3, 100000, 0);
+    pthread_join(g.th, NULL);
+    check("reader: L3 holds 100000", 100000, (long)p3.x->held_n);
+    check("reader: L3 not paused under the ceiling", 1, xconn_wants_in(p3.x));
+    ceiling_link(&p4, 1, &b, 2);
+    pour_bg(&p4, 1, &g, 1, 4, 0, 1);
+    io_until_paused(p3.x, &p4, 0);
+    check("reader: the ceiling crossed", 1, xc_held() >= 131072);
+    check("reader: L4 held at most one read past it", 1, p4.x->held_n >= 31072 && p4.x->held_n < 47456);
+    check("reader: L3, the largest, paused", 0, xconn_wants_in(p3.x));
+    check("reader: L4 not paused", 1, xconn_wants_in(p4.x));
+    held_ok("reader: sum");
+    pthread_join(g.th, NULL);
+    wait_pending(p4.x->link.fd);
+    int64_t h4 = p4.x->held_n;
+    xconn_io(p4.x, EPOLLIN, 0);
+    check("reader: L4's next pass reads nothing", (long)h4, (long)p4.x->held_n);
+    check("reader: and pauses L4", 0, xconn_wants_in(p4.x));
+    held_ok("reader: sum at the end");
+    close_plain(&p3);
+    close_plain(&p4);
+    budget_off();
+}
+
+/* catches: a paused link waiting for the soft budget while stalled streams hold it */
+static void t_resume_with_stalled_holders(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p0, p1;
+    struct xs a, b;
+    struct bg g;
+    ceiling_link(&p0, 0, &a, 1);
+    pour_bg(&p0, 0, &g, 1, 3, 10848, 1);
+    io_until_held(&p0, 60000, 0);
+    pthread_join(g.th, NULL);
+    check("stalled: L0 holds 60000", 60000, (long)p0.x->held_n);
+    ceiling_link(&p1, 1, &b, 2);
+    pour_bg(&p1, 1, &g, 1, 5, 0, 1);
+    io_until_paused(p1.x, &p1, 0);
+    pthread_join(g.th, NULL);
+    check("stalled: L1 holds more than L0", 1, p1.x->held_n > 60000);
+    check("stalled: L1 paused", 0, xconn_wants_in(p1.x));
+    check("stalled: L0 not paused", 1, xconn_wants_in(p0.x));
+    size_t got = 0;
+    xs_read(&b, g_big, 30000, &got);
+    check("stalled: held under resume, over soft", 1, xc_held() >= 101072 && xc_held() < 117456);
+    check("stalled: L1 resumed", 1, xconn_wants_in(p1.x));
+    held_ok("stalled: sum");
+    close_plain(&p0);
+    close_plain(&p1);
+    budget_off();
+}
+
+static void ab_link(struct pl *p, struct xs *a, struct xs *b) {
+    xc_budget_set(65536, 131072, 122880);
+    open_plain(p, 1, 0, 0, 0);
+    g_bx[0] = p->x;
+    xs_open(p->x, &RQ_GET, 1, a);
+    xs_open(p->x, &RQ_GET, 2, b);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+    unsigned char *q = g_pour[0];
+    size_t m = frame(q, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, 3, ST200);
+    m += pour_frames(q + m, 3, 0, 2000);
+    m += pour_frames(q + m, 1, 9, 0);
+    struct bg g;
+    bg_start(&g, p->pfd, q, m);
+    io_until_paused(p->x, p, 0);
+    pthread_join(g.th, NULL);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+}
+
+/* catches: a ceiling held by stalled streams hanging every flow forever, or a reset before 30 s */
+static void t_ceiling_stall_reset(void) {
+    struct pl p;
+    struct xs a, b;
+    ab_link(&p, &a, &b);
+    check("stall: L1 paused", 0, xconn_wants_in(p.x));
+    int64_t ha = p.x->held_n - 2000;
+    check("stall: A crossed the ceiling", 1, p.x->held_n >= 131072);
+    g_wk_n = 0;
+    xconn_tick(p.x, 20000);
+    size_t got = 0;
+    xs_read(&b, g_big, 1000, &got);
+    check("stall: B read 1000", 1000, (long)got);
+    check("stall: 29999 nothing", 0, xconn_tick(p.x, 29999));
+    xconn_flush(p.x);
+    check("stall: nothing sent before 30000", 0, peer_frames(p.pfd, 20));
+    check("stall: still paused", 0, xconn_wants_in(p.x));
+    check("stall: 30000 ticks clean", 0, xconn_tick(p.x, 30000));
+    xconn_flush(p.x);
+    int k = peer_frames(p.pfd, 20);
+    check("stall: two frames", 2, k);
+    check("stall: RST_STREAM(1, CANCEL)", 1, rst_is(k, 0, 1));
+    check("stall: WU(0, A's bytes + B's 1000) alone", 1, wu_is(k, 1, 0, (uint32_t)(ha + 1000)));
+    check("stall: A's owner woken", 1, wakes(1, XW_READ));
+    check("stall: with H2_ERESET", H2_ERESET, wake_rc(1, XW_READ));
+    check("stall: A reads the reset", H2_ERESET, xs_read(&a, g_big, 100, &got));
+    check("stall: B's 1000 held", 1000, (long)xc_held());
+    check("stall: L1 resumed", 1, xconn_wants_in(p.x));
+    held_ok("stall: sum");
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: held bytes of a dead or closed paused link never subtracted */
+static void t_pause_stream_ends(void) {
+    struct pl p;
+    struct xs a, b;
+    ab_link(&p, &a, &b);
+    check("ends: paused", 0, xconn_wants_in(p.x));
+    int64_t h = xc_held(), ha = p.x->held_n - 2000;
+    xs_close(&a);
+    check("ends: held less exactly A's bytes", (long)(h - ha), (long)xc_held());
+    check("ends: B's 2000 left", 2000, (long)xc_held());
+    check("ends: resumed", 1, xconn_wants_in(p.x));
+    held_ok("ends: sum");
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: held bytes of a dead or closed paused link never subtracted */
+static void t_pause_link_dies(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p1, p2;
+    struct xs a, b;
+    struct bg g;
+    ceiling_link(&p1, 0, &a, 1);
+    pour_bg(&p1, 0, &g, 1, 9, 0, 1);
+    io_until_paused(p1.x, &p1, 0);
+    pthread_join(g.th, NULL);
+    int64_t ha = p1.x->held_n;
+    ceiling_link(&p2, 1, &b, 2);
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("dies: L2 paused", 0, xconn_wants_in(p2.x));
+    xconn_fail(p1.x, TR_EIO);
+    held_ok("dies: sum after the failure");
+    int end = 0;
+    size_t n = read_all_of(&a, g_big, sizeof g_big, &end);
+    check("dies: A reads its held bytes", (long)ha, (long)n);
+    check("dies: then the error", TR_EIO, end);
+    xs_close(&a);
+    check("dies: nothing held", 0, (long)xc_held());
+    check("dies: L2 resumed", 1, xconn_wants_in(p2.x));
+    held_ok("dies: sum");
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("dies: L2 delivers 1000", 1000, (long)p2.x->held_n);
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
+}
+
+/* catches: a paused link killed by its own PING timeout */
+static void t_pause_no_keepalive(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p;
+    struct xs a;
+    struct bg g;
+    int rc;
+    ceiling_link(&p, 0, &a, 1);
+    pour_bg(&p, 0, &g, 1, 9, 0, 1);
+    io_until_paused(p.x, &p, 0);
+    pthread_join(g.th, NULL);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    check("no ping: paused", 0, xconn_wants_in(p.x));
+    size_t got = 0;
+    check("no ping: tick 29000", 0, tick_pings(&p, 29000, &rc));
+    xs_read(&a, g_big, 1, &got);
+    check("no ping: tick 58000", 0, tick_pings(&p, 58000, &rc));
+    xs_read(&a, g_big, 1, &got);
+    check("no ping: none at 60000", 0, tick_pings(&p, 60000, &rc));
+    check("no ping: tick 60000 clean", 0, rc);
+    check("no ping: link live", XC_LIVE, p.x->state);
+    check("no ping: still paused", 0, xconn_wants_in(p.x));
+    xs_read(&a, g_big, (size_t)(p.x->held_n - 122879), &got);
+    check("no ping: under resume", 122879, (long)xc_held());
+    check("no ping: resumed", 1, xconn_wants_in(p.x));
+    check("no ping: none at 61000", 0, tick_pings(&p, 61000, &rc));
+    check("no ping: none at 104999", 0, tick_pings(&p, 104999, &rc));
+    check("no ping: PING at 105000", 1, tick_pings(&p, 105000, &rc));
+    held_ok("no ping: sum");
+    close_plain(&p);
+    budget_off();
+}
+
+
+static void paused_at(struct pl *p, int slot, struct xs *a, uint64_t now) {
+    struct bg g;
+    ceiling_at(p, slot, a, (uint16_t)(slot + 1), now);
+    pour_bg(p, slot, &g, 1, 9, 0, 1);
+    io_until_paused(p->x, p, now);
+    pthread_join(g.th, NULL);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+}
+
+static int rst_after_tick(struct pl *p, uint64_t now) {
+    xconn_tick(p->x, now);
+    xconn_flush(p->x);
+    int k = peer_frames(p->pfd, 20);
+    return count_type(k, FR_RST_STREAM, -1);
+}
+
+/* catches: a dead or freed paused link still counted, so the next pause runs on an old stall clock */
+static void t_pause_count_cleared(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p1, p2, p3, p4;
+    struct xs a, b, c, d;
+    int end = 0;
+    paused_at(&p1, 0, &a, 0);
+    check("count: L1 paused", 0, xconn_wants_in(p1.x));
+    xconn_fail(p1.x, TR_EIO);
+    read_all_of(&a, g_big, sizeof g_big, &end);
+    xs_close(&a);
+    check("count: nothing held after the dead link", 0, (long)xc_held());
+    paused_at(&p2, 1, &b, 100000);
+    check("count: L2 paused at 100000", 0, xconn_wants_in(p2.x));
+    check("count: no reset at 129999", 0, rst_after_tick(&p2, 129999));
+    check("count: reset at 130000", 1, rst_after_tick(&p2, 130000));
+    xs_close(&b);
+    close_plain(&p2);
+    paused_at(&p3, 2, &c, 200000);
+    check("count: L3 paused", 0, xconn_wants_in(p3.x));
+    close_plain(&p3);
+    g_bx[2] = NULL;
+    check("count: nothing held after the free", 0, (long)xc_held());
+    paused_at(&p4, 3, &d, 300000);
+    check("count: L4 paused at 300000", 0, xconn_wants_in(p4.x));
+    check("count: no reset at 329999", 0, rst_after_tick(&p4, 329999));
+    check("count: reset at 330000", 1, rst_after_tick(&p4, 330000));
+    xs_close(&d);
+    close_plain(&p4);
+    close_plain(&p1);
+    budget_off();
+}
+
+/* catches: a stall reset leaving the clock, so every tick after it resets another stream */
+static void t_stall_clock_restarts(void) {
+    xc_budget_set(65536, 131072, 16384);
+    struct pl p;
+    struct xs a, b;
+    open_plain(&p, 1, 0, 0, 0);
+    g_bx[0] = p.x;
+    xs_open(p.x, &RQ_GET, 1, &a);
+    xs_open(p.x, &RQ_GET, 2, &b);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    unsigned char *q = g_pour[0];
+    size_t m = frame(q, 1, FR_HEADERS, FLAG_END_HEADERS, 1, ST200);
+    m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, 3, ST200);
+    m += pour_frames(q + m, 1, 5, 0);
+    m += pour_frames(q + m, 3, 4, 0);
+    struct bg g;
+    bg_start(&g, p.pfd, q, m);
+    io_until_paused(p.x, &p, 0);
+    pthread_join(g.th, NULL);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    check("clock: paused", 0, xconn_wants_in(p.x));
+    check("clock: A's 81920 reset at 30000", 1, rst_after_tick(&p, 30000));
+    check("clock: B still over resume, paused", 0, xconn_wants_in(p.x));
+    check("clock: no second reset at 30001", 0, rst_after_tick(&p, 30001));
+    check("clock: none at 30999", 0, rst_after_tick(&p, 30999));
+    check("clock: B reset at 31000", 1, rst_after_tick(&p, 31000));
+    check("clock: resumed", 1, xconn_wants_in(p.x));
+    held_ok("clock: sum");
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: a paused link's hang-up ignored until it resumes */
+static void t_paused_hangup_fails(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p;
+    struct xs a;
+    paused_at(&p, 0, &a, 0);
+    int64_t h = p.x->held_n;
+    check("hangup: paused", 0, xconn_wants_in(p.x));
+    check("hangup: EPOLLHUP fails it", TR_EIO, xconn_io(p.x, EPOLLHUP, 0));
+    check("hangup: dead", XC_DEAD, p.x->state);
+    check("hangup: nothing read", (long)h, (long)p.x->held_n);
+    held_ok("hangup: sum");
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: a paused link that died still counted, so the next pause runs on its stall clock */
+static void t_dead_pause_uncounted(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p1, p2;
+    struct xs a, b;
+    paused_at(&p1, 0, &a, 0);
+    int64_t h = xc_held();
+    xconn_fail(p1.x, TR_EIO);
+    ceiling_at(&p2, 1, &b, 2, 100000);
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 100000);
+    check("dead pause: L2 paused at 100000", 0, xconn_wants_in(p2.x));
+    xconn_tick(p2.x, 129999);
+    check("dead pause: A kept at 129999", (long)h, (long)xc_held());
+    xconn_tick(p2.x, 130000);
+    check("dead pause: A dropped at 130000", 0, (long)xc_held());
+    check("dead pause: L2 resumed", 1, xconn_wants_in(p2.x));
+    held_ok("dead pause: sum");
+    xs_close(&a);
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
+}
+
+/* catches: a PING sent before the pause timing out while the link may not read its ACK */
+static void t_pause_holds_ping_clock(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p;
+    struct xs a;
+    struct bg g;
+    int rc;
+    ceiling_at(&p, 0, &a, 1, 0);
+    check("ping clock: PING at 45000", 1, tick_pings(&p, 45000, &rc));
+    pour_bg(&p, 0, &g, 1, 9, 0, 1);
+    io_until_paused(p.x, &p, 50000);
+    pthread_join(g.th, NULL);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    check("ping clock: paused at 50000", 0, xconn_wants_in(p.x));
+    check("ping clock: no timeout at 60000 while paused", 0, xconn_tick(p.x, 60000));
+    check("ping clock: tick 70000", 0, xconn_tick(p.x, 70000));
+    size_t got = 0;
+    xs_read(&a, g_big, (size_t)(p.x->held_n - 122879), &got);
+    check("ping clock: resumed at 70000", 1, xconn_wants_in(p.x));
+    check("ping clock: no timeout at 84999", 0, xconn_tick(p.x, 84999));
+    check("ping clock: timeout at 85000", XC_EPING, xconn_tick(p.x, 85000));
+    xs_close(&a);
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: a private link's read rewinding the stall clock to its own stale time */
+static void t_private_read_no_progress(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl pp, p1;
+    struct xs b, a;
+    open_plain(&pp, 0, 0, 0, 0);
+    xs_open(pp.x, &RQ_GET, 2, &b);
+    xconn_flush(pp.x);
+    peer_drain(pp.pfd, g_pb, sizeof g_pb, 10);
+    pw(pp.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(pp.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(pp.x->link.fd);
+    paused_at(&p1, 0, &a, 100000);
+    check("private read: L1 paused at 100000", 0, xconn_wants_in(p1.x));
+    check("private read: none at 110000", 0, rst_after_tick(&p1, 110000));
+    size_t got = 0;
+    for (int i = 0; i < 20 && !got; i++) xs_read(&b, g_big, 100, &got);
+    check("private read: 100 read", 100, (long)got);
+    g_wk_n = 0;
+    check("private read: no reset at 110001", 0, rst_after_tick(&p1, 110001));
+    check("private read: none at 129999", 0, rst_after_tick(&p1, 129999));
+    check("private read: reset at 130000", 1, rst_after_tick(&p1, 130000));
+    close_plain(&p1);
+    xs_close(&b);
+    close_plain(&pp);
+    budget_off();
+}
+
+/* catches: a dead link's read rewinding the stall clock to the time it died */
+static void t_dead_read_progress_now(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p2, p1;
+    struct xs b, a;
+    ceiling_at(&p2, 1, &b, 2, 0);
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("dead read: L2 holds 1000", 1000, (long)p2.x->held_n);
+    xconn_fail(p2.x, TR_EIO);
+    paused_at(&p1, 0, &a, 100000);
+    check("dead read: L1 paused at 100000", 0, xconn_wants_in(p1.x));
+    xconn_tick(p1.x, 105000);
+    size_t got = 0;
+    xs_read(&b, g_big, 100, &got);
+    check("dead read: 100 read at 105000", 100, (long)got);
+    check("dead read: no reset at 125000", 0, rst_after_tick(&p1, 125000));
+    xs_read(&a, g_big, 1, &got);
+    check("dead read: A read 1 at 125000", 1, (long)got);
+    int64_t h = xc_held();
+    xconn_tick(p1.x, 134999);
+    check("dead read: B kept at 134999", (long)h, (long)xc_held());
+    g_wk_n = 0;
+    xconn_tick(p1.x, 135000);
+    check("dead read: B reset at 135000", H2_ERESET, wake_rc(2, XW_READ));
+    check("dead read: B's 900 dropped", (long)(h - 900), (long)xc_held());
+    check("dead read: A still paused", 0, xconn_wants_in(p1.x));
+    check("dead read: A reset at 155000", 1, rst_after_tick(&p1, 155000));
+    xs_close(&a);
+    xs_close(&b);
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
+}
+
+static int rst_sid(struct pl *p, uint64_t now) {
+    xconn_tick(p->x, now);
+    xconn_flush(p->x);
+    int k = peer_frames(p->pfd, 20), n = 0;
+    uint32_t sid = 0;
+    for (int i = 0; i < k; i++)
+        if (g_fv[i].type == FR_RST_STREAM) {
+            n++;
+            sid = g_fv[i].sid;
+        }
+    return n == 1 ? (int)sid : -n;
+}
+
+/* catches: a stall episode freeing one stream per 30 s, or resetting past the resume threshold */
+static void t_stall_steps(void) {
+    xc_budget_set(65536, 131072, 40000);
+    struct pl p;
+    struct xs s[6];
+    open_plain(&p, 1, 0, 0, 0);
+    g_bx[0] = p.x;
+    for (int i = 0; i < 6; i++) xs_open(p.x, &RQ_GET, (uint16_t)(i + 1), &s[i]);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    unsigned char *q = g_pour[0];
+    size_t m = 0;
+    for (int i = 0; i < 6; i++) m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, (uint32_t)(2 * i + 1), ST200);
+    for (int i = 0; i < 6; i++) m += pour_frames(q + m, (uint32_t)(2 * i + 1), 1, 5616);
+    struct bg g;
+    bg_start(&g, p.pfd, q, m);
+    io_until_paused(p.x, &p, 0);
+    pthread_join(g.th, NULL);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    check("steps: paused", 0, xconn_wants_in(p.x));
+    check("steps: held in [131072, 132000]", 1, xc_held() >= 131072 && xc_held() <= 132000);
+    check("steps: none at 29999", 0, rst_sid(&p, 29999));
+    check("steps: sid 1 at 30000", 1, rst_sid(&p, 30000));
+    check("steps: none at 30999", 0, rst_sid(&p, 30999));
+    check("steps: sid 3 at 31000", 3, rst_sid(&p, 31000));
+    check("steps: sid 5 at 32000", 5, rst_sid(&p, 32000));
+    check("steps: sid 7 at 33000", 7, rst_sid(&p, 33000));
+    check("steps: still paused over 40000", 0, xconn_wants_in(p.x));
+    check("steps: sid 9 at 34000", 9, rst_sid(&p, 34000));
+    check("steps: under resume, resumed", 1, xc_held() < 40000 && xconn_wants_in(p.x));
+    check("steps: none at 35000", 0, rst_sid(&p, 35000));
+    check("steps: none at 64000", 0, rst_sid(&p, 64000));
+    check("steps: F keeps its bytes", 1, p.x->held_n > 21000);
+    held_ok("steps: sum");
+    m = pour_frames(q, 11, 7, 0);
+    bg_start(&g, p.pfd, q, m);
+    io_until_paused(p.x, &p, 40000);
+    pthread_join(g.th, NULL);
+    check("steps: a new episode paused at 40000", 0, xconn_wants_in(p.x));
+    check("steps: the new episode waits, none at 41000", 0, rst_sid(&p, 41000));
+    check("steps: none at 69999", 0, rst_sid(&p, 69999));
+    check("steps: sid 11 at 70000", 11, rst_sid(&p, 70000));
+    for (int i = 0; i < 6; i++) xs_close(&s[i]);
+    close_plain(&p);
+    budget_off();
+}
+
+static void steps_setup(struct pl *p, struct xs *s) {
+    xc_budget_set(65536, 131072, 40000);
+    open_plain(p, 1, 0, 0, 0);
+    g_bx[0] = p->x;
+    for (int i = 0; i < 6; i++) xs_open(p->x, &RQ_GET, (uint16_t)(i + 1), &s[i]);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+    unsigned char *q = g_pour[0];
+    size_t m = 0;
+    for (int i = 0; i < 6; i++) m += frame(q + m, 1, FR_HEADERS, FLAG_END_HEADERS, (uint32_t)(2 * i + 1), ST200);
+    for (int i = 0; i < 6; i++) m += pour_frames(q + m, (uint32_t)(2 * i + 1), 1, 5616);
+    struct bg g;
+    bg_start(&g, p->pfd, q, m);
+    io_until_paused(p->x, p, 0);
+    pthread_join(g.th, NULL);
+    xconn_flush(p->x);
+    peer_drain(p->pfd, g_pb, sizeof g_pb, 10);
+}
+
+/* catches: a read between ticks stamped with the last tick, or a stream just read reset by the episode */
+static void t_episode_read_between_ticks(void) {
+    struct pl p;
+    struct xs s[6];
+    steps_setup(&p, s);
+    xc_budget_set(65536, 131072, 10000);
+    check("episode read: paused", 0, xconn_wants_in(p.x));
+    check("episode read: sid 1 at 30000", 1, rst_sid(&p, 30000));
+    size_t got = 0;
+    p.x->now_ms = 30200;
+    xs_read(&s[5], g_big, 100, &got);
+    check("episode read: sid 11 read 100 at 30200", 100, (long)got);
+    p.x->now_ms = 30500;
+    xs_read(&s[2], g_big, 100, &got);
+    check("episode read: sid 5 read 100 at 30500", 100, (long)got);
+    xconn_flush(p.x);
+    peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
+    check("episode read: sid 3 at 31000", 3, rst_sid(&p, 31000));
+    check("episode read: sid 7 at 32000", 7, rst_sid(&p, 32000));
+    check("episode read: sid 9 at 33000", 9, rst_sid(&p, 33000));
+    check("episode read: readers over resume, paused", 0, xconn_wants_in(p.x));
+    check("episode read: readers spared at 34000", 0, rst_sid(&p, 34000));
+    check("episode read: spared at 60000, read 29800 ms ago", 0, rst_sid(&p, 60000));
+    check("episode read: sid 11 at 60200", 11, rst_sid(&p, 60200));
+    check("episode read: sid 5 waits a second, none at 60500", 0, rst_sid(&p, 60500));
+    check("episode read: none at 61199", 0, rst_sid(&p, 61199));
+    check("episode read: sid 5 at 61200", 5, rst_sid(&p, 61200));
+    for (int i = 0; i < 6; i++) xs_close(&s[i]);
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: an episode resetting more than one stream per second */
+static void t_storm_bound(void) {
+    struct pl p;
+    struct xs s[6];
+    steps_setup(&p, s);
+    check("storm: sid 1 at 30000", 1, rst_sid(&p, 30000));
+    check("storm: same now again none", 0, rst_sid(&p, 30000));
+    check("storm: none at 30999", 0, rst_sid(&p, 30999));
+    check("storm: sid 3 at 31000", 3, rst_sid(&p, 31000));
+    check("storm: none at 31999", 0, rst_sid(&p, 31999));
+    for (int i = 0; i < 6; i++) xs_close(&s[i]);
+    close_plain(&p);
+    budget_off();
+}
+
+/* catches: a loop-wide progress clock, so a stalled holder is never reset while another flow reads */
+static void t_stall_with_reader_elsewhere(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p2, p1;
+    struct xs b, a;
+    ceiling_at(&p2, 1, &b, 2, 0);
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 0);
+    check("reader elsewhere: L2 holds 1000", 1000, (long)p2.x->held_n);
+    paused_at(&p1, 0, &a, 0);
+    check("reader elsewhere: L1 paused", 0, xconn_wants_in(p1.x));
+    size_t got = 0;
+    for (uint64_t t = 10000; t <= 20000; t += 10000) {
+        xconn_tick(p2.x, t - 5000);
+        xs_read(&b, g_big, 100, &got);
+        check("reader elsewhere: L2 read 100", 100, (long)got);
+        check("reader elsewhere: no reset before 30000", 0, rst_after_tick(&p1, t));
+    }
+    xconn_tick(p2.x, 25000);
+    xs_read(&b, g_big, 100, &got);
+    check("reader elsewhere: none at 29999", 0, rst_after_tick(&p1, 29999));
+    check("reader elsewhere: A reset at 30000", 1, rst_after_tick(&p1, 30000));
+    check("reader elsewhere: L1 resumed", 1, xconn_wants_in(p1.x));
+    check("reader elsewhere: B keeps its 700", 700, (long)xc_held());
+    xconn_tick(p2.x, 35000);
+    xs_read(&b, g_big, 100, &got);
+    check("reader elsewhere: B still reads", 100, (long)got);
+    held_ok("reader elsewhere: sum");
+    xs_close(&a);
+    xs_close(&b);
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
+}
+
+/* catches: a fruitless walk deferring the next one past a holder that fills after it */
+static void t_stall_holder_fills_late(void) {
+    xc_budget_set(65536, 131072, 122880);
+    struct pl p2, p1;
+    struct xs c, a;
+    ceiling_at(&p2, 1, &c, 2, 0);
+    paused_at(&p1, 0, &a, 0);
+    xc_budget_set(65536, 131072, 40000);
+    p1.x->now_ms = 1000;
+    size_t got = 0;
+    xs_read(&a, g_big, 50000, &got);
+    check("fills late: A read 50000 at 1000", 50000, (long)got);
+    check("fills late: L1 still paused", 0, xconn_wants_in(p1.x));
+    check("fills late: none at 2000", 0, rst_after_tick(&p1, 2000));
+    pw(p2.pfd, FR_HEADERS, FLAG_END_HEADERS, 1, ST200, 1);
+    pw(p2.pfd, FR_DATA, 0, 1, NULL, 1000);
+    wait_pending(p2.x->link.fd);
+    xconn_io(p2.x, EPOLLIN, 5000);
+    check("fills late: C holds 1000", 1000, (long)p2.x->held_n);
+    for (uint64_t t = 10000; t < 30000; t += 10000) check("fills late: none", 0, rst_after_tick(&p1, t));
+    check("fills late: none at 29999", 0, rst_after_tick(&p1, 29999));
+    g_wk_n = 0;
+    check("fills late: A spared at 30000", 0, rst_after_tick(&p1, 30000));
+    check("fills late: C reset at 30000", H2_ERESET, wake_rc(2, XW_READ));
+    check("fills late: C's 1000 dropped", 0, (long)p2.x->held_n);
+    check("fills late: A reset at 31000", 1, rst_after_tick(&p1, 31000));
+    held_ok("fills late: sum");
+    xs_close(&a);
+    xs_close(&c);
+    close_plain(&p1);
+    close_plain(&p2);
+    budget_off();
 }
 
 int main(void) {
@@ -2021,9 +3141,10 @@ int main(void) {
 
     t_seal_is_write();
     t_dial_preface();
-    t_preface_past_budget();
-    t_discard_past_budget();
-    t_preface_counts_held();
+    t_alpn_any();
+    t_pend_one_frame();
+    t_pend_flush_write_fails();
+    t_cancel_ping_ceiling();
     t_send_never_blocks();
     t_room_sum_fits();
     t_new_room_counts_flows();
@@ -2031,10 +3152,22 @@ int main(void) {
     t_room_wakes_below_low();
     t_control_ignores_high_water();
     t_control_flood_closes();
+    t_control_flood_tls();
+    t_control_ceiling_counts_records();
     t_staging_per_link();
+    t_records_alone();
     t_slow_stream_does_not_stop_fast();
-    t_budget_exact();
     t_stream_credit_on_consumption();
+    t_credit_go_reads();
+    t_nowner_credit();
+    t_nowner_freed_on_fail();
+    t_close_refund_open();
+    t_close_refund_ended();
+    t_close_refund_nowner();
+    t_dead_link_no_refund();
+    t_discard_close_credit();
+    t_nowner_discard_gate();
+    t_credit_held_while_blocked();
     t_keepalive();
     t_idle_close();
     t_orphan_post_times_out();
@@ -2054,9 +3187,6 @@ int main(void) {
     t_chunk_boundary_pay();
     t_two_flushes_one_turn();
     t_overshoot_held_then_sent();
-    t_consumed_link_paid_first();
-    t_owed_not_debt();
-    t_priority_pays_every_link();
     t_coalesced_credit_over_ceiling();
     t_room_counts_held();
     t_headroom_from_a_pool();
@@ -2066,6 +3196,27 @@ int main(void) {
     t_room_within_held_limit();
     t_private_overshoot_refused();
     t_fail_drops_held();
+    t_soft_withholds_holders();
+    t_release_on_close();
+    t_hard_ceiling_pauses();
+    t_ceiling_reader_paused();
+    t_resume_with_stalled_holders();
+    t_ceiling_stall_reset();
+    t_pause_stream_ends();
+    t_pause_link_dies();
+    t_pause_no_keepalive();
+    t_pause_count_cleared();
+    t_stall_clock_restarts();
+    t_paused_hangup_fails();
+    t_dead_pause_uncounted();
+    t_pause_holds_ping_clock();
+    t_private_read_no_progress();
+    t_dead_read_progress_now();
+    t_stall_steps();
+    t_episode_read_between_ticks();
+    t_storm_bound();
+    t_stall_with_reader_elsewhere();
+    t_stall_holder_fills_late();
 
     printf("\nxconnmatch: %s (%d failed)\n", fails ? "FAIL" : "ok", fails);
     return fails ? 1 : 0;

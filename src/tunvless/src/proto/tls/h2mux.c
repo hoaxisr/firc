@@ -14,8 +14,13 @@
 
 #define E_FLOW_CONTROL 3
 #define E_NO_ERROR     0
+#define E_CANCEL       8
+
+#define FRAME_MAX 16777215
 
 static __thread unsigned char g_frame[9 + DEFAULT_MAX_FRAME];
+static __thread unsigned char g_block[H2M_BLOCK_MAX];
+static __thread struct h2w_list g_list;
 
 static int die(struct h2m *m, int rc) {
     if (!m->dead) m->dead = rc;
@@ -23,17 +28,25 @@ static int die(struct h2m *m, int rc) {
 }
 
 static int emit(struct h2m *m, unsigned char type, unsigned char flags, uint32_t sid,
-                const unsigned char *body, size_t n, int control) {
+                const unsigned char *body, size_t n) {
     h2w_frame_hdr(g_frame, (uint32_t)n, type, flags, sid);
     if (n) memcpy(g_frame + 9, body, n);
-    int rc = m->cb.out(m->cb.ctx, g_frame, 9 + n, control);
+    int rc = m->cb.out(m->cb.ctx, g_frame, 9 + n, H2M_CTL | H2M_END);
     return rc ? die(m, rc) : 0;
 }
 
 static int emit_u32(struct h2m *m, unsigned char type, uint32_t sid, uint32_t v) {
     unsigned char b[4];
     put32(b, v);
-    return emit(m, type, 0, sid, b, 4, 1);
+    return emit(m, type, 0, sid, b, 4);
+}
+
+static int emit_data(struct h2m *m, unsigned char flags, uint32_t sid, const unsigned char *d, size_t n) {
+    unsigned char h[9];
+    h2w_frame_hdr(h, (uint32_t)n, FR_DATA, flags, sid);
+    int rc = m->cb.out(m->cb.ctx, h, 9, n ? 0u : H2M_END);
+    if (!rc && n) rc = m->cb.out(m->cb.ctx, d, n, H2M_PAY | H2M_END);
+    return rc ? die(m, rc) : 0;
 }
 
 static int live(const struct h2m *m, uint16_t slot) {
@@ -47,22 +60,37 @@ static uint16_t slot_of(const struct h2m *m, uint32_t sid) {
     return NO_SLOT;
 }
 
-static void conn_credit(struct h2m *m, uint32_t n) {
-    if (m->dead) return;
-    m->conn_owed += n;
-    if (m->conn_owed < WINDOW_REFILL) return;
-    if (emit_u32(m, FR_WINDOW_UPDATE, 0, m->conn_owed)) return;
-    m->recv_win_conn += (int32_t)m->conn_owed;
-    m->conn_owed = 0;
+uint32_t h2m_in_add(struct h2m_in *f, uint32_t n) {
+    int64_t u = (int64_t)f->unsent + n;
+    if (u + f->avail > WIN_MAX) u = (int64_t)WIN_MAX - f->avail;
+    f->unsent = (int32_t)u;
+    if (f->unsent < H2M_MIN_REFRESH && f->unsent < f->avail) return 0;
+    f->avail += f->unsent;
+    f->unsent = 0;
+    return (uint32_t)u;
 }
 
-static void stream_credit(struct h2m *m, uint16_t slot, uint32_t n) {
-    struct h2m_stream *s = &m->st[slot];
-    s->recv_owed += n;
-    if (s->recv_owed < WINDOW_REFILL) return;
-    if (emit_u32(m, FR_WINDOW_UPDATE, s->sid, s->recv_owed)) return;
-    s->recv_win += (int32_t)s->recv_owed;
-    s->recv_owed = 0;
+static void in_keep(struct h2m_in *f, uint32_t n) {
+    int64_t u = (int64_t)f->unsent + n;
+    f->unsent = u + f->avail > WIN_MAX ? WIN_MAX - f->avail : (int32_t)u;
+}
+
+static void credit_out(struct h2m *m, uint32_t c, uint32_t sid, uint32_t s) {
+    unsigned char b[26];
+    size_t n = 0;
+    if (c) {
+        h2w_frame_hdr(b, 4, FR_WINDOW_UPDATE, 0, 0);
+        put32(b + 9, c);
+        n = 13;
+    }
+    if (s) {
+        h2w_frame_hdr(b + n, 4, FR_WINDOW_UPDATE, 0, sid);
+        put32(b + n + 9, s);
+        n += 13;
+    }
+    if (!n) return;
+    int rc = m->cb.out(m->cb.ctx, b, n, H2M_CTL | H2M_END);
+    if (rc) die(m, rc);
 }
 
 static void free_slot(struct h2m *m, uint16_t slot) {
@@ -72,13 +100,15 @@ static void free_slot(struct h2m *m, uint16_t slot) {
     m->f_slot = NO_SLOT;
     if (m->f_type == FR_DATA && !m->paid) {
         m->paid = 1;
-        if (m->f_left > m->pad_left) m->lost += m->f_left - m->pad_left;
+        m->f_drop += m->f_pad + (m->f_left > m->pad_left ? m->f_left - m->pad_left : 0);
+        m->f_pad = 0;
     }
 }
 
 static void end_stream(struct h2m *m, uint16_t slot, int code) {
+    struct h2m_in in = m->st[slot].in;
     free_slot(m, slot);
-    m->cb.end(m->cb.ctx, slot, code);
+    m->cb.end(m->cb.ctx, slot, code, &in);
 }
 
 static int flow_reset(struct h2m *m, uint16_t slot) {
@@ -106,19 +136,22 @@ static int grow(struct h2m *m) {
     return 0;
 }
 
-int h2m_start(struct h2m *m, const struct h2m_cb *cb, int conn_update) {
+int h2m_start(struct h2m *m, const struct h2m_cb *cb, uint64_t seed) {
     memset(m, 0, sizeof(*m));
     m->cb = *cb;
+    m->rng = seed;
+    m->peer_max_frame = DEFAULT_MAX_FRAME;
+    hpe_init(&m->enc);
     m->st = calloc(ST_FIRST, sizeof(*m->st));
     if (!m->st) return H2_EIO;
     m->st_cap = ST_FIRST;
     m->next_sid = 1;
     m->send_win_conn = 65535;
     m->peer_init_win = 65535;
-    m->recv_win_conn = conn_update ? OUR_WINDOW : 65535;
+    m->in_conn.avail = 65535 + H2M_CONN_INC;
     m->f_slot = NO_SLOT;
-    size_t n = h2w_preface(g_frame, sizeof(g_frame), conn_update);
-    int rc = m->cb.out(m->cb.ctx, g_frame, n, 0);
+    size_t n = h2w_go_preface(g_frame, sizeof(g_frame));
+    int rc = m->cb.out(m->cb.ctx, g_frame, n, H2M_END);
     return rc ? die(m, rc) : 0;
 }
 
@@ -142,24 +175,44 @@ uint32_t h2m_header_budget(const struct h2m *m, uint32_t server_max) {
 
 unsigned h2m_open_n(const struct h2m *m) { return m->open_n; }
 
-int h2m_open(struct h2m *m, const struct h2_req *r, int browser, uint16_t *slot) {
+static int headers_out(struct h2m *m, size_t bn, int end_stream) {
+    size_t at = 0;
+    unsigned char type = FR_HEADERS, es = end_stream ? FLAG_END_STREAM : 0;
+    do {
+        size_t k = bn - at < m->peer_max_frame ? bn - at : m->peer_max_frame;
+        int last = at + k == bn;
+        unsigned char h[9];
+        h2w_frame_hdr(h, (uint32_t)k, type, (unsigned char)(es | (last ? FLAG_END_HEADERS : 0)), m->next_sid);
+        int rc = m->cb.out(m->cb.ctx, h, 9, 0);
+        if (!rc) rc = m->cb.out(m->cb.ctx, g_block + at, k, last ? H2M_END : 0u);
+        if (rc) return die(m, rc);
+        at += k;
+        type = FR_CONTINUATION;
+        es = 0;
+    } while (at < bn);
+    return 0;
+}
+
+int h2m_open(struct h2m *m, const struct h2_req *r, uint16_t *slot) {
     if (m->dead) return m->dead;
     if (m->goaway || m->next_sid > WIN_MAX) return H2_ERESET;
     if (m->open_n >= h2m_cap(m)) return H2_EFULL;
     uint16_t s = 0;
     while (s < m->st_cap && (m->st[s].state & ST_LIVE)) s++;
     if (s == m->st_cap && grow(m)) return H2_EFULL;
-    size_t bn = h2w_headers(g_frame + 9, DEFAULT_MAX_FRAME, r, browser);
-    if (!bn) return H2_ETOOBIG;
-    h2w_frame_hdr(g_frame, (uint32_t)bn, FR_HEADERS,
-                  (unsigned char)(FLAG_END_HEADERS | (r->end_stream ? FLAG_END_STREAM : 0)), m->next_sid);
-    int rc = m->cb.out(m->cb.ctx, g_frame, 9 + bn, 0);
-    if (rc) return die(m, rc);
+    uint64_t rng = m->rng;
+    int rc = h2w_go_fields(r, &rng, &g_list);
+    if (rc) return rc;
+    if (hpe_bound(g_list.f, g_list.n) > H2M_BLOCK_MAX) return H2_ETOOBIG;
+    size_t bn = hpe_block(&m->enc, g_list.f, g_list.n, g_block, sizeof g_block);
+    if (!bn || bn > sizeof g_block) return H2_ETOOBIG;
+    m->rng = rng;
+    rc = headers_out(m, bn, r->end_stream);
+    if (rc) return rc;
     struct h2m_stream *st = &m->st[s];
     st->sid = m->next_sid;
     st->send_win = m->peer_init_win;
-    st->recv_win = OUR_WINDOW;
-    st->recv_owed = 0;
+    st->in = (struct h2m_in){ m->next_sid, H2M_STREAM_WIN, 0, 0 };
     st->state = (uint8_t)(ST_LIVE | (r->end_stream ? ST_LOCAL_END : 0));
     m->next_sid += 2;
     m->open_n++;
@@ -177,52 +230,125 @@ long h2m_conn_room(const struct h2m *m) {
     return m->send_win_conn > 0 ? m->send_win_conn : 0;
 }
 
-int h2m_send(struct h2m *m, uint16_t slot, const unsigned char *d, size_t n, int end) {
+int h2m_send_begin(struct h2m *m, uint16_t slot, size_t n, int end) {
     if (m->dead) return m->dead;
     if (!live(m, slot)) return H2_ERESET;
     struct h2m_stream *s = &m->st[slot];
-    if (s->state & ST_LOCAL_END) return H2_EPROTO;
+    if (s->state & ST_LOCAL_END || m->up_left) return H2_EPROTO;
     if (n > INT32_MAX) return H2_ETOOBIG;
     if (n && ((int32_t)n > s->send_win || (int32_t)n > m->send_win_conn)) return H2_EWINDOW;
-    size_t at = 0;
-    do {
-        size_t chunk = n - at > DEFAULT_MAX_FRAME ? DEFAULT_MAX_FRAME : n - at;
-        if (!chunk && !end) break;
-        unsigned char flags = end && at + chunk == n ? FLAG_END_STREAM : 0;
-        int rc = emit(m, FR_DATA, flags, s->sid, chunk ? d + at : NULL, chunk, 0);
-        if (rc) return rc;
-        s->send_win -= (int32_t)chunk;
-        m->send_win_conn -= (int32_t)chunk;
-        at += chunk;
-    } while (at < n);
+    s->send_win -= (int32_t)n;
+    m->send_win_conn -= (int32_t)n;
     if (end) s->state |= ST_LOCAL_END;
+    m->up_sid = s->sid;
+    m->up_left = (uint32_t)n;
+    m->up_frame = 0;
+    m->up_end = end ? 1 : 0;
+    return !n && end ? emit_data(m, FLAG_END_STREAM, s->sid, NULL, 0) : 0;
+}
+
+int h2m_send_put(struct h2m *m, const unsigned char *d, size_t k) {
+    if (m->dead) return m->dead;
+    if (k > m->up_left) return H2_EPROTO;
+    uint32_t fmax = m->peer_max_frame < H2M_SEND_SCRATCH ? m->peer_max_frame : H2M_SEND_SCRATCH;
+    while (k) {
+        if (!m->up_frame) {
+            unsigned char h[9];
+            m->up_frame = m->up_left < fmax ? m->up_left : fmax;
+            int es = m->up_end && m->up_frame == m->up_left;
+            h2w_frame_hdr(h, m->up_frame, FR_DATA, es ? FLAG_END_STREAM : 0, m->up_sid);
+            int rc = m->cb.out(m->cb.ctx, h, 9, 0);
+            if (rc) return die(m, rc);
+        }
+        uint32_t c = k < m->up_frame ? (uint32_t)k : m->up_frame;
+        m->up_frame -= c;
+        m->up_left -= c;
+        int rc = m->cb.out(m->cb.ctx, d, c, H2M_PAY | (m->up_frame ? 0u : H2M_END));
+        if (rc) return die(m, rc);
+        d += c;
+        k -= c;
+    }
     return 0;
+}
+
+int h2m_send(struct h2m *m, uint16_t slot, const unsigned char *d, size_t n, int end) {
+    int rc = h2m_send_begin(m, slot, n, end);
+    return rc || !n ? rc : h2m_send_put(m, d, n);
 }
 
 int h2m_reset(struct h2m *m, uint16_t slot, uint32_t code) {
     if (m->dead) return m->dead;
     if (!live(m, slot)) return H2_ERESET;
-    int rc = emit_u32(m, FR_RST_STREAM, m->st[slot].sid, code);
+    uint32_t sid = m->st[slot].sid;
+    int ping = 0;
+    if (code == E_CANCEL && !m->goaway && m->read_before_sid <= sid && !m->rst_ping_block)
+        ping = !m->resets_pending++;
+    unsigned char b[30];
+    h2w_frame_hdr(b, 4, FR_RST_STREAM, 0, sid);
+    put32(b + 9, code);
+    int rc;
+    if (ping) {
+        uint64_t v = h2w_rng(&m->rng);
+        h2w_frame_hdr(b + 13, 8, FR_PING, 0, 0);
+        put32(b + 22, (uint32_t)(v >> 32));
+        put32(b + 26, (uint32_t)v);
+        rc = m->cb.out(m->cb.ctx, b, 13, H2M_CTL);
+        if (!rc) rc = m->cb.out(m->cb.ctx, b + 13, 17, H2M_CTL | H2M_END);
+    } else {
+        rc = m->cb.out(m->cb.ctx, b, 13, H2M_CTL | H2M_END);
+    }
     free_slot(m, slot);
-    return rc;
+    return rc ? die(m, rc) : 0;
 }
 
-void h2m_consumed(struct h2m *m, uint16_t slot, uint32_t n) {
-    if (m->dead || !live(m, slot)) return;
-    stream_credit(m, slot, n);
+static struct h2m_in *inflow(struct h2m *m, uint16_t slot, struct h2m_in *ended) {
+    if (live(m, slot)) return &m->st[slot].in;
+    return slot == NO_SLOT ? ended : NULL;
 }
 
-void h2m_credit_conn(struct h2m *m, uint32_t n) { conn_credit(m, n); }
+void h2m_consumed(struct h2m *m, uint16_t slot, struct h2m_in *ended, uint32_t n, int give) {
+    if (m->dead || !n) return;
+    struct h2m_in *f = inflow(m, slot, ended);
+    uint32_t k = n;
+    if (f && !give) {
+        f->wh += (int32_t)n;
+        k = 0;
+    } else if (f) {
+        k += (uint32_t)f->wh;
+        f->wh = 0;
+    }
+    if (m->hold) {
+        in_keep(&m->in_conn, n);
+        if (f && k) in_keep(f, k);
+        return;
+    }
+    uint32_t c = h2m_in_add(&m->in_conn, n), s = f && k ? h2m_in_add(f, k) : 0;
+    credit_out(m, c, f ? f->sid : 0, s);
+}
 
-uint32_t h2m_take_lost(struct h2m *m) {
-    uint32_t n = m->lost;
-    m->lost = 0;
-    return n;
+void h2m_conn_refund(struct h2m *m, uint32_t n) {
+    if (m->dead || !n) return;
+    if (m->hold) {
+        in_keep(&m->in_conn, n);
+        return;
+    }
+    credit_out(m, h2m_in_add(&m->in_conn, n), 0, 0);
+}
+
+uint32_t h2m_stream_flush(struct h2m *m, uint16_t slot, struct h2m_in *ended) {
+    struct h2m_in *f = inflow(m, slot, ended);
+    if (!f) return 0;
+    if (m->dead) return (uint32_t)f->unsent;
+    in_keep(f, (uint32_t)f->wh);
+    f->wh = 0;
+    if (m->hold) return (uint32_t)f->unsent;
+    credit_out(m, 0, f->sid, h2m_in_add(f, 0));
+    return (uint32_t)f->unsent;
 }
 
 int h2m_ping(struct h2m *m, const unsigned char op[8]) {
     if (m->dead) return m->dead;
-    int rc = emit(m, FR_PING, 0, 0, op, 8, 1);
+    int rc = emit(m, FR_PING, 0, 0, op, 8);
     if (rc) return rc;
     memcpy(m->ping_op, op, 8);
     m->ping_out = 1;
@@ -232,7 +358,12 @@ int h2m_ping(struct h2m *m, const unsigned char op[8]) {
 static int setting(struct h2m *m, const unsigned char *e) {
     unsigned id = ((unsigned)e[0] << 8) | e[1];
     uint32_t v = get32(e + 2);
-    if (id == 0x03) {
+    if (id == 0x01) {
+        hpe_set_max(&m->enc, v);
+    } else if (id == 0x05) {
+        if (v < DEFAULT_MAX_FRAME || v > FRAME_MAX) return H2_EPROTO;
+        m->peer_max_frame = v;
+    } else if (id == 0x03) {
         m->peer_max_streams = v;
         m->peer_max_set = 1;
     } else if (id == 0x06) {
@@ -256,7 +387,7 @@ static int setting(struct h2m *m, const unsigned char *e) {
 static int settings_end(struct h2m *m) {
     if (m->f_flags & FLAG_ACK) return 0;
     m->peer_settings_seen = 1;
-    int rc = emit(m, FR_SETTINGS, FLAG_ACK, 0, NULL, 0, 1);
+    int rc = emit(m, FR_SETTINGS, FLAG_ACK, 0, NULL, 0);
     if (rc || !m->grew) return rc;
     m->grew = 0;
     for (uint16_t i = 0; i < m->st_cap; i++)
@@ -300,18 +431,24 @@ static int frame_begin(struct h2m *m) {
     m->f_sid = get32(m->hdr + 5) & 0x7FFFFFFFu;
     m->f_slot = NO_SLOT;
     m->ctl_n = 0;
+    if (m->f_len > H2M_FRAME_IN) return H2_EPROTO;
+    if (m->f_type == FR_DATA || m->f_type == FR_HEADERS) m->rst_ping_block = 0;
+    if (m->f_type == FR_DATA || m->f_type == FR_HEADERS || m->f_type == FR_RST_STREAM ||
+        (m->f_type == FR_WINDOW_UPDATE && m->f_sid))
+        m->read_before_sid = m->next_sid;
     m->pad_wait = m->pad_left = m->skip_left = 0;
     m->peek = m->paid = 0;
+    m->f_drop = m->f_pad = 0;
     if (m->cont && (m->f_type != FR_CONTINUATION || m->f_sid != m->cont_sid)) return H2_EPROTO;
     if (!m->cont && m->f_type == FR_CONTINUATION) return H2_EPROTO;
     switch (m->f_type) {
         case FR_DATA:
             m->pad_wait = (m->f_flags & FLAG_PADDED) != 0;
             if (m->pad_wait > m->f_len) return H2_EPROTO;
-            if ((int64_t)m->f_len > m->recv_win_conn) return H2_EFLOW;
-            m->recv_win_conn -= (int32_t)m->f_len;
+            if ((int64_t)m->f_len > m->in_conn.avail) return H2_EFLOW;
+            m->in_conn.avail -= (int32_t)m->f_len;
             m->f_slot = slot_of(m, m->f_sid);
-            if (m->f_slot != NO_SLOT && (int64_t)m->f_len > m->st[m->f_slot].recv_win) {
+            if (m->f_slot != NO_SLOT && (int64_t)m->f_len > m->st[m->f_slot].in.avail) {
                 uint16_t s = m->f_slot;
                 m->f_slot = NO_SLOT;
                 int rc = flow_reset(m, s);
@@ -319,9 +456,9 @@ static int frame_begin(struct h2m *m) {
             }
             if (m->f_slot == NO_SLOT) {
                 m->paid = 1;
-                m->lost += m->f_len;
+                m->f_drop = m->f_len;
             } else {
-                m->st[m->f_slot].recv_win -= (int32_t)m->f_len;
+                m->st[m->f_slot].in.avail -= (int32_t)m->f_len;
             }
             return 0;
         case FR_HEADERS:
@@ -343,10 +480,26 @@ static int frame_begin(struct h2m *m) {
     return 0;
 }
 
+static void refund(struct h2m *m, uint16_t s) {
+    if (!m->f_len) return;
+    uint32_t r = m->f_drop + m->f_pad, c = 0, k = 0;
+    struct h2m_in *f = s != NO_SLOT ? &m->st[s].in : NULL;
+    if (m->hold) {
+        in_keep(&m->in_conn, r);
+        if (f) in_keep(f, m->f_pad);
+        return;
+    }
+    c = h2m_in_add(&m->in_conn, r);
+    if (f) k = h2m_in_add(f, m->f_pad);
+    credit_out(m, c, f ? f->sid : 0, k);
+}
+
 static int frame_end(struct h2m *m) {
     uint16_t s = m->f_slot;
     switch (m->f_type) {
         case FR_DATA:
+            refund(m, s);
+            if (m->dead) return m->dead;
             if ((m->f_flags & FLAG_END_STREAM) && s != NO_SLOT) return remote_end(m, s);
             return 0;
         case FR_HEADERS:
@@ -369,7 +522,11 @@ static int frame_end(struct h2m *m) {
             return settings_end(m);
         case FR_PING:
             if (m->f_len != 8) return 0;
-            if (!(m->f_flags & FLAG_ACK)) return emit(m, FR_PING, FLAG_ACK, 0, m->ctl, 8, 1);
+            if (!(m->f_flags & FLAG_ACK)) return emit(m, FR_PING, FLAG_ACK, 0, m->ctl, 8);
+            if (m->resets_pending) {
+                m->resets_pending = 0;
+                m->rst_ping_block = 1;
+            }
             if (m->ping_out && memcmp(m->ping_op, m->ctl, 8) == 0) {
                 m->ping_out = 0;
                 m->cb.ping_ack(m->cb.ctx);
@@ -428,10 +585,7 @@ static int body(struct h2m *m, const unsigned char *d, size_t n) {
             m->pad_left = d[i];
             i++;
             m->f_left--;
-            if (m->f_type == FR_DATA && !m->paid) {
-                m->st[m->f_slot].recv_owed += (uint32_t)m->pad_left + 1;
-                m->lost += (uint32_t)m->pad_left + 1;
-            }
+            if (m->f_type == FR_DATA && !m->paid) m->f_pad = (uint32_t)m->pad_left + 1;
             continue;
         }
         if (m->skip_left) {
@@ -479,4 +633,22 @@ int h2m_feed(struct h2m *m, const unsigned char *d, size_t n) {
         if (m->dead) return m->dead;
     }
     return 0;
+}
+void h2m_hold(struct h2m *m, int on) {
+    if (on) {
+        m->hold = 1;
+        return;
+    }
+    if (!m->hold) return;
+    m->hold = 0;
+    if (m->dead) return;
+    uint32_t c = h2m_in_add(&m->in_conn, 0);
+    for (uint16_t i = 0; i < m->st_cap && !m->dead; i++) {
+        if (!live(m, i)) continue;
+        uint32_t k = h2m_in_add(&m->st[i].in, 0);
+        if (!k) continue;
+        credit_out(m, c, m->st[i].sid, k);
+        c = 0;
+    }
+    if (!m->dead) credit_out(m, c, 0, 0);
 }

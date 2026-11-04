@@ -165,10 +165,12 @@ struct xs { struct xconn *x; uint16_t slot; uint32_t sid; };
 
 #define XH_POST_MAX 64
 
-struct xh_post { struct xs s; uint64_t seq; };
+#define XH_POST_RETRY 2
 
 struct xc_chunk;
 struct xc_q { struct xc_chunk *head, *tail; size_t n; };
+
+struct xh_post { struct xs s; uint64_t seq; struct xc_q keep; uint8_t tries, redo; };
 
 struct xm_mgr;
 struct transport;
@@ -185,7 +187,7 @@ struct xh_flow {
     size_t bres, blim;
     uint64_t post_at, bw_at, wait_until;
     int end;
-    uint8_t wait_n, shared, post_dec, post_wait, blisted, bstarved;
+    uint8_t wait_n, shared, post_dec, post_wait, blisted, bstarved, wrote, again, get_wait, redo_n;
     uint16_t owner;
 };
 
@@ -444,6 +446,8 @@ extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
 int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);
 int xh_post_flush(struct transport *t);
+int xh_get_open(struct transport *t, struct xconn *x);
+void xh_posts_drop(struct transport *t);
 
 /* ---- ws and httpupgrade: the shared Upgrade request (trupgrade.c) and frames (trws.c) ------ */
 

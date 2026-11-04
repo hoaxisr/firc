@@ -112,13 +112,26 @@ static size_t settings_frame(unsigned char *out, uint16_t id, uint32_t v) {
 
 static struct hr_block g_blk;
 
-static void look_req(struct fake_io *io, const struct h2_req *r) {
+static void grpc_req(struct fake_io *io, const struct h2_req *r) {
     memset(io, 0, sizeof *io);
     io->sent_n = h2w_preface(io->sent, sizeof io->sent, 1);
-    size_t n = h2w_headers(io->sent + io->sent_n + 9, DEFAULT_MAX_FRAME, r, 1);
+    size_t n = h2w_headers(io->sent + io->sent_n + 9, DEFAULT_MAX_FRAME, r);
     unsigned char flags = (unsigned char)(FLAG_END_HEADERS | (r->end_stream ? FLAG_END_STREAM : 0));
     h2w_frame_hdr(io->sent + io->sent_n, (uint32_t)n, FR_HEADERS, flags, 1);
     io->sent_n += 9 + n;
+}
+
+static struct h2w_list g_gl;
+
+static void go_req(const struct h2_req *r) {
+    uint64_t rng = 7;
+    if (h2w_go_fields(r, &rng, &g_gl)) g_gl.n = 0;
+    g_blk.n = 0;
+    for (size_t i = 0; i < g_gl.n && i < HR_MAX; i++) {
+        snprintf(g_blk.f[i].name, sizeof g_blk.f[i].name, "%s", g_gl.f[i].name);
+        snprintf(g_blk.f[i].value, sizeof g_blk.f[i].value, "%s", g_gl.f[i].value);
+        g_blk.n++;
+    }
 }
 
 static void t_req_put_method_not_collapsed_to_post(void) {
@@ -135,28 +148,22 @@ static void t_req_put_method_not_collapsed_to_post(void) {
     check("PUT request: :method value PUT", 0, strcmp(g_blk.f[0].value, "PUT"));
 
     struct h2_req g = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1 };
-    look_req(&io, &g);
+    grpc_req(&io, &g);
     hr_first_headers(io.sent, io.sent_n, &g_blk);
     check("GET request: :method indexed 2", 1, g_blk.f[0].kind == 'i' && g_blk.f[0].index == 2);
     check("GET request: END_STREAM on HEADERS", 1, (io.sent[24 + 21 + 13 + 4] & 0x01) != 0);
 }
 
-static void t_req_fields_slot_order_and_lowercase(void) {
-    struct fake_io io;
+static void t_req_fields_lowercase(void) {
     const struct h2_field fl[] = { { "X-A", "1" }, { "cookie", "s=2" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "POST",
                         .fields = fl, .fields_n = 2 };
-    look_req(&io, &r);
-    check("browser request with fields: HEADERS decode", 0,
-          hr_first_headers(io.sent, io.sent_n, &g_blk));
-    int dest = hr_find(&g_blk, "sec-fetch-dest");
-    check("sec-fetch-dest present", 1, dest > 0);
-    check("first field right after sec-fetch-dest, lowercased", 0,
-          strcmp(g_blk.f[dest + 1].name, "x-a"));
-    check("first field value", 0, strcmp(g_blk.f[dest + 1].value, "1"));
-    check("second field next", 0, strcmp(g_blk.f[dest + 2].name, "cookie"));
-    check("second field value", 0, strcmp(g_blk.f[dest + 2].value, "s=2"));
-    check("accept-language after the fields", dest + 3, hr_find(&g_blk, "accept-language"));
+    go_req(&r);
+    check("browser request with fields: listed", 1, g_blk.n > 0);
+    check("sec-fetch-dest present", 1, hr_find(&g_blk, "sec-fetch-dest") > 0);
+    check("first field lowercased", 0, strcmp(g_blk.f[hr_find(&g_blk, "x-a")].value, "1"));
+    check("second field value", 0, strcmp(g_blk.f[hr_find(&g_blk, "cookie")].value, "s=2"));
+    check("accept-language present", 1, hr_find(&g_blk, "accept-language") > 0);
     check("no upper-case X-A", -1, hr_find(&g_blk, "X-A"));
     check("no referer unless given", -1, hr_find(&g_blk, "referer"));
 }
@@ -172,17 +179,15 @@ static void t_list_size_counts_32_per_field(void) {
 }
 
 static void t_list_size_browser_matches_decoded_block(void) {
-    struct fake_io io;
     const struct h2_field fl[] = { { "X-Pad", "abc" }, { "referer", "https://a/p" } };
     struct h2_req r = { .authority = "a", .path = "/p", .content_type = "application/grpc",
                         .method = "PATCH", .fields = fl, .fields_n = 2 };
-    look_req(&io, &r);
-    hr_first_headers(io.sent, io.sent_n, &g_blk);
+    go_req(&r);
     size_t want = 0;
     for (size_t i = 0; i < g_blk.n; i++)
         want += strlen(g_blk.f[i].name) + strlen(g_blk.f[i].value) + 32;
-    check("browser list size: 20 fields decoded", 20, (int)g_blk.n);
-    check("browser list size equals the decoded block", (int)want, (int)h2w_list_size(&r, 1));
+    check("browser list size: 22 fields listed", 22, (int)g_blk.n);
+    check("browser list size equals the listed fields", (int)want, (int)h2w_list_size(&r, 1));
 }
 
 static void t_block_too_big_writes_nothing(void) {
@@ -229,46 +234,39 @@ static size_t decoded_size(const struct hr_block *b) {
     return s;
 }
 
-static void t_lead_fields_before_the_look_not_after_dest(void) {
-    struct fake_io io;
+static void t_user_fields_join_the_look(void) {
     const struct h2_field fl[] = { { "X-A", "1" }, { "referer", "https://a/p" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 2, .lead_n = 1 };
-    look_req(&io, &r);
-    check("lead: HEADERS decode", 0, hr_first_headers(io.sent, io.sent_n, &g_blk));
-    check("lead: x-a right after the pseudo-headers", 4, hr_find(&g_blk, "x-a"));
-    check("lead: the look follows it", 5, hr_find(&g_blk, "sec-ch-ua"));
-    check("lead: referer still right after sec-fetch-dest",
-          hr_find(&g_blk, "sec-fetch-dest") + 1, hr_find(&g_blk, "referer"));
-    check("lead: list size equals the decoded block", (int)decoded_size(&g_blk),
+                        .fields = fl, .fields_n = 2 };
+    go_req(&r);
+    check("user fields: x-a present", 1, hr_find(&g_blk, "x-a") >= 4);
+    check("user fields: the look present", 1, hr_find(&g_blk, "sec-ch-ua") >= 4);
+    check("user fields: referer present", 1, hr_find(&g_blk, "referer") >= 4);
+    check("user fields: list size equals the listed fields", (int)decoded_size(&g_blk),
           (int)h2w_list_size(&r, 1));
 }
 
 static void t_field_named_like_a_look_field_replaces_it(void) {
-    struct fake_io io;
     const struct h2_field fl[] = { { "Accept", "text/html" }, { "Pragma", "p" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 2, .lead_n = 2 };
-    look_req(&io, &r);
-    check("replace: HEADERS decode", 0, hr_first_headers(io.sent, io.sent_n, &g_blk));
+                        .fields = fl, .fields_n = 2 };
+    go_req(&r);
     check("replace: one accept", 1, count_named(&g_blk, "accept"));
     check("replace: accept is ours", 0,
           strcmp(g_blk.f[hr_find(&g_blk, "accept")].value, "text/html"));
     check("replace: one pragma (a tail field)", 1, count_named(&g_blk, "pragma"));
     check("replace: pragma is ours", 0, strcmp(g_blk.f[hr_find(&g_blk, "pragma")].value, "p"));
     check("replace: the rest of the look stays", 1, hr_find(&g_blk, "sec-fetch-dest") > 0);
-    check("replace: list size equals the decoded block", (int)decoded_size(&g_blk),
+    check("replace: list size equals the listed fields", (int)decoded_size(&g_blk),
           (int)h2w_list_size(&r, 1));
 }
 
 static void t_look_keeps_its_identity_fields_over_ours(void) {
-    struct fake_io io;
     const struct h2_field fl[] = { { "Accept-Language", "ru" }, { "Sec-Fetch-Mode", "navigate" },
                                    { "DNT", "0" }, { "sec-ch-ua", "x" }, { "X-A", "1" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 5, .lead_n = 2 };
-    look_req(&io, &r);
-    check("identity: HEADERS decode", 0, hr_first_headers(io.sent, io.sent_n, &g_blk));
+                        .fields = fl, .fields_n = 5 };
+    go_req(&r);
     check("identity: one accept-language", 1, count_named(&g_blk, "accept-language"));
     check("identity: accept-language is the look's", 0,
           strcmp(g_blk.f[hr_find(&g_blk, "accept-language")].value, "en-US,en;q=0.9"));
@@ -280,33 +278,236 @@ static void t_look_keeps_its_identity_fields_over_ours(void) {
     check("identity: one sec-ch-ua", 1, count_named(&g_blk, "sec-ch-ua"));
     check("identity: sec-ch-ua is not ours", 1, strcmp(g_blk.f[hr_find(&g_blk, "sec-ch-ua")].value, "x") != 0);
     check("identity: an unrelated field stays", 0, strcmp(g_blk.f[hr_find(&g_blk, "x-a")].value, "1"));
-    check("identity: list size equals the decoded block", (int)decoded_size(&g_blk),
+    check("identity: list size equals the listed fields", (int)decoded_size(&g_blk),
           (int)h2w_list_size(&r, 1));
 }
 
 static void t_no_look_sends_only_the_fields(void) {
-    struct fake_io io;
     const struct h2_field fl[] = { { "User-Agent", "MyApp/1" }, { "referer", "r" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 2, .lead_n = 1, .no_look = 1 };
-    look_req(&io, &r);
-    check("no look: HEADERS decode", 0, hr_first_headers(io.sent, io.sent_n, &g_blk));
-    check("no look: four pseudo-headers and two fields", 6, (int)g_blk.n);
+                        .fields = fl, .fields_n = 2, .no_look = 1 };
+    go_req(&r);
+    check("no look: four pseudo-headers, two fields and accept-encoding", 7, (int)g_blk.n);
     check("no look: user-agent is ours", 0,
           strcmp(g_blk.f[hr_find(&g_blk, "user-agent")].value, "MyApp/1"));
     check("no look: no sec-ch-ua", -1, hr_find(&g_blk, "sec-ch-ua"));
     check("no look: no pragma", -1, hr_find(&g_blk, "pragma"));
-    check("no look: list size equals the decoded block", (int)decoded_size(&g_blk),
+    check("no look: list size equals the listed fields", (int)decoded_size(&g_blk),
           (int)h2w_list_size(&r, 1));
 }
 
+static const char *gval(const char *name) {
+    int i = hr_find(&g_blk, name);
+    return i < 0 ? NULL : g_blk.f[i].value;
+}
+
+static int gis(const char *name, const char *value) {
+    const char *v = gval(name);
+    return v && strcmp(v, value) == 0 && count_named(&g_blk, name) == 1;
+}
+
+/* catches: a cookie value sent as one field where Go splits it per cookie-pair */
+static void t_go_cookie_split(void) {
+    char v[] = "a=1; b=2;  c=3;;d=4;";
+    const struct h2_field fl[] = { { "Cookie", v }, { "x-z", "q" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = fl, .fields_n = 2, .no_look = 1 };
+    uint64_t rng = 7;
+    check("cookie split: listed", 0, h2w_go_fields(&r, &rng, &g_gl));
+    memset(v, 'z', sizeof v - 1);
+    const char *want[] = { "a=1", "b=2", "c=3", "", "d=4" };
+    size_t at = 0;
+    while (at < g_gl.n && strcmp(g_gl.f[at].name, "cookie")) at++;
+    check("cookie split: eleven fields", 11, (int)g_gl.n);
+    for (size_t i = 0; i < 5; i++)
+        check("cookie split: pair in order, spaces after ; stripped", 1,
+              at + i < g_gl.n && !strcmp(g_gl.f[at + i].name, "cookie") && !strcmp(g_gl.f[at + i].value, want[i]));
+    const struct h2_field one[] = { { "cookie", "s=2" } };
+    r.fields = one;
+    r.fields_n = 1;
+    check("cookie split: a single pair listed", 0, h2w_go_fields(&r, &rng, &g_gl));
+    check("cookie split: a single pair stays one field", 6, (int)g_gl.n);
+    char big[2100];
+    memset(big, 'k', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    big[2090] = ';';
+    const struct h2_field over[] = { { "cookie", big } };
+    r.fields = over;
+    check("cookie split: pairs past the copy room refused", H2_ETOOBIG, h2w_go_fields(&r, &rng, &g_gl));
+}
+
+static void t_rng_splitmix(void) {
+    uint64_t st = 0;
+    /* catches: a generator other than splitmix64 from the seed */
+    check("splitmix64: first of seed 0", 1, h2w_rng(&st) == 0xe220a8397b1dcdafull);
+    check("splitmix64: second of seed 0", 1, h2w_rng(&st) == 0x6e789e6aa1b965f4ull);
+    check("splitmix64: third of seed 0", 1, h2w_rng(&st) == 0x06c45d188009454full);
+    st = 1;
+    check("splitmix64: first of seed 1", 1, h2w_rng(&st) == 0x910a2dec89025cc1ull);
+    check("splitmix64: state moves by the golden gamma", 1, st == 0x9e3779b97f4a7c16ull);
+}
+
+static void t_go_fields_look(void) {
+    const struct h2_field fl[] = { { "referer", "https://a/p" }, { "Connection", "keep-alive" },
+                                   { "Keep-Alive", "5" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = fl, .fields_n = 3 };
+    /* catches: a look field lost or changed with the order, or a connection header Go drops sent */
+    go_req(&r);
+    check("go look: 4 pseudo, 13 look, referer, accept-encoding", 19, (int)g_blk.n);
+    check("go look: :authority first", 0, strcmp(g_blk.f[0].name, ":authority"));
+    check("go look: :method second", 0, strcmp(g_blk.f[1].name, ":method"));
+    check("go look: :path third", 0, strcmp(g_blk.f[2].name, ":path"));
+    check("go look: :scheme fourth", 0, strcmp(g_blk.f[3].name, ":scheme"));
+    check("go look: :scheme https", 0, strcmp(g_blk.f[3].value, "https"));
+    check("go look: accept-encoding last", 0, strcmp(g_blk.f[18].name, "accept-encoding"));
+    check("go look: gzip", 0, strcmp(g_blk.f[18].value, "gzip"));
+    check("go look: sec-ch-ua", 1, gis("sec-ch-ua",
+          "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""));
+    check("go look: sec-ch-ua-mobile", 1, gis("sec-ch-ua-mobile", "?0"));
+    check("go look: sec-ch-ua-platform", 1, gis("sec-ch-ua-platform", "\"Windows\""));
+    check("go look: dnt", 1, gis("dnt", "1"));
+    check("go look: user-agent", 1, gis("user-agent",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/149.0.0.0 Safari/537.36"));
+    check("go look: accept", 1, gis("accept", "*/*"));
+    check("go look: sec-fetch-site", 1, gis("sec-fetch-site", "same-origin"));
+    check("go look: sec-fetch-mode", 1, gis("sec-fetch-mode", "cors"));
+    check("go look: sec-fetch-dest", 1, gis("sec-fetch-dest", "empty"));
+    check("go look: accept-language", 1, gis("accept-language", "en-US,en;q=0.9"));
+    check("go look: priority", 1, gis("priority", "u=1, i"));
+    check("go look: cache-control", 1, gis("cache-control", "no-cache"));
+    check("go look: pragma", 1, gis("pragma", "no-cache"));
+    check("go look: referer", 1, gis("referer", "https://a/p"));
+    check("go look: no connection", -1, hr_find(&g_blk, "connection"));
+    check("go look: no keep-alive", -1, hr_find(&g_blk, "keep-alive"));
+}
+
+static void t_go_fields_dropped(void) {
+    const struct h2_field fl[] = { { "Host", "h" }, { "Content-Length", "9" }, { "Proxy-Connection", "x" },
+                                   { "Transfer-Encoding", "chunked" }, { "Upgrade", "h2c" },
+                                   { "User-Agent", "A/1" }, { "user-agent", "B/2" }, { "X-K", "v" } };
+    const struct h2_field fe[] = { { "User-Agent", "" }, { "User-Agent", "C/3" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = fl, .fields_n = 8, .no_look = 1 };
+    /* catches: a field Go drops sent, a second user-agent kept, or an empty one sent */
+    go_req(&r);
+    check("go drops: pseudo, user-agent, x-k, accept-encoding", 7, (int)g_blk.n);
+    check("go drops: the first user-agent only", 1, gis("user-agent", "A/1"));
+    check("go drops: x-k kept", 1, gis("x-k", "v"));
+    check("go drops: no host", -1, hr_find(&g_blk, "host"));
+    check("go drops: no user content-length", -1, hr_find(&g_blk, "content-length"));
+    r.fields = fe;
+    r.fields_n = 2;
+    go_req(&r);
+    check("go drops: an empty first user-agent drops both", -1, hr_find(&g_blk, "user-agent"));
+    check("go drops: pseudo and accept-encoding", 5, (int)g_blk.n);
+}
+
+static void t_go_fields_uniform(void) {
+    const struct h2_field fl[] = { { "a", "1" }, { "b", "2" }, { "cookie", "c=1" }, { "cookie", "d=2" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = fl, .fields_n = 4, .no_look = 1 };
+    static const char *const orders[6] = { "abc", "acb", "bac", "bca", "cab", "cba" };
+    int seen[6] = { 0 }, glued = 1, shape = 1;
+    /* catches: an order other than the documented uniform permutation, or cookies split apart */
+    for (uint64_t seed = 1; seed <= 6000; seed++) {
+        uint64_t rng = seed;
+        if (h2w_go_fields(&r, &rng, &g_gl) || g_gl.n != 9) { shape = 0; continue; }
+        char o[4] = { 0 };
+        int k = 0;
+        for (size_t i = 4; i < 8; i++) {
+            char c = g_gl.f[i].name[0];
+            if (k < 3 && (!k || o[k - 1] != c)) o[k++] = c;
+            if (!strcmp(g_gl.f[i].name, "cookie") && !strcmp(g_gl.f[i].value, "c=1"))
+                glued &= i + 1 < 8 && !strcmp(g_gl.f[i + 1].value, "d=2");
+        }
+        for (int j = 0; j < 6; j++) seen[j] += strcmp(o, orders[j]) == 0;
+    }
+    check("uniform: every list shaped", 1, shape);
+    check("uniform: c=1 directly before d=2", 1, glued);
+    int total = 0;
+    for (int j = 0; j < 6; j++) {
+        char what[64];
+        snprintf(what, sizeof what, "uniform: order %s between 850 and 1150", orders[j]);
+        check(what, 1, seen[j] >= 850 && seen[j] <= 1150);
+        total += seen[j];
+    }
+    check("uniform: 6000 lists of three units", 6000, total);
+}
+
+static const char *go_cl(const char *method, int64_t body_len) {
+    struct h2_req r = { .authority = "a", .path = "/p", .method = method, .no_look = 1, .body_len = body_len };
+    go_req(&r);
+    return gval("content-length");
+}
+
+static void t_content_length_rule(void) {
+    /* catches: content-length sent for an unknown or empty GET body, or missing for an empty POST, PUT or PATCH */
+    check("content-length: GET 0 none", 1, go_cl("GET", 0) == NULL);
+    check("content-length: GET 5", 1, go_cl("GET", 5) && !strcmp(go_cl("GET", 5), "5"));
+    check("content-length: POST 0", 1, go_cl("POST", 0) && !strcmp(go_cl("POST", 0), "0"));
+    check("content-length: PUT 0", 1, go_cl("PUT", 0) && !strcmp(go_cl("PUT", 0), "0"));
+    check("content-length: PATCH 0", 1, go_cl("PATCH", 0) && !strcmp(go_cl("PATCH", 0), "0"));
+    check("content-length: POST unknown none", 1, go_cl("POST", -1) == NULL);
+    check("content-length: POST 1000000", 1, go_cl("POST", 1000000) && !strcmp(go_cl("POST", 1000000), "1000000"));
+    go_cl("POST", 1000000);
+    check("content-length: before accept-encoding", 1,
+          g_blk.n >= 2 && !strcmp(g_blk.f[g_blk.n - 2].name, "content-length") &&
+          !strcmp(g_blk.f[g_blk.n - 1].name, "accept-encoding"));
+}
+
+static void t_gzip_rule(void) {
+    const struct h2_field ae[] = { { "Accept-Encoding", "br" }, { "x-a", "1" } };
+    const struct h2_field rg[] = { { "Range", "bytes=0-" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .no_look = 1,
+                        .fields = ae, .fields_n = 2 };
+    /* catches: gzip asked beside a user Accept-Encoding, a range, or a HEAD, or not last otherwise */
+    go_req(&r);
+    check("gzip: user accept-encoding kept alone", 1, gis("accept-encoding", "br"));
+    check("gzip: user accept-encoding among the units", 1, hr_find(&g_blk, "accept-encoding") >= 4);
+    r.fields = rg;
+    r.fields_n = 1;
+    go_req(&r);
+    check("gzip: none with a range", -1, hr_find(&g_blk, "accept-encoding"));
+    check("gzip: the range kept", 1, gis("range", "bytes=0-"));
+    r.fields_n = 0;
+    r.method = "HEAD";
+    go_req(&r);
+    check("gzip: none for HEAD", -1, hr_find(&g_blk, "accept-encoding"));
+    r.method = "GET";
+    go_req(&r);
+    check("gzip: otherwise last", 1, g_blk.n == 5 && !strcmp(g_blk.f[4].name, "accept-encoding") &&
+          !strcmp(g_blk.f[4].value, "gzip"));
+}
+
+static void t_list_size_go(void) {
+    const struct h2_field fl[] = { { "referer", "r" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "POST", .fields = fl, .fields_n = 1,
+                        .body_len = 1000000 };
+    /* catches: the list size leaving out content-length or accept-encoding, or counting a dropped field */
+    check("list size go: packet POST, 1018 + 53 + 51", 1122, (int)h2w_list_size(&r, 1));
+    r.body_len = -1;
+    check("list size go: unknown body, 1018 + 51", 1069, (int)h2w_list_size(&r, 1));
+    r.body_len = 0;
+    check("list size go: empty POST body, 1018 + 47 + 51", 1116, (int)h2w_list_size(&r, 1));
+}
+
 int main(void) {
-    t_lead_fields_before_the_look_not_after_dest();
+    t_go_fields_look();
+    t_go_cookie_split();
+    t_go_fields_dropped();
+    t_go_fields_uniform();
+    t_rng_splitmix();
+    t_content_length_rule();
+    t_gzip_rule();
+    t_list_size_go();
+    t_user_fields_join_the_look();
     t_field_named_like_a_look_field_replaces_it();
     t_look_keeps_its_identity_fields_over_ours();
     t_no_look_sends_only_the_fields();
     t_req_put_method_not_collapsed_to_post();
-    t_req_fields_slot_order_and_lowercase();
+    t_req_fields_lowercase();
     t_list_size_counts_32_per_field();
     t_list_size_browser_matches_decoded_block();
     t_block_too_big_writes_nothing();

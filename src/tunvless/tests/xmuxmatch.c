@@ -9,6 +9,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "hpackread.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -458,7 +460,17 @@ struct pc {
     size_t upn;
     struct { unsigned type, flags; uint32_t sid, len; unsigned char body[16]; } fq[4];
     int fqn;
-    unsigned char b[65536];
+    char ord[128];
+    size_t ordn;
+    uint32_t refd[PS_MAX];
+    int nrefd;
+    char paths[1024];
+    size_t pathn;
+    char cls[256];
+    size_t cln;
+    char dl[256];
+    size_t dln;
+    unsigned char b[1 << 18];
     size_t bn;
 };
 
@@ -466,7 +478,7 @@ static struct {
     int lfd, lfd2, mcs, stop, refuse;
     int split, hold, refuse_post, refuse_get, post_status, nowu, get_ci, shut, shut2, post_body;
     long pad_post, pad_cap;
-    int pad_go, pad_get, noecho;
+    int pad_go, pad_get, noecho, early, over, lim, over_left, over_c0, nosettings, iwin, imcs, mfs;
     uint32_t get_sid;
     uint16_t port, port2;
     struct pc c[PC_MAX];
@@ -527,6 +539,44 @@ static void p_split_data(struct pc *c, unsigned flags, uint32_t sid, const unsig
     else if (c->nheld < PS_MAX) c->held[c->nheld++] = sid;
 }
 
+static int p_refd(const struct pc *c, uint32_t sid) {
+    for (int i = 0; i < c->nrefd; i++)
+        if (c->refd[i] == sid) return 1;
+    return 0;
+}
+
+static struct hr_ctx g_hc[PC_MAX];
+static struct hr_block g_hb;
+
+static void p_path(struct pc *c, const unsigned char *b, uint32_t len) {
+    struct hr_ctx *hc = &g_hc[c - g_p.c];
+    int i = hr_decode_ctx(hc, b, len, &g_hb) ? -1 : hr_find(&g_hb, ":path");
+    const char *v = i >= 0 ? g_hb.f[i].value : "?";
+    int w = snprintf(c->paths + c->pathn, sizeof c->paths - c->pathn, "%s ", v);
+    if (w > 0 && (size_t)w < sizeof c->paths - c->pathn) c->pathn += (size_t)w;
+    i = i >= 0 ? hr_find(&g_hb, "content-length") : -1;
+    w = snprintf(c->cls + c->cln, sizeof c->cls - c->cln, "%s ", i >= 0 ? g_hb.f[i].value : "-");
+    if (w > 0 && (size_t)w < sizeof c->cls - c->cln) c->cln += (size_t)w;
+}
+
+static int p_paths_is(int ci, int k, int j) {
+    pthread_mutex_lock(&g_p.mu);
+    char a[256] = "", b[256] = "";
+    const char *s = ci < g_p.n ? g_p.c[ci].paths : "";
+    for (int n = 0; *s; n++) {
+        const char *e = strchr(s, ' ');
+        size_t l = e ? (size_t)(e - s) : strlen(s);
+        if (l >= sizeof a) l = sizeof a - 1;
+        if (n == k) { memcpy(a, s, l); a[l] = 0; }
+        if (n == j) { memcpy(b, s, l); b[l] = 0; }
+        s += l + (e ? 1 : 0);
+    }
+    pthread_mutex_unlock(&g_p.mu);
+    int ok = a[0] && strcmp(a, "?") && !strcmp(a, b);
+    if (!ok) printf("     paths %d %d: \"%s\" \"%s\"\n", k, j, a, b);
+    return ok;
+}
+
 static void p_frames(struct pc *c) {
     size_t i = 0;
     if (!c->pre) {
@@ -534,7 +584,13 @@ static void p_frames(struct pc *c) {
         c->pre = 1;
         i = 24;
         unsigned char st[6] = { 0, 3, 0, 0, 0, (unsigned char)g_p.mcs };
-        p_write(c->fd, 4, 0, 0, st, g_p.mcs ? 6 : 0);
+        if (!g_p.early && !g_p.nosettings) p_write(c->fd, 4, 0, 0, st, g_p.mcs ? 6 : 0);
+        if (g_p.mfs) {
+            static const unsigned char mf[12] = { 0, 5, 0, 0x10, 0, 0, 0, 4, 0, 0x10, 0, 0 };
+            static const unsigned char wu[4] = { 0, 0x0f, 0, 0x01 };
+            p_write(c->fd, 4, 0, 0, mf, 12);
+            p_write(c->fd, 8, 0, 0, wu, 4);
+        }
     }
     while (i + 9 <= c->bn) {
         const unsigned char *h = c->b + i;
@@ -543,10 +599,30 @@ static void p_frames(struct pc *c) {
         unsigned type = h[3], flags = h[4];
         uint32_t sid = p_be32(h + 5) & 0x7fffffffu;
         const unsigned char *body = h + 9;
+        if (c->ordn + 16 < sizeof c->ord) {
+            char tag = type == 4 ? ((flags & 1) ? 'A' : 'S') : type == 8 ? 'W' : type == 1 ? 'H' : '?';
+            int w = type == 4 ? snprintf(c->ord + c->ordn, sizeof c->ord - c->ordn, "%c ", tag)
+                              : snprintf(c->ord + c->ordn, sizeof c->ord - c->ordn, "%c%u ", tag, (unsigned)sid);
+            if (w > 0) c->ordn += (size_t)w;
+        }
+        if (type == 0 && c->dln + 16 < sizeof c->dl) {
+            int w = snprintf(c->dl + c->dln, sizeof c->dl - c->dln, "%u:%u ", (unsigned)len, flags);
+            if (w > 0) c->dln += (size_t)w;
+        }
         if (type == 1) {
+            p_path(c, body, len);
             if (c->nsid < PS_MAX) c->sid[c->nsid++] = sid;
-            unsigned char st = 0x88, code[4] = { 0, 0, 0, 7 };
-            if (g_p.split && (flags & 1) && g_p.refuse_get) {
+            unsigned char st = 0x88, code[4] = { 0, 0, 0, 2 }, refused[4] = { 0, 0, 0, 7 };
+            if (g_p.over && c->nsid > g_p.lim && (!g_p.over_c0 || c == g_p.c) && g_p.over_left >= 0) {
+                if (g_p.over_left && !--g_p.over_left) g_p.over_left = -1;
+                unsigned char iw[6] = { 0, 4, (unsigned char)(g_p.iwin >> 24), (unsigned char)(g_p.iwin >> 16),
+                                        (unsigned char)(g_p.iwin >> 8), (unsigned char)g_p.iwin };
+                unsigned char im[12] = { 0, 4, iw[2], iw[3], iw[4], iw[5], 0, 3, 0, 0, 0, (unsigned char)g_p.imcs };
+                if (g_p.iwin) p_write(c->fd, 4, 0, 0, im, g_p.imcs ? 12 : 6);
+                g_p.iwin = g_p.imcs = 0;
+                if (c->nrefd < PS_MAX) c->refd[c->nrefd++] = sid;
+                p_write(c->fd, 3, 0, sid, refused, 4);
+            } else if (g_p.split && (flags & 1) && g_p.refuse_get) {
                 p_write(c->fd, 3, 0, sid, code, 4);
             } else if (g_p.split && (flags & 1)) {
                 g_p.get_ci = (int)(c - g_p.c);
@@ -567,6 +643,7 @@ static void p_frames(struct pc *c) {
                     c->pad_left = g_p.pad_post;
                 }
             }
+        } else if (type == 0 && p_refd(c, sid)) {
         } else if (type == 0 && len && g_p.split) {
             p_split_data(c, flags, sid, body, len);
         } else if (type == 0 && len) {
@@ -639,7 +716,7 @@ static void *p_run(void *arg) {
                 if (poll(&w, 1, 0) == 1 && (w.revents & POLLOUT)) {
                     static const unsigned char xs[4096] = { 'X' };
                     long k = c->pad_left < 4096 ? c->pad_left : 4096;
-                    if (c->pad_sent + k <= 1048576 + c->wus_sum && c->pad_sent + k <= 65535 + c->wu0_sum) {
+                    if (c->pad_sent + k <= 4194304 + c->wus_sum && c->pad_sent + k <= 65535 + c->wu0_sum) {
                         p_write(c->fd, 0, 0, c->pad_sid, xs, (uint32_t)k);
                         c->pad_left -= k;
                         c->pad_sent += k;
@@ -670,8 +747,11 @@ static void *p_run(void *arg) {
             int fd = accept(ep ? g_p.lfd2 : g_p.lfd, NULL, NULL);
             if (fd >= 0 && g_p.n < PC_MAX) {
                 memset(&g_p.c[g_p.n], 0, sizeof g_p.c[0]);
+                hr_ctx_init(&g_hc[g_p.n], 4096);
                 g_p.c[g_p.n].ep = ep;
                 g_p.c[g_p.n++].fd = fd;
+                unsigned char st[6] = { 0, 3, 0, 0, 0, (unsigned char)g_p.early };
+                if (g_p.early) p_write(fd, 4, 0, 0, st, 6);
             } else if (fd >= 0) {
                 close(fd);
             }
@@ -718,7 +798,7 @@ static void p_start(int mcs) {
     g_p.shut = g_p.shut2 = g_p.refuse_get = g_p.post_body = 0;
     g_p.pad_post = 0;
     g_p.pad_go = 1;
-    g_p.pad_get = g_p.noecho = 0;
+    g_p.pad_get = g_p.noecho = g_p.early = g_p.over = g_p.lim = g_p.over_left = g_p.over_c0 = g_p.nosettings = g_p.iwin = g_p.imcs = g_p.mfs = 0;
     g_p.pad_cap = 0;
     g_p.get_sid = 0;
     g_p.port = lo_listen(&g_p.lfd);
@@ -814,6 +894,21 @@ static int p_up_is(int ci, const char *want) {
     return ok;
 }
 
+static int p_dl_is(int ci, const char *want, int say) {
+    pthread_mutex_lock(&g_p.mu);
+    int ok = ci < g_p.n && !strcmp(g_p.c[ci].dl, want);
+    if (!ok && say) printf("     data frames: \"%s\"\n", ci < g_p.n ? g_p.c[ci].dl : "");
+    pthread_mutex_unlock(&g_p.mu);
+    return ok;
+}
+
+static int p_cls_is(int ci, const char *want) {
+    pthread_mutex_lock(&g_p.mu);
+    int ok = ci < g_p.n && !strcmp(g_p.c[ci].cls, want);
+    pthread_mutex_unlock(&g_p.mu);
+    return ok;
+}
+
 static void p_frame_out(int ci, unsigned type, unsigned flags, uint32_t sid, const char *body) {
     pthread_mutex_lock(&g_p.mu);
     struct pc *c = &g_p.c[ci];
@@ -826,6 +921,21 @@ static void p_frame_out(int ci, unsigned type, unsigned flags, uint32_t sid, con
         c->fqn++;
     }
     pthread_mutex_unlock(&g_p.mu);
+}
+
+static int p_ord_starts(int ci, const char *want) {
+    pthread_mutex_lock(&g_p.mu);
+    int ok = ci < g_p.n && !strncmp(g_p.c[ci].ord, want, strlen(want));
+    if (!ok && ci < g_p.n) printf("     order: \"%s\"\n", g_p.c[ci].ord);
+    pthread_mutex_unlock(&g_p.mu);
+    return ok;
+}
+
+static int p_ord_len(int ci) {
+    pthread_mutex_lock(&g_p.mu);
+    int n = ci < g_p.n ? (int)g_p.c[ci].ordn : 0;
+    pthread_mutex_unlock(&g_p.mu);
+    return n;
 }
 
 static void p_noread(int ci) {
@@ -906,7 +1016,10 @@ static int gl_submit(void *link, int *done) {
     return 0;
 }
 
+static unsigned g_wev[1024];
+
 static int gl_watch(unsigned idx, int fd, unsigned ev) {
+    if (fd >= 0 && fd < 1024) g_wev[fd] = ev;
     if (!ev) return epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, NULL) == 0 || errno == ENOENT ? 0 : -1;
     struct epoll_event e = { .events = ev, .data = { .u32 = idx } };
     if (epoll_ctl(g_ep, EPOLL_CTL_MOD, fd, &e) == 0) return 0;
@@ -1061,6 +1174,99 @@ static void t_two_flows_one_accept(void) {
     check("glue one: sid 3", 3, P_SID(0, 1));
     check("glue one: flow 0 echo", 1, gl_echo(0, "alpha"));
     check("glue one: flow 1 echo", 1, gl_echo(1, "bravo-two"));
+    gl_end();
+}
+
+static void t_first_headers_before_ack(void) {
+    gl_begin(0);
+    P_SET(early, 100);
+    struct tr_node n = gl_node(g_p.port, "");
+    /* catches: the adoption read putting the ACK before the first HEADERS */
+    check("first headers: flow waits", XA_WAIT, gl_attach(0, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    check("first headers: peer accepted and wrote SETTINGS", 1, P_ACCEPTS());
+    UNTIL(gl_ready(0) && p_ord_len(0) >= 10);
+    check("first headers: SETTINGS, WINDOW_UPDATE(0), HEADERS(1), ACK", 1, p_ord_starts(0, "S W0 H1 A "));
+    gl_end();
+}
+
+static void t_refused_before_settings_retried(void) {
+    gl_begin(0);
+    P_SET(early, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a stream refused before the server's SETTINGS failing its flow or its client */
+    check("refused: first waits", XA_WAIT, gl_attach(0, &n, g_key));
+    check("refused: second waits", XA_WAIT, gl_attach(1, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && gl_ready(1) && read_wakes(1) > 0);
+    check("refused: the server refused sid 3", 1, P_NSID(0) == 2);
+    check("refused: the read reports no error", 0, gl_read(1));
+    check("refused: re-placed on a dialing link", 1, g_t[1].xh.f.wait != NULL);
+    check("refused: a read while waiting is quiet", 0, gl_read(1));
+    check("refused: a write while waiting is held", H2_EWINDOW, transport_write(&g_t[1], (const unsigned char *)"y", 1));
+    int rw = room_wakes(1);
+    UNTIL(gl_ready(1) && P_ACCEPTS() == 2 && P_NSID(1) == 1);
+    check("refused: served flow told of room", 1, room_wakes(1) > rw);
+    check("refused: retried on a second connection", 2, P_ACCEPTS());
+    check("refused: same client", 1, g_t[1].xh.f.cl != NULL && g_t[1].xh.f.cl == g_t[0].xh.f.cl);
+    check("refused: client not failed", 0, g_t[1].xh.f.cl ? g_t[1].xh.f.cl->closed : -1);
+    check("refused: flow 1 echo", 1, gl_echo(1, "bravo"));
+    check("refused: flow 0 echo", 1, gl_echo(0, "alpha"));
+    gl_end();
+}
+
+static void t_refused_after_write_ends(void) {
+    gl_begin(0);
+    P_SET(early, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a refused stream retried after its bytes went out, or its end failing the client */
+    check("refused written: first waits", XA_WAIT, gl_attach(0, &n, g_key));
+    check("refused written: second waits", XA_WAIT, gl_attach(1, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && gl_ready(1));
+    check("refused written: write before the refusal", 0, transport_write(&g_t[1], (const unsigned char *)"x", 1));
+    UNTIL(read_wakes(1) > 0);
+    check("refused written: the flow ends refused", XC_EREFUSED, gl_read(1));
+    check("refused written: a cut without lost", 2, tr_xmux_cut(&g_t[1]));
+    struct xm_client *cl = g_t[1].xh.f.cl;
+    gl_close(1);
+    check("refused written: no second connection", 1, P_ACCEPTS());
+    check("refused written: client not failed", 0, cl ? cl->closed : -1);
+    check("refused written: flow 0 echo", 1, gl_echo(0, "alpha"));
+    gl_end();
+}
+
+static void t_refused_retry_fails(void) {
+    gl_begin(0);
+    P_SET(early, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a re-placed flow whose new link failed reading as if nothing happened */
+    check("refused retry fails: first waits", XA_WAIT, gl_attach(0, &n, g_key));
+    check("refused retry fails: second waits", XA_WAIT, gl_attach(1, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && gl_ready(1) && read_wakes(1) > 0);
+    check("refused retry fails: re-placed", 0, gl_read(1));
+    P_SET(shut, 1);
+    dl = ms_now() + 3000;
+    while (p_get(22, 0, 0) >= 0 && ms_now() < dl) usleep(1000);
+    int rw = read_wakes(1);
+    UNTIL(read_wakes(1) > rw);
+    check("refused retry fails: the read reports the dial", TR_ECONNREFUSED, gl_read(1));
+    check("refused retry fails: and keeps reporting it", TR_ECONNREFUSED, gl_read(1));
     gl_end();
 }
 
@@ -1500,6 +1706,379 @@ static int gl_post(int i, const char *msg) {
     int rc = transport_write(&g_t[i], (const unsigned char *)msg, strlen(msg));
     UNTIL(!g_t[i].xh.f.bat.n);
     return rc;
+}
+
+static void t_refused_stream_up_reads_again(void) {
+    gl_begin(0);
+    P_SET(split, 1);
+    P_SET(early, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_c0, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "stream-up");
+    /* catches: a re-placed stream-up flow left answering every read with nothing */
+    check("refused up: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && read_wakes(0) > 0 && P_NSID(0) == 2);
+    check("refused up: the POST refused, the read reports no error", 0, gl_read(0));
+    UNTIL(gl_ready(0) && g_t[0].xh.f.up.x && P_ACCEPTS() == 2 && P_NSID(1) == 2);
+    check("refused up: GET and POST on the second connection", 2, P_NSID(1));
+    check("refused up: echo through the new GET", 1, gl_echo(0, "upward"));
+    gl_end();
+}
+
+static void t_refused_twice_ends(void) {
+    gl_begin(0);
+    P_SET(over, 1);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a refused flow re-placed again and again */
+    check("refused twice: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && read_wakes(0) > 0);
+    int rc = 0;
+    for (uint64_t dl = ms_now() + 3000; !rc && ms_now() < dl;) {
+        turn();
+        rc = gl_read(0);
+    }
+    check("refused twice: the flow ends refused", XC_EREFUSED, rc);
+    check("refused twice: exactly one retry", 2, P_NSID(0));
+    check("refused twice: on one connection", 1, P_ACCEPTS());
+    gl_end();
+}
+
+static void t_refused_post_resent(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a POST refused before the server's SETTINGS losing its bytes, ending the flow or failing its client */
+    check("refused post: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused post: seq 0 taken", 0, gl_post(0, "p0"));
+    gl_got[0] = 0;
+    uint64_t dl = ms_now() + 3000;
+    int rc = 0;
+    while (gl_got[0] < 2 && ms_now() < dl && !(rc = gl_read(0))) turn();
+    check("refused post: refused once, sent again", 3, P_NSID(0));
+    check("refused post: sent again with the same path and seq", 1, p_paths_is(0, 1, 2));
+    check("refused post: the server got its bytes once", 1, p_up_is(0, "p0"));
+    check("refused post: the flow reads on", 0, rc);
+    check("refused post: the echo arrives", 1, gl_got[0] == 2 && !memcmp(gl_buf[0], "p0", 2));
+    check("refused post: client not failed", 0, g_t[0].xh.f.cl ? g_t[0].xh.f.cl->closed : -1);
+    check("refused post: one connection", 1, P_ACCEPTS());
+    gl_end();
+}
+
+static void t_refused_get_reopened(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(lim, 0);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a refused GET ending a flow that already wrote */
+    check("refused get: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0));
+    check("refused get: written before the refusal", 0, transport_write(&g_t[0], (const unsigned char *)"g0", 2));
+    UNTIL(P_UPN(0) == 2 && read_wakes(0) > 0);
+    check("refused get: the read reports no error", 0, gl_read(0));
+    UNTIL(P_NSID(0) == 3 && g_t[0].xh.f.down.x);
+    check("refused get: GET opened again", 3, P_NSID(0));
+    check("refused get: the server got g0", 1, p_up_is(0, "g0"));
+    check("refused get: echo through the new GET", 1, gl_echo(0, "g1"));
+    check("refused get: client not failed", 0, g_t[0].xh.f.cl ? g_t[0].xh.f.cl->closed : -1);
+    gl_end();
+}
+
+static void t_refused_post_unkept(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a POST refused after the server's SETTINGS failing the client */
+    check("refused post unkept: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused post unkept: seq 0 taken", 0, gl_post(0, "p0"));
+    int rc = 0;
+    for (uint64_t dl = ms_now() + 3000; !rc && ms_now() < dl;) {
+        turn();
+        rc = gl_read(0);
+    }
+    check("refused post unkept: the flow ends refused", XC_EREFUSED, rc);
+    check("refused post unkept: not sent again", 2, P_NSID(0));
+    check("refused post unkept: client not failed", 0, g_t[0].xh.f.cl ? g_t[0].xh.f.cl->closed : -1);
+    gl_end();
+}
+
+static void t_refused_post_bounded(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a refused POST sent again without a bound */
+    check("refused post bounded: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused post bounded: seq 0 taken", 0, gl_post(0, "p0"));
+    int rc = 0;
+    for (uint64_t dl = ms_now() + 3000; !rc && ms_now() < dl;) {
+        turn();
+        rc = gl_read(0);
+    }
+    check("refused post bounded: the flow ends refused", XC_EREFUSED, rc);
+    check("refused post bounded: GET and three tries of seq 0", 4, P_NSID(0));
+    check("refused post bounded: client not failed", 0, g_t[0].xh.f.cl ? g_t[0].xh.f.cl->closed : -1);
+    gl_end();
+}
+
+static void t_refused_get_twice_ends(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(lim, 0);
+    P_SET(over, 1);
+    P_SET(over_left, 2);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a refused GET opened again and again */
+    check("refused get twice: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0));
+    int rc = 0;
+    for (uint64_t dl = ms_now() + 3000; !rc && ms_now() < dl;) {
+        turn();
+        rc = gl_read(0);
+    }
+    check("refused get twice: the flow ends refused", XC_EREFUSED, rc);
+    check("refused get twice: exactly one retry", 2, P_NSID(0));
+    gl_end();
+}
+
+static void t_refused_get_waits(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(hold, 1);
+    P_SET(early, 2);
+    P_SET(lim, 0);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    struct tr_node nb = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a refused GET re-opened on a full link, or never opened when its link comes */
+    check("refused get waits: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && read_wakes(0) > 0);
+    check("refused get waits: written after the refusal", 0, transport_write(&g_t[0], (const unsigned char *)"g0", 2));
+    UNTIL(P_NSID(0) == 2 && P_UPN(0) == 2);
+    gl_attach(1, &nb, g_key);
+    UNTIL(gl_ready(1) && P_NSID(0) == 3);
+    check("refused get waits: a POST and another flow fill the link", 3, P_NSID(0));
+    check("refused get waits: the read reports no error", 0, gl_read(0));
+    check("refused get waits: the GET waits for a link", 1, g_t[0].xh.f.wait != NULL);
+    UNTIL(g_t[0].xh.f.down.x && P_ACCEPTS() == 2 && P_NSID(1) == 1);
+    check("refused get waits: GET opened on the second connection", 1, P_NSID(1));
+    p_release(0);
+    check("refused get waits: echo through the new GET", 1, gl_echo(0, "g1"));
+    check("refused get waits: the flow kept its seq", 2, (long)g_t[0].xh.seq);
+    gl_end();
+}
+
+static void t_refused_post_past_window(void) {
+    static char big[201];
+    memset(big, 'w', 200);
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    P_SET(iwin, 64);
+    xc_pend_set(150);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a re-sent POST larger than the server's stream window held back for ever, or held for more than its excess */
+    check("refused past window: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused past window: 200 B taken", 0, gl_post(0, big));
+    gl_got[0] = 0;
+    uint64_t dl = ms_now() + 3000;
+    int rc = 0;
+    while (gl_got[0] < 200 && ms_now() < dl && !(rc = gl_read(0))) turn();
+    check("refused past window: sent again", 3, P_NSID(0));
+    check("refused past window: the server got all 200 B once", 1, p_up_is(0, big));
+    check("refused past window: GET without, both POSTs with content-length 200", 1, p_cls_is(0, "- 200 200 "));
+    check("refused past window: the flow reads on", 0, rc);
+    check("refused past window: the echo arrives", 1, gl_got[0] == 200 && !memcmp(gl_buf[0], big, 200));
+    check("refused past window: nothing waits to be sent again", 0, g_t[0].xh.f.redo_n);
+    gl_end();
+    xc_pend_set(XC_PEND_MAX);
+}
+
+static void t_refused_post_past_pend(void) {
+    static char big[201];
+    memset(big, 'w', 200);
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    P_SET(iwin, 64);
+    xc_pend_set(100);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    /* catches: a re-send the held bytes cannot carry left hanging or sent in part */
+    check("refused past pend: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused past pend: 200 B taken", 0, gl_post(0, big));
+    int rc = 0;
+    for (uint64_t dl = ms_now() + 3000; !rc && ms_now() < dl;) {
+        turn();
+        rc = gl_read(0);
+    }
+    check("refused past pend: the flow ends refused", XC_EREFUSED, rc);
+    check("refused past pend: not sent again", 2, P_NSID(0));
+    check("refused past pend: client not failed", 0, g_t[0].xh.f.cl ? g_t[0].xh.f.cl->closed : -1);
+    gl_end();
+    xc_pend_set(XC_PEND_MAX);
+}
+
+static unsigned char g_stk[512 * 1024] __attribute__((aligned(4096)));
+struct stk_job { void (*fn)(void); };
+
+static void *stk_run(void *a) {
+    ((struct stk_job *)a)->fn();
+    return NULL;
+}
+
+static size_t stack_used(void (*fn)(void)) {
+    memset(g_stk, 0xa5, sizeof g_stk);
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstack(&at, g_stk, sizeof g_stk);
+    struct stk_job j = { fn };
+    pthread_t th;
+    if (pthread_create(&th, &at, stk_run, &j)) return SIZE_MAX;
+    pthread_join(th, NULL);
+    pthread_attr_destroy(&at);
+    size_t i = 0;
+    while (i < sizeof g_stk && g_stk[i] == 0xa5) i++;
+    return sizeof g_stk - i;
+}
+
+static void stk_idle(void) {}
+
+/* catches: block-sized buffers on the loop stack in the re-send path */
+static void t_redo_stack(void) {
+    size_t base = stack_used(stk_idle), used = stack_used(t_refused_post_past_window);
+    printf("     redo path stack: %zu B over %zu B\n", used - base, base);
+#ifndef __SANITIZE_ADDRESS__
+    check("redo stack: the re-send path under 16 KiB", 1, used - base < 16384);
+#endif
+}
+
+static void t_refused_post_pend_busy(void) {
+    static char big[201];
+    memset(big, 'w', 200);
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 2);
+    P_SET(iwin, 64);
+    xc_pend_set(50);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    n.post_from = n.post_to = 100;
+    /* catches: a re-send that finds the held bytes busy failing the flow instead of waiting for room */
+    check("refused pend busy: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused pend busy: 200 B taken", 0, gl_post(0, big));
+    gl_got[0] = 0;
+    uint64_t dl = ms_now() + 3000;
+    int rc = 0;
+    while (gl_got[0] < 200 && ms_now() < dl && !(rc = gl_read(0))) turn();
+    check("refused pend busy: two POSTs refused, both sent again", 5, P_NSID(0));
+    check("refused pend busy: the flow reads on", 0, rc);
+    check("refused pend busy: the echo arrives", 1, gl_got[0] == 200 && !memcmp(gl_buf[0], big, 200));
+    check("refused pend busy: nothing waits to be sent again", 0, g_t[0].xh.f.redo_n);
+    gl_end();
+    xc_pend_set(XC_PEND_MAX);
+}
+
+static void t_refused_post_waits_for_slot(void) {
+    static char big[201];
+    memset(big, 'w', 200);
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(nosettings, 1);
+    P_SET(lim, 1);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    P_SET(iwin, 64);
+    P_SET(imcs, 2);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    struct tr_node nb = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a re-send opened on a full link */
+    check("refused slot: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    check("refused slot: 200 B taken", 0, gl_post(0, big));
+    UNTIL(read_wakes(0) > 0 && P_NSID(0) == 2);
+    gl_attach(1, &nb, g_key);
+    UNTIL(gl_ready(1) && P_NSID(0) == 3);
+    check("refused slot: the read reports no error", 0, gl_read(0));
+    turns(3);
+    check("refused slot: the re-send waits for a slot", 1, g_t[0].xh.f.redo_n);
+    gl_close(1);
+    gl_got[0] = 0;
+    uint64_t dl = ms_now() + 3000;
+    int rc = 0;
+    while (gl_got[0] < 200 && ms_now() < dl && !(rc = gl_read(0))) turn();
+    check("refused slot: sent again once the slot is free", 4, P_NSID(0));
+    check("refused slot: the flow reads on", 0, rc);
+    check("refused slot: the echo arrives", 1, gl_got[0] == 200 && !memcmp(gl_buf[0], big, 200));
+    gl_end();
+}
+
+static void t_refused_get_own_deadline(void) {
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(hold, 1);
+    P_SET(early, 2);
+    P_SET(lim, 0);
+    P_SET(over, 1);
+    P_SET(over_left, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    struct tr_node nb = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    /* catches: a GET opened again waiting under the deadline of its first placement */
+    check("get deadline: waits", XA_WAIT, gl_attach(0, &n, g_key));
+    jobs_run();
+    uint64_t dl = ms_now() + 3000;
+    while (P_ACCEPTS() < 1 && ms_now() < dl) usleep(1000);
+    UNTIL(gl_ready(0) && read_wakes(0) > 0);
+    transport_write(&g_t[0], (const unsigned char *)"g0", 2);
+    UNTIL(P_NSID(0) == 2 && P_UPN(0) == 2);
+    gl_attach(1, &nb, g_key);
+    UNTIL(gl_ready(1) && P_NSID(0) == 3);
+    g_hold = 1;
+    g_now += 7000;
+    turn();
+    check("get deadline: the read reports no error", 0, gl_read(0));
+    check("get deadline: the GET waits for a dial", 1, g_t[0].xh.f.wait != NULL);
+    g_now += 2000;
+    turns(3);
+    check("get deadline: still waiting 9 s after placement", 1, g_t[0].xh.f.wait != NULL);
+    check("get deadline: no error yet", 0, gl_read(0));
+    g_now += 7000;
+    int rw = read_wakes(0);
+    UNTIL(read_wakes(0) > rw);
+    check("get deadline: its own deadline passed", TR_ECONNTIMEOUT, gl_read(0));
+    g_hold = 0;
+    gl_end();
 }
 
 static void t_stream_up_same_link(void) {
@@ -2272,11 +2851,15 @@ static void t_wake_no_double(void) {
 }
 
 static int g_send_calls, g_send_fail_at;
-extern int (*tr_xh_send)(const struct xs *s, const unsigned char *d, size_t n, int end);
+extern int (*tr_xh_send_q)(const struct xs *s, struct xc_q *q, size_t n, int end);
 
-static int send_fails(const struct xs *s, const unsigned char *d, size_t n, int end) {
-    if (++g_send_calls == g_send_fail_at) return H2_EIO;
-    return xs_send(s, d, n, end);
+static int send_fails(const struct xs *s, struct xc_q *q, size_t n, int end) {
+    static unsigned char sink[32768];
+    if (++g_send_calls == g_send_fail_at) {
+        xc_q_pop(q, sink, sizeof sink);
+        return H2_EIO;
+    }
+    return xs_send_q(s, q, n, end);
 }
 
 static void t_partial_send_counts(void) {
@@ -2288,16 +2871,36 @@ static void t_partial_send_counts(void) {
     turns(3);
     check("partial: 40000 taken", 0, transport_write(&g_t[0], gl_big, 40000));
     g_send_calls = 0;
-    g_send_fail_at = 2;
-    tr_xh_send = send_fails;
+    g_send_fail_at = 1;
+    tr_xh_send_q = send_fails;
     tr_xmux_pass(g_now, MUXP_LATE);
-    tr_xh_send = xs_send;
+    tr_xh_send_q = xs_send_q;
     /* catches: bytes taken from the batch for a POST that failed partway kept in the budget */
     check("partial: two pieces taken, 7232 left", 7232, (long)g_t[0].xh.f.bat.n);
     check("partial: the flow failed", 1, g_t[0].xh.err != 0);
     check("partial: counted exactly", 1, ACCT_OK());
     gl_close(0);
     check("partial: nothing left after close", 0, (long)tr_xmux_bat_used());
+    gl_end();
+}
+
+static void t_post_one_frame(void) {
+    static unsigned char big[100000];
+    memset(big, 'o', sizeof big);
+    gl_begin(0);
+    P_SET(split, 2);
+    P_SET(mfs, 1);
+    P_SET(noecho, 1);
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    gl_attach(0, &n, g_key);
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    turns(3);
+    check("one frame: 100,000 taken", 0, transport_write(&g_t[0], big, sizeof big));
+    UNTIL(!g_t[0].xh.f.bat.n && P_NSID(0) == 2 && p_dl_is(0, "100000:1 ", 0));
+    /* catches: POST bodies still cut into 16 KiB frames */
+    check("one frame: one POST", 2, P_NSID(0));
+    check("one frame: its body one DATA of 100,000 with END_STREAM", 1, p_dl_is(0, "100000:1 ", 1));
+    check("one frame: the flow fine", 0, g_t[0].xh.err);
     gl_end();
 }
 
@@ -2816,11 +3419,11 @@ static void t_dl_post_padding_discarded(void) {
     gl_attach_dl(0, &n, g_key);
     UNTIL(gl_ready(0) && P_NSID_AT(0) == 1 && P_NSID_AT(1) == 1);
     int mc = p_first_on(0);
-    UNTIL(p_get(21, mc, 0) == 0 && p_get(20, mc, 0) >= 1504);
+    UNTIL(p_get(21, mc, 0) == 0 && p_get(20, mc, 0) >= (1572864 - 4095) / 1024);
     turns(5);
     check("dl padding: all of it sent", 0, p_get(21, mc, 0));
-    check("dl padding: the stream credited", 1, p_get(20, mc, 0) >= 1504);
-    check("dl padding: the connection credited past the preface", 1, p_get(19, mc, 0) >= (983041 + 1572864 - 32768) / 1024);
+    check("dl padding: the stream credited", 1, p_get(20, mc, 0) >= (1572864 - 4095) / 1024);
+    check("dl padding: the connection credited past the preface", 1, p_get(19, mc, 0) >= (1073741824 + 1572864 - 4095) / 1024);
     check("dl padding: main link open", 1, P_OPEN(mc));
     check("dl padding: echo after", 1, gl_echo(0, "after"));
     gl_end();
@@ -2839,29 +3442,6 @@ static void t_dl_post_400_body_fails_the_write(void) {
     UNTIL(gl_answered(0));
     turns(3);
     check("dl 400 body: the next write fails", H2_ESTATUS, transport_write(&g_t[0], (const unsigned char *)"y", 1));
-    gl_end();
-}
-
-/* catches: main links of a dl node drawing on the receive budget */
-static void t_dl_only_the_block_draws_the_budget(void) {
-    static char k2[4];
-    gl_begin(0);
-    xc_budget_set(2097153);
-    P_SET(split, 2);
-    struct tr_node n = gl_dl("xmux.maxConnections=1\n", "xmux.maxConnections=3\n", "packet-up");
-    for (int i = 0; i < 3; i++) {
-        gl_attach_dl(i, &n, g_key);
-        UNTIL(gl_ready(i) && P_NSID_AT(1) == i + 1);
-        turns(3);
-    }
-    gl_attach_dl(3, &n, k2);
-    UNTIL(gl_ready(3) && P_ACC(0) == 2);
-    turns(5);
-    check("dl budget: main sends the normal preface", 983041, p_get(18, p_nth_on(0, 0), 0));
-    check("dl budget: the first block link drew it", 983041, p_get(18, p_nth_on(1, 0), 0));
-    check("dl budget: a live main link drew nothing", 983041, p_get(18, p_nth_on(1, 1), 0));
-    check("dl budget: the third block link found it spent", 0, p_get(17, p_nth_on(1, 2), 0));
-    check("dl budget: a main link opened past the budget keeps the normal preface", 983041, p_get(18, p_nth_on(0, 1), 0));
     gl_end();
 }
 
@@ -3119,8 +3699,8 @@ static void t_dl_discard_credit_coalesced(void) {
     check("dl coalesce: all padding sent", 0, p_get(21, mc, 0));
     check("dl coalesce: at most one update queued for the stream and one for the connection", 1, b1 >= b0 && b1 - b0 <= 26);
     p_read_again(mc);
-    UNTIL(p_get(20, mc, 0) >= (983040 - 32768) / 1024);
-    check("dl coalesce: the held-back credit is paid once the socket drains", 1, p_get(20, mc, 0) >= (983040 - 32768) / 1024);
+    UNTIL(p_get(20, mc, 0) >= (983040 - 4095) / 1024);
+    check("dl coalesce: the held-back credit is paid once the socket drains", 1, p_get(20, mc, 0) >= (983040 - 4095) / 1024);
     gl_end();
 }
 
@@ -3193,8 +3773,8 @@ static void t_late_serves_before_batched_posts(void) {
     gl_end();
 }
 
-/* catches: credit for DATA on a dead stream queued per frame */
-static void t_dead_stream_credit_coalesced(void) {
+/* catches: DATA on a dead stream refunded later than Go's 4096 B rule, or twice */
+static void t_dead_stream_credit_per_frame(void) {
     gl_begin(0);
     p_rcvbuf(4096);
     P_SET(split, 1);
@@ -3235,9 +3815,9 @@ static void t_dead_stream_credit_coalesced(void) {
     turns(10);
     size_t b1 = x->out.n;
     check("dead credit: all DATA on the reset stream sent", 0, p_get(21, 0, 0));
-    check("dead credit: no update added while one is queued", 1, b1 == b0);
+    check("dead credit: one WINDOW_UPDATE(0, 4096) per 4096 B frame", 240 * 13, (long)(b1 - b0));
     p_read_again(0);
-    long want = before + (40960 + 983040 - 32767) / 1024;
+    long want = before + (40960 + 983040 - 4095) / 1024;
     UNTIL(p_get(19, 0, 0) >= want);
     turns(10);
     long after = (long)p_get(19, 0, 0);
@@ -3266,11 +3846,89 @@ static void t_pin_is_released(void) {
     gl_end();
 }
 
+static void t_budget_per_loop(void) {
+    gl_begin(0);
+    struct mux_host h = GL_HOST;
+    h.loops = 4096;
+    tr_xmux_host(&h, gl_stale);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    gl_attach(0, &n, g_key);
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    static unsigned char msg[9000];
+    memset(msg, 'b', sizeof msg);
+    /* catches: every loop given the whole process ceiling */
+    check("loop budget: 9000 written", 0, transport_write(&g_t[0], msg, sizeof msg));
+    struct xconn *x = g_t[0].xh.f.one.x;
+    UNTIL(!xconn_wants_in(x));
+    check("loop budget: paused at 32 MiB / 4096", 0, xconn_wants_in(x));
+    check("loop budget: held at least 8192", 1, xc_held() >= 8192);
+    gl_end();
+}
+
+static void t_paused_link_disarmed(void) {
+    gl_begin(0);
+    struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\n");
+    gl_attach(0, &n, g_key);
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    xc_budget_set(1024, 2048, 1536);
+    static unsigned char msg[4000];
+    memset(msg, 'm', sizeof msg);
+    /* catches: a level-triggered paused socket spinning the loop */
+    check("disarm: 4000 written", 0, transport_write(&g_t[0], msg, sizeof msg));
+    struct xconn *x = g_t[0].xh.f.one.x;
+    UNTIL(!xconn_wants_in(x));
+    turns(3);
+    int fd = x->link.fd;
+    check("disarm: paused", 0, xconn_wants_in(x));
+    check("disarm: crossed the ceiling", 1, xc_held() >= 2048);
+    check("disarm: watched", 1, g_wev[fd] != 0);
+    check("disarm: no EPOLLIN while paused", 0, (long)(g_wev[fd] & EPOLLIN));
+    static unsigned char got[4000];
+    size_t tot = 0;
+    uint64_t dl = ms_now() + 3000;
+    while (!xconn_wants_in(x) && ms_now() < dl) {
+        size_t k = 0;
+        if (transport_read(&g_t[0], got + tot, 100, &k) || !k) break;
+        tot += k;
+    }
+    check("disarm: resumed under 1536", 1, xconn_wants_in(x) && xc_held() < 1536);
+    tr_xmux_pass(g_now, MUXP_LATE);
+    check("disarm: the LATE pass arms EPOLLIN", EPOLLIN, (long)(g_wev[fd] & EPOLLIN));
+    dl = ms_now() + 3000;
+    while (tot < sizeof got && ms_now() < dl) {
+        size_t k = 0;
+        turn();
+        if (transport_read(&g_t[0], got + tot, sizeof got - tot, &k)) break;
+        tot += k;
+    }
+    check("disarm: all 4000 echoed", 4000, (long)tot);
+    check("disarm: the bytes", 0, memcmp(got, msg, sizeof msg));
+    gl_end();
+}
+
 static void glue(void) {
     signal(SIGPIPE, SIG_IGN);
     g_now = 1000000;
     tr_xmux_rnd = rnd_zero;
     t_two_flows_one_accept();
+    t_first_headers_before_ack();
+    t_refused_before_settings_retried();
+    t_refused_after_write_ends();
+    t_refused_retry_fails();
+    t_refused_stream_up_reads_again();
+    t_refused_twice_ends();
+    t_refused_post_resent();
+    t_refused_get_reopened();
+    t_refused_post_unkept();
+    t_refused_post_bounded();
+    t_refused_get_twice_ends();
+    t_refused_get_waits();
+    t_refused_post_past_window();
+    t_redo_stack();
+    t_refused_post_past_pend();
+    t_refused_post_pend_busy();
+    t_refused_post_waits_for_slot();
+    t_refused_get_own_deadline();
     t_default_three();
     t_waiters_share_a_dial();
     t_dial_fail_retries_once();
@@ -3311,9 +3969,12 @@ static void glue(void) {
     t_idle_reservation_shrinks();
     t_share_among_uploaders();
     t_wake_after_all_flushes();
+    t_paused_link_disarmed();
+    t_budget_per_loop();
     t_close_frees_wakes();
     t_wake_no_double();
     t_partial_send_counts();
+    t_post_one_frame();
     t_batch_holds_a_write_past_post_max();
     t_serve_skips_big_waiter();
     t_post_waits_for_window();
@@ -3354,11 +4015,10 @@ static void glue(void) {
     t_waiter_beats_queued_posts();
     t_post_wait_deadline();
     t_late_serves_before_batched_posts();
-    t_dead_stream_credit_coalesced();
+    t_dead_stream_credit_per_frame();
     t_pin_is_released();
     t_dl_post_padding_discarded();
     t_dl_post_400_body_fails_the_write();
-    t_dl_only_the_block_draws_the_budget();
     t_dl_no_eviction_without_both_slots();
     t_dl_shared_block_outlives_one_stale_node();
     close(g_ep);

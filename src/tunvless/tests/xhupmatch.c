@@ -85,8 +85,7 @@ static void check(int ok, const char *what) {
 
 static int g_srv = -1;                /* the "server" end of the socket pair */
 
-/* What the client has written since the pair was made: preface, HEADERS, DATA. Kept to look for
- * the request paths: HPACK sends them as plain literals (h2w_headers in h2wire.c). */
+/* What the client has written since the pair was made: preface, HEADERS, DATA. */
 static unsigned char g_seen[1 << 20];
 static size_t g_seen_n;
 
@@ -97,7 +96,11 @@ static void srv_drain(void) {
 }
 
 static int seen(const char *s) {
-    return memmem(g_seen, g_seen_n, s, strlen(s)) != NULL;
+    static struct hr_block b;
+    for (int k = 0; !hr_nth_headers(g_seen, g_seen_n, k, &b); k++)
+        for (size_t i = 0; i < b.n; i++)
+            if (strstr(b.f[i].value, s)) return 1;
+    return 0;
 }
 
 /* Whether the client left unread bytes on its end: an answer post_pull never took. */
@@ -663,16 +666,53 @@ static void t_budget_too_small_fails_with_reason(void) {
     xclose(fds);
 }
 
+static const char *cl_of(const struct hr_block *b) {
+    const char *v = fval(b, "content-length");
+    return v ? v : "(none)";
+}
+
+static void t_content_length_per_mode(void) {
+    int fds[2];
+    struct transport c;
+    unsigned char pl[10] = { 0 };
+    /* catches: a content-length on a stream body or the GET, or a packet POST without its body length */
+    struct tr_node n = xnode("stream-up", NULL, NULL);
+    int rc = xopen(&c, &n, fds);
+    down_block(&g_hb);
+    int down = !strcmp(cl_of(&g_hb), "(none)") && fval(&g_hb, "accept-encoding");
+    up_block(0, &g_hb);
+    check(rc == 0 && down && !strcmp(cl_of(&g_hb), "(none)"), "content-length: none on stream-up or its GET");
+    xclose(fds);
+    n = xnode("stream-one", NULL, NULL);
+    rc = xopen(&c, &n, fds);
+    down_block(&g_hb);
+    check(rc == 0 && !strcmp(cl_of(&g_hb), "(none)"), "content-length: none on stream-one");
+    xclose(fds);
+    n = xnode("packet-up", NULL, NULL);
+    rc = xopen(&c, &n, fds);
+    int wr = rc ? -1 : transport_write(&c, pl, sizeof pl);
+    srv_drain();
+    up_block(0, &g_hb);
+    check(wr == 0 && !strcmp(cl_of(&g_hb), "10"), "content-length: 10 on a packet POST of 10 bytes");
+    xclose(fds);
+    n = xnode("packet-up", "uplinkDataPlacement=header", NULL);
+    rc = xopen(&c, &n, fds);
+    wr = rc ? -1 : transport_write(&c, pl, sizeof pl);
+    srv_drain();
+    up_block(0, &g_hb);
+    check(wr == 0 && !strcmp(cl_of(&g_hb), "0"), "content-length: 0 on a POST with data in headers");
+    xclose(fds);
+}
+
 static void t_custom_headers_first(void) {
     int fds[2];
     struct transport c;
     struct tr_node n = xnode("packet-up", NULL, "X-A: 1\n");
     int rc = xopen(&c, &n, fds);
     down_block(&g_hb);
-    size_t i = 0;
-    while (i < g_hb.n && g_hb.f[i].name[0] == ':') i++;
-    check(rc == 0 && i < g_hb.n && !strcmp(g_hb.f[i].name, "x-a") && !strcmp(g_hb.f[i].value, "1"),
-          "custom headers: x-a is the first field after the pseudo-headers");
+    int i = hr_find(&g_hb, "x-a");
+    check(rc == 0 && i >= 4 && !strcmp(g_hb.f[i].value, "1") && hr_find_from(&g_hb, "x-a", i + 1) < 0,
+          "custom headers: x-a once among the fields after the pseudo-headers");
     xclose(fds);
 }
 
@@ -930,6 +970,35 @@ static size_t decode_cookie_req(int k, unsigned char *out, size_t cap, int *bad,
     int dn = xc_b64url_decode(b64, out, cap);
     *bad = dn <= 0;
     return dn > 0 ? (size_t)dn : 0;
+}
+
+static int cookie_starts(const struct hr_block *b, const char *pre) {
+    for (size_t i = 0; i < b->n; i++)
+        if (!strcmp(b->f[i].name, "cookie") && !strncmp(b->f[i].value, pre, strlen(pre))) return 1;
+    return 0;
+}
+
+static void t_data_key_case(void) {
+    int fds[2];
+    struct transport c;
+    unsigned char pl[10] = { 1, 2, 3 };
+    /* catches: a data cookie name lowercased, or a data header name sent with its uppercase */
+    struct tr_node n = xnode("packet-up", "uplinkDataPlacement=cookie\nuplinkDataKey=Data", NULL);
+    int rc = xopen(&c, &n, fds);
+    int wr = rc ? -1 : transport_write(&c, pl, sizeof pl);
+    srv_drain();
+    up_block(0, &g_hb);
+    check(wr == 0 && cookie_starts(&g_hb, "Data_0=") && !cookie_starts(&g_hb, "data_0="),
+          "data key case: the cookie is Data_0 exactly");
+    xclose(fds);
+    n = xnode("packet-up", "uplinkDataPlacement=header\nuplinkDataKey=X-Up", NULL);
+    rc = xopen(&c, &n, fds);
+    wr = rc ? -1 : transport_write(&c, pl, sizeof pl);
+    srv_drain();
+    up_block(0, &g_hb);
+    check(wr == 0 && hr_find(&g_hb, "x-up-0") >= 4 && hr_find(&g_hb, "X-Up-0") < 0,
+          "data key case: the header is x-up-0 on the wire");
+    xclose(fds);
 }
 
 static void t_data_cookie(void) {
@@ -1289,8 +1358,8 @@ static void t_packet_up_one_connection(void) {
     if (fa >= 0) srv_headers_fd(fa, 3, 0x88, 1);
     int w3 = rc ? -1 : transport_write(&c, piece, 10);
     int w4 = rc ? -1 : transport_write(&c, piece, 10);
-    size_t bn = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 500);
-    check(w3 == 0 && hdr_sid(ab, bn, 0) == 7 && hdr_is(ab, bn, 0, ":path", p2) && w4 == H2_EWINDOW,
+    size_t bn = fa < 0 ? 0 : an + read_wait(fa, ab + an, sizeof ab - an, 500);
+    check(w3 == 0 && hdr_sid(ab, bn, 3) == 7 && hdr_is(ab, bn, 3, ":path", p2) && w4 == H2_EWINDOW,
           "packet-up: the 200 to stream 3 frees one slot: seq 2 on stream 7, then full");
     if (!rc) transport_close(&c);
     if (fa >= 0) close(fa);
@@ -1546,6 +1615,7 @@ int main(void) {
     t_no_grpc_header_from_the_main_side();
     t_custom_data_header_replaced();
     t_data_cookie();
+    t_data_key_case();
     t_data_cookie_budget();
     t_referer_without_session();
     t_session_header();
@@ -1561,6 +1631,7 @@ int main(void) {
     t_budget_too_small_fails_with_reason();
     t_server_max_header_bytes_before_settings();
     t_custom_headers_first();
+    t_content_length_per_mode();
     t_custom_accept_replaces();
     t_ipv6_authority_in_brackets();
     t_literal_ua_drops_look();

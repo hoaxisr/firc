@@ -62,7 +62,7 @@ static int put_headers(struct h2 *h, struct wbuf *b, const struct h2_req *r) {
     size_t at = b->n;
     if (at + 9 > b->cap) return H2_ETOOBIG;
     size_t room = b->cap - at - 9;
-    size_t n = h2w_headers(b->p + at + 9, room < H2_MAX_BLOCK ? room : H2_MAX_BLOCK, r, 0);
+    size_t n = h2w_headers(b->p + at + 9, room < H2_MAX_BLOCK ? room : H2_MAX_BLOCK, r);
     if (!n) return H2_ETOOBIG;
 
     /* END_STREAM as the caller asks. A long-lived stream has none: the request body is the

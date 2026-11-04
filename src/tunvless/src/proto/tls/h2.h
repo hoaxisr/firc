@@ -89,7 +89,7 @@ struct h2 {
     uint32_t sid;
 };
 
-/* Chrome's look in request headers: xhttp (h2w_headers in h2wire.c, which says where the set comes
+/* Chrome's look in request headers: xhttp (h2w_go_fields in h2wire.c, which says where the set comes
  * from) and the Upgrade request of ws and httpupgrade (proto/transport/trupgrade.c). One place
  * for both, so the browser version cannot differ between transports.
  *
@@ -123,8 +123,9 @@ struct h2_req {
     const char *authority, *path, *content_type;
     const char *method;
     const struct h2_field *fields;
-    size_t fields_n, lead_n;
+    size_t fields_n;
     int end_stream, no_look;
+    int64_t body_len;
 };
 
 /* Sends the data in DATA frames, all or nothing (H2_EWINDOW); see h2.c. */

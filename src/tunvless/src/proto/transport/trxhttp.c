@@ -89,7 +89,7 @@ struct xh_rq {
     struct xh_ar a;
 };
 
-struct xh_scratch { struct xh_rq q; char arena[XH_ARENA]; };
+struct xh_scratch { struct xh_rq q; char arena[XH_ARENA]; unsigned char blk[XH_BLOCK]; };
 
 static __thread struct xh_scratch *g_xs;
 
@@ -122,7 +122,6 @@ static void rq_join(struct xh_rq *q, int with_data) {
     size_t n = 0;
     for (size_t i = 0; i < q->lead; i++)
         if (!rq_shadowed(q, q->main[i].name, with_data)) q->all[n++] = q->main[i];
-    q->r.lead_n = n;
     for (size_t i = q->lead; i < q->main_n; i++) q->all[n++] = q->main[i];
     for (size_t i = 0; with_data && i < q->dat_n; i++) q->all[n++] = q->dat[i];
     for (size_t i = 0; i < q->ck_n; i++) q->all[n++] = q->ck[i];
@@ -332,6 +331,7 @@ static int rq_build(struct transport *t, enum xh_kind k, const char *seq, int wo
     q->r.method = k == XK_DOWN ? "GET" : o->method;
     q->r.content_type = (k == XK_ONE || k == XK_UP) && !o->no_grpc ? "application/grpc" : NULL;
     q->r.end_stream = k == XK_DOWN;
+    q->r.body_len = k == XK_ONE || k == XK_UP ? -1 : 0;
     rq_join(q, 0);
     return 0;
 }
@@ -422,6 +422,8 @@ static int rq_data(struct transport *t, const unsigned char *d, size_t n, size_t
         size_t c = cs[i] < e - at ? cs[i] : e - at;
         char name[80];
         snprintf(name, sizeof name, o->data_place == XHP_COOKIE ? "%s_%zu" : "%s-%zu", o->data_key, i);
+        for (char *c = name; o->data_place == XHP_HEADER && *c; c++)
+            if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + ('a' - 'A'));
         char *b = ar_begin(&q->a);
         if (o->data_place == XHP_COOKIE) {
             ar_cat(&q->a, name, strlen(name));
@@ -531,6 +533,10 @@ static int post_reap(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
     for (unsigned i = 0; i < f->post_n;) {
         struct xh_post *p = &f->post[i];
+        if (p->redo) {
+            i++;
+            continue;
+        }
         unsigned char sink[64];
         size_t got = 0;
         int rc = 0;
@@ -540,10 +546,20 @@ static int post_reap(struct transport *t) {
             continue;
         }
         int st = xs_status(&p->s);
-        if (!st && t->xh.f.shared) tr_xmux_post_failed(p->s.x);
+        if (rc == XC_EREFUSED && !st && f->shared && p->keep.n) {
+            xs_close(&p->s);
+            p->redo = 1;
+            p->tries++;
+            f->redo_n++;
+            tr_xmux_redo(t);
+            i++;
+            continue;
+        }
+        if (!st && f->shared && rc != XC_EREFUSED) tr_xmux_post_failed(p->s.x);
         if (st != 200 && !t->xh.err) t->xh.err = st ? (st > 0 ? st : -1) : rc;
         if (t->xh.err == -1) t->xh.err = H2_ESTATUS;
         xs_close(&p->s);
+        xc_q_drop(&p->keep);
         f->post[i] = f->post[--f->post_n];
     }
     return xh_err(t);
@@ -573,6 +589,17 @@ static int up_reap(struct transport *t) {
 static int up_open(struct transport *t, struct xconn *main) {
     int rc = rq_build(t, XK_UP, NULL, 0);
     return rc ? rc : xs_open(main, &g_xs->q.r, t->xh.f.owner, &t->xh.f.up);
+}
+
+int xh_get_open(struct transport *t, struct xconn *x) {
+    int rc = rq_build(t, XK_DOWN, NULL, 0);
+    return rc ? rc : xs_open(x, &g_xs->q.r, t->xh.f.owner, &t->xh.f.down);
+}
+
+void xh_posts_drop(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    for (unsigned i = 0; i < f->post_n; i++) xc_q_drop(&f->post[i].keep);
+    f->redo_n = 0;
 }
 
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner) {
@@ -681,6 +708,7 @@ static int post_open(struct transport *t, const unsigned char *d, size_t n, int 
     int rc = rq_build(t, XK_PACKET, seq, 0);
     if (!rc && meta) rc = rq_data(t, d, n, took);
     struct xh_post *p = &f->post[f->post_n];
+    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
     if (!rc) rc = xs_open(x_post(t), &g_xs->q.r, f->owner, &p->s);
     if (rc) return rc;
     p->seq = x->seq++;
@@ -710,7 +738,52 @@ static int packet_meta_write(struct transport *t, const unsigned char *d, size_t
     return rc ? rc : out_wait(t, x_post(t));
 }
 
-int (*tr_xh_send)(const struct xs *s, const unsigned char *d, size_t n, int end) = xs_send;
+int (*tr_xh_send_q)(const struct xs *s, struct xc_q *q, size_t n, int end) = xs_send_q;
+
+static int post_redo(struct transport *t, struct xconn *m, struct xh_post *p) {
+    struct xh_state *x = &t->xh;
+    struct xh_flow *f = &x->f;
+    size_t n = p->keep.n;
+    int meta = data_meta(&x->main_side.opts);
+    if (!xc_slot_free(m) || (meta && n > XH_BLOCK)) return 0;
+    if (!meta) {
+        long w = m->h2.peer_init_win < h2m_conn_room(&m->h2) ? m->h2.peer_init_win : h2m_conn_room(&m->h2);
+        size_t now = w > 0 ? ((size_t)w < n ? (size_t)w : n) : 0;
+        long iw = m->h2.peer_init_win;
+        size_t fresh = iw <= 0 ? 0 : (size_t)iw < n ? (size_t)iw : n;
+        if (n - fresh > xc_pend_limit()) return XC_EREFUSED;
+        if (n - now > xc_pend_free()) return 0;
+    }
+    char seq[24];
+    snprintf(seq, sizeof seq, "%llu", (unsigned long long)p->seq);
+    int rc = rq_build(t, XK_PACKET, seq, 0);
+    if (!rc && meta) {
+        size_t took = n;
+        xc_q_peek(&p->keep, g_xs->blk, n);
+        rc = rq_data(t, g_xs->blk, n, &took);
+        if (!rc && took != n) rc = TR_EIO;
+    }
+    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
+    if (!rc) rc = xs_open(m, &g_xs->q.r, f->owner, &p->s);
+    if (rc) return rc;
+    p->redo = 0;
+    f->redo_n--;
+    int hold = p->tries < XH_POST_RETRY;
+    if (meta) {
+        if (!hold) xc_q_drop(&p->keep);
+        return 1;
+    }
+    struct xc_q again = { 0 };
+    if (hold && xc_q_copy(&again, &p->keep, n)) xc_q_drop(&again);
+    rc = sent(tr_xh_send_q(&p->s, &p->keep, n, 1), &p->s);
+    xc_q_drop(&p->keep);
+    if (rc) {
+        xc_q_drop(&again);
+        return rc;
+    }
+    p->keep = again;
+    return 1;
+}
 
 int xh_post_flush(struct transport *t) {
     struct xh_state *x = &t->xh;
@@ -718,15 +791,17 @@ int xh_post_flush(struct transport *t) {
     struct xconn *m = f->post_x;
     int rc = post_reap(t);
     if (rc) return rc;
+    for (unsigned i = 0; m && f->redo_n && i < f->post_n; i++)
+        if (f->post[i].redo) return post_redo(t, m, &f->post[i]);
     if (!m || f->post_n >= XH_POST_MAX || packet_slots(t) <= 0) return 0;
-    unsigned char buf[XH_BLOCK];
+    int keep = f->shared && !m->h2.peer_settings_seen;
     int meta = data_meta(&x->main_side.opts);
     size_t n = f->bat.n;
     if (meta) {
         size_t w = packet_cap(t);
         if (!w) return TR_EIO;
         if (n > w) n = w;
-        if (n > sizeof buf) n = sizeof buf;
+        if (n > XH_BLOCK) n = XH_BLOCK;
     } else {
         size_t cap = x->post_max ? x->post_max : 1000000;
         long r = xc_room_new(m, f->owner);
@@ -741,28 +816,38 @@ int xh_post_flush(struct transport *t) {
     rc = rq_build(t, XK_PACKET, seq, 0);
     size_t took = n;
     if (!rc && meta) {
-        xc_q_peek(&f->bat, buf, n);
-        rc = rq_data(t, buf, n, &took);
+        xc_q_peek(&f->bat, g_xs->blk, n);
+        rc = rq_data(t, g_xs->blk, n, &took);
     }
     struct xh_post *p = &f->post[f->post_n];
+    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
     if (!rc) rc = xs_open(m, &g_xs->q.r, f->owner, &p->s);
     if (rc) return rc;
     p->seq = x->seq++;
+    p->keep = (struct xc_q){ 0 };
+    p->tries = p->redo = 0;
     f->post_n++;
     if (meta) {
-        xc_q_pop(&f->bat, buf, took);
+        xc_q_pop(&f->bat, g_xs->blk, took);
+        if (keep && xc_q_push(&p->keep, g_xs->blk, took)) xc_q_drop(&p->keep);
         return (int)took;
     }
-    for (size_t left = n; left;) {
-        size_t k = xc_q_pop(&f->bat, buf, left < sizeof buf ? left : sizeof buf);
-        left -= k;
-        rc = sent(tr_xh_send(&p->s, buf, k, !left), &p->s);
-        if (rc) return rc;
-    }
-    return (int)n;
+    if (keep && xc_q_copy(&p->keep, &f->bat, n)) xc_q_drop(&p->keep);
+    rc = sent(tr_xh_send_q(&p->s, &f->bat, n, 1), &p->s);
+    return rc ? rc : (int)n;
 }
 
+static int xhttp_write_mode(struct transport *t, const unsigned char *d, size_t n);
+
 static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
+    struct xh_flow *f = &t->xh.f;
+    if (f->shared && f->again && f->wait) return H2_EWINDOW;
+    int rc = xhttp_write_mode(t, d, n);
+    if (!rc && n && f->shared) f->wrote = 1;
+    return rc;
+}
+
+static int xhttp_write_mode(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_state *x = &t->xh;
     switch (x->mode) {
         case XH_STREAM_ONE: {
@@ -811,14 +896,27 @@ static int xhttp_write(struct transport *t, const unsigned char *d, size_t n) {
     return H2_EPROTO;
 }
 
+static int refused(struct transport *t, int rc, int up) {
+    struct xh_flow *f = &t->xh.f;
+    if (rc != XC_EREFUSED || !f->shared) return rc;
+    if (!up && t->xh.mode != XH_STREAM_ONE) return tr_xmux_reget(t);
+    return f->wrote ? rc : tr_xmux_refused(t);
+}
+
 static int xhttp_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
-    if (t->xh.f.shared && t->xh.mode != XH_STREAM_ONE) {
-        int rc = t->xh.mode == XH_STREAM_UP ? up_reap(t) : post_reap(t);
-        if (rc) return rc;
+    struct xh_flow *f = &t->xh.f;
+    *got = 0;
+    if (f->shared && f->again && t->xh.err) return f->end = t->xh.err;
+    if (f->shared && f->again && f->wait) return 0;
+    if (f->shared && t->xh.mode != XH_STREAM_ONE) {
+        int rc = t->xh.mode == XH_STREAM_UP ? refused(t, up_reap(t), 1) : post_reap(t);
+        if (rc) f->end = rc;
+        if (rc || f->again) return rc;
     }
     const struct xs *s = x_rd(t);
     int rc = sent(xs_read(s, d, cap, got), s);
-    if (rc) t->xh.f.end = rc;
+    if (rc) rc = refused(t, rc, 0);
+    if (rc) f->end = rc;
     return rc;
 }
 

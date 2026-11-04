@@ -33,7 +33,7 @@ struct xl {
     struct transport *wait, *held;
     uint64_t used_ms;
     unsigned wn, hn, posters;
-    uint8_t used, dialing, gone, watched, out;
+    uint8_t used, dialing, gone, watched, out, in;
 };
 
 struct xm_ctx { const struct tr_node *n; const struct xc_ref *ref; struct xmm *mm; };
@@ -75,7 +75,7 @@ static struct xl *find(const struct xconn *x) {
 
 static void unwatch(struct xl *l) {
     if (l->watched && g_h.watch) g_h.watch(idx(l), l->x->link.fd, 0);
-    l->watched = l->out = 0;
+    l->watched = l->out = l->in = 0;
 }
 
 static int side(const struct transport *t, const struct xl *l) { return t->xh.f.mgr == &l->mm->m ? 0 : 1; }
@@ -122,7 +122,7 @@ static int usable(const struct xl *l) {
 }
 
 static unsigned need(const struct transport *t) {
-    return t->xh.f.post_wait || t->xh.f.mgr_dl ? 1 : t->xh.mode == XH_STREAM_UP ? 2 : 1;
+    return t->xh.f.post_wait || t->xh.f.get_wait || t->xh.f.mgr_dl ? 1 : t->xh.mode == XH_STREAM_UP ? 2 : 1;
 }
 
 static int room(const struct xl *l, unsigned k) {
@@ -201,6 +201,17 @@ static void wake(uint16_t owner, int rc) {
     if (g_h.wake) g_h.wake(g_h.arg, owner, XW_DONE, rc);
 }
 
+static void done(struct transport *t, int rc) {
+    struct xh_flow *f = &t->xh.f;
+    if (!f->again) {
+        wake(f->owner, rc);
+        return;
+    }
+    if (rc) t->xh.err = rc;
+    else f->again = 0;
+    if (g_h.wake) g_h.wake(g_h.arg, f->owner, XW_READ | XW_ROOM, 0);
+}
+
 static void wait_add(struct xl *l, struct transport *t) {
     struct xh_flow *f = &t->xh.f;
     f->wait = l->x;
@@ -224,6 +235,7 @@ static void wait_del(struct transport *t) {
         }
     f->wnext = NULL;
     f->post_wait = 0;
+    f->get_wait = 0;
 }
 
 static struct xl *choose(struct xm_client *cl, struct xm_ctx *cx, unsigned k) {
@@ -415,7 +427,7 @@ static void retry(struct transport *t, const struct xc_ref *ref, int rc) {
         if (r == XA_WAIT) return;
         if (r == XA_READY) r = 0;
     }
-    wake(f->owner, r);
+    done(t, r);
 }
 
 static void requeue(struct transport *w, const struct xc_ref *ref, int rc) {
@@ -427,6 +439,9 @@ static void requeue(struct transport *w, const struct xc_ref *ref, int rc) {
         if (t->xh.f.post_wait) {
             t->xh.f.post_wait = 0;
             post_err(t, rc);
+        } else if (t->xh.f.get_wait) {
+            t->xh.f.get_wait = 0;
+            done(t, rc);
         } else {
             retry(t, ref, rc);
         }
@@ -468,9 +483,16 @@ static void serve(struct xl *l) {
             post_use(l, t);
             continue;
         }
+        if (f->get_wait) {
+            f->get_wait = 0;
+            l->used_ms = g_now;
+            done(t, xh_get_open(t, l->x));
+            p = &l->wait;
+            continue;
+        }
         hold_on(l, t, side(t, l));
         int r = go(t, &l->x->ref);
-        if (r != XA_WAIT) wake(f->owner, r == XA_READY ? 0 : r);
+        if (r != XA_WAIT) done(t, r == XA_READY ? 0 : r);
         p = &l->wait;
     }
 }
@@ -497,11 +519,13 @@ static void after(struct xl *l) {
     }
     serve(l);
     if (l->x != x) return;
-    uint8_t out = xconn_wants_out(x) ? 1 : 0;
-    if (l->watched && out == l->out) return;
-    if (g_h.watch && !g_h.watch(idx(l), x->link.fd, EPOLLIN | (out ? EPOLLOUT : 0))) {
+    uint8_t out = xconn_wants_out(x) ? 1 : 0, in = xconn_wants_in(x) ? 1 : 0;
+    if (l->watched && out == l->out && in == l->in) return;
+    unsigned ev = (in ? EPOLLIN : 0u) | (out ? EPOLLOUT : 0u);
+    if (g_h.watch && !g_h.watch(idx(l), x->link.fd, ev ? ev : EPOLLHUP)) {
         l->watched = 1;
         l->out = out;
+        l->in = in;
         return;
     }
     xconn_fail(x, TR_EIO);
@@ -523,6 +547,8 @@ static void adopt(struct xl *l, uint64_t now) {
         return;
     }
     l->used_ms = now;
+    after(l);
+    if (l->x != x || x->state != XC_LIVE) return;
     xconn_io(x, EPOLLIN, now);
     after(l);
 }
@@ -608,13 +634,9 @@ int tr_xmux_attach(struct transport *t, const struct tr_node *n, const void *key
     return place(t, ref);
 }
 
-void tr_xmux_detach(struct transport *t) {
+static void flow_close(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
-    struct xmm *mm = (struct xmm *)f->mgr, *md = (struct xmm *)f->mgr_dl;
-    if (f->wait) wait_del(t);
-    const struct xs *rd = t->xh.mode == XH_STREAM_ONE ? &f->one : &f->down;
-    struct xm_client *rcl = md ? f->cl_dl : f->cl;
-    if (rcl && f->end == H2_ERESET && rd->x && !xs_status(rd)) xm_failed(rcl);
+    xh_posts_drop(t);
     struct xs *st[3 + XH_POST_MAX] = { &f->one, &f->down, &f->up };
     unsigned n = 3;
     for (unsigned i = 0; i < f->post_n; i++) st[n++] = &f->post[i].s;
@@ -636,6 +658,16 @@ void tr_xmux_detach(struct transport *t) {
         l->used_ms = g_now;
         link_check(l);
     }
+}
+
+void tr_xmux_detach(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    struct xmm *mm = (struct xmm *)f->mgr, *md = (struct xmm *)f->mgr_dl;
+    if (f->wait) wait_del(t);
+    const struct xs *rd = t->xh.mode == XH_STREAM_ONE ? &f->one : &f->down;
+    struct xm_client *rcl = md ? f->cl_dl : f->cl;
+    if (rcl && f->end == H2_ERESET && rd->x && !xs_status(rd)) xm_failed(rcl);
+    flow_close(t);
     if (mm) {
         release(t);
         mm->flows--;
@@ -809,7 +841,7 @@ size_t tr_xmux_bat_used(void) { return g_bat_used; }
 
 static void bat_flush(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
-    while (f->bat.n && g_now >= f->post_at) {
+    while ((f->bat.n || f->redo_n) && g_now >= f->post_at) {
         int rc = t->xh.err ? t->xh.err : post_decide(t);
         if (rc == H2_EWINDOW) return;
         size_t before = f->bat.n;
@@ -836,13 +868,13 @@ static int bats(void) {
     bat_wakes();
     for (struct transport **p = &g_bat; *p;) {
         struct xh_flow *f = &(*p)->xh.f;
-        if (!f->bat.n && !f->bstarved && f->blim <= XL_RES_KEEP) {
+        if (!f->bat.n && !f->redo_n && !f->bstarved && f->blim <= XL_RES_KEEP) {
             *p = f->bnext;
             f->bnext = NULL;
             f->blisted = 0;
             continue;
         }
-        if (f->bat.n && f->post_at > g_now && (!due || f->post_at - g_now < due)) due = f->post_at - g_now;
+        if ((f->bat.n || f->redo_n) && f->post_at > g_now && (!due || f->post_at - g_now < due)) due = f->post_at - g_now;
         uint64_t idle_at = f->bw_at + XL_RES_IDLE_MS;
         if (f->blim > XL_RES_KEEP && idle_at > g_now && (!due || idle_at - g_now < due)) due = idle_at - g_now;
         p = &f->bnext;
@@ -861,9 +893,10 @@ void tr_xmux_host(const struct mux_host *h, int (*stale)(const struct xc_ref *r)
     g_stale = stale;
     struct xc_host xh = { g_h.wake, g_h.arg };
     xc_set_host(&xh);
-    xc_budget_set(XC_RX_BUDGET / (g_h.loops ? g_h.loops : 1));
     tr_xmux_up_budget = XL_UP_BUDGET / (g_h.loops ? g_h.loops : 1);
     xc_pend_set(XC_PEND_MAX / (g_h.loops ? g_h.loops : 1));
+    unsigned loops = g_h.loops ? g_h.loops : 1;
+    xc_budget_set(XC_RX_BUDGET / loops, XC_RX_HARD / loops, XC_RX_RESUME / loops);
 }
 
 int tr_xmux_dial(void *link, int timeout_s) { return xconn_dial(link, timeout_s); }
@@ -976,10 +1009,56 @@ int tr_xmux_pass(uint64_t now, int phase) {
     return due;
 }
 
+int tr_xmux_refused(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    struct xmm *mm = (struct xmm *)f->mgr;
+    const struct xs *rd = t->xh.mode == XH_STREAM_ONE ? &f->one : &f->down;
+    if (f->wait_n || !rd->x) return XC_EREFUSED;
+    struct xc_ref ref = mm->has_ref ? mm->ref : rd->x->ref;
+    flow_close(t);
+    release(t);
+    f->wait_n++;
+    f->again = 1;
+    int r = place(t, &ref);
+    if (r == XA_READY) {
+        f->again = 0;
+        if (g_h.wake) g_h.wake(g_h.arg, f->owner, XW_ROOM, 0);
+        return 0;
+    }
+    return r == XA_WAIT ? 0 : r;
+}
+
+int tr_xmux_reget(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    struct xmm *mm = (struct xmm *)f->mgr, *md = (struct xmm *)f->mgr_dl;
+    if (f->wait_n || f->wait || !f->down.x) return XC_EREFUSED;
+    struct xc_ref ref = f->down.x->ref;
+    struct xl *old = find(f->down.x);
+    xs_close(&f->down);
+    if (old) link_check(old);
+    f->wait_n++;
+    struct xmm *m = md ? md : mm;
+    struct xm_client *cl = md ? f->cl_dl : f->cl;
+    struct xm_ctx cx = { &m->n, &ref, m };
+    struct xl *l = cl ? choose(cl, &cx, 1) : NULL;
+    if (!l) return XC_EREFUSED;
+    if (fresh(l, 1)) {
+        l->used_ms = g_now;
+        return xh_get_open(t, l->x);
+    }
+    f->again = 1;
+    f->get_wait = 1;
+    f->wait_until = g_h.wait_ms ? g_now + g_h.wait_ms : 0;
+    wait_add(l, t);
+    return 0;
+}
+
+void tr_xmux_redo(struct transport *t) { bat_on(t); }
+
 int tr_xmux_cut(const struct transport *t) {
     int e = t->xh.f.end;
     if (!t->xh.f.shared || !e || e == H2_ERESET || e == H2_ESTATUS) return 0;
-    return e == XC_EGOAWAY ? 2 : 1;
+    return e == XC_EGOAWAY || e == XC_EREFUSED ? 2 : 1;
 }
 
 int tr_xmux_busy(void) {
@@ -1006,7 +1085,8 @@ void tr_xmux_dropped(void *link) {
             t->xh.f.post_wait = 0;
             post_err(t, TR_ECLOSED);
         } else {
-            wake(t->xh.f.owner, TR_ECLOSED);
+            t->xh.f.get_wait = 0;
+            done(t, TR_ECLOSED);
         }
     }
 }

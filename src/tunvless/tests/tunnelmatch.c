@@ -1046,7 +1046,11 @@ static void f_clear(void *sess) {
     s->flow_opens = 0;
 }
 static int f_fd(const void *sess) { return ((const struct fsess *)sess)->fd; }
-static int f_has_data(const void *sess) { (void)sess; return 0; }
+static int g_f_buffered;
+static int f_has_data(const void *sess) {
+    int fd = ((const struct fsess *)sess)->fd, n = 0;
+    return g_f_buffered && fd >= 0 && ioctl(fd, FIONREAD, &n) == 0 && n > 0;
+}
 static int g_fopen_fail;
 static struct flow_key g_fopen_key;
 static int f_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
@@ -6301,6 +6305,98 @@ static void t_mux_read_wake(void) {
           "  the next wait is 0 only while the stream has data");
 }
 
+static void m_window(uint16_t sport, uint16_t win) {
+    unsigned char p[128];
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, sport, 443, 1001, 2, TCP_ACK, NULL, 0, win, 0, -1);
+    handle_packet(&g_tun, p, l);
+    up_flush(&g_tun);
+}
+
+/* catches: ready flows that cannot take spending the late pass, so a later ready flow is never read */
+static void t_mux_ready_tail_drained(void) {
+    m_new();
+    struct conn *a = m_flow(41135), *b = m_flow(41136), *c = m_flow(41137);
+    m_window(41135, 0);
+    m_window(41136, 0);
+    pm_drain(NULL, NULL);
+    g_m_wake_what = 0;
+    g_mh->wake(g_mh->arg, (uint16_t)(a - g_conns), XW_READ, 0);
+    g_mh->wake(g_mh->arg, (uint16_t)(b - g_conns), XW_READ, 0);
+    loop_turn(&g_L, 0);
+    check(a && b && c && a->rx_ready && b->rx_ready && !c->rx_ready && c->our_seq == 2,
+          "mux: two flows ready with a closed client window, a third one idle");
+    g_m_rn = 1000;
+    for (int i = 0; i < 3; i++) loop_turn(&g_L, 0);
+    check(c && c->our_seq == 1002 && g_m_rn == 0 && a->our_seq == 2 && b->our_seq == 2,
+          "  the third flow's data is read in the next turns");
+}
+
+/* catches: the late pass reading a direct flow whose client window is closed */
+static void t_late_direct_closed_window(void) {
+    fake_new();
+    pm_drain(NULL, NULL);
+    struct conn *a = pm_open(41150, SRV_IP), *b = pm_open(41151, SRV_IP);
+    int sa = a ? pm_srv_of(a) : -1, sb = b ? pm_srv_of(b) : -1;
+    static unsigned char big[200000];
+    memset(big, 'd', sizeof big);
+    check(sa >= 0 && sb >= 0 && send(sa, big, sizeof big, MSG_DONTWAIT) == (ssize_t)sizeof big,
+          "fixture: two direct flows, 200000 B waiting for the first");
+    settle();
+    g_f_buffered = 1;
+    loop_turn(&g_L, 0);
+    pm_drain(NULL, NULL);
+    uint32_t s1 = a ? a->our_seq : 0;
+    int full = a && !conn_can_take(a) && a->rx_ready && !a->srv_closed;
+    if (sb >= 0 && send(sb, big, 1000, 0) != 1000) check(0, "fixture: server send");
+    settle();
+    for (int i = 0; i < 3; i++) loop_turn(&g_L, 0);
+    pm_drain(NULL, NULL);
+    check(full && a->our_seq == s1 && !a->srv_closed && b->our_seq == 1002,
+          "late pass: a direct flow with a closed client window reads nothing past it");
+    g_f_buffered = 0;
+    while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+    pm_drain(NULL, NULL);
+}
+
+static void m_ack(uint16_t sport, uint32_t ack, uint16_t win) {
+    unsigned char p[128];
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, sport, 443, 1001, ack, TCP_ACK, NULL, 0, win, 0, -1);
+    handle_packet(&g_tun, p, l);
+    up_flush(&g_tun);
+}
+
+/* catches: a flow reopened by the TUN batch spending the late pass, so a ready flow counted before the wait is never read */
+static void t_mux_reopened_head_spares_tail(void) {
+    m_new();
+    struct conn *a = m_flow(41138), *c = m_flow(41139);
+    m_window(41138, 0);
+    m_window(41139, 0);
+    pm_drain(NULL, NULL);
+    g_m_wake_what = 0;
+    g_mh->wake(g_mh->arg, (uint16_t)(a - g_conns), XW_READ, 0);
+    g_m_rn = (size_t)1 << 30;
+    for (int i = 0; i < 2; i++) loop_turn(&g_L, 0);
+    int closed = a && c && a->our_seq == 2 && c->our_seq == 2;
+    m_ack(41139, 2, 65535);
+    for (int i = 0; i < 50 && a && c; i++) {
+        unsigned char p[128];
+        size_t l = tcp_build(p, sizeof p, CLI_IP, SRV_IP, 41138, 443, 1001, a->our_seq, TCP_ACK, NULL, 0, 65535, 0, -1);
+        if (send(g_dev_peer, p, l, 0) != (ssize_t)l) check(0, "fixture: device write");
+        loop_turn(&g_L, 0);
+        pm_drain(NULL, NULL);
+    }
+    check(closed && a->our_seq - 2 > 65536 && c->our_seq - 2 >= 16384,
+          "mux: a flow reopened in every TUN batch does not starve a ready flow behind it");
+    g_m_rn = 0;
+    if (a && c) {
+        m_ack(41138, a->our_seq, 65535);
+        m_ack(41139, c->our_seq, 65535);
+    }
+    for (int i = 0; i < 3; i++) loop_turn(&g_L, 0);
+    pm_drain(NULL, NULL);
+    check(m_turn_ms(300) >= 200, "  with nothing left to read the loop waits again");
+}
+
 /* catches: a grown room announced twice */
 static void t_mux_room_wake(void) {
     m_new();
@@ -6602,6 +6698,9 @@ static void mux_part(void) {
     t_mux_phase_order();
     t_mux_deadline_wakes_loop();
     t_mux_read_wake();
+    t_mux_ready_tail_drained();
+    t_mux_reopened_head_spares_tail();
+    t_late_direct_closed_window();
     t_mux_room_wake();
     t_mux_cut_rst();
     t_mux_send_does_not_poll();

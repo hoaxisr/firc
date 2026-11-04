@@ -4026,8 +4026,7 @@ static int loop_turn(struct loop *L, int max_ms) {
     for (int li = 0; forced && li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
         if (!c->rx_ready || c->pending) continue;
-        forced--;
-        if (c->mux && (c->srv_closed || !conn_can_take(c))) continue;
+        if (c->srv_closed || !conn_can_take(c)) continue;
         drain_conn(c, tun);
     }
     mux_pass(MUXP_LATE);

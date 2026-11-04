@@ -138,7 +138,7 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
      *
      * Failures AFTER a successful handshake close through transport_close, not close(fd): the
      * keys are expanded by now and the cipher contexts live on the HEAP. Callers do not clean up
-     * (the node probe returns at once, the spare pool just marks the slot empty). A grpc/xhttp
+     * (the node probe returns at once, the spare pool just marks the slot empty). A grpc
      * node with security=reality that Reality did not accept fails here on EVERY attempt (a
      * cover site without h2 picks http/1.1), and the spare pool refills on every SYN: a leak
      * here grows RSS until the OOM killer. */
@@ -245,7 +245,7 @@ const char *transport_strerror(int rc) {
         case TR_ENONODE: return tr_dial_strerror(rc);
         case TR_EIO: return "I/O error";
         case TR_ECLOSED: return "server closed the connection";
-        case TR_ENOH2: return "server did not agree to HTTP/2 (needed for grpc and xhttp)";
+        case TR_ENOH2: return "server did not agree to HTTP/2 (needed for grpc)";
         case TR_EGRPC: return "unexpected gRPC stream format";
         case TR_ENOH1: return "server did not pick HTTP/1.1 (needed for ws and httpupgrade)";
         /* The status goes in the text: 404 and 400 almost always mean a wrong path or host (that
@@ -274,6 +274,7 @@ const char *transport_strerror(int rc) {
         case H2_EFULL: case H2_EFLOW: return h2_strerror(rc);
         case XC_EPING: return "HTTP/2 PING got no answer within 15 s";
         case XC_EGOAWAY: return "server sent GOAWAY before this stream was served";
+        case XC_EREFUSED: return "server refused the stream before serving it";
         case REALITY_EBADKEY: return "cannot parse pbk or sid";
         case REALITY_ECRYPTO: return "crypto failure";
         case REALITY_ETOOBIG: return "ClientHello does not fit";

@@ -36,7 +36,7 @@ TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trvenc.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
                  src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
 TLS_SRC       := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
-                 src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/ech.c \
+                 src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c \
                  src/proto/tls/roots.c
 LIB_SRC       := src/lib/osrand.c
 # The one file that sees wolfSSL headers: built with the library's own flags.
@@ -114,7 +114,7 @@ T_CFLAGS  = -O1 -g $(WARN) -Wno-unused-function $(INC) -Itests $(if $(SANITIZE),
 TW_LIB   := $(T)/wolfssl/libwolfssl.a
 TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
-UNIT := h2match h2muxmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match
+UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch
 
 test: unit-test crypto-test
@@ -130,7 +130,11 @@ $(T)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2wire.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/h2match.c src/proto/tls/h2wire.c
 
-H2MUX_SRC := src/proto/tls/h2mux.c src/proto/tls/h2wire.c src/proto/tls/h2.c
+$(T)/hpackmatch: tests/hpackmatch.c tests/hpackread.h src/proto/tls/hpack.c $(HDR)
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/hpackmatch.c src/proto/tls/hpack.c
+
+H2MUX_SRC := src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/h2wire.c src/proto/tls/h2.c
 $(T)/h2muxmatch: tests/h2muxmatch.c tests/hpackread.h $(H2MUX_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/h2muxmatch.c $(H2MUX_SRC)
@@ -139,7 +143,7 @@ XHUP_SRC := src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/transport/transp
             src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c \
             src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c \
             src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/lib/osrand.c \
-            src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
+            src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
 $(T)/xhupmatch: tests/xhupmatch.c tests/trvenc-stub.c src/proto/transport/trxhttp.c $(XHUP_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/xhupmatch.c tests/trvenc-stub.c $(XHUP_SRC) -lpthread
@@ -148,7 +152,7 @@ WS_SRC := src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/t
           src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trdial.c \
           src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/h2.c \
           src/proto/tls/h2wire.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/tls/roots.c src/lib/osrand.c \
-          src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
+          src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
 $(T)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) -lpthread
@@ -292,7 +296,7 @@ CLIENT_SRC := src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/v
               src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/transport/xconn.c \
               src/proto/transport/trxmux.c src/proto/transport/xmux.c \
               src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
-              src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/ech.c
+              src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c
 
 $(T)/scryptomatch: tests/scryptomatch.c tests/scrypto-pki.h tests/scrypto-pq.h $(T)/scrypto.o
 	$(CC) $(T_CFLAGS) -o $@ tests/scryptomatch.c $(T_CRYPTO)
@@ -310,7 +314,7 @@ $(T)/vlessmatch: tests/vlessmatch.c $(CLIENT_SRC) src/proto/transport/trdial.c s
 
 $(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c $(CLIENT_SRC) src/proto/transport/trdial.c \
                  src/proto/tls/roots.c $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
-	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -o $@ tests/xconnmatch.c \
+	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=malloc -o $@ tests/xconnmatch.c \
 		$(CLIENT_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/probematch: tests/probematch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)
@@ -334,11 +338,14 @@ $(T)/xudpprobe: tests/xudpprobe.c src/proto/vless/vldial.c $(CLIENT_SRC) $(T)/sc
 	$(CC) $(T_CFLAGS) -o $@ tests/xudpprobe.c src/proto/vless/vldial.c $(CLIENT_SRC) \
 		src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
 
-interop: $(T)/vencprobe $(T)/xudpprobe $(O)/tunvless
+$(T)/h2tap: tests/h2tap.c tests/hpackread.h $(T)/scrypto.o
+	$(CC) $(T_CFLAGS) -o $@ tests/h2tap.c $(T_CRYPTO)
+
+interop: $(T)/vencprobe $(T)/xudpprobe $(T)/h2tap $(O)/tunvless
 	BUILD=$(T) sh tests/venc.sh
 	BUILD=$(T) sh tests/xudp.sh
 	BUILD=$(T) sh tests/ech.sh
-	TUNVLESS=$(O)/tunvless sh tests/run-xray.sh
+	TUNVLESS=$(O)/tunvless H2TAP=$(T)/h2tap sh tests/run-xray.sh
 
 e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/run-tunnel.sh

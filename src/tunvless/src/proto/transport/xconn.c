@@ -13,8 +13,9 @@
 
 #define XC_NONE    UINT16_MAX
 #define XC_CANCEL  8
-#define XC_PREFACE (OUR_WINDOW)
 #define XC_ST_FIRST 16
+#define XC_REC_OVER 22
+#define XC_REFUSED_STREAM 7
 
 struct xc_chunk {
     struct xc_chunk *next;
@@ -24,8 +25,11 @@ struct xc_chunk {
 };
 
 static __thread struct xc_host g_host;
-static __thread uint32_t g_limit = XC_RX_BUDGET, g_pend_max = XC_PEND_MAX;
-static __thread int64_t g_held, g_out;
+static __thread uint32_t g_pend_max = XC_PEND_MAX;
+static __thread int64_t g_held;
+static __thread uint32_t g_soft = XC_RX_BUDGET, g_hard = XC_RX_HARD, g_resume = XC_RX_RESUME;
+static __thread unsigned g_wh_n, g_paused_n;
+static __thread uint64_t g_since_ms, g_try_ms, g_now_ms;
 static __thread size_t g_queued, g_pend;
 static __thread struct xc_chunk *g_free;
 static __thread unsigned g_free_n, g_links;
@@ -42,9 +46,15 @@ void xc_set_host(const struct xc_host *h) {
     else memset(&g_host, 0, sizeof g_host);
 }
 
-void xc_budget_set(uint32_t limit) { g_limit = limit; }
-
 void xc_pend_set(uint32_t limit) { g_pend_max = limit; }
+
+void xc_budget_set(uint32_t soft, uint32_t hard, uint32_t resume) {
+    g_soft = soft;
+    g_hard = hard;
+    g_resume = resume;
+}
+
+int64_t xc_held(void) { return g_held; }
 
 uint32_t xc_pend_limit(void) { return g_pend_max; }
 
@@ -168,63 +178,17 @@ static void wake(struct xconn *x, struct xc_st *e, unsigned what, int rc) {
     if (x->shared) wq_add(e->owner, what, rc);
 }
 
-static int64_t link_out(const struct xconn *x) {
-    return (int64_t)x->h2.recv_win_conn + x->h2.conn_owed - x->base;
-}
-
-static void out_acct(struct xconn *x) {
-    if (!x->shared || x->discard || x->state != XC_LIVE) return;
-    int64_t now = link_out(x);
-    g_out += now - x->out_seen;
-    x->out_seen = now;
-}
-
 static void held_add(struct xconn *x, int64_t n) {
     x->held_n += n;
     if (x->shared) g_held += n;
 }
 
-static void credit_conn(struct xconn *x, uint32_t n) {
-    uint64_t q = x->pt_q;
-    h2m_credit_conn(&x->h2, n);
-    if (x->pt_q != q) x->wu_at = x->pt_q;
-}
+static int bounded(const struct xconn *x) { return x->shared && !x->discard; }
 
-static void pay(struct xconn *x) {
-    if (x->state != XC_LIVE) return;
-    if (x->drop) {
-        credit_conn(x, x->drop);
-        x->drop = 0;
-    }
-    if (!x->shared) {
-        if (x->debt) credit_conn(x, x->debt);
-        x->debt = 0;
-        return;
-    }
-    out_acct(x);
-    int64_t room = (int64_t)g_limit - (g_held + g_out);
-    int64_t k = room < (int64_t)x->debt ? room : (int64_t)x->debt;
-    if (k >= WINDOW_REFILL) {
-        k -= k % WINDOW_REFILL;
-        credit_conn(x, (uint32_t)k);
-        x->debt -= (uint32_t)k;
-    }
-    out_acct(x);
-}
-
-static int64_t owed(const struct xconn *x) { return (int64_t)x->debt - x->held_n; }
-
-static void pay_all(struct xconn *x) {
-    for (;;) {
-        struct xconn *b = NULL;
-        for (struct xconn *y = g_list; y; y = y->next)
-            if (y->state == XC_LIVE && y->debt >= WINDOW_REFILL && (!b || owed(y) > owed(b))) b = y;
-        if (!b) break;
-        uint32_t d = b->debt;
-        pay(b);
-        if (b->debt == d) break;
-    }
-    pay(x);
+static void wh_drop(struct xc_st *e) {
+    if (!e->withheld) return;
+    e->withheld = 0;
+    g_wh_n--;
 }
 
 static struct xc_st *ent(const struct xs *s) {
@@ -253,6 +217,39 @@ static void pend_drop(struct xconn *x, struct xc_st *e) {
     x->pend_n -= n;
 }
 
+static void q_skip(struct xc_q *q, size_t k) {
+    struct xc_chunk *h = q->head;
+    h->off += (uint32_t)k;
+    q->n -= k;
+    if (h->off < h->len) return;
+    q->head = h->next;
+    if (!q->head) q->tail = NULL;
+    chunk_put(h);
+}
+
+static int q_put(struct xconn *x, struct xc_q *q, size_t n) {
+    while (n) {
+        struct xc_chunk *h = q->head;
+        size_t k = h->len - h->off < n ? h->len - h->off : n;
+        int rc = h2m_send_put(&x->h2, h->d + h->off, k);
+        if (rc) return rc;
+        q_skip(q, k);
+        n -= k;
+    }
+    return 0;
+}
+
+static int q_move(struct xc_q *dst, struct xc_q *src, size_t n) {
+    while (n) {
+        struct xc_chunk *h = src->head;
+        size_t k = h->len - h->off < n ? h->len - h->off : n;
+        if (q_push(dst, h->d + h->off, k)) return -1;
+        q_skip(src, k);
+        n -= k;
+    }
+    return 0;
+}
+
 static void pend_flush(struct xconn *x) {
     x->pend_due = 0;
     uint16_t n = x->st_cap, at = x->pend_at;
@@ -261,45 +258,35 @@ static void pend_flush(struct xconn *x) {
         struct xc_st *e = &x->st[i];
         if (!e->used || e->h2slot == XC_NONE || (!e->pend.n && !e->pend_end)) continue;
         long w = h2m_room(&x->h2, e->h2slot);
-        while (e->pend.n && w > 0) {
-            struct xc_chunk *h = e->pend.head;
-            size_t k = h->len - h->off;
-            if ((long)k > w) k = (size_t)w;
-            int last = e->pend_end && k == e->pend.n;
-            int rc = h2m_send(&x->h2, e->h2slot, h->d + h->off, k, last);
-            if (rc) {
-                check_dead(x, rc);
-                return;
-            }
-            h->off += (uint32_t)k;
-            e->pend.n -= k;
-            g_pend -= k;
-            x->pend_n -= k;
-            w -= (long)k;
-            x->pend_at = (uint16_t)((i + 1) % n);
-            if (last) e->pend_end = 0;
-            if (h->off == h->len) {
-                e->pend.head = h->next;
-                if (!e->pend.head) e->pend.tail = NULL;
-                chunk_put(h);
-            }
+        size_t k = e->pend.n;
+        if (k && w <= 0) continue;
+        if ((long)k > w) k = (size_t)w;
+        int last = e->pend_end && k == e->pend.n;
+        size_t had = e->pend.n;
+        int rc = h2m_send_begin(&x->h2, e->h2slot, k, last);
+        if (!rc) rc = q_put(x, &e->pend, k);
+        g_pend -= had - e->pend.n;
+        x->pend_n -= had - e->pend.n;
+        if (rc) {
+            check_dead(x, rc);
+            return;
         }
-        if (!e->pend.n && e->pend_end) {
-            e->pend_end = 0;
-            int rc = h2m_send(&x->h2, e->h2slot, NULL, 0, 1);
-            if (rc) {
-                check_dead(x, rc);
-                return;
-            }
-        }
+        if (k) x->pend_at = (uint16_t)((i + 1) % n);
+        if (last) e->pend_end = 0;
     }
+}
+
+static void rx_drop(struct xconn *x, struct xc_st *e) {
+    size_t n = e->rx.n;
+    q_clear(&e->rx);
+    held_add(x, -(int64_t)n);
+    if (x->state == XC_LIVE) h2m_conn_refund(&x->h2, (uint32_t)n);
 }
 
 static void ent_free(struct xconn *x, struct xc_st *e) {
     pend_drop(x, e);
-    size_t n = e->rx.n;
-    q_clear(&e->rx);
-    held_add(x, -(int64_t)n);
+    rx_drop(x, e);
+    wh_drop(e);
     unmap(x, e);
     memset(e, 0, sizeof *e);
     e->h2slot = XC_NONE;
@@ -312,8 +299,24 @@ static void ent_end(struct xconn *x, struct xc_st *e, int code) {
     unmap(x, e);
     e->ended = 1;
     e->code = code;
-    if (e->owner == XS_NOWNER) ent_free(x, e);
-    else wake(x, e, XW_READ, 0);
+    if (e->owner == XS_NOWNER && !e->disc) ent_free(x, e);
+    else if (e->owner != XS_NOWNER) wake(x, e, XW_READ, 0);
+}
+
+static void credit(struct xconn *x, struct xc_st *e, size_t n, int give) {
+    uint16_t slot = e->h2slot != XC_NONE ? e->h2slot : UINT16_MAX;
+    struct h2m_in *in = e->in.sid ? &e->in : NULL;
+    if (give) {
+        wh_drop(e);
+    } else if (!e->withheld) {
+        e->withheld = 1;
+        g_wh_n++;
+    }
+    while (n && x->state == XC_LIVE && !x->h2.dead) {
+        uint32_t k = n < XC_READ_UNIT ? (uint32_t)n : XC_READ_UNIT;
+        h2m_consumed(&x->h2, slot, in, k, give);
+        n -= k;
+    }
 }
 
 static int seal(struct xconn *x) {
@@ -346,7 +349,7 @@ static int seal(struct xconn *x) {
     return 0;
 }
 
-static int x_out(void *ctx, const unsigned char *d, size_t n, int control) {
+static int x_out(void *ctx, const unsigned char *d, size_t n, unsigned flags) {
     struct xconn *x = ctx;
     if (x->in_dial) {
         if (x->pre_n + n > sizeof x->pre) return H2_ETOOBIG;
@@ -354,10 +357,10 @@ static int x_out(void *ctx, const unsigned char *d, size_t n, int control) {
         x->pre_n += n;
         return 0;
     }
-    if (control && x->q_ctl + n > XC_CTL_MAX) return H2_EIO;
+    uint32_t cn = (flags & H2M_CTL) ? (uint32_t)n + (x->link.plain || !(flags & H2M_END) ? 0 : XC_REC_OVER) : 0;
+    if (cn && x->q_ctl + cn > XC_CTL_MAX) return H2_EIO;
     x->pt_q += n;
-    size_t p = !control && n >= 9 && d[3] == FR_DATA ? n - 9 : 0;
-    uint32_t cn = control ? (uint32_t)n : 0;
+    size_t p = (flags & H2M_PAY) ? n : 0;
     while (n) {
         if (!x->stage && !(x->stage = chunk_get())) return H2_EIO;
         struct xc_chunk *c = x->stage;
@@ -380,22 +383,34 @@ static int x_out(void *ctx, const unsigned char *d, size_t n, int control) {
     }
     x->q_pay += p;
     x->q_ctl += cn;
+    if (x->q_ctl >= XC_CTL_HOLD) h2m_hold(&x->h2, 1);
     if (x->shared) g_queued += p;
-    return 0;
+    return (flags & H2M_END) && !x->link.plain ? seal(x) : 0;
 }
 
 static void disc_pay(struct xconn *x, struct xc_st *e) {
-    if (e && e->disc && e->h2slot != XC_NONE && x->pt_s >= e->wu_at) {
-        uint64_t q = x->pt_q;
-        h2m_consumed(&x->h2, e->h2slot, e->disc);
-        e->disc = 0;
-        if (x->pt_q != q) e->wu_at = x->pt_q;
-    }
-    if (x->disc && x->pt_s >= x->wu_at) {
-        uint64_t q = x->pt_q;
-        h2m_credit_conn(&x->h2, x->disc);
-        x->disc = 0;
-        if (x->pt_q != q) x->wu_at = x->pt_q;
+    if (!e->disc || x->pt_s < e->wu_at) return;
+    uint64_t q = x->pt_q;
+    uint32_t n = e->disc;
+    e->disc = 0;
+    credit(x, e, n, 1);
+    if (x->pt_q != q) e->wu_at = x->pt_q;
+}
+
+static void nown_pay(struct xconn *x) {
+    if (!x->nown_due) return;
+    x->nown_due = 0;
+    for (uint16_t i = 0; i < x->st_cap; i++) {
+        struct xc_st *e = &x->st[i];
+        if (!e->used || e->owner != XS_NOWNER || !e->disc) continue;
+        if (x->discard) {
+            disc_pay(x, e);
+        } else {
+            uint32_t n = e->disc;
+            e->disc = 0;
+            credit(x, e, n, 1);
+        }
+        if (e->ended && !e->disc) ent_free(x, e);
     }
 }
 
@@ -403,22 +418,23 @@ static void x_data(void *ctx, uint16_t slot, const unsigned char *d, size_t n) {
     struct xconn *x = ctx;
     struct xc_st *e = by_slot(x, slot);
     if (!e) return;
+    if (e->owner == XS_NOWNER) {
+        e->disc += (uint32_t)n;
+        x->nown_due = 1;
+        return;
+    }
     if (x->discard) {
         e->disc += (uint32_t)n;
-        x->disc += (uint32_t)n;
         disc_pay(x, e);
         return;
     }
-    if (e->owner == XS_NOWNER) {
-        x->drop += (uint32_t)n;
-        return;
-    }
+    size_t had = e->rx.n;
     if (q_push(&e->rx, d, n)) {
         x->oom = 1;
-        x->drop += (uint32_t)n;
+        held_add(x, (int64_t)(e->rx.n - had));
+        h2m_conn_refund(&x->h2, (uint32_t)(n - (e->rx.n - had)));
         return;
     }
-    x->debt += (uint32_t)n;
     held_add(x, (int64_t)n);
     wake(x, e, XW_READ, 0);
 }
@@ -434,14 +450,16 @@ static void x_status(void *ctx, uint16_t slot, int status) {
     ent_end(x, e, H2_ESTATUS);
 }
 
-static void x_end(void *ctx, uint16_t slot, int code) {
+static void x_end(void *ctx, uint16_t slot, int code, const struct h2m_in *in) {
     struct xconn *x = ctx;
     struct xc_st *e = by_slot(x, slot);
     if (!e) return;
+    e->in = *in;
     int c = H2_ERESET;
     e->reset = code != 0;
     if (code == H2_EFLOW) c = H2_EFLOW;
     else if (x->h2.goaway && e->sid > x->h2.goaway_last) c = XC_EGOAWAY;
+    else if (code == XC_REFUSED_STREAM && !e->seen) c = XC_EREFUSED;
     if (c == XC_EGOAWAY) x->refused++;
     ent_end(x, e, c);
 }
@@ -494,6 +512,46 @@ static void list_del(struct xconn *x) {
     x->listed = 0;
 }
 
+static void pause_link(struct xconn *x) {
+    if (x->paused) return;
+    if (!g_paused_n++) {
+        g_since_ms = g_now_ms;
+        g_try_ms = 0;
+    }
+    x->paused = 1;
+}
+
+static void unpause(struct xconn *x) {
+    if (!x->paused) return;
+    x->paused = 0;
+    g_paused_n--;
+    x->last_rx_ms = x->now_ms;
+    if (x->h2.ping_out) x->ping_at_ms = x->now_ms;
+}
+
+static void pause_largest(void) {
+    struct xconn *b = NULL;
+    for (struct xconn *y = g_list; y; y = y->next)
+        if (y->state == XC_LIVE && bounded(y) && !y->paused && (!b || y->held_n > b->held_n)) b = y;
+    if (b) pause_link(b);
+}
+
+static void budget(void) {
+    if (g_paused_n && g_held < (int64_t)g_resume)
+        for (struct xconn *y = g_list; y; y = y->next) unpause(y);
+    if (!g_wh_n || g_held >= (int64_t)g_soft) return;
+    for (struct xconn *y = g_list; y; y = y->next) {
+        for (uint16_t i = 0; i < y->st_cap; i++) {
+            struct xc_st *e = &y->st[i];
+            if (!e->used || !e->withheld) continue;
+            wh_drop(e);
+            if (y->state != XC_LIVE || y->h2.dead) continue;
+            h2m_stream_flush(&y->h2, e->h2slot != XC_NONE ? e->h2slot : UINT16_MAX, e->in.sid ? &e->in : NULL);
+        }
+        check_dead(y, 0);
+    }
+}
+
 struct xconn *xconn_new(const struct tr_node *n, int64_t keepalive_s, int shared) {
     struct xconn *x = calloc(1, sizeof *x);
     if (!x) return NULL;
@@ -503,41 +561,25 @@ struct xconn *xconn_new(const struct tr_node *n, int64_t keepalive_s, int shared
     x->shared = shared ? 1 : 0;
     x->keepalive_ms = keepalive_s == 0 ? XC_KEEPALIVE_MS : keepalive_s < 0 ? -1 : keepalive_s * 1000;
     for (unsigned i = 0; i < H2M_STREAMS; i++) x->map[i] = XC_NONE;
-    x->conn_update = 1;
-    if (x->shared) {
-        if (g_held + g_out + XC_PREFACE <= (int64_t)g_limit) {
-            x->out_seen = XC_PREFACE;
-            g_out += XC_PREFACE;
-        } else {
-            x->conn_update = 0;
-            x->base = 65535;
-        }
-    }
     if (x->shared) g_links++;
     return x;
 }
 
-void xconn_discard(struct xconn *x) {
-    g_out -= x->out_seen;
-    x->out_seen = 0;
-    x->base = 0;
-    x->conn_update = 1;
-    x->discard = 1;
-}
+void xconn_discard(struct xconn *x) { x->discard = 1; }
 
 int xconn_start(struct xconn *x) {
     if (x->state != XC_DIALING || x->link.fd < 0) return H2_EPROTO;
     int rc = 0;
-    if (!x->link.plain && x->link.tls.alpn[0] && strcmp(x->link.tls.alpn, "h2")) {
-        tr_link_close(&x->link);
-        rc = TR_ENOH2;
-    }
-    if (!rc) {
+    {
         struct h2m_cb cb = XC_CB;
         cb.ctx = x;
         x->in_dial = 1;
         x->pre_n = 0;
-        rc = h2m_start(&x->h2, &cb, x->conn_update);
+        unsigned char sb[8];
+        if (os_rand_seed(sb, sizeof sb)) memset(sb, 0x5a, sizeof sb);
+        uint64_t seed = 0;
+        for (size_t i = 0; i < sizeof sb; i++) seed = seed << 8 | sb[i];
+        rc = h2m_start(&x->h2, &cb, seed);
         x->in_dial = 0;
         if (!rc) rc = tr_link_write(&x->link, x->pre, x->pre_n);
         if (rc) {
@@ -590,9 +632,8 @@ int xconn_adopt(struct xconn *x, uint64_t now_ms) {
         return rc;
     }
     x->state = XC_LIVE;
-    x->now_ms = x->last_rx_ms = x->idle_since_ms = now_ms;
+    x->now_ms = x->last_rx_ms = x->idle_since_ms = g_now_ms = now_ms;
     list_add(x);
-    out_acct(x);
     return 0;
 }
 
@@ -603,7 +644,10 @@ static void fail_in(struct xconn *x, int err) {
         struct xc_st *e = &x->st[i];
         if (!e->used) continue;
         pend_drop(x, e);
-        if (e->ended) continue;
+        if (e->ended) {
+            if (e->owner == XS_NOWNER) ent_free(x, e);
+            continue;
+        }
         x->cut_n++;
         unmap(x, e);
         e->ended = 1;
@@ -616,14 +660,13 @@ static void fail_in(struct xconn *x, int err) {
         x->stage = NULL;
     }
     q_clear(&x->out);
-    if (x->shared) {
-        g_queued -= x->q_pay;
-        g_out -= x->out_seen;
-    }
+    if (x->shared) g_queued -= x->q_pay;
     x->q_pay = x->stage_pay = 0;
     x->q_ctl = x->stage_ctl = 0;
-    x->out_seen = 0;
-    x->debt = x->drop = 0;
+    if (x->paused) {
+        x->paused = 0;
+        g_paused_n--;
+    }
     x->state = XC_DEAD;
     x->rc = err;
 }
@@ -645,13 +688,18 @@ static int feed(struct xconn *x, const unsigned char *d, size_t n) {
         fail_in(x, rc ? rc : H2_EIO);
         return x->rc;
     }
-    x->disc += h2m_take_lost(&x->h2);
+    nown_pay(x);
     if (x->pend_due) pend_flush(x);
-    pay_all(x);
-    return check_dead(x, 0);
+    rc = check_dead(x, 0);
+    budget();
+    return rc;
 }
 
-static int read_shared(struct xconn *x, uint64_t now) {
+static int at_ceiling(const struct xconn *x) {
+    return bounded(x) && g_held >= (int64_t)g_hard && (x->link.plain || !tls13_has_record(&x->link.tls));
+}
+
+static int read_pass(struct xconn *x, uint64_t now) {
     size_t total = 0;
     while (total < XC_READ_MAX || (!x->link.plain && tls13_has_record(&x->link.tls))) {
         if (x->link.plain) {
@@ -666,6 +714,7 @@ static int read_shared(struct xconn *x, uint64_t now) {
             total += (size_t)r;
             int rc = feed(x, g_rbuf, (size_t)r);
             if (rc) return rc;
+            if (at_ceiling(x)) return 0;
             continue;
         }
         uint64_t seq = x->link.tls.rd_seq;
@@ -682,8 +731,19 @@ static int read_shared(struct xconn *x, uint64_t now) {
         total += n;
         rc = feed(x, body, n);
         if (rc) return rc;
+        if (at_ceiling(x)) return 0;
     }
     return 0;
+}
+
+static int read_shared(struct xconn *x, uint64_t now) {
+    if (bounded(x) && g_held >= (int64_t)g_hard) {
+        pause_link(x);
+        return 0;
+    }
+    int rc = read_pass(x, now);
+    if (!rc && g_held >= (int64_t)g_hard) pause_largest();
+    return rc;
 }
 
 static int read_one(struct xconn *x) {
@@ -710,6 +770,14 @@ static void low_water(void) {
                 wake(y, e, XW_ROOM, 0);
             }
         }
+}
+
+static void release(struct xconn *x) {
+    h2m_hold(&x->h2, 0);
+    for (uint16_t i = 0; i < x->st_cap && !x->h2.dead; i++) {
+        struct xc_st *e = &x->st[i];
+        if (e->used && e->h2slot == XC_NONE && e->in.sid && e->in.unsent) h2m_stream_flush(&x->h2, UINT16_MAX, &e->in);
+    }
 }
 
 static int flush_in(struct xconn *x) {
@@ -745,9 +813,13 @@ static int flush_in(struct xconn *x) {
         if (x->shared) g_queued -= h->pay;
         chunk_put(h);
     }
-    for (uint16_t i = 0; x->discard && i < x->st_cap; i++)
-        if (x->st[i].used) disc_pay(x, &x->st[i]);
-    disc_pay(x, NULL);
+    if (x->h2.hold && x->q_ctl < XC_CTL_RESUME) release(x);
+    for (uint16_t i = 0; x->discard && i < x->st_cap; i++) {
+        struct xc_st *e = &x->st[i];
+        if (!e->used) continue;
+        disc_pay(x, e);
+        if (e->owner == XS_NOWNER && e->ended && !e->disc) ent_free(x, e);
+    }
     if ((rc = check_dead(x, 0))) return rc;
     if (x->shared) low_water();
     return 0;
@@ -755,9 +827,12 @@ static int flush_in(struct xconn *x) {
 
 int xconn_flush(struct xconn *x) {
     int rc = flush_in(x);
+    budget();
     wq_run();
     return rc;
 }
+
+int xconn_wants_in(const struct xconn *x) { return x->state == XC_LIVE && !x->paused; }
 
 int xconn_wants_out(const struct xconn *x) {
     return x->state == XC_LIVE && (x->out.head || (x->stage && x->stage->len));
@@ -766,9 +841,12 @@ int xconn_wants_out(const struct xconn *x) {
 int xconn_io(struct xconn *x, uint32_t ev, uint64_t now_ms) {
     if (x->state == XC_DEAD) return x->rc;
     if (x->state != XC_LIVE) return H2_EPROTO;
-    x->now_ms = now_ms;
+    x->now_ms = g_now_ms = now_ms;
     int rc = 0;
-    if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
+    if (x->paused && (ev & (EPOLLHUP | EPOLLERR))) {
+        rc = TR_EIO;
+        fail_in(x, rc);
+    } else if (!x->paused && (ev & (EPOLLIN | EPOLLHUP | EPOLLERR))) {
         rc = read_shared(x, now_ms);
         if (rc) fail_in(x, rc);
     }
@@ -788,23 +866,59 @@ static void orphans(struct xconn *x) {
     }
 }
 
+static int stall_reset(uint64_t now) {
+    struct xconn *bx = NULL;
+    struct xc_st *be = NULL;
+    g_try_ms = now + XC_STALL_NEXT_MS;
+    for (struct xconn *y = g_list; y; y = y->next)
+        for (uint16_t i = 0; i < y->st_cap; i++) {
+            struct xc_st *e = &y->st[i];
+            if (!e->used || e->owner == XS_NOWNER || !e->rx.n) continue;
+            uint64_t at = (e->read_ms > g_since_ms ? e->read_ms : g_since_ms) + XC_STALL_MS;
+            if (now < at) {
+                if (at < g_try_ms) g_try_ms = at;
+                continue;
+            }
+            if (be && e->rx.n <= be->rx.n) continue;
+            bx = y;
+            be = e;
+        }
+    if (!be) return 0;
+    if (bx->state == XC_LIVE && be->h2slot != XC_NONE) {
+        h2m_reset(&bx->h2, be->h2slot, XC_CANCEL);
+        unmap(bx, be);
+    }
+    pend_drop(bx, be);
+    rx_drop(bx, be);
+    wh_drop(be);
+    be->ended = 1;
+    be->reset = 1;
+    be->code = H2_ERESET;
+    wake(bx, be, XW_READ, H2_ERESET);
+    check_dead(bx, 0);
+    return 1;
+}
+
 int xconn_tick(struct xconn *x, uint64_t now_ms) {
     if (x->state == XC_DEAD) return x->rc;
     if (x->state != XC_LIVE) return 0;
-    x->now_ms = now_ms;
-    if (x->h2.ping_out) {
+    x->now_ms = g_now_ms = now_ms;
+    if (x->h2.ping_out && !x->paused) {
         if (now_ms >= x->ping_at_ms + XC_PING_TIMEOUT_MS) {
             xconn_fail(x, XC_EPING);
             return XC_EPING;
         }
-    } else if (x->keepalive_ms >= 0 && now_ms >= x->last_rx_ms + (uint64_t)x->keepalive_ms) {
+    } else if (!x->h2.ping_out && !x->paused && x->keepalive_ms >= 0 &&
+               now_ms >= x->last_rx_ms + (uint64_t)x->keepalive_ms) {
         unsigned char op[8];
         if (os_rand_seed(op, sizeof op)) memset(op, 0x5a, sizeof op);
         h2m_ping(&x->h2, op);
         x->ping_at_ms = now_ms;
     }
     orphans(x);
+    if (x->paused && now_ms >= g_try_ms && stall_reset(now_ms)) g_try_ms = now_ms + XC_STALL_NEXT_MS;
     int rc = check_dead(x, 0);
+    budget();
     wq_run();
     if (rc) return rc;
     if (!x->nstreams && (x->retired || now_ms >= x->idle_since_ms + XC_IDLE_MS)) return XC_IDLE;
@@ -823,19 +937,25 @@ void xconn_free(struct xconn *x) {
         size_t n = e->rx.n;
         q_clear(&e->rx);
         held_add(x, -(int64_t)n);
+        wh_drop(e);
+    }
+    if (x->paused) {
+        x->paused = 0;
+        g_paused_n--;
     }
     free(x->st);
     if (x->stage) chunk_put(x->stage);
     q_clear(&x->out);
-    if (x->shared) {
-        g_queued -= x->q_pay;
-        g_out -= x->out_seen;
-    }
+    if (x->shared) g_queued -= x->q_pay;
     h2m_free(&x->h2);
     tr_link_close(&x->link);
     int shared = x->shared;
     free(x);
     if (shared && g_links && !--g_links) free_list_drop();
+    if (shared) {
+        budget();
+        wq_run();
+    }
 }
 
 static int ent_new(struct xconn *x, uint16_t *idx) {
@@ -865,7 +985,7 @@ int xs_open(struct xconn *x, const struct h2_req *r, uint16_t owner, struct xs *
     int rc = ent_new(x, &idx);
     if (rc) return rc;
     uint16_t hs = XC_NONE;
-    rc = h2m_open(&x->h2, r, 1, &hs);
+    rc = h2m_open(&x->h2, r, &hs);
     if (rc) return check_dead(x, rc);
     struct xc_st *e = &x->st[idx];
     memset(e, 0, sizeof *e);
@@ -951,6 +1071,12 @@ long xs_room(const struct xs *s) {
     return r;
 }
 
+int xc_slot_free(const struct xconn *x) {
+    return x->state == XC_LIVE && !x->retired && !x->h2.goaway && h2m_open_n(&x->h2) < h2m_cap(&x->h2);
+}
+
+size_t xc_pend_free(void) { return g_pend < g_pend_max ? g_pend_max - g_pend : 0; }
+
 long xc_room_new(const struct xconn *x, uint16_t owner) {
     if (x->state != XC_LIVE || x->retired || x->h2.goaway || h2m_open_n(&x->h2) >= h2m_cap(&x->h2)) return 0;
     long c = h2m_conn_room(&x->h2) - (long)x->pend_n;
@@ -960,29 +1086,37 @@ long xc_room_new(const struct xconn *x, uint16_t owner) {
     return a < w ? a : w;
 }
 
-int xs_send(const struct xs *s, const unsigned char *d, size_t n, int end) {
+static int send_src(const struct xs *s, const unsigned char *d, struct xc_q *q, size_t n, int end) {
     struct xc_st *e = ent(s);
     if (!e) return H2_ERESET;
     struct xconn *x = s->x;
     if (x->state == XC_DEAD) return x->rc;
     if (x->state != XC_LIVE) return H2_EPROTO;
     if (e->ended || e->h2slot == XC_NONE) return e->code ? e->code : H2_ERESET;
-    if (e->pend_end) return H2_EPROTO;
+    if (e->pend_end || (q && n > q->n)) return H2_EPROTO;
     long w = h2m_room(&x->h2, e->h2slot);
-    int rc;
+    size_t k = n;
+    int behind = x->shared && e->pend.n;
     if (x->shared && (e->pend.n || (long)n > w)) {
-        size_t k = e->pend.n || w <= 0 ? 0 : (size_t)w;
+        k = e->pend.n || w <= 0 ? 0 : (size_t)w;
         if (g_pend + (n - k) > g_pend_max) return H2_EWINDOW;
-        if (k && (rc = h2m_send(&x->h2, e->h2slot, d, k, 0))) return check_dead(x, rc);
-        if (q_push(&e->pend, d + k, n - k)) {
+    }
+    int fin = end && k == n && !behind;
+    if (k || fin) {
+        int rc = h2m_send_begin(&x->h2, e->h2slot, k, fin);
+        if (!rc && k) rc = q ? q_put(x, q, k) : h2m_send_put(&x->h2, d, k);
+        if (rc) return check_dead(x, rc);
+    }
+    if (k < n || (end && !fin)) {
+        size_t had = e->pend.n;
+        int rc = q ? q_move(&e->pend, q, n - k) : q_push(&e->pend, d + k, n - k);
+        g_pend += e->pend.n - had;
+        x->pend_n += e->pend.n - had;
+        if (rc) {
             x->oom = 1;
             return check_dead(x, H2_EIO);
         }
-        g_pend += n - k;
-        x->pend_n += n - k;
         e->pend_end = end ? 1 : 0;
-    } else if ((rc = h2m_send(&x->h2, e->h2slot, d, n, end))) {
-        return check_dead(x, rc);
     }
     if (n) e->up_cur = 1;
     if (end) {
@@ -991,6 +1125,14 @@ int xs_send(const struct xs *s, const unsigned char *d, size_t n, int end) {
     }
     if (!x->shared) return flush_in(x);
     return 0;
+}
+
+int xs_send(const struct xs *s, const unsigned char *d, size_t n, int end) {
+    return send_src(s, d, NULL, n, end);
+}
+
+int xs_send_q(const struct xs *s, struct xc_q *q, size_t n, int end) {
+    return send_src(s, NULL, q, n, end);
 }
 
 int xs_read(const struct xs *s, unsigned char *out, size_t cap, size_t *got) {
@@ -1007,12 +1149,13 @@ int xs_read(const struct xs *s, unsigned char *out, size_t cap, size_t *got) {
         size_t k = q_pop(&e->rx, out, cap);
         *got = k;
         held_add(x, -(int64_t)k);
+        if (k && bounded(x)) e->read_ms = x->now_ms > g_now_ms ? x->now_ms : g_now_ms;
         if (x->state == XC_LIVE) {
-            if (e->h2slot != XC_NONE) h2m_consumed(&x->h2, e->h2slot, (uint32_t)k);
-            pay_all(x);
+            credit(x, e, k, !(bounded(x) && g_held >= (int64_t)g_soft && e->rx.n));
             check_dead(x, 0);
             if (!x->shared && x->state == XC_LIVE) flush_in(x);
         }
+        budget();
         wq_run();
         return 0;
     }
@@ -1031,6 +1174,15 @@ size_t xc_q_peek(const struct xc_q *q, unsigned char *out, size_t cap) {
         got += k;
     }
     return got;
+}
+
+int xc_q_copy(struct xc_q *dst, const struct xc_q *src, size_t n) {
+    for (const struct xc_chunk *h = src->head; h && n; h = h->next) {
+        size_t k = h->len - h->off < n ? h->len - h->off : n;
+        if (q_push(dst, h->d + h->off, k)) return -1;
+        n -= k;
+    }
+    return 0;
 }
 
 size_t xc_q_pop(struct xc_q *q, unsigned char *out, size_t cap) { return q_pop(q, out, cap); }
@@ -1057,25 +1209,26 @@ void xs_close(struct xs *s) {
     struct xconn *x = s->x;
     s->x = NULL;
     if (!e) return;
-    size_t n = e->rx.n;
-    q_clear(&e->rx);
-    held_add(x, -(int64_t)n);
+    int keep = 0;
     if (x->state == XC_LIVE && e->h2slot != XC_NONE) {
         if (e->post && e->local_end && !e->seen) {
+            rx_drop(x, e);
             e->owner = XS_NOWNER;
-            pay_all(x);
-            wq_run();
-            return;
+            keep = 1;
+        } else {
+            h2m_reset(&x->h2, e->h2slot, XC_CANCEL);
+            unmap(x, e);
         }
-        h2m_reset(&x->h2, e->h2slot, XC_CANCEL);
-        unmap(x, e);
     }
-    ent_free(x, e);
+    if (!keep) {
+        if (x->state == XC_LIVE && e->disc) credit(x, e, e->disc, 1);
+        ent_free(x, e);
+    }
     if (x->state == XC_LIVE) {
-        pay_all(x);
         check_dead(x, 0);
         if (!x->shared && x->state == XC_LIVE) flush_in(x);
     }
+    budget();
     wq_run();
 }
 
