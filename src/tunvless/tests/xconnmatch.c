@@ -418,6 +418,197 @@ static void t_seal_is_write(void) {
     tp_free(&p);
 }
 
+static int peer_lens(struct tp *p, size_t *lens, int max, int want) {
+    int k = 0;
+    while (k < max && k < want) {
+        size_t n = 0;
+        unsigned char inner = 0;
+        if (rec_open(p->cd, p->s.fd, g_rec, sizeof g_rec, &n, &inner)) break;
+        lens[k++] = n;
+    }
+    return k;
+}
+
+struct rw { struct tr_link *l; size_t n; int rc; pthread_t th; };
+
+static void *rw_run(void *a) {
+    struct rw *w = a;
+    unsigned char *buf = calloc(1, w->n ? w->n : 1);
+    w->rc = buf ? tls13_write(&w->l->tls, buf, w->n) : -1;
+    free(buf);
+    return NULL;
+}
+
+static int ramp_open(struct tp *p, struct tr_link *l, const char *what) {
+    char nm[64];
+    snprintf(nm, sizeof nm, "%s: peer starts", what);
+    check(nm, 0, tp_start(p, "h2"));
+    struct tr_node n = tls_node(g_port);
+    memset(l, 0, sizeof *l);
+    snprintf(nm, sizeof nm, "%s: handshake", what);
+    check(nm, 0, tr_link_open(l, &n, "h2", 3));
+    snprintf(nm, sizeof nm, "%s: peer keys", what);
+    int rc = tp_finish(p);
+    check(nm, 0, rc);
+    return rc;
+}
+
+static void ramp_expect(const char *what, struct tp *p, const size_t *want, int n) {
+    size_t got[128];
+    int k = peer_lens(p, got, 128, n);
+    check(what, n, k);
+    for (int i = 0; i < k && i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("  %s: record %d is %zu, want %zu\n", what, i + 1, got[i], want[i]);
+            check(what, (long)want[i], (long)got[i]);
+            return;
+        }
+    }
+}
+
+/* catches: a byte-count threshold in place of a record count, or a ramp that does not reach 16384 at the 14th record */
+static void t_ramp_small_records(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "ramp small")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    unsigned char one = 7;
+    for (int i = 0; i < 13; i++) check("ramp small: 1 B write", 0, tls13_write(&l.tls, &one, 1));
+    struct rw w = { .l = &l, .n = 40000 };
+    int started = pthread_create(&w.th, NULL, rw_run, &w);
+    check("ramp small: writer starts", 0, started);
+    size_t want[16];
+    for (int i = 0; i < 13; i++) want[i] = 1;
+    want[13] = 16384; want[14] = 16384; want[15] = 7232;
+    ramp_expect("ramp small: lengths", &p, want, 16);
+    shutdown(l.fd, SHUT_RDWR);
+    if (!started) pthread_join(w.th, NULL);
+    check("ramp small: big write", 0, started ? -1 : w.rc);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+/* catches: a write cut at 16384 whatever the count, or a step other than 1186 */
+static void t_ramp_one_write(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "ramp one")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    struct rw w = { .l = &l, .n = 1048576 };
+    int started = pthread_create(&w.th, NULL, rw_run, &w);
+    check("ramp one: writer starts", 0, started);
+    size_t want[71] = { 1186, 2372, 3558, 4744, 5930, 7116, 8302, 9488, 10674, 11860, 13046, 14232, 15418 };
+    for (int i = 13; i < 70; i++) want[i] = 16384;
+    want[70] = 6762;
+    ramp_expect("ramp one: lengths", &p, want, 71);
+    shutdown(l.fd, SHUT_RDWR);
+    if (!started) pthread_join(w.th, NULL);
+    check("ramp one: write", 0, started ? -1 : w.rc);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+/* catches: the count restarted per write */
+static void t_ramp_across_writes(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "ramp across")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    unsigned char *buf = calloc(1, 8192);
+    for (int i = 0; i < 7; i++) check("ramp across: write", 0, tls13_write(&l.tls, buf, 8192));
+    free(buf);
+    size_t want[11] = { 1186, 2372, 3558, 1076, 5930, 2262, 8192, 8192, 8192, 8192, 8192 };
+    ramp_expect("ramp across: lengths", &p, want, 11);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+/* catches: an empty record sealed for a zero-length write, advancing the ramp */
+static void t_ramp_zero_write(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "ramp zero")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    unsigned char *buf = calloc(1, 2000);
+    check("ramp zero: empty write", 0, tls13_write(&l.tls, NULL, 0));
+    check("ramp zero: write", 0, tls13_write(&l.tls, buf, 2000));
+    free(buf);
+    size_t want[2] = { 1186, 814 };
+    ramp_expect("ramp zero: lengths", &p, want, 2);
+    size_t extra[1];
+    struct timeval tv = { .tv_usec = 200000 };
+    setsockopt(p.s.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    check("ramp zero: no third record", 0, peer_lens(&p, extra, 1, 1));
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+/* catches: the client Finished or handshake flight counted as application records */
+static void t_ramp_after_handshake(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "ramp fresh")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    unsigned char *buf = calloc(1, 2000);
+    check("ramp fresh: write", 0, tls13_write(&l.tls, buf, 2000));
+    free(buf);
+    size_t want[2] = { 1186, 814 };
+    ramp_expect("ramp fresh: lengths", &p, want, 2);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+/* catches: room counted at 16384 per record, or wr_seq advanced by a refused seal */
+static void t_seal_room_ramp(void) {
+    struct tp p;
+    struct tr_link l;
+    if (ramp_open(&p, &l, "room ramp")) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    struct tls13 *b = calloc(1, sizeof *b);
+    b->fd = -1;
+    b->ready = 1;
+    b->wr.aead = l.tls.wr.aead;
+    b->wr.key_n = l.tls.wr.key_n;
+    memcpy(b->wr.key, l.tls.wr.key, sizeof b->wr.key);
+    memcpy(b->wr.iv, l.tls.wr.iv, sizeof b->wr.iv);
+    check("room ramp: copy keyed", 0, tls13_keys_setup(&b->wr));
+    static unsigned char msg[20000], out[20100];
+    size_t on = 0;
+    b->wr_seq = 0;
+    check("room ramp: 5065 refused", TLS13_ETOOBIG, tls13_seal(b, msg, 5000, out, 5065, &on));
+    check("room ramp: refusal keeps wr_seq", 0, (long)b->wr_seq);
+    check("room ramp: 5066 fits", 0, tls13_seal(b, msg, 5000, out, 5066, &on));
+    check("room ramp: 5066 bytes", 5066, (long)on);
+    check("room ramp: three records", 3, (long)b->wr_seq);
+    b->wr_seq = 13;
+    check("room ramp: late ramp fits", 0, tls13_seal(b, msg, 20000, out, 20044, &on));
+    check("room ramp: late ramp bytes", 20044, (long)on);
+    check("room ramp: two records", 15, (long)b->wr_seq);
+    check("room ramp: first late record", 16384 + 22, (long)(((out[3] << 8) | out[4]) + 5));
+    tls13_keys_free(&b->wr);
+    free(b);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
 static const unsigned char PREFACE70[70] = {
     0x50, 0x52, 0x49, 0x20, 0x2a, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x32, 0x2e, 0x30, 0x0d, 0x0a, 0x0d, 0x0a,
     0x53, 0x4d, 0x0d, 0x0a, 0x0d, 0x0a,
@@ -896,6 +1087,203 @@ static void t_records_alone(void) {
     check("alone: DATA record is one DATA of 100", 1, k == 1 && f[0].type == FR_DATA && f[0].len == 100);
     usleep(20000);
     check("alone: nothing more", 0, fd_pending(p.s.fd));
+    xconn_free(x);
+    tp_free(&p);
+}
+
+static int rec_lens(struct tp *p, size_t *lens, unsigned char (*head)[9], int want) {
+    int k = 0;
+    while (k < want) {
+        size_t n = 0;
+        unsigned char inner = 0;
+        if (rec_open(p->cd, p->s.fd, g_rec, sizeof g_rec, &n, &inner)) break;
+        lens[k] = n;
+        if (head) memcpy(head[k], g_rec, n < 9 ? n : 9);
+        k++;
+    }
+    return k;
+}
+
+static void lens_expect(const char *what, const size_t *got, const size_t *want, int n) {
+    for (int i = 0; i < n; i++) {
+        if (got[i] == want[i]) continue;
+        printf("  %s: record %d is %zu, want %zu; got", what, i + 1, got[i], want[i]);
+        for (int j = 0; j < n; j++) printf(" %zu", got[j]);
+        printf("\n");
+        check(what, (long)want[i], (long)got[i]);
+        return;
+    }
+    check(what, 0, 0);
+}
+
+static int is_data_head(const unsigned char *h, uint32_t len, uint32_t sid) {
+    uint32_t l = ((uint32_t)h[0] << 16) | ((uint32_t)h[1] << 8) | h[2];
+    return l == len && h[3] == FR_DATA && (be32(h + 5) & 0x7fffffffu) == sid;
+}
+
+static void get_flushed(struct tp *p, struct xconn *x, const char *what) {
+    struct xs g;
+    char nm[80];
+    snprintf(nm, sizeof nm, "%s: GET opened", what);
+    check(nm, 0, xs_open(x, &RQ_GET, 1, &g));
+    xconn_flush(x);
+    size_t lens[2];
+    snprintf(nm, sizeof nm, "%s: preface and GET HEADERS records", what);
+    check(nm, 2, rec_lens(p, lens, NULL, 2));
+}
+
+/* catches: the limit read once per x_out call (4744 4744 4744), or chunks filled to 16384 and then cut (4744 5930 5710 9) */
+static void t_ramp_units(void) {
+    struct tp p;
+    struct xconn *x;
+    check("ramp units: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    get_flushed(&p, x, "ramp units");
+    struct xs u;
+    check("ramp units: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("ramp units: 40000 B sent", 0, xs_send(&u, g_big, 40000, 0));
+    xconn_flush(x);
+    size_t got[7] = { 0 };
+    unsigned char head[7][9];
+    check("ramp units: POST HEADERS record", 1, rec_lens(&p, got, NULL, 1));
+    check("ramp units: six DATA records", 6, rec_lens(&p, got, head, 6));
+    static const size_t want[6] = { 4744, 5930, 5719, 8302, 8091, 7241 };
+    lens_expect("ramp units: 4744 5930 5719 / 8302 8091 / 7241", got, want, 6);
+    check("ramp units: unit 1 opens record 4", 1, is_data_head(head[0], 16384, u.sid));
+    check("ramp units: unit 2 opens record 7", 1, is_data_head(head[3], 16384, u.sid));
+    check("ramp units: unit 3 opens record 9", 1, is_data_head(head[5], 7232, u.sid));
+    usleep(20000);
+    check("ramp units: nothing more", 0, fd_pending(p.s.fd));
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: control records left out of the count */
+static void t_ramp_counts_control(void) {
+    struct tp p;
+    struct xconn *x;
+    check("ramp control: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    get_flushed(&p, x, "ramp control");
+    static const unsigned char op[8] = { 1, 1, 2, 3, 5, 8, 13, 21 };
+    unsigned char msg[64];
+    size_t m = frame(msg, 0, FR_SETTINGS, 0, 0, NULL);
+    m += frame(msg + m, 8, FR_PING, 0, 0, op);
+    check("ramp control: peer writes SETTINGS and PING", 0, tp_seal(p.sd, p.s.fd, msg, m));
+    io_in(x, 0);
+    xconn_flush(x);
+    size_t got[6] = { 0 };
+    check("ramp control: SETTINGS ACK and PING ACK records", 2, rec_lens(&p, got, NULL, 2));
+    check("ramp control: SETTINGS ACK 9 B", 9, (long)got[0]);
+    check("ramp control: PING ACK 17 B", 17, (long)got[1]);
+    struct xs u;
+    check("ramp control: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("ramp control: 16384 B sent", 0, xs_send(&u, g_big, 16384, 0));
+    xconn_flush(x);
+    check("ramp control: POST HEADERS record", 1, rec_lens(&p, got, NULL, 1));
+    check("ramp control: three DATA records", 3, rec_lens(&p, got, NULL, 3));
+    static const size_t want[3] = { 7116, 8302, 975 };
+    lens_expect("ramp control: 7116 8302 975", got, want, 3);
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: a limit that fell below the staged chunk copied past it instead of sealing the chunk first */
+static void t_stage_over_limit(void) {
+    struct tp p;
+    struct xconn *x;
+    check("stage over limit: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    get_flushed(&p, x, "stage over limit");
+    check("stage over limit: nothing queued", 0, (long)x->out.n);
+    uint64_t seq = x->link.tls.wr_seq;
+    x->link.tls.wr_seq = 20;
+    check("stage over limit: 5000 B staged", 0, x->h2.cb.out(x->h2.cb.ctx, g_big, 5000, H2M_PAY));
+    check("stage over limit: still nothing queued", 0, (long)x->out.n);
+    x->link.tls.wr_seq = 0;
+    check("stage over limit: 100 B more", 0, x->h2.cb.out(x->h2.cb.ctx, g_big, 100, H2M_PAY));
+    check("stage over limit: the 5000 B chunk sealed alone, as 1186 2372 1442", 5000 + 3 * 22, (long)x->out.n);
+    check("stage over limit: three records", 3, (long)x->link.tls.wr_seq);
+    x->link.tls.wr_seq = seq;
+    xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: a ramp per stream, or a counter shared between links */
+static void t_ramp_once_per_link(void) {
+    struct tp pa, pb;
+    struct xconn *xa, *xb;
+    size_t got[4] = { 0 };
+    check("ramp link: link A", 0, tls_link(&pa, &xa));
+    xconn_adopt(xa, 0);
+    get_flushed(&pa, xa, "ramp link A");
+    unsigned char msg[32];
+    for (int i = 0; i < 11; i++) {
+        unsigned char op[8] = { (unsigned char)i, 2, 3, 4, 5, 6, 7, 8 };
+        size_t m = frame(msg, 8, FR_PING, 0, 0, op);
+        check("ramp link: peer PING", 0, tp_seal(pa.sd, pa.s.fd, msg, m));
+        io_in(xa, 0);
+        xconn_flush(xa);
+        check("ramp link: PING ACK record", 1, rec_lens(&pa, got, NULL, 1));
+        check("ramp link: PING ACK 17 B", 17, (long)got[0]);
+    }
+    struct xs u;
+    check("ramp link: POST on A", 0, xs_open(xa, &RQ_POST, 2, &u));
+    check("ramp link: 16384 B on A", 0, xs_send(&u, g_big, 16384, 0));
+    xconn_flush(xa);
+    check("ramp link: POST HEADERS on A", 1, rec_lens(&pa, got, NULL, 1));
+    check("ramp link: two DATA records on A", 2, rec_lens(&pa, got, NULL, 2));
+    static const size_t want_a[2] = { 16384, 9 };
+    lens_expect("ramp link: A at k15 cuts 16384 9", got, want_a, 2);
+    check("ramp link: link B", 0, tls_link(&pb, &xb));
+    xconn_adopt(xb, 0);
+    struct xs v;
+    check("ramp link: POST on B", 0, xs_open(xb, &RQ_POST, 2, &v));
+    xconn_flush(xb);
+    check("ramp link: preface and POST HEADERS on B", 2, rec_lens(&pb, got, NULL, 2));
+    check("ramp link: 2000 B on B", 0, xs_send(&v, g_big, 2000, 0));
+    xconn_flush(xb);
+    check("ramp link: one DATA record on B", 1, rec_lens(&pb, got, NULL, 1));
+    check("ramp link: B at k3 holds 2009 B", 2009, (long)got[0]);
+    check("ramp link: 16384 B on B", 0, xs_send(&v, g_big, 16384, 0));
+    xconn_flush(xb);
+    check("ramp link: three DATA records on B", 3, rec_lens(&pb, got, NULL, 3));
+    static const size_t want_b[3] = { 4744, 5930, 5719 };
+    lens_expect("ramp link: B at k4 cuts 4744 5930 5719", got, want_b, 3);
+    usleep(20000);
+    check("ramp link: nothing more on B", 0, fd_pending(pb.s.fd));
+    xconn_free(xb);
+    tp_free(&pb);
+    xconn_free(xa);
+    tp_free(&pa);
+}
+
+/* catches: the flush pass sealing part of a unit */
+static void t_flush_keeps_unit(void) {
+    struct tp p;
+    struct xconn *x;
+    check("keep unit: tls link", 0, tls_link(&p, &x));
+    xconn_adopt(x, 0);
+    struct xs u;
+    check("keep unit: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    xconn_flush(x);
+    size_t got[2] = { 0 };
+    check("keep unit: preface and POST HEADERS", 2, rec_lens(&p, got, NULL, 2));
+    uint16_t slot = x->st[u.slot].h2slot;
+    check("keep unit: DATA of 3000 begun", 0, h2m_send_begin(&x->h2, slot, 3000, 0));
+    check("keep unit: first 1000 B put", 0, h2m_send_put(&x->h2, g_big, 1000));
+    xconn_flush(x);
+    usleep(20000);
+    check("keep unit: no record for part of the unit", 0, fd_pending(p.s.fd));
+    check("keep unit: last 2000 B put", 0, h2m_send_put(&x->h2, g_big + 1000, 2000));
+    xconn_flush(x);
+    struct fv f[4];
+    size_t n = 0;
+    int k = next_rec(&p, f, 4, &n);
+    check("keep unit: one record of 3009 B", 3009, (long)n);
+    check("keep unit: it holds the whole DATA frame", 1, k == 1 && f[0].type == FR_DATA && f[0].len == 3000);
+    usleep(20000);
+    check("keep unit: nothing more", 0, fd_pending(p.s.fd));
     xconn_free(x);
     tp_free(&p);
 }
@@ -3140,6 +3528,12 @@ int main(void) {
     b64url(g_rs_pub, 32, g_pbk);
 
     t_seal_is_write();
+    t_ramp_small_records();
+    t_ramp_one_write();
+    t_ramp_across_writes();
+    t_ramp_zero_write();
+    t_ramp_after_handshake();
+    t_seal_room_ramp();
     t_dial_preface();
     t_alpn_any();
     t_pend_one_frame();
@@ -3156,6 +3550,11 @@ int main(void) {
     t_control_ceiling_counts_records();
     t_staging_per_link();
     t_records_alone();
+    t_ramp_units();
+    t_ramp_counts_control();
+    t_ramp_once_per_link();
+    t_stage_over_limit();
+    t_flush_keeps_unit();
     t_slow_stream_does_not_stop_fast();
     t_stream_credit_on_consumption();
     t_credit_go_reads();

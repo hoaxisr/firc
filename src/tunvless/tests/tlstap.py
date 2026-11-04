@@ -5,6 +5,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--listen', required=True)
 ap.add_argument('--to', required=True)
 ap.add_argument('--dir', required=True)
+ap.add_argument('--cap', type=int, default=1 << 62)
 a = ap.parse_args()
 
 def addr(s):
@@ -42,7 +43,7 @@ def serve(c, n):
     base = os.path.join(a.dir, str(n))
     t = threading.Thread(target=pump, args=(u, c, base + '.s2c', 65536), daemon=True)
     t.start()
-    pump(c, u, base + '.c2s', 1 << 62)
+    pump(c, u, base + '.c2s', a.cap)
     t.join()
     c.close()
     u.close()

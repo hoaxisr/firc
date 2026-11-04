@@ -169,6 +169,7 @@ struct dialer_ops {
      * that held uploads to 10-20 Mbit/s with multi-second stalls. When the room grows back
      * (WINDOW_UPDATE, read by drain_conn) the stack sends the client a window update. */
     long (*room)(const void *ctx, void *sess);
+    size_t (*up_write)(const void *ctx, void *sess);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
      * not fit. */
     size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);

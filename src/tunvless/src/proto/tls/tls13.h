@@ -9,6 +9,7 @@
 
 #define TLS13_MAX_REC   16640          /* 2^14 + 256: RFC 8446 limit for a protected record */
 #define TLS13_MAX_PLAIN 16384
+#define TLS13_RAMP_STEP 1186
 /* ServerHello bytes kept for the ML-DSA check (about 1200 with the hybrid). */
 #define TLS13_SH_KEEP   2048
 
@@ -189,6 +190,12 @@ size_t tls13_buffered(const struct tls13 *t);
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap);
 
 int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap, size_t *out_n);
+
+/* The most plaintext the next application record may carry: 1186 per record sent, 16384 from the 14th. */
+static inline size_t tls13_plain_cap_at(uint64_t seq) {
+    return seq >= 13 ? (size_t)TLS13_MAX_PLAIN : (size_t)TLS13_RAMP_STEP * (size_t)(seq + 1);
+}
+static inline size_t tls13_plain_cap(const struct tls13 *t) { return tls13_plain_cap_at(t->wr_seq); }
 int tls13_write(struct tls13 *t, const unsigned char *data, size_t n);
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got);
 

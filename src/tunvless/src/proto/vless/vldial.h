@@ -19,6 +19,7 @@ struct vl_sess {
     /* ---- flow: VLESS and Vision ---- */
     uint8_t header_sent;       /* the VLESS request header has been sent */
     uint8_t established;       /* the VLESS response header has been stripped */
+    uint8_t v6;
     /* ---- UDP datagram assembly (UDP flows only) ----
      *
      * VLESS carries datagrams as a stream: [length(2)][data], repeated. TLS records know

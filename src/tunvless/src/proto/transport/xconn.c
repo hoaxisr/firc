@@ -17,6 +17,8 @@
 #define XC_REC_OVER 22
 #define XC_REFUSED_STREAM 7
 
+_Static_assert(TLS13_MAX_PLAIN <= XC_CHUNK, "a TLS record's plaintext fits one chunk");
+
 struct xc_chunk {
     struct xc_chunk *next;
     uint32_t off, len, pt, ctl;
@@ -364,12 +366,18 @@ static int x_out(void *ctx, const unsigned char *d, size_t n, unsigned flags) {
     while (n) {
         if (!x->stage && !(x->stage = chunk_get())) return H2_EIO;
         struct xc_chunk *c = x->stage;
-        size_t k = XC_CHUNK - c->len < n ? XC_CHUNK - c->len : n;
+        size_t lim = x->link.plain ? XC_CHUNK : tls13_plain_cap(&x->link.tls);
+        if (c->len >= lim) {
+            int rc = seal(x);
+            if (rc) return rc;
+            continue;
+        }
+        size_t k = lim - c->len < n ? lim - c->len : n;
         memcpy(c->d + c->len, d, k);
         c->len += (uint32_t)k;
         d += k;
         n -= k;
-        if (c->len == XC_CHUNK) {
+        if (c->len == lim) {
             int rc = seal(x);
             if (rc) return rc;
         }
@@ -788,7 +796,7 @@ static int flush_in(struct xconn *x) {
         x->st[i].up_last = x->st[i].up_cur;
         x->st[i].up_cur = 0;
     }
-    int rc = seal(x);
+    int rc = x->link.plain ? seal(x) : 0;
     if (rc) {
         fail_in(x, rc);
         return rc;

@@ -91,6 +91,11 @@ static int g_send_rc;                 /* what transport_write returns: 0 or H2_E
 static int g_send_again_n;            /* return H2_EWINDOW this many times, then 0 */
 static int g_send_calls;
 static size_t g_send_last_n;          /* length of the last transport_write */
+static size_t g_send_sz[64];
+static int g_send_szn;
+static int g_send_ok_first;
+static int g_whole;
+static long g_grpc_win = -1;
 /* The node's room (transport_room): -1 no limit. g_room_on_read, when not -2, becomes the room at
  * the next read, as a WINDOW_UPDATE read from the node would make it. */
 static long g_room = -1;
@@ -132,17 +137,32 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     g_send_calls++;
     g_send_last_n = n;
-    if (g_send_hold) return H2_EWINDOW;
-    if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
-    if (!g_send_rc && g_wire_on && g_wire_n + n <= sizeof g_wire && g_wlog_n < 8192) {
+    if (g_send_szn < 64) g_send_sz[g_send_szn++] = n;
+    if (g_grpc_win >= 0) {
+        long cost = (long)n + 6 + (n < 128 ? 1 : n < 16384 ? 2 : 3);
+        if (cost > g_grpc_win) return H2_EWINDOW;
+        g_grpc_win -= cost;
+    }
+    int rc;
+    if (g_send_ok_first > 0) {
+        g_send_ok_first--;
+        rc = 0;
+    } else {
+        if (g_send_hold) return H2_EWINDOW;
+        if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
+        rc = g_send_rc;
+    }
+    if (!rc && g_wire_on && g_wire_n + n <= sizeof g_wire && g_wlog_n < 8192) {
         g_wlog[g_wlog_n].t = c;
         g_wlog[g_wlog_n].off = g_wire_n;
         g_wlog[g_wlog_n++].n = n;
         memcpy(g_wire + g_wire_n, d, n);
         g_wire_n += n;
     }
-    return g_send_rc;
+    return rc;
 }
+int transport_whole_writes(const struct transport *t) { (void)t; return g_whole; }
+const struct transport_ops tr_grpc = { .name = "grpc" };
 int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
                       const unsigned char **data, size_t *got) {
     (void)c; (void)buf; (void)cap;
@@ -157,7 +177,11 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
 }
 static int g_held_on;
 int transport_has_data(const struct transport *c) { (void)c; return g_held_on && g_recv_n > 0; }
-long transport_room(struct transport *c) { (void)c; return g_room; }
+long transport_room(struct transport *c) {
+    (void)c;
+    if (g_grpc_win >= 0) return g_grpc_win > 9 ? g_grpc_win - 9 : 0;
+    return g_room;
+}
 void transport_close(struct transport *c) {
     if (__atomic_load_n(&g_own_fd, __ATOMIC_ACQUIRE) && c->link.fd >= 0 && c->link.fd != g_sess_pipe[0])
         close(c->link.fd);
@@ -257,14 +281,14 @@ static int wait_ready(struct conn *c, int ms) {
 
 /* Open a connection up to "flow ready, the server answered with the header and 1000 bytes, the
  * client has not acknowledged them yet". Client ISN 1000. */
-static struct conn *open_conn(uint16_t win) {
+static struct conn *open_conn_isn(uint16_t win, uint32_t isn) {
     struct flow_key k = cli_key();
     struct conn *c = conn_find(&k);
     if (c) conn_drop(c);
-    cli_send(1000, 0, TCP_SYN, win, NULL, 0);
+    cli_send(isn, 0, TCP_SYN, win, NULL, 0);
     c = conn_find(&k);
     if (!c || !c->pending || wait_ready(c, 2000) != 0) return NULL;
-    cli_send(1001, 2, TCP_ACK, win, NULL, 0);
+    cli_send(isn + 1, 2, TCP_ACK, win, NULL, 0);
     g_recv_rc = 0;
     g_recv_buf[0] = 0; g_recv_buf[1] = 0;                 /* VLESS reply: version, addons length */
     memset(g_recv_buf + 2, 'r', 1000);
@@ -277,6 +301,8 @@ static struct conn *open_conn(uint16_t win) {
     if (!vs->established || c->rtx.len != 1000 || c->srv_closed) return NULL;
     return c;
 }
+
+static struct conn *open_conn(uint16_t win) { return open_conn_isn(win, 1000); }
 
 /* ---- checks -------------------------------------------------------------------- */
 
@@ -504,6 +530,487 @@ static void t_gather(void) {
     g_send_again_n = 0;
     conn_drop(c);
     dev_drain(NULL);
+}
+
+static unsigned char g_up_stream[16400];
+
+static void up_stream_fill(void) {
+    for (size_t i = 0; i < sizeof g_up_stream; i++) g_up_stream[i] = (unsigned char)('a' + i / 1000);
+}
+
+static struct conn *up_open_isn(uint32_t isn) {
+    struct conn *c = open_conn_isn(65535, isn);
+    if (!c) return NULL;
+    unsigned char d[100];
+    memset(d, 'h', sizeof d);
+    cli_send(isn + 1, 2, TCP_ACK, 65535, d, sizeof d);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    if (c->client_seq != isn + 101 || !((const struct vl_sess *)SESS(c))->header_sent) return NULL;
+    g_send_szn = 0;
+    g_wire_on = 1;
+    g_wire_n = 0;
+    g_wlog_n = 0;
+    return c;
+}
+
+static struct conn *up_open(void) { return up_open_isn(1000); }
+
+static void up_close(struct conn *c) {
+    g_wire_on = 0;
+    g_send_ok_first = 0;
+    g_send_again_n = 0;
+    g_send_rc = 0;
+    g_whole = 0;
+    g_room = -1;
+    g_grpc_win = -1;
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    g_node.flow[0] = 0;
+    if (c && c->used) conn_drop(c);
+    dev_drain(NULL);
+}
+
+static void up_gather(uint32_t seq, int segs) {
+    for (int i = 0; i < segs; i++)
+        cli_send_more(seq + (uint32_t)i * 1000, 2, TCP_ACK, 65535, g_up_stream + i * 1000, 1000);
+}
+
+static void t_up_cut(void) {
+    /* catches: the gather sent as one 16 KiB write */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    struct flow_key last;
+    memset(&last, 0, sizeof last);
+    int acks = dev_drain(&last);
+    check(g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 7808 &&
+              g_wire_n == 16000 && !memcmp(g_wire, g_up_stream, 16000),
+          "up cut: a 16000-byte gather goes as 8192 + 7808, in order");
+    check(c->client_seq == seq + 16000 && acks == 1 && last.ack == seq + 16000,
+          "up cut: all 16000 acknowledged, with one ACK");
+    up_close(c);
+}
+
+static void t_up_cut_partial(void) {
+    /* catches: all or nothing acknowledged for a partly taken gather */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut partial: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    g_send_ok_first = 1;
+    g_send_again_n = 2;
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    check(g_send_szn == 3 && g_send_sz[0] == 8192 && g_send_sz[1] == 7808 && g_send_sz[2] == 7808 &&
+              g_wire_n == 8192 && !memcmp(g_wire, g_up_stream, 8192),
+          "up cut partial: the first piece taken, the second refused twice");
+    flush_acks(&g_tun);
+    struct flow_key last;
+    memset(&last, 0, sizeof last);
+    dev_drain(&last);
+    check(c->client_seq == seq + 8192 && g_up.c == NULL && c->used && !c->srv_closed &&
+              last.ack == seq + 8192,
+          "up cut partial: exactly the 8192 taken bytes acknowledged, nothing left gathered");
+    g_send_szn = 0;
+    cli_send(seq + 8192, 2, TCP_ACK, 65535, g_up_stream + 8192, 1000);
+    check(g_send_szn == 1 && g_send_sz[0] == 1000 && c->client_seq == seq + 9192 &&
+              g_wire_n == 9192 && !memcmp(g_wire, g_up_stream, 9192),
+          "up cut partial: the client's resend at the new seq goes on, no byte lost or doubled");
+    up_close(c);
+}
+
+static void t_up_cut_resend_whole(void) {
+    /* catches: a resent segment that straddles the partial ACK dropped instead of trimmed to its tail */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut resend: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    g_send_ok_first = 1;
+    g_send_again_n = 2;
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    if (c->client_seq != seq + 8192) { check(0, "up cut resend: the first piece was not taken"); up_close(c); return; }
+    g_send_szn = 0;
+    c->ack_due = 0;
+    cli_send(seq + 7000, 2, TCP_ACK, 65535, g_up_stream + 7000, 1000);
+    check(g_send_szn == 0 && c->client_seq == seq + 8192 && c->ack_due && g_wire_n == 8192,
+          "up cut resend: a segment wholly below the ACK is dropped and acknowledged again");
+    c->ack_due = 0;
+    cli_send(seq + 9000, 2, TCP_ACK, 65535, g_up_stream + 9000, 1000);
+    check(g_send_szn == 0 && c->client_seq == seq + 8192 && c->ack_due && g_wire_n == 8192,
+          "up cut resend: a segment past the ACK is dropped and acknowledged");
+    cli_send(seq + 8000, 2, TCP_ACK, 65535, g_up_stream + 8000, 1000);
+    check(g_send_szn == 1 && g_send_sz[0] == 808 && c->client_seq == seq + 9000 &&
+              g_wire_n == 9000 && !memcmp(g_wire, g_up_stream, 9000),
+          "up cut resend: the whole segment across the ACK sends its 808-byte tail only");
+    cli_send(seq + 8000, 2, TCP_ACK | TCP_FIN, 65535, g_up_stream + 8000, 1001);
+    check(g_send_szn == 2 && g_send_sz[1] == 1 && c->client_seq == seq + 9002 && c->client_fin &&
+              g_wire_n == 9001 && !memcmp(g_wire, g_up_stream, 9001),
+          "up cut resend: a FIN on a trimmed segment stays with its tail");
+    up_close(c);
+    c = up_open();
+    if (!c) { check(0, "up cut resend: second test connection did not open"); up_close(NULL); return; }
+    seq = c->client_seq;
+    cli_send(seq, 2, TCP_ACK, 65535, g_up_stream, 1000);
+    g_send_szn = 0;
+    cli_send(seq, 2, TCP_ACK | TCP_FIN, 65535, g_up_stream, 1000);
+    check(g_send_szn == 0 && c->client_seq == seq + 1001 && c->client_fin && g_wire_n == 1000,
+          "up cut resend: taken data resent with a FIN gives the FIN alone");
+    up_close(c);
+}
+
+static void t_up_cut_resend_wrap(void) {
+    /* catches: the trim bounds compared unsigned, so a resent segment across 2^32 is dropped */
+    up_stream_fill();
+    struct conn *c = up_open_isn(0xFFFFFFFFu - 8200u);
+    if (!c) { check(0, "up cut resend wrap: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    g_send_ok_first = 1;
+    g_send_again_n = 2;
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    if (seq != 0xFFFFFFFFu - 8099u || c->client_seq != 92) {
+        check(0, "up cut resend wrap: the partial ACK did not land past 2^32");
+        up_close(c);
+        return;
+    }
+    g_send_szn = 0;
+    cli_send(seq + 8000, 2, TCP_ACK, 65535, g_up_stream + 8000, 1000);
+    check(g_send_szn == 1 && g_send_sz[0] == 808 && c->client_seq == 900 &&
+              g_wire_n == 9000 && !memcmp(g_wire, g_up_stream, 9000),
+          "up cut resend wrap: the segment across 2^32 sends its 808-byte tail only");
+    up_close(c);
+}
+
+static void t_up_cut_resend_early(void) {
+    /* catches: a fully taken duplicate trimmed to nothing and held behind the early tail without an ACK */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut resend early: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    c->early = malloc(EARLY_CAP);
+    if (!c->early) { check(0, "up cut resend early: no memory"); up_close(c); return; }
+    memset(c->early, 'e', 10);
+    c->early_n = 10;
+    c->early_off = 0;
+    g_send_again_n = 1;
+    c->ack_due = 0;
+    unsigned char d[100];
+    memset(d, 'h', sizeof d);
+    cli_send(seq - 100, 2, TCP_ACK, 65535, d, sizeof d);
+    check(c->ack_due && g_send_szn == 0 && c->client_seq == seq && c->early_n == 10 && c->early_off == 0,
+          "up cut resend early: a taken duplicate is acknowledged again while the early tail waits");
+    up_close(c);
+}
+
+static void t_up_cut_fatal(void) {
+    /* catches: client_seq moved only after the whole gather, or the rest skipped */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut fatal: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    struct flow_key k = cli_key();
+    g_send_ok_first = 1;
+    g_send_rc = -1;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    struct flow_key last;
+    memset(&last, 0, sizeof last);
+    dev_drain(&last);
+    check(g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 7808 && conn_find(&k) == NULL,
+          "up cut fatal: the second piece fails, the flow is reset");
+    check((last.tcp_flags & TCP_RST) && last.ack == seq + 8192,
+          "up cut fatal: the RST acknowledges the taken 8192 bytes");
+    up_close(NULL);
+}
+
+static void t_up_whole_packet_up(void) {
+    /* catches: private packet-up cut into two POSTs per gather */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up whole: test connection did not open"); up_close(NULL); return; }
+    uint32_t seq = c->client_seq;
+    g_whole = 1;
+    up_gather(seq, 16);
+    up_flush(&g_tun);
+    check(g_send_szn == 1 && g_send_sz[0] == 16000 && c->client_seq == seq + 16000 &&
+              !memcmp(g_wire, g_up_stream, 16000),
+          "up whole: packet-up keeps the 16000-byte gather as one write");
+    up_close(c);
+}
+
+static struct conn *first_open(const char *flow) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "%s", flow);
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    c = conn_find(&k);
+    if (!c || wait_ready(c, 2000) != 0) return NULL;
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    if (((const struct vl_sess *)SESS(c))->header_sent) return NULL;
+    g_send_szn = 0;
+    g_wire_on = 1;
+    g_wire_n = 0;
+    g_wlog_n = 0;
+    return c;
+}
+
+static const unsigned char g_hdr_uuid[16] = { 0x8f, 0x7d, 0x3b, 0x1a, 0x2c, 0x4e, 0x4f, 0x60,
+                                              0x9a, 0x81, 0xb5, 0xd7, 0xe6, 0xc3, 0x01, 0x24 };
+
+static size_t first_header(int vision, unsigned char *h) {
+    size_t i = 0;
+    h[i++] = 0;
+    memcpy(h + i, g_hdr_uuid, 16);
+    i += 16;
+    if (vision) {
+        h[i++] = 18;
+        h[i++] = 0x0a;
+        h[i++] = 16;
+        memcpy(h + i, "xtls-rprx-vision", 16);
+        i += 16;
+    } else {
+        h[i++] = 0;
+    }
+    h[i++] = 1;
+    h[i++] = 0x01;
+    h[i++] = 0xbb;
+    h[i++] = 1;
+    uint32_t a = SRV_IP;
+    memcpy(h + i, &a, 4);
+    i += 4;
+    return i;
+}
+
+static void t_first_write_as_xray(void) {
+    /* catches: header and data cut at the gather's own pieces (8192, 26, 808), not packed as Xray's BufferedWriter packs them */
+    up_stream_fill();
+    unsigned char h[64];
+    size_t hn = first_header(0, h);
+    struct conn *c = first_open("");
+    if (!c) { check(0, "first write: test connection did not open"); up_close(NULL); return; }
+    up_gather(1001, 9);
+    up_flush(&g_tun);
+    check(hn == 26 && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 834 &&
+              g_wire_n == 26 + 9000 && !memcmp(g_wire, h, 26) &&
+              !memcmp(g_wire + 26, g_up_stream, 9000) && c->client_seq == 10001,
+          "first write: header + 9000 goes as 8192, 834, in order");
+    up_close(c);
+
+    hn = first_header(1, h);
+    c = first_open("xtls-rprx-vision");
+    if (!c) { check(0, "first write: Vision connection did not open"); up_close(NULL); return; }
+    up_gather(1001, 9);
+    up_flush(&g_tun);
+    const unsigned char *f = g_wire + 44;
+    size_t pad = g_wire_n >= 44 + 21 ? ((size_t)f[19] << 8) | f[20] : 999;
+    size_t clen = g_wire_n >= 44 + 21 ? ((size_t)f[17] << 8) | f[18] : 0;
+    check(hn == 44 && g_send_szn == 3 && g_send_sz[0] == 8192 && pad < 256 &&
+              g_send_sz[1] == 21 + pad && g_send_sz[2] == 852,
+          "first write, Vision, tunvless's deferred form (not Xray's): 8192, 21 + pad, 852");
+    check(g_wire_n == 44 + 21 + 8148 + pad + 852 && !memcmp(g_wire, h, 44) &&
+              !memcmp(f, g_hdr_uuid, 16) && f[16] == VISION_CMD_END && clen == 8148 &&
+              !memcmp(f + 21, g_up_stream, 8148) &&
+              !memcmp(f + 21 + 8148 + pad, g_up_stream + 8148, 852) && c->client_seq == 10001,
+          "first write, Vision, tunvless's deferred form: header, frame of 8148, then 852");
+    up_close(c);
+
+    hn = first_header(0, h);
+    c = first_open("");
+    if (!c) { check(0, "first write: packet-up connection did not open"); up_close(NULL); return; }
+    g_whole = 1;
+    up_gather(1001, 9);
+    up_flush(&g_tun);
+    check(g_send_szn == 1 && g_send_sz[0] == 9026 && !memcmp(g_wire, h, 26) &&
+              !memcmp(g_wire + 26, g_up_stream, 9000),
+          "first write, packet-up: header + 9000 as one write of 9026");
+    up_close(c);
+}
+
+static void t_first_write_cut_per_piece(void) {
+    /* catches: the cut read once per flush, so every piece of a first gather is 8192 less the header */
+    up_stream_fill();
+    unsigned char h[64];
+    first_header(0, h);
+    struct conn *c = first_open("");
+    if (!c) { check(0, "first write per piece: test connection did not open"); up_close(NULL); return; }
+    up_gather(1001, 16);
+    cli_send_more(1001 + 16000, 2, TCP_ACK, 65535, g_up_stream + 16000, 392);
+    up_flush(&g_tun);
+    check(g_send_szn == 3 && g_send_sz[0] == 8192 && g_send_sz[1] == 8192 && g_send_sz[2] == 34 &&
+              g_wire_n == 26 + 16392 && !memcmp(g_wire, h, 26) &&
+              !memcmp(g_wire + 26, g_up_stream, 16392) && c->client_seq == 1001 + 16392,
+          "first write per piece: header + 16392 goes as 8192, 8192, 34");
+    up_close(c);
+}
+
+static void t_up_write_size(void) {
+    /* catches: the first piece sized without the header, or with the wrong header for the host, family or flow */
+    static struct vl_sess s;
+    struct flow_key k = cli_key();
+    size_t v4, host, v6, vis, sent, whole;
+    memset(&s, 0, offsetof(struct vl_sess, dg));
+    s.t.link.fd = -1;
+    vless_dialer.clear(&s);
+    vless_dialer.flow_open(&g_node, &s, &k, 0);
+    v4 = vless_dialer.up_write(&g_node, &s);
+    vless_dialer.set_host(&s, "example.com");
+    host = vless_dialer.up_write(&g_node, &s);
+    s.header_sent = 1;
+    sent = vless_dialer.up_write(&g_node, &s);
+    g_whole = 1;
+    whole = vless_dialer.up_write(&g_node, &s);
+    g_whole = 0;
+    k.v6 = 1;
+    vless_dialer.clear(&s);
+    vless_dialer.flow_open(&g_node, &s, &k, 0);
+    v6 = vless_dialer.up_write(&g_node, &s);
+    k.v6 = 0;
+    snprintf(g_node.flow, sizeof g_node.flow, "xtls-rprx-vision");
+    vless_dialer.clear(&s);
+    vless_dialer.flow_open(&g_node, &s, &k, 0);
+    vis = vless_dialer.up_write(&g_node, &s);
+    g_node.flow[0] = 0;
+    check(v4 == 8192 - 26 && host == 8192 - 34 && v6 == 8192 - 38 && vis == 8192 - 44 &&
+              sent == 8192 && whole == 0,
+          "up_write: 8192 less the unsent header (IPv4 26, host 34, IPv6 38, Vision 44), then 8192");
+}
+
+static void t_up_cut_grpc_room(void) {
+    /* catches: a gather sized to the gRPC room refused in part once each piece is a message of its own */
+    up_stream_fill();
+    struct conn *c = up_open();
+    if (!c) { check(0, "up cut gRPC: test connection did not open"); up_close(NULL); return; }
+    struct vl_sess *vs = SESS(c);
+    vs->t.fr = &tr_grpc;
+    g_grpc_win = 16018;
+    g_recv_rc = 0;
+    g_recv_n = 0;
+    long room = conn_room(c);
+    uint32_t seq = c->client_seq;
+    uint32_t got = 0;
+    while (room > 0 && got + 1000 <= (uint32_t)room) {
+        cli_send_more(seq + got, 2, TCP_ACK, 65535, g_up_stream + got, 1000);
+        got += 1000;
+    }
+    if (room > 0 && got < (uint32_t)room) {
+        cli_send_more(seq + got, 2, TCP_ACK, 65535, g_up_stream + got, (uint32_t)room - got);
+        got = (uint32_t)room;
+    }
+    up_flush(&g_tun);
+    check(room > 8192 && got == (uint32_t)room && g_send_szn == 2 && g_send_sz[0] == 8192 &&
+              g_send_sz[1] == (size_t)room - 8192 && c->client_seq == seq + got &&
+              !memcmp(g_wire, g_up_stream, got),
+          "up cut gRPC: a gather of the whole room goes as two messages, all taken");
+    vs->t.fr = NULL;
+    up_close(c);
+}
+
+static void t_first_write_second_refused(void) {
+    /* catches: a refused second part of the first write taken as a closed window */
+    up_stream_fill();
+    struct conn *c = first_open("");
+    if (!c) { check(0, "first write refused: test connection did not open"); up_close(NULL); return; }
+    g_send_ok_first = 1;
+    g_send_again_n = 1;
+    int sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_FATAL && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 26,
+          "first write: the second part refused, the send fails");
+    up_close(c);
+}
+
+static void first_room(const char *flow) {
+    up_stream_fill();
+    unsigned char h[64];
+    size_t hn = first_header(flow[0] != 0, h);
+    struct conn *c = first_open(flow);
+    char what[96];
+    const char *tag = flow[0] ? ", Vision" : "";
+    if (!c) {
+        snprintf(what, sizeof what, "first write room%s: test connection did not open", tag);
+        check(0, what);
+        up_close(NULL);
+        return;
+    }
+    struct vl_sess *vs = SESS(c);
+    struct vision before = vs->vis;
+    g_room = 8000;
+    int sr = upstream_send(c, g_up_stream, 8192);
+    snprintf(what, sizeof what, "first write room%s: refused before any write", tag);
+    check(sr == SEND_AGAIN && g_send_szn == 0 && !vs->header_sent &&
+              vs->vis.need_uuid == before.need_uuid && vs->vis.sent_end == before.sent_end &&
+              vs->vis.sent_frames == before.sent_frames, what);
+    g_room = -1;
+    sr = upstream_send(c, g_up_stream, 8192);
+    size_t rest = hn;
+    if (flow[0]) rest = g_wire_n >= hn + 21 ? 21 + (((size_t)g_wire[hn + 19] << 8) | g_wire[hn + 20]) + hn : 0;
+    snprintf(what, sizeof what, "first write room%s: the resend goes as 8192 + the rest", tag);
+    check(sr == SEND_OK && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == rest && rest &&
+              !memcmp(g_wire, h, hn) && vs->header_sent, what);
+    up_close(c);
+}
+
+static void t_first_write_room(void) {
+    /* catches: the first part written when the second cannot follow */
+    first_room("");
+    first_room("xtls-rprx-vision");
+}
+
+static void t_first_write_room_edge(void) {
+    /* catches: the room compared with the first part, or refused when it equals the whole */
+    up_stream_fill();
+    struct conn *c = first_open("");
+    if (!c) { check(0, "first write room edge: test connection did not open"); up_close(NULL); return; }
+    struct vl_sess *vs = SESS(c);
+    g_room = 26 + 8192 - 1;
+    int sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_AGAIN && g_send_szn == 0 && !vs->header_sent,
+          "first write room edge: room 8217 for 8218 refuses with no write");
+    g_room = 26 + 8192;
+    sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_OK && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 26 && vs->header_sent,
+          "first write room edge: room 8218 for 8218 gives 8192, 26");
+    up_close(c);
+}
+
+static void t_first_write_room_grpc(void) {
+    /* catches: the first write's room on gRPC checked without the second message's overhead, so half a request goes out */
+    up_stream_fill();
+    struct conn *c = first_open("");
+    if (!c) { check(0, "first write room gRPC: test connection did not open"); up_close(NULL); return; }
+    struct vl_sess *vs = SESS(c);
+    vs->t.fr = &tr_grpc;
+    g_grpc_win = 9 + 8218;
+    int sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_AGAIN && g_send_szn == 0 && !vs->header_sent,
+          "first write room gRPC: room 8218 for 8218 in two messages refuses with no write");
+    g_grpc_win = 9 + 8218 + 8;
+    sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_AGAIN && g_send_szn == 0 && !vs->header_sent,
+          "first write room gRPC: room 8226 refuses with no write");
+    g_grpc_win = 9 + 8218 + 9;
+    sr = upstream_send(c, g_up_stream, 8192);
+    check(sr == SEND_OK && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == 26 && vs->header_sent,
+          "first write room gRPC: room 8227 gives 8192, 26");
+    vs->t.fr = NULL;
+    up_close(c);
 }
 
 /* SEND_AGAIN (the HTTP/2 window to the node is closed) while the client has no window either:
@@ -1402,6 +1909,41 @@ static void t_pool_dead_slot_refuses(void) {
     int rc = pl_connect(NULL, s, 1);
     check(rc == 0, "the same slot live again: dialled");
     if (rc == 0) close(((struct fsess *)INNER(s))->fd);
+}
+
+static const void *g_upw_ctx;
+static const void *g_upw_sess;
+static size_t f_up_write(const void *ctx, void *sess) {
+    g_upw_ctx = ctx;
+    g_upw_sess = sess;
+    return 4321;
+}
+
+static void t_pool_up_write(void) {
+    /* catches: the pool handing the inner dialer its own session, or no piece size at all */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 1);
+    check(g_pl_ops.up_write == NULL, "pool: no piece size when the inner dialer has none");
+    static struct dialer_ops up_ops;
+    static struct pool_proto up_proto;
+    up_ops = f_ops;
+    up_ops.up_write = f_up_write;
+    up_proto = f_proto;
+    up_proto.ops = &up_ops;
+    g_pproto = &up_proto;
+    pool_new(1, POOL_BY_CONNECTION, 1);
+    _Alignas(max_align_t) unsigned char buf[PL_HDR + sizeof(struct fsess)];
+    memset(buf, 0, sizeof buf);
+    struct pl_sess *s = (struct pl_sess *)buf;
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind(s, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    g_upw_ctx = g_upw_sess = NULL;
+    size_t w = g_pl_ops.up_write ? g_pl_ops.up_write(&g_pl, s) : 0;
+    check(w == 4321 && s->node && g_upw_ctx == s->node && g_upw_sess == INNER(s),
+          "pool: the piece size is the inner dialer's, asked for the inner session");
+    g_pproto = &f_proto;
+    pool_new(1, POOL_BY_CONNECTION, 1);
 }
 
 /* Catches: a full connector queue blamed on the CPU while the handshakes wait for a silent node, or the other way round. */
@@ -2420,6 +2962,7 @@ static void pool_part(void) {
     t_pool_pick();
     t_pool_refill();
     t_pool_dead_slot_refuses();
+    t_pool_up_write();
     t_connq_full_cause();
     t_pool_spares();
     t_pool_kick_once();
@@ -6869,6 +7412,21 @@ int main(void) {
     t_server_first();
     t_room_window();
     t_gather();
+    t_up_cut();
+    t_up_cut_partial();
+    t_up_cut_resend_whole();
+    t_up_cut_resend_wrap();
+    t_up_cut_resend_early();
+    t_up_cut_fatal();
+    t_up_whole_packet_up();
+    t_first_write_as_xray();
+    t_first_write_cut_per_piece();
+    t_first_write_room();
+    t_first_write_second_refused();
+    t_first_write_room_edge();
+    t_first_write_room_grpc();
+    t_up_write_size();
+    t_up_cut_grpc_room();
     t_stop_resets();
     t_stop_wakes_the_loop();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");

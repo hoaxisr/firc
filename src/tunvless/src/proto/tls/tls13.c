@@ -845,11 +845,19 @@ size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap) {
 
 int tls13_seal(struct tls13 *t, const unsigned char *d, size_t n, unsigned char *out, size_t cap, size_t *out_n) {
     if (!t->ready) return TLS13_ESTATE;
-    size_t recs = (n + TLS13_MAX_PLAIN - 1) / TLS13_MAX_PLAIN;
-    if (n + recs * 22 > cap) return TLS13_ETOOBIG;
+    size_t need = 0;
+    uint64_t seq = t->wr_seq;
+    for (size_t left = n; left; seq++) {
+        size_t c = tls13_plain_cap_at(seq);
+        size_t piece = left > c ? c : left;
+        need += piece + 22;
+        left -= piece;
+    }
+    if (need > cap) return TLS13_ETOOBIG;
     size_t o = 0;
     while (n) {
-        size_t chunk = n > TLS13_MAX_PLAIN ? TLS13_MAX_PLAIN : n;
+        size_t lim = tls13_plain_cap(t);
+        size_t chunk = n > lim ? lim : n;
         size_t total = chunk + 1 + 16;          /* + inner type + tag */
         unsigned char *r = out + o;
         r[0] = 0x17; r[1] = 0x03; r[2] = 0x03;
@@ -870,7 +878,8 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
     if (!t->ready) return TLS13_ESTATE;
     unsigned char out[TLS13_MAX_REC + 5];
     while (n) {
-        size_t chunk = n > TLS13_MAX_PLAIN ? TLS13_MAX_PLAIN : n;
+        size_t lim = tls13_plain_cap(t);
+        size_t chunk = n > lim ? lim : n;
         size_t want = 0, sent = 0;
         int rc = tls13_seal(t, data, chunk, out, sizeof out, &want);
         if (rc) return rc;

@@ -2190,7 +2190,8 @@ static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigne
  * cost the node link a TLS record, an HTTP/2 frame and a write: with uploads flowing at all
  * (dialer_ops.room), they took 80% of the loop and downloads alongside fell from 4 Gbit/s to
  * 160 Mbit/s. Consecutive in-order data segments of one connection within one TUN batch are
- * therefore gathered here and go to the node as one send, acknowledged once.
+ * therefore gathered here and go to the node in pieces of the dialer's size (dialer_ops.up_write),
+ * acknowledged once.
  *
  * One connection at a time per loop thread. Whatever is not a continuation (another flow, a FIN,
  * a bare ACK, a gap) sends the gathered bytes first, and so does the end of the batch
@@ -2198,26 +2199,33 @@ static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigne
  * the bytes are not acknowledged until the node took them, as before. */
 /* (UP_MAX and g_up: declared before conn_drop, which forgets a dropped connection's bytes.) */
 
-/* Send what is gathered. On success the bytes are acknowledged; otherwise nothing is, and the
- * client resends them (SEND_AGAIN) or gets RST (failure). */
+/* Send what is gathered, piece by piece. Each piece the node took is acknowledged; at the first
+ * refused piece the rest is not, and the client resends it (SEND_AGAIN) or gets RST (failure). */
 static void up_flush(const struct tun_dev *tun) {
     struct conn *c = g_up.c;
     if (!c) return;
     g_up.c = NULL;
     TR("client data %u bytes (gathered) -> server\n", g_up.n);
-    int sr = send_or_wait(c, tun, g_up.buf, g_up.n);
-    if (sr == SEND_CLOSED) return;
-    if (sr == SEND_AGAIN) {
-        TR("window closed, %u gathered bytes not acknowledged — the client will resend\n", g_up.n);
-        return;
+    for (size_t off = 0; off < g_up.n;) {
+        size_t cut = g_dl->ops->up_write ? g_dl->ops->up_write(g_dl->ctx, SESS(c)) : 0;
+        if (!cut) cut = g_up.n;
+        size_t n = g_up.n - off < cut ? g_up.n - off : cut;
+        int sr = send_or_wait(c, tun, g_up.buf + off, n);
+        if (sr == SEND_CLOSED) return;
+        if (sr == SEND_AGAIN) {
+            TR("window closed, %u gathered bytes not acknowledged — the client will resend\n",
+               (unsigned)(g_up.n - off));
+            return;
+        }
+        if (sr != SEND_OK) {
+            conn_node_lost(c);
+            conn_reset(c, tun);
+            return;
+        }
+        c->client_seq += (uint32_t)n;
+        c->ack_due = 1;
+        off += n;
     }
-    if (sr != SEND_OK) {
-        conn_node_lost(c);
-        conn_reset(c, tun);
-        return;
-    }
-    c->client_seq += g_up.n;
-    c->ack_due = 1;
 }
 
 /* Gather the in-order segment (seq, d, n) of c (the caller checked the order). Sends what was
@@ -2485,7 +2493,14 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * the one before it was lost, and duplicate ACKs trigger the client's fast retransmit;
      * without them the hole closes only on timeout. A repeat of data already taken means our ACK
      * was lost, and without an answer the client would retry until it gives up. */
-    if (k.seq != c->client_seq + (g_up.c == c ? g_up.n : 0)) { c->ack_due = 1; return; }
+    uint32_t exp = c->client_seq + (g_up.c == c ? g_up.n : 0);
+    if ((int32_t)(k.seq - exp) < 0 && (int32_t)(k.seq + (uint32_t)data_n + (uint32_t)fin - exp) > 0) {
+        uint32_t head = exp - k.seq;
+        off += head;
+        data_n -= head;
+        k.seq = exp;
+    }
+    if (k.seq != exp) { c->ack_due = 1; return; }
 
     /* The early data tail has not gone yet (the HTTP/2 window was closed when the flow became
      * ready): fresh data must not go ahead of it, or bytes swap places. Do not acknowledge, the

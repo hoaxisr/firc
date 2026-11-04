@@ -27,6 +27,8 @@
 #include "trxmux.h"
 
 #define LOG_W  "tunvless[warn] tunnel: "
+#define VL_UP_WRITE 8192
+#define VL_GRPC_FRAME 9
 
 /* The stack's buffer must hold a whole transport record plus room for the VLESS header and
  * Vision padding. TUNNEL_BUF (dialer.h) is a plain number; it is checked here. */
@@ -130,10 +132,10 @@ static int vl_set_host(void *sess, const char *host) {
 }
 
 static int vl_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
-    (void)k;
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
     s->header_sent = 0;
+    s->v6 = k->v6;
     s->established = 0;
     s->host[0] = 0;
     if (vless_uuid_parse(node->uuid, s->uuid) != 0) {
@@ -331,7 +333,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
                    const unsigned char *data, size_t n) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
-    /* out is needed only to join the header or the Vision frame and the data into one write.
+    /* out is needed only to join the header or the Vision frame and the data into one buffer.
      * Usually there is nothing to join (the header goes once per connection, and Vision ends
      * padding with its first frame), and the data goes straight from the packet, uncopied. */
     static __thread unsigned char out[TUNNEL_BUF];
@@ -399,8 +401,19 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
         len = n;
     }
 
-    /* The transport knows the framing (tcp, grpc, xhttp), not the dialer. */
-    int rc = transport_write(&s->t, body, len);
+    /* The transport knows the framing (tcp, grpc, xhttp), not the dialer. The header's write is
+     * at most VL_UP_WRITE, the rest follows; the room is checked for both before the first. */
+    size_t first = len;
+    if (!udp && !s->header_sent && len > VL_UP_WRITE && !transport_whole_writes(&s->t)) {
+        long room = transport_room(&s->t);
+        size_t need = len + (s->t.fr == &tr_grpc ? VL_GRPC_FRAME : 0);
+        if (room >= 0 && (size_t)room < need) {
+            s->vis = vis_before;
+            return SEND_AGAIN;
+        }
+        first = VL_UP_WRITE;
+    }
+    int rc = transport_write(&s->t, body, first);
     if (rc == H2_EWINDOW) {
         /* The HTTP/2 window is closed: the server is not keeping up. This is not a failure,
          * it is what flow control is for. Nothing was sent (h2_write sends all or nothing), so
@@ -409,6 +422,10 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
          * uploads at a random point. */
         s->vis = vis_before;                /* the frame did not leave: undo the wrapping */
         return SEND_AGAIN;
+    }
+    if (!rc && first < len) {
+        rc = transport_write(&s->t, body + first, len - first);
+        if (rc == H2_EWINDOW) return SEND_FATAL;
     }
     if (rc == H2_ESTATUS) {
         /* The xhttp server refused the upload (stream-up, packet-up): the chunk is lost, and
@@ -641,9 +658,22 @@ static long vl_room(const void *ctx, void *sess) {
     struct vl_sess *s = sess;
     long r = transport_room(&s->t);
     if (r < 0) return -1;
+    if (s->t.fr == &tr_grpc) r -= VL_GRPC_FRAME * (r / VL_UP_WRITE);
     if (!s->header_sent) r -= 64 + (s->host[0] ? 1 + (long)strlen(s->host) : 0);
     if (node->flow[0] && !s->vis.sent_end) r -= 2048;
     return r > 0 ? r : 0;
+}
+
+static size_t vl_up_write(const void *ctx, void *sess) {
+    const struct vless_node *node = ctx;
+    struct vl_sess *s = sess;
+    if (transport_whole_writes(&s->t)) return 0;
+    if (s->header_sent) return VL_UP_WRITE;
+    static const unsigned char ip[16];
+    unsigned char h[512];
+    size_t hl = vless_build_request(s->uuid, VLESS_CMD_TCP, s->host[0] ? s->host : NULL, ip,
+                                    s->v6 ? 16 : 4, 0, node->flow, h, sizeof h);
+    return hl && hl < VL_UP_WRITE ? VL_UP_WRITE - hl : VL_UP_WRITE;
 }
 
 static void vl_mux_host(const struct mux_host *h) { tr_xmux_host(h, pool_ref_stale); }
@@ -691,6 +721,7 @@ const struct dialer_ops vless_dialer = {
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,
+    .up_write = vl_up_write,
     .dgram_frame = vl_dgram_frame,
     .read = vl_read,
     .deliver = vl_deliver,

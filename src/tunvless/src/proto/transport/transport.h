@@ -376,6 +376,8 @@ int transport_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
  * retransmission timeouts (see dialer_ops.room). */
 long transport_room(struct transport *t);
 
+int transport_whole_writes(const struct transport *t);
+
 /* Read WITHOUT AN EXTRA COPY where the transport allows it (transport_ops.zc).
  *
  * *data points either into the connection (at a record decrypted in place) or into buf; the

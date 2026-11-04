@@ -275,6 +275,28 @@ static void t_packet_up_order(void) {
     transport_close(&c);
 }
 
+static void t_whole_writes(void) {
+    /* catches: private packet-up cut, or a stream mode, shared packet-up or another transport kept whole */
+    static const struct transport_ops other = { .name = "other" };
+    static struct transport t;
+    memset(&t, 0, sizeof t);
+    t.fr = &tr_xhttp;
+    t.xh.mode = XH_PACKET_UP;
+    int priv = transport_whole_writes(&t);
+    t.xh.f.shared = 1;
+    int shared = transport_whole_writes(&t);
+    t.xh.f.shared = 0;
+    t.xh.mode = XH_STREAM_UP;
+    int up = transport_whole_writes(&t);
+    t.xh.mode = XH_STREAM_ONE;
+    int one = transport_whole_writes(&t);
+    t.xh.mode = XH_PACKET_UP;
+    t.fr = &other;
+    int oth = transport_whole_writes(&t);
+    check(priv == 1 && shared == 0 && up == 0 && one == 0 && oth == 0,
+          "whole writes: private packet-up only");
+}
+
 static unsigned char g_down[1 << 20];
 static size_t g_down_n;
 static int g_dsrv = -1;
@@ -1591,6 +1613,7 @@ static void t_direct_keeps_the_flow(void) {
 }
 
 int main(void) {
+    t_whole_writes();
     t_post_reset_fails_flow();
     t_close_keeps_the_flow_bytes();
     t_direct_keeps_the_flow();

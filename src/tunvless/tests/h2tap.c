@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -446,9 +447,67 @@ static int cmd_dump(void) {
     return 0;
 }
 
+static size_t ramp_cap(size_t i) { return i < 13 ? 1186 * (i + 1) : 16384; }
+
+static int ramp_over(void) {
+    for (size_t i = 0; i < rn; i++)
+        if (rv[i].len > ramp_cap(i)) {
+            printf("FAIL rec %zu: %zu over %zu\n", i, rv[i].len, ramp_cap(i));
+            return 1;
+        }
+    return 0;
+}
+
+static int cmd_lens(size_t n) {
+    if (!n || n > rn) n = rn;
+    for (size_t i = 0; i < n; i++) printf(i ? " %zu" : "%zu", rv[i].len);
+    printf("\n");
+    return 0;
+}
+
+static int cmd_ramp(void) {
+    if (ramp_over()) return 1;
+    printf("ok records %zu\n", rn);
+    return 0;
+}
+
+static int cmd_ramp_units(void) {
+    if (ramp_over()) return 1;
+    for (size_t u = 0; u < un; u++)
+        for (size_t r = rec_of(uv[u].off); r + 1 < rn && rv[r].off + rv[r].len < uv[u].end; r++)
+            if (rv[r].len != ramp_cap(r)) {
+                printf("FAIL rec %zu: cut inside a unit at %zu, cap %zu\n", r, rv[r].len, ramp_cap(r));
+                return 1;
+            }
+    printf("ok records %zu units %zu\n", rn, un);
+    return 0;
+}
+
+static int cmd_has(const char *needle) {
+    size_t k = strlen(needle);
+    for (size_t i = 0; k && i + k <= st_n; i++)
+        if (!memcmp(st + i, needle, k)) return 0;
+    return 1;
+}
+
+static int count_arg(const char *a, size_t *out) {
+    if (*a < '0' || *a > '9') return -1;
+    char *e;
+    errno = 0;
+    unsigned long v = strtoul(a, &e, 10);
+    if (*e || errno) return -1;
+    *out = v;
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 5 || (!strcmp(argv[1], "names") && argc < 6)) {
-        fprintf(stderr, "usage: h2tap dump|check|first|wu|afterack|names KEYLOG C2S S2C [METHOD]\n");
+    if (argc < 5 || ((!strcmp(argv[1], "names") || !strcmp(argv[1], "has")) && argc < 6)) {
+        fprintf(stderr, "usage: h2tap dump|check|first|wu|afterack|names|lens|ramp|ramp-units|has KEYLOG C2S S2C [METHOD|N|TEXT]\n");
+        return 2;
+    }
+    size_t lens_n = 0;
+    if (!strcmp(argv[1], "lens") && argc > 5 && count_arg(argv[5], &lens_n)) {
+        fprintf(stderr, "h2tap: lens N: %s is not a record count\n", argv[5]);
         return 2;
     }
     size_t cn, sn;
@@ -457,7 +516,11 @@ int main(int argc, char **argv) {
     decrypt(argv[2], c, cn, s, sn);
     free(c);
     free(s);
+    if (!strcmp(argv[1], "lens")) return cmd_lens(lens_n);
+    if (!strcmp(argv[1], "ramp")) return cmd_ramp();
+    if (!strcmp(argv[1], "has")) return cmd_has(argv[5]);
     parse();
+    if (!strcmp(argv[1], "ramp-units")) return cmd_ramp_units();
     if (!strcmp(argv[1], "check")) return cmd_check();
     if (!strcmp(argv[1], "first")) return cmd_first();
     if (!strcmp(argv[1], "names")) return cmd_names(argv[5]);

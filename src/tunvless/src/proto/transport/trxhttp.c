@@ -1007,3 +1007,7 @@ const struct transport_ops tr_xhttp = {
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read, .dial = xhttp_dial, .fd = xhttp_fd,
     .close = xhttp_close, .pending = xhttp_pending, .room = xhttp_room,
 };
+
+int transport_whole_writes(const struct transport *t) {
+    return t->fr == &tr_xhttp && t->xh.mode == XH_PACKET_UP && !t->xh.f.shared;
+}
