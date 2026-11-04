@@ -134,9 +134,13 @@ firc_err_t firc_app_add_group(firc_app_t *app, firc_group_t *group);
 /* like firc_app_add_group; on a failed enable, why gets group "<name>": <step>: <error> */
 firc_err_t firc_app_add_group_why(firc_app_t *app, firc_group_t *group, char *why, size_t why_len);
 
-/* whether the group is routed right now; *reason is disabled/not-enabled/no-interface/tunnel-down/not-written in that
- * order, or NULL when live; before firc_app_set_running every enabled group reads not-enabled */
+/* whether the group is routed right now; *reason is disabled/not-enabled/dns-down/no-interface/tunnel-down/not-written
+ * in that order, or NULL when live; before firc_app_set_running every enabled group reads not-enabled */
 bool firc_app_group_live(const firc_app_t *app, firc_id_t id, const char **reason);
+
+/* the DNS proxy is not listening: no group is live; going up arms the port remap and asks for a full pass */
+void firc_app_set_dns_down(firc_app_t *app, bool down);
+bool firc_app_dns_down_for_test(const firc_app_t *app);
 
 /* down(ud, iface): iface is a tunnel's device and the tunnel carries no traffic; read on the loop thread; NULL: none */
 typedef bool (*firc_app_tunnel_down_fn)(void *ud, const char *iface);

@@ -1219,7 +1219,7 @@ TEST a_web_port_that_cannot_open_is_named_in_the_log(void) {
     text[got] = '\0';
     fclose(log);
     char want[128];
-    snprintf(want, sizeof(want), ":%u/tcp: address already in use (is another program using this port?)", last);
+    snprintf(want, sizeof(want), ":%u/tcp: address already in use by ", last);
     ASSERTm(text, strstr(text, want) != NULL);
     firc_httpd_destroy(other);
     firc_loop_destroy(loop);

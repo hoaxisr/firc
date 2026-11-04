@@ -130,8 +130,15 @@ clear_wedged() {
   return 0
 }
 
-# The launch is a backgrounded subshell, so a missing pid counts only after the first second.
 wait_ready() {
+  wait_up "$1"
+  R=$?
+  touch "$CHECKED" 2>/dev/null
+  return $R
+}
+
+# The launch is a backgrounded subshell, so a missing pid counts only after the first second.
+wait_up() {
   DEADLINE=`expr $(now_s) + $1`
   ready && return 0
   while [ "`now_s`" -lt "$DEADLINE" ]; do
@@ -151,11 +158,37 @@ load_tun() {
   [ -c "$TUN_DEV" ] || logger "$DESC: $TUN_DEV is missing and the tun module did not load; tunnels cannot start."
 }
 
+LASTOUT="$INITDIR/fircd.last"
+CHECKED="$INITDIR/.start-checked"
+start_lines() {
+  END=`expr $(now_s) + $START_BUDGET + 5`
+  while [ ! -e "$CHECKED" ] && [ "`now_s`" -lt "$END" ]; do
+    l=
+    if IFS= read -t 1 -r l || [ -n "$l" ]; then
+      printf '%s\n' "$l" > "$1"
+      logger -t $PROC "$l"
+    elif [ -z "`pidof $PROC`" ]; then
+      break
+    fi
+  done
+  exec logger -t $PROC
+}
+
 # Detached from the caller's descriptors, or `$(S99firc start)` would wait for the daemon to exit.
 launch() {
   load_tun
+  KEEP=/dev/null
+  ensure_initdir && rm -f "$LASTOUT" "$CHECKED" && KEEP="$LASTOUT"
   # reset HUP: the boot loop ignores it, and an ignored disposition survives exec
-  ( trap - HUP; exec > /dev/null 2>&1 < /dev/null; $PREARGS $PROC $ARGS 2>&1 | logger -t $PROC ) &
+  ( trap - HUP; exec > /dev/null 2>&1 < /dev/null; $PREARGS $PROC $ARGS 2>&1 | start_lines "$KEEP" ) &
+}
+
+say_last() {
+  sleep 1
+  L=
+  [ -f "$LASTOUT" ] && read -r L < "$LASTOUT"
+  case "$L" in [0-9][0-9][0-9][0-9]-*Z\ *) L=${L#* } ;; esac
+  [ -n "$L" ] && echo "$DESC: the daemon's last line: $L" >&2
 }
 
 # The pid file holds pid and start time; a reused pid is stale and nothing is killed on its say-so.
@@ -299,6 +332,7 @@ start() {
   if [ -z "$READY_NOW" ]; then
     echo -e "            $ansi_red failed. $ansi_std"
     logger "Failed to start $DESC."
+    say_last
     return 255
   else
     echo -e "            $ansi_green done. $ansi_std"

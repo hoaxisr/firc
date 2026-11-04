@@ -25,6 +25,7 @@ typedef struct firc_system_ctx {
     uint16_t web_port; /* the WebUI's listening port, 0 if none */
     uint16_t web_moved_from; /* the port it was configured on when that one was busy, else 0 */
     const firc_tunnels_t *tunnels; /* the running tunnels, read on the loop thread; NULL if none */
+    const struct firc_dnsproxy *dnsproxy; /* its listening state for the settings answer; NULL: not reported */
     firc_update_t *update; /* the updater, whose install refuses a restart; NULL if none */
     struct ifaces_read *ifaces_read; /* the interface read in flight, NULL if none; loop thread only */
     void (*iface_event)(void *ud, const char *iface); /* an NDM layer event on iface; NULL ignores them */

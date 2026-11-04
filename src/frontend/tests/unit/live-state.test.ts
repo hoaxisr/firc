@@ -38,6 +38,10 @@ describe("a group's live state", () => {
       "tunnel-down",
     );
     assert.strictEqual(
+      liveKind(enabled, false, { live: false, liveReason: "dns-down" }),
+      "dns-down",
+    );
+    assert.strictEqual(
       liveKind(enabled, false, { live: false, liveReason: "disabled" }),
       "disabled",
     );
@@ -58,6 +62,7 @@ describe("a group's live state", () => {
     const expected: Record<LiveKind, [string, string]> = {
       live: ["CircleCheck", "var(--green)"],
       "not-enabled": ["CircleX", "var(--red)"],
+      "dns-down": ["ServerOff", "var(--red)"],
       "no-interface": ["Unplug", "var(--orange)"],
       "not-written": ["RefreshCw", "var(--orange)"],
       "tunnel-down": ["ServerOff", "var(--orange)"],
@@ -113,6 +118,17 @@ describe("a group's live state", () => {
       "The group starts working by itself once a node answers. The tunnel's nodes are on the Tunnels tab.",
     ]);
     assert.strictEqual(tip.error, undefined);
+    assert.strictEqual(tip.footer, true);
+  });
+
+  // Catches dns-down falling back to another reason's text, or not pointing at the warning.
+  it("says the DNS proxy is down and where to look", () => {
+    const tip = liveTooltip("dns-down", { iface: "nwg0" }, t, clock);
+    assert.strictEqual(tip.title, "DNS is not working");
+    assert.deepStrictEqual(tip.lines, [
+      "Another program holds firc's DNS port, so firc answers no DNS and the group's names resolve without it.",
+      "The group starts working by itself once firc gets the port. The warning over the page says what to do.",
+    ]);
     assert.strictEqual(tip.footer, true);
   });
 

@@ -949,5 +949,17 @@
   "Address": "Адрес",
   "Name ": "Имя",
   "To group": "В группу",
-  "{address} added to «{group}»": "{address} добавлен в «{group}»"
+  "{address} added to «{group}»": "{address} добавлен в «{group}»",
+  "DNS is not working": "DNS не работает",
+  "Port {port} is taken by {name} (pid {pid}).": "Порт {port} занят программой {name} (pid {pid}).",
+  "Port {port} is taken by another program.": "Порт {port} занят другой программой.",
+  "Stop {name}, or give firc another DNS proxy port in Settings and restart firc.": "Остановите {name} или задайте firc другой порт DNS-прокси в настройках и перезапустите firc.",
+  "Stop that program, or give firc another DNS proxy port in Settings and restart firc.": "Остановите эту программу или задайте firc другой порт DNS-прокси в настройках и перезапустите firc.",
+  "firc is running, but it answers no DNS: no new name gets a fake address, so name rules do not apply. Subnet rules and addresses already handed out still route.": "firc работает, но не отвечает на DNS: новые имена не получают подменных адресов, поэтому правила по именам не действуют. Правила подсетей и уже выданные адреса продолжают работать.",
+  "firc takes the port by itself within seconds once it is free, and this warning goes away.": "Как только порт освободится, firc сам займёт его за несколько секунд, и это предупреждение исчезнет.",
+  "What to do": "Что сделать",
+  "Hide for a minute": "Скрыть на минуту",
+  "Open Settings": "Открыть настройки",
+  "Another program holds firc's DNS port, so firc answers no DNS and the group's names resolve without it.": "Порт DNS firc занят другой программой, поэтому firc не отвечает на DNS, и имена группы разрешаются без него.",
+  "The group starts working by itself once firc gets the port. The warning over the page says what to do.": "Группа заработает сама, как только firc получит порт. Что сделать, написано в предупреждении поверх страницы."
 }

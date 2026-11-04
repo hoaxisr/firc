@@ -209,12 +209,30 @@ if (!DATA.groups.some((g: any) => g.id === "7ac7e125")) {
 
 const LIVE_REASONS: Record<string, string> = {};
 let NETFILTER: Record<string, unknown> = { ok: true };
+let DNS_HOLDER: { name: string; pid: number } | null | undefined;
+
+function dnsProxyState() {
+  const port = RUNNING["app.dnsProxy.host.port"];
+  if (DNS_HOLDER === undefined)
+    return { listening: true, port, proto: "", error: "", holder: null };
+  const by = DNS_HOLDER
+    ? `by ${DNS_HOLDER.name} (pid ${DNS_HOLDER.pid})`
+    : "(is another program using this port?)";
+  return {
+    listening: false,
+    port,
+    proto: "udp",
+    error: `[::]:${port}/udp: address already in use ${by}`,
+    holder: DNS_HOLDER,
+  };
+}
 
 const IFACE_STATES: Record<string, MockIfaceState> = {};
 const ACTIVE: Record<string, number> = {};
 
 function liveOf(group: any, active: string): { live: boolean; liveReason?: string } {
   if (group.enable === false) return { live: false, liveReason: "disabled" };
+  if (DNS_HOLDER !== undefined) return { live: false, liveReason: "dns-down" };
   const forced = LIVE_REASONS[group.id];
   if (forced && forced !== "not-written") return { live: false, liveReason: forced };
   const tunnel = TUNNELS.find((tn) => tn.device === active);
@@ -1331,8 +1349,11 @@ app.get(`${API_BASE}/system/settings`, (c) =>
     boot: BOOT,
     restarting: RESTARTING,
     webUi: { port: RUNNING["app.httpWeb.host.port"], movedFrom: 0, lanAddress: "192.168.1.1" },
+    dnsProxy: dnsProxyState(),
   }),
 );
+
+app.get(`${API_BASE}/system/dnsproxy`, (c) => c.json(dnsProxyState()));
 
 function settingRefusal(key: string, value: unknown): string | null {
   if (!(key in SETTINGS_DEFAULTS)) return "not a setting";
@@ -2054,6 +2075,13 @@ app.put("/dev/live", async (c) => {
   }
   if (body?.netfilter && typeof body.netfilter.ok === "boolean") NETFILTER = body.netfilter;
   return c.json({ reasons: LIVE_REASONS, netfilter: NETFILTER });
+});
+
+app.put("/dev/dnsproxy", async (c) => {
+  const body = await c.req.json();
+  if (body?.busy === false) DNS_HOLDER = undefined;
+  else if (body?.busy === true) DNS_HOLDER = body.holder ?? null;
+  return c.json(dnsProxyState());
 });
 
 app.put("/dev/autolist", async (c) => {

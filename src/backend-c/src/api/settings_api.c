@@ -12,6 +12,7 @@
 
 #include <cjson/cJSON.h>
 
+#include "firc/dnsproxy.h"
 #include "firc/duration.h"
 #include "firc/events.h"
 #include "firc/ifaddr.h"
@@ -317,6 +318,38 @@ static cJSON *web_ui_json(const firc_system_ctx_t *ctx) {
     return web;
 }
 
+static cJSON *dns_proxy_json(const firc_system_ctx_t *ctx) {
+    firc_dnsproxy_listen_t st = {.listening = true};
+    if (ctx->dnsproxy != NULL) { firc_dnsproxy_listen_state(ctx->dnsproxy, &st); }
+    const char *error = st.listening ? "" : firc_dnsproxy_listen_error(ctx->dnsproxy);
+    cJSON *dns = cJSON_CreateObject();
+    if (dns == NULL || cJSON_AddBoolToObject(dns, "listening", st.listening) == NULL ||
+        cJSON_AddNumberToObject(dns, "port", firc_app_running_settings(ctx->app)->dns_proxy.host.port) == NULL ||
+        cJSON_AddStringToObject(dns, "proto", st.listening ? "" : st.type == SOCK_DGRAM ? "udp" : "tcp") == NULL ||
+        cJSON_AddStringToObject(dns, "error", error) == NULL) {
+        cJSON_Delete(dns);
+        return NULL;
+    }
+    cJSON *holder = st.listening || !st.held ? cJSON_AddNullToObject(dns, "holder") : cJSON_AddObjectToObject(dns, "holder");
+    if (holder == NULL || (!cJSON_IsNull(holder) && (cJSON_AddStringToObject(holder, "name", st.holder.name) == NULL ||
+                                                      cJSON_AddNumberToObject(holder, "pid", (double)st.holder.pid) ==
+                                                          NULL))) {
+        cJSON_Delete(dns);
+        return NULL;
+    }
+    return dns;
+}
+
+static void handle_get_dnsproxy(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    cJSON *dns = dns_proxy_json(ud);
+    if (dns == NULL) {
+        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
+        return;
+    }
+    firc_http_res_write_json(res, 200, dns);
+}
+
 firc_err_t firc_system_listen_web(firc_system_ctx_t *ctx, firc_httpd_t *h, const uint16_t *ports,
                                   size_t n) {
     const firc_app_config_t *running = firc_app_running_settings(ctx->app);
@@ -365,7 +398,8 @@ static void handle_get_settings(firc_http_req_t *req, firc_http_res_t *res, void
         cJSON_AddStringToObject(out, "boot", firc_event_boot()) == NULL ||
         cJSON_AddBoolToObject(out, "restarting", firc_system_restart_under_way(ctx)) == NULL ||
         !cJSON_AddItemToObject(out, "pendingRestart", pending_json(ctx->app)) ||
-        !cJSON_AddItemToObject(out, "webUi", web_ui_json(ctx))) {
+        !cJSON_AddItemToObject(out, "webUi", web_ui_json(ctx)) ||
+        !cJSON_AddItemToObject(out, "dnsProxy", dns_proxy_json(ctx))) {
         cJSON_Delete(out);
         firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
         return;
@@ -505,6 +539,7 @@ static void handle_restart(firc_http_req_t *req, firc_http_res_t *res, void *ud)
 
 void firc_settings_register_routes(firc_httpd_t *h, firc_system_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/system/settings", handle_get_settings, ctx);
+    must_route(h, "GET", "/api/v1/system/dnsproxy", handle_get_dnsproxy, ctx);
     must_route(h, "PUT", "/api/v1/system/settings", handle_put_settings, ctx);
     must_route(h, "POST", "/api/v1/system/restart", handle_restart, ctx);
 }

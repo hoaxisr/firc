@@ -173,6 +173,8 @@ definitions:
             example: 192.168.1.1
             type: string
         type: object
+      dnsProxy:
+        $ref: '#/definitions/types.DnsProxyState'
     type: object
   types.SettingsPutReq:
     properties:
@@ -813,6 +815,43 @@ definitions:
         example: 3f2a1c0b5d6e7f80
         type: string
     type: object
+  types.DnsProxyState:
+    description: >-
+      The DNS proxy as this run listens. When its port was in use at start
+      the daemon runs without it: no DNS answers, the port-53 redirect not
+      staged, every enabled group not live (dns-down). No new name gets a
+      fake address, so name rules do not apply; subnet rules and addresses
+      already handed out still route. It tries the port again every 5 s and
+      answers and redirects as soon as it gets it.
+    properties:
+      listening:
+        description: 'True while its UDP and TCP sockets are open'
+        example: false
+        type: boolean
+      port:
+        description: 'The port it runs (or would run) on'
+        example: 3553
+        type: integer
+      proto:
+        description: 'Which socket could not open: udp or tcp; empty while listening'
+        example: udp
+        type: string
+      error:
+        description: 'Why it could not open, with the address, port, protocol and holder; empty while listening'
+        example: '[::]:3553/udp: address already in use by socat (pid 812)'
+        type: string
+      holder:
+        description: 'The process holding the port, when /proc shows one; null otherwise'
+        x-nullable: true
+        properties:
+          name:
+            example: socat
+            type: string
+          pid:
+            example: 812
+            type: integer
+        type: object
+    type: object
   types.ErrorRes:
     properties:
       error:
@@ -967,10 +1006,11 @@ definitions:
         example: true
         type: boolean
       liveReason:
-        description: 'Present only when live is false. Checked in this order. disabled -- the group is turned off; not-enabled -- enabling it failed, and the daemon retries by itself (after 1 s, then less often, up to once a minute); no-interface -- it is in the DNS view but its interface does not exist, is down, or its name is invalid; its addresses lead nowhere; tunnel-down -- its interface is a tunvless tunnel''s device and that tunnel carries no traffic (no node answers, it is starting, restarting after an exit, off, refused its configuration, has no nodes or no uplink); the routing stays as it is, and the group is live again by itself once a node carries; not-written -- the committer''s first pass after start has not completed, or its passes have failed for five seconds in a row, and its chains may be missing from the kernel (GET /api/v1/system/netfilter says what exactly and since when).'
+        description: 'Present only when live is false. Checked in this order. disabled -- the group is turned off; not-enabled -- enabling it failed, and the daemon retries by itself (after 1 s, then less often, up to once a minute); dns-down -- the DNS proxy is not listening (its port was taken at start, see dnsProxy in GET /api/v1/system/settings), so no new name gets a fake address and name rules do not apply (subnet rules and addresses already handed out still route); the daemon takes the port by itself once it is free; no-interface -- it is in the DNS view but its interface does not exist, is down, or its name is invalid; its addresses lead nowhere; tunnel-down -- its interface is a tunvless tunnel''s device and that tunnel carries no traffic (no node answers, it is starting, restarting after an exit, off, refused its configuration, has no nodes or no uplink); the routing stays as it is, and the group is live again by itself once a node carries; not-written -- the committer''s first pass after start has not completed, or its passes have failed for five seconds in a row, and its chains may be missing from the kernel (GET /api/v1/system/netfilter says what exactly and since when).'
         enum:
         - disabled
         - not-enabled
+        - dns-down
         - no-interface
         - tunnel-down
         - not-written
@@ -2955,6 +2995,30 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Save the configuration'
+      tags:
+      - config
+  /api/v1/system/dnsproxy:
+    get:
+      description: >-
+        Whether the DNS proxy listens. When its port was taken at start the
+        daemon runs without it (no DNS answers, the port-53 redirect not
+        staged, every enabled group not live with dns-down; subnet rules and
+        addresses already handed out still route) and tries the port again
+        every 5 s; the WebUI shows a warning while this says it is not
+        listening.
+        The same object is dnsProxy in GET /system/settings.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.DnsProxyState'
+        "500":
+          description: 'Internal Server Error -- not enough memory for the answer'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'DNS proxy listening state'
       tags:
       - config
   /api/v1/system/settings:

@@ -61,6 +61,23 @@ fake_socat '{"webUi":{"port":0,"movedFrom":0,"lanAddress":"192.168.1.1"}}'
 expect "not listening" "firc: the WebUI is not listening (turned off, or every port tried is in use);
 firc: set app.httpWeb.host.port in $WORK/firc.conf and run /opt/etc/init.d/S99firc restart"
 
+fake_socat '{"webUi":{"port":666,"movedFrom":0,"lanAddress":"192.168.1.1"},"dnsProxy":{"listening":false,"port":3553,"proto":"udp","error":"[::]:3553/udp: address already in use by socat (pid 812)","holder":{"name":"socat","pid":812}}}'
+expect "the DNS proxy is down" "firc: the DNS proxy is not running: [::]:3553/udp: address already in use by socat (pid 812)
+firc: until port 3553/udp is free, firc answers no DNS: no new name gets a fake address
+firc: and name rules do not apply; subnet rules and addresses already handed out still route.
+firc: firc takes the port by itself once it is free, or set app.dnsProxy.host.port in $WORK/firc.conf and restart
+firc: WebUI at http://192.168.1.1:666"
+
+fake_socat '{"webUi":{"port":666,"movedFrom":0,"lanAddress":"192.168.1.1"},"dnsProxy":{"listening":false,"port":3553,"proto":"tcp","error":"[::]:3553/tcp: address already in use by a\"b\\ (pid 9)","holder":{"name":"a\"b\\","pid":9}}}'
+expect "a holder whose name has a quote and a backslash" "firc: the DNS proxy is not running: [::]:3553/tcp: address already in use by a\"b\\ (pid 9)
+firc: until port 3553/tcp is free, firc answers no DNS: no new name gets a fake address
+firc: and name rules do not apply; subnet rules and addresses already handed out still route.
+firc: firc takes the port by itself once it is free, or set app.dnsProxy.host.port in $WORK/firc.conf and restart
+firc: WebUI at http://192.168.1.1:666"
+
+fake_socat '{"webUi":{"port":666,"movedFrom":0,"lanAddress":"192.168.1.1"},"dnsProxy":{"listening":true,"port":3553,"proto":"","error":"","holder":null}}'
+expect "the DNS proxy is up" "firc: WebUI at http://192.168.1.1:666"
+
 fake_socat ''
 expect "no answer from the daemon" "firc: could not ask the daemon where the WebUI is; firc.conf sets port 999"
 

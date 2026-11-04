@@ -8,6 +8,7 @@
 
 #include "firc/dnswire.h"
 #include "firc/err.h"
+#include "firc/listen.h"
 #include "firc/events.h"
 #include "firc/fakeip.h"
 #include "firc/fakeip_addr.h"
@@ -157,6 +158,18 @@ firc_err_t firc_dnsproxy_start(firc_dnsproxy_t *p);
 
 /* Why the last start could not open its sockets, as firc_listen_describe words it; "" otherwise. */
 const char *firc_dnsproxy_listen_error(const firc_dnsproxy_t *p);
+
+typedef struct firc_dnsproxy_listen {
+    bool listening;
+    bool busy;
+    int type;
+    uint16_t port;
+    bool held;
+    firc_listen_holder_t holder;
+} firc_dnsproxy_listen_t;
+
+/* Whether the listeners are open, and what the last failed start met; loop thread. */
+void firc_dnsproxy_listen_state(const firc_dnsproxy_t *p, firc_dnsproxy_listen_t *out);
 
 uint64_t firc_dnsproxy_dropped(const firc_dnsproxy_t *p);
 uint64_t firc_dnsproxy_inflight(const firc_dnsproxy_t *p);

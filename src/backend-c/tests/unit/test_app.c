@@ -4115,6 +4115,45 @@ TEST live_follows_the_interface_link(void) {
     PASS();
 }
 
+/* Catches: dns-down missed, said after disabled is checked or after a missing interface, a recovery that stays down,
+ * or one that never stages the port-53 redirect a degraded start left out. */
+TEST a_dns_proxy_down_holds_every_group_and_its_return_stages_the_redirect(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up_no_committer(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    ASSERT_EQ(FIRC_OK, firc_port_remap_disable(l.remap));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    firc_group_t *g2 = activation_group(2, "b.example", NULL, NULL);
+    g2->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g2));
+    firc_group_t *g3 = activation_group(3, "c.example", NULL, NULL);
+    free(g3->iface);
+    g3->iface = strdup("nolink0");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g3));
+    firc_app_set_dns_down(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(l.app));
+    ASSERT(wait_written_after(&l, 0));
+
+    ASSERT(firc_app_dns_down_for_test(l.app));
+    ASSERT_STR_EQm("an enabled group says why", "dns-down", live_reason(&l, 1));
+    ASSERT_STR_EQm("a disabled one still says it is off", "disabled", live_reason(&l, 2));
+    ASSERT_STR_EQm("dns-down is said before a missing interface", "dns-down", live_reason(&l, 3));
+    ASSERTm("routing itself is unchanged", group_routed(&l, 1));
+    ASSERT_FALSEm("no redirect while the proxy is down", pass_landed(&l));
+
+    uint64_t before = firc_app_nf_last_completed_pass_for_test(l.app);
+    firc_app_set_dns_down(l.app, false);
+    ASSERT(wait_written_after(&l, before));
+    ASSERT_FALSE(firc_app_dns_down_for_test(l.app));
+    ASSERTm("the redirect is staged by the pass the return asked for", pass_landed(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQm("fixture: the third group has no interface", "no-interface", live_reason(&l, 3));
+    locked_app_down(&l);
+    PASS();
+}
+
 static const char *g_tun_down_iface;
 
 static bool fake_tunnel_down(void *ud, const char *iface) {
@@ -8934,6 +8973,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_moved_to_blackhole_flushes_its_flows);
     RUN_TEST(live_follows_the_interface_link);
     RUN_TEST(live_reads_the_tunnel_behind_the_interface);
+    RUN_TEST(a_dns_proxy_down_holds_every_group_and_its_return_stages_the_redirect);
     RUN_TEST(a_committer_that_keeps_failing_says_not_written);
     RUN_TEST(a_save_before_its_pass_still_reads_live);
     RUN_TEST(before_the_first_pass_a_group_reads_not_written);

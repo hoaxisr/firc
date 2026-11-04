@@ -1415,7 +1415,18 @@ static firc_dnsproxy_t *proxy_on(firc_loop_t *loop, const char *addr, uint16_t p
     return firc_dnsproxy_create(&cfg, loop, live_hook, NULL, &p) == FIRC_OK ? p : NULL;
 }
 
-/* Catches: a busy port reported as a bare system error, without the address, port and protocol it was. */
+static void self_holder(char *out, size_t cap) {
+    char comm[64] = "";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f != NULL) {
+        if (fgets(comm, sizeof(comm), f) == NULL) { comm[0] = '\0'; }
+        fclose(f);
+    }
+    comm[strcspn(comm, "\n")] = '\0';
+    snprintf(out, cap, "%s (pid %ld)", comm, (long)getpid());
+}
+
+/* Catches: a busy port reported as a bare system error, or without the address, port, protocol and holder. */
 TEST a_port_another_socket_holds_is_named_with_its_reason(void) {
     int held = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT(held >= 0);
@@ -1429,13 +1440,73 @@ TEST a_port_another_socket_holds_is_named_with_its_reason(void) {
     firc_dnsproxy_t *p = proxy_on(loop, "127.0.0.1", port);
     ASSERT(p != NULL);
     ASSERT(firc_dnsproxy_start(p) != FIRC_OK);
-    char want[200];
-    snprintf(want, sizeof(want),
-             "127.0.0.1:%u/udp: address already in use (is another program using this port?)", port);
+    char holder[100];
+    self_holder(holder, sizeof(holder));
+    char want[300];
+    snprintf(want, sizeof(want), "127.0.0.1:%u/udp: address already in use by %s", port, holder);
     ASSERT_STR_EQ(want, firc_dnsproxy_listen_error(p));
     firc_dnsproxy_destroy(p);
     firc_loop_destroy(loop);
     close(held);
+    PASS();
+}
+
+/* Catches: a busy port not flagged busy, its holder or socket type lost, or a later start that cannot recover. */
+TEST a_busy_port_is_held_by_someone_until_it_is_freed(void) {
+    int held = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT(held >= 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof(sa);
+    ASSERT_EQ(0, bind(held, (struct sockaddr *)&sa, len));
+    ASSERT_EQ(0, getsockname(held, (struct sockaddr *)&sa, &len));
+    uint16_t port = ntohs(sa.sin_port);
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    firc_dnsproxy_t *p = proxy_on(loop, "127.0.0.1", port);
+    ASSERT(p != NULL);
+    firc_dnsproxy_listen_t st;
+    firc_dnsproxy_listen_state(p, &st);
+    ASSERT_FALSEm("not listening before a start", st.listening);
+    ASSERT(firc_dnsproxy_start(p) != FIRC_OK);
+    firc_dnsproxy_listen_state(p, &st);
+    char comm[64] = "";
+    FILE *f = fopen("/proc/self/comm", "r");
+    ASSERT(f != NULL);
+    if (fgets(comm, sizeof(comm), f) == NULL) { comm[0] = '\0'; }
+    fclose(f);
+    comm[strcspn(comm, "\n")] = '\0';
+    ASSERT_FALSE(st.listening);
+    ASSERT(st.busy);
+    ASSERT_EQ(SOCK_DGRAM, st.type);
+    ASSERT_EQ(port, st.port);
+    ASSERT(st.held);
+    ASSERT_EQ((long)getpid(), st.holder.pid);
+    ASSERT_STR_EQ(comm, st.holder.name);
+    close(held);
+    ASSERT_EQ(FIRC_OK, firc_dnsproxy_start(p));
+    firc_dnsproxy_listen_state(p, &st);
+    ASSERT(st.listening);
+    ASSERT_FALSE(st.busy);
+    ASSERT_STR_EQ("", firc_dnsproxy_listen_error(p));
+    firc_dnsproxy_destroy(p);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+/* Catches: an address the router lacks taken for a busy port, which would start the daemon degraded for a typo. */
+TEST an_address_not_on_the_router_is_not_busy(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    firc_dnsproxy_t *p = proxy_on(loop, "192.0.2.1", 53);
+    ASSERT(p != NULL);
+    ASSERT(firc_dnsproxy_start(p) != FIRC_OK);
+    firc_dnsproxy_listen_t st;
+    firc_dnsproxy_listen_state(p, &st);
+    ASSERT_FALSE(st.listening);
+    ASSERT_FALSE(st.busy);
+    ASSERT_FALSE(st.held);
+    firc_dnsproxy_destroy(p);
+    firc_loop_destroy(loop);
     PASS();
 }
 
@@ -1454,10 +1525,15 @@ TEST a_tcp_port_held_closes_the_udp_listener_and_names_tcp(void) {
     firc_dnsproxy_t *p = proxy_on(loop, "127.0.0.1", port);
     ASSERT(p != NULL);
     ASSERT(firc_dnsproxy_start(p) != FIRC_OK);
-    char want[200];
-    snprintf(want, sizeof(want),
-             "127.0.0.1:%u/tcp: address already in use (is another program using this port?)", port);
+    char holder[100];
+    self_holder(holder, sizeof(holder));
+    char want[300];
+    snprintf(want, sizeof(want), "127.0.0.1:%u/tcp: address already in use by %s", port, holder);
     ASSERT_STR_EQ(want, firc_dnsproxy_listen_error(p));
+    firc_dnsproxy_listen_t st;
+    firc_dnsproxy_listen_state(p, &st);
+    ASSERT_EQ(SOCK_STREAM, st.type);
+    ASSERT(st.busy);
     int udp = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT(udp >= 0);
     ASSERT_EQm("the UDP port is still held", 0, bind(udp, (struct sockaddr *)&sa, sizeof(sa)));
@@ -5264,5 +5340,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_port_another_socket_holds_is_named_with_its_reason);
     RUN_TEST(an_address_not_on_the_router_is_named);
     RUN_TEST(a_tcp_port_held_closes_the_udp_listener_and_names_tcp);
+    RUN_TEST(a_busy_port_is_held_by_someone_until_it_is_freed);
+    RUN_TEST(an_address_not_on_the_router_is_not_busy);
     GREATEST_MAIN_END();
 }

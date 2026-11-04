@@ -308,6 +308,7 @@ jobs:
           sh tests/e2e/tunnels.sh
           sudo modprobe -a xt_string xt_connbytes xt_length xt_NFLOG nfnetlink_log
           sh tests/e2e/autolist.sh
+          sh tests/e2e/dnsbusy.sh
           sh tests/routing/run_uplink_routing.sh
 
       - name: Sanitizers (ASan+UBSan)

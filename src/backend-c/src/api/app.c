@@ -207,6 +207,7 @@ struct firc_app {
     size_t al_ptr_sent_at;
     firc_app_tunnel_down_fn tunnel_down;
     void *tunnel_down_ud;
+    bool dns_down;
     firc_app_ifaces_t ifaces;
     firc_app_dnsstats_fn dnsstats;
     void *dnsstats_ud;
@@ -1342,6 +1343,8 @@ bool firc_app_group_live(const firc_app_t *app, firc_id_t id, const char **reaso
         why = "disabled";
     } else if (rs == NULL || !firc_ruleset_runtime_enabled(rs)) {
         why = "not-enabled";
+    } else if (app->dns_down) {
+        why = "dns-down";
     } else if (!firc_ruleset_routed(rs)) {
         why = "no-interface";
     } else if (blocked) {
@@ -4035,6 +4038,19 @@ void firc_app_set_device_lookup(firc_app_t *app, firc_devsel_mark_fn mark, firc_
     app->lookup.policy_nets = policy_nets;
     app->lookup.ud = ud;
 }
+
+void firc_app_set_dns_down(firc_app_t *app, bool down) {
+    app_nf_enter(app);
+    bool up = app->dns_down && !down;
+    app->dns_down = down;
+    if (up) {
+        firc_port_remap_arm(app->port_remap);
+        if (app->committer != NULL) { firc_nfcommit_request(app->committer); }
+    }
+    app_nf_leave(app);
+}
+
+bool firc_app_dns_down_for_test(const firc_app_t *app) { return app->dns_down; }
 
 void firc_app_set_tunnel_down(firc_app_t *app, firc_app_tunnel_down_fn down, void *ud) {
     if (app == NULL) { return; }

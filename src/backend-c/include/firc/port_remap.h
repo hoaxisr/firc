@@ -24,6 +24,9 @@ firc_err_t firc_port_remap_enable(firc_port_remap_t *p);
 /* Writes nat with nothing of ours in it: for the daemon's teardown, after every group is gone. */
 firc_err_t firc_port_remap_disable(firc_port_remap_t *p);
 
+/* Marks it on without writing: the next full pass stages it. */
+void firc_port_remap_arm(firc_port_remap_t *p);
+
 /* Re-stages the chain and its jump for a full rebuild without committing; no-op when p is NULL or disabled. */
 firc_err_t firc_port_remap_prepare_iptables(firc_port_remap_t *p);
 

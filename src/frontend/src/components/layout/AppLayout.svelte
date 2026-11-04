@@ -12,6 +12,7 @@
   import { settings } from "../../modules/settings/settings.svelte";
   import SettingsView from "../../modules/settings/SettingsView.svelte";
   import TunnelsView from "../../modules/tunnels/TunnelsView.svelte";
+  import DnsProxyWarning from "../DnsProxyWarning.svelte";
   import ConfirmDialog from "../feedback/ConfirmDialog.svelte";
   import Overlay from "../feedback/Overlay.svelte";
   import ScrollToTop from "../feedback/ScrollToTop.svelte";
@@ -82,6 +83,7 @@
 
 <Toast />
 <ConfirmDialog />
+<DnsProxyWarning />
 <Overlay />
 {#if settings.overlay}
   <RestartOverlay />

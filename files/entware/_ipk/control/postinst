@@ -219,6 +219,17 @@ conf_web_port() {
     awk '/^  httpWeb:/ { w = 1; next } /^  [^ ]/ { w = 0 } w && /^ +port:/ { p = $2; exit } END { print (p == "" ? 666 : p) }' "$CONF" 2>/dev/null
 }
 
+report_dns() {
+    dns=$(printf '%s' "$ans" |
+        sed -n -E 's/.*"dnsProxy":\{"listening":false,"port":([0-9]*),"proto":"([a-z]*)","error":"(([^"\\]|\\.)*)".*/\1\/\2 \3/p' |
+        sed 's/\\\(.\)/\1/g')
+    [ -n "$dns" ] || return 0
+    echo "firc: the DNS proxy is not running: ${dns#* }" >&2
+    echo "firc: until port ${dns%% *} is free, firc answers no DNS: no new name gets a fake address" >&2
+    echo "firc: and name rules do not apply; subnet rules and addresses already handed out still route." >&2
+    echo "firc: firc takes the port by itself once it is free, or set app.dnsProxy.host.port in $CONF and restart" >&2
+}
+
 report_web() {
     ans=$(printf 'GET /api/v1/system/settings HTTP/1.0\r\n\r\n' |
         socat -t10 - UNIX-CONNECT:"$SOCK" 2>/dev/null)
@@ -228,6 +239,7 @@ report_web() {
         echo "firc: could not ask the daemon where the WebUI is; firc.conf sets port $(conf_web_port)" >&2
         return 0
     fi
+    report_dns
     set -- $web
     port=$1 moved=$2 addr=${3:-}
     if [ "$port" = 0 ]; then
@@ -259,7 +271,7 @@ migrate_groups "$GROUPS" || {
 
 # A failed start must fail the configure step so opkg leaves the package unpacked.
 /opt/etc/init.d/S99firc restart || {
-    echo "firc: the daemon did not start; see the system log and /opt/etc/firc/firc.conf" >&2
+    echo "firc: the daemon did not start; the line above says why, and the system log has it under fircd" >&2
     exit 1
 }
 

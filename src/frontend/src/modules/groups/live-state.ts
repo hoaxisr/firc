@@ -5,6 +5,7 @@ import type { IfaceState } from "./iface-list";
 export type LiveReason =
   | "disabled"
   | "not-enabled"
+  | "dns-down"
   | "no-interface"
   | "tunnel-down"
   | "not-written";
@@ -50,6 +51,7 @@ export type NetfilterState = {
 export type LiveKind =
   | "live"
   | "not-enabled"
+  | "dns-down"
   | "no-interface"
   | "tunnel-down"
   | "not-written"
@@ -60,6 +62,7 @@ export type LiveKind =
 const REASONS: readonly string[] = [
   "disabled",
   "not-enabled",
+  "dns-down",
   "no-interface",
   "tunnel-down",
   "not-written",
@@ -92,6 +95,7 @@ export type LiveIcon =
 export const LIVE_LOOK: Record<LiveKind, { icon: LiveIcon; color: string }> = {
   live: { icon: "CircleCheck", color: "var(--green)" },
   "not-enabled": { icon: "CircleX", color: "var(--red)" },
+  "dns-down": { icon: "ServerOff", color: "var(--red)" },
   "no-interface": { icon: "Unplug", color: "var(--orange)" },
   "tunnel-down": { icon: "ServerOff", color: "var(--orange)" },
   "not-written": { icon: "RefreshCw", color: "var(--orange)" },
@@ -145,6 +149,19 @@ export function liveTooltip(
           t("The group could not be enabled. Until it comes up, its traffic goes direct."),
           t(
             "The daemon retries by itself: after 1 s, then less often, down to once a minute. If the icon does not turn green within a couple of minutes, the reason is in the Journal.",
+          ),
+        ],
+        footer: true,
+      };
+    case "dns-down":
+      return {
+        title: t("DNS is not working"),
+        lines: [
+          t(
+            "Another program holds firc's DNS port, so firc answers no DNS and the group's names resolve without it.",
+          ),
+          t(
+            "The group starts working by itself once firc gets the port. The warning over the page says what to do.",
           ),
         ],
         footer: true,

@@ -73,6 +73,7 @@
 
 #define FIRC_POOL_STATE_PATH FIRC_APP_RUN_DIR "/pool.state"
 #define FIRC_INSTANCE_LOCK_PATH FIRC_APP_RUN_DIR "/fircd.lock"
+#define FIRC_DNS_RETRY_MS 5000u
 /* every 10 sweep ticks (30 s each) when dirty */
 #define FIRC_POOL_SAVE_EVERY_TICKS 10
 
@@ -108,6 +109,7 @@ struct daemon {
     size_t n_refresh_ifaces;
     bool refresh_all;
     int refresh_timer;
+    int dns_retry_timer;
     firc_port_remap_t *port_remap;
     firc_app_t *app;
     firc_tunrun_t *tunrun;
@@ -319,6 +321,10 @@ static void daemon_teardown(struct daemon *d)
     firc_tunrun_stop(d->tunrun, 5000);
     firc_tunrun_free(d->tunrun);
     d->tunrun = NULL;
+    if (d->dns_retry_timer != 0 && d->loop != NULL) {
+        (void)firc_loop_del_timer(d->loop, d->dns_retry_timer);
+        d->dns_retry_timer = 0;
+    }
     /* Ordering only: delete before anything its callback reads is freed. */
     if (d->refresh_timer != 0 && d->loop != NULL) {
         (void)firc_loop_del_timer(d->loop, d->refresh_timer);
@@ -629,6 +635,23 @@ static void on_chunk_taken(void *ud, const firc_fakeip_t *f)
 {
     (void)f;
     save_pool(ud, false);
+}
+
+static void on_dns_retry(firc_loop_t *loop, void *ud)
+{
+    struct daemon *d = ud;
+    char before[192];
+    snprintf(before, sizeof(before), "%s", firc_dnsproxy_listen_error(d->proxy));
+    if (firc_dnsproxy_start(d->proxy) != FIRC_OK) {
+        if (strcmp(before, firc_dnsproxy_listen_error(d->proxy)) != 0) {
+            FIRC_ERROR("DNS proxy still cannot listen: %s", firc_dnsproxy_listen_error(d->proxy));
+        }
+        return;
+    }
+    (void)firc_loop_del_timer(loop, d->dns_retry_timer);
+    d->dns_retry_timer = 0;
+    firc_app_set_dns_down(d->app, false);
+    FIRC_WARN("DNS proxy has its port now: answering DNS again");
 }
 
 static void on_pool_sweep_timer(firc_loop_t *loop, void *ud)
@@ -1472,12 +1495,21 @@ int main(int argc, char **argv)
     }
 #endif
     err = firc_dnsproxy_start(d.proxy);
+    bool dns_down = false;
     if (err != FIRC_OK) {
         const char *why = firc_dnsproxy_listen_error(d.proxy);
-        FIRC_ERROR("failed to start DNS proxy: %s", why[0] != '\0' ? why : firc_err_str(err));
-        daemon_teardown(&d);
-        firc_config_clear(&cfg);
-        return 1;
+        firc_dnsproxy_listen_t st;
+        firc_dnsproxy_listen_state(d.proxy, &st);
+        if (!st.busy) {
+            FIRC_ERROR("failed to start DNS proxy: %s", why[0] != '\0' ? why : firc_err_str(err));
+            daemon_teardown(&d);
+            firc_config_clear(&cfg);
+            return 1;
+        }
+        FIRC_ERROR("DNS proxy cannot listen: %s; running without DNS, so no name gets a fake address until it can "
+                   "(retried every %u s)",
+                   why, FIRC_DNS_RETRY_MS / 1000u);
+        dns_down = true;
     }
 
     if (firc_loop_add_signals(d.loop, &set, on_signal, &d) != FIRC_OK) {
@@ -1506,7 +1538,7 @@ int main(int argc, char **argv)
             firc_config_clear(&cfg);
             return 1;
         }
-        err = firc_port_remap_enable(d.port_remap);
+        err = dns_down ? FIRC_OK : firc_port_remap_enable(d.port_remap);
         if (err != FIRC_OK) {
             FIRC_ERROR("failed to override DNS: %s", firc_err_str(err));
             daemon_teardown(&d);
@@ -1548,6 +1580,14 @@ int main(int argc, char **argv)
                                firc_kn_policies_policy_nets, d.policies);
     firc_app_set_policies_read(d.app, firc_kn_policies_read);
 #endif
+    firc_app_set_dns_down(d.app, dns_down);
+    if (dns_down && firc_loop_add_timer(d.loop, FIRC_DNS_RETRY_MS, FIRC_DNS_RETRY_MS, on_dns_retry, &d,
+                                        &d.dns_retry_timer) != FIRC_OK) {
+        FIRC_ERROR("failed to schedule the DNS proxy's retry");
+        daemon_teardown(&d);
+        firc_config_clear(&cfg);
+        return 1;
+    }
     /* No group stops the daemon: one that fails is logged and left out. */
     err = firc_app_start_groups(d.app);
     if (err != FIRC_OK) {
@@ -1649,6 +1689,7 @@ int main(int argc, char **argv)
         .config_path = config_path,
         .config_version = FIRC_VERSION,
         .tunnels = firc_tunrun_config(d.tunrun),
+        .dnsproxy = d.proxy,
         .iface_event = on_iface_event,
         .iface_event_ud = &d,
     };

@@ -143,6 +143,10 @@ firc_err_t firc_port_remap_enable(firc_port_remap_t *p) {
     return FIRC_OK;
 }
 
+void firc_port_remap_arm(firc_port_remap_t *p) {
+    if (p != NULL) { p->enabled = true; }
+}
+
 firc_err_t firc_port_remap_disable(firc_port_remap_t *p) {
     if (!p->enabled) { return FIRC_OK; }
     p->enabled = false;
