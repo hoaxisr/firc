@@ -25,7 +25,7 @@ env:
 jobs:
   build_test:
     name: Build, test, sanitize (host)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -334,7 +334,7 @@ jobs:
 
   api_reference:
     name: The API reference names every route the daemon serves
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -347,7 +347,7 @@ jobs:
 
   differential:
     name: Differential/regression suites (vs golden snapshots)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -367,7 +367,7 @@ jobs:
 
   cross_build:
     name: Cross-build skeleton (mipsel)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -386,7 +386,7 @@ jobs:
 
   mips_be_tests:
     name: Unit tests (big-endian mips, qemu-user)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       SDK_ASSET: entware-sdk-mips-3.4_gcc-8.4.0_glibc-2.27.Linux-x86_64
