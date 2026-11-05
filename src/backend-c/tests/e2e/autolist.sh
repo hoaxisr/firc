@@ -319,8 +319,12 @@ wait_for 20 True status running
 T0=$(date +%s)
 check "the automatic list runs" True "$(status running)"
 check "it runs in mode add" add "$(status mode)"
-check "its chain hangs off mangle/FORWARD" 1 "$($IPT -t mangle -S FORWARD | grep -c -- '-j FIRC_AUTO')"
-check "its seven rules are in the kernel" 7 "$($IPT -t mangle -S FIRC_AUTO | grep -c NFLOG)"
+hooked() { $IPT -t mangle -S FORWARD | grep -c -- '-j FIRC_AUTO'; }
+nflogs() { $IPT -t mangle -S FIRC_AUTO 2>/dev/null | grep -c NFLOG; }
+wait_for 5 1 hooked
+check "its chain hangs off mangle/FORWARD" 1 "$(hooked)"
+wait_for 5 7 nflogs
+check "its seven rules are in the kernel" 7 "$(nflogs)"
 
 check "a probe on request is accepted" 202 "$(probe www.frost.test)"
 check "a second request waits its turn" 202 "$(probe www.ok.test)"
