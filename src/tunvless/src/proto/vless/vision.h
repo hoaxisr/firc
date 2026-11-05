@@ -45,6 +45,7 @@ struct vision {
     uint32_t rx_data_left;   /* payload bytes left in the current frame */
     uint32_t rx_pad_left;    /* padding bytes left in the current frame */
     int rx_end_after;        /* the current frame's command is end or direct */
+    int rx_direct_after;
 
     unsigned long sent_frames;
 };

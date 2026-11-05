@@ -46,7 +46,7 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-dl-name xhttp-dl-route xhttp-dl-neg-path xhttp-dl-neg-sess
            xmux-count-one xmux-count-packet xmux-count-up xmux-concurrency xmux-requests xmux-reuse
            xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall
-           h2-wire-reality h2-wire-tls h2-credit h2-speed rec-raw rec-vision rec-ws"
+           h2-wire-reality h2-wire-tls h2-credit h2-speed rec-raw rec-vision rec-ws vis-dl vis-dl-tls"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -113,6 +113,7 @@ bg_in "$NSS" "$W/mask.log" openssl s_server -accept "$S_IP:8443" -cert "$W/mask.
     -tls1_3 -alpn h2,http/1.1 -www -quiet
 # The target, and the targets of the node probe.
 bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080
+case " $CASES " in *" vis-"*) bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0 ;; esac
 bg_in "$NSS" "$W/probe1.log" python3 tests/grpc-target.py 1.1.1.1 80
 bg_in "$NSS" "$W/probe2.log" python3 tests/grpc-target.py 8.8.8.8 80
 bg_in "$NSS" "$W/target6.log" python3 tests/grpc-target.py "$TARGET6" 8080
@@ -257,6 +258,10 @@ case_cfg() {
     rec-raw)                 NET='"network":"tcp"'; Q="type=tcp"; XCNET="$NET"; KEYLOG=1 ;;
     rec-vision)              NET='"network":"tcp"'; Q="type=tcp&flow=xtls-rprx-vision"; XCNET="$NET"
                              FLOW=xtls-rprx-vision; KEYLOG=1 ;;
+    vis-dl)                  NET='"network":"tcp"'; Q="type=tcp&flow=xtls-rprx-vision"; XCNET="$NET"
+                             FLOW=xtls-rprx-vision ;;
+    vis-dl-tls)              SEC=tls; TUN_ARGS="--ca $W/mask.pem"; XALPN=http/1.1; NET='"network":"tcp"'; Q="type=tcp&flow=xtls-rprx-vision"; XCNET="$NET"
+                             FLOW=xtls-rprx-vision ;;
     rec-ws)                  SEC=tls; TUN_ARGS="--ca $W/mask.pem"; NET='"network":"ws","wsSettings":{"path":"/ws"}'
                              Q="type=ws&path=%2Fws"; XCNET="$NET"; XALPN=http/1.1; KEYLOG=1 ;;
     *) echo "run-xray: unknown case $1"; exit 2 ;;
@@ -373,7 +378,7 @@ want() {
     else echo "run-xray: FAIL — $1: ${2:-none}, expected $3 $4"; XR=1; fi
 }
 tun_up() {
-    ip netns exec "$NSC" "$1" $TUN_ARGS "$W/sub.txt" -d vl -n 0 --interval 3600 > "$W/tun-$MODE-$2.log" 2>&1 &
+    ip netns exec "$NSC" env ${TUN_TRACE:+STEER_TUN_TRACE=1} "$1" $TUN_ARGS "$W/sub.txt" -d vl -n 0 --interval 3600 > "$W/tun-$MODE-$2.log" 2>&1 &
     SPID=$!; PIDS="$PIDS $SPID"
     for _ in $(seq 60); do ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 && break; sleep 0.25; done
     ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 || {
@@ -397,7 +402,7 @@ xc_up() {
     XN=${XCNET:-"\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"$XMODE\"$XMJ}"}
     cat > "$W/xc-$MODE.json" <<JSON
 {"log":{"loglevel":"warning"},
- "inbounds":[{"listen":"127.0.0.1","port":18080,"protocol":"dokodemo-door","settings":{"address":"$TARGET","port":8080,"network":"tcp"}}],
+ "inbounds":[{"listen":"127.0.0.1","port":18080,"protocol":"dokodemo-door","settings":{"address":"$TARGET","port":${XC_TPORT:-8080},"network":"tcp"}}],
  "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$S_IP","port":${LPORT:-$PORT},"users":[{"id":"$UUID","encryption":"none"$FJ}]}]},
    "streamSettings":{$XN,$CS}}]}
 JSON
@@ -793,6 +798,28 @@ NFT
         grep -q '"type":"bytes"' "$W/kev" && echo "run-xray: tunvless reported redirected bytes" || {
             echo "run-xray: FAIL — no bytes event for the redirected flows"; XR=1; } ;;
     rec-raw|rec-vision|rec-ws) rec_case "$m" || XR=1 ;;
+    vis-dl|vis-dl-tls)
+        N=${VN:-200}
+        vloop() {
+            ok=0; bad=0; i=0
+            while [ $i -lt "$N" ]; do
+                case $((i % 6)) in 0) qs="bytes=3000000" ;; 1) qs="bytes=3000000&chunk=1400" ;;
+                2) qs="bytes=200000&delay=0.05" ;; 3) qs="bytes=3000000&first=6000&gap=0.03" ;;
+                4) qs="bytes=3000000&first=3000&gap=0.03" ;; *) qs="bytes=3000000&first=7900" ;; esac
+                e=$(ip netns exec "$NSC" curl -sS -k --tlsv1.3 -m 15 -o /dev/null "https://$1/__down?$qs" 2>&1) && ok=$((ok + 1)) || {
+                    bad=$((bad + 1)); echo "    $2 #$i $qs: $e"; }
+                i=$((i + 1))
+            done
+            echo "run-xray: $2: $ok ok, $bad failed of $N"
+            want "$2 failures of $N" "$bad" eq 0
+        }
+        TUN_TRACE=1 tun_up "$BIN" t || return 1
+        vloop "$TARGET:8443" tunvless
+        tun_down
+        want "tunvless switches to direct copy" "$(grep -c 'server switched to direct copy' "$W/tun-$MODE-t.log")" ge 1
+        XC_TPORT=8443 xc_up || return 1
+        vloop "127.0.0.1:18080" "Xray client"
+        xc_down ;;
     h2-wire-reality|h2-wire-tls)
         tap_down; tap_up q || return 1
         out=$(probe); tap_down
@@ -991,7 +1018,7 @@ EOF
         continue
     fi
     [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; FAIL=1; tap_down; kill "$XPID" 2>/dev/null || true; continue; }
-    case "$MODE" in xmux-*|h2-*|rec-*)
+    case "$MODE" in xmux-*|h2-*|rec-*|vis-*)
         SPID=""; CPID=""; LPID=""
         rc=0; xmux_case "$MODE" || rc=1
         tun_down; xc_down; tap_down

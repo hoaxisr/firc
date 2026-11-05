@@ -259,6 +259,61 @@ int main(void) {
               VISION_EPROTO, rc2);
     }
 
+    /* catches: a direct frame split across outer records bypassing decryption before its last byte */
+    {
+        static unsigned char s[8192];
+        static unsigned char want[4096];
+        size_t sn = 0, wn = 0;
+        memcpy(s, UUID, 16);
+        sn = 16;
+        unsigned char hello[200];
+        memset(hello, 0x16, sizeof hello);
+        sn += put_frame(s + sn, VISION_CMD_CONTINUE, hello, sizeof hello, 50);
+        memcpy(want, hello, sizeof hello);
+        wn = sizeof hello;
+        unsigned char app[3000];
+        for (size_t k = 0; k < sizeof app; k++) app[k] = (unsigned char)(k * 7 + 1);
+        app[0] = 0x17; app[1] = 0x03; app[2] = 0x03;
+        sn += put_frame(s + sn, VISION_CMD_DIRECT, app, sizeof app, 30);
+        memcpy(want + wn, app, sizeof app);
+        wn += sizeof app;
+        const size_t rec[3] = {1185, 2370, 0};
+        struct vision v;
+        vinit(&v);
+        static char out[4096];
+        size_t got = 0, pos = 0;
+        int early = 0, rc = 0;
+        for (int r = 0; r < 3 && pos < sn; r++) {
+            size_t len = rec[r] && rec[r] < sn - pos ? rec[r] : sn - pos;
+            got += drain(&v, s + pos, len, len, out + got, sizeof(out) - got, &rc);
+            pos += len;
+            if (pos < sn && v.recv_direct) early = 1;
+        }
+        check("direct frame across records: no bypass before its last byte", 0, early);
+        check("direct frame across records: bypass after its last byte", 1, v.recv_direct);
+        check("direct frame across records: payloads whole", 1,
+              rc == 0 && got == wn && memcmp(out, want, wn) == 0);
+    }
+
+    /* catches: an empty direct frame leaving the stream parsed instead of passed through */
+    {
+        static unsigned char s[256];
+        size_t sn = 16;
+        memcpy(s, UUID, 16);
+        sn += put_frame(s + sn, VISION_CMD_DIRECT, "", 0, 0);
+        const char tail[] = "\x17\x03\x03raw tail";
+        memcpy(s + sn, tail, sizeof tail - 1);
+        sn += sizeof tail - 1;
+        struct vision v;
+        vinit(&v);
+        char out[64];
+        int rc = 0;
+        size_t got = drain(&v, s, sn, sn, out, sizeof out, &rc);
+        check("empty direct frame: bypass set", 1, v.recv_direct);
+        check("empty direct frame: tail passes through", 1,
+              rc == 0 && got == sizeof tail - 1 && memcmp(out, tail, got) == 0);
+    }
+
     printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all checks passed");
     return fails ? 1 : 0;
 }

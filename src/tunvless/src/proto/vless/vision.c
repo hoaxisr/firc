@@ -108,6 +108,11 @@ size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
     return i;
 }
 
+static void frame_done(struct vision *v) {
+    v->recv_done = 1;
+    v->recv_direct = v->rx_direct_after;
+}
+
 /* Unwraps the incoming stream. Each call consumes part of in (*consumed) and returns at most
  * one piece of payload; the caller calls again until in is used up.
  *
@@ -167,7 +172,7 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         v->rx_data_left -= (uint32_t)take;
         i += take;
         *consumed += i;
-        if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) frame_done(v);
         return 0;
     }
 
@@ -177,7 +182,7 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         v->rx_pad_left -= (uint32_t)take;
         i += take;
         *consumed += i;
-        if (!v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        if (!v->rx_pad_left && v->rx_end_after) frame_done(v);
         return 0;
     }
 
@@ -191,13 +196,9 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
     v->rx_data_left = ((uint32_t)v->rx_hdr[1] << 8) | v->rx_hdr[2];
     v->rx_pad_left = ((uint32_t)v->rx_hdr[3] << 8) | v->rx_hdr[4];
     v->rx_end_after = (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT);
-    /* direct is not just another end: from now on the server writes the destination's stream
-     * to the socket without its own TLS, and it must be read bypassing decryption. Parsed as
-     * our records, it gives nonsense lengths and AEAD failures mid-transfer, at a point that
-     * depends on when the server spotted TLS inside. */
-    if (cmd == VISION_CMD_DIRECT) v->recv_direct = 1;
+    v->rx_direct_after = cmd == VISION_CMD_DIRECT;
     v->rx_hdr_n = 0;
     /* A frame with neither payload nor padding: the server ends padding this way. */
-    if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+    if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) frame_done(v);
     return 0;
 }
