@@ -5,6 +5,10 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <netpacket/packet.h>
+#include <unistd.h>
 #include <time.h>
 #include <sys/socket.h>
 
@@ -16,6 +20,8 @@
 #include "firc/app.h"
 #include "firc/events.h"
 #include "firc/fakeip.h"
+#include "firc/log.h"
+#include "firc/nfcommit.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/pool_reject.h"
 #include "firc/port_remap.h"
@@ -831,6 +837,441 @@ TEST the_remap_enables_after_the_start_clean_and_the_barrier(void) {
     ASSERT(chain_has_rule(fake, "nat", "PREROUTING", k_remap_jump, 2));
     firc_port_remap_free(remap);
     firc_ipt_free(ipt);
+    PASS();
+}
+
+static const char *const k_dns_10_99_0_1_tcp[] = {"-d", "10.99.0.1/32", "-p", "tcp", "-m", "tcp", "--dport", "53",
+                                                  "-j", "DNAT", "--to-destination", ":3553"};
+static const char *const k_dns_10_99_0_1_udp[] = {"-d", "10.99.0.1/32", "-p", "udp", "-m", "udp", "--dport", "53",
+                                                  "-j", "DNAT", "--to-destination", ":3553"};
+static const char *const k_dns_10_99_0_2_tcp[] = {"-d", "10.99.0.2/32", "-p", "tcp", "-m", "tcp", "--dport", "53",
+                                                  "-j", "DNAT", "--to-destination", ":3553"};
+static const uint8_t k_v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
+
+static struct ifaddrs g_ifa[16];
+static struct sockaddr_storage g_sa[16];
+static size_t g_ifa_n;
+static bool g_ifa_stub, g_ifa_fail;
+static unsigned g_ifa_reads;
+
+int __real_getifaddrs(struct ifaddrs **ifap);
+int __wrap_getifaddrs(struct ifaddrs **ifap);
+int __wrap_getifaddrs(struct ifaddrs **ifap) {
+    if (!g_ifa_stub) { return __real_getifaddrs(ifap); }
+    g_ifa_reads++;
+    if (g_ifa_fail) {
+        errno = EIO;
+        return -1;
+    }
+    for (size_t i = 0; i < g_ifa_n; i++) { g_ifa[i].ifa_next = i + 1 < g_ifa_n ? &g_ifa[i + 1] : NULL; }
+    *ifap = g_ifa_n > 0 ? g_ifa : NULL;
+    return 0;
+}
+
+void __real_freeifaddrs(struct ifaddrs *ifa);
+void __wrap_freeifaddrs(struct ifaddrs *ifa);
+void __wrap_freeifaddrs(struct ifaddrs *ifa) {
+    if (ifa != g_ifa) { __real_freeifaddrs(ifa); }
+}
+
+static void stub_reset(void) {
+    memset(g_ifa, 0, sizeof g_ifa);
+    memset(g_sa, 0, sizeof g_sa);
+    g_ifa_n = 0;
+    g_ifa_reads = 0;
+    g_ifa_fail = false;
+    g_ifa_stub = true;
+}
+
+static void stub_no_addr(const char *name) { g_ifa[g_ifa_n++].ifa_name = (char *)name; }
+
+static void stub_family(const char *name, int family) {
+    g_sa[g_ifa_n].ss_family = (sa_family_t)family;
+    g_ifa[g_ifa_n].ifa_name = (char *)name;
+    g_ifa[g_ifa_n].ifa_addr = (struct sockaddr *)&g_sa[g_ifa_n];
+    g_ifa_n++;
+}
+
+static void stub_v4(const char *name, uint8_t last) {
+    struct sockaddr_in *s = (struct sockaddr_in *)&g_sa[g_ifa_n];
+    memcpy(&s->sin_addr, (uint8_t[]){10, 99, 0, last}, 4);
+    stub_family(name, AF_INET);
+}
+
+static void stub_v6(const char *name, const uint8_t ip[16]) {
+    struct sockaddr_in6 *s = (struct sockaddr_in6 *)&g_sa[g_ifa_n];
+    memcpy(&s->sin6_addr, ip, 16);
+    stub_family(name, AF_INET6);
+}
+
+static void refresh_with_one_address(fixture_t *fx, uint8_t last) {
+    stub_reset();
+    stub_v4("br0", last);
+    firc_app_refresh_remap(fx->app, "br0");
+    g_ifa_stub = false;
+}
+
+static size_t dnsor_rules(fixture_t *fx) {
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    return firc_fake_ipt_get_rules(fx->fake, "nat", "FIRC_DNSOR", &rules, &n) ? n : (size_t)-1;
+}
+
+static bool wait_dnsor_rule(fixture_t *fx, const char *const *rule) {
+    bool written = false;
+    for (int i = 0; i < 400 && !written; i++) {
+        firc_app_nf_enter(fx->app);
+        written = chain_has_rule(fx->fake, "nat", "FIRC_DNSOR", rule, 12);
+        firc_app_nf_leave(fx->app);
+        if (!written) { nanosleep(&(struct timespec){.tv_nsec = 5000000}, NULL); }
+    }
+    return written;
+}
+
+TEST a_new_link_address_is_caught_by_the_next_pass(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_1_tcp, 12));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_1_udp, 12));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_moved_link_address_leaves_no_rule_for_the_old_one(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    refresh_with_one_address(&fx, 2);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_2_tcp, 12));
+    ASSERT_FALSE(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_1_tcp, 12));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST an_address_moved_while_dns_was_down_is_the_one_armed(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    ASSERT_EQ(FIRC_OK, firc_port_remap_disable(fx.remap));
+    firc_app_set_dns_down(fx.app, true);
+    refresh_with_one_address(&fx, 2);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_FALSE(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_2_tcp, 12));
+    firc_app_set_dns_down(fx.app, false);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_2_tcp, 12));
+    ASSERT_FALSE(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_1_tcp, 12));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST the_last_link_address_going_empties_the_chain_and_keeps_the_jump(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    stub_reset();
+    firc_app_refresh_remap(fx.app, "br0");
+    g_ifa_stub = false;
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_EQ_FMT((size_t)0, dnsor_rules(&fx), "%zu");
+    ASSERT(chain_has_rule(fx.fake, "nat", "PREROUTING", k_remap_jump, 2));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_change_in_the_second_address_is_seen_and_both_are_written(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    firc_remap_addr_t a[2] = {{AF_INET, {10, 99, 0, 1}, 4}, {AF_INET, {10, 99, 0, 3}, 4}};
+    ASSERT_EQ(FIRC_OK, firc_port_remap_set_addrs(fx.remap, a, 2));
+    a[1].ip[3] = 2;
+    ASSERT_FALSE(firc_port_remap_same_addrs(fx.remap, a, 2));
+    ASSERT_EQ(FIRC_OK, firc_port_remap_set_addrs(fx.remap, a, 2));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_1_tcp, 12));
+    ASSERT(chain_has_rule(fx.fake, "nat", "FIRC_DNSOR", k_dns_10_99_0_2_tcp, 12));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST an_ipv6_change_past_the_fourth_byte_is_a_change(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    firc_remap_addr_t a = {.family = AF_INET6, .iplen = 16};
+    memcpy(a.ip, k_v6, 16);
+    ASSERT_EQ(FIRC_OK, firc_port_remap_set_addrs(fx.remap, &a, 1));
+    ASSERT(firc_port_remap_same_addrs(fx.remap, &a, 1));
+    a.ip[15] = 8;
+    ASSERT_FALSE(firc_port_remap_same_addrs(fx.remap, &a, 1));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST the_same_bytes_in_another_family_are_a_change(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    firc_remap_addr_t a = {.family = AF_INET6, .iplen = 16};
+    memcpy(a.ip, k_v6, 16);
+    ASSERT_EQ(FIRC_OK, firc_port_remap_set_addrs(fx.remap, &a, 1));
+    firc_remap_addr_t v4 = {.family = AF_INET, .iplen = 4};
+    memcpy(v4.ip, k_v6, 4);
+    ASSERT_FALSE(firc_port_remap_same_addrs(fx.remap, &v4, 1));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST the_same_link_addresses_report_no_change(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    firc_remap_addr_t addr = {AF_INET, {10, 99, 0, 1}, 4};
+    ASSERT_EQ(FIRC_OK, firc_port_remap_set_addrs(fx.remap, &addr, 1));
+    ASSERT(firc_port_remap_same_addrs(fx.remap, &addr, 1));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_change_takes_the_netfilter_lock_once_and_the_same_addresses_never(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(fx.app));
+    uint64_t before = firc_app_nf_enters_for_test(fx.app);
+    refresh_with_one_address(&fx, 1);
+    uint64_t changed = firc_app_nf_enters_for_test(fx.app);
+    refresh_with_one_address(&fx, 1);
+    uint64_t same = firc_app_nf_enters_for_test(fx.app);
+    firc_app_stop_netfilter_committer(fx.app);
+    ASSERT_EQ_FMT((unsigned long long)before + 1, (unsigned long long)changed, "%llu");
+    ASSERT_EQ_FMT((unsigned long long)changed, (unsigned long long)same, "%llu");
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST the_committer_writes_a_new_link_address_by_itself(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(fx.app));
+    refresh_with_one_address(&fx, 1);
+    bool written = wait_dnsor_rule(&fx, k_dns_10_99_0_1_udp);
+    firc_app_stop_netfilter_committer(fx.app);
+    ASSERT(written);
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST the_same_addresses_ask_for_no_pass(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(fx.app));
+    struct timespec settle = {.tv_nsec = 300000000};
+    refresh_with_one_address(&fx, 1);
+    bool first = wait_dnsor_rule(&fx, k_dns_10_99_0_1_tcp);
+    nanosleep(&settle, NULL);
+    uint64_t passes = firc_nfcommit_passes(firc_app_committer_for_test(fx.app));
+    refresh_with_one_address(&fx, 1);
+    nanosleep(&settle, NULL);
+    uint64_t after_same = firc_nfcommit_passes(firc_app_committer_for_test(fx.app));
+    firc_app_stop_netfilter_committer(fx.app);
+    ASSERT(first);
+    ASSERT_EQ_FMT((unsigned long long)passes, (unsigned long long)after_same, "%llu");
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST an_event_on_another_interface_reads_no_addresses(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    stub_reset();
+    stub_v4("br0", 1);
+    firc_app_refresh_remap(fx.app, "br01");
+    g_ifa_stub = false;
+    ASSERT_EQ(0u, g_ifa_reads);
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_re_read_of_everything_needs_no_interface_name(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    stub_reset();
+    stub_v4("br0", 1);
+    firc_app_refresh_remap(fx.app, NULL);
+    g_ifa_stub = false;
+    firc_remap_addr_t addr = {AF_INET, {10, 99, 0, 1}, 4};
+    ASSERT(firc_port_remap_same_addrs(fx.remap, &addr, 1));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_failed_re_read_keeps_the_old_addresses(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    stub_reset();
+    g_ifa_fail = true;
+    firc_app_refresh_remap(fx.app, "br0");
+    g_ifa_stub = false;
+    firc_remap_addr_t addr = {AF_INET, {10, 99, 0, 1}, 4};
+    ASSERT(firc_port_remap_same_addrs(fx.remap, &addr, 1));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_daemon_without_the_redirect_ignores_link_events(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    firc_app_set_port_remap(fx.app, NULL);
+    stub_reset();
+    firc_app_refresh_remap(fx.app, "br0");
+    g_ifa_stub = false;
+    firc_app_set_port_remap(fx.app, fx.remap);
+    ASSERT_EQ(0u, g_ifa_reads);
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST collection_reads_every_address_of_a_link_and_only_its_own(void) {
+    stub_reset();
+    stub_family("br0", AF_PACKET);
+    stub_no_addr("br0");
+    stub_v4("br0", 1);
+    stub_v4("br0", 2);
+    stub_v6("br0", k_v6);
+    stub_v4("eth9", 3);
+    char *names[] = {"br0"};
+    firc_remap_addr_t *a = NULL;
+    size_t n = 0;
+    firc_err_t err = firc_port_remap_collect(names, 1, true, &a, &n);
+    g_ifa_stub = false;
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)3, n, "%zu");
+    ASSERT_EQ(AF_INET, a[0].family);
+    ASSERT_EQ(1, a[0].ip[3]);
+    ASSERT_EQ(2, a[1].ip[3]);
+    ASSERT_EQ(AF_INET6, a[2].family);
+    ASSERT_EQ(16, a[2].iplen);
+    ASSERT_MEM_EQ(k_v6, a[2].ip, 16);
+    free(a);
+    PASS();
+}
+
+TEST collection_holds_more_addresses_than_its_first_allocation(void) {
+    stub_reset();
+    for (uint8_t i = 1; i <= 9; i++) { stub_v4("br0", i); }
+    char *names[] = {"br0"};
+    firc_remap_addr_t *a = NULL;
+    size_t n = 0;
+    firc_err_t err = firc_port_remap_collect(names, 1, true, &a, &n);
+    g_ifa_stub = false;
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)9, n, "%zu");
+    ASSERT_EQ(9, a[8].ip[3]);
+    free(a);
+    PASS();
+}
+
+TEST a_link_that_does_not_exist_is_skipped_and_named_in_the_log(void) {
+    stub_reset();
+    stub_family("nwg9", AF_PACKET);
+    stub_family("br0", AF_PACKET);
+    stub_v4("br0", 1);
+    char *names[] = {"nwg9", "gone0", "br0"};
+    firc_remap_addr_t *a = NULL;
+    size_t n = 0;
+    FILE *log = tmpfile();
+    ASSERT(log != NULL);
+    firc_log_set_fd(fileno(log));
+    firc_err_t err = firc_port_remap_collect(names, 3, true, &a, &n);
+    firc_log_set_fd(2);
+    g_ifa_stub = false;
+    char text[2048] = {0};
+    ssize_t got = pread(fileno(log), text, sizeof text - 1, 0);
+    fclose(log);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    free(a);
+    ASSERT(got > 0);
+    ASSERT(strstr(text, "link nwg9 has no address") != NULL);
+    ASSERT(strstr(text, "link gone0 has no address") != NULL);
+    ASSERT(strstr(text, "link br0") == NULL);
+    PASS();
+}
+
+TEST a_missing_link_is_not_logged_again_while_nothing_changes(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    stub_reset();
+    stub_v4("br0", 1);
+    FILE *log = tmpfile();
+    ASSERT(log != NULL);
+    firc_log_set_fd(fileno(log));
+    free(fx.cfg.app.link[0]);
+    fx.cfg.app.link[0] = strdup("gone0");
+    char **list = realloc(fx.cfg.app.link, 2 * sizeof(*list));
+    ASSERT(list != NULL);
+    fx.cfg.app.link = list;
+    list[1] = strdup("br0");
+    fx.cfg.app.n_link = 2;
+    firc_app_refresh_remap(fx.app, "br0");
+    firc_log_set_fd(2);
+    g_ifa_stub = false;
+    char text[2048] = {0};
+    ssize_t got = pread(fileno(log), text, sizeof text - 1, 0);
+    fclose(log);
+    ASSERT(got >= 0);
+    ASSERT(strstr(text, "has no address") == NULL);
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_link_losing_its_address_is_logged_when_it_happens(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    refresh_with_one_address(&fx, 1);
+    stub_reset();
+    FILE *log = tmpfile();
+    ASSERT(log != NULL);
+    firc_log_set_fd(fileno(log));
+    firc_app_refresh_remap(fx.app, "br0");
+    firc_log_set_fd(2);
+    g_ifa_stub = false;
+    char text[2048] = {0};
+    ssize_t got = pread(fileno(log), text, sizeof text - 1, 0);
+    fclose(log);
+    ASSERT(got > 0);
+    ASSERT(strstr(text, "link br0 has no address") != NULL);
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST only_links_that_do_not_exist_collect_nothing(void) {
+    stub_reset();
+    stub_v4("br0", 1);
+    char *names[] = {"gone0"};
+    firc_remap_addr_t *a = NULL;
+    size_t n = 7;
+    firc_err_t err = firc_port_remap_collect(names, 1, true, &a, &n);
+    g_ifa_stub = false;
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)0, n, "%zu");
+    free(a);
+    PASS();
+}
+
+TEST a_failed_read_of_the_interfaces_is_an_error(void) {
+    stub_reset();
+    g_ifa_fail = true;
+    char *names[] = {"br0"};
+    firc_remap_addr_t *a = NULL;
+    size_t n = 0;
+    firc_err_t err = firc_port_remap_collect(names, 1, true, &a, &n);
+    g_ifa_stub = false;
+    ASSERT(err != FIRC_OK);
     PASS();
 }
 
@@ -1684,6 +2125,28 @@ int main(int argc, char **argv) {
     RUN_TEST(a_pass_writes_the_dnat_chain_and_commits_the_pool);
     RUN_TEST(an_incremental_pass_sweeps_a_table_moved_since_its_write);
     RUN_TEST(port_remap_uses_the_configured_chain_prefix);
+    RUN_TEST(a_new_link_address_is_caught_by_the_next_pass);
+    RUN_TEST(a_moved_link_address_leaves_no_rule_for_the_old_one);
+    RUN_TEST(an_address_moved_while_dns_was_down_is_the_one_armed);
+    RUN_TEST(the_last_link_address_going_empties_the_chain_and_keeps_the_jump);
+    RUN_TEST(a_change_in_the_second_address_is_seen_and_both_are_written);
+    RUN_TEST(an_ipv6_change_past_the_fourth_byte_is_a_change);
+    RUN_TEST(the_same_bytes_in_another_family_are_a_change);
+    RUN_TEST(the_same_link_addresses_report_no_change);
+    RUN_TEST(a_change_takes_the_netfilter_lock_once_and_the_same_addresses_never);
+    RUN_TEST(the_committer_writes_a_new_link_address_by_itself);
+    RUN_TEST(the_same_addresses_ask_for_no_pass);
+    RUN_TEST(an_event_on_another_interface_reads_no_addresses);
+    RUN_TEST(a_re_read_of_everything_needs_no_interface_name);
+    RUN_TEST(a_failed_re_read_keeps_the_old_addresses);
+    RUN_TEST(a_daemon_without_the_redirect_ignores_link_events);
+    RUN_TEST(collection_reads_every_address_of_a_link_and_only_its_own);
+    RUN_TEST(collection_holds_more_addresses_than_its_first_allocation);
+    RUN_TEST(a_link_that_does_not_exist_is_skipped_and_named_in_the_log);
+    RUN_TEST(a_missing_link_is_not_logged_again_while_nothing_changes);
+    RUN_TEST(a_link_losing_its_address_is_logged_when_it_happens);
+    RUN_TEST(only_links_that_do_not_exist_collect_nothing);
+    RUN_TEST(a_failed_read_of_the_interfaces_is_an_error);
     RUN_TEST(the_remap_enables_after_the_start_clean_and_the_barrier);
     RUN_TEST(destroying_the_app_takes_the_dnat_chain_back);
     RUN_TEST(a_pass_puts_the_pool_reject_barrier_first_in_forward);

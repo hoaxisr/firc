@@ -317,6 +317,9 @@ firc_err_t firc_app_force_commit_iptables(firc_app_t *app);
 
 /* lets the rebuild reach the port-53 DNAT chain owned by main(); NULL disables remap53 */
 void firc_app_set_port_remap(firc_app_t *app, firc_port_remap_t *remap);
+/* re-reads the app.link addresses when iface is one of them (NULL: always); only a difference takes the lock
+ * and asks for a pass; loop thread */
+void firc_app_refresh_remap(firc_app_t *app, const char *iface);
 
 /* The ports tunvless<N> reported, by N (0: none); a change asks for a pass. Loop thread. */
 void firc_app_set_ktcp_ports(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEVICES]);

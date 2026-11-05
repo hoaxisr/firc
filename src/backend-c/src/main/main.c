@@ -788,6 +788,7 @@ static void resync(struct daemon *d, const char *iface_name)
                        firc_err_str(err));
         }
     }
+    firc_app_refresh_remap(d->app, iface_name);
     firc_tunrun_refresh_uplinks(d->tunrun, iface_name);
     (void)firc_app_retry_groups(d->app, iface_name);
     if (d->ifwatch != NULL) { firc_ifwatch_refresh(d->ifwatch, iface_name); }
@@ -896,6 +897,7 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
     struct daemon *d = ud;
     FIRC_DEBUG("interface %s: %s", up ? "up" : "down", iface_name);
     if (d->ifwatch != NULL) { firc_ifwatch_link(d->ifwatch, iface_name, up); }
+    firc_app_refresh_remap(d->app, iface_name);
     if (!up) { return; }
     for (size_t i = 0; i < firc_app_user_group_count(d->app); i++) {
         firc_ruleset_t *rs = firc_app_user_group_at(d->app, i);
@@ -914,83 +916,6 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
     /* An interface coming up is the likeliest reason a failed group's retry now holds. */
     (void)firc_app_retry_groups(d->app, iface_name);
     firc_app_republish_resolve_routes(d->app);
-}
-
-/* A configured link interface that does not exist is fatal at startup. */
-static firc_err_t collect_link_addrs(char *const *link_names, size_t n_link,
-                                   firc_remap_addr_t **out, size_t *out_n)
-{
-    *out = NULL;
-    *out_n = 0;
-    if (n_link == 0) {
-        return FIRC_OK;
-    }
-
-    for (size_t i = 0; i < n_link; i++) {
-        if (if_nametoindex(link_names[i]) == 0) {
-            FIRC_ERROR("failed to find link %s: %s", link_names[i],
-                     strerror(errno));
-            return firc_err_from_errno(errno);
-        }
-    }
-
-    struct ifaddrs *ifap;
-    if (getifaddrs(&ifap) != 0) {
-        return firc_err_from_errno(errno);
-    }
-
-    size_t cap = 0;
-    size_t n = 0;
-    firc_remap_addr_t *arr = NULL;
-    for (struct ifaddrs *p = ifap; p != NULL; p = p->ifa_next) {
-        if (p->ifa_addr == NULL) {
-            continue;
-        }
-        bool matched = false;
-        for (size_t i = 0; i < n_link; i++) {
-            if (strcmp(p->ifa_name, link_names[i]) == 0) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            continue;
-        }
-
-        firc_remap_addr_t a = {0};
-        if (p->ifa_addr->sa_family == AF_INET) {
-            struct sockaddr_in sin;
-            memcpy(&sin, p->ifa_addr, sizeof(sin));
-            a.family = AF_INET;
-            a.iplen = 4;
-            memcpy(a.ip, &sin.sin_addr, 4);
-        } else if (p->ifa_addr->sa_family == AF_INET6) {
-            struct sockaddr_in6 sin6;
-            memcpy(&sin6, p->ifa_addr, sizeof(sin6));
-            a.family = AF_INET6;
-            a.iplen = 16;
-            memcpy(a.ip, &sin6.sin6_addr, 16);
-        } else {
-            continue;
-        }
-
-        if (n == cap) {
-            size_t ncap = cap ? cap * 2 : 8;
-            firc_remap_addr_t *np = realloc(arr, ncap * sizeof(*np));
-            if (!np) {
-                free(arr);
-                freeifaddrs(ifap);
-                return FIRC_ERR_NOMEM;
-            }
-            arr = np;
-            cap = ncap;
-        }
-        arr[n++] = a;
-    }
-    freeifaddrs(ifap);
-    *out = arr;
-    *out_n = n;
-    return FIRC_OK;
 }
 
 static const char *auth_state_dir_fn(void *ud)
@@ -1522,7 +1447,7 @@ int main(int argc, char **argv)
     if (!cfg.app.dns_proxy.disable_remap53) {
         firc_remap_addr_t *addrs = NULL;
         size_t n_addrs = 0;
-        err = collect_link_addrs(cfg.app.link, cfg.app.n_link, &addrs, &n_addrs);
+        err = firc_port_remap_collect(cfg.app.link, cfg.app.n_link, true, &addrs, &n_addrs);
         if (err != FIRC_OK) {
             daemon_teardown(&d);
             firc_config_clear(&cfg);

@@ -2692,6 +2692,36 @@ void firc_app_set_port_remap(firc_app_t *app, firc_port_remap_t *remap) {
     app->port_remap = remap;
 }
 
+static void set_remap_addrs(firc_app_t *app, const firc_remap_addr_t *addrs, size_t n) {
+    app_nf_enter(app);
+    firc_err_t err = firc_port_remap_set_addrs(app->port_remap, addrs, n);
+    if (err == FIRC_OK) { app_request_more_locked(app); }
+    app_nf_leave(app);
+    if (err != FIRC_OK) { FIRC_WARN("port 53 redirect keeps its old addresses: %s", firc_err_str(err)); }
+}
+
+void firc_app_refresh_remap(firc_app_t *app, const char *iface) {
+    if (app->port_remap == NULL) { return; }
+    const firc_app_config_t *running = firc_app_running_settings(app);
+    bool listed = iface == NULL;
+    for (size_t i = 0; !listed && i < running->n_link; i++) { listed = strcmp(running->link[i], iface) == 0; }
+    if (!listed) { return; }
+
+    firc_remap_addr_t *addrs = NULL;
+    size_t n = 0;
+    firc_err_t err = firc_port_remap_collect(running->link, running->n_link, false, &addrs, &n);
+    bool same = err == FIRC_OK && firc_port_remap_same_addrs(app->port_remap, addrs, n);
+    free(addrs);
+    addrs = NULL;
+    if (err == FIRC_OK && !same) { err = firc_port_remap_collect(running->link, running->n_link, true, &addrs, &n); }
+    if (err != FIRC_OK) {
+        FIRC_WARN("port 53 redirect keeps its old addresses: %s", firc_err_str(err));
+    } else if (!same) {
+        set_remap_addrs(app, addrs, n);
+    }
+    free(addrs);
+}
+
 /* collected by the pass under nf_mu while it walks the registry: DNAT follows "routed" */
 typedef struct routed_ids {
     char (*ids)[FIRC_ID_STR_LEN];

@@ -1,10 +1,15 @@
 #include "firc/port_remap.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+
+#include "firc/log.h"
 
 struct firc_port_remap {
     char *chain_name;
@@ -51,6 +56,92 @@ firc_port_remap_t *firc_port_remap_new(const char *chain_prefix, uint16_t from, 
     p->ipt4 = ipt4;
     p->ipt6 = ipt6;
     return p;
+}
+
+static bool same_addr(const firc_remap_addr_t *a, const firc_remap_addr_t *b) {
+    return a->family == b->family && a->iplen == b->iplen && memcmp(a->ip, b->ip, a->iplen) == 0;
+}
+
+bool firc_port_remap_same_addrs(const firc_port_remap_t *p, const firc_remap_addr_t *addrs, size_t n) {
+    if (n != p->n_addrs) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        if (!same_addr(&addrs[i], &p->addrs[i])) { return false; }
+    }
+    return true;
+}
+
+firc_err_t firc_port_remap_set_addrs(firc_port_remap_t *p, const firc_remap_addr_t *addrs, size_t n) {
+    firc_remap_addr_t *copy = NULL;
+    if (n > 0) {
+        copy = calloc(n, sizeof(*copy));
+        if (copy == NULL) { return FIRC_ERR_NOMEM; }
+        memcpy(copy, addrs, n * sizeof(*copy));
+    }
+    free(p->addrs);
+    p->addrs = copy;
+    p->n_addrs = n;
+    return FIRC_OK;
+}
+
+static bool remap_addr_of(const struct ifaddrs *a, firc_remap_addr_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (a->ifa_addr == NULL) { return false; }
+    if (a->ifa_addr->sa_family == AF_INET) {
+        struct sockaddr_in sin;
+        memcpy(&sin, a->ifa_addr, sizeof(sin));
+        out->family = AF_INET;
+        out->iplen = 4;
+        memcpy(out->ip, &sin.sin_addr, 4);
+        return true;
+    }
+    if (a->ifa_addr->sa_family == AF_INET6) {
+        struct sockaddr_in6 sin6;
+        memcpy(&sin6, a->ifa_addr, sizeof(sin6));
+        out->family = AF_INET6;
+        out->iplen = 16;
+        memcpy(out->ip, &sin6.sin6_addr, 16);
+        return true;
+    }
+    return false;
+}
+
+firc_err_t firc_port_remap_collect(char *const *names, size_t n_names, bool warn, firc_remap_addr_t **out,
+                                   size_t *out_n) {
+    *out = NULL;
+    *out_n = 0;
+    if (n_names == 0) { return FIRC_OK; }
+
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0) { return firc_err_from_errno(errno); }
+
+    size_t cap = 0;
+    size_t n = 0;
+    firc_remap_addr_t *arr = NULL;
+    for (size_t i = 0; i < n_names; i++) {
+        bool found = false;
+        for (const struct ifaddrs *a = ifap; a != NULL; a = a->ifa_next) {
+            firc_remap_addr_t addr;
+            if (strcmp(a->ifa_name, names[i]) != 0 || !remap_addr_of(a, &addr)) { continue; }
+            found = true;
+            if (n == cap) {
+                size_t ncap = cap ? cap * 2 : 8;
+                firc_remap_addr_t *grown = realloc(arr, ncap * sizeof(*grown));
+                if (grown == NULL) {
+                    free(arr);
+                    freeifaddrs(ifap);
+                    return FIRC_ERR_NOMEM;
+                }
+                arr = grown;
+                cap = ncap;
+            }
+            arr[n++] = addr;
+        }
+        if (!found && warn) { FIRC_WARN("link %s has no address: DNS sent to it is not redirected", names[i]); }
+    }
+    freeifaddrs(ifap);
+    *out = arr;
+    *out_n = n;
+    return FIRC_OK;
 }
 
 void firc_port_remap_free(firc_port_remap_t *p) {
