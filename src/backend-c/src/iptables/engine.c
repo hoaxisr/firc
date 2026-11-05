@@ -555,6 +555,14 @@ void firc_ipt_take_report(firc_ipt_t *ipt, char *out, size_t cap) {
     ipt->report[0] = '\0';
 }
 
+bool firc_ipt_tables_moved(firc_ipt_t *ipt) {
+    if (ipt == NULL) { return false; }
+    for (int t = 0; t < N_TABLES; t++) {
+        if (ipt->known[t] && !firc_xt_shape_is(ipt->xt, k_tables[t], &ipt->shape[t])) { return true; }
+    }
+    return false;
+}
+
 static firc_err_t commit_kind(firc_ipt_t *ipt, bool full) {
     if (ipt == NULL) { return FIRC_ERR_INVAL; }
     ipt->refusal = 0;

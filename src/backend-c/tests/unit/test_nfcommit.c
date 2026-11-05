@@ -49,6 +49,7 @@ typedef struct {
     int gate_at;
     firc_cancel_t *cancel;
     struct timespec started_at[32];
+    void *watch;
 } probe_t;
 
 static void probe_init(probe_t *p) {
@@ -907,6 +908,172 @@ TEST a_completed_pass_starts_the_bound_over(void) {
     PASS();
 }
 
+typedef struct {
+    atomic_int polls;
+    atomic_int moved_left;
+} watch_probe_t;
+
+static bool watch_fn(void *ud) {
+    probe_t *p = ud;
+    watch_probe_t *w = p->watch;
+    atomic_fetch_add(&w->polls, 1);
+    int left = atomic_load(&w->moved_left);
+    if (left > 0) { atomic_store(&w->moved_left, left - 1); }
+    return left > 0;
+}
+
+static void await_polls(watch_probe_t *w, int n) {
+    for (int i = 0; i < 4000 && atomic_load(&w->polls) < n; i++) {
+        nanosleep(&(struct timespec){.tv_nsec = 1000000L}, NULL);
+    }
+}
+
+TEST a_moved_table_gets_a_full_pass_with_no_request(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 1);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_delays_for_test(c, 1, 4);
+    firc_nfcommit_set_watch(c, watch_fn, 1);
+    firc_nfcommit_start(c);
+    AWAIT(&p, p.finished >= 1);
+    await_polls(&w, atomic_load(&w.polls) + 3);
+    ASSERT_EQ_FMT(1, p.full_passes, "%d");
+    ASSERT_EQ_FMT(0, p.partial_passes, "%d");
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+TEST an_unmoved_table_gets_no_pass(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_delays_for_test(c, 1, 4);
+    firc_nfcommit_set_watch(c, watch_fn, 1);
+    firc_nfcommit_start(c);
+    await_polls(&w, 5);
+    ASSERT(atomic_load(&w.polls) >= 5);
+    ASSERT_EQ_FMT(0, p.started, "%d");
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+TEST the_watch_looks_once_an_interval(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_watch(c, watch_fn, 50);
+    firc_nfcommit_start(c);
+    nanosleep(&(struct timespec){.tv_nsec = 240000000L}, NULL);
+    int polls = atomic_load(&w.polls);
+    tracked_free(c);
+    probe_destroy(&p);
+    ASSERT(polls >= 2 && polls <= 20);
+    PASS();
+}
+
+TEST the_watch_keeps_looking_after_a_pass(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_delays_for_test(c, 1, 4);
+    firc_nfcommit_set_watch(c, watch_fn, 1);
+    firc_nfcommit_start(c);
+    atomic_store(&w.moved_left, 1);
+    AWAIT(&p, p.finished >= 1);
+    atomic_store(&w.moved_left, 1);
+    AWAIT(&p, p.finished >= 2);
+    ASSERT_EQ_FMT(2, p.full_passes, "%d");
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+TEST the_watch_does_not_look_during_a_pass(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    p.gate_at = 1;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_delays_for_test(c, 1, 4);
+    firc_nfcommit_set_watch(c, watch_fn, 1);
+    firc_nfcommit_request(c);
+    firc_nfcommit_start(c);
+    AWAIT(&p, p.started >= 1);
+    atomic_store(&w.polls, 0);
+    nanosleep(&(struct timespec){.tv_nsec = 30000000L}, NULL);
+    ASSERT_EQ_FMT(0, atomic_load(&w.polls), "%d");
+    set_gate(&p, 0);
+    AWAIT(&p, p.finished >= 1);
+    await_polls(&w, 2);
+    ASSERT(atomic_load(&w.polls) >= 2);
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+TEST a_request_is_served_without_a_look(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_delays_for_test(c, 1, 4);
+    firc_nfcommit_set_watch(c, watch_fn, 60000);
+    firc_nfcommit_start(c);
+    nanosleep(&(struct timespec){.tv_nsec = 30000000L}, NULL);
+    firc_nfcommit_request(c);
+    AWAIT(&p, p.finished >= 1);
+    ASSERT_EQ_FMT(0, atomic_load(&w.polls), "%d");
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
+TEST stop_does_not_wait_out_the_watch(void) {
+    static probe_t p;
+    static watch_probe_t w;
+    probe_init(&p);
+    atomic_store(&w.polls, 0);
+    atomic_store(&w.moved_left, 0);
+    p.watch = &w;
+    firc_nfcommit_t *c = tracked_new(probe_rebuild, &p);
+    firc_nfcommit_set_watch(c, watch_fn, 60000);
+    firc_nfcommit_start(c);
+    nanosleep(&(struct timespec){.tv_nsec = 30000000L}, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_nfcommit_stop(c);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ASSERT(t1.tv_sec - t0.tv_sec < 5);
+    ASSERT_EQ_FMT(0, atomic_load(&w.polls), "%d");
+    tracked_free(c);
+    probe_destroy(&p);
+    PASS();
+}
+
 /* Catches: first_pending false at start, cleared by a failed pass, or left set after a completed one. */
 TEST the_first_write_is_pending_until_a_pass_completes(void) {
     static probe_t p;
@@ -1172,5 +1339,12 @@ int main(int argc, char **argv) {
     RUN_TEST(races_past_the_bound_are_failing);
     RUN_TEST(a_completed_pass_starts_the_bound_over);
     RUN_TEST(the_first_write_is_pending_until_a_pass_completes);
+    RUN_TEST(a_moved_table_gets_a_full_pass_with_no_request);
+    RUN_TEST(an_unmoved_table_gets_no_pass);
+    RUN_TEST(the_watch_looks_once_an_interval);
+    RUN_TEST(the_watch_keeps_looking_after_a_pass);
+    RUN_TEST(the_watch_does_not_look_during_a_pass);
+    RUN_TEST(a_request_is_served_without_a_look);
+    RUN_TEST(stop_does_not_wait_out_the_watch);
     GREATEST_MAIN_END();
 }

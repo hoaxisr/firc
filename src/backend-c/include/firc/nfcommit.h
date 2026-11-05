@@ -33,6 +33,13 @@ void firc_nfcommit_request_more(firc_nfcommit_t *c);
 /* Thread-safe, non-blocking, NULL-safe: a pass for new fake addresses; settles FIRC_NFCOMMIT_ADDR_DELAY_MS only if the last pass ended FIRC_NFCOMMIT_ADDR_IDLE_MS ago, else long. */
 void firc_nfcommit_request_addresses(firc_nfcommit_t *c);
 
+/* Asked on the committer thread between passes: did another writer change a table? */
+typedef bool (*firc_nfcommit_watch_fn)(void *ud);
+
+/* Call before start. Every interval_ms with nothing pending, fn gets the rebuild's ud; true asks for a full pass. */
+void firc_nfcommit_set_watch(firc_nfcommit_t *c, firc_nfcommit_watch_fn fn, unsigned interval_ms);
+
+#define FIRC_NFCOMMIT_WATCH_MS 1000u
 #define FIRC_NFCOMMIT_ADDR_DELAY_MS 25u
 #define FIRC_NFCOMMIT_ADDR_IDLE_MS 300u
 

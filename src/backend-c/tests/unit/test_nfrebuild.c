@@ -819,6 +819,29 @@ TEST an_incremental_pass_sweeps_a_table_moved_since_its_write(void) {
     PASS();
 }
 
+TEST a_foreign_write_shows_as_a_moved_table_until_the_next_pass(void) {
+    fixture_t fx;
+    fixture_up(&fx);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_FALSE(firc_ipt_tables_moved(fx.ipt));
+    seed_stale_chain(fx.fake);
+    ASSERT(firc_ipt_tables_moved(fx.ipt));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(fx.app, NULL, true));
+    ASSERT_FALSE(firc_ipt_tables_moved(fx.ipt));
+    fixture_down(&fx);
+    PASS();
+}
+
+TEST a_table_firc_never_wrote_has_not_moved(void) {
+    firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(fake), "FIRC_");
+    seed_stale_chain(fake);
+    ASSERT_FALSE(firc_ipt_tables_moved(ipt));
+    ASSERT_FALSE(firc_ipt_tables_moved(NULL));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 /* Catches: the DNS remap at start finding nat PREROUTING unregistered after the clean and the barrier used it up. */
 TEST the_remap_enables_after_the_start_clean_and_the_barrier(void) {
     firc_fake_ipt_t *fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
@@ -2124,6 +2147,8 @@ int main(int argc, char **argv) {
     RUN_TEST(rebuild_aborts_on_a_raised_cancel);
     RUN_TEST(a_pass_writes_the_dnat_chain_and_commits_the_pool);
     RUN_TEST(an_incremental_pass_sweeps_a_table_moved_since_its_write);
+    RUN_TEST(a_foreign_write_shows_as_a_moved_table_until_the_next_pass);
+    RUN_TEST(a_table_firc_never_wrote_has_not_moved);
     RUN_TEST(port_remap_uses_the_configured_chain_prefix);
     RUN_TEST(a_new_link_address_is_caught_by_the_next_pass);
     RUN_TEST(a_moved_link_address_leaves_no_rule_for_the_old_one);

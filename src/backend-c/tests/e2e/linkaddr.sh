@@ -88,6 +88,17 @@ ip addr del 10.71.0.1/24 dev late0
 check "a new address is redirected" 2 "$(wait_rules 10.72.0.1 2)"
 check "the old address is not" 0 "$(wait_rules 10.71.0.1 0)"
 
+iptables-legacy -t nat -D PREROUTING -j FIRC_DNSOR
+iptables-legacy -t nat -F FIRC_DNSOR
+check "rules wiped by another writer come back with no hook" 2 "$(wait_rules 10.70.0.1 2)"
+check "and so does the jump" 1 "$(iptables-legacy-save -t nat 2>/dev/null | grep -c -- '-A PREROUTING -j FIRC_DNSOR')"
+
+before=$(grep -c 'changed with no hook' "$W/fircd.log")
+ip6tables-legacy -t nat -N FOREIGN6
+i=0
+while [ "$i" -lt 50 ] && [ "$(grep -c 'changed with no hook' "$W/fircd.log")" = "$before" ]; do i=$((i + 1)); sleep 0.1; done
+check "an IPv6 table is watched too" 1 "$(( $(grep -c 'changed with no hook' "$W/fircd.log") - before ))"
+
 ip link del late0
 check "a deleted interface leaves no rule" 0 "$(wait_rules 10.72.0.1 0)"
 check "a deleted interface is named once" 1 "$(grep -c 'link late0 has no address' "$W/fircd.log")"

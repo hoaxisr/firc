@@ -4539,6 +4539,14 @@ static firc_err_t rebuild_netfilter_cb(void *ud, firc_cancel_t *cancel, bool ful
     return firc_app_rebuild_netfilter_kind(ud, cancel, full);
 }
 
+static bool tables_moved_cb(void *ud) {
+    firc_app_t *app = ud;
+    pthread_mutex_lock(&app->nf_mu);
+    bool moved = firc_ipt_tables_moved(app->ipt4) || firc_ipt_tables_moved(app->ipt6);
+    pthread_mutex_unlock(&app->nf_mu);
+    return moved;
+}
+
 /* only after a full pass: an incremental one leaves the kernel with our rules, so sweeping it would drop live flows */
 /* ponytail: a whole-table dump on the DNS loop thread, cost unmeasured */
 static void sweep_fail_open_flows(firc_app_t *app) {
@@ -4711,6 +4719,8 @@ firc_err_t firc_app_start_netfilter_committer(firc_app_t *app) {
         pthread_mutex_destroy(&app->nf_mu);
         return FIRC_ERR_NOMEM;
     }
+
+    firc_nfcommit_set_watch(app->committer, tables_moved_cb, FIRC_NFCOMMIT_WATCH_MS);
 
     app->nf_mu_ready = true; /* published before the thread starts, so the first webhook request already takes the lock */
 

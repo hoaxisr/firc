@@ -19,6 +19,8 @@
 struct firc_nfcommit {
     firc_nfcommit_rebuild_fn rebuild;
     void *ud;
+    firc_nfcommit_watch_fn watch;
+    unsigned watch_ms;
 
     firc_cancel_t *cancel;
 
@@ -254,6 +256,12 @@ void firc_nfcommit_request_addresses(firc_nfcommit_t *c) {
     pthread_mutex_unlock(&c->mu);
 }
 
+void firc_nfcommit_set_watch(firc_nfcommit_t *c, firc_nfcommit_watch_fn fn, unsigned interval_ms) {
+    if (!c) { return; }
+    c->watch = fn;
+    c->watch_ms = interval_ms;
+}
+
 void firc_nfcommit_interrupt(firc_nfcommit_t *c) {
     if (!c) { return; }
 
@@ -263,8 +271,7 @@ void firc_nfcommit_interrupt(firc_nfcommit_t *c) {
     pthread_mutex_unlock(&c->mu);
 }
 
-/* Returns false on exit; a new request does not cut the wait short. */
-static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
+static struct timespec deadline_after(unsigned delay_ms) {
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += (time_t)(delay_ms / 1000u);
@@ -273,6 +280,12 @@ static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
         deadline.tv_sec += 1;
         deadline.tv_nsec -= 1000000000L;
     }
+    return deadline;
+}
+
+/* Returns false on exit; a new request does not cut the wait short. */
+static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
+    struct timespec deadline = deadline_after(delay_ms);
 
     pthread_mutex_lock(&c->mu);
     while (!c->stopping) {
@@ -284,13 +297,33 @@ static bool settle(firc_nfcommit_t *c, unsigned delay_ms) {
     return go_on;
 }
 
+static void wait_for_work(firc_nfcommit_t *c) {
+    struct timespec deadline = deadline_after(c->watch_ms);
+    while (!c->pending && !c->stopping) {
+        if (c->watch == NULL) {
+            pthread_cond_wait(&c->cv, &c->mu);
+            continue;
+        }
+        if (pthread_cond_timedwait(&c->cv, &c->mu, &deadline) != ETIMEDOUT) { continue; }
+        pthread_mutex_unlock(&c->mu);
+        bool moved = c->watch(c->ud);
+        pthread_mutex_lock(&c->mu);
+        if (moved) {
+            FIRC_DEBUG("a netfilter table changed with no hook, writing it again");
+            c->pending = true;
+            c->full_owed = true;
+        }
+        deadline = deadline_after(c->watch_ms);
+    }
+}
+
 static void *committer_main(void *arg) {
     firc_nfcommit_t *c = arg;
     unsigned backoff_ms = 0;
 
     for (;;) {
         pthread_mutex_lock(&c->mu);
-        while (!c->pending && !c->stopping) { pthread_cond_wait(&c->cv, &c->mu); }
+        wait_for_work(c);
         bool stopping = c->stopping;
         pthread_mutex_unlock(&c->mu);
         if (stopping) { break; }
