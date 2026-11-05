@@ -218,27 +218,6 @@ static uint64_t room(size_t base, uint32_t from, uint32_t to) {
     return sum;
 }
 
-static int ua_profile(const char *h, char *why, size_t why_n) {
-    static const char *const lacking[] = { "firefox", "safari", "curl", "golang" };
-    while (h && *h) {
-        const char *e = strchr(h, '\n'), *c = strchr(h, ':');
-        size_t len = e ? (size_t)(e - h) : strlen(h);
-        if (c && (size_t)(c - h) == 10 && c < h + len && !strncasecmp(h, "User-Agent", 10)) {
-            const char *v = c + 1;
-            while (v < h + len && *v == ' ') v++;
-            size_t vn = (size_t)(h + len - v);
-            for (size_t i = 0; i < 4; i++)
-                if (vn == strlen(lacking[i]) && !memcmp(v, lacking[i], vn)) {
-                    snprintf(why, why_n, "xhttp: unsupported User-Agent profile: %.*s", (int)vn, v);
-                    return -1;
-                }
-        }
-        if (!e) break;
-        h = e + 1;
-    }
-    return 0;
-}
-
 static int split(const char *xhx, struct xh_raw *r, char *why, size_t why_n) {
     memset(r, 0, sizeof *r);
     for (const char *s = xhx; s && *s;) {
@@ -259,8 +238,8 @@ static int split(const char *xhx, struct xh_raw *r, char *why, size_t why_n) {
     return 0;
 }
 
-int xh_opts_parse(const char *xhx, const char *mode, const char *headers, uint16_t pad_to,
-                  struct xh_opts *o, char *why, size_t why_n) {
+int xh_opts_parse(const char *xhx, const char *mode, uint16_t pad_to, struct xh_opts *o, char *why,
+                  size_t why_n) {
     struct xh_raw r;
     int packet_up = mode && !strcmp(mode, "packet-up");
     memset(o, 0, sizeof *o);
@@ -378,5 +357,5 @@ int xh_opts_parse(const char *xhx, const char *mode, const char *headers, uint16
         return -1;
     }
 
-    return ua_profile(headers, why, why_n);
+    return 0;
 }

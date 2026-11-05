@@ -1302,11 +1302,12 @@ static void check_block(const char *what, const char *hex) {
 }
 
 static const struct h2_req G1 = { .authority = "a.example", .path = "/xp/1", .method = "GET",
-                                  .end_stream = 1, .no_look = 1 };
+                                  .end_stream = 1, .look = H2L_NONE };
 static const struct h2_req G2 = { .authority = "a.example", .path = "/xp/2", .method = "GET",
-                                  .end_stream = 1, .no_look = 1 };
-#define G1_BLOCK "41 87 1a e5 f2 3a 6b a0 bf 82 45 84 63 cd 6c 07 87 50 83 9b d9 ab"
-#define G2_BLOCK "c0 82 45 84 63 cd 6c 0b 87 bf"
+                                  .end_stream = 1, .look = H2L_NONE };
+#define G1_BLOCK "41 87 1a e5 f2 3a 6b a0 bf 82 45 84 63 cd 6c 07 87 50 83 9b d9 ab " \
+    "7a 8d c4 75 a7 4a 6b 58 94 18 b5 25 81 2e 0f"
+#define G2_BLOCK "c1 82 45 84 63 cd 6c 0b 87 c0 bf"
 
 static void t_go_blocks(void) {
     static unsigned char in[64];
@@ -1324,7 +1325,7 @@ static void t_go_blocks(void) {
     check_block("go blocks: second GET after the update", "3f e1 1f " G2_BLOCK);
     r_clear(&g_r);
     open1(&g_m, &put);
-    check_block("go blocks: PUT with content-length 0", "c1 43 03 50 55 54 bf 87 5c 01 30 c1");
+    check_block("go blocks: PUT with content-length 0", "c2 43 03 50 55 54 bf 87 5c 01 30 c2 c1");
     check("go blocks: PUT END_STREAM|END_HEADERS", 0x05, g_r.sent[4]);
     h2m_free(&g_m);
 }
@@ -1360,7 +1361,7 @@ static void t_continuation_one_block(void) {
     hr_ctx_init(&hc, 4096);
     r_clear(&g_r);
     check("continuation: opened", 0, h2m_open(&g_m, &r, &(uint16_t){0}));
-    check_str("continuation: one unit, END on the last piece", "9:0 16384:0 9:0 3648:4 ", g_r.calls);
+    check_str("continuation: one unit, END on the last piece", "9:0 16384:0 9:0 3663:4 ", g_r.calls);
     check("continuation: HEADERS 16384", 16384, (long)h2w_frame_len(g_r.sent));
     check("continuation: HEADERS END_STREAM without END_HEADERS", 0x01, g_r.sent[4]);
     check("continuation: then CONTINUATION", 0x09, g_r.sent[9 + 16384 + 3]);
@@ -1368,19 +1369,20 @@ static void t_continuation_one_block(void) {
     check("continuation: same stream", 1, (long)get32(g_r.sent + 9 + 16384 + 5));
     size_t bn = sent_block(&g_r);
     check("continuation: joined block decodes", 0, hr_decode_ctx(&hc, g_blk_out, bn, &hb));
-    check("continuation: six fields", 6, (long)hb.n);
-    check_str("continuation: :path", "/xp/1", hb.n == 6 ? hb.f[2].value : "");
-    check_str("continuation: x-big", "x-big", hb.n == 6 ? hb.f[4].name : "");
-    check("continuation: x-big value", 1, hb.n == 6 && strcmp(hb.f[4].value, g_huge) == 0);
-    check_str("continuation: accept-encoding last", "gzip", hb.n == 6 ? hb.f[5].value : "");
+    check("continuation: seven fields", 7, (long)hb.n);
+    check_str("continuation: :path", "/xp/1", hb.n == 7 ? hb.f[2].value : "");
+    check_str("continuation: x-big", "x-big", hb.n == 7 ? hb.f[4].name : "");
+    check("continuation: x-big value", 1, hb.n == 7 && strcmp(hb.f[4].value, g_huge) == 0);
+    check_str("continuation: accept-encoding sixth", "gzip", hb.n == 7 ? hb.f[5].value : "");
+    check_str("continuation: Go's user-agent last", "Go-http-client/2.0", hb.n == 7 ? hb.f[6].value : "");
     check("continuation: SETTINGS 0x5 1048576", 0, feed(&g_m, in, fr_setting(in, 0x05, 1048576)));
     r_clear(&g_r);
     check("continuation: reopened", 0, h2m_open(&g_m, &r, &(uint16_t){0}));
-    check_str("continuation: one HEADERS at the larger frame size", "9:0 20015:4 ", g_r.calls);
+    check_str("continuation: one HEADERS at the larger frame size", "9:0 20016:4 ", g_r.calls);
     check("continuation: END_STREAM|END_HEADERS", 0x05, g_r.sent[4]);
     bn = sent_block(&g_r);
     check("continuation: second block decodes on the same table", 0, hr_decode_ctx(&hc, g_blk_out, bn, &hb));
-    check("continuation: second x-big value", 1, hb.n == 6 && strcmp(hb.f[4].value, g_huge) == 0);
+    check("continuation: second x-big value", 1, hb.n == 7 && strcmp(hb.f[4].value, g_huge) == 0);
     h2m_free(&g_m);
 }
 
@@ -1561,9 +1563,9 @@ static void t_inbound_frame_size(void) {
 }
 
 static const struct h2_req NL_GET = { .authority = "a.example", .path = "/c", .method = "GET",
-                                      .end_stream = 1, .no_look = 1 };
+                                      .end_stream = 1, .look = H2L_NONE };
 static const struct h2_req NL_POST = { .authority = "a.example", .path = "/c", .method = "POST",
-                                       .no_look = 1 };
+                                       .look = H2L_NONE };
 
 static size_t rst_ping(unsigned char *o, uint32_t sid, const unsigned char op[8]) {
     size_t n = fr_u32(o, 0x03, sid, 8);

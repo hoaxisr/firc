@@ -645,6 +645,8 @@ int xconn_adopt(struct xconn *x, uint64_t now_ms) {
     return 0;
 }
 
+static void low_water(void);
+
 static void fail_in(struct xconn *x, int err) {
     if (x->state == XC_DEAD) return;
     if (!err) err = TR_EIO;
@@ -677,6 +679,7 @@ static void fail_in(struct xconn *x, int err) {
     }
     x->state = XC_DEAD;
     x->rc = err;
+    if (x->shared) low_water();
 }
 
 void xconn_fail(struct xconn *x, int err) {
@@ -961,6 +964,7 @@ void xconn_free(struct xconn *x) {
     free(x);
     if (shared && g_links && !--g_links) free_list_drop();
     if (shared) {
+        low_water();
         budget();
         wq_run();
     }
@@ -1045,8 +1049,8 @@ static long admit(const struct xconn *x, uint16_t owner, struct xc_st *e) {
     if (c < 0) c = 0;
     long a = (c < free_q ? c : free_q) / (long)uploaders(x, owner);
     if (a >= XC_MSS) return a;
-    if (e && free_q < c) e->starved = 1;
-    else if (e) e->win_wait = 1;
+    if (free_q < c) e->starved = 1;
+    else e->win_wait = 1;
     return XC_MSS;
 }
 
@@ -1064,6 +1068,10 @@ long xs_room(const struct xs *s) {
         long a = admit(x, e->owner, e);
         if (w < a) e->win_wait = 1;
         return a < w ? a : w;
+    }
+    if (g_queued >= XC_OUT_HIGH) {
+        e->starved = 1;
+        return 0;
     }
     long a = admit(x, e->owner, e);
     if (w < a) e->win_wait = 1;
@@ -1085,13 +1093,14 @@ int xc_slot_free(const struct xconn *x) {
 
 size_t xc_pend_free(void) { return g_pend < g_pend_max ? g_pend_max - g_pend : 0; }
 
-long xc_room_new(const struct xconn *x, uint16_t owner) {
+long xc_post_room(const struct xconn *x, size_t n) {
     if (x->state != XC_LIVE || x->retired || x->h2.goaway || h2m_open_n(&x->h2) >= h2m_cap(&x->h2)) return 0;
+    long iw = x->h2.peer_init_win;
     long c = h2m_conn_room(&x->h2) - (long)x->pend_n;
-    long w = x->h2.peer_init_win < c ? x->h2.peer_init_win : c;
-    if (w <= 0) return 0;
-    long a = admit(x, owner, NULL);
-    return a < w ? a : w;
+    long g = iw < c ? iw : c;
+    long need = n < XC_CHUNK ? (long)n : XC_CHUNK;
+    if (!n || g < need) return 0;
+    return (long)n < iw ? (long)n : iw;
 }
 
 static int send_src(const struct xs *s, const unsigned char *d, struct xc_q *q, size_t n, int end) {
@@ -1196,6 +1205,17 @@ int xc_q_copy(struct xc_q *dst, const struct xc_q *src, size_t n) {
 size_t xc_q_pop(struct xc_q *q, unsigned char *out, size_t cap) { return q_pop(q, out, cap); }
 
 void xc_q_drop(struct xc_q *q) { q_clear(q); }
+
+size_t xc_q_skip(struct xc_q *q, size_t n) {
+    size_t got = 0;
+    while (got < n && q->head) {
+        struct xc_chunk *h = q->head;
+        size_t k = h->len - h->off < n - got ? h->len - h->off : n - got;
+        q_skip(q, k);
+        got += k;
+    }
+    return got;
+}
 
 int xs_status(const struct xs *s) {
     struct xc_st *e = ent(s);

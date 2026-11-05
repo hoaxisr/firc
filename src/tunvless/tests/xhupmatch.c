@@ -153,7 +153,7 @@ static void conn_init(struct transport *c, enum xhttp_mode xh, int fd) {
     c->xh.wait_ms = 1000;
     c->xh.priv[0] = pair_link(fd);
     snprintf(c->xh.main_side.authority, sizeof(c->xh.main_side.authority), "stand.example");
-    xh_opts_parse(NULL, "", NULL, 0, &c->xh.main_side.opts, NULL, 0);
+    xh_opts_parse(NULL, "", 0, &c->xh.main_side.opts, NULL, 0);
     snprintf(c->xh.main_side.base_path, sizeof(c->xh.main_side.base_path), "/xh/");
     snprintf(c->xh.sid, sizeof(c->xh.sid), "0f1e2d3c");
 }
@@ -783,6 +783,81 @@ static void t_literal_ua_drops_look(void) {
     check(rc == 0 && ua && !strcmp(ua, "MyApp/1") && hr_find(&g_hb, "sec-ch-ua") < 0 && !fetch,
           "literal User-Agent: ours, no sec-ch-ua, no sec-fetch-*");
     xclose(fds);
+}
+
+static int named_n(const struct hr_block *b, const char *name) {
+    int k = 0;
+    for (size_t i = 0; i < b->n; i++) k += !strcmp(b->f[i].name, name);
+    return k;
+}
+
+static int prefixed_n(const struct hr_block *b, const char *pre) {
+    int k = 0;
+    for (size_t i = 0; i < b->n; i++) k += !strncmp(b->f[i].name, pre, strlen(pre));
+    return k;
+}
+
+static void t_golang_ua_go_default(void) {
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("packet-up", NULL, "User-Agent: golang\n");
+    /* catches: golang refused, sent as a literal "golang", or given the Chrome look */
+    int rc = xopen(&c, &n, fds);
+    down_block(&g_hb);
+    check(rc == 0 && g_hb.n > 0 && !strcmp(g_hb.f[g_hb.n - 1].name, "user-agent") &&
+          !strcmp(g_hb.f[g_hb.n - 1].value, "Go-http-client/2.0"),
+          "User-Agent golang: Go's user-agent last");
+    check(named_n(&g_hb, "user-agent") == 1 && hr_find(&g_hb, "sec-ch-ua") < 0 &&
+          !prefixed_n(&g_hb, "sec-fetch-") && hr_find(&g_hb, "accept-language") < 0,
+          "User-Agent golang: one user-agent, no look");
+    xclose(fds);
+}
+
+static void t_first_ua_line_decides(void) {
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("packet-up", NULL, "User-Agent: chrome\nUser-Agent: Foo\n");
+    /* catches: a later User-Agent line flipping the look */
+    int rc = xopen(&c, &n, fds);
+    down_block(&g_hb);
+    const char *ua = fval(&g_hb, "user-agent");
+    check(rc == 0 && ua && !strcmp(ua, UA_CHROME) && named_n(&g_hb, "user-agent") == 1 &&
+          hr_find(&g_hb, "sec-ch-ua") >= 0, "chrome then Foo: the Chrome look, one user-agent");
+    xclose(fds);
+    n = xnode("packet-up", NULL, "User-Agent: Foo\nUser-Agent: chrome\n");
+    rc = xopen(&c, &n, fds);
+    down_block(&g_hb);
+    ua = fval(&g_hb, "user-agent");
+    check(rc == 0 && ua && !strcmp(ua, "Foo") && named_n(&g_hb, "user-agent") == 1 &&
+          hr_find(&g_hb, "sec-ch-ua") < 0 && !prefixed_n(&g_hb, "sec-fetch-"),
+          "Foo then chrome: no look, one user-agent Foo");
+    xclose(fds);
+}
+
+static void t_ua_word_picks_look(void) {
+    static const struct { const char *hdr, *ua; int n, dnt, fetch, chua; const char *what; } W[] = {
+        { "User-Agent: edge\n", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/149.0.0.0 Safari/537.36Edg/149.0.0.0", 1, 1, 3, 1, "User-Agent edge: Edge's look" },
+        { "User-Agent: firefox\n", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
+          1, 1, 3, 0, "User-Agent firefox: Firefox's look" },
+        { "User-Agent: safari\n", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+          "(KHTML, like Gecko) Version/26.6 Safari/605.1.15", 1, 0, 3, 0, "User-Agent safari: Safari's look" },
+        { "User-Agent: curl\n", "curl/8.20.0", 1, 0, 0, 0, "User-Agent curl: curl's user-agent only" },
+        { "User-Agent: Firefox\n", "Firefox", 1, 0, 0, 0, "User-Agent Firefox: a literal, no look" },
+    };
+    /* catches: a word matched without case, or a look not reaching the request */
+    for (size_t i = 0; i < sizeof W / sizeof *W; i++) {
+        int fds[2];
+        struct transport c;
+        struct tr_node n = xnode("packet-up", NULL, W[i].hdr);
+        int rc = xopen(&c, &n, fds);
+        down_block(&g_hb);
+        const char *ua = fval(&g_hb, "user-agent");
+        check(rc == 0 && ua && !strcmp(ua, W[i].ua) && named_n(&g_hb, "user-agent") == W[i].n &&
+              named_n(&g_hb, "dnt") == W[i].dnt && prefixed_n(&g_hb, "sec-fetch-") == W[i].fetch &&
+              (hr_find(&g_hb, "sec-ch-ua") >= 0) == W[i].chua, W[i].what);
+        xclose(fds);
+    }
 }
 
 static void t_chrome_ua_keeps_look(void) {
@@ -1658,6 +1733,9 @@ int main(void) {
     t_custom_accept_replaces();
     t_ipv6_authority_in_brackets();
     t_literal_ua_drops_look();
+    t_golang_ua_go_default();
+    t_first_ua_line_decides();
+    t_ua_word_picks_look();
     t_chrome_ua_keeps_look();
     t_room_worst_padding();
     t_packet_up_order();

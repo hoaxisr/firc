@@ -30,16 +30,9 @@
  * (`/static/v1/cache/<hash>`) answered them with RST/GOAWAY even though Reality accepted us;
  * something in front of the server cut them.
  *
- * The set is Xray's (transport/internet/splithttp/config.go: GetRequestHeader →
- * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(chrome, fetch)), repeated
- * name by name. Xray derives the Chrome version from the date (144 on 2026-01-13, plus one per
- * 35 days, minus a CPU-seeded lag; see h2.h); 149 is its highest value for early September
- * 2026. sec-ch-ua follows its rule: three brands, one fake, shuffled by the version number
- * (seed 149 gives exactly this order).
- *
- * The strings (UA_CHROME, UA_CH_CHROME) are in h2.h: the Upgrade requests of ws and
- * httpupgrade (proto/transport/trupgrade.c) use the same look, and two transports of one node
- * must not disagree on the browser version. */
+ * The sets are Xray's (transport/internet/splithttp/config.go: GetRequestHeader →
+ * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(browser, fetch)), one table
+ * per look, repeated name by name. The strings are in h2.h, shared with ws and httpupgrade. */
 
 struct wbuf { unsigned char *p; size_t n, cap; };
 
@@ -86,46 +79,81 @@ static void hp_indexed(struct wbuf *b, unsigned index) {
 }
 
 struct hf { unsigned idx; const char *name, *value; };
-struct lf { const char *name, *value; int soft; };
+enum lk { LK_F, LK_X, LK_S };
+struct lf { const char *name, *value; enum lk kind; };
 
-static const struct lf br_head[] = {
-    { "sec-ch-ua", UA_CH_CHROME, 0 },
-    { "sec-ch-ua-mobile", "?0", 0 },
-    { "sec-ch-ua-platform", "\"Windows\"", 0 },
-    { "dnt", "1", 0 },
-    { "user-agent", UA_CHROME, 0 },
-    { "accept", "*/*", 1 },
-    { "sec-fetch-site", "same-origin", 0 },
-    { "sec-fetch-mode", "cors", 0 },
-    { "sec-fetch-dest", "empty", 0 },
+#define LF_FETCH(lang, prio) \
+    { "accept", "*/*", LK_S }, \
+    { "sec-fetch-site", "same-origin", LK_F }, \
+    { "sec-fetch-mode", "cors", LK_F }, \
+    { "sec-fetch-dest", "empty", LK_F }, \
+    { "accept-language", lang, LK_F }, \
+    { "priority", prio, LK_S }, \
+    { "cache-control", "no-cache", LK_S }, \
+    { "pragma", "no-cache", LK_S }
+
+static const struct lf lk_chrome[] = {
+    { "sec-ch-ua", UA_CH_CHROME, LK_X },
+    { "sec-ch-ua-mobile", "?0", LK_X },
+    { "sec-ch-ua-platform", "\"Windows\"", LK_X },
+    { "dnt", "1", LK_X },
+    { "user-agent", UA_CHROME, LK_F },
+    LF_FETCH("en-US,en;q=0.9", "u=1, i"),
 };
-static const struct lf br_tail[] = {
-    { "accept-language", "en-US,en;q=0.9", 0 },
-    { "priority", "u=1, i", 1 },
-    { "cache-control", "no-cache", 1 },
-    { "pragma", "no-cache", 1 },
+static const struct lf lk_edge[] = {
+    { "sec-ch-ua", UA_CH_EDGE, LK_X },
+    { "sec-ch-ua-mobile", "?0", LK_X },
+    { "sec-ch-ua-platform", "\"Windows\"", LK_X },
+    { "dnt", "1", LK_X },
+    { "user-agent", UA_EDGE, LK_F },
+    LF_FETCH("en-US,en;q=0.9", "u=1, i"),
 };
+static const struct lf lk_firefox[] = {
+    { "dnt", "1", LK_X },
+    { "user-agent", UA_FIREFOX, LK_F },
+    LF_FETCH("en-US,en;q=0.5", "u=4"),
+};
+static const struct lf lk_safari[] = {
+    { "user-agent", UA_SAFARI, LK_F },
+    LF_FETCH("en-US,en;q=0.9", "u=3, i"),
+};
+static const struct lf lk_curl[] = {
+    { "user-agent", UA_CURL, LK_F },
+};
+
+struct look { const struct lf *l; size_t n, head; };
+
+#define NELEM(a) (sizeof(a) / sizeof((a)[0]))
+#define LOOK(t) { t, NELEM(t), NELEM(t) - 4 }
+
+static const struct look looks[H2L_NONE + 1] = {
+    [H2L_CHROME] = LOOK(lk_chrome),
+    [H2L_EDGE] = LOOK(lk_edge),
+    [H2L_FIREFOX] = LOOK(lk_firefox),
+    [H2L_SAFARI] = LOOK(lk_safari),
+    [H2L_CURL] = { lk_curl, NELEM(lk_curl), NELEM(lk_curl) },
+};
+
 static const struct hf grpc_tail[] = {
     { 0, "te", "trailers" },
     { HP_USER_AGENT, "user-agent", "grpc-go/1.60.0" },
 };
 
-#define NELEM(a) (sizeof(a) / sizeof((a)[0]))
-
-static int hf_taken(const struct h2_req *r, const char *name) {
-    for (size_t i = 0; r && i < r->fields_n; i++)
-        if (strcasecmp(r->fields[i].name, name) == 0) return 1;
+static int hf_set(const struct h2_req *r, const char *name) {
+    for (size_t i = 0; i < r->fields_n; i++)
+        if (strcasecmp(r->fields[i].name, name) == 0) return r->fields[i].value[0] != '\0';
     return 0;
 }
 
-static int hf_forced(const struct lf *l, size_t n, const char *name) {
-    for (size_t i = 0; i < n; i++)
-        if (!l[i].soft && strcasecmp(l[i].name, name) == 0) return 1;
-    return 0;
+static const struct look *look_of(const struct h2_req *r) {
+    return &looks[r->look];
 }
 
-static int look_forced(const char *name) {
-    return hf_forced(br_head, NELEM(br_head), name) || hf_forced(br_tail, NELEM(br_tail), name);
+static int look_takes(const struct look *k, const struct h2_req *r, const char *name) {
+    for (size_t i = 0; i < k->n; i++)
+        if (strcasecmp(k->l[i].name, name) == 0)
+            return k->l[i].kind == LK_F || (k->l[i].kind == LK_S && !hf_set(r, name));
+    return 0;
 }
 
 static void hp_list(struct wbuf *b, const struct hf *l, size_t n) {
@@ -192,9 +220,11 @@ static const char *gl_lower(struct gl *g, const char *name) {
     return name;
 }
 
-static void gl_look(struct gl *g, const struct lf *l, size_t n, const struct h2_req *r) {
-    for (size_t i = 0; i < n; i++)
-        if (!l[i].soft || !hf_taken(r, l[i].name)) gl_rest(g, l[i].name, l[i].value);
+static void gl_look(struct gl *g, const struct look *k, size_t from, size_t to, const struct h2_req *r) {
+    for (size_t i = from; i < to; i++) {
+        const struct lf *l = &k->l[i];
+        if (l->kind != LK_S || !hf_set(r, l->name)) gl_rest(g, l->name, l->value);
+    }
 }
 
 static void gl_cookie(struct gl *g, const char *v) {
@@ -205,13 +235,14 @@ static void gl_cookie(struct gl *g, const char *v) {
     if (*v) gl_rest(g, "cookie", v);
 }
 
-static void gl_user(struct gl *g, const struct h2_req *r, int look) {
+static int gl_user(struct gl *g, const struct h2_req *r) {
     int ua = 0;
     for (size_t i = 0; i < r->fields_n; i++) {
         const char *nm = r->fields[i].name, *v = r->fields[i].value;
-        int drop = look && look_forced(nm);
+        int drop = look_takes(look_of(r), r, nm);
         for (size_t k = 0; k < NELEM(go_drop); k++) drop |= strcasecmp(nm, go_drop[k]) == 0;
         if (strcasecmp(nm, "user-agent") == 0) {
+            if (r->look == H2L_GOLANG) continue;
             drop |= ua || !v[0];
             ua = 1;
         }
@@ -219,6 +250,7 @@ static void gl_user(struct gl *g, const struct h2_req *r, int look) {
         if (strcasecmp(nm, "cookie") == 0) gl_cookie(g, v);
         else gl_rest(g, gl_lower(g, nm), v);
     }
+    return ua;
 }
 
 static void gl_out(struct gl *g, const char *name, const char *value) {
@@ -245,13 +277,10 @@ int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
     gl_out(&g, ":method", r->method);
     gl_out(&g, ":path", r->path);
     gl_out(&g, ":scheme", "https");
-    if (r->no_look) {
-        gl_user(&g, r, 0);
-    } else {
-        gl_look(&g, br_head, NELEM(br_head), r);
-        gl_user(&g, r, 1);
-        gl_look(&g, br_tail, NELEM(br_tail), r);
-    }
+    const struct look *k = look_of(r);
+    gl_look(&g, k, 0, k->head, r);
+    int ua = gl_user(&g, r) || look_takes(k, r, "user-agent");
+    gl_look(&g, k, k->head, k->n, r);
     if (r->content_type) gl_rest(&g, "content-type", r->content_type);
     if (g.over) return H2_ETOOBIG;
     size_t units = 0;
@@ -281,6 +310,7 @@ int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
     }
     if (!gl_has(&g, "accept-encoding") && !gl_has(&g, "range") && strcmp(r->method, "HEAD"))
         gl_out(&g, "accept-encoding", "gzip");
+    if (!ua) gl_out(&g, "user-agent", "Go-http-client/2.0");
     return g.over ? H2_ETOOBIG : 0;
 }
 

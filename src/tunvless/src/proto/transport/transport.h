@@ -185,7 +185,8 @@ struct xh_flow {
     struct transport *wnext, *bnext, *hnext[2];
     struct xc_q bat;
     size_t bres, blim;
-    uint64_t post_at, bw_at, wait_until;
+    uint64_t post_at, bw_at, wait_until, feed_seq;
+    uint32_t feed;
     int end;
     uint8_t wait_n, shared, post_dec, post_wait, blisted, bstarved, wrote, again, get_wait, redo_n;
     uint16_t owner;
@@ -448,6 +449,7 @@ extern const struct security_ops tr_sec_none, tr_sec_tls, tr_sec_reality;
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner);
 int xh_attach(struct transport *t, const struct tr_node *n, uint16_t owner);
 int xh_post_flush(struct transport *t);
+int xh_post_feed(struct transport *t);
 int xh_get_open(struct transport *t, struct xconn *x);
 void xh_posts_drop(struct transport *t);
 

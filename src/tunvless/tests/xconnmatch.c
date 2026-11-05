@@ -716,7 +716,7 @@ static void t_send_never_blocks(void) {
     check("never blocks: every send accepted", 0, bad);
     check("never blocks: every call under 5 ms", 0, slow);
     check("never blocks: bytes stay queued only after EAGAIN", 0, unforced);
-    check("never blocks: room at the floor", XC_MSS, xs_room(&s));
+    check("never blocks: no room at a full queue", 0, xs_room(&s));
     check("never blocks: wants out", 1, xconn_wants_out(p.x));
     close_plain(&p);
     check("never blocks: queue released at free", 0, (long)xc_queued());
@@ -750,9 +750,9 @@ static void t_room_sum_fits(void) {
     close_plain(&p);
 }
 
-static void t_new_room_counts_flows(void) {
+static void t_post_room_no_share(void) {
     struct pl p;
-    check("flows room: link", 0, open_plain(&p, 1, 0, 0, 0));
+    check("post room: link", 0, open_plain(&p, 1, 0, 0, 0));
     pw_settings_win(p.pfd, 1048576);
     pw_u32(p.pfd, FR_WINDOW_UPDATE, 0, 1048576 - 65535);
     io_in(p.x, 0);
@@ -765,10 +765,28 @@ static void t_new_room_counts_flows(void) {
     peer_drain(p.pfd, g_pb, sizeof g_pb, 10);
     pw_u32(p.pfd, FR_WINDOW_UPDATE, 0, 3);
     io_in(p.x, 0);
-    /* catches: a flow's streams each counted as an uploader in the room of a new stream */
-    check("flows room: a third flow gets 262144/3", 87381, xc_room_new(p.x, 3));
-    check("flows room: the two-stream flow gets 262144/2", 131072, xc_room_new(p.x, 1));
+    /* catches: the queue share, the uploaders split or the connection room kept in a new POST's size */
+    check("post room: the stream window, 65535 + 983041 - 3 + 3", 1048576, xc_post_room(p.x, 2000000));
+    check("post room: 200000 queued unflushed", 0, xs_send(&s[0], g_big, 200000, 0));
+    check("post room: connection room 848576 left", 848576, h2m_conn_room(&p.x->h2) - (long)p.x->pend_n);
+    check("post room: the connection room only guards", 1048576, xc_post_room(p.x, 2000000));
     close_plain(&p);
+}
+
+static void t_q_skip_across_chunks(void) {
+    struct xc_q q = { 0 };
+    static unsigned char got[40000];
+    xc_q_push(&q, g_big, 40000);
+    /* catches: a skip that stops at the first chunk, drops past the bytes asked, or miscounts what it dropped */
+    check("skip: 20000 dropped across two chunks", 20000, (long)xc_q_skip(&q, 20000));
+    check("skip: 20000 left", 20000, (long)q.n);
+    check("skip: the rest starts after the skipped bytes", 20000, (long)xc_q_peek(&q, got, sizeof got));
+    check("skip: the bytes", 0, memcmp(got, g_big + 20000, 20000));
+    check("skip: past the end drops what is there", 20000, (long)xc_q_skip(&q, 50000));
+    check("skip: empty", 0, (long)q.n);
+    check("skip: no chunk kept", 1, q.head == NULL && q.tail == NULL);
+    check("skip: nothing from an empty queue", 0, (long)xc_q_skip(&q, 1));
+    xc_q_drop(&q);
 }
 
 /* catches: SEND_AGAIN for bytes the stack was told fit */
@@ -783,7 +801,12 @@ static void t_granted_room_is_accepted(void) {
     xs_open(a.x, &RQ_POST, 1, &sa);
     xs_open(b.x, &RQ_POST, 2, &sb);
     xs_open(c.x, &RQ_POST, 3, &sc);
-    int refused = 0, zero = 0;
+    check("granted: c sends to a 1000-byte window", 0, xs_send(&sc, g_big, 64535, 0));
+    check("granted: c connection window", 1000, h2m_conn_room(&c.x->h2));
+    long r = xs_room(&sc);
+    check("granted: the window plus the send-ahead", 1000 + XC_PEND_STREAM, r);
+    check("granted: window room accepted", 0, xs_send(&sc, g_big, (size_t)r, 0));
+    int refused = 0, zero = 0, full = 0;
     for (int k = 0; k < 20; k++) {
         long level = (long)k * 300000 / 19;
         long need = level - (long)xc_queued();
@@ -792,17 +815,15 @@ static void t_granted_room_is_accepted(void) {
             xs_send(&sb, g_big, (size_t)m, 0);
             need -= m;
         }
-        long r = xs_room(&sa);
-        if (r <= 0) zero++;
-        else if (xs_send(&sa, g_big, (size_t)r, 0) != 0) refused++;
+        int over = xc_queued() >= XC_OUT_HIGH;
+        long ra = xs_room(&sa);
+        if (over) full += ra == 0;
+        else if (ra <= 0) zero++;
+        else if (xs_send(&sa, g_big, (size_t)ra, 0) != 0) refused++;
     }
     check("granted: no room refused at 20 queue levels", 0, refused);
-    check("granted: room never 0 with open windows", 0, zero);
-    check("granted: c sends to a 1000-byte window", 0, xs_send(&sc, g_big, 64535, 0));
-    check("granted: c connection window", 1000, h2m_conn_room(&c.x->h2));
-    long r = xs_room(&sc);
-    check("granted: room capped by the window", 1000, r);
-    check("granted: window room accepted", 0, xs_send(&sc, g_big, (size_t)r, 0));
+    check("granted: room never 0 below a full queue with open windows", 0, zero);
+    check("granted: room 0 at every full level", 3, full);
     close_plain(&a);
     close_plain(&b);
     close_plain(&c);
@@ -822,8 +843,8 @@ static void t_room_wakes_below_low(void) {
         xconn_flush(p.x);
     }
     check("low: queue full", 1, xc_queued() >= XC_OUT_HIGH);
-    check("low: room A at the floor", XC_MSS, xs_room(&s[0]));
-    check("low: room B at the floor", XC_MSS, xs_room(&s[1]));
+    check("low: no room A at a full queue", 0, xs_room(&s[0]));
+    check("low: no room B at a full queue", 0, xs_room(&s[1]));
     g_wk_n = 0;
     int early = 0, late = 0, above = 0;
     uint64_t dl = mono_us() + 10000000;
@@ -845,6 +866,38 @@ static void t_room_wakes_below_low(void) {
     check("low: owner 22 woken once", 1, wakes(22, XW_ROOM));
     check("low: owner 23 never asked, not woken", 0, wakes(23, XW_ROOM));
     close_plain(&p);
+}
+
+static void link_end_wakes(int how) {
+    struct pl a, b;
+    open_plain(&a, 1, 0, 0, 0);
+    open_plain(&b, 1, 0, 0, 0);
+    fill_windows(&a);
+    fill_windows(&b);
+    struct xs sa, sb;
+    xs_open(a.x, &RQ_POST, 31, &sa);
+    xs_open(b.x, &RQ_POST, 32, &sb);
+    xs_send(&sa, g_big, 300000, 0);
+    check("link end: A holds the queue full", 1, xc_queued() >= XC_OUT_HIGH);
+    check("link end: B starved", 0, xs_room(&sb));
+    g_wk_n = 0;
+    if (how) {
+        xconn_free(a.x);
+        a.x = NULL;
+    } else {
+        xconn_fail(a.x, H2_EIO);
+    }
+    check("link end: queue below low water", 1, xc_queued() < XC_OUT_LOW);
+    check(how ? "link end: B woken by the free" : "link end: B woken by the failure", 1, wakes(32, XW_ROOM));
+    check("link end: room for B", 1, xs_room(&sb) > 0);
+    close_plain(&a);
+    close_plain(&b);
+}
+
+/* catches: a starved stream left waiting a turn after its queue went with a failed or freed link */
+static void t_link_end_wakes_starved(void) {
+    link_end_wakes(0);
+    link_end_wakes(1);
 }
 
 /* catches: PING ACK dropped at high water, or sent ahead of queued data */
@@ -2455,11 +2508,12 @@ static void t_room_counts_held(void) {
     io_in(p.x, 0);
     check("count held: still held behind the stream window", 3000, (long)p.x->pend_n);
     check("count held: room of another flow, (10000 - 3000) / 2 and 64 KiB to hold", 69036, xs_room(&t));
-    check("count held: room of a new stream, (10000 - 3000) / 2", 3500, xc_room_new(p.x, 66));
+    check("count held: a 5000 POST, 10000 - 3000 held = 7000 >= min(5000, 16384)", 5000, xc_post_room(p.x, 5000));
+    check("count held: a 100000 POST waits, 7000 < 16384", 0, xc_post_room(p.x, 100000));
     xs_close(&t);
     check("count held: past the window, 8000 more", 0, xs_send(&s, g_big, 8000, 0));
     check("count held: 11000 held against a 10000 window", 11000, (long)p.x->pend_n);
-    check("count held: no room for a new stream while held bytes cover the window", 0, xc_room_new(p.x, 66));
+    check("count held: no new POST while 11000 held cover the 10000 window", 0, xc_post_room(p.x, 1));
     xs_close(&s);
     close_plain(&p);
 }
@@ -3541,9 +3595,11 @@ int main(void) {
     t_cancel_ping_ceiling();
     t_send_never_blocks();
     t_room_sum_fits();
-    t_new_room_counts_flows();
+    t_post_room_no_share();
+    t_q_skip_across_chunks();
     t_granted_room_is_accepted();
     t_room_wakes_below_low();
+    t_link_end_wakes_starved();
     t_control_ignores_high_water();
     t_control_flood_closes();
     t_control_flood_tls();

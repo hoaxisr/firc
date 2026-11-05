@@ -852,7 +852,7 @@ int sl_link_usable_pre(struct vless_node *n) {
             snprintf(n->skip_reason, sizeof(n->skip_reason), "downloadSettings: %.77s", n->dl->skip_reason);
             return 1;
         }
-        if (xh_opts_parse(n->xhx, n->mode, n->headers, n->pad_to, &o, n->skip_reason, sizeof(n->skip_reason)))
+        if (xh_opts_parse(n->xhx, n->mode, n->pad_to, &o, n->skip_reason, sizeof(n->skip_reason)))
             return 1;
     }
     if (n->encryption == SL_FULL || n->pqv == SL_FULL || n->pcs == SL_FULL || n->pks == SL_FULL ||

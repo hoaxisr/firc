@@ -248,25 +248,6 @@ static void hm_set_empty(struct hmap *m, const char *k, const char *v) {
     if (!e || !e->vn) hm_set(m, k, v);
 }
 
-/* Xray's other looks (common/utils/browser.go), for a node whose User-Agent in headers is the
- * word firefox, safari, edge, curl or golang: Xray reads the word as "pose as this client". Xray
- * derives the versions from the date with a CPU-dependent shift (FirefoxVersion, SafariVersion,
- * CurlVersion); here they are fixed by the same rule as UA_CHROME in h2.h: the formula's value
- * for September 2026 at the middle shift. Xray's Edge User-Agent is ChromeUA followed by
- * "Edg/..." with no space between, as browser.go builds it. Edge's sec-ch-ua is built by the
- * getGreasedChUa rule for version 149, UA_CHROME_MAJOR (permutation {2,1,0}, the same fake brand
- * as Chrome). */
-#define UA_FIREFOX \
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
-#define UA_SAFARI \
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) " \
-    "Version/26.6 Safari/605.1.15"
-#define UA_EDGE UA_CHROME "Edg/" UA_CHROME_MAJOR ".0.0.0"
-#define UA_CH_EDGE \
-    "\"Microsoft Edge\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
-    "\", \"Not)A;Brand\";v=\"24\""
-#define UA_CURL "curl/8.20.0"
-
 enum browser { BR_CHROME, BR_EDGE, BR_FIREFOX, BR_SAFARI, BR_CURL, BR_GOLANG };
 
 /* applyMasqueradedHeaders(header, browser, "ws"), line by line. */

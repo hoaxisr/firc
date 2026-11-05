@@ -261,6 +261,12 @@ static void t_field_named_like_a_look_field_replaces_it(void) {
           (int)h2w_list_size(&r, 1));
 }
 
+static int has_value(const char *name, const char *value) {
+    for (size_t i = 0; i < g_blk.n; i++)
+        if (!strcmp(g_blk.f[i].name, name) && !strcmp(g_blk.f[i].value, value)) return 1;
+    return 0;
+}
+
 static void t_look_keeps_its_identity_fields_over_ours(void) {
     const struct h2_field fl[] = { { "Accept-Language", "ru" }, { "Sec-Fetch-Mode", "navigate" },
                                    { "DNT", "0" }, { "sec-ch-ua", "x" }, { "X-A", "1" } };
@@ -273,10 +279,11 @@ static void t_look_keeps_its_identity_fields_over_ours(void) {
     check("identity: one sec-fetch-mode", 1, count_named(&g_blk, "sec-fetch-mode"));
     check("identity: sec-fetch-mode is cors", 0,
           strcmp(g_blk.f[hr_find(&g_blk, "sec-fetch-mode")].value, "cors"));
-    check("identity: one dnt", 1, count_named(&g_blk, "dnt"));
-    check("identity: dnt is 1", 0, strcmp(g_blk.f[hr_find(&g_blk, "dnt")].value, "1"));
-    check("identity: one sec-ch-ua", 1, count_named(&g_blk, "sec-ch-ua"));
-    check("identity: sec-ch-ua is not ours", 1, strcmp(g_blk.f[hr_find(&g_blk, "sec-ch-ua")].value, "x") != 0);
+    check("identity: header[\"DNT\"] beside Header.Add's Dnt, two dnt", 2, count_named(&g_blk, "dnt"));
+    check("identity: header[\"DNT\"] beside Header.Add's Dnt, 0 and 1", 1, has_value("dnt", "0") && has_value("dnt", "1"));
+    check("identity: header[\"Sec-CH-UA\"] beside Header.Add's Sec-Ch-Ua, two sec-ch-ua", 2,
+          count_named(&g_blk, "sec-ch-ua"));
+    check("identity: header[\"Sec-CH-UA\"] beside Header.Add's Sec-Ch-Ua, x among them", 1, has_value("sec-ch-ua", "x"));
     check("identity: an unrelated field stays", 0, strcmp(g_blk.f[hr_find(&g_blk, "x-a")].value, "1"));
     check("identity: list size equals the listed fields", (int)decoded_size(&g_blk),
           (int)h2w_list_size(&r, 1));
@@ -285,7 +292,7 @@ static void t_look_keeps_its_identity_fields_over_ours(void) {
 static void t_no_look_sends_only_the_fields(void) {
     const struct h2_field fl[] = { { "User-Agent", "MyApp/1" }, { "referer", "r" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 2, .no_look = 1 };
+                        .fields = fl, .fields_n = 2, .look = H2L_NONE };
     go_req(&r);
     check("no look: four pseudo-headers, two fields and accept-encoding", 7, (int)g_blk.n);
     check("no look: user-agent is ours", 0,
@@ -311,14 +318,14 @@ static void t_go_cookie_split(void) {
     char v[] = "a=1; b=2;  c=3;;d=4;";
     const struct h2_field fl[] = { { "Cookie", v }, { "x-z", "q" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 2, .no_look = 1 };
+                        .fields = fl, .fields_n = 2, .look = H2L_NONE };
     uint64_t rng = 7;
     check("cookie split: listed", 0, h2w_go_fields(&r, &rng, &g_gl));
     memset(v, 'z', sizeof v - 1);
     const char *want[] = { "a=1", "b=2", "c=3", "", "d=4" };
     size_t at = 0;
     while (at < g_gl.n && strcmp(g_gl.f[at].name, "cookie")) at++;
-    check("cookie split: eleven fields", 11, (int)g_gl.n);
+    check("cookie split: twelve fields", 12, (int)g_gl.n);
     for (size_t i = 0; i < 5; i++)
         check("cookie split: pair in order, spaces after ; stripped", 1,
               at + i < g_gl.n && !strcmp(g_gl.f[at + i].name, "cookie") && !strcmp(g_gl.f[at + i].value, want[i]));
@@ -326,7 +333,7 @@ static void t_go_cookie_split(void) {
     r.fields = one;
     r.fields_n = 1;
     check("cookie split: a single pair listed", 0, h2w_go_fields(&r, &rng, &g_gl));
-    check("cookie split: a single pair stays one field", 6, (int)g_gl.n);
+    check("cookie split: a single pair stays one field", 7, (int)g_gl.n);
     char big[2100];
     memset(big, 'k', sizeof big - 1);
     big[sizeof big - 1] = '\0';
@@ -383,13 +390,208 @@ static void t_go_fields_look(void) {
     check("go look: no keep-alive", -1, hr_find(&g_blk, "keep-alive"));
 }
 
+static void t_go_default_ua(void) {
+    const char *go = "Go-http-client/2.0";
+    const struct h2_field xk[] = { { "X-K", "v" } };
+    const struct h2_field gl[] = { { "User-Agent", "golang" } };
+    const struct h2_field em[] = { { "User-Agent", "" } };
+    const struct h2_field foo[] = { { "User-Agent", "Foo" } };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = xk, .fields_n = 1, .look = H2L_GOLANG };
+    /* catches: the default UA missing, placed before accept-encoding or content-length, sent beside an empty or look user-agent, or left out of the budget */
+    go_req(&r);
+    check("default ua: golang GET, 7 fields", 7, (int)g_blk.n);
+    check("default ua: golang GET, accept-encoding sixth", 1,
+          g_blk.n == 7 && !strcmp(g_blk.f[5].name, "accept-encoding") && !strcmp(g_blk.f[5].value, "gzip"));
+    check("default ua: golang GET, Go's user-agent last", 1,
+          g_blk.n == 7 && !strcmp(g_blk.f[6].name, "user-agent") && !strcmp(g_blk.f[6].value, go));
+    check("default ua: golang GET, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+    r.method = "POST";
+    r.end_stream = 0;
+    r.body_len = 10;
+    go_req(&r);
+    check("default ua: golang POST, 8 fields", 8, (int)g_blk.n);
+    check("default ua: golang POST, content-length sixth", 1,
+          g_blk.n == 8 && !strcmp(g_blk.f[5].name, "content-length") && !strcmp(g_blk.f[5].value, "10"));
+    check("default ua: golang POST, accept-encoding seventh", 1,
+          g_blk.n == 8 && !strcmp(g_blk.f[6].name, "accept-encoding"));
+    check("default ua: golang POST, Go's user-agent last", 1,
+          g_blk.n == 8 && !strcmp(g_blk.f[7].name, "user-agent") && !strcmp(g_blk.f[7].value, go));
+    check("default ua: golang POST, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+    r.method = "GET";
+    r.end_stream = 1;
+    r.body_len = 0;
+    r.fields = gl;
+    go_req(&r);
+    check("default ua: golang word dropped, Go's user-agent once", 1, gis("user-agent", go));
+    check("default ua: golang word, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+    r.fields = em;
+    r.look = H2L_NONE;
+    go_req(&r);
+    check("default ua: empty user-agent sends none", -1, hr_find(&g_blk, "user-agent"));
+    check("default ua: empty user-agent, 5 fields", 5, (int)g_blk.n);
+    check("default ua: empty user-agent, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+    r.fields = foo;
+    go_req(&r);
+    check("default ua: literal user-agent once", 1, gis("user-agent", "Foo"));
+    check("default ua: literal, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+    r.fields = xk;
+    r.look = H2L_CHROME;
+    go_req(&r);
+    check("default ua: chrome look's user-agent once", 1, gis("user-agent",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/149.0.0.0 Safari/537.36"));
+    check("default ua: chrome, size", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+}
+
+#define T_CHROME_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
+    "Chrome/149.0.0.0 Safari/537.36"
+#define T_FIREFOX_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
+#define T_SAFARI_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 " \
+    "(KHTML, like Gecko) Version/26.6 Safari/605.1.15"
+
+static void look_req(int look, const struct h2_field *fl, size_t n) {
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
+                        .fields = fl, .fields_n = n, .look = look };
+    go_req(&r);
+    check("look: list size equals the listed fields", (int)decoded_size(&g_blk), (int)h2w_list_size(&r, 1));
+}
+
+static void t_go_fields_edge(void) {
+    /* catches: edge sent as Chrome, or Edge's brands out of getGreasedChUa's order */
+    look_req(H2L_EDGE, NULL, 0);
+    check("edge: 4 pseudo, 13 look, accept-encoding", 18, (int)g_blk.n);
+    check("edge: accept-encoding last", 1, g_blk.n == 18 && !strcmp(g_blk.f[17].name, "accept-encoding"));
+    check("edge: user-agent", 1, gis("user-agent", T_CHROME_UA "Edg/149.0.0.0"));
+    check("edge: sec-ch-ua", 1, gis("sec-ch-ua",
+          "\"Microsoft Edge\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""));
+    check("edge: sec-ch-ua-mobile", 1, gis("sec-ch-ua-mobile", "?0"));
+    check("edge: sec-ch-ua-platform", 1, gis("sec-ch-ua-platform", "\"Windows\""));
+    check("edge: dnt", 1, gis("dnt", "1"));
+    check("edge: accept", 1, gis("accept", "*/*"));
+    check("edge: sec-fetch-site", 1, gis("sec-fetch-site", "same-origin"));
+    check("edge: sec-fetch-mode", 1, gis("sec-fetch-mode", "cors"));
+    check("edge: sec-fetch-dest", 1, gis("sec-fetch-dest", "empty"));
+    check("edge: accept-language", 1, gis("accept-language", "en-US,en;q=0.9"));
+    check("edge: priority", 1, gis("priority", "u=1, i"));
+    check("edge: cache-control", 1, gis("cache-control", "no-cache"));
+    check("edge: pragma", 1, gis("pragma", "no-cache"));
+}
+
+static void t_go_fields_firefox(void) {
+    /* catches: Chrome's client hints or q=0.9 or u=1, i sent for firefox */
+    look_req(H2L_FIREFOX, NULL, 0);
+    check("firefox: 4 pseudo, 10 look, accept-encoding", 15, (int)g_blk.n);
+    check("firefox: user-agent", 1, gis("user-agent", T_FIREFOX_UA));
+    check("firefox: dnt", 1, gis("dnt", "1"));
+    check("firefox: accept-language", 1, gis("accept-language", "en-US,en;q=0.5"));
+    check("firefox: sec-fetch-mode", 1, gis("sec-fetch-mode", "cors"));
+    check("firefox: sec-fetch-dest", 1, gis("sec-fetch-dest", "empty"));
+    check("firefox: sec-fetch-site", 1, gis("sec-fetch-site", "same-origin"));
+    check("firefox: priority", 1, gis("priority", "u=4"));
+    check("firefox: cache-control", 1, gis("cache-control", "no-cache"));
+    check("firefox: pragma", 1, gis("pragma", "no-cache"));
+    check("firefox: accept", 1, gis("accept", "*/*"));
+    check("firefox: accept-encoding", 1, gis("accept-encoding", "gzip"));
+    check("firefox: no sec-ch-ua", -1, hr_find(&g_blk, "sec-ch-ua"));
+    check("firefox: no sec-ch-ua-mobile", -1, hr_find(&g_blk, "sec-ch-ua-mobile"));
+    check("firefox: no sec-ch-ua-platform", -1, hr_find(&g_blk, "sec-ch-ua-platform"));
+}
+
+static void t_go_fields_safari(void) {
+    /* catches: dnt sent for safari, or the ws variant's Sec-Fetch-Dest websocket used for fetch */
+    look_req(H2L_SAFARI, NULL, 0);
+    check("safari: 4 pseudo, 9 look, accept-encoding", 14, (int)g_blk.n);
+    check("safari: user-agent", 1, gis("user-agent", T_SAFARI_UA));
+    check("safari: accept-language", 1, gis("accept-language", "en-US,en;q=0.9"));
+    check("safari: sec-fetch-mode", 1, gis("sec-fetch-mode", "cors"));
+    check("safari: sec-fetch-dest", 1, gis("sec-fetch-dest", "empty"));
+    check("safari: sec-fetch-site", 1, gis("sec-fetch-site", "same-origin"));
+    check("safari: priority", 1, gis("priority", "u=3, i"));
+    check("safari: cache-control", 1, gis("cache-control", "no-cache"));
+    check("safari: pragma", 1, gis("pragma", "no-cache"));
+    check("safari: accept", 1, gis("accept", "*/*"));
+    check("safari: no dnt", -1, hr_find(&g_blk, "dnt"));
+    check("safari: no sec-ch-ua", -1, hr_find(&g_blk, "sec-ch-ua"));
+    check("safari: no sec-ch-ua-mobile", -1, hr_find(&g_blk, "sec-ch-ua-mobile"));
+    check("safari: no sec-ch-ua-platform", -1, hr_find(&g_blk, "sec-ch-ua-platform"));
+}
+
+static void t_go_fields_curl(void) {
+    /* catches: the fetch variant applied to curl */
+    look_req(H2L_CURL, NULL, 0);
+    check("curl: 4 pseudo, user-agent, accept-encoding", 6, (int)g_blk.n);
+    check("curl: user-agent fifth", 1, g_blk.n == 6 && !strcmp(g_blk.f[4].name, "user-agent") &&
+          !strcmp(g_blk.f[4].value, "curl/8.20.0"));
+    check("curl: accept-encoding last", 1, g_blk.n == 6 && !strcmp(g_blk.f[5].name, "accept-encoding") &&
+          !strcmp(g_blk.f[5].value, "gzip"));
+    check("curl: no accept", -1, hr_find(&g_blk, "accept"));
+    check("curl: no sec-fetch-mode", -1, hr_find(&g_blk, "sec-fetch-mode"));
+    check("curl: no priority", -1, hr_find(&g_blk, "priority"));
+}
+
+static void t_go_fields_soft_per_look(void) {
+    const struct h2_field pr[] = { { "Priority", "u=0" } };
+    const struct h2_field al[] = { { "Accept-Language", "ru" } };
+    /* catches: soft and forced kinds taken from Chrome's table for another look */
+    look_req(H2L_FIREFOX, pr, 1);
+    check("firefox soft: priority is ours, once", 1, gis("priority", "u=0"));
+    look_req(H2L_FIREFOX, al, 1);
+    check("firefox forced: accept-language is the look's, once", 1, gis("accept-language", "en-US,en;q=0.5"));
+}
+
+static void t_look_exact_keys(void) {
+    const struct h2_field ch[] = { { "DNT", "0" }, { "sec-ch-ua", "x" }, { "Sec-CH-UA-Platform", "\"Linux\"" } };
+    const struct h2_field dnt[] = { { "DNT", "0" } };
+    const struct h2_field ed[] = { { "DNT", "0" }, { "sec-ch-ua-mobile", "?1" } };
+    const struct h2_field cu[] = { { "sec-ch-ua", "x" } };
+    const struct h2_field lit[] = { { "User-Agent", "A" }, { "DNT", "0" } };
+    /* catches: an exact-key look field still replacing the custom one, or a custom field dropped for a look that has no such field */
+    look_req(H2L_CHROME, ch, 3);
+    check("exact keys chrome: two dnt", 2, count_named(&g_blk, "dnt"));
+    check("exact keys chrome: dnt 0 and 1", 1, has_value("dnt", "0") && has_value("dnt", "1"));
+    check("exact keys chrome: two sec-ch-ua", 2, count_named(&g_blk, "sec-ch-ua"));
+    check("exact keys chrome: sec-ch-ua x and Chrome's", 1, has_value("sec-ch-ua", "x") &&
+          has_value("sec-ch-ua", "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""));
+    check("exact keys chrome: two sec-ch-ua-platform", 2, count_named(&g_blk, "sec-ch-ua-platform"));
+    check("exact keys chrome: platform Linux and Windows", 1, has_value("sec-ch-ua-platform", "\"Linux\"") &&
+          has_value("sec-ch-ua-platform", "\"Windows\""));
+    look_req(H2L_EDGE, ed, 2);
+    check("exact keys edge: two dnt", 2, count_named(&g_blk, "dnt"));
+    check("exact keys edge: dnt 0 and 1", 1, has_value("dnt", "0") && has_value("dnt", "1"));
+    check("exact keys edge: two sec-ch-ua-mobile", 2, count_named(&g_blk, "sec-ch-ua-mobile"));
+    check("exact keys edge: mobile ?1 and ?0", 1, has_value("sec-ch-ua-mobile", "?1") &&
+          has_value("sec-ch-ua-mobile", "?0"));
+    look_req(H2L_CHROME, ed, 2);
+    check("exact keys chrome: two sec-ch-ua-mobile", 2, count_named(&g_blk, "sec-ch-ua-mobile"));
+    look_req(H2L_FIREFOX, dnt, 1);
+    check("exact keys firefox: two dnt", 2, count_named(&g_blk, "dnt"));
+    look_req(H2L_CURL, dnt, 1);
+    check("exact keys curl: one dnt, ours", 1, gis("dnt", "0"));
+    look_req(H2L_GOLANG, cu, 1);
+    check("exact keys golang: one sec-ch-ua, ours", 1, gis("sec-ch-ua", "x"));
+    look_req(H2L_NONE, lit, 2);
+    check("exact keys literal: one dnt, ours", 1, gis("dnt", "0"));
+}
+
+static void t_look_soft_empty(void) {
+    const struct h2_field em[] = { { "Priority", "" }, { "Accept", "" } };
+    const struct h2_field ac[] = { { "Accept", "text/html" } };
+    /* catches: an empty custom value taken as set, sending an empty field Xray replaces */
+    look_req(H2L_CHROME, em, 2);
+    check("soft empty: one priority, the look's", 1, gis("priority", "u=1, i"));
+    check("soft empty: one accept, the look's", 1, gis("accept", "*/*"));
+    look_req(H2L_CHROME, ac, 1);
+    check("soft set: one accept, ours", 1, gis("accept", "text/html"));
+}
+
 static void t_go_fields_dropped(void) {
     const struct h2_field fl[] = { { "Host", "h" }, { "Content-Length", "9" }, { "Proxy-Connection", "x" },
                                    { "Transfer-Encoding", "chunked" }, { "Upgrade", "h2c" },
                                    { "User-Agent", "A/1" }, { "user-agent", "B/2" }, { "X-K", "v" } };
     const struct h2_field fe[] = { { "User-Agent", "" }, { "User-Agent", "C/3" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 8, .no_look = 1 };
+                        .fields = fl, .fields_n = 8, .look = H2L_NONE };
     /* catches: a field Go drops sent, a second user-agent kept, or an empty one sent */
     go_req(&r);
     check("go drops: pseudo, user-agent, x-k, accept-encoding", 7, (int)g_blk.n);
@@ -407,13 +609,13 @@ static void t_go_fields_dropped(void) {
 static void t_go_fields_uniform(void) {
     const struct h2_field fl[] = { { "a", "1" }, { "b", "2" }, { "cookie", "c=1" }, { "cookie", "d=2" } };
     struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .end_stream = 1,
-                        .fields = fl, .fields_n = 4, .no_look = 1 };
+                        .fields = fl, .fields_n = 4, .look = H2L_NONE };
     static const char *const orders[6] = { "abc", "acb", "bac", "bca", "cab", "cba" };
     int seen[6] = { 0 }, glued = 1, shape = 1;
     /* catches: an order other than the documented uniform permutation, or cookies split apart */
     for (uint64_t seed = 1; seed <= 6000; seed++) {
         uint64_t rng = seed;
-        if (h2w_go_fields(&r, &rng, &g_gl) || g_gl.n != 9) { shape = 0; continue; }
+        if (h2w_go_fields(&r, &rng, &g_gl) || g_gl.n != 10) { shape = 0; continue; }
         char o[4] = { 0 };
         int k = 0;
         for (size_t i = 4; i < 8; i++) {
@@ -437,7 +639,7 @@ static void t_go_fields_uniform(void) {
 }
 
 static const char *go_cl(const char *method, int64_t body_len) {
-    struct h2_req r = { .authority = "a", .path = "/p", .method = method, .no_look = 1, .body_len = body_len };
+    struct h2_req r = { .authority = "a", .path = "/p", .method = method, .look = H2L_NONE, .body_len = body_len };
     go_req(&r);
     return gval("content-length");
 }
@@ -453,14 +655,14 @@ static void t_content_length_rule(void) {
     check("content-length: POST 1000000", 1, go_cl("POST", 1000000) && !strcmp(go_cl("POST", 1000000), "1000000"));
     go_cl("POST", 1000000);
     check("content-length: before accept-encoding", 1,
-          g_blk.n >= 2 && !strcmp(g_blk.f[g_blk.n - 2].name, "content-length") &&
-          !strcmp(g_blk.f[g_blk.n - 1].name, "accept-encoding"));
+          g_blk.n >= 3 && !strcmp(g_blk.f[g_blk.n - 3].name, "content-length") &&
+          !strcmp(g_blk.f[g_blk.n - 2].name, "accept-encoding"));
 }
 
 static void t_gzip_rule(void) {
     const struct h2_field ae[] = { { "Accept-Encoding", "br" }, { "x-a", "1" } };
     const struct h2_field rg[] = { { "Range", "bytes=0-" } };
-    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .no_look = 1,
+    struct h2_req r = { .authority = "a", .path = "/p", .method = "GET", .look = H2L_NONE,
                         .fields = ae, .fields_n = 2 };
     /* catches: gzip asked beside a user Accept-Encoding, a range, or a HEAD, or not last otherwise */
     go_req(&r);
@@ -477,7 +679,7 @@ static void t_gzip_rule(void) {
     check("gzip: none for HEAD", -1, hr_find(&g_blk, "accept-encoding"));
     r.method = "GET";
     go_req(&r);
-    check("gzip: otherwise last", 1, g_blk.n == 5 && !strcmp(g_blk.f[4].name, "accept-encoding") &&
+    check("gzip: otherwise before Go's user-agent", 1, g_blk.n == 6 && !strcmp(g_blk.f[4].name, "accept-encoding") &&
           !strcmp(g_blk.f[4].value, "gzip"));
 }
 
@@ -497,6 +699,14 @@ int main(void) {
     t_go_fields_look();
     t_go_cookie_split();
     t_go_fields_dropped();
+    t_go_default_ua();
+    t_go_fields_edge();
+    t_go_fields_firefox();
+    t_go_fields_safari();
+    t_go_fields_curl();
+    t_go_fields_soft_per_look();
+    t_look_exact_keys();
+    t_look_soft_empty();
     t_go_fields_uniform();
     t_rng_splitmix();
     t_content_length_rule();

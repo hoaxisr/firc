@@ -45,8 +45,9 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-dl-reality-auto xhttp-dl-packet-tls xhttp-dl-none xhttp-dl-extra xhttp-dl-post-main
            xhttp-dl-name xhttp-dl-route xhttp-dl-neg-path xhttp-dl-neg-sess
            xmux-count-one xmux-count-packet xmux-count-up xmux-concurrency xmux-requests xmux-reuse
-           xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall
-           h2-wire-reality h2-wire-tls h2-credit h2-speed rec-raw rec-vision rec-ws vis-dl vis-dl-tls"
+           xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall xmux-post-size
+           h2-wire-reality h2-wire-tls h2-credit h2-speed rec-raw rec-vision rec-ws vis-dl vis-dl-tls
+           ua-golang ua-edge ua-firefox ua-safari ua-curl ua-empty"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -167,7 +168,7 @@ dl_cfg() {
 }
 neg() { EXPECT=fail; XP="{\"path\":\"/xp/\",\"mode\":\"packet-up\",$1}"; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up"; }
 case_cfg() {
-    SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""
+    SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
     XCNET=""; FLOW=""; XALPN=h2; DL=""; DH="$S_IP2"; BP=/xp/
     XP='{"path":"/xp/"}'
     case "$1" in
@@ -246,6 +247,7 @@ case_cfg() {
     xmux-count-one|xmux-idle|xmux-stall|xmux-kernel-inbound) xm stream-one "" ;;
     xmux-count-packet)       SEC=tls; TUN_ARGS="--ca $W/mask.pem"; xm packet-up "" ;;
     xmux-count-up)           SEC=tls; TUN_ARGS="--ca $W/mask.pem"; xm stream-up "" ;;
+    xmux-post-size)          SEC=tls; TUN_ARGS="--ca $W/mask.pem"; xm packet-up ""; KEYLOG=1; TAPCAP=4294967296 ;;
     xmux-concurrency)        xm stream-one '{"maxConcurrency":4}' ;;
     xmux-requests)           xm stream-one '{"maxConnections":1,"hMaxRequestTimes":5}' ;;
     xmux-reuse)              xm stream-one '{"cMaxReuseTimes":3}' ;;
@@ -255,6 +257,12 @@ case_cfg() {
     h2-wire-reality|h2-credit) xm stream-one ""; KEYLOG=1 ;;
     h2-wire-tls)             SEC=tls; TUN_ARGS="--ca $W/mask.pem"; xm packet-up ""; KEYLOG=1 ;;
     h2-speed)                xm stream-one "" ;;
+    ua-golang)               ua '{"User-Agent":"golang"}' ;;
+    ua-edge)                 ua '{"User-Agent":"edge"}' ;;
+    ua-firefox)              ua '{"User-Agent":"firefox","DNT":"0"}' ;;
+    ua-safari)               ua '{"User-Agent":"safari"}' ;;
+    ua-curl)                 ua '{"User-Agent":"curl"}' ;;
+    ua-empty)                ua '{"User-Agent":""}' ;;
     rec-raw)                 NET='"network":"tcp"'; Q="type=tcp"; XCNET="$NET"; KEYLOG=1 ;;
     rec-vision)              NET='"network":"tcp"'; Q="type=tcp&flow=xtls-rprx-vision"; XCNET="$NET"
                              FLOW=xtls-rprx-vision; KEYLOG=1 ;;
@@ -267,7 +275,7 @@ case_cfg() {
     *) echo "run-xray: unknown case $1"; exit 2 ;;
     esac
     [ -z "$DL" ] || dl_cfg
-    case "$1" in xhttp-*|xmux-*|h2-*|v6-carry-xhttp|node6-xhttp) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    case "$1" in xhttp-*|xmux-*|h2-*|ua-*|v6-carry-xhttp|node6-xhttp) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
     FJ=""; [ -z "$FLOW" ] || FJ=",\"flow\":\"$FLOW\""
     KL=""; [ -z "$KEYLOG" ] || { KL=",\"masterKeyLog\":\"$W/keys.log\""; LPORT=18444; }
     if [ "$SEC" = none ]; then
@@ -355,6 +363,9 @@ srv_v6() {
     ip -n "$NSS" addr "$1" "$S_IP6/64" dev grs0 nodad
 }
 
+ua() { SEC=tls; TUN_ARGS="--ca $W/mask.pem"; KEYLOG=1; XMODE=packet-up
+    Q="type=xhttp&path=%2Fxp%2F&mode=packet-up&extra=$(enc "{\"headers\":$1}")"
+    XCNET="\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"packet-up\",\"headers\":$1}"; }
 xm() { XMODE=$1; XMUX=$2; Q="type=xhttp&path=%2Fxp%2F&mode=$1${2:+&extra=$(enc "{\"xmux\":$2}")}"; }
 sub_write() { printf '%s\n' "vless://$UUID@$HOST:${LPORT:-$PORT}?encryption=none&$Q&$LSEC#$MODE" > "$W/sub.txt"; }
 est() { ip netns exec "$NSS" ss -Htn state established "( sport = :$PORT )" | wc -l; }
@@ -494,7 +505,7 @@ print("holders: %d connections held unread" % len(ss))
 tap_up() {
     TAPD="$W/tap-$MODE-$1"
     ip netns exec "$NSS" python3 tests/tlstap.py --listen "$S_IP:$LPORT" --to "$S_IP:$PORT" --dir "$TAPD" \
-        --cap 1048576 > "$W/tap-$MODE-$1.log" 2>&1 &
+        --cap "$TAPCAP" > "$W/tap-$MODE-$1.log" 2>&1 &
     RPID=$!; PIDS="$PIDS $RPID"
     for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " && break; sleep 0.25; done
     ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " || { echo "run-xray: FAIL — the relay did not start"; return 1; }
@@ -674,8 +685,9 @@ rec_case() {
 h2_load() {
     case "$MODE" in
     h2-wire-reality) lrun "$1" --dur 3 --down 0 --up 0 --rate 1 ;;
-    h2-wire-tls)     lrun "$1" --dur 3 --down 0 --up 0 --rate 1 && up200 ;;
+    h2-wire-tls|ua-*) lrun "$1" --dur 3 --down 0 --up 0 --rate 1 && up200 ;;
     h2-credit)       lrun "$1" --dur 5 --down 1 --up 0 --rate 0 --report 5 ;;
+    xmux-post-size)  lrun "$1" --dur 4 --down 0 --up 2 --rate 0 --report 1 ;;
     esac
 }
 h2_run() {
@@ -684,6 +696,46 @@ h2_run() {
     h2_load "$1" || { echo "run-xray: FAIL — the load failed ($1)"; XR=1; }
     sleep 1
     tun_down; xc_down; sleep 0.5; tap_down
+}
+tap_fields() { for n in $(tap_conns "$1"); do h2t fields "$1" "$n" "$2" 2>/dev/null && return 0; done; return 1; }
+fl_names() { sed 's/: .*//' "$1" | sort | tr '\n' ' '; }
+fl_vals() { sed -n "s/^$2: //p" "$1" | sort | tr '\n' '|'; }
+ua_case() {
+    case "$1" in ua-golang) tail=3 ;; *) tail=2 ;; esac
+    for me in GET POST; do
+        for c in t x; do
+            tap_fields "$W/tap-$MODE-$c" "$me" > "$W/f-$c-$me" || { echo "run-xray: FAIL — no $me block ($c)"; XR=1; : > "$W/f-$c-$me"; }
+            echo "run-xray: $me fields, $c:"; sed 's/^/run-xray:   /' "$W/f-$c-$me" | cut -c1-160
+        done
+        same "$me names" "$(fl_names "$W/f-t-$me")" "$(fl_names "$W/f-x-$me")"
+        [ -s "$W/f-x-$me" ] || { echo "run-xray: FAIL — empty $me block"; XR=1; }
+        if [ "$me" = POST ]; then
+            for c in t x; do
+                same "last names of the POST ($c)" "$(sed 's/: .*//' "$W/f-$c-POST" | tail -n "$tail" | tr '\n' ' ')" \
+                    "$(if [ "$tail" = 3 ]; then echo 'content-length accept-encoding user-agent '; else echo 'content-length accept-encoding '; fi)"
+            done
+        fi
+        for f in user-agent accept-language priority dnt accept cache-control pragma sec-fetch-mode sec-fetch-dest sec-fetch-site sec-ch-ua-mobile sec-ch-ua-platform; do
+            for c in t x; do
+                v=$(fl_vals "$W/f-$c-$me" $f); [ "$f" != user-agent ] || v=$(echo "$v" | sed 's/[0-9][0-9]*/N/g')
+                eval "V_$c=\$v"
+            done
+            same "$me $f" "$V_t" "$V_x"
+        done
+        for c in t x; do
+            eval "B_$c=\$(sed -n 's/^sec-ch-ua: //p' \"$W/f-$c-$me\" | grep -o '\"Google Chrome\"\\|\"Microsoft Edge\"\\|\"Chromium\"' | sort | tr '\\n' ' ')"
+        done
+        same "$me sec-ch-ua brands" "$B_t" "$B_x"
+        for c in t x; do
+            u=$(fl_vals "$W/f-$c-$me" user-agent); d=$(fl_vals "$W/f-$c-$me" dnt)
+            case "$1" in
+            ua-golang) same "$me user-agent ($c)" "$u" "Go-http-client/2.0|" ;;
+            ua-empty) same "$me user-agent ($c)" "$u" "" ;;
+            ua-firefox) same "$me dnt ($c)" "$d" "0|1|" ;;
+            esac
+        done
+    done
+    return $XR
 }
 xmux_case() {
     m=$1; XR=0
@@ -696,7 +748,7 @@ xmux_case() {
         want "TCP connections opened during the load" "$4" eq "$w" ;;
     xmux-count-packet|xmux-count-up)
         tun_up "$BIN" t || return 1
-        xcount t 60 20 2; T="$CNT $(lres t 4)"; tun_down
+        xcount t 60 20 2; T="$CNT $(lres t 4)"; TC=$(cpu); TR=$(rss); tun_down
         xc_up || return 1
         xcount x 60 20 2; X="$CNT $(lres x 4)"; xc_down
         set -- $T $X
@@ -704,7 +756,16 @@ xmux_case() {
         echo "run-xray:   tunvless      $1 $2 $3 $4   $5"
         echo "run-xray:   Xray client   $6 $7 $8 $9   ${10}"
         want "tunvless most at once against Xray's most" "$2" le "$7"
-        want "tunvless least at once against Xray's least" "$1" le "$6" ;;
+        want "tunvless least at once against Xray's least" "$1" le "$6"
+        if [ "$m" = xmux-count-packet ]; then
+            want "tunvless MB up, percent of Xray's" "$((${5%%.*} * 100 / (${10%%.*} + 1)))" ge 90
+            echo "run-xray: tunvless: CPU ticks $TC, VmRSS $TR KiB, MB up per 1000 ticks $((${5%%.*} * 1000 / (TC + 1)))"
+            if [ -x "${TUNVLESS_BASE:-}" ]; then
+                tun_up "$TUNVLESS_BASE" b || return 1
+                xcount b 60 20 2; ub=$(lres b 4); BC=$(cpu); BR=$(rss); tun_down
+                echo "run-xray: base: MB up ${ub:-?}, CPU ticks $BC, VmRSS $BR KiB, MB up per 1000 ticks $((${ub:-0} * 1000 / (BC + 1)))"
+            fi
+        fi ;;
     xmux-requests|xmux-reuse)
         tun_up "$BIN" t || return 1
         d=5; w=2; [ "$m" = xmux-reuse ] && { d=5.5; w=3; }
@@ -797,6 +858,12 @@ NFT
         want "redirected connections" "$(ip netns exec "$NSC" nft list table ip xredir | sed -n 's/.*packets \([0-9]*\) .*/\1/p')" eq 5
         grep -q '"type":"bytes"' "$W/kev" && echo "run-xray: tunvless reported redirected bytes" || {
             echo "run-xray: FAIL — no bytes event for the redirected flows"; XR=1; } ;;
+    ua-*)
+        h2_run t || return 1
+        h2_run x || return 1
+        tap_check "$W/tap-$MODE-t" tunvless
+        tap_check "$W/tap-$MODE-x" "Xray client"
+        ua_case "$m" ;;
     rec-raw|rec-vision|rec-ws) rec_case "$m" || XR=1 ;;
     vis-dl|vis-dl-tls)
         N=${VN:-200}
@@ -820,6 +887,19 @@ NFT
         XC_TPORT=8443 xc_up || return 1
         vloop "127.0.0.1:18080" "Xray client"
         xc_down ;;
+    xmux-post-size)
+        h2_run t || return 1
+        h2_run x || return 1
+        for c in t x; do
+            d="$W/tap-$MODE-$c"; : > "$W/posts-$c"
+            for n in $(tap_conns "$d"); do h2t posts "$d" "$n" >> "$W/posts-$c" 2>/dev/null || true; done
+            set -- $(awk '{ p = $1; sub(/\?.*/, "", p); sub(/.*\//, "", p) } p ~ /^[0-9]+$/ && p + 0 >= 8 && $2 ~ /^[0-9]+$/ { print $2 }' "$W/posts-$c" |
+                sort -n | awk '{ a[NR] = $1 } END { if (!NR) { print 0, 0, 0; exit } m = int((NR + 1) / 2); q = int((NR + 9) / 10); print NR, a[m], a[q] }')
+            echo "run-xray: $c POSTs $(wc -l < "$W/posts-$c"), after the ramp $1, median $2, p10 $3"
+            eval "md_$c=$2 pt_$c=$3"
+        done
+        want "tunvless median POST, percent of Xray's $md_x" "$((md_t * 100 / (md_x > 0 ? md_x : 1)))" ge 90
+        want "tunvless p10 POST, percent of its median $md_t" "$((pt_t * 100 / (md_t > 0 ? md_t : 1)))" ge 50 ;;
     h2-wire-reality|h2-wire-tls)
         tap_down; tap_up q || return 1
         out=$(probe); tap_down
@@ -884,7 +964,7 @@ NFT
         while [ $i -lt 20 ]; do r=$(rss); [ "$r" -le "$mx" ] || mx=$r; i=$((i + 1)); sleep 0.5; done
         o1=$(nft_val dlcnt bytes out1); c1=$(cpu)
         wait "$HP" || XR=1; sed 's/^/    /' "$W/load-$MODE-hold.log"
-        echo "run-xray: CPU time of tunvless while 20 flows are not read: $((c1 - c0)) ticks"
+        want "CPU time of tunvless while 20 flows are not read, ticks" "$((c1 - c0))" le 100
         want "VmRSS growth while 20 flows are not read, KiB (from $r0)" "$((mx - r0))" le 36864
         want "VmRSS growth while 20 flows are not read, KiB (from $r0)" "$((mx - r0))" ge 24576
         want "bytes the node sent meanwhile" "$((o1 - o0))" ge 33554432 ;;
@@ -924,7 +1004,7 @@ for MODE in $CASES; do
         echo "run-xray: case $MODE — SKIPPED (no TUNVLESS_BASE binary; not passed)"
         SKIPPED="$SKIPPED $MODE"; continue
     fi
-    case "$MODE" in h2-*|rec-*)
+    case "$MODE" in h2-*|rec-*|ua-*|xmux-post-size)
         if [ ! -x "${H2TAP:-}" ]; then
             echo "run-xray: case $MODE — SKIPPED (no H2TAP binary; not passed)"
             SKIPPED="$SKIPPED $MODE"; continue
@@ -1018,7 +1098,7 @@ EOF
         continue
     fi
     [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; FAIL=1; tap_down; kill "$XPID" 2>/dev/null || true; continue; }
-    case "$MODE" in xmux-*|h2-*|rec-*|vis-*)
+    case "$MODE" in xmux-*|h2-*|rec-*|vis-*|ua-*)
         SPID=""; CPID=""; LPID=""
         rc=0; xmux_case "$MODE" || rc=1
         tun_down; xc_down; tap_down

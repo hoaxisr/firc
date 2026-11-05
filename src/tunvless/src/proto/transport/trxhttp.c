@@ -220,7 +220,18 @@ static void trim_sp(const char **v, size_t *vn) {
     while (*vn && ((*v)[*vn - 1] == ' ' || (*v)[*vn - 1] == '\t')) (*vn)--;
 }
 
+static int ua_look(const char *v, size_t vn) {
+    static const struct { const char *w; int look; } W[] = {
+        { "chrome", H2L_CHROME }, { "edge", H2L_EDGE }, { "firefox", H2L_FIREFOX },
+        { "safari", H2L_SAFARI }, { "curl", H2L_CURL }, { "golang", H2L_GOLANG },
+    };
+    for (size_t i = 0; i < sizeof W / sizeof *W; i++)
+        if (vn == strlen(W[i].w) && !memcmp(v, W[i].w, vn)) return W[i].look;
+    return H2L_NONE;
+}
+
 static void rq_custom(struct xh_rq *q, const char *h) {
+    int seen_ua = 0;
     while (h && *h) {
         const char *eol = strchr(h, '\n');
         size_t ln = eol ? (size_t)(eol - h) : strlen(h);
@@ -232,9 +243,10 @@ static void rq_custom(struct xh_rq *q, const char *h) {
             trim_sp(&v, &vn);
             int host = kn == 4 && !strncasecmp(h, "Host", 4);
             int ua = kn == 10 && !strncasecmp(h, "User-Agent", 10);
-            int look = ua && ((vn == 6 && !memcmp(v, "chrome", 6)) || (vn == 4 && !memcmp(v, "edge", 4)));
-            if (ua && !look && !q->r.no_look) q->r.no_look = 1;
-            if (!host && !look) rq_field(q, ar_str(&q->a, h, kn), ar_str(&q->a, v, vn));
+            if (ua && !seen_ua) q->r.look = ua_look(v, vn);
+            seen_ua |= ua;
+            int drop = host || (ua && q->r.look != H2L_NONE);
+            if (!drop) rq_field(q, ar_str(&q->a, h, kn), ar_str(&q->a, v, vn));
         }
         h += ln + (eol ? 1 : 0);
     }
@@ -449,7 +461,7 @@ static int side_init(struct xh_side *s, const struct tr_node *n, const char *mod
     char hostbuf[160];
     const char *authority = n->http_host && n->http_host[0] ? n->http_host
                           : n->sni[0] ? n->sni : tr_host_literal(n->host, hostbuf, sizeof(hostbuf));
-    if (xh_opts_parse(n->xhx, mode, n->headers, n->pad_to, &s->opts, NULL, 0)) return TR_EIO;
+    if (xh_opts_parse(n->xhx, mode, n->pad_to, &s->opts, NULL, 0)) return TR_EIO;
     snprintf(s->authority, sizeof(s->authority), "%s", authority);
     const char *p = n->path ? n->path : "";
     const char *qm = strchr(p, '?');
@@ -600,6 +612,7 @@ void xh_posts_drop(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
     for (unsigned i = 0; i < f->post_n; i++) xc_q_drop(&f->post[i].keep);
     f->redo_n = 0;
+    f->feed = 0;
 }
 
 int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, uint16_t owner) {
@@ -608,6 +621,7 @@ int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, u
     memset(&x->f.down, 0, sizeof x->f.down);
     memset(&x->f.up, 0, sizeof x->f.up);
     x->f.post_n = 0;
+    x->f.feed = 0;
     x->f.owner = owner;
     x->seq = 0;
     x->err = 0;
@@ -804,12 +818,10 @@ int xh_post_flush(struct transport *t) {
         if (n > XH_BLOCK) n = XH_BLOCK;
     } else {
         size_t cap = x->post_max ? x->post_max : 1000000;
-        long r = xc_room_new(m, f->owner);
         if (n > cap) n = cap;
-        if ((long)n > r) {
-            if (r < XC_CHUNK) return 0;
-            n = (size_t)r;
-        }
+        long r = xc_post_room(m, n);
+        if (r <= 0) return 0;
+        n = (size_t)r;
     }
     char seq[24];
     snprintf(seq, sizeof seq, "%llu", (unsigned long long)x->seq);
@@ -833,8 +845,33 @@ int xh_post_flush(struct transport *t) {
         return (int)took;
     }
     if (keep && xc_q_copy(&p->keep, &f->bat, n)) xc_q_drop(&p->keep);
-    rc = sent(tr_xh_send_q(&p->s, &f->bat, n, 1), &p->s);
-    return rc ? rc : (int)n;
+    f->feed = (uint32_t)n;
+    f->feed_seq = p->seq;
+    rc = xh_post_feed(t);
+    return rc < 0 ? rc : (int)n;
+}
+
+int xh_post_feed(struct transport *t) {
+    struct xh_flow *f = &t->xh.f;
+    int rc = post_reap(t);
+    if (rc) return rc;
+    if (!f->feed) return 1;
+    struct xh_post *p = NULL;
+    for (unsigned i = 0; !p && i < f->post_n; i++)
+        if (f->post[i].seq == f->feed_seq && !f->post[i].redo) p = &f->post[i];
+    if (!p) {
+        xc_q_skip(&f->bat, f->feed);
+        f->feed = 0;
+        return 1;
+    }
+    if (xc_queued() >= XC_OUT_HIGH) return 0;
+    long r = xs_room(&p->s);
+    size_t k = r > 0 ? ((size_t)r < f->feed ? (size_t)r : f->feed) : 0;
+    if (!k) return 0;
+    rc = sent(tr_xh_send_q(&p->s, &f->bat, k, k == f->feed), &p->s);
+    if (rc) return rc;
+    f->feed -= (uint32_t)k;
+    return !f->feed;
 }
 
 static int xhttp_write_mode(struct transport *t, const unsigned char *d, size_t n);

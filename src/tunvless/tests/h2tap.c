@@ -28,6 +28,7 @@ struct blk {
     int pseudo_ok;
     char method[16];
     char *names;
+    char *fields;
 };
 
 static unsigned char *st;
@@ -247,6 +248,13 @@ static void block_done(size_t first, size_t last, size_t n) {
     }
     b->pseudo_ok = ok && np == 4;
     qsort(nm, hblk.n, sizeof nm[0], cmp_str);
+    size_t ft = 1;
+    for (size_t i = 0; i < hblk.n; i++) ft += strlen(hblk.f[i].name) + strlen(hblk.f[i].value) + 3;
+    b->fields = malloc(ft);
+    if (!b->fields) { fprintf(stderr, "h2tap: out of memory\n"); exit(2); }
+    char *fp = b->fields;
+    for (size_t i = 0; i < hblk.n; i++) fp += sprintf(fp, "%s: %s\n", hblk.f[i].name, hblk.f[i].value);
+    *fp = '\0';
     b->names = malloc(tot);
     if (!b->names) { fprintf(stderr, "h2tap: out of memory\n"); exit(2); }
     b->names[0] = '\0';
@@ -398,6 +406,34 @@ static int cmd_names(const char *method) {
     return 1;
 }
 
+static int cmd_fields(const char *method) {
+    for (size_t b = 0; b < bn; b++)
+        if (!strcmp(bv[b].method, method)) { fputs(bv[b].fields, stdout); return 0; }
+    return 1;
+}
+
+static const char *field_of(const char *fields, const char *name, size_t *n) {
+    size_t k = strlen(name);
+    for (const char *l = fields; *l; l = strchr(l, '\n') + 1) {
+        if (!strncmp(l, name, k) && l[k] == ':' && l[k + 1] == ' ') {
+            *n = strcspn(l + k + 2, "\n");
+            return l + k + 2;
+        }
+        if (!strchr(l, '\n')) break;
+    }
+    return NULL;
+}
+
+static int cmd_posts(void) {
+    for (size_t b = 0; b < bn; b++) {
+        if (strcmp(bv[b].method, "POST")) continue;
+        size_t pn = 0, cn = 0;
+        const char *p = field_of(bv[b].fields, ":path", &pn), *c = field_of(bv[b].fields, "content-length", &cn);
+        printf("%.*s %.*s\n", (int)(p ? pn : 1), p ? p : "-", (int)(c ? cn : 1), c ? c : "-");
+    }
+    return 0;
+}
+
 static int cmd_wu(void) {
     size_t pairs = 0, lone0 = 0, lones = 0;
     for (size_t u = 0; u < un; u++) {
@@ -501,8 +537,8 @@ static int count_arg(const char *a, size_t *out) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5 || ((!strcmp(argv[1], "names") || !strcmp(argv[1], "has")) && argc < 6)) {
-        fprintf(stderr, "usage: h2tap dump|check|first|wu|afterack|names|lens|ramp|ramp-units|has KEYLOG C2S S2C [METHOD|N|TEXT]\n");
+    if (argc < 5 || ((!strcmp(argv[1], "names") || !strcmp(argv[1], "has") || !strcmp(argv[1], "fields")) && argc < 6)) {
+        fprintf(stderr, "usage: h2tap dump|check|first|wu|posts|afterack|names|fields|lens|ramp|ramp-units|has KEYLOG C2S S2C [METHOD|N|TEXT]\n");
         return 2;
     }
     size_t lens_n = 0;
@@ -524,7 +560,9 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "check")) return cmd_check();
     if (!strcmp(argv[1], "first")) return cmd_first();
     if (!strcmp(argv[1], "names")) return cmd_names(argv[5]);
+    if (!strcmp(argv[1], "fields")) return cmd_fields(argv[5]);
     if (!strcmp(argv[1], "wu")) return cmd_wu();
+    if (!strcmp(argv[1], "posts")) return cmd_posts();
     if (!strcmp(argv[1], "afterack")) return cmd_afterack();
     if (!strcmp(argv[1], "dump")) return cmd_dump();
     fprintf(stderr, "h2tap: unknown command %s\n", argv[1]);

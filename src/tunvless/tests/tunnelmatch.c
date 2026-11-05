@@ -6874,6 +6874,23 @@ static void t_mux_ready_tail_drained(void) {
           "  the third flow's data is read in the next turns");
 }
 
+/* catches: a ready flow whose client window is closed cutting the wait to zero */
+static void t_mux_blocked_ready_waits(void) {
+    m_new();
+    struct conn *a = m_flow(41140), *b = m_flow(41141);
+    m_window(41140, 0);
+    m_window(41141, 0);
+    pm_drain(NULL, NULL);
+    g_m_wake_what = 0;
+    g_m_rn = 1000;
+    g_mh->wake(g_mh->arg, (uint16_t)(a - g_conns), XW_READ, 0);
+    g_mh->wake(g_mh->arg, (uint16_t)(b - g_conns), XW_READ, 0);
+    loop_turn(&g_L, 0);
+    uint64_t w = m_turn_ms(300);
+    check(a && b && a->rx_ready && b->rx_ready && a->our_seq == 2 && b->our_seq == 2 && g_m_rn == 1000 && w >= 200,
+          "mux: flows ready behind a closed client window do not make the loop poll");
+}
+
 /* catches: the late pass reading a direct flow whose client window is closed */
 static void t_late_direct_closed_window(void) {
     fake_new();
@@ -7242,6 +7259,7 @@ static void mux_part(void) {
     t_mux_deadline_wakes_loop();
     t_mux_read_wake();
     t_mux_ready_tail_drained();
+    t_mux_blocked_ready_waits();
     t_mux_reopened_head_spares_tail();
     t_late_direct_closed_window();
     t_mux_room_wake();

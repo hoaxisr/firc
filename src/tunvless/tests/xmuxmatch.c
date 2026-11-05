@@ -449,7 +449,8 @@ struct pc {
     int fd, eof, rst, pre, kill, pings, mcs_sent, ep, wu0;
     uint32_t wu0_first, pad_sid;
     int noread;
-    long wu0_sum, wus_sum, pad_left, pad_sent;
+    long wu0_sum, wus_sum, pad_left, pad_sent, upb;
+    uint64_t uph;
     uint32_t sid[PS_MAX], rsid[PS_MAX], rcode[PS_MAX];
     int nsid, nrst;
     uint32_t goaway, rst_sid;
@@ -470,6 +471,12 @@ struct pc {
     size_t cln;
     char dl[256];
     size_t dln;
+    long sidb[256], sidseq[256], sidcl[256];
+    unsigned char sidk[256];
+    char sess[4][64];
+    uint64_t sessh[4];
+    long sessb[4];
+    int nsess;
     unsigned char b[1 << 18];
     size_t bn;
 };
@@ -479,7 +486,7 @@ static struct {
     int split, hold, refuse_post, refuse_get, post_status, nowu, get_ci, shut, shut2, post_body;
     long pad_post, pad_cap;
     int pad_go, pad_get, noecho, early, over, lim, over_left, over_c0, nosettings, iwin, imcs, mfs;
-    uint32_t get_sid;
+    uint32_t get_sid, swin;
     uint16_t port, port2;
     struct pc c[PC_MAX];
     int n;
@@ -523,6 +530,14 @@ static void p_answer(struct pc *c, uint32_t sid) {
 }
 
 static void p_split_data(struct pc *c, unsigned flags, uint32_t sid, const unsigned char *body, uint32_t len) {
+    c->upb += len;
+    for (uint32_t i = 0; i < len; i++) c->uph = (c->uph ^ body[i]) * 0x100000001b3ull;
+    c->sidb[(sid >> 1) & 255] += len;
+    int sk = c->sidk[(sid >> 1) & 255];
+    if (sk) {
+        c->sessb[sk - 1] += len;
+        for (uint32_t i = 0; i < len; i++) c->sessh[sk - 1] = (c->sessh[sk - 1] ^ body[i]) * 0x100000001b3ull;
+    }
     if (len <= sizeof c->up - c->upn) {
         memcpy(c->up + c->upn, body, len);
         c->upn += len;
@@ -559,6 +574,27 @@ static void p_path(struct pc *c, const unsigned char *b, uint32_t len) {
     if (w > 0 && (size_t)w < sizeof c->cls - c->cln) c->cln += (size_t)w;
 }
 
+static void p_sess(struct pc *c, uint32_t sid) {
+    int i = hr_find(&g_hb, ":path");
+    if (i < 0) return;
+    const char *v = g_hb.f[i].value, *e = strrchr(v, '/');
+    size_t l = e ? (size_t)(e - v) : strlen(v);
+    if (l >= sizeof c->sess[0]) l = sizeof c->sess[0] - 1;
+    int k = 0;
+    while (k < c->nsess && (strlen(c->sess[k]) != l || strncmp(c->sess[k], v, l))) k++;
+    if (k == c->nsess) {
+        if (k == 4) return;
+        memcpy(c->sess[k], v, l);
+        c->sess[k][l] = 0;
+        c->sessh[k] = 0xcbf29ce484222325ull;
+        c->nsess++;
+    }
+    c->sidk[(sid >> 1) & 255] = (unsigned char)(k + 1);
+    c->sidseq[(sid >> 1) & 255] = e ? atol(e + 1) : -1;
+    int j = hr_find(&g_hb, "content-length");
+    c->sidcl[(sid >> 1) & 255] = j >= 0 ? atol(g_hb.f[j].value) : -1;
+}
+
 static int p_paths_is(int ci, int k, int j) {
     pthread_mutex_lock(&g_p.mu);
     char a[256] = "", b[256] = "";
@@ -583,8 +619,19 @@ static void p_frames(struct pc *c) {
         if (c->bn < 24) return;
         c->pre = 1;
         i = 24;
-        unsigned char st[6] = { 0, 3, 0, 0, 0, (unsigned char)g_p.mcs };
-        if (!g_p.early && !g_p.nosettings) p_write(c->fd, 4, 0, 0, st, g_p.mcs ? 6 : 0);
+        uint32_t sw = g_p.swin;
+        unsigned char st[12] = { 0, 3, 0, 0, 0, (unsigned char)g_p.mcs };
+        unsigned char sws[6] = { 0, 4, (unsigned char)(sw >> 24), (unsigned char)(sw >> 16), (unsigned char)(sw >> 8), (unsigned char)sw };
+        uint32_t stn = g_p.mcs ? 6 : 0;
+        if (sw) {
+            memcpy(st + stn, sws, 6);
+            stn += 6;
+        }
+        if (!g_p.early && !g_p.nosettings) p_write(c->fd, 4, 0, 0, st, stn);
+        if (!g_p.early && sw) {
+            static const unsigned char wu8[4] = { 0, 0x80, 0, 0 };
+            p_write(c->fd, 8, 0, 0, wu8, 4);
+        }
         if (g_p.mfs) {
             static const unsigned char mf[12] = { 0, 5, 0, 0x10, 0, 0, 0, 4, 0, 0x10, 0, 0 };
             static const unsigned char wu[4] = { 0, 0x0f, 0, 0x01 };
@@ -611,6 +658,7 @@ static void p_frames(struct pc *c) {
         }
         if (type == 1) {
             p_path(c, body, len);
+            p_sess(c, sid);
             if (c->nsid < PS_MAX) c->sid[c->nsid++] = sid;
             unsigned char st = 0x88, code[4] = { 0, 0, 0, 2 }, refused[4] = { 0, 0, 0, 7 };
             if (g_p.over && c->nsid > g_p.lim && (!g_p.over_c0 || c == g_p.c) && g_p.over_left >= 0) {
@@ -749,6 +797,7 @@ static void *p_run(void *arg) {
                 memset(&g_p.c[g_p.n], 0, sizeof g_p.c[0]);
                 hr_ctx_init(&g_hc[g_p.n], 4096);
                 g_p.c[g_p.n].ep = ep;
+                g_p.c[g_p.n].uph = 0xcbf29ce484222325ull;
                 g_p.c[g_p.n++].fd = fd;
                 unsigned char st[6] = { 0, 3, 0, 0, 0, (unsigned char)g_p.early };
                 if (g_p.early) p_write(fd, 4, 0, 0, st, 6);
@@ -800,7 +849,7 @@ static void p_start(int mcs) {
     g_p.pad_go = 1;
     g_p.pad_get = g_p.noecho = g_p.early = g_p.over = g_p.lim = g_p.over_left = g_p.over_c0 = g_p.nosettings = g_p.iwin = g_p.imcs = g_p.mfs = 0;
     g_p.pad_cap = 0;
-    g_p.get_sid = 0;
+    g_p.get_sid = g_p.swin = 0;
     g_p.port = lo_listen(&g_p.lfd);
     g_p.port2 = lo_listen(&g_p.lfd2);
     if (pthread_create(&g_p.th, NULL, p_run, NULL)) exit(2);
@@ -828,10 +877,10 @@ static void p_settle(void) {
     }
 }
 
-static int p_get(int what, int ci, int k) {
+static int64_t p_get(int what, int ci, int k) {
     if (what == 0 || what == 13) p_settle();
     pthread_mutex_lock(&g_p.mu);
-    int v = -1;
+    int64_t v = -1;
     if (what == 0) v = g_p.n;
     else if (what == 16) v = g_p.lfd2;
     else if (what == 22) v = g_p.lfd;
@@ -858,6 +907,8 @@ static int p_get(int what, int ci, int k) {
         else if (what == 19) v = (int)(c->wu0_sum / 1024);
         else if (what == 20) v = (int)(c->wus_sum / 1024);
         else if (what == 21) v = (int)c->pad_left;
+        else if (what == 23) v = c->upb;
+        else if (what == 24) v = (int64_t)c->uph;
     }
     pthread_mutex_unlock(&g_p.mu);
     return v;
@@ -879,6 +930,8 @@ static int p_get(int what, int ci, int k) {
 #define P_ACC(ep)     p_get(13, 0, ep)
 #define P_NSID_AT(ep) p_get(14, 0, ep)
 #define P_UPN_AT(ep)  p_get(15, 0, ep)
+#define P_UPB(i)      p_get(23, i, 0)
+#define P_UPH(i)      ((uint64_t)p_get(24, i, 0))
 #define P_SET(f, v)                    \
     do {                               \
         pthread_mutex_lock(&g_p.mu);   \
@@ -905,22 +958,71 @@ static int p_dl_is(int ci, const char *want, int say) {
 static int p_cls_is(int ci, const char *want) {
     pthread_mutex_lock(&g_p.mu);
     int ok = ci < g_p.n && !strcmp(g_p.c[ci].cls, want);
+    if (!ok) printf("     content-lengths: \"%s\"\n", ci < g_p.n ? g_p.c[ci].cls : "");
     pthread_mutex_unlock(&g_p.mu);
     return ok;
 }
 
-static void p_frame_out(int ci, unsigned type, unsigned flags, uint32_t sid, const char *body) {
+static void p_frame_bin(int ci, unsigned type, unsigned flags, uint32_t sid, const void *body, uint32_t len) {
     pthread_mutex_lock(&g_p.mu);
     struct pc *c = &g_p.c[ci];
-    if (c->fqn < 4) {
+    if (c->fqn < 4 && len <= sizeof c->fq[0].body) {
         c->fq[c->fqn].type = type;
         c->fq[c->fqn].flags = flags;
         c->fq[c->fqn].sid = sid;
-        c->fq[c->fqn].len = (uint32_t)strlen(body);
-        memcpy(c->fq[c->fqn].body, body, c->fq[c->fqn].len);
+        c->fq[c->fqn].len = len;
+        memcpy(c->fq[c->fqn].body, body, len);
         c->fqn++;
     }
     pthread_mutex_unlock(&g_p.mu);
+}
+
+static void p_frame_out(int ci, unsigned type, unsigned flags, uint32_t sid, const char *body) {
+    p_frame_bin(ci, type, flags, sid, body, (uint32_t)strlen(body));
+}
+
+static void p_refd_add(int ci, uint32_t sid) {
+    pthread_mutex_lock(&g_p.mu);
+    if (ci < g_p.n && g_p.c[ci].nrefd < PS_MAX) g_p.c[ci].refd[g_p.c[ci].nrefd++] = sid;
+    pthread_mutex_unlock(&g_p.mu);
+}
+
+static void p_rst_code(int ci, uint32_t sid, unsigned code) {
+    unsigned char b[4] = { 0, 0, 0, (unsigned char)code };
+    p_frame_bin(ci, 3, 0, sid, b, 4);
+}
+
+static long p_sid_bytes(int ci, uint32_t sid) {
+    pthread_mutex_lock(&g_p.mu);
+    long v = ci < g_p.n ? g_p.c[ci].sidb[(sid >> 1) & 255] : -1;
+    pthread_mutex_unlock(&g_p.mu);
+    return v;
+}
+
+static int p_resent(int ci, uint32_t sid, long cl) {
+    pthread_mutex_lock(&g_p.mu);
+    int n = 0;
+    if (ci < g_p.n) {
+        const struct pc *c = &g_p.c[ci];
+        unsigned r = (sid >> 1) & 255;
+        for (unsigned k = 0; k < 256; k++)
+            if (c->sidk[r] && c->sidk[k] == c->sidk[r] && c->sidseq[k] == c->sidseq[r] && c->sidcl[k] == cl) n++;
+    }
+    pthread_mutex_unlock(&g_p.mu);
+    return n;
+}
+
+static uint64_t p_sess_hash(int ci, const char *key, long *bytes) {
+    pthread_mutex_lock(&g_p.mu);
+    uint64_t h = 0;
+    *bytes = -1;
+    for (int k = 0; ci < g_p.n && k < g_p.c[ci].nsess; k++)
+        if (strstr(g_p.c[ci].sess[k], key)) {
+            h = g_p.c[ci].sessh[k];
+            *bytes = g_p.c[ci].sessb[k];
+        }
+    pthread_mutex_unlock(&g_p.mu);
+    return h;
 }
 
 static int p_ord_starts(int ci, const char *want) {
@@ -2515,7 +2617,11 @@ static void t_dead_post_link_redials(void) {
     gl_end();
 }
 
-static unsigned char gl_big[65536];
+static unsigned char gl_big[1 << 20];
+
+static void gl_big_fill(void) {
+    for (size_t i = 0; i < sizeof gl_big; i++) gl_big[i] = (unsigned char)(i * 7 + i / 251);
+}
 
 static void t_room_never_decides(void) {
     gl_begin(0);
@@ -2959,6 +3065,663 @@ static void t_post_waits_for_window(void) {
     /* catches: a POST cut to a nearly closed window, or bytes refused instead of held for it */
     check("window: held, 5535 is too small a POST", 10000, (int)g_t[0].xh.f.bat.n);
     check("window: two POSTs only", 3, P_NSID(0));
+    gl_end();
+}
+
+static uint64_t g_fh;
+static long g_fw;
+
+static uint64_t fnv_add(uint64_t h, const unsigned char *d, size_t n) {
+    for (size_t i = 0; i < n; i++) h = (h ^ d[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static long fed_batch(int i) {
+    long tot = 0;
+    for (long r; (r = transport_room(&g_t[i])) > 0; tot += r) {
+        if (transport_write(&g_t[i], gl_big, (size_t)r)) break;
+        g_fh = fnv_add(g_fh, gl_big, (size_t)r);
+        g_fw += r;
+    }
+    return tot;
+}
+
+static void fed_begin(int small) {
+    static struct tr_node n;
+    gl_begin(0);
+    if (small) p_rcvbuf(16384);
+    P_SET(split, 2);
+    P_SET(swin, 1048576);
+    tr_xmux_up_budget = 4194304;
+    g_fh = 0xcbf29ce484222325ull;
+    g_fw = 0;
+    n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    gl_attach(0, &n, g_key);
+    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    turns(3);
+}
+
+static void fed_ramp(int k) {
+    for (int i = 0; i < k; i++) {
+        fed_batch(0);
+        g_now += 30;
+        UNTIL(!g_t[0].xh.f.bat.n && P_UPB(0) == g_fw);
+    }
+}
+
+static void fed_stall(void) {
+    int sb = 4096;
+    setsockopt(g_t[0].xh.f.down.x->link.fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+    p_noread(0);
+}
+
+static void t_post_ramps_past_out_high(void) {
+    fed_begin(0);
+    fed_ramp(8);
+    /* catches: the POST still cut to the out-queue room */
+    check("post size: ramp past 262144 to 1000000", 1, p_cls_is(0, "- 16384 32768 65536 131072 262144 524288 1000000 1000000 "));
+    check("post size: every byte arrived", g_fw, (long)P_UPB(0));
+    check("post size: bytes in order", 1, P_UPH(0) == g_fh);
+    check("post size: counted exactly", 1, ACCT_OK());
+    gl_end();
+}
+
+static void t_post_fed_across_passes(void) {
+    fed_begin(1);
+    fed_ramp(6);
+    fed_stall();
+    long b0 = (long)P_UPB(0);
+    check("fed: one 1000000 batch", 1000000, fed_batch(0));
+    g_now += 30;
+    turn();
+    /* catches: the whole body handed to the queue or the hold at open, or fed bytes not taken off the budget */
+    check("fed: after the opening pass most of the body is unfed", 1, g_t[0].xh.f.feed >= 1000000 - (XC_OUT_HIGH + XC_PEND_STREAM));
+    int okq = 1, oka = 1, okb = 1;
+    for (int i = 0; i < 10; i++) {
+        turn();
+        okq &= xc_queued() <= XC_OUT_HIGH + XC_CHUNK;
+        oka &= ACCT_OK();
+        okb &= tr_xmux_bat_used() <= tr_xmux_up_budget;
+    }
+    check("fed: still unfed while the peer does not read", 1, g_t[0].xh.f.feed > 0);
+    check("fed: queue bounded at every turn", 1, okq);
+    check("fed: counted exactly at every turn", 1, oka);
+    check("fed: within the budget at every turn", 1, okb);
+    p_read_again(0);
+    oka = okb = 1;
+    for (uint64_t dl = ms_now() + 3000; (g_t[0].xh.f.feed || P_UPB(0) < b0 + 1000000) && ms_now() < dl;) {
+        turn();
+        okq &= xc_queued() <= XC_OUT_HIGH + XC_CHUNK;
+        oka &= ACCT_OK();
+        okb &= tr_xmux_bat_used() <= tr_xmux_up_budget;
+    }
+    check("fed: the body handed in full", 0, (long)g_t[0].xh.f.feed);
+    check("fed: one POST of 1000000", 1, p_cls_is(0, "- 16384 32768 65536 131072 262144 524288 1000000 "));
+    check("fed: its bytes arrived whole", b0 + 1000000, (long)P_UPB(0));
+    check("fed: bytes in order", 1, P_UPH(0) == g_fh);
+    check("fed: queue bounded while it drained", 1, okq);
+    check("fed: counted exactly while it drained", 1, oka);
+    check("fed: within the budget while it drained", 1, okb);
+    check("fed: batch empty", 0, (long)g_t[0].xh.f.bat.n);
+    gl_end();
+}
+
+static void t_feed_stall_bounded(void) {
+    fed_begin(1);
+    fed_ramp(6);
+    fed_stall();
+    long b0 = (long)P_UPB(0);
+    fed_batch(0);
+    g_now += 30;
+    turn();
+    size_t qmax = 0;
+    int oka = 1;
+    for (int i = 0; i < 200; i++) {
+        turn();
+        if (xc_queued() > qmax) qmax = xc_queued();
+        oka &= ACCT_OK();
+    }
+    /* catches: the MSS floor fed past XC_OUT_HIGH on every pass */
+    check("stall: body still unfed after 200 turns", 1, g_t[0].xh.f.feed > 0);
+    check("stall: queue never past XC_OUT_HIGH + XC_CHUNK", 1, qmax <= XC_OUT_HIGH + XC_CHUNK);
+    check("stall: counted exactly at every turn", 1, oka);
+    p_read_again(0);
+    UNTIL(!g_t[0].xh.f.feed && P_UPB(0) == b0 + 1000000);
+    check("stall: the body handed in full after", 0, (long)g_t[0].xh.f.feed);
+    check("stall: its bytes arrived whole", b0 + 1000000, (long)P_UPB(0));
+    check("stall: bytes in order", 1, P_UPH(0) == g_fh);
+    gl_end();
+}
+
+static long su_write(int i) {
+    long r = transport_room(&g_t[i]);
+    if (r <= 0) return r;
+    if (r > (long)sizeof gl_big) r = (long)sizeof gl_big;
+    if (transport_write(&g_t[i], gl_big, (size_t)r)) return -1;
+    g_fh = fnv_add(g_fh, gl_big, (size_t)r);
+    g_fw += r;
+    return r;
+}
+
+static const char *su_l(const char *mode, const char *what) {
+    static char b[16][96];
+    static int k;
+    char *o = b[k++ % 16];
+    snprintf(o, sizeof b[0], "%s stall: %s", mode, what);
+    return o;
+}
+
+static void stall_bounded(const char *mode, int nsid) {
+    gl_begin(0);
+    p_rcvbuf(16384);
+    P_SET(split, 1);
+    P_SET(noecho, 1);
+    P_SET(nowu, 1);
+    P_SET(swin, 1048576);
+    g_fh = 0xcbf29ce484222325ull;
+    g_fw = 0;
+    struct tr_node n = gl_mode("xmux.maxConnections=1\n", mode);
+    gl_attach(0, &n, g_key);
+    struct xh_flow *f = &g_t[0].xh.f;
+    UNTIL(gl_ready(0) && (nsid == 1 || f->up.x) && P_NSID(0) == nsid);
+    int sb = 4096;
+    setsockopt((nsid == 1 ? f->one.x : f->up.x)->link.fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+    p_noread(0);
+    size_t qmax = 0;
+    int okw = 1;
+    for (int i = 0; i < 200; i++) {
+        okw &= su_write(0) >= 0;
+        if (xc_queued() > qmax) qmax = xc_queued();
+        turn();
+        if (xc_queued() > qmax) qmax = xc_queued();
+    }
+    check(su_l(mode, "the queue filled"), 1, qmax >= XC_OUT_HIGH - XC_CHUNK);
+    check(su_l(mode, "every write taken"), 1, okw);
+    check(su_l(mode, "queue never past XC_OUT_HIGH + XC_CHUNK"), 1, qmax <= XC_OUT_HIGH + XC_CHUNK);
+    int w0 = room_wakes(0);
+    p_read_again(0);
+    UNTIL(room_wakes(0) > w0);
+    check(su_l(mode, "a room wake once the queue drains"), 1, room_wakes(0) > w0);
+    check(su_l(mode, "room once woken"), 1, transport_room(&g_t[0]) >= XC_MSS);
+    p_noread(0);
+    okw &= su_write(0) > 0;
+    check(su_l(mode, "refilled in one write"), 1, xc_queued() >= XC_OUT_HIGH);
+    check(su_l(mode, "no room at the refilled queue"), 0, transport_room(&g_t[0]));
+    int w1 = room_wakes(0);
+    p_read_again(0);
+    UNTIL(room_wakes(0) > w1);
+    check(su_l(mode, "woken again once the refill drains"), 1, room_wakes(0) > w1);
+    long target = g_fw + 100000;
+    for (uint64_t dl = ms_now() + 3000; (g_fw < target || P_UPB(0) < g_fw) && ms_now() < dl;) {
+        if (g_fw < target) okw &= su_write(0) >= 0;
+        turn();
+    }
+    check(su_l(mode, "the upload goes on after"), 1, g_fw >= target && okw);
+    check(su_l(mode, "its bytes arrived whole"), g_fw, (long)P_UPB(0));
+    check(su_l(mode, "bytes in order"), 1, P_UPH(0) == g_fh);
+    gl_end();
+}
+
+/* catches: the MSS floor granted to a stalled stream-up or stream-one upload on every pass */
+static void t_stream_stall_bounded(void) {
+    stall_bounded("stream-up", 2);
+    stall_bounded("stream-one", 1);
+}
+
+static void t_next_post_waits_for_body(void) {
+    fed_begin(1);
+    fed_ramp(6);
+    fed_stall();
+    fed_batch(0);
+    g_now += 30;
+    turn();
+    check("next waits: body unfed", 1, g_t[0].xh.f.feed > 0);
+    check("next waits: more batched behind it", 1, fed_batch(0) > 0);
+    uint64_t s0 = g_t[0].xh.seq;
+    g_now += 1000;
+    turns(10);
+    /* catches: the next POST gated by the interval alone, or a feed that asks the loop for a 0-ms deadline */
+    check("next waits: no new POST while the body is fed", 1, g_t[0].xh.seq == s0);
+    check("next waits: body still unfed", 1, g_t[0].xh.f.feed > 0);
+    check("next waits: no timer while only room is awaited", 0, tr_xmux_pass(g_now, MUXP_LATE));
+    p_read_again(0);
+    UNTIL(!g_t[0].xh.f.bat.n && !g_t[0].xh.f.feed && P_UPB(0) == g_fw);
+    check("next waits: the next POST once the body is handed", 1, g_t[0].xh.seq == s0 + 1);
+    check("next waits: one POST each", 1, p_cls_is(0, "- 16384 32768 65536 131072 262144 524288 1000000 1000000 "));
+    check("next waits: every byte arrived", g_fw, (long)P_UPB(0));
+    check("next waits: bytes in order", 1, P_UPH(0) == g_fh);
+    check("next waits: counted exactly", 1, ACCT_OK());
+    gl_end();
+}
+
+static void t_batch_fills_while_body_drains(void) {
+    fed_begin(1);
+    fed_ramp(6);
+    fed_stall();
+    fed_batch(0);
+    g_now += 30;
+    turn();
+    size_t fd0 = g_t[0].xh.f.feed;
+    check("fills: body unfed", 1, fd0 > 0);
+    /* catches: the unfed body counted against the batch cap or the reservation */
+    check("fills: room is the full limit", 1000000, transport_room(&g_t[0]));
+    check("fills: a write of the full limit taken", 0, transport_write(&g_t[0], gl_big, 1000000));
+    g_fh = fnv_add(g_fh, gl_big, 1000000);
+    g_fw += 1000000;
+    check("fills: batch is the unfed body and the new write", (long)(g_t[0].xh.f.feed + 1000000), (long)g_t[0].xh.f.bat.n);
+    check("fills: counted exactly", 1, ACCT_OK());
+    check("fills: within the budget", 1, tr_xmux_bat_used() <= tr_xmux_up_budget);
+    p_read_again(0);
+    UNTIL(!g_t[0].xh.f.bat.n && P_UPB(0) == g_fw);
+    check("fills: the next POST carries 1000000", 1, p_cls_is(0, "- 16384 32768 65536 131072 262144 524288 1000000 1000000 "));
+    check("fills: every byte arrived", g_fw, (long)P_UPB(0));
+    check("fills: bytes in order", 1, P_UPH(0) == g_fh);
+    check("fills: counted exactly after", 1, ACCT_OK());
+    gl_end();
+}
+
+static uint64_t g_f2h[2];
+static long g_f2w[2];
+static char g_f2s[2][136];
+
+static long f2_batch(int i, long most) {
+    long tot = 0;
+    for (long r; (r = transport_room(&g_t[i])) > 0 && tot < most; tot += r) {
+        if (r > most - tot) r = most - tot;
+        if (transport_write(&g_t[i], gl_big, (size_t)r)) break;
+        g_f2h[i] = fnv_add(g_f2h[i], gl_big, (size_t)r);
+        g_f2w[i] += r;
+    }
+    return tot;
+}
+
+static int f2_done(void) { return !g_t[0].xh.f.bat.n && !g_t[1].xh.f.bat.n && P_UPB(0) == g_f2w[0] + g_f2w[1]; }
+
+static void f2_begin(int nosettings, size_t budget) {
+    static struct tr_node n;
+    gl_begin(0);
+    p_rcvbuf(16384);
+    P_SET(split, 2);
+    P_SET(swin, nosettings ? 65535u : 1048576u);
+    P_SET(nosettings, nosettings);
+    P_SET(noecho, 1);
+    tr_xmux_up_budget = budget;
+    for (int i = 0; i < 2; i++) {
+        g_f2h[i] = 0xcbf29ce484222325ull;
+        g_f2w[i] = 0;
+    }
+    n = gl_mode("xmux.maxConnections=1\n", "packet-up");
+    gl_attach(0, &n, g_key);
+    gl_attach(1, &n, g_key);
+    UNTIL(gl_ready(0) && gl_ready(1) && P_NSID(0) == 2);
+    turns(3);
+    for (int i = 0; i < 2; i++) snprintf(g_f2s[i], sizeof g_f2s[i], "%s", g_t[i].xh.sid);
+}
+
+static void f2_ramp(int k, long most) {
+    for (int r = 0; r < k; r++) {
+        f2_batch(0, most);
+        f2_batch(1, most);
+        g_now += 30;
+        UNTIL(f2_done());
+    }
+}
+
+static int f2_hash_ok(int ci, int i) {
+    long b = 0;
+    uint64_t h = p_sess_hash(ci, g_f2s[i], &b);
+    if (h != g_f2h[i] || b != g_f2w[i]) printf("     flow %d: %ld bytes at the peer, %ld written\n", i, b, g_f2w[i]);
+    return h == g_f2h[i] && b == g_f2w[i];
+}
+
+#define RS_MAX 4096
+struct rs { uint32_t sid; long n; int pass; };
+static struct rs g_rs[RS_MAX];
+static int g_rs_n, g_pass;
+static long g_rf[RS_MAX];
+
+static int send_rec(const struct xs *s, struct xc_q *q, size_t n, int end) {
+    if (g_rs_n < RS_MAX) g_rs[g_rs_n++] = (struct rs){ s->sid, (long)n, g_pass };
+    return xs_send_q(s, q, n, end);
+}
+
+static void rs_turn(void) {
+    jobs_run();
+    tr_xmux_pass(g_now, MUXP_EARLY);
+    struct epoll_event ev[16];
+    int n = epoll_wait(g_ep, ev, 16, 3);
+    for (int i = 0; i < n; i++) tr_xmux_event(ev[i].data.u32, ev[i].events);
+    if (g_pass < RS_MAX) g_rf[g_pass] = (long)XC_OUT_HIGH - (long)xc_queued() - (long)(xc_pend_limit() - xc_pend_free());
+    tr_xmux_pass(g_now, MUXP_LATE);
+    g_pass++;
+}
+
+static void rs_drive(void) {
+    p_read_again(0);
+    jobs_run();
+    tr_xmux_pass(g_now, MUXP_EARLY);
+    long f = 0;
+    for (uint64_t dl = ms_now() + 3000; ms_now() < dl;) {
+        struct epoll_event ev[16];
+        int n = epoll_wait(g_ep, ev, 16, 3);
+        for (int i = 0; i < n; i++) tr_xmux_event(ev[i].data.u32, ev[i].events);
+        f = (long)XC_OUT_HIGH - (long)xc_queued() - (long)(xc_pend_limit() - xc_pend_free());
+        if (f > 4 * XC_MSS) break;
+    }
+    if (g_pass < RS_MAX) g_rf[g_pass] = f;
+    tr_xmux_pass(g_now, MUXP_LATE);
+    g_pass++;
+    p_noread(0);
+}
+
+static uint32_t f2_feed_sid(int i) {
+    const struct xh_flow *f = &g_t[i].xh.f;
+    for (unsigned k = 0; k < f->post_n; k++)
+        if (f->post[k].seq == f->feed_seq) return f->post[k].s.sid;
+    return 0;
+}
+
+static int f2_answered(void) {
+    const struct xconn *x = g_t[0].xh.f.down.x;
+    for (uint16_t i = 0; i < x->st_cap; i++)
+        if (x->st[i].used && x->st[i].post && !(x->st[i].seen && x->st[i].ended)) return 0;
+    return 1;
+}
+
+static void f2_stall(void) {
+    int sb = 4096;
+    setsockopt(g_t[0].xh.f.down.x->link.fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+    p_noread(0);
+}
+
+static int near(long got, long want) { return got >= want - XC_CHUNK && got <= want + XC_CHUNK; }
+
+static void t_feed_rotates(void) {
+    f2_begin(0, 4194304);
+    f2_ramp(7, 1000000);
+    UNTIL(f2_answered());
+    f2_stall();
+    f2_batch(0, 1000000);
+    f2_batch(1, 1000000);
+    g_now += 30;
+    g_rs_n = g_pass = 0;
+    tr_xh_send_q = send_rec;
+    int oka = 1, open0 = 0;
+    p_noread(0);
+    rs_turn();
+    open0 = g_t[0].xh.f.feed > 0 && g_t[1].xh.f.feed > 0 && f2_feed_sid(0) && f2_feed_sid(1);
+    oka &= ACCT_OK() && f2_batch(1, 65536) > 0 && ACCT_OK();
+    int idle = 0;
+    for (int r = 0; r < 10; r++) {
+        for (int d = 0; d < 3; d++) {
+            rs_drive();
+            oka &= ACCT_OK();
+        }
+        for (uint64_t dl = ms_now() + 3000; ms_now() < dl;) {
+            int k0 = g_rs_n;
+            rs_turn();
+            oka &= ACCT_OK();
+            if (g_rs_n == k0) {
+                idle++;
+                break;
+            }
+        }
+    }
+    tr_xh_send_q = xs_send_q;
+    uint32_t a = f2_feed_sid(0), b = f2_feed_sid(1);
+    uint32_t x = g_rs_n ? g_rs[0].sid : 0, y = x == a ? b : a;
+    check("rotates: both POSTs open in one pass", 1, open0);
+    check("rotates: room before it past four MSS", 1, g_rf[0] > 4 * XC_MSS);
+    check("rotates: opening pass, the first takes the room", 1, g_rs_n > 0 && g_rs[0].pass == 0 && near(g_rs[0].n, g_rf[0]));
+    check("rotates: opening pass, the second waits at a full queue", 1, g_rs_n > 1 && g_rs[1].pass > 0);
+    int alt = 1, steady = 0, shares = 1, prev_both = 0;
+    uint32_t want = x;
+    for (int i = 0; i < g_rs_n;) {
+        int p = g_rs[i].pass, j = i;
+        while (j < g_rs_n && g_rs[j].pass == p) j++;
+        alt &= g_rs[i].sid == want;
+        want = g_rs[i].sid == x ? y : x;
+        int both = j - i == 2 && g_rs[i + 1].sid != g_rs[i].sid;
+        if (prev_both && both && g_rf[p] > 4 * XC_MSS) {
+            shares &= near(g_rs[i].n, g_rf[p] / 2) && near(g_rs[i + 1].n, g_rf[p] / 4);
+            steady++;
+        }
+        prev_both = both;
+        i = j;
+    }
+    /* catches: a feed that ignores xs_room's split, or a fixed pass order giving one flow twice the other's share */
+    check("rotates: the flow sent first alternates every sending pass", 1, alt);
+    check("rotates: one pass without room between sends, ten times", 10, idle);
+    check("rotates: steady passes give F/2 then F/4", 1, shares);
+    check("rotates: a steady pass in every round", 1, steady >= 10);
+    check("rotates: both bodies still unfed", 1, g_t[0].xh.f.feed > 0 && g_t[1].xh.f.feed > 0);
+    check("rotates: counted exactly at every turn", 1, oka);
+    p_read_again(0);
+    UNTIL(f2_done());
+    check("rotates: flow 0 bytes whole and in order", 1, f2_hash_ok(0, 0));
+    check("rotates: flow 1 bytes whole and in order", 1, f2_hash_ok(0, 1));
+    check("rotates: counted exactly after", 1, ACCT_OK());
+    gl_end();
+}
+
+static int g_ia, g_ib;
+static long g_cl;
+
+static int f2_flow_done(int i) {
+    long b = 0;
+    p_sess_hash(0, g_f2s[i], &b);
+    const struct xh_flow *f = &g_t[i].xh.f;
+    return !f->bat.n && !f->feed && !f->redo_n && b == g_f2w[i];
+}
+
+static int mid_open(size_t budget, int rounds, long most, long cl) {
+    f2_begin(0, budget);
+    f2_ramp(rounds, most);
+    UNTIL(f2_answered());
+    f2_stall();
+    f2_batch(0, cl);
+    f2_batch(1, cl);
+    g_now += 30;
+    turn();
+    g_cl = cl;
+    g_ia = g_t[0].xh.f.feed < (uint32_t)cl ? 0 : 1;
+    g_ib = 1 - g_ia;
+    uint32_t fa = g_t[g_ia].xh.f.feed;
+    long more = f2_batch(g_ib, 65536);
+    return fa > 0 && fa < (uint32_t)cl && more > 0 && ACCT_OK();
+}
+
+static int mid_until(int (*done)(void)) {
+    int ok = 1;
+    for (uint64_t dl = ms_now() + 3000; !done() && ms_now() < dl;) {
+        turn();
+        ok &= ACCT_OK();
+    }
+    return ok && done();
+}
+
+static int a_failed(void) { return g_t[g_ia].xh.err != 0; }
+static int b_done(void) { return f2_flow_done(g_ib); }
+static int both_done(void) { return f2_flow_done(0) && f2_flow_done(1); }
+
+static void t_refused_mid_body_after_settings(void) {
+    check("refused mid after: A partly fed, B batched past it", 1, mid_open(4194304, 7, 1000000, 1000000));
+    uint32_t sid = f2_feed_sid(g_ia);
+    p_rst_code(0, sid, 7);
+    /* catches: a feed retrying a stream the server refused after SETTINGS */
+    check("refused mid after: the flow fails, counted exactly", 1, mid_until(a_failed));
+    long fed = g_cl - (long)g_t[g_ia].xh.f.feed;
+    check("refused mid after: the flow ends refused", XC_EREFUSED, g_t[g_ia].xh.err);
+    p_read_again(0);
+    check("refused mid after: B's body completes, counted exactly", 1, mid_until(b_done));
+    check("refused mid after: no DATA on the refused stream after it", 1, p_sid_bytes(0, sid) <= fed);
+    check("refused mid after: not sent again", 1, p_resent(0, sid, g_cl));
+    check("refused mid after: B's bytes whole and in order", 1, f2_hash_ok(0, g_ib));
+    gl_close(g_ia);
+    check("refused mid after: only B left in the budget", 1, tr_xmux_bat_used() == g_t[g_ib].xh.f.bat.n + g_t[g_ib].xh.f.bres);
+    check("refused mid after: counted exactly", 1, ACCT_OK());
+    gl_end();
+}
+
+static void reset_mid(const char *name, int st400) {
+    char m[96];
+    snprintf(m, sizeof m, "%s: A partly fed, B batched past it", name);
+    check(m, 1, mid_open(4194304, 7, 1000000, 1000000));
+    uint32_t sid = f2_feed_sid(g_ia);
+    if (st400) p_frame_bin(0, 1, 5, sid, "\x8c", 1);
+    else p_rst_code(0, sid, 8);
+    snprintf(m, sizeof m, "%s: the flow fails, counted exactly", name);
+    check(m, 1, mid_until(a_failed));
+    snprintf(m, sizeof m, "%s: the flow ends", name);
+    check(m, 1, st400 ? g_t[g_ia].xh.err == 400 : g_t[g_ia].xh.err == H2_ERESET);
+    p_read_again(0);
+    g_rs_n = g_pass = 0;
+    tr_xh_send_q = send_rec;
+    int every = 1, rooms = 0;
+    for (uint64_t dl = ms_now() + 3000; rooms < 5 && g_pass < RS_MAX && ms_now() < dl;) {
+        int k0 = g_rs_n;
+        rs_turn();
+        if (g_rf[g_pass - 1] <= XC_MSS) continue;
+        rooms++;
+        int sent = 0;
+        for (int k = k0; k < g_rs_n; k++) sent |= g_rs[k].sid != sid;
+        every &= sent;
+    }
+    tr_xh_send_q = xs_send_q;
+    snprintf(m, sizeof m, "%s: B sends in every pass with room", name);
+    check(m, 1, rooms == 5 && every);
+    snprintf(m, sizeof m, "%s: B's body completes, counted exactly", name);
+    check(m, 1, mid_until(b_done));
+    snprintf(m, sizeof m, "%s: B's bytes whole and in order", name);
+    check(m, 1, f2_hash_ok(0, g_ib));
+    gl_close(g_ia);
+    snprintf(m, sizeof m, "%s: only B left in the budget", name);
+    check(m, 1, tr_xmux_bat_used() == g_t[g_ib].xh.f.bat.n + g_t[g_ib].xh.f.bres);
+    snprintf(m, sizeof m, "%s: counted exactly", name);
+    check(m, 1, ACCT_OK());
+    gl_end();
+}
+
+static void t_reset_mid_body(void) {
+    /* catches: one flow's failure stopping another's feed, or its unfed bytes left in the budget */
+    reset_mid("reset mid", 0);
+    reset_mid("400 mid", 1);
+}
+
+static int rst_seen(uint32_t sid, int code) {
+    for (int k = 0; k < P_NRST(0); k++)
+        if (P_RSID(0, k) == sid && P_RCODE(0, k) == code) return 1;
+    return 0;
+}
+
+static void t_close_mid_body(void) {
+    check("close mid: A partly fed, B batched past it", 1, mid_open(1572864, 7, 786432, 524288));
+    uint32_t sid = f2_feed_sid(g_ia);
+    gl_close(g_ia);
+    /* catches: a closed flow's unfed body kept in the budget or the uploader count */
+    check("close mid: only B left in the budget", 1, tr_xmux_bat_used() == g_t[g_ib].xh.f.bat.n + g_t[g_ib].xh.f.bres);
+    check("close mid: counted exactly", 1, ACCT_OK());
+    p_read_again(0);
+    UNTIL(rst_seen(sid, 8));
+    check("close mid: the peer saw RST CANCEL on A's POST", 1, rst_seen(sid, 8));
+    UNTIL(!g_t[g_ib].xh.f.bat.n && !g_t[g_ib].xh.f.feed);
+    check("close mid: B's limit is half the budget", 786432, (long)g_t[g_ib].xh.f.blim);
+    check("close mid: B wrote its limit", 786432, f2_batch(g_ib, 786432));
+    UNTIL(!g_t[g_ib].xh.f.bat.n && !g_t[g_ib].xh.f.feed);
+    check("close mid: B's next limit doubles to 1000000", 1000000, (long)g_t[g_ib].xh.f.blim);
+    check("close mid: counted exactly after", 1, ACCT_OK());
+    gl_end();
+}
+
+static void t_goaway_mid_body(void) {
+    check("goaway mid: A partly fed, B batched past it", 1, mid_open(4194304, 7, 1000000, 1000000));
+    check("goaway mid: A batched past its body", 65536, f2_batch(g_ia, 65536));
+    uint32_t sa = f2_feed_sid(g_ia), sb = f2_feed_sid(g_ib);
+    const struct xconn *old = g_t[g_ia].xh.f.post_x;
+    uint64_t s0 = g_t[g_ia].xh.seq;
+    p_cmd(0, 0, 1, sa > sb ? sa : sb);
+    p_read_again(0);
+    int ok = 1, oka = 1;
+    for (uint64_t dl = ms_now() + 3000; g_t[g_ia].xh.f.feed && ms_now() < dl;) {
+        turn();
+        ok &= !g_t[g_ia].xh.f.feed || (g_t[g_ia].xh.f.post_x == old && g_t[g_ia].xh.seq == s0);
+        oka &= ACCT_OK();
+    }
+    /* catches: the feed following f->post_x to the new link, or the move done mid-body */
+    check("goaway mid: the body handed in full", 0, (long)g_t[g_ia].xh.f.feed);
+    check("goaway mid: no move while the body was fed", 1, ok);
+    check("goaway mid: counted exactly while fed", 1, oka);
+    UNTIL(p_sid_bytes(0, sa) == g_cl);
+    check("goaway mid: the body completed on the old link", g_cl, p_sid_bytes(0, sa));
+    long b1 = 0;
+    for (uint64_t dl = ms_now() + 3000; b1 != 65536 && ms_now() < dl;) {
+        turn();
+        p_sess_hash(1, g_f2s[g_ia], &b1);
+    }
+    check("goaway mid: the next POST on a new link", 2, P_ACCEPTS());
+    check("goaway mid: carries A's next bytes", 65536, b1);
+    check("goaway mid: counted exactly after", 1, ACCT_OK());
+    gl_end();
+}
+
+static int g_rd[2];
+
+static int both_dead(void) {
+    for (int i = 0; i < 2; i++)
+        if (!g_rd[i]) g_rd[i] = gl_read(i);
+    return g_rd[0] < 0 && g_rd[1] < 0;
+}
+
+static void t_link_dead_mid_body(void) {
+    check("dead mid: A partly fed, B batched past it", 1, mid_open(4194304, 7, 1000000, 1000000));
+    g_rd[0] = g_rd[1] = 0;
+    p_cmd(0, 1, 0, 0);
+    /* catches: a dead link leaving a fed body's bytes in the budget */
+    check("dead mid: both flows end, counted exactly", 1, mid_until(both_dead));
+    gl_close(0);
+    gl_close(1);
+    check("dead mid: nothing left in the budget", 0, (long)tr_xmux_bat_used());
+    gl_end();
+}
+
+static int a_partial(void) { return g_t[0].xh.f.feed > 0 && g_t[0].xh.f.feed < 65535; }
+
+static void t_refused_mid_body_before_settings(void) {
+    f2_begin(1, 4194304);
+    f2_ramp(4, 65535);
+    UNTIL(f2_answered());
+    f2_stall();
+    int oka = 1;
+    for (uint64_t dl = ms_now() + 3000; xc_queued() < XC_OUT_HIGH && ms_now() < dl;) {
+        f2_batch(1, 131070);
+        g_now += 30;
+        turn();
+        oka &= ACCT_OK();
+    }
+    check("refused mid before: B's POSTs hold the queue full", 1, xc_queued() >= XC_OUT_HIGH);
+    check("refused mid before: A wrote 65535", 65535, f2_batch(0, 65535));
+    g_now += 30;
+    turn();
+    check("refused mid before: A's POST opened", 1, g_t[0].xh.f.feed > 0);
+    uint32_t sid = f2_feed_sid(0);
+    p_refd_add(0, sid);
+    for (uint64_t dl = ms_now() + 3000; !a_partial() && g_t[0].xh.f.feed && ms_now() < dl;) {
+        p_read_again(0);
+        turn();
+        p_noread(0);
+        oka &= ACCT_OK();
+    }
+    check("refused mid before: A partly fed", 1, a_partial());
+    check("refused mid before: B batched past A's body", 1, f2_batch(1, 65535) > 0 && ACCT_OK());
+    p_rst_code(0, sid, 7);
+    p_read_again(0);
+    /* catches: the unfed remainder sent after a refusal, or a refused body re-sent short */
+    check("refused mid before: both flows complete, counted exactly", 1, mid_until(both_done) && oka);
+    check("refused mid before: A's 65535 sent twice", 2, p_resent(0, sid, 65535));
+    check("refused mid before: A's bytes whole and in order", 1, f2_hash_ok(0, 0));
+    check("refused mid before: B's bytes whole and in order", 1, f2_hash_ok(0, 1));
+    check("refused mid before: the flow fine", 0, g_t[0].xh.err);
+    check("refused mid before: counted exactly", 1, ACCT_OK());
     gl_end();
 }
 
@@ -3908,6 +4671,7 @@ static void t_paused_link_disarmed(void) {
 
 static void glue(void) {
     signal(SIGPIPE, SIG_IGN);
+    gl_big_fill();
     g_now = 1000000;
     tr_xmux_rnd = rnd_zero;
     t_two_flows_one_accept();
@@ -3978,6 +4742,19 @@ static void glue(void) {
     t_batch_holds_a_write_past_post_max();
     t_serve_skips_big_waiter();
     t_post_waits_for_window();
+    t_post_ramps_past_out_high();
+    t_post_fed_across_passes();
+    t_feed_stall_bounded();
+    t_stream_stall_bounded();
+    t_next_post_waits_for_body();
+    t_batch_fills_while_body_drains();
+    t_feed_rotates();
+    t_refused_mid_body_before_settings();
+    t_refused_mid_body_after_settings();
+    t_reset_mid_body();
+    t_close_mid_body();
+    t_goaway_mid_body();
+    t_link_dead_mid_body();
     t_post_waits_for_a_stream_slot();
     t_header_post_waits_for_a_stream_slot();
     t_stream_up_needs_two_slots();

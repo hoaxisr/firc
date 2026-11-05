@@ -780,7 +780,8 @@ static void bat_shrink(struct transport *t) {
 static size_t bat_reserve(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
     size_t lim = bat_lim(t);
-    size_t want = lim > f->bat.n ? lim - f->bat.n : 0;
+    size_t un = f->bat.n - f->feed;
+    size_t want = lim > un ? lim - un : 0;
     if (want > f->bres) {
         size_t add = want - f->bres, free = bat_free();
         if (add > free) add = free;
@@ -828,7 +829,7 @@ long tr_xmux_bat_room(struct transport *t) {
 int tr_xmux_batch(struct transport *t, const unsigned char *d, size_t n) {
     struct xh_flow *f = &t->xh.f;
     size_t take = n < f->bres ? n : f->bres;
-    if (f->bat.n + n > bat_cap(t) || n - take > bat_free()) return H2_EWINDOW;
+    if (f->bat.n - f->feed + n > bat_cap(t) || n - take > bat_free()) return H2_EWINDOW;
     if (xc_q_push(&f->bat, d, n)) return TR_EIO;
     f->bres -= take;
     g_bat_used += n - take;
@@ -841,7 +842,18 @@ size_t tr_xmux_bat_used(void) { return g_bat_used; }
 
 static void bat_flush(struct transport *t) {
     struct xh_flow *f = &t->xh.f;
-    while ((f->bat.n || f->redo_n) && g_now >= f->post_at) {
+    for (;;) {
+        if (f->feed) {
+            size_t had = f->bat.n;
+            int fr = xh_post_feed(t);
+            g_bat_used -= had - f->bat.n;
+            if (fr < 0) {
+                post_err(t, fr);
+                return;
+            }
+            if (f->feed) return;
+        }
+        if (!(f->bat.n || f->redo_n) || g_now < f->post_at) return;
         int rc = t->xh.err ? t->xh.err : post_decide(t);
         if (rc == H2_EWINDOW) return;
         size_t before = f->bat.n;
@@ -856,17 +868,23 @@ static void bat_flush(struct transport *t) {
         f->post_dec = 0;
         struct xm_range iv = t->xh.main_side.opts.interval;
         f->post_at = iv.from > 0 ? g_now + (uint64_t)xm_draw(iv, tr_xmux_rnd) : 0;
+        if (f->feed) return;
     }
 }
 
 static int bats(void) {
     uint64_t due = 0;
+    struct transport *h = g_bat;
+    size_t hn = h ? h->xh.f.bat.n : 0;
+    uint64_t hs = h ? h->xh.seq : 0;
+    unsigned hr = h ? h->xh.f.redo_n : 0;
     for (struct transport *t = g_bat; t; t = t->xh.f.bnext) {
         bat_flush(t);
         if (t->xh.f.blim > XL_RES_KEEP && g_now >= t->xh.f.bw_at + XL_RES_IDLE_MS) bat_shrink(t);
     }
     bat_wakes();
-    for (struct transport **p = &g_bat; *p;) {
+    struct transport **p = &g_bat;
+    while (*p) {
         struct xh_flow *f = &(*p)->xh.f;
         if (!f->bat.n && !f->redo_n && !f->bstarved && f->blim <= XL_RES_KEEP) {
             *p = f->bnext;
@@ -878,6 +896,11 @@ static int bats(void) {
         uint64_t idle_at = f->bw_at + XL_RES_IDLE_MS;
         if (f->blim > XL_RES_KEEP && idle_at > g_now && (!due || idle_at - g_now < due)) due = idle_at - g_now;
         p = &f->bnext;
+    }
+    if (g_bat == h && h && h->xh.f.bnext && (h->xh.f.bat.n != hn || h->xh.seq != hs || h->xh.f.redo_n < hr)) {
+        *p = g_bat;
+        g_bat = g_bat->xh.f.bnext;
+        (*p)->xh.f.bnext = NULL;
     }
     return due > INT32_MAX ? INT32_MAX : (int)due;
 }

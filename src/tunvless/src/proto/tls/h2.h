@@ -89,15 +89,14 @@ struct h2 {
     uint32_t sid;
 };
 
-/* Chrome's look in request headers: xhttp (h2w_go_fields in h2wire.c, which says where the set comes
- * from) and the Upgrade request of ws and httpupgrade (proto/transport/trupgrade.c). One place
- * for both, so the browser version cannot differ between transports.
+/* The browser looks of request headers: xhttp (h2w_go_fields in h2wire.c) and the Upgrade
+ * request of ws and httpupgrade (proto/transport/trupgrade.c). One place for both, so the
+ * versions cannot differ between transports.
  *
- * THE NUMBER IS FIXED, NOT DERIVED FROM THE CLOCK. Xray derives the version from the date
- * (common/utils/browser.go: 144 on 2026-01-13, plus one per 35 days, minus a lag of 35 to 140
- * days seeded from the CPU), but a router with a wrong clock (common without an RTC battery)
- * would then claim a Chrome from the future or from years ago, which stands out more than a
- * slightly old version. Update it with the rest of the fingerprint when the ClientHello is
+ * THE VERSIONS ARE FIXED, NOT DERIVED FROM THE CLOCK. Xray derives them from the date
+ * (common/utils/browser.go), but a router with a wrong clock (common without an RTC battery)
+ * would then claim a browser from the future or from years ago, which stands out more than a
+ * slightly old version. Update them with the rest of the fingerprint when the ClientHello is
  * updated. */
 #define UA_CHROME_MAJOR "149"
 #define UA_CHROME \
@@ -106,6 +105,16 @@ struct h2 {
 #define UA_CH_CHROME \
     "\"Google Chrome\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
     "\", \"Not)A;Brand\";v=\"24\""
+#define UA_EDGE UA_CHROME "Edg/" UA_CHROME_MAJOR ".0.0.0"
+#define UA_CH_EDGE \
+    "\"Microsoft Edge\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
+    "\", \"Not)A;Brand\";v=\"24\""
+#define UA_FIREFOX \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
+#define UA_SAFARI \
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) " \
+    "Version/26.6 Safari/605.1.15"
+#define UA_CURL "curl/8.20.0"
 
 /* The room a h2_read caller must give. A TLS record carries up to 16384 bytes, all of which
  * may be DATA body, plus a carried-over header fragment. A smaller buffer would mean
@@ -119,12 +128,14 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
 
 struct h2_field { const char *name; const char *value; };
 
+enum h2_look { H2L_CHROME, H2L_EDGE, H2L_FIREFOX, H2L_SAFARI, H2L_CURL, H2L_GOLANG, H2L_NONE };
+
 struct h2_req {
     const char *authority, *path, *content_type;
     const char *method;
     const struct h2_field *fields;
     size_t fields_n;
-    int end_stream, no_look;
+    int end_stream, look;
     int64_t body_len;
 };
 

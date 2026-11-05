@@ -23,8 +23,8 @@ struct xh_opts {
     struct xm_range interval;
 };
 
-int xh_opts_parse(const char *xhx, const char *mode, const char *headers, uint16_t pad_to,
-                  struct xh_opts *o, char *why, size_t why_n);
+int xh_opts_parse(const char *xhx, const char *mode, uint16_t pad_to, struct xh_opts *o, char *why,
+                  size_t why_n);
 
 void xm_cfg_effective(const struct xm_cfg *in, struct xm_cfg *out);
 

@@ -108,7 +108,7 @@ void xconn_free(struct xconn *x);
 
 int  xs_open(struct xconn *x, const struct h2_req *r, uint16_t owner, struct xs *s);
 long xs_room(const struct xs *s);
-long xc_room_new(const struct xconn *x, uint16_t owner);
+long xc_post_room(const struct xconn *x, size_t n);
 int  xc_slot_free(const struct xconn *x);
 size_t xc_pend_free(void);
 int  xs_send(const struct xs *s, const unsigned char *d, size_t n, int end);
@@ -125,5 +125,6 @@ size_t xc_q_peek(const struct xc_q *q, unsigned char *out, size_t cap);
 int    xc_q_copy(struct xc_q *dst, const struct xc_q *src, size_t n);
 size_t xc_q_pop(struct xc_q *q, unsigned char *out, size_t cap);
 void   xc_q_drop(struct xc_q *q);
+size_t xc_q_skip(struct xc_q *q, size_t n);
 
 #endif
