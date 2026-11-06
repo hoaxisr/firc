@@ -54,6 +54,7 @@
 /* Before any include: the included sources need GNU extensions, and the first header fixes the
  * feature set. */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -61,11 +62,13 @@
 #include <dirent.h>
 #include <stdint.h>
 
-/* Two sources are included whole, not linked, to reach their static seams: g_tcp_dial (trdial.c)
- * and g_cert_roots (roots.c). The VLESS client and the transport layers are linked as separate
- * objects (Makefile). */
+/* Three sources are included whole, not linked, to reach their static seams: g_tcp_dial
+ * (trdial.c), g_cert_roots (roots.c) and g_fm_new (trsec.c). The VLESS client and the other
+ * transport layers are linked as separate objects (Makefile). */
 #include "../src/proto/transport/trdial.c"
 #include "../src/proto/tls/roots.c"
+#include "../src/proto/transport/trsec.c"
+#include "fmrelay.h"
 #include "client.h"
 
 #include "scrypto.h"
@@ -1024,12 +1027,15 @@ finished:;
 /* ---- TCP setup seam ------------------------------------------------------------ */
 
 static int g_give_fd = -1;
+static int g_fm_relay;
+static struct fmrelay g_relay;
 
 static int fake_dial(const char *host, uint16_t port, int timeout_s) {
     (void)host; (void)port;
     int fd = g_give_fd;
     g_give_fd = -1;
     if (fd < 0) return TR_ECONNECT;
+    if (g_fm_relay) fd = fmrelay_wrap(&g_relay, fd);
     /* What tcp_connect does with the winning socket: read and write timeouts. Without them a
      * bug in the server half would hang the test instead of failing it. */
     sock_ready(fd, timeout_s);
@@ -1257,6 +1263,451 @@ static void heap_check_selftest(void) {
 #endif
 }
 
+static int fm_inq(int fd) {
+    int v = -1;
+    ioctl(fd, FIONREAD, &v);
+    return v;
+}
+
+static void fm_use(const struct fm_ops *o, int relay) {
+    g_fmt_ops = o;
+    g_fm_new = o ? fmt_new : NULL;
+    g_fm_relay = relay;
+}
+
+static int fm_app_keys(struct srv *s, struct dir *cd, struct dir *sd) {
+    unsigned char zeros[HLEN] = { 0 }, empty[HLEN], derived[HLEN], master[HLEN], th[HLEN];
+    unsigned char c_ap[HLEN], s_ap[HLEN];
+    if (sc_hash(SC_SHA256, zeros, 0, empty)) return -1;
+    if (xlabel(s->hs, "derived", empty, HLEN, derived, HLEN)) return -1;
+    if (sc_hkdf_extract(SC_SHA256, derived, HLEN, zeros, HLEN, master)) return -1;
+    tr_snapshot(&s->tr, th);
+    if (xlabel(master, "c ap traffic", th, HLEN, c_ap, HLEN)) return -1;
+    if (xlabel(master, "s ap traffic", th, HLEN, s_ap, HLEN)) return -1;
+    if (client_finished(s, cd) != 1) return -1;
+    return dir_set(cd, c_ap) || dir_set(sd, s_ap) ? -1 : 0;
+}
+
+static void fm_dirs_free(struct dir *cd, struct dir *sd) {
+    if (cd && cd->ready) sc_aead_free(&cd->g);
+    if (sd && sd->ready) sc_aead_free(&sd->g);
+    free(cd);
+    free(sd);
+}
+
+static unsigned char g_fmx_up[3000], g_fmx_down[1000], g_fmx_in[4096];
+
+static int fm_read_n(struct transport *c, unsigned char *out, size_t want) {
+    static unsigned char buf[VLESS_MIN_RECV_CAP];
+    size_t have = 0;
+    for (int i = 0; i < 100 && have < want; i++) {
+        if (!transport_has_data(c)) {
+            struct pollfd p = { .fd = transport_fd(c), .events = POLLIN, .revents = 0 };
+            if (poll(&p, 1, 3000) <= 0) return -110;
+        }
+        size_t got = 0;
+        int rc = transport_read(c, buf, sizeof buf, &got);
+        if (rc) return rc;
+        if (have + got > want) return -111;
+        memcpy(out + have, buf, got);
+        have += got;
+    }
+    return have == want ? 0 : -112;
+}
+
+enum { FM_RECORDS, FM_DIRECT_RAW, FM_DIRECT_MASKED };
+
+static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -100;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = pl;
+    const int tls = strcmp(n->security, "none") != 0;
+    pthread_t th;
+    if (tls && pthread_create(&th, NULL, server_half, &s)) {
+        close(sv[0]);
+        close(sv[1]);
+        return -101;
+    }
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(n, &c, 3);
+    g_tcp_dial = NULL;
+    if (tls) pthread_join(th, NULL);
+    struct dir *cd = calloc(1, sizeof *cd), *sd = calloc(1, sizeof *sd);
+    const int up = rc == 0;
+    if (!rc && (!cd || !sd || s.rc)) rc = -102;
+    if (!rc && tls && fm_app_keys(&s, cd, sd)) rc = -103;
+    for (size_t i = 0; i < sizeof g_fmx_up; i++) g_fmx_up[i] = (unsigned char)(i * 13 + 7);
+    for (size_t i = 0; i < sizeof g_fmx_down; i++) g_fmx_down[i] = (unsigned char)(i * 29 + 3);
+    if (!rc) rc = transport_write(&c, g_fmx_up, sizeof g_fmx_up);
+    size_t have = 0;
+    while (!rc && have < sizeof g_fmx_up) {
+        size_t k = 0;
+        unsigned char inner = 0;
+        if (tls) {
+            if (rec_open(cd, s.fd, g_fmx_in + have, sizeof g_fmx_in - have, &k, &inner) || inner != 0x17) rc = -104;
+        } else {
+            ssize_t r = read(s.fd, g_fmx_in + have, sizeof g_fmx_up - have);
+            if (r <= 0) rc = -104;
+            else k = (size_t)r;
+        }
+        have += k;
+    }
+    if (!rc && memcmp(g_fmx_in, g_fmx_up, sizeof g_fmx_up)) rc = -105;
+    if (!rc && how != FM_RECORDS) {
+        if (how == FM_DIRECT_RAW) fmrelay_off(&g_relay, 1);
+        transport_direct(&c);
+        if (wr_all(s.fd, g_fmx_down, sizeof g_fmx_down)) rc = -106;
+    } else if (!rc) {
+        if (tls ? rec_seal(sd, s.fd, g_fmx_down, sizeof g_fmx_down) : wr_all(s.fd, g_fmx_down, sizeof g_fmx_down))
+            rc = -106;
+    }
+    if (!rc) rc = fm_read_n(&c, g_fmx_in, sizeof g_fmx_down);
+    if (!rc && memcmp(g_fmx_in, g_fmx_down, sizeof g_fmx_down)) rc = -107;
+    if (up) transport_close(&c);
+    fm_dirs_free(cd, sd);
+    close(s.fd);
+    fmrelay_join(&g_relay);
+    return rc;
+}
+
+static int upg_answer(const struct srv *s, char *resp, size_t cap) {
+    int k;
+    if (s->plan->upg == 1) {
+        char key[32] = "", acc[29];
+        const char *kp = strstr(s->req, "\r\nSec-WebSocket-Key: ");
+        if (!kp) return -1;
+        sscanf(kp + 21, "%31[^\r]", key);
+        if (ws_accept(key, acc)) return -1;
+        k = snprintf(resp, cap, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+        resp[k++] = (char)0x82;
+        resp[k++] = 5;
+        memcpy(resp + k, "FIRST", 5);
+        k += 5;
+    } else {
+        k = snprintf(resp, cap, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                     "Upgrade: websocket\r\n\r\nFIRST");
+    }
+    return k;
+}
+
+static void *plain_upg(void *arg) {
+    struct srv *s = arg;
+    s->rc = -1;
+    size_t rn = 0;
+    while (!strstr(s->req, "\r\n\r\n")) {
+        ssize_t r = read(s->fd, s->req + rn, sizeof s->req - 1 - rn);
+        if (r <= 0) return NULL;
+        rn += (size_t)r;
+        s->req[rn] = '\0';
+    }
+    char resp[512];
+    int k = upg_answer(s, resp, sizeof resp);
+    if (k < 0 || wr_all(s->fd, (const unsigned char *)resp, (size_t)k)) return NULL;
+    unsigned char b[11];
+    if (s->plan->upg == 1) {
+        if (rd_all(s->fd, b, 11) || b[0] != 0x82 || b[1] != (0x80 | 5)) return NULL;
+        for (int i = 0; i < 5; i++) b[6 + i] ^= b[2 + (i & 3)];
+        s->got_hello = !memcmp(b + 6, "hello", 5);
+        if (s->plan->ed_first) s->got_hello &= strstr(s->req, "\r\nSec-WebSocket-Protocol: aGVsbG8\r\n") != NULL;
+        if (wr_all(s->fd, (const unsigned char *)"\x82\x05" "AGAIN", 7)) return NULL;
+    } else {
+        if (rd_all(s->fd, b, 5)) return NULL;
+        s->got_hello = !memcmp(b, "hello", 5);
+        if (wr_all(s->fd, (const unsigned char *)"AGAIN", 5)) return NULL;
+    }
+    s->rc = 0;
+    return NULL;
+}
+
+static int fm_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
+    if (strcmp(n->security, "none")) {
+        int rc = run_upg(pl, n, s);
+        fmrelay_join(&g_relay);
+        return rc;
+    }
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    memset(s, 0, sizeof(*s));
+    s->fd = sv[1];
+    s->plan = pl;
+    pthread_t th;
+    if (pthread_create(&th, NULL, plain_upg, s) != 0) { close(sv[0]); close(sv[1]); return -101; }
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(n, &c, 3);
+    g_tcp_dial = NULL;
+    if (rc == 0) {
+        unsigned char got[5];
+        if (pl->ed_first) rc = transport_write(&c, (const unsigned char *)"hello", 5);
+        if (!rc) rc = fm_read_n(&c, got, 5);
+        if (!rc && memcmp(got, "FIRST", 5)) rc = -102;
+        if (!rc) rc = transport_write(&c, (const unsigned char *)"hello", 5);
+        if (!rc) rc = fm_read_n(&c, got, 5);
+        if (!rc && memcmp(got, "AGAIN", 5)) rc = -104;
+        transport_close(&c);
+    }
+    pthread_join(th, NULL);
+    if (!rc && s->rc) rc = -103;
+    close(s->fd);
+    fmrelay_join(&g_relay);
+    return rc;
+}
+
+static void upg_node(struct vless_node *n, const char *sec, const char *type, const char *path) {
+    node_reality(n, type);
+    snprintf(n->security, sizeof n->security, "%s", sec);
+    b64url(g_rs_pub, 32, n->pbk);
+    snprintf(n->path, sizeof n->path, "%s", path);
+    snprintf(n->http_host, sizeof n->http_host, "%s", "cdn.example");
+}
+
+/* catches: one of trsec.c:155, tls13.c:104/147/759/774/887, transport.c:30/56, trupgrade.c:628/726, trws.c:312/343 left on the bare fd */
+static void t_fm_x55(void) {
+    struct plan ok = { .name = "x55", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    int fd0 = fd_count();
+    fm_use(NULL, 1);
+    check("x55: the relay alone breaks a reality link", 1, fm_data(&ok, &rn, FM_RECORDS) != 0);
+    fm_use(&FMT_X55, 1);
+    check("x55 reality tcp: data both ways", 0, fm_data(&ok, &rn, FM_RECORDS));
+    check("x55 reality tcp: the relay carried it", 1, g_relay.n[0] > 3000 && g_relay.n[1] > 1000);
+    struct vless_node pn;
+    upg_node(&pn, "none", "tcp", "");
+    check("x55 none tcp: data both ways", 0, fm_data(&ok, &pn, FM_RECORDS));
+    check("x55 none tcp: the relay carried it", 3000 + 1000, g_relay.n[0] + g_relay.n[1]);
+    static const char *ty[] = { "ws", "httpupgrade", "ws" };
+    static const char *pa[] = { "/w?ed=0", "/w?ed=2048", "/w?ed=2048" };
+    static const char *nm[] = { "ws", "httpupgrade", "ws ed" };
+    for (int sec = 0; sec < 2; sec++)
+        for (int u = 0; u < 3; u++) {
+            struct plan up = { .name = "x55 upg", .reality_ok = 1, .upg = u == 1 ? 2 : 1, .ed_first = u == 2 };
+            struct vless_node n;
+            upg_node(&n, sec ? "none" : "reality", ty[u], pa[u]);
+            static struct srv s;
+            char what[96];
+            int rc = fm_upg(&up, &n, &s);
+            snprintf(what, sizeof what, "x55 %s %s: FIRST read, hello sent", sec ? "none" : "reality", nm[u]);
+            check(what, 0, rc);
+            snprintf(what, sizeof what, "x55 %s %s: the server read hello", sec ? "none" : "reality", nm[u]);
+            check(what, 1, s.got_hello);
+            snprintf(what, sizeof what, "x55 %s %s: the relay carried it", sec ? "none" : "reality", nm[u]);
+            check(what, 1, g_relay.n[0] > 0 && g_relay.n[1] > 0);
+        }
+    fm_use(NULL, 0);
+    check("x55: descriptor count restored", fd0, fd_count());
+    check("x55: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+/* catches: a socket EPROTO on an unmasked link reported as the mask's error */
+static void t_lk_err_unmasked(void) {
+    struct tr_link l;
+    memset(&l, 0, sizeof l);
+    errno = EPROTO;
+    check("unmasked link, EPROTO: a plain I/O error", TR_EIO, tr_lk_err(&l, -1));
+    check("unmasked link, EOF: closed", TR_ECLOSED, tr_lk_err(&l, 0));
+}
+
+/* catches: tr_link_read passing direct=0, or bypassing a non-splice layer */
+static void t_fm_direct(void) {
+    struct plan ok = { .name = "direct", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    int fd0 = fd_count();
+    fm_use(&FMT_X55, 1);
+    check("direct, splice layer: raw bytes read past it", 0, fm_data(&ok, &rn, FM_DIRECT_RAW));
+    fm_use(&FMT_X55_NOSPLICE, 1);
+    check("direct, non-splice layer: bytes still read through it", 0, fm_data(&ok, &rn, FM_DIRECT_MASKED));
+    fm_use(NULL, 0);
+    check("direct: descriptor count restored", fd0, fd_count());
+    check("direct: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+static void *silent_half(void *arg) {
+    struct srv *s = arg;
+    unsigned char b[4096];
+    while (read(s->fd, b, sizeof b) > 0) {}
+    return NULL;
+}
+
+/* catches: the chain leaked on link_drop or the retry */
+static void t_fm_free_paths(void) {
+    struct vless_node node;
+    node_reality(&node, "tcp");
+    static const struct plan pl[] = {
+        { .name = "hangup", .hangup = 1 },
+        { .name = "bad finished", .bad_finished = 1 },
+        { .name = "no key share", .no_keyshare = 1 },
+    };
+    static const int want[] = { TLS13_ECLOSED, TLS13_EFINISHED, TLS13_ENOKEYSHARE };
+    fm_use(&FMT_X55, 1);
+    for (size_t i = 0; i < sizeof pl / sizeof *pl; i++) {
+        char what[96];
+        int fd0 = fd_count();
+        int rc = run_case(&pl[i], &node, NULL, 0, NULL);
+        fmrelay_join(&g_relay);
+        snprintf(what, sizeof what, "free paths, %s: the masked handshake fails there", pl[i].name);
+        check(what, want[i], rc);
+        snprintf(what, sizeof what, "free paths, %s: descriptor count restored", pl[i].name);
+        check(what, fd0, fd_count());
+        snprintf(what, sizeof what, "free paths, %s: nothing left on the heap", pl[i].name);
+        check(what, 0, LEAK_CHECK());
+    }
+    struct vless_node bad;
+    node_reality(&bad, "tcp");
+    snprintf(bad.pbk, sizeof bad.pbk, "%s", "!!");
+    for (int k = 0; k < 2; k++) {
+        int fd0 = fd_count(), sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) break;
+        fm_use(k ? &FMT_HSFAIL : &FMT_X55, 0);
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(k ? &node : &bad, &c, 1);
+        g_tcp_dial = NULL;
+        close(sv[1]);
+        check(k ? "free paths, the layer's handshake fails: TR_EMASK" : "free paths, the hello cannot be built",
+              k ? TR_EMASK : REALITY_EBADKEY, rc);
+        check(k ? "free paths, the layer's handshake fails: descriptor count restored"
+                : "free paths, the hello cannot be built: descriptor count restored", fd0, fd_count());
+        check(k ? "free paths, the layer's handshake fails: nothing left on the heap"
+                : "free paths, the hello cannot be built: nothing left on the heap", 0, LEAK_CHECK());
+    }
+    fm_use(&FMT_X55, 1);
+    struct vless_node rn;
+    node_reality(&rn, "tcp");
+    snprintf(rn.host, sizeof rn.host, "%s", "retry.invalid");
+    int sv[2];
+    int fd0 = fd_count();
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        struct timeval tv = { .tv_sec = 5 };
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        static struct srv s;
+        memset(&s, 0, sizeof s);
+        s.fd = sv[1];
+        pthread_t th;
+        pthread_create(&th, NULL, silent_half, &s);
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        struct transport c;
+        int rc = vless_connect(&rn, &c, 1);
+        g_tcp_dial = NULL;
+        check("free paths, nopq retry: the silent node times out", TLS13_ETIMEOUT, rc);
+        pthread_join(th, NULL);
+        close(sv[1]);
+        fmrelay_join(&g_relay);
+    }
+    fm_use(NULL, 0);
+    check("free paths, nopq retry: descriptor count restored", fd0, fd_count());
+    check("free paths, nopq retry: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+/* catches: transport_has_data not asking the chain */
+static void t_fm_pending_ready(void) {
+    struct plan ok = { .name = "hold", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    int fd0 = fd_count();
+    fm_use(&FMT_HOLD, 0);
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = &ok;
+    pthread_t th;
+    pthread_create(&th, NULL, server_half, &s);
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(&rn, &c, 3);
+    g_tcp_dial = NULL;
+    pthread_join(th, NULL);
+    check("pending: connected through a holding layer", 0, rc);
+    struct dir *cd = calloc(1, sizeof *cd), *sd = calloc(1, sizeof *sd);
+    check("pending: server keys", 0, !rc && cd && sd ? fm_app_keys(&s, cd, sd) : -1);
+    if (!rc) {
+        check("pending: two records written", 0,
+              rec_seal(sd, s.fd, (const unsigned char *)"abc", 3) || rec_seal(sd, s.fd, (const unsigned char *)"def", 3));
+        int fd = transport_fd(&c);
+        for (int i = 0; i < 300 && fm_inq(fd) < 50; i++) usleep(1000);
+        check("pending: both records in the socket", 50, fm_inq(fd));
+        unsigned char got[3] = { 0 };
+        check("pending: the first record read", 0, fm_read_n(&c, got, 3));
+        check("pending: abc", 0, memcmp(got, "abc", 3));
+        check("pending: the socket is empty", 0, fm_inq(fd));
+        check("pending: one byte held by the chain", 1, fm_pending(c.link.tls.fm));
+        check("pending: transport_has_data asks the chain", 1, transport_has_data(&c));
+        size_t n = 0;
+        static unsigned char buf[VLESS_MIN_RECV_CAP];
+        check("pending: the second record read without the socket", 0, transport_read(&c, buf, sizeof buf, &n));
+        check("pending: def", 1, n == 3 && !memcmp(buf, "def", 3));
+        transport_close(&c);
+    }
+    fm_dirs_free(cd, sd);
+    close(s.fd);
+    fm_use(NULL, 0);
+    check("pending: descriptor count restored", fd0, fd_count());
+    check("pending: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+/* catches: a layer's read error reported as an I/O error, or a node whose mask cannot be built dialled unmasked */
+static void t_fm_mask_error(void) {
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    int fd0 = fd_count();
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    struct plan ok = { .name = "bad read", .reality_ok = 1 };
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = &ok;
+    pthread_t th;
+    pthread_create(&th, NULL, server_half, &s);
+    fm_use(&FMT_BAD, 0);
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(&rn, &c, 3);
+    g_tcp_dial = NULL;
+    fm_use(NULL, 0);
+    check("mask error: a layer's read error fails the handshake as TR_EMASK", TR_EMASK, rc);
+    check_str("mask error: the text names the layer's reason", "finalmask: test: bad read", transport_strerror(rc));
+    close(sv[1]);
+    pthread_join(th, NULL);
+    rn.fm = "{\"tcp\":[{\"type\":";
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        rc = vless_connect(&rn, &c, 3);
+        g_tcp_dial = NULL;
+        check("mask refused: TR_EMASK", TR_EMASK, rc);
+        check("mask refused: never dialled", sv[0], g_give_fd);
+        check_str("mask refused: the text says why", "finalmask: the node's mask does not parse", transport_strerror(rc));
+        g_give_fd = -1;
+        close(sv[0]);
+        close(sv[1]);
+    }
+    check("mask error: descriptor count restored", fd0, fd_count());
+    check("mask error: nothing left on the heap", 0, LEAK_CHECK());
+}
+
 int main(void) {
     /* The server half writes to a socket the client has already closed: on a failed check the
      * client closes without reading to the end. Without this the test would die of SIGPIPE
@@ -1434,6 +1885,13 @@ int main(void) {
             check(what, 0, LEAK_CHECK());
         }
     }
+
+    t_fm_x55();
+    t_lk_err_unmasked();
+    t_fm_direct();
+    t_fm_free_paths();
+    t_fm_pending_ready();
+    t_fm_mask_error();
 
     {
         struct plan ok = { .name = "two links", .reality_ok = 1, .hold = 1 };
@@ -1740,6 +2198,19 @@ int main(void) {
             snprintf(what, sizeof(what), "tls + %s: nothing left on the heap", ttype[u - 1]);
             check(what, 0, LEAK_CHECK());
         }
+        {
+            struct plan ok = { .name = "x55 tls", .chain = LEAF_OK };
+            struct vless_node tn;
+            node_tls(&tn, "tcp");
+            int fd0 = fd_count();
+            fm_use(&FMT_X55, 1);
+            /* catches: tls13.c:104/147/759/774/887 or trsec.c:155 on the bare fd under security=tls */
+            check("x55 tls tcp: data both ways", 0, fm_data(&ok, &tn, FM_RECORDS));
+            fm_use(NULL, 0);
+            check("x55 tls tcp: descriptor count restored", fd0, fd_count());
+            check("x55 tls tcp: nothing left on the heap", 0, LEAK_CHECK());
+        }
+
         /* The server behind TLS chose h2, but the upgrade runs over HTTP/1.1: its own code, not
          * "did not agree to HTTP/2". */
         {

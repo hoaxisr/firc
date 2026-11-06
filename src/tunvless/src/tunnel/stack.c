@@ -242,6 +242,8 @@ struct conn {
     uint8_t ib_reply;
     uint8_t ib_udp;
     uint8_t mux;
+    uint8_t fm_wait;
+    uint8_t no_due;
 };
 
 /* The hot record must stay small: that is the whole point of the split. A build check rather
@@ -1516,9 +1518,23 @@ static long conn_room(const struct conn *c) {
     return g_dl->ops->room(g_dl->ctx, SESS(c));
 }
 
+static int conn_due(struct conn *c, uint64_t now_ms, int *next_ms) {
+    *next_ms = -1;
+    if (c->no_due || !g_dl->ops->due) return 0;
+    if (g_dl->ops->due(SESS(c), now_ms, next_ms) != SEND_OK) return -1;
+    if (*next_ms == -2) {
+        c->no_due = 1;
+        *next_ms = -1;
+    }
+    c->fm_wait = (uint8_t)(*next_ms < 0 ? 0 : *next_ms ? 1 : 2);
+    return 0;
+}
+
 static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
     int sr = g_dl->ops->send(g_dl->ctx, SESS(c), &c->key, c->is_udp, data, n);
     if (sr == SEND_OK) c->sent_any = 1;
+    int next;
+    if (sr == SEND_OK && conn_due(c, g_now_ns / 1000000, &next)) return SEND_FATAL;
     return sr;
 }
 
@@ -1853,6 +1869,8 @@ static int conn_can_take(struct conn *c) {
  * Two dialer steps, not one: read, then deliver. Between them the stack counts bytes from the
  * node per pass (DRAIN_MAX_BYTES) and time spent reading (STEER_TUN_STATS), and those numbers
  * must not depend on what parsing the protocol costs. */
+#define PUMP_DUE (-1000)
+
 static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
     /* Static rather than on the stack: TUNNEL_BUF would be 18 KB of stack per call. */
     static __thread unsigned char buf[TUNNEL_BUF];
@@ -1866,9 +1884,13 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
     g_rx_total += got;
     if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
     if (rc) { TR("read from server: rc=%d\n", rc); return rc; }
+    int next;
     /* Zero bytes is legitimate: an HTTP/2 control frame arrived and no data yet. Taking it for
      * the end of the stream would break the connection on the first SETTINGS. */
-    if (!got) { TR("control frame, no data\n"); return 0; }
+    if (!got) {
+        TR("control frame, no data\n");
+        return conn_due(c, g_now_ns / 1000000, &next) ? PUMP_DUE : 0;
+    }
     TR("%zu bytes from server\n", got);
 
     /* Parsing — response header, wrappers, datagram reassembly — is the dialer's. It delivers the
@@ -1879,6 +1901,7 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
                            c->is_udp ? (c->ib_udp ? emit_ib_dgram : emit_dgram) : c->sock ? emit_sock : emit_stream,
                            &e) != 0)
         return -1;
+    if (conn_due(c, g_now_ns / 1000000, &next)) return PUMP_DUE;
     if (c->is_udp) return 0;
 
     if (!e.total) { TR("no data after parsing\n"); return 0; }
@@ -2627,14 +2650,15 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
     uint64_t drained_from = g_rx_total;
     c->rx_ready = 0;
     for (;;) {
-        if (downstream_pump(c, tun) != 0) {
+        int pr = downstream_pump(c, tun);
+        if (pr != 0) {
             /* The server closed. Do NOT close the connection until the client acknowledges
              * everything: unacknowledged data in the ring must still be resent, and closing would
              * destroy the ring. The FIN goes from the common pass. */
             c->srv_closed = 1;
             c->closed_at = g_now_ns;
             /* Cut, not closed: the client gets RST from the common pass (the aborted field). */
-            if (conn_node_lost(c) && !c->is_udp) c->aborted = 1;
+            if ((conn_node_lost(c) || pr == PUMP_DUE) && !c->is_udp) c->aborted = 1;
             TR("server closed conn#%ld, waiting for ACK of %u bytes\n",
                (long)(c - g_conns), c->rtx.len);
             return;
@@ -2735,7 +2759,8 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
         if (ratelog_take(&g_said_open, ratelog_now(), 10, &held))
             fprintf(stderr, LOG_W "flow to %s did not open: %s%s\n",
                     d->peer_of ? d->peer_of(g_dl->ctx, SESS(c)) : d->peer(g_dl->ctx),
-                    d->strerror(c->rc), ratelog_more(more, sizeof more, held));
+                    d->why ? d->why(SESS(c), c->rc) : d->strerror(c->rc),
+                    ratelog_more(more, sizeof more, held));
         if (c->ib_reply) {
             ib_refuse(c, IBHS_END_DIAL);
             return 1;
@@ -3817,7 +3842,8 @@ static int loop_turn(struct loop *L, int max_ms) {
     int pend = 0, forced = 0;
     /* Wait until the nearest retransmission deadline, not always a second: otherwise a
      * resend waits for the loop to wake by itself. With live traffic that is at once, but
-     * after the last segment is lost nothing wakes it — exactly the case the timer is for. */
+     * after the last segment is lost nothing wakes it — exactly the case the timer is for.
+     * The same holds for the bytes a link keeps back for a mask delay (fm_wait). */
     int wait_ms = max_ms;
     for (int li = 0; li < g_live_n; li++) {
         struct conn *c = &g_conns[g_live[li]];
@@ -3825,6 +3851,17 @@ static int loop_turn(struct loop *L, int max_ms) {
             pend++;
             if (c->mux && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) wait_ms = 0;
             continue;
+        }
+        if (c->fm_wait && c->srv_closed) c->fm_wait = 0;
+        if (c->fm_wait) {
+            int next;
+            if (conn_due(c, now / 1000000, &next)) {
+                conn_node_lost(c);
+                conn_reset(c, tun);
+                li--;
+                continue;
+            }
+            if (next > 0 && next < wait_ms) wait_ms = next;
         }
 
         /* Window and in-flight are recorded ALWAYS, not only on a refused read: a flow can
@@ -3855,7 +3892,7 @@ static int loop_turn(struct loop *L, int max_ms) {
          * its header, emit_to_client), there is nothing to wait for: a level-triggered
          * EPOLLOUT on a writable descriptor would wake the loop on every turn for nothing. */
         if (c->ack_hold && !c->ack_due) c->ack_hold = 0;
-        unsigned arm = (want ? ARM_IN : 0u) | (c->ack_hold ? ARM_OUT : 0u);
+        unsigned arm = (want ? ARM_IN : 0u) | (c->ack_hold || c->fm_wait == 2 ? ARM_OUT : 0u);
         if (!c->mux && arm != c->armed) {
             struct epoll_event e = { .events = (arm & ARM_IN ? EPOLLIN : 0u) |
                                                (arm & ARM_OUT ? EPOLLOUT : 0u),

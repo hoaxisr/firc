@@ -68,8 +68,11 @@ struct tls13_keys {
  * struct, but the layer cannot promise the library never adds a pointer. Pass a pointer; for a
  * second instance, set it up from the key again. */
 
+struct fm_link;
+
 struct tls13 {
     int fd;
+    struct fm_link *fm;
     int ready;
     /* Read buffer: take everything the socket has in one call and assemble records from here.
      * Without it each record cost several system calls and a wait for the rest of it

@@ -1,0 +1,1 @@
+{"tcp":[{"type":"filter","settings":{"allowedSourceIPs":["10.0.0.1/32","!192.168.0.0/16","::1","geoip:ru","ext:a.dat:tag","ext-ip:f:c","geoip:!ru","!ext:a:b:c"]}}]}

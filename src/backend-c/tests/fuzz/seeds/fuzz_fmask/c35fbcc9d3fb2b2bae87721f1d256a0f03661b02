@@ -1,0 +1,1 @@
+{"tcp":[{"type":"header-custom","settings":{"servers":[[{"rand":2,"capture":"a"}],[{"transform":{"op":"concat","args":[{"reuse":"a"}]}}]]}}]}

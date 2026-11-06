@@ -24,6 +24,7 @@
 #include "roots.h"
 #include "certverify.h"
 #include "ech.h"
+#include "fmlink.h"
 
 /* security=none — a bare stream, no TLS at all (for a trusted network). Without TLS there is no
  * ALPN negotiation, so an HTTP/2 transport starts HTTP/2 at once: the server either accepts bare
@@ -150,12 +151,10 @@ static int sec_tls_hello(struct tr_link *l, const struct tr_node *n, const char 
 
     size_t sent = 0;
     while (sent < send_n) {
-        /* MSG_NOSIGNAL: a node that closes before the ClientHello is a write error, not a
-         * signal. */
-        ssize_t w = send(l->fd, send_hello + sent, send_n - sent, MSG_NOSIGNAL);
+        ssize_t w = tr_lk_send(l, send_hello + sent, send_n - sent);
         if (w <= 0) {
-            if (w < 0 && errno == EINTR) continue;
-            return TR_EIO;
+            if (w == -1 && errno == EINTR) continue;
+            return w < -1 ? (int)w : TR_EIO;
         }
         sent += (size_t)w;
     }
@@ -296,19 +295,42 @@ static void nopq_remember(const struct tr_node *n) {
                 n->host, (unsigned)n->port, tr_nopq_ttl_s / 60);
 }
 
+static struct fm_link *(*g_fm_new)(const struct tr_node *n);
+
+static int link_chain(const struct tr_node *n, struct fm_link **out) {
+    if (!g_fm_new) return fm_link_open(n->fm, out);
+    *out = g_fm_new(n);
+    return 0;
+}
+
+static void link_unchain(struct tr_link *l) {
+    fm_link_free(l->tls.fm);
+    l->tls.fm = NULL;
+}
+
 static int link_hello(struct tr_link *l, const struct tr_node *n, const char *alpn, int timeout_s,
                       int nopq, struct sec_pend *p) {
     l->fd = -1;
     l->nopq = nopq;
+    l->tls.fm = NULL;
     p->eh = NULL;
+    struct fm_link *fm;
+    int rc = link_chain(n, &fm);
+    if (rc) return rc;
     int fd = tr_dial(n->host, n->port, timeout_s);
-    if (fd < 0) return fd;
+    if (fd < 0) {
+        fm_link_free(fm);
+        return fd;
+    }
     l->fd = fd;
-    int rc = tr_security(n->security)->hello(l, n, alpn, p);
+    l->tls.fm = fm;
+    rc = fm ? fm_link_hs(fm, fd, timeout_s * 1000) : 0;
+    if (!rc) rc = tr_security(n->security)->hello(l, n, alpn, p);
     if (rc) {
         pend_drop(p);
         close(fd);
         l->fd = -1;
+        link_unchain(l);
     }
     return rc;
 }
@@ -317,11 +339,12 @@ static void link_drop(struct tr_link *l, struct sec_pend *p) {
     pend_drop(p);
     close(l->fd);
     l->fd = -1;
+    link_unchain(l);
 }
 
-/* On a failed handshake only close(), not tr_link_close: tls13_handshake_auth frees its own heap
- * state on failure, and tests/vlessmatch.c checks that under AddressSanitizer for every failure
- * branch. */
+/* On a failed handshake close() and the chain, not tr_link_close: tls13_handshake_auth frees its
+ * own heap state on failure, and tests/vlessmatch.c checks that under AddressSanitizer for every
+ * failure branch. */
 static int link_finish(struct tr_link *l, const struct tr_node *n, struct sec_pend *p) {
     const struct security_ops *s = tr_security(n->security);
     int rc = s->finish ? s->finish(l, n, p) : 0;
@@ -367,6 +390,8 @@ static int link_first(const struct tr_link *a, const struct tr_node *na, const s
                       const struct tr_node *nb, int timeout_s) {
     if (!tr_security(na->security)->finish) return 0;
     if (!tr_security(nb->security)->finish) return 1;
+    if (fm_pending(a->tls.fm)) return 0;
+    if (fm_pending(b->tls.fm)) return 1;
     struct pollfd pv[2] = { { .fd = a->fd, .events = POLLIN }, { .fd = b->fd, .events = POLLIN } };
     int r;
     do r = poll(pv, 2, timeout_s * 1000); while (r < 0 && errno == EINTR);

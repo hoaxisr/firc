@@ -80,6 +80,7 @@
 #include "osrand.h"
 
 #include "transport.h"
+#include "fmlink.h"
 #include "trpath.h"
 
 /* ---- helpers: randomness, base64, SHA-1 ------------------------------------------------ */
@@ -620,15 +621,18 @@ static int h1_wait(struct transport *t, int ws, int timeout_s) {
         } else {
             int64_t left = deadline - mono_ms();
             if (left <= 0) return TR_EUPTIMEOUT;
-            struct pollfd p = { .fd = t->link.fd, .events = POLLIN, .revents = 0 };
-            int pr = poll(&p, 1, (int)left);
-            if (pr < 0 && errno == EINTR) continue;
-            if (pr <= 0) return pr == 0 ? TR_EUPTIMEOUT : TR_EIO;
+            if (!fm_pending(t->link.tls.fm)) {
+                struct pollfd p = { .fd = t->link.fd, .events = POLLIN, .revents = 0 };
+                int pr = poll(&p, 1, (int)left);
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr <= 0) return pr == 0 ? TR_EUPTIMEOUT : TR_EIO;
+            }
             if (t->link.plain) {
-                ssize_t k = read(t->link.fd, raw, sizeof(raw));
+                ssize_t k = tr_lk_recv(&t->link, raw, sizeof(raw), 0);
                 if (k == 0) return TR_ECLOSED;
                 if (k < 0) {
                     if (errno == EINTR) continue;
+                    if (errno == EPROTO) return TR_EMASK;
                     return errno == EAGAIN || errno == EWOULDBLOCK ? TR_EUPTIMEOUT : TR_EIO;
                 }
                 in = raw;
@@ -723,8 +727,8 @@ static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_
     const unsigned char *in = d;
     size_t n = 0;
     if (t->link.plain) {
-        ssize_t k = read(t->link.fd, d, cap);
-        if (k <= 0) return k == 0 ? TR_ECLOSED : TR_EIO;
+        ssize_t k = tr_lk_recv(&t->link, d, cap, 0);
+        if (k <= 0) return tr_lk_err(&t->link, k);
         n = (size_t)k;
     } else {
         int rc = tls13_read_ref(&t->link.tls, &in, &n);

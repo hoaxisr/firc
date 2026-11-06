@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #include "trxmux.h"
 #include "xconn.h"
@@ -100,7 +101,7 @@ static void link_free(struct xl *l) {
     if (!l->dialing && x->state == XC_LIVE && x->link.fd >= 0) {
         unsigned char sink[4096];
         xconn_flush(x);
-        for (int i = 0; i < 64 && recv(x->link.fd, sink, sizeof sink, MSG_DONTWAIT) > 0; i++) {}
+        for (int i = 0; i < 64 && tr_lk_recv(&x->link, sink, sizeof sink, MSG_DONTWAIT) > 0; i++) {}
     }
     xconn_free(x);
     memset(l, 0, sizeof *l);
@@ -1011,6 +1012,7 @@ int tr_xmux_pass(uint64_t now, int phase) {
         if (l->used && !l->dialing && l->x->state == XC_LIVE) after(l);
     }
     int due = phase == MUXP_LATE ? bats() : 0;
+    uint64_t mnow = 0;
     for (unsigned i = 0; i < XC_MAX; i++) {
         struct xl *l = &g_l[i];
         if (!l->used) continue;
@@ -1022,6 +1024,10 @@ int tr_xmux_pass(uint64_t now, int phase) {
         l->x->now_ms = now;
         if (phase == MUXP_LATE) xconn_flush(l->x);
         after(l);
+        if (phase != MUXP_LATE || !l->used || l->x->state != XC_LIVE || !l->x->out_due) continue;
+        if (!mnow) mnow = tr_mono_ms();
+        int d = xconn_due(l->x, mnow);
+        if (d >= 0 && (!due || (d ? d : 1) < due)) due = d ? d : 1;
     }
     if (phase == MUXP_LATE && (!g_ticked || now >= g_tick + XL_TICK_MS)) {
         g_ticked = 1;

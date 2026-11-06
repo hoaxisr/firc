@@ -29,12 +29,13 @@ DEFS     := -DTUNVLESS_VERSION='"$(VERSION)"'
 
 TUNNEL_SRC    := src/tunnel/tun.c src/tunnel/stack.c src/tunnel/ibhs.c src/tunnel/rtx.c src/tunnel/ifcfg.c src/tunnel/pool.c src/tunnel/nodes.c src/control.c src/ctlmap.c
 VLESS_SRC     := src/proto/vless/vldial.c src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vlink.c \
-                 src/proto/vless/vision.c src/proto/vless/sublink.c src/proto/vless/sub.c
+                 src/proto/vless/vision.c src/proto/vless/sublink.c src/proto/vless/sub.c src/proto/transport/fmask.c
 TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trsec.c src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c \
                  src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
                  src/proto/transport/trvenc.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
-                 src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
+                 src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
+                 src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c
 TLS_SRC       := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
                  src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c \
                  src/proto/tls/roots.c
@@ -114,7 +115,9 @@ T_CFLAGS  = -O1 -g $(WARN) -Wno-unused-function $(INC) -Itests $(if $(SANITIZE),
 TW_LIB   := $(T)/wolfssl/libwolfssl.a
 TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
-UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match
+FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/lib/osrand.c
+
+UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch
 
 test: unit-test crypto-test
@@ -143,7 +146,8 @@ XHUP_SRC := src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/transport/transp
             src/proto/transport/trdial.c src/proto/transport/trgrpc.c src/proto/tls/roots.c \
             src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c \
             src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/lib/osrand.c \
-            src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
+            src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
+            src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/proto/transport/fmask.c
 $(T)/xhupmatch: tests/xhupmatch.c tests/trvenc-stub.c src/proto/transport/trxhttp.c $(XHUP_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/xhupmatch.c tests/trvenc-stub.c $(XHUP_SRC) -lpthread
@@ -152,7 +156,8 @@ WS_SRC := src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/t
           src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trdial.c \
           src/proto/transport/trgrpc.c src/proto/transport/trxhttp.c src/proto/tls/h2.c \
           src/proto/tls/h2wire.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/tls/roots.c src/lib/osrand.c \
-          src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c
+          src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
+          src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/proto/transport/fmask.c
 $(T)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) -lpthread
@@ -166,9 +171,9 @@ $(T)/xmuxmatch: tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) -lpthread
 
-$(T)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c $(HDR)
+$(T)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/pqfallbackmatch.c src/proto/transport/trsec.c
+	$(CC) $(T_CFLAGS) -o $@ tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) -lpthread
 
 $(T)/b3match: tests/b3match.c src/lib/blake3.h
 	@mkdir -p $(T)
@@ -178,7 +183,8 @@ $(T)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/lib/osrand.c 
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/visionmatch.c src/proto/vless/vision.c src/lib/osrand.c -lpthread
 
-SUB_SRC := src/proto/vless/sublink.c src/proto/transport/trpath.c src/proto/transport/xhopts.c
+SUB_SRC := src/proto/vless/sublink.c src/proto/vless/vlink.c src/proto/transport/trpath.c src/proto/transport/xhopts.c \
+           src/proto/transport/fmask.c
 $(T)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC) $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/submatch.c $(SUB_SRC)
@@ -187,9 +193,9 @@ $(T)/subpq: tests/subpq.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/subpq.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC)
 
-$(T)/vlinkmatch: tests/vlinkmatch.c tests/sub-pq-samples.h src/proto/vless/vlink.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC) $(HDR)
+$(T)/vlinkmatch: tests/vlinkmatch.c tests/sub-pq-samples.h src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC) $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/vlinkmatch.c src/proto/vless/vlink.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC)
+	$(CC) $(T_CFLAGS) -o $@ tests/vlinkmatch.c src/proto/vless/sub.c src/proto/vless/vless_proto.c $(SUB_SRC)
 
 $(T)/tungromatch: tests/tungromatch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
@@ -206,6 +212,14 @@ $(T)/tun6match: tests/tun6match.c src/tunnel/tun.c $(HDR)
 $(T)/addr6match: tests/addr6match.c src/tunnel/ifcfg.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/addr6match.c src/tunnel/ifcfg.c
+
+$(T)/fmaskmatch: tests/fmaskmatch.c src/proto/transport/fmask.c $(HDR)
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/fmaskmatch.c src/proto/transport/fmask.c
+
+$(T)/fmlinkmatch: tests/fmlinkmatch.c $(FMLINK_SRC) $(HDR)
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/fmlinkmatch.c $(filter-out src/proto/transport/fmlink.c,$(FMLINK_SRC)) -lpthread
 
 $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
@@ -237,7 +251,7 @@ $(T)/dialmatch: tests/dialmatch.c src/proto/transport/trdial.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/dialmatch.c -lpthread
 
-CTLN_SRC := src/ctlnodes.c src/ctlmap.c src/ctlinb.c src/control.c src/tunnel/nodes.c src/proto/vless/vlink.c src/proto/vless/sub.c \
+CTLN_SRC := src/ctlnodes.c src/ctlmap.c src/ctlinb.c src/control.c src/tunnel/nodes.c src/proto/vless/sub.c \
             src/proto/vless/vless_proto.c $(SUB_SRC)
 $(T)/ctlnodesmatch: tests/ctlnodesmatch.c tests/sub-pq-samples.h src/proto/transport/trdial.c $(CTLN_SRC) $(HDR)
 	@mkdir -p $(T)
@@ -257,7 +271,7 @@ $(T)/rtxmatch: tests/rtxmatch.c src/tunnel/rtx.c src/tunnel/rtx.h
 
 TUNNEL_TEST_SRC := src/control.c src/ctlmap.c src/tunnel/tun.c src/tunnel/rtx.c src/tunnel/ifcfg.c src/proto/vless/vless_proto.c \
                    src/proto/vless/vision.c src/proto/vless/vldial.c src/lib/osrand.c src/tunnel/ibhs.c src/tunnel/nodes.c \
-                   src/ctlinb.c src/ctlnodes.c src/proto/vless/vlink.c src/proto/vless/sub.c src/proto/transport/trdial.c \
+                   src/ctlinb.c src/ctlnodes.c src/proto/vless/sub.c src/proto/transport/trdial.c \
                    $(SUB_SRC)
 $(T)/tunnelmatch: tests/tunnelmatch.c src/tunnel/stack.c src/tunnel/pool.c $(TUNNEL_TEST_SRC) $(HDR)
 	@mkdir -p $(T)
@@ -289,12 +303,13 @@ T_CERTZIP = $(T)/certzip.o $(CERTZIP_LIBS)
 $(T)/certzipmatch: tests/certzipmatch.c tests/certzip-samples.h $(T)/certzip.o
 	$(CC) $(T_CFLAGS) -Wl,--wrap=malloc -o $@ tests/certzipmatch.c $(T_CERTZIP)
 CLIENT_SRC := src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-              src/proto/vless/sub.c src/proto/vless/sublink.c \
+              src/proto/vless/sub.c src/proto/vless/sublink.c src/proto/vless/vlink.c src/proto/transport/fmask.c \
               src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trgrpc.c \
               src/proto/transport/trxhttp.c src/proto/transport/trupgrade.c src/proto/transport/trws.c \
               src/proto/transport/trpath.c src/proto/transport/trvenc.c \
               src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/transport/xconn.c \
               src/proto/transport/trxmux.c src/proto/transport/xmux.c \
+              src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
               src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
               src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c
 
@@ -307,26 +322,27 @@ $(T)/hellofreeze: tests/hellofreeze.c tests/chello-frozen.h tests/chello-frozen-
 $(T)/echmatch: tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c $(T)/scrypto.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c $(T_CRYPTO)
 
-# vlessmatch includes trdial.c and roots.c (it reaches their static seams).
-$(T)/vlessmatch: tests/vlessmatch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c \
+# vlessmatch includes trdial.c, roots.c and trsec.c (it reaches their static seams).
+VLM_SRC := $(filter-out src/proto/transport/trsec.c,$(CLIENT_SRC))
+$(T)/vlessmatch: tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c \
                  $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
-	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -o $@ tests/vlessmatch.c $(CLIENT_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
+	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -o $@ tests/vlessmatch.c $(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
-$(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c $(CLIENT_SRC) src/proto/transport/trdial.c \
+$(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c \
                  src/proto/tls/roots.c $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=malloc -o $@ tests/xconnmatch.c \
-		$(CLIENT_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
+		$(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/probematch: tests/probematch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/probematch.c $(CLIENT_SRC) src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/takematch: tests/takematch.c src/proto/vless/vldial.c $(CLIENT_SRC) $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/takematch.c src/proto/vless/vldial.c $(TUNNEL_SRC) $(CLIENT_SRC) \
-		src/ctlinb.c src/ctlnodes.c src/proto/vless/vlink.c src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
+		src/ctlinb.c src/ctlnodes.c src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/xudpmatch: tests/xudpmatch.c src/proto/vless/vldial.c $(CLIENT_SRC) $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -o $@ tests/xudpmatch.c $(TUNNEL_SRC) $(CLIENT_SRC) \
-		src/ctlinb.c src/ctlnodes.c src/proto/vless/vlink.c src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
+		src/ctlinb.c src/ctlnodes.c src/proto/transport/trdial.c src/proto/tls/roots.c $(T_CERTZIP) $(T_CRYPTO)
 
 # -- probes for the interop scripts (a real server on the other side) --
 

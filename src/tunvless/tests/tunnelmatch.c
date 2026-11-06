@@ -114,6 +114,24 @@ static unsigned char g_wire[256 * 1024];
 static size_t g_wire_n;
 static struct { const struct transport *t; size_t off, n; } g_wlog[8192];
 static int g_wlog_n;
+static int g_due_arm;
+static int g_due_on_read;
+static int g_due_rc;
+static uint64_t g_due_at;
+static uint64_t g_due_target;
+static uint64_t g_due_sent;
+static uint64_t g_due_calls[256];
+static int g_due_n;
+static long g_mask_room = -1;
+static int g_idle;
+static char g_fm_dummy;
+static int g_due_block;
+
+static uint64_t due_mono(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
 
 int vless_connect(const struct vless_node *node, struct transport *conn, int timeout_s) {
     (void)node; (void)timeout_s;
@@ -132,6 +150,7 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
     conn->link.fd = __atomic_load_n(&g_own_fd, __ATOMIC_ACQUIRE) ? eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
                                                                  : g_sess_pipe[0];
     conn->link.plain = 1;
+    conn->link.tls.fm = (struct fm_link *)&g_fm_dummy;
     return 0;
 }
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
@@ -152,6 +171,11 @@ int transport_write(struct transport *c, const unsigned char *d, size_t n) {
         if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
         rc = g_send_rc;
     }
+    if (!rc && g_due_arm) {
+        g_due_arm = 0;
+        g_due_at = due_mono() + 30;
+        g_due_target = g_due_at;
+    }
     if (!rc && g_wire_on && g_wire_n + n <= sizeof g_wire && g_wlog_n < 8192) {
         g_wlog[g_wlog_n].t = c;
         g_wlog[g_wlog_n].off = g_wire_n;
@@ -165,8 +189,16 @@ int transport_whole_writes(const struct transport *t) { (void)t; return g_whole;
 const struct transport_ops tr_grpc = { .name = "grpc" };
 int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
                       const unsigned char **data, size_t *got) {
-    (void)c; (void)buf; (void)cap;
+    (void)buf; (void)cap;
     g_recv_calls++;
+    if (g_due_on_read) {
+        uint64_t v;
+        ssize_t rd = read(c->link.fd, &v, sizeof v);
+        (void)rd;
+        g_due_on_read = 0;
+        g_due_at = due_mono() + 30;
+        g_due_target = g_due_at;
+    }
     if (g_room_on_read != -2) { g_room = g_room_on_read; g_room_on_read = -2; }
     *got = 0;
     if (g_recv_rc) return g_recv_rc;
@@ -188,6 +220,32 @@ void transport_close(struct transport *c) {
     c->link.fd = -1;
 }
 void transport_moved(struct transport *c) { (void)c; }
+void transport_set_loop(struct transport *c) { (void)c; }
+int transport_idle(const struct transport *c) { (void)c; return g_idle; }
+int transport_due(struct transport *c, uint64_t now_ms, int *next_ms) {
+    *next_ms = -1;
+    if (g_due_n < 256) g_due_calls[g_due_n++] = now_ms;
+    if (g_due_block) {
+        struct pollfd p = { .fd = c->link.fd, .events = POLLOUT };
+        if (poll(&p, 1, 0) == 1 && (p.revents & POLLOUT)) {
+            g_due_block = 0;
+            g_due_sent = now_ms;
+            return 0;
+        }
+        *next_ms = 0;
+        return 0;
+    }
+    if (!g_due_at) return 0;
+    if (now_ms < g_due_at) {
+        *next_ms = (int)(g_due_at - now_ms);
+        return 0;
+    }
+    if (g_due_rc) return g_due_rc;
+    g_due_at = 0;
+    g_due_sent = now_ms;
+    return 0;
+}
+long transport_mask_room(struct transport *c) { (void)c; return g_mask_room; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
 int tr_xmux_shares(const struct tr_node *n) { (void)n; return 0; }
 int tr_xmux_attach(struct transport *t, const struct tr_node *n, const void *key, const void *dl_key,
@@ -3053,6 +3111,7 @@ static void t_stop_resets(void) {
 }
 
 static int g_stop_ms = -1;
+static struct loop g_L_due;
 static void *stop_thread(void *arg) {
     (void)arg;
     uint64_t t0 = now_ns();
@@ -3094,6 +3153,214 @@ static void t_stop_wakes_the_loop(void) {
           "stop: the loop is woken, resets its TUN connection, and the stop returns at once");
     while (g_live_n) conn_drop(&g_conns[g_live[0]]);
     loop_close(&L);
+}
+
+static struct conn *due_open(struct loop *L) {
+    if (loop_open(L, &g_tun, 0) != 0) return NULL;
+    __atomic_store_n(&g_own_fd, 1, __ATOMIC_RELEASE);
+    struct conn *c = open_conn(65535);
+    __atomic_store_n(&g_own_fd, 0, __ATOMIC_RELEASE);
+    if (!c) {
+        loop_close(L);
+        return NULL;
+    }
+    cli_send(1001, 1002, TCP_ACK, 65535, NULL, 0);
+    flush_acks(&g_tun);
+    loop_turn(L, 0);
+    dev_drain(NULL);
+    g_due_at = g_due_sent = 0;
+    g_due_n = 0;
+    g_due_rc = 0;
+    return c;
+}
+
+static void due_close(struct loop *L) {
+    __atomic_store_n(&g_own_fd, 1, __ATOMIC_RELEASE);
+    while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+    __atomic_store_n(&g_own_fd, 0, __ATOMIC_RELEASE);
+    loop_close(L);
+    dev_drain(NULL);
+    g_due_at = g_due_sent = 0;
+    g_due_arm = g_due_on_read = g_due_rc = g_due_block = 0;
+    g_due_n = 0;
+}
+
+static int due_calls(void) {
+    int k = 0;
+    for (int i = 0; i < g_due_n; i++) k += g_due_calls[i] <= g_due_sent;
+    return k;
+}
+
+static void due_run(uint64_t t0, int ms) {
+    while (!g_due_sent && due_mono() < t0 + (uint64_t)ms && g_live_n) loop_turn(&g_L_due, 1000);
+}
+
+/* catches: the loop sleeping its full max_ms past a mask delay, or polling due on every connection */
+static void t_due_wakes_loop(void) {
+    struct conn *c = due_open(&g_L_due);
+    if (!c) {
+        check(0, "due: fixture connection");
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'u', sizeof d);
+    g_due_arm = 1;
+    uint64_t t0 = due_mono();
+    cli_send(1001, 1002, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    check(g_due_at != 0 && c->fm_wait, "due: a send that leaves a piece behind a gap flags the connection");
+    due_run(t0, 300);
+    check(g_due_sent && g_due_sent < t0 + 300, "due: the loop asks due again within 300 ms");
+    check(g_due_sent >= g_due_target, "due: and never before the piece is due");
+    check(due_calls() <= 3, "due: no polling on every turn meanwhile");
+    check(!c->fm_wait, "due: the flag clears once nothing waits");
+    int n = g_due_n;
+    loop_turn(&g_L_due, 30);
+    loop_turn(&g_L_due, 30);
+    check(g_due_n == n, "due: not asked again once cleared");
+    due_close(&g_L_due);
+}
+
+/* catches: an unmasked connection asking the dialer for a deadline after every send */
+static void t_due_idle_latched(void) {
+    g_idle = 1;
+    struct conn *c = due_open(&g_L_due);
+    if (!c) {
+        g_idle = 0;
+        check(0, "due idle: fixture connection");
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'u', sizeof d);
+    g_due_n = 0;
+    for (int i = 0; i < 4; i++) {
+        cli_send(1001 + (uint32_t)i * 100, 1002, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+        flush_acks(&g_tun);
+        dev_drain(NULL);
+    }
+    check(c->no_due, "due idle: a session that can never be due is latched");
+    check(g_due_n == 0, "due idle: and never asked");
+    due_close(&g_L_due);
+    g_idle = 0;
+}
+
+/* catches: the delay flag set only after sends, so a read-path write behind a gap never leaves */
+static void t_due_after_read(void) {
+    struct conn *c = due_open(&g_L_due);
+    if (!c) {
+        check(0, "due read: fixture connection");
+        return;
+    }
+    g_recv_n = 0;
+    g_due_on_read = 1;
+    uint64_t one = 1;
+    uint64_t t0 = due_mono();
+    ssize_t w = write(c->fd, &one, sizeof one);
+    check(w == (ssize_t)sizeof one, "due read: the node's socket made readable");
+    due_run(t0, 300);
+    check(!g_due_on_read, "due read: the read ran");
+    check(g_due_sent && g_due_sent < t0 + 300 && g_due_sent >= g_due_target,
+          "due read: the pong leaves within 300 ms, not before its due time");
+    check(due_calls() <= 3, "due read: no polling on every turn meanwhile");
+    memset(g_recv_buf, 'd', 10);
+    g_recv_n = 10;
+    g_due_sent = 0;
+    g_due_n = 0;
+    g_due_on_read = 1;
+    t0 = due_mono();
+    w = write(c->fd, &one, sizeof one);
+    due_run(t0, 300);
+    check(g_due_sent && g_due_sent < t0 + 300 && g_due_sent >= g_due_target,
+          "due read: also after a read that carried data");
+    check(due_calls() <= 3, "due read: and no polling then either");
+    due_close(&g_L_due);
+}
+
+/* catches: a link blocked on a full socket polled with a zero wait, or never woken when it drains */
+static void t_due_writable(void) {
+    struct conn *c = due_open(&g_L_due);
+    int sp[2];
+    if (!c || socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sp) != 0) {
+        check(0, "due writable: fixture connection");
+        if (c) due_close(&g_L_due);
+        return;
+    }
+    unsigned char fill[4096];
+    memset(fill, 'f', sizeof fill);
+    while (send(sp[0], fill, sizeof fill, MSG_DONTWAIT) > 0) {}
+    struct vl_sess *vs = SESS(c);
+    close(c->fd);
+    c->fd = vs->t.link.fd = sp[0];
+    c->armed = 0;
+    unsigned char d[100];
+    memset(d, 'u', sizeof d);
+    g_due_block = 1;
+    cli_send(1001, 1002, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    check(c->fm_wait == 2, "due writable: a link held by a full socket waits for writability");
+    uint64_t t1 = due_mono();
+    loop_turn(&g_L_due, 200);
+    check(due_mono() - t1 >= 150, "due writable: the loop sleeps while the socket is full");
+    check(!g_due_sent && (c->armed & ARM_OUT), "due writable: not kicked while full, writability watched");
+    unsigned char b[65536];
+    while (recv(sp[1], b, sizeof b, MSG_DONTWAIT) > 0) {}
+    uint64_t drained = due_mono();
+    struct epoll_event ev[8];
+    int n = epoll_wait(g_L_due.ep, ev, 8, 0), out = 0;
+    for (int i = 0; i < n; i++)
+        if (ev[i].data.u32 == (uint32_t)(c - g_conns) && (ev[i].events & EPOLLOUT)) out = 1;
+    check(out, "due writable: the drained socket wakes the loop");
+    while (!g_due_sent && due_mono() < drained + 5000 && g_live_n) loop_turn(&g_L_due, 100);
+    check(g_due_sent && g_due_sent >= drained, "due writable: kicked once the socket drains, not before");
+    due_close(&g_L_due);
+    close(sp[1]);
+}
+
+/* catches: a failed delayed write ignored */
+static void t_due_fatal(void) {
+    struct conn *c = due_open(&g_L_due);
+    if (!c) {
+        check(0, "due fatal: fixture connection");
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'u', sizeof d);
+    g_due_arm = 1;
+    g_due_rc = TR_EIO;
+    uint64_t t0 = due_mono();
+    cli_send(1001, 1002, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    while (g_live_n && due_mono() < t0 + 300) loop_turn(&g_L_due, 1000);
+    struct flow_key k = cli_key();
+    uint32_t seq[4], ack[4];
+    int wrong;
+    int r = stop_rsts(CLI_PORT, seq, ack, 4, &wrong);
+    check(!conn_find(&k) && r >= 1, "due fatal: the flow ends with RST to the client");
+    due_close(&g_L_due);
+}
+
+/* catches: room ignoring the queue, so a delayed flow buffers without limit */
+static void t_room_held(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) {
+        check(0, "room held: fixture connection");
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'u', sizeof d);
+    g_mask_room = 65536 - 60000;
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    flush_acks(&g_tun);
+    struct flow_key last;
+    memset(&last, 0, sizeof last);
+    dev_drain(&last);
+    check(last.ack == 1101 && last.window <= 5536, "room held: 60000 queued, the window is at most 5536");
+    g_mask_room = -1;
+    conn_drop(c);
+    dev_drain(NULL);
 }
 
 /* ---- stack --------------------------------------------------------------------------------- */
@@ -7447,6 +7714,12 @@ int main(void) {
     t_up_cut_grpc_room();
     t_stop_resets();
     t_stop_wakes_the_loop();
+    t_due_wakes_loop();
+    t_due_after_read();
+    t_due_idle_latched();
+    t_due_writable();
+    t_due_fatal();
+    t_room_held();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
     sock_part();
 

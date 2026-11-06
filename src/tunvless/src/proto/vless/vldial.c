@@ -57,7 +57,18 @@ static void vl_describe(const void *ctx, char *out, size_t n) {
 
 static int vl_connect(const void *ctx, void *sess, int timeout_s) {
     struct vl_sess *s = sess;
-    return vless_connect(ctx, &s->t, timeout_s);
+    int rc = vless_connect(ctx, &s->t, timeout_s);
+    if (!rc) transport_set_loop(&s->t);
+    else {
+        s->why_rc = rc;
+        snprintf(s->why, sizeof s->why, "%s", vless_strerror(rc));
+    }
+    return rc;
+}
+
+static const char *vl_why(const void *sess, int rc) {
+    const struct vl_sess *s = sess;
+    return rc && s->why_rc == rc ? s->why : vless_strerror(rc);
 }
 
 /* Moves the link from a spare session into the connection's session. Only the part of struct
@@ -650,18 +661,28 @@ int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_
     return pool_run(tc, pc, ready, arg);
 }
 
-/* What vl_send takes now (dialer_ops.room): the transport's room less what vl_send adds in front
- * of the data — the request header until it is sent, a Vision frame (with padding of up to
- * about 1400 bytes) until Vision has ended padding. */
+/* What vl_send takes now (dialer_ops.room): the transport's room, or its mask queue's when that is
+ * smaller, less what vl_send adds in front of the data — the request header until it is sent, a
+ * Vision frame (with padding of up to about 1400 bytes) until Vision has ended padding. */
 static long vl_room(const void *ctx, void *sess) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
-    long r = transport_room(&s->t);
+    long r = transport_room(&s->t), q = s->t.link.tls.fm ? transport_mask_room(&s->t) : -1;
+    if (q >= 0 && (r < 0 || q < r)) r = q;
     if (r < 0) return -1;
     if (s->t.fr == &tr_grpc) r -= VL_GRPC_FRAME * (r / VL_UP_WRITE);
     if (!s->header_sent) r -= 64 + (s->host[0] ? 1 + (long)strlen(s->host) : 0);
     if (node->flow[0] && !s->vis.sent_end) r -= 2048;
     return r > 0 ? r : 0;
+}
+
+static int vl_due(void *sess, uint64_t now_ms, int *next_ms) {
+    struct vl_sess *s = sess;
+    if (transport_idle(&s->t)) {
+        *next_ms = -2;
+        return SEND_OK;
+    }
+    return transport_due(&s->t, now_ms, next_ms) ? SEND_FATAL : SEND_OK;
 }
 
 static size_t vl_up_write(const void *ctx, void *sess) {
@@ -712,6 +733,7 @@ const struct dialer_ops vless_dialer = {
     .peer = vl_peer,
     .describe = vl_describe,
     .strerror = vless_strerror,
+    .why = vl_why,
     .connect = vl_connect,
     .take = vl_take,
     .close = vl_close,
@@ -721,6 +743,7 @@ const struct dialer_ops vless_dialer = {
     .flow_open = vl_flow_open,
     .send = vl_send,
     .room = vl_room,
+    .due = vl_due,
     .up_write = vl_up_write,
     .dgram_frame = vl_dgram_frame,
     .read = vl_read,

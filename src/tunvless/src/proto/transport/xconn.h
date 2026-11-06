@@ -76,7 +76,7 @@ struct xconn {
     uint8_t in_dial, listed, oom, discard, pend_due, nown_due, paused;
     uint16_t pend_at;
     uint32_t refused;
-    uint64_t pt_q, pt_s;
+    uint64_t pt_q, pt_s, out_due;
     unsigned char pre[128];
     size_t pre_n;
 };
@@ -99,6 +99,7 @@ int  xconn_start(struct xconn *x);
 int  xconn_adopt(struct xconn *x, uint64_t now_ms);
 int  xconn_io(struct xconn *x, uint32_t ev, uint64_t now_ms);
 int  xconn_flush(struct xconn *x);
+int  xconn_due(struct xconn *x, uint64_t now_ms);
 int  xconn_wants_out(const struct xconn *x);
 int  xconn_wants_in(const struct xconn *x);
 int  xconn_tick(struct xconn *x, uint64_t now_ms);

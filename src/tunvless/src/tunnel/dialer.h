@@ -128,6 +128,9 @@ struct dialer_ops {
     /* For the startup line "<dev> -> <description>": name, address, transport. */
     void (*describe)(const void *ctx, char *out, size_t n);
     const char *(*strerror)(int rc);
+    /* The text of connect's failure rc, kept in the session by the connector thread that failed:
+     * some reasons live in that thread only. OPTIONAL: NULL means strerror(rc). */
+    const char *(*why)(const void *sess, int rc);
 
     /* ---- the link to the node ---- */
     /* Connect (in a connector thread: blocks for up to timeout_s). Returns 0 when ready. On
@@ -169,6 +172,13 @@ struct dialer_ops {
      * that held uploads to 10-20 Mbit/s with multi-second stalls. When the room grows back
      * (WINDOW_UPDATE, read by drain_conn) the stack sends the client a window update. */
     long (*room)(const void *ctx, void *sess);
+    /* Send what the link holds back for a delay (a finalmask piece queued behind its gap) once it
+     * is due, at now_ms (CLOCK_MONOTONIC). *next_ms: in how many ms to ask again, 0 when the
+     * socket must become writable first, -1 when nothing waits. Returns SEND_OK or SEND_FATAL.
+     * The stack asks after every send and read and, while something waits, from its wait.
+     * *next_ms == -2: nothing will ever be held back on this session; the stack stops asking.
+     * OPTIONAL: NULL means nothing is ever held back. */
+    int  (*due)(void *sess, uint64_t now_ms, int *next_ms);
     size_t (*up_write)(const void *ctx, void *sess);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
      * not fit. */

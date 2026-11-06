@@ -4,6 +4,7 @@
  * Needs the crypto library: the VLESS dialer pulls in the transport, TLS 1.3 and Reality. */
 #define _GNU_SOURCE
 #include <stddef.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,41 @@ static void check(const char *what, long want, long got) {
     }
 }
 
+struct conn_job { struct vless_node *n; struct vl_sess *s; int rc; };
+
+static void *conn_run(void *a) {
+    struct conn_job *j = a;
+    j->rc = vless_dialer.connect(j->n, j->s, 1);
+    return NULL;
+}
+
+/* catches: a connector's failure reason read back on the loop's thread, where it is not set */
+static void t_why_from_connector(void) {
+    printf("\n== a connector's failure text reaches the loop ==\n");
+    static struct vless_node n;
+    static struct vl_sess s;
+    memset(&n, 0, sizeof n);
+    memset(&s, 0, sizeof s);
+    snprintf(n.host, sizeof n.host, "%s", "node.invalid");
+    n.port = 443;
+    snprintf(n.type, sizeof n.type, "%s", "tcp");
+    snprintf(n.security, sizeof n.security, "%s", "none");
+    n.fm = "{\"tcp\":[";
+    struct conn_job j = { &n, &s, 0 };
+    pthread_t th;
+    if (pthread_create(&th, NULL, conn_run, &j)) { check("connector thread", 0, -1); return; }
+    pthread_join(th, NULL);
+    check("the connector failed on the mask", TR_EMASK, j.rc);
+    check("the loop thread holds no mask reason of its own", 0,
+          strstr(vless_dialer.strerror(j.rc), "does not parse") != NULL);
+    const char *w = vless_dialer.why(&s, j.rc);
+    check("the loop's text is the connector's reason", 1,
+          w && !strcmp(w, "finalmask: the node's mask does not parse"));
+    check("another code gets its own text", 1, !strcmp(vless_dialer.why(&s, TR_ECLOSED), "server closed the connection"));
+}
+
 int main(void) {
+    t_why_from_connector();
     /* Taking a spare copies the link from the pool slot into the connection's session (memcpy),
      * and the transport fixes its self-pointer (grpc_moved): h2.io.ctx. Left unfixed, it points
      * into the abandoned slot, which the next spare reuses at once, and one connection's data

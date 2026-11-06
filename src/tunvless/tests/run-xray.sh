@@ -47,7 +47,10 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xmux-count-one xmux-count-packet xmux-count-up xmux-concurrency xmux-requests xmux-reuse
            xmux-kill xmux-ping xmux-up-parallel xmux-dl xmux-kernel-inbound xmux-stall xmux-post-size
            h2-wire-reality h2-wire-tls h2-credit h2-speed rec-raw rec-vision rec-ws vis-dl vis-dl-tls
-           ua-golang ua-edge ua-firefox ua-safari ua-curl ua-empty"
+           ua-golang ua-edge ua-firefox ua-safari ua-curl ua-empty
+           fm-frag-hello-tls fm-frag-hello-reality fm-frag-range fm-frag-loop fm-frag-xhttp
+           fm-hc-raw fm-hc-vision fm-hc-xhttp fm-hc-ws fm-hc-neg fm-filter-ok fm-filter-neg
+           fm-chain-hf fm-chain-fh fm-dl-same fm-dl-noinherit fm-dl-frag fm-refuse-sudoku fm-refuse-xmc"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -114,7 +117,7 @@ bg_in "$NSS" "$W/mask.log" openssl s_server -accept "$S_IP:8443" -cert "$W/mask.
     -tls1_3 -alpn h2,http/1.1 -www -quiet
 # The target, and the targets of the node probe.
 bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080
-case " $CASES " in *" vis-"*) bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0 ;; esac
+case " $CASES " in *" vis-"*|*" fm-hc-vision "*) bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0 ;; esac
 bg_in "$NSS" "$W/probe1.log" python3 tests/grpc-target.py 1.1.1.1 80
 bg_in "$NSS" "$W/probe2.log" python3 tests/grpc-target.py 8.8.8.8 80
 bg_in "$NSS" "$W/target6.log" python3 tests/grpc-target.py "$TARGET6" 8080
@@ -163,13 +166,24 @@ dl_cfg() {
     tls)     BS="\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"$MASK\"}" ;;
     *)       BS='"security":"none"' ;;
     esac
-    BLK="{\"address\":\"$DH\",\"port\":$PORT,\"network\":\"xhttp\",$BS,\"xhttpSettings\":{\"path\":\"$BP\"${BX:+,$BX}}}"
+    BLK="{\"address\":\"$DH\",\"port\":${DPORT:-$PORT},\"network\":\"xhttp\",$BS,\"xhttpSettings\":{\"path\":\"$BP\"${BX:+,$BX}}${BFM:+,\"finalmask\":$BFM}}"
+    XBS=$BS; [ "$SEC" != tls ] || XBS="\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"$MASK\",\"alpn\":[\"h2\"],\"fingerprint\":\"chrome\",\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"usage\":\"verify\"}]}"
+    XBLK="{\"address\":\"$DH\",\"port\":${DPORT:-$PORT},\"network\":\"xhttp\",$XBS,\"xhttpSettings\":{\"path\":\"$BP\"${BX:+,$BX}}${BFM:+,\"finalmask\":$BFM}}"
     Q="type=xhttp&path=%2Fxp%2F${LM:+&mode=$LM}&extra=$(enc "{${MX:+$MX,}\"downloadSettings\":$BLK}")"
 }
+HCJ='{"type":"header-custom","settings":{"clients":[[{"packet":"GET / HTTP/1.1\r\n\r\n","type":"str"}]],"servers":[[{"packet":"HTTP/1.1 200 OK\r\n\r\n","type":"str"}]]}}'
+HCX='{"type":"header-custom","settings":{"clients":[[{"packet":"GET /x HTTP/1.1\r\n\r\n","type":"str"}]],"servers":[[{"packet":"HTTP/1.1 200 OK\r\n\r\n","type":"str"}]]}}'
+HCH=474554202f20485454502f312e310d0a0d0a
+FR10='{"type":"fragment","settings":{"packets":"tlshello","length":10}}'
+fmtls() { SEC=tls; TUN_ARGS="--ca $W/mask.pem"; XALPN=${1:-http/1.1}; }
+fmraw() { NET='"network":"tcp"'; Q="type=tcp"; XCNET="$NET"; }
+fmfrag() { fmraw; CFM="{\"tcp\":[{\"type\":\"fragment\",\"settings\":$1}]}"; LPORT=18444; TAPLENS=1; }
+fmxh() { XP="{\"path\":\"/xp/\",\"mode\":\"$1\"}"; Q="type=xhttp&path=%2Fxp%2F&mode=$1"; }
 neg() { EXPECT=fail; XP="{\"path\":\"/xp/\",\"mode\":\"packet-up\",$1}"; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up"; }
 case_cfg() {
     SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
     XCNET=""; FLOW=""; XALPN=h2; DL=""; DH="$S_IP2"; BP=/xp/
+    CFM=""; SFM=""; BFM=""; DPORT=""; TAPLENS=""; TAP2=""
     XP='{"path":"/xp/"}'
     case "$1" in
     grpc-gun|grpc-multi)
@@ -272,10 +286,36 @@ case_cfg() {
                              FLOW=xtls-rprx-vision ;;
     rec-ws)                  SEC=tls; TUN_ARGS="--ca $W/mask.pem"; NET='"network":"ws","wsSettings":{"path":"/ws"}'
                              Q="type=ws&path=%2Fws"; XCNET="$NET"; XALPN=http/1.1; KEYLOG=1 ;;
+    fm-frag-hello-tls)       fmtls; fmfrag '{"packets":"tlshello","length":"10-20"}' ;;
+    fm-frag-hello-reality)   fmfrag '{"packets":"tlshello","length":"10-20"}' ;;
+    fm-frag-range)           fmfrag '{"packets":"1-1","length":100,"delay":20}' ;;
+    fm-frag-loop)            fmfrag '{"packets":"3-3","length":200,"delay":200}' ;;
+    fm-frag-xhttp)           fmfrag '{"packets":"2-4","length":50,"delay":20}'; fmxh stream-up ;;
+    fm-hc-raw)               fmtls; fmraw; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; LPORT=18444 ;;
+    fm-hc-vision)            fmtls; fmraw; Q="type=tcp&flow=xtls-rprx-vision"; FLOW=xtls-rprx-vision; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM ;;
+    fm-hc-xhttp)             fmtls h2; fmxh stream-up; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; LPORT=18444 ;;
+    fm-hc-ws)                fmtls; NET='"network":"ws","wsSettings":{"path":"/ws"}'
+                             Q="type=ws&path=%2Fws"; XCNET="$NET"; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; LPORT=18444 ;;
+    fm-hc-neg)               fmtls; fmraw; CFM="{\"tcp\":[$HCX]}"; SFM="{\"tcp\":[$HCJ]}"; EXPECT=fail ;;
+    fm-filter-ok)            fmraw; SFM="{\"tcp\":[{\"type\":\"filter\",\"settings\":{\"allowedSourceIPs\":[\"$C_IP/32\"]}}]}"; CFM=$SFM ;;
+    fm-filter-neg)           fmraw; SFM='{"tcp":[{"type":"filter","settings":{"allowedSourceIPs":["10.255.255.1/32"]}}]}'; EXPECT=fail ;;
+    fm-chain-hf)             fmtls; fmraw; CFM="{\"tcp\":[$HCJ,$FR10]}"; SFM="{\"tcp\":[$HCJ]}"; LPORT=18444 ;;
+    fm-chain-fh)             fmtls; fmraw; CFM="{\"tcp\":[$FR10,$HCJ]}"; SFM="{\"tcp\":[$HCJ]}"; LPORT=18444 ;;
+    fm-dl-same)              fmtls h2; dl tls packet-up packet-up ""; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; BFM=$CFM ;;
+    fm-dl-noinherit)         fmtls h2; dl tls packet-up packet-up ""; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; EXPECT=fail ;;
+    fm-dl-frag)              dl reality packet-up packet-up ""; BFM="{\"tcp\":[$FR10]}"; LPORT=18444; DPORT=18444; TAP2=1 ;;
+    fm-refuse-sudoku)        fmraw; CFM='{"tcp":[{"type":"sudoku","settings":{"password":"p"}}]}'; SFM=$CFM ;;
+    fm-refuse-xmc)           fmtls; fmraw; CFM='{"tcp":[{"type":"xmc","settings":{"password":"p","profiles":[{"username":"Steve_1","uuid":"00112233-4455-6677-8899-aabbccddeeff","texturesValue":"v","texturesSignature":"s"}]}}]}'; SFM=$CFM ;;
     *) echo "run-xray: unknown case $1"; exit 2 ;;
     esac
     [ -z "$DL" ] || dl_cfg
-    case "$1" in xhttp-*|xmux-*|h2-*|ua-*|v6-carry-xhttp|node6-xhttp) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    case "$1" in xhttp-*|xmux-*|h2-*|ua-*|v6-carry-xhttp|node6-xhttp|fm-*xhttp|fm-dl-*) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    case "$1" in
+    fm-*xhttp) XCNET="$NET" ;;
+    fm-dl-*)   XCNET="\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"$XM\",\"downloadSettings\":$XBLK}" ;;
+    esac
+    [ -z "$SFM" ] || NET="$NET,\"finalmask\":$SFM"
+    [ -z "$CFM" ] || { Q="$Q&fm=$(enc "$CFM")"; XCNET="$XCNET,\"finalmask\":$CFM"; }
     FJ=""; [ -z "$FLOW" ] || FJ=",\"flow\":\"$FLOW\""
     KL=""; [ -z "$KEYLOG" ] || { KL=",\"masterKeyLog\":\"$W/keys.log\""; LPORT=18444; }
     if [ "$SEC" = none ]; then
@@ -505,7 +545,7 @@ print("holders: %d connections held unread" % len(ss))
 tap_up() {
     TAPD="$W/tap-$MODE-$1"
     ip netns exec "$NSS" python3 tests/tlstap.py --listen "$S_IP:$LPORT" --to "$S_IP:$PORT" --dir "$TAPD" \
-        --cap "$TAPCAP" > "$W/tap-$MODE-$1.log" 2>&1 &
+        --cap "$TAPCAP" ${TAPLENS:+--lens} > "$W/tap-$MODE-$1.log" 2>&1 &
     RPID=$!; PIDS="$PIDS $RPID"
     for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " && break; sleep 0.25; done
     ip netns exec "$NSS" ss -ltn | grep -q "$S_IP:$LPORT " || { echo "run-xray: FAIL — the relay did not start"; return 1; }
@@ -975,6 +1015,266 @@ NFT
     return $XR
 }
 
+tap2_up() {
+    ip netns exec "$NSS" python3 tests/tlstap.py --listen "$S_IP2:$LPORT" --to "$S_IP2:$PORT" --dir "$W/tap2-$MODE-$1" \
+        ${TAPLENS:+--lens} > "$W/tap2-$MODE-$1.log" 2>&1 &
+    R2PID=$!; PIDS="$PIDS $R2PID"
+    for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn | grep -q "$S_IP2:$LPORT " && break; sleep 0.25; done
+    ip netns exec "$NSS" ss -ltn | grep -q "$S_IP2:$LPORT " || { echo "run-xray: FAIL — the second relay did not start"; return 1; }
+}
+tap2_down() { [ -z "${R2PID:-}" ] || { kill "$R2PID" 2>/dev/null || true; wait "$R2PID" 2>/dev/null || true; }; R2PID=""; }
+fmpy() {
+    python3 -c '
+import os, sys
+mode, d, a = sys.argv[1], sys.argv[2], sys.argv[3:]
+def recs(b, off):
+    r = []
+    while off + 5 <= len(b):
+        n = b[off + 3] << 8 | b[off + 4]
+        r.append((b[off], off, n))
+        off += 5 + n
+    return r
+def spans(n):
+    r, o = [], 0
+    with open(os.path.join(d, "%d.lens" % n)) as f:
+        for l in f:
+            t, k = l.split()
+            r.append((o, o + int(k), float(t)))
+            o += int(k)
+    return r
+def hello(b, off, lo, hi, one=False):
+    if len(b) < off + 9 or b[off] != 22 or b[off + 5] != 1:
+        return "no handshake record at %d" % off
+    need = 4 + (b[off + 6] << 16 | b[off + 7] << 8 | b[off + 8])
+    got, ls = 0, []
+    while got < need:
+        if len(b) < off + 5 or b[off] != 22:
+            return "the hello ends after %d of %d bytes" % (got, need)
+        n = b[off + 3] << 8 | b[off + 4]
+        ls.append(n); got += n; off += 5 + n
+    if got != need:
+        return "records carry %d bytes, the hello %d" % (got, need)
+    if any(not lo <= x <= hi for x in ls[:-1]) or not 1 <= ls[-1] <= hi or one and len(ls) != 1:
+        return "bodies %s" % ls
+    return "ok: hello %d B in %d records, bodies %d..%d, last %d" % (need, len(ls), min(ls), max(ls), ls[-1])
+def check(n, b):
+    if mode == "head":
+        h = bytes.fromhex(a[0])
+        return "ok: starts with the header" if b.startswith(h) else "starts %s" % b[:len(h)].hex()
+    if mode == "hello":
+        return hello(b, int(a[2]), int(a[0]), int(a[1]))
+    if mode == "uncut":
+        return hello(b, int(a[0]), 1, 1 << 30, True)
+    r = recs(b, 0)
+    if mode == "range":
+        m = int(a[0]); h = 5 + r[0][2]
+        cov = [s for s in spans(n) if s[0] < h]
+        k = sum(1 for s in cov if s[1] - s[0] <= m)
+        w = h // m - 2
+        return "%s: hello %d B in %d recvs, %d of them <= %d B (expected >= %d)" % ("ok" if k >= w else "bad", h, len(cov), k, m, w)
+    if mode == "xh":
+        m, k = int(a[0]), int(a[1])
+        if len(r) < k:
+            return "skip: %d records" % len(r)
+        s0, e = r[0][1] + 5 + r[0][2], min(len(b), r[k - 1][1] + 5 + r[k - 1][2])
+        cov = [s for s in spans(n) if s[0] < e and s[1] > s0]
+        big = [s[1] - s[0] for s in cov if s[1] - s[0] > m]
+        ok = cov and cov[0][0] == s0 and not big and len(cov) >= -(-(e - s0) // m)
+        return "%s: records 2-%d (%d B from %d) in %d recvs: %s" % ("ok" if ok else "bad", k, e - s0, s0, len(cov), [s[1] - s[0] for s in cov])
+    if mode == "loop":
+        m = int(a[0])
+        if len(r) < 4:
+            return "skip: %d records" % len(r)
+        o, n4 = r[3][1], 5 + r[3][2]
+        if n4 < 1000:
+            return "skip: record 4 is %d B" % n4
+        cov = [s for s in spans(n) if s[0] < o + n4 and s[1] > o]
+        sz = [s[1] - s[0] for s in cov]
+        gaps = [cov[i + 1][2] - cov[i][2] for i in range(len(cov) - 1)]
+        tot = cov[-1][2] - cov[0][2]
+        ok = cov[0][0] == o and len(cov) >= 5 and max(sz) <= m and min(gaps) >= 0.18 and tot >= 0.8
+        return "%s: record 4 of %d B in %d recvs %s, gaps %s ms, %.0f ms in all" % ("ok" if ok else "bad", n4, len(cov), sz, [round(g * 1000) for g in gaps], tot * 1000)
+    return "unknown mode"
+cs = sorted(int(f[:-4]) for f in os.listdir(d) if f.endswith(".c2s")) if os.path.isdir(d) else []
+bad, good = 0, 0
+for n in cs:
+    b = open(os.path.join(d, "%d.c2s" % n), "rb").read()
+    if not b:
+        print("run-xray:   connection %d: empty" % n)
+        continue
+    try:
+        v = check(n, b)
+    except (IndexError, ValueError, OSError) as e:
+        v = "unreadable: %s" % e
+    print("run-xray:   connection %d: %s" % (n, v))
+    if v.startswith("ok"):
+        good += 1
+    elif not v.startswith("skip"):
+        bad += 1
+sys.exit(1 if bad or not good else 0)
+' "$@"
+}
+fm_loop_drive() {
+    ip netns exec "$NSC" timeout 40 python3 -c '
+import socket, sys, threading, time
+host, port = sys.argv[1], int(sys.argv[2])
+res = {}
+def conn():
+    s = socket.create_connection((host, port), 30)
+    s.settimeout(30)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return s
+def readall(s):
+    r = b""
+    while True:
+        d = s.recv(65536)
+        if not d:
+            return r
+        r += d
+def fa():
+    try:
+        fmt = b"POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+        cl = 1000 - len(fmt % 0)
+        while len(fmt % cl) + cl != 1000:
+            cl = 1000 - len(fmt % cl)
+        s = conn()
+        s.sendall(fmt % cl + b"u" * cl)
+        res["a"] = readall(s).endswith(b"ok %d" % cl)
+    except OSError as e:
+        res["a"] = "%s" % e
+def fb():
+    try:
+        t0 = time.monotonic()
+        s = conn()
+        s.sendall(b"GET /pg/0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        d = s.recv(65536)
+        res["bt"] = (time.monotonic() - t0) * 1000
+        res["b"] = (d + readall(s)).startswith(b"HTTP/1.1 200 OK")
+    except OSError as e:
+        res["b"] = "%s" % e
+ta = threading.Thread(target=fa)
+ta.start()
+time.sleep(0.05)
+tb = threading.Thread(target=fb)
+tb.start()
+ta.join()
+tb.join()
+bt = res.get("bt", 1e9)
+print("run-xray: flow A (1000 B): %s; flow B: %s, reply %.0f ms after its connect began (expected < 150)" % (res.get("a"), res.get("b"), bt))
+sys.exit(0 if res.get("a") is True and res.get("b") is True and bt < 150 else 1)' "$1" "$2"
+}
+fm_vis() {
+    ok=0; i=0
+    for qs in bytes=3000000 "bytes=3000000&chunk=1400" "bytes=200000&delay=0.05" "bytes=3000000&first=6000&gap=0.03" "bytes=3000000&first=7900" bytes=100000; do
+        e=$(ip netns exec "$NSC" curl -sS -k --tlsv1.3 -m 15 -o /dev/null "https://$1/__down?$qs" 2>&1) && ok=$((ok + 1)) || echo "    #$i $qs: $e"
+        i=$((i + 1))
+    done
+    echo "run-xray: $ok of $i downloads ok"
+    [ "$ok" -eq "$i" ]
+}
+fm_drive() {
+    h=$TARGET; p=8080; [ "$1" = x ] && { h=127.0.0.1; p=18080; }
+    case "$MODE" in
+    fm-frag-loop) fm_loop_drive "$h" "$p" ;;
+    fm-hc-vision) [ "$1" = t ] && p=8443; fm_vis "$h:$p" ;;
+    *) rec_drive plain "$h" "$p" first ;;
+    esac
+}
+fm_taps() { tap_down; tap2_down; [ -z "$LPORT" ] || tap_up "$1" || return 1; [ -z "$TAP2" ] || tap2_up "$1"; }
+fm_run() {
+    fm_taps "$1" || return 1
+    O=fail
+    if [ "$1" = t ] && [ "$EXPECT" = fail ]; then
+        O=fail
+        for _ in 1 2 3; do out=$(probe); echo "run-xray: probe: $out"; ! is_ok "$out" || O=ok; done
+    elif [ "$1" = t ]; then
+        if [ "$MODE" = fm-hc-vision ]; then TUN_TRACE=1 tun_up "$BIN" t || return 1; else tun_up "$BIN" t || return 1; fi
+        ! fm_drive t || O=ok
+    else
+        if [ "$MODE" = fm-hc-vision ]; then XC_TPORT=8443 xc_up || return 1; else xc_up || return 1; fi
+        ! fm_drive x || O=ok
+    fi
+    sleep 0.5; tun_down; xc_down; sleep 0.5; tap_down; tap2_down
+    eval "O_$1=\$O"
+}
+fm_warm() {
+    fm_taps w || return 1
+    for _ in $(seq 12); do out=$(probe); is_ok "$out" && break; sleep 1; done
+    echo "run-xray: warm-up probe: $out"
+    tap_down; tap2_down
+}
+fm_refuse() {
+    kind=${MODE#fm-refuse-}
+    if [ -z "${FMX:-}" ]; then
+        s0=$(nft_val dlcnt packets syn1)
+        rm -f "$W/kin"; mkfifo "$W/kin"; : > "$W/kev"
+        ip netns exec "$NSC" "$BIN" --control -d vl -A 1 --interval 3600 < "$W/kin" > "$W/kev" 2> "$W/tun-$MODE-t.log" &
+        SPID=$!; PIDS="$PIDS $SPID"
+        exec 7> "$W/kin"
+        cat "$W/sub.txt" >&7; echo >&7
+        txt="link cannot be used: finalmask: $kind is not supported yet"
+        i=0; while [ $i -lt 25 ] && ! grep -qF "$txt" "$W/tun-$MODE-t.log"; do sleep 0.2; i=$((i + 1)); done
+        out=$(probe); echo "run-xray: probe: $out"
+        sleep 2; exec 7>&-; tun_down
+        if grep -F "$txt" "$W/tun-$MODE-t.log"; then echo "run-xray: tunvless refused the link"
+        else echo "run-xray: FAIL — no '$txt' in the log:"; tail -5 "$W/tun-$MODE-t.log"; XR=1; fi
+        ! is_ok "$out" || { echo "run-xray: FAIL — the probe passed on a refused link"; XR=1; }
+        want "TCP connections from tunvless to $S_IP" "$(($(nft_val dlcnt packets syn1) - s0))" eq 0
+    fi
+    xc_up || return 1
+    O=fail; for _ in 1 2 3; do rec_drive plain 127.0.0.1 18080 first && { O=ok; break; }; sleep 1; done
+    xc_down
+    same "Xray client with $kind" "$O" ok
+}
+fm_case() {
+    XR=0; O_t=skip; O_x=skip; R2PID=""
+    case "$MODE" in fm-refuse-*) fm_refuse; return $XR ;; esac
+    [ "$EXPECT" = fail ] || fm_warm || return 1
+    for c in t x; do
+        [ "$c" = t ] && [ -n "${FMX:-}" ] && continue
+        a=$(dl_snap)
+        fm_run "$c" || return 1
+        if [ -n "$DL" ] && [ "$EXPECT" = fail ]; then
+            read -r _ _ _ _ _ s2 <<EOF
+$(dl_delta "$a" "$(dl_snap)")
+EOF
+            want "$c: TCP connections to the download address $S_IP2" "$s2" gt 0
+        fi
+    done
+    echo "run-xray: outcome: tunvless $O_t, Xray client $O_x"
+    for c in t x; do
+        eval "o=\$O_$c"
+        [ "$o" != skip ] || continue
+        if [ "$EXPECT" = fail ]; then same "$c refused" "$o" fail
+        elif [ "$MODE" != fm-frag-hello-reality ]; then same "$c data" "$o" ok; fi
+    done
+    [ "$MODE" != fm-frag-hello-reality ] || [ -n "${FMX:-}" ] || same "tunvless outcome, as Xray's client" "$O_t" "$O_x"
+    [ "$EXPECT" = ok ] || return $XR
+    for c in t x; do
+        eval "o=\$O_$c"
+        [ "$o" = ok ] || continue
+        d="$W/tap-$MODE-$c"
+        echo "run-xray: $c taps:"
+        case "$MODE" in
+        fm-frag-hello-*)   fmpy hello "$d" 10 19 0 ;;
+        fm-frag-range)     fmpy range "$d" 100 ;;
+        fm-frag-loop)      fmpy loop "$d" 200 ;;
+        fm-frag-xhttp)     fmpy xh "$d" 50 5 ;;
+        fm-hc-raw|fm-hc-xhttp|fm-hc-ws) fmpy head "$d" "$HCH" ;;
+        fm-chain-hf)       fmpy head "$d" "$HCH" && fmpy uncut "$d" 18 ;;
+        fm-chain-fh)       fmpy head "$d" "$HCH" && fmpy hello "$d" 10 10 18 ;;
+        fm-dl-frag)        fmpy hello "$W/tap2-$MODE-$c" 10 10 0 && fmpy uncut "$d" 0 ;;
+        *) echo "run-xray:   none" ;;
+        esac || { echo "run-xray: FAIL — $c: the tap does not show the mask"; XR=1; }
+    done
+    [ "$MODE" != fm-hc-vision ] || [ -n "${FMX:-}" ] ||
+        want "tunvless switches to direct copy" "$(grep -c 'server switched to direct copy' "$W/tun-$MODE-t.log")" ge 1
+    if grep -E "does not answer|answers again|did not open|refused the data" "$W"/tun-"$MODE"-*.log 2>/dev/null | head -3 | grep .; then
+        echo "run-xray: FAIL — the pool declared the node dead, a flow did not open, or data was refused"; XR=1
+    fi
+    return $XR
+}
+
 for MODE in $CASES; do
     rm -rf "/etc/netns/$NSC" 2>/dev/null || true
     srv_v6 replace
@@ -1015,6 +1315,12 @@ for MODE in $CASES; do
         SKIPPED="$SKIPPED $MODE"; continue
     fi
     case "$MODE" in xmux-*)
+        if [ -z "$DLNFT" ]; then
+            echo "run-xray: case $MODE — SKIPPED (no nft counters in the server namespace; not passed)"
+            SKIPPED="$SKIPPED $MODE"; continue
+        fi ;;
+    esac
+    case "$MODE" in fm-refuse-*)
         if [ -z "$DLNFT" ]; then
             echo "run-xray: case $MODE — SKIPPED (no nft counters in the server namespace; not passed)"
             SKIPPED="$SKIPPED $MODE"; continue
@@ -1068,6 +1374,15 @@ JSON
     sub_write
     probe() { ip netns exec "$NSC" "$BIN" --probe --timeout 5 $TUN_ARGS "$W/sub.txt" 2>&1 || true; }
     is_ok() { printf '%s' "$1" | awk -F '\t' '$3 == "ok" { f = 1 } END { exit !f }'; }
+    case "$MODE" in fm-*)
+        SPID=""; CPID=""; LPID=""
+        rc=0; fm_case || rc=1
+        tun_down; xc_down; tap_down; tap2_down
+        kill "$XPID" 2>/dev/null || true
+        sleep 0.5
+        if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-xray: case $MODE — FAIL"; else echo "run-xray: case $MODE — ok"; fi
+        continue ;;
+    esac
 
     # Warm-up: the very first connection to a freshly started Xray with Reality can be slow (and
     # openssl s_server as the cover site even more), so failures are counted only after the first

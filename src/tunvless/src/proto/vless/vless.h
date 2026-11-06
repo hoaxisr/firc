@@ -53,13 +53,15 @@ struct vless_node {
      * range; the client picks one value per connection). The server answers 413 to more.
      * post_to == 0 — not announced: Xray's default 1000000, above any chunk we send. */
     uint32_t post_from, post_to;
-    /* Post-quantum fields of Xray-core. They are long (an ML-DSA-65 key is 2603 base64url
-     * characters, a VLESS encryption string with an ML-KEM-768 key about 1600), so the strings live
-     * in a shared table (sl_intern, sublink.c), not in the node: equal values share one copy, which
-     * is never freed and does not grow on repeated parsing. NULL — no such field. The pointer
-     * outlives the node and its copies. */
+    /* Post-quantum fields of Xray-core, and fm, the finalmask JSON compacted (NULL also when it
+     * has no tcp mask). They are long (an ML-DSA-65 key is 2603 base64url characters, a VLESS
+     * encryption string with an ML-KEM-768 key about 1600, a finalmask up to FM_JSON_MAX), so the
+     * strings live in a shared table (sl_intern, sublink.c), not in the node: equal values share
+     * one copy, which is never freed and does not grow on repeated parsing. NULL — no such field.
+     * The pointer outlives the node and its copies. */
     const char *pqv;         /* reality: mldsa65Verify / pqv */
     const char *encryption;  /* vless: encryption=mlkem768x25519plus.… (none is not stored) */
+    const char *fm;
     /* Settings the client does not support and the server requires (the connection would not
      * open): the node is unusable at once, with a named reason, instead of failing every connect.
      * tcp_http — tcp HTTP camouflage header (headerType=http). */

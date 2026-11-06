@@ -172,7 +172,8 @@ TUNVLESS_PARSER_SRCS := \
     $(TUNVLESS_DIR)/src/proto/vless/vless_proto.c \
     $(TUNVLESS_DIR)/src/proto/vless/vlink.c \
     $(TUNVLESS_DIR)/src/proto/transport/trpath.c \
-    $(TUNVLESS_DIR)/src/proto/transport/xhopts.c
+    $(TUNVLESS_DIR)/src/proto/transport/xhopts.c \
+    $(TUNVLESS_DIR)/src/proto/transport/fmask.c
 TUNVLESS_CFLAGS = -std=gnu11 $(OPT) -Wall -Wextra $(filter-out -Werror%,$(CFLAGS_EXTRA)) -MMD -MP \
     -I$(TUNVLESS_DIR)/src/lib -I$(TUNVLESS_DIR)/src/tunnel -I$(TUNVLESS_DIR)/src/proto/vless \
     -I$(TUNVLESS_DIR)/src/proto/transport -I$(TUNVLESS_DIR)/src/proto/tls \
@@ -426,6 +427,11 @@ $(BUILDDIR)/fuzz/fuzz_release: tests/fuzz/fuzz_release.c src/update/release.c sr
 	    -fsanitize=fuzzer,address,undefined -o $@ $< src/update/release.c src/api/json.c $(CORE_SRCS) \
 	    $(CONFIG_SRCS) $(DEP_LIBS)
 
+$(BUILDDIR)/fuzz/fuzz_fmask: tests/fuzz/fuzz_fmask.c $(TUNVLESS_DIR)/src/proto/transport/fmask.c
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) -std=gnu11 -g -O1 -I$(TUNVLESS_DIR)/src/proto/transport \
+	    -fsanitize=fuzzer,address,undefined -o $@ $< $(TUNVLESS_DIR)/src/proto/transport/fmask.c
+
 $(BUILDDIR)/fuzz/%: tests/fuzz/%.c $(CORE_SRCS) $(TAP_SRCS)
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) -std=c11 -g -O1 -Iinclude -D_POSIX_C_SOURCE=200809L \
@@ -440,7 +446,8 @@ fuzz: $(FUZZ_BINS)
 	    [ -d tests/fuzz/seeds/$$name ] && \
 	        cp -n tests/fuzz/seeds/$$name/* tests/fuzz/corpus/$$name/ 2>/dev/null || true; \
 	    log=$$(mktemp); \
-	    if $$f -runs=$(FUZZ_RUNS) -max_len=1600 \
+	    case $$name in fuzz_fmask) max_len=6000 ;; *) max_len=1600 ;; esac; \
+	    if $$f -runs=$(FUZZ_RUNS) -max_len=$$max_len \
 	        tests/fuzz/corpus/$$name >"$$log" 2>&1; then \
 	        tail -3 "$$log"; rm -f "$$log"; \
 	    else \

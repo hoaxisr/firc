@@ -14,6 +14,7 @@
 #include <strings.h>
 #include "vless.h"
 #include "sublink.h"
+#include "vlink.h"
 /* vless_uuid_form: the rule that turns the id into 16 bytes lives in one place, vless_proto.c
  * (no libraries). */
 #include "vless_proto.h"
@@ -104,7 +105,16 @@ static int node_usable(struct vless_node *n) {
         break;
     }
 
-    return sl_link_usable_post(n);
+    if (sl_link_usable_post(n)) return 1;
+    if (n->fm || (vless_dl(n) && vless_dl(n)->fm)) {
+        struct vless_node c = *n;
+        vless_name_cut(c.name);
+        if (vless_node_link_len(&c) >= VLESS_LINK_MAX) {
+            snprintf(n->skip_reason, sizeof(n->skip_reason), "finalmask: too long for a link");
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ---- a subscription as an Xray config -----------------------------------------------------------
@@ -547,7 +557,12 @@ static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d) {
         }
         else if (d && !strcmp(k, "address")) { sj_str(j, n->host, sizeof(n->host)); sl_host_unbracket(n->host); }
         else if (d && !strcmp(k, "port")) n->port = xray_port(j);
-        else if (d && !strcmp(k, "finalmask")) d->finalmask = (uint8_t)xray_present(j);
+        else if (!strcasecmp(k, "finalmask")) {
+            sj_ws(j);
+            const char *p0 = j->p;
+            sj_skip(j);
+            sl_set_fm(n, p0, (size_t)(j->p - p0));
+        }
         else if (d && !strcmp(k, "quicParams")) d->quic = (uint8_t)xray_present(j);
         else if (!strcmp(k, "tcpSettings") || !strcmp(k, "rawSettings")) {
             int f2 = 1;

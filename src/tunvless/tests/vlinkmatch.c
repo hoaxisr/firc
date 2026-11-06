@@ -7,6 +7,7 @@
 #include "vless.h"
 #include "sublink.h"
 #include "vlink.h"
+#include "fmask.h"
 #include "sub-pq-samples.h"
 #include "reality.h"
 
@@ -24,7 +25,7 @@ static const char *const g_fields[] = {
     "name", "host", "port", "uuid", "type", "security", "sni", "fp", "pbk", "sid", "flow", "path",
     "service", "mode", "http_host", "headers", "pad_from", "pad_to", "post_from", "post_to", "pqv",
     "encryption", "tcp_http", "pcs", "pks", "vcn", "ech", "allow_insecure", "insecure", "xhx",
-    "dl",
+    "fm", "dl",
 };
 #define NFIELDS (sizeof g_fields / sizeof *g_fields)
 static unsigned g_cover[NFIELDS];
@@ -40,7 +41,7 @@ static void hit(const char *f) {
 
 static int marker(const char *p) {
     return p && (p == SL_BAD_PQV || p == SL_FULL || p == SL_BAD_PIN || p == SL_BAD_ECH || p == SL_ECH_DNS ||
-                 p == SL_BAD_XHX || p == SL_BAD_XHX_JSON);
+                 p == SL_BAD_XHX || p == SL_BAD_XHX_JSON || p == SL_BAD_FM);
 }
 
 static int same_ptr(const char *a, const char *b) {
@@ -59,7 +60,7 @@ static const char *diff(const struct vless_node *n, const struct vless_node *m) 
     FS(sid); FS(flow); FS(path); FS(service); FS(mode); FS(http_host); FS(headers);
     FN(pad_from); FN(pad_to); FN(post_from); FN(post_to); FP(pqv); FP(encryption);
     FN(tcp_http); FP(pcs); FP(pks); FP(vcn); FP(ech); FN(allow_insecure);
-    FN(insecure); FP(xhx);
+    FN(insecure); FP(xhx); FP(fm);
     if (!n->dl != !m->dl || (n->dl == &SL_DL_FULL) != (m->dl == &SL_DL_FULL)) bad = "dl";
     else if (n->dl && n->dl != &SL_DL_FULL) {
         static char why[48];
@@ -180,6 +181,199 @@ static const char *own_intern(const char *v, size_t n) {
     memcpy(buf, v, n);
     buf[n] = 0;
     return g_own_last = buf;
+}
+
+#define FMF "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"tlshello\",\"length\":\"10-20\"}}]}"
+#define FMB "{\"tcp\":[{\"type\":\"filter\",\"settings\":{\"allowedSourceIPs\":[\"10.0.0.1\"]}}]}"
+
+static size_t fm_pct(char *o, const char *s) {
+    size_t k = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || strchr("-._~", *p))
+            o[k++] = (char)*p;
+        else k += (size_t)sprintf(o + k, "%%%02X", *p);
+    }
+    o[k] = '\0';
+    return k;
+}
+
+static void fm_fill(char *o, char ch, size_t total) {
+    static const char a[] = "{\"tcp\":[{\"type\":\"header-custom\",\"settings\":{\"clients\":[[{\"type\":\"str\",\"packet\":\"";
+    static const char b[] = "\"}]]}}]}";
+    size_t f = total - (sizeof a - 1) - (sizeof b - 1);
+    memcpy(o, a, sizeof a - 1);
+    memset(o + sizeof a - 1, ch, f);
+    memcpy(o + sizeof a - 1 + f, b, sizeof b);
+}
+
+static void fm_ech(char *o, size_t bl) {
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    unsigned char raw[1099];
+    size_t e = 0;
+    raw[0] = (unsigned char)((bl - 2) >> 8), raw[1] = (unsigned char)(bl - 2);
+    raw[2] = 0xfe, raw[3] = 0x0d, raw[4] = (unsigned char)((bl - 6) >> 8), raw[5] = (unsigned char)(bl - 6);
+    for (size_t i = 6; i < bl; i++) raw[i] = (unsigned char)"\xfb\xef\xbe"[i % 3];
+    for (size_t i = 0; i < bl; i += 3) {
+        unsigned v = (unsigned)raw[i] << 16 | (i + 1 < bl ? (unsigned)raw[i + 1] << 8 : 0) | (i + 2 < bl ? raw[i + 2] : 0);
+        o[e++] = b64[v >> 18 & 63], o[e++] = b64[v >> 12 & 63];
+        o[e++] = i + 1 < bl ? b64[v >> 6 & 63] : '=', o[e++] = i + 2 < bl ? b64[v & 63] : '=';
+    }
+    o[e] = '\0';
+}
+
+static char *fm_worst(size_t main_fm, size_t block_fm, int block_long, size_t name) {
+    static char fm1[FM_JSON_MAX + 1], fm2[FM_JSON_MAX + 1], enc[10000], ech[1500], dech[1500], pins[1100], extra[16384];
+    char k63[64], m15[16], blong[8192] = "";
+    char *url = malloc(65536), *p = enc;
+    if (main_fm) fm_fill(fm1, '!', main_fm);
+    fm_fill(fm2, '*', block_fm);
+    p += sprintf(p, "mlkem768x25519plus.native.0rtt.");
+    for (int i = 0; i < 16; i++) p += sprintf(p, "65535-65535-65535-a.");
+    for (int i = 0; i < 6; i++) { memset(p, 'A', 1579); p += 1579; *p++ = '.'; }
+    p[-1] = '\0';
+    fm_ech(ech, 1099);
+    fm_ech(dech, 1047);
+    for (int i = 0; i < 16; i++) sprintf(pins + 65 * i, "%s%s", i ? "," : "", H1);
+    memset(k63, '!', 63), k63[63] = '\0';
+    memset(m15, '!', 15), m15[15] = '\0';
+    if (block_long)
+        snprintf(blong, sizeof blong, ",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"d.example\","
+                 "\"mldsa65Verify\":\"%s\"}", PQV_KEY);
+    if (block_long > 1)
+        snprintf(blong, sizeof blong, ",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"d.example\","
+                 "\"mldsa65Verify\":\"%s\",\"echConfigList\":\"%s\",\"pinnedPeerCertSha256\":\"%s\"},"
+                 "\"xhttpSettings\":{\"sessionPlacement\":\"header\",\"sessionKey\":\"%s\",\"seqPlacement\":\"header\","
+                 "\"seqKey\":\"%s\",\"uplinkDataPlacement\":\"header\",\"uplinkDataKey\":\"%s\",\"xPaddingObfsMode\":true,"
+                 "\"xPaddingKey\":\"%s\",\"xPaddingHeader\":\"%s\",\"xPaddingPlacement\":\"header\"}",
+                 PQV_KEY, dech, pins, k63, k63, k63, k63, k63);
+    snprintf(extra, sizeof extra,
+             "{\"sessionPlacement\":\"header\",\"sessionKey\":\"%s\",\"seqPlacement\":\"header\",\"seqKey\":\"%s\","
+             "\"uplinkDataPlacement\":\"header\",\"uplinkDataKey\":\"%s\",\"xPaddingObfsMode\":true,\"xPaddingKey\":\"%s\","
+             "\"xPaddingHeader\":\"%s\",\"xPaddingPlacement\":\"header\",\"uplinkHTTPMethod\":\"%s\",\"downloadSettings\":"
+             "{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalmask\":%s%s}}",
+             k63, k63, k63, k63, k63, m15, fm2, blong);
+    p = url + sprintf(url, "vless://" UUID "@m.example:443?type=xhttp&security=tls&sni=m.example&mode=packet-up&path=/x"
+                      "&encryption=%s&pqv=%s&ech=", enc, PQV_KEY);
+    p += fm_pct(p, ech);
+    if (main_fm) {
+        p += sprintf(p, "&fm=");
+        p += fm_pct(p, fm1);
+    }
+    p += sprintf(p, "&extra=");
+    p += fm_pct(p, extra);
+    *p++ = '#';
+    memset(p, 'n', name);
+    p[name] = '\0';
+    return url;
+}
+
+static void t_fm_roundtrip(void) {
+    static char buf[32768], big[65536], want[16384];
+    struct vless_node n, m;
+    sl_intern_reset();
+    char *u = xlink("type=xhttp&security=tls&sni=m.example&path=%2Fxp&mode=packet-up&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A"
+                    "%22fragment%22%2C%22settings%22%3A%7B%22packets%22%3A%22tlshello%22%2C%22length%22%3A%2210-20%22%7D%7D%5D%7D",
+                    "{\"downloadSettings\":{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalmask\":" FMB "}}");
+    int rc = vless_parse_url(u, &n);
+    free(u);
+    /* catches: fm lost by vlink, or a masked node vanishing from the link list without a reason */
+    check("fm round trip: usable", 0, rc);
+    check_str("fm round trip: main mask", FMF, n.fm ? n.fm : "(null)");
+    check_str("fm round trip: block mask", FMB, vless_dl(&n) && vless_dl(&n)->fm ? vless_dl(&n)->fm : "(null)");
+    size_t l = vless_node_link(&n, buf, sizeof buf);
+    check("fm round trip: a link", 1, l > 0);
+    strcpy(want, "&fm=");
+    fm_pct(want + 4, FMF);
+    check("fm round trip: fm= is the encoded compact JSON", 1, strstr(buf, want) != NULL);
+    char *ex = strstr(buf, "&extra=");
+    if (ex) {
+        snprintf(big, sizeof big, "%s", ex + 7);
+        char *amp = strchr(big, '&');
+        if (amp) *amp = '\0';
+        sl_pct_decode(big);
+    } else big[0] = '\0';
+    char *ds = strstr(big, "\"downloadSettings\":{");
+    check("fm round trip: extra has the block's finalmask raw", 1,
+          ds && strstr(ds, "\"finalmask\":" FMB) != NULL && strstr(big, "\"finalmask\":" FMB) == strstr(ds, "\"finalmask\""));
+    check("fm round trip: re-parsed", 0, l ? vless_parse_url(buf, &m) : -1);
+    check("fm round trip: same main pointer", 1, l && m.fm == n.fm);
+    check("fm round trip: same block pointer", 1, l && vless_dl(&m) && vless_dl(&m)->fm == vless_dl(&n)->fm);
+    struct tr_node t, td;
+    sl_tr_nodes(&n, &t, &td);
+    check("fm round trip: the transport sees both masks", 1, t.fm == n.fm && t.dl == &td && td.fm == vless_dl(&n)->fm);
+    m = n;
+    m.fm = SL_BAD_FM;
+    l = vless_node_link(&m, buf, sizeof buf);
+    check("fm round trip: a marker is never written", 1, l > 0 && !strstr(buf, "&fm="));
+    static const char *const v[] = {
+        "vless://" UUID "@h.example:443?type=tcp&security=tls&sni=h.example&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22filter%22%7D%5D%7D#f",
+        "vless://" UUID "@h.example:443?type=tcp&security=tls&sni=h.example&fm=%7B%22tcp%22%3A%5B%7B%22type%22%3A%22sudoku%22%7D%5D%7D#s",
+    };
+    links("fm links", v, N(v));
+
+    sl_intern_reset();
+    u = fm_worst(FM_JSON_MAX, FM_JSON_MAX, 0, 0);
+    rc = vless_parse_url(u, &n);
+    free(u);
+    check("fm worst: usable", 0, rc);
+    check("fm worst: main mask at the cap", FM_JSON_MAX, n.fm ? (long)strlen(n.fm) : -1);
+    check("fm worst: block mask at the cap", FM_JSON_MAX, vless_dl(&n) && vless_dl(&n)->fm ? (long)strlen(vless_dl(&n)->fm) : -1);
+    check("fm worst: longest encryption", 9830, n.encryption ? (long)strlen(n.encryption) : -1);
+    check("fm worst: longest ech", 1468, n.ech ? (long)strlen(n.ech) : -1);
+    l = vless_node_link(&n, buf, sizeof buf);
+    check("fm worst: a link in 32768", 1, l > 0);
+    check("fm worst: re-parsed", 0, l ? vless_parse_url(buf, &m) : -1);
+    check("fm worst: the same node", 1, l && diff(&n, &m) == NULL);
+
+    int fit = 0, over = 0, bad = 0;
+    for (size_t i = 0; i < 3 * (FM_JSON_MAX / 2 + 1); i++) {
+        sl_intern_reset();
+        u = fm_worst(FM_JSON_MAX / 2 + i / 3, FM_JSON_MAX, 1, i % 3 + 1);
+        rc = vless_parse_url(u, &n);
+        free(u);
+        if (rc == 0) {
+            fit++;
+            if (!vless_node_link(&n, buf, sizeof buf)) bad++;
+        } else {
+            over++;
+            if (strcmp(n.skip_reason, "finalmask: too long for a link")) bad++;
+            n.skip_reason[0] = '\0';
+            if (vless_node_link(&n, buf, sizeof buf) || !vless_node_link(&n, big, sizeof big)) bad++;
+        }
+    }
+    int cut_saved = 0, cut_bad = 0;
+    for (size_t i = 0; i <= FM_JSON_MAX / 2; i++) {
+        char *full = malloc(VLESS_LINK_MAX * 2);
+        sl_intern_reset();
+        u = fm_worst(FM_JSON_MAX / 2 + i, FM_JSON_MAX, 1, 127);
+        rc = vless_parse_url(u, &n);
+        free(u);
+        int skipped = rc != 0;
+        n.skip_reason[0] = '\0';
+        size_t whole = vless_node_link(&n, full, VLESS_LINK_MAX * 2);
+        vless_name_cut(n.name);
+        int fits = vless_node_link(&n, buf, sizeof buf) > 0;
+        if (skipped == fits) cut_bad++;
+        if (!skipped && whole >= VLESS_LINK_MAX) cut_saved++;
+        free(full);
+    }
+    /* catches: a node measured with the name the link will not carry */
+    check("fm overflow, cut name: refused exactly when the cut link does not fit", 0, cut_bad);
+    check("fm overflow, cut name: a node fits only with its name cut", 1, cut_saved > 0);
+    sl_intern_reset();
+    u = fm_worst(0, FM_JSON_MAX, 2, 1);
+    rc = vless_parse_url(u, &n);
+    free(u);
+    check("fm overflow by the block's mask: skipped", 1, rc);
+    check_str("fm overflow by the block's mask: reason", "finalmask: too long for a link", n.skip_reason);
+    check("fm overflow by the block's mask: no main mask", 1, n.fm == NULL && vless_dl(&n) && vless_dl(&n)->fm);
+    n.skip_reason[0] = '\0';
+    check("fm overflow by the block's mask: the link does not fit", 1,
+          !vless_node_link(&n, buf, sizeof buf) && vless_node_link(&n, big, sizeof big));
+    sl_intern_reset();
+    check("fm overflow: some masked nodes fit", 1, fit > 0);
+    check("fm overflow: some masked nodes overflow", 1, over > 0);
+    check("fm overflow: refused exactly when the link does not fit", 0, bad);
 }
 
 int main(void) {
@@ -1019,6 +1213,8 @@ int main(void) {
         check("fp switch: NULL leaves each link its fp", 10 * REALITY_FP_FIREFOX + REALITY_FP_CHROME,
               10 * reality_fp_of(t[4].fp) + reality_fp_of(t[5].fp));
     }
+
+    t_fm_roundtrip();
 
     for (size_t i = 0; i < NFIELDS; i++) {
         char what[96];

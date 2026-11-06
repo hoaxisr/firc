@@ -10,6 +10,7 @@
  *
  * The file includes the sources it tests, to reach their static functions. They need no network
  * and no crypto library, so the test builds without them. */
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
@@ -680,8 +681,6 @@ static void t_dl_refusals(void) {
         { "{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"security\":\"reality\","
           "\"realitySettings\":{\"serverName\":\"r.example\"}}", "downloadSettings: reality without pbk" },
         { DL_B("0.0.0.0"), "downloadSettings: 0.0.0.0: nobody to answer" },
-        { "{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalmask\":{}}",
-          "downloadSettings: finalmask is not supported" },
         { "{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"quicParams\":{}}",
           "downloadSettings: quicParams is not supported" },
         { DL_TLS(",\"alpn\":[\"h3\"]"), "downloadSettings: alpn h3 is not supported" },
@@ -1164,6 +1163,242 @@ static void t_xmux_all(void) {
     t_xmux_block();
     t_xmux_clash();
     t_xmux_node_refused();
+}
+
+#define FM_FRAG "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"tlshello\",\"length\":\"10-20\"}}]}"
+#define FM_FRAG_WS "{ \"tcp\" : [ { \"type\" : \"fragment\" ,\n \"settings\" : { \"packets\" : \"tlshello\" , \"length\" : \"10-20\" } } ] }"
+#define FM_SUDOKU "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{}}]}"
+#define FM_XMC "{\"tcp\":[{\"type\":\"xmc\",\"settings\":{}}]}"
+#define FM_FILTER "{\"tcp\":[{\"type\":\"filter\",\"settings\":{\"allowedSourceIPs\":[\"10.0.0.1\"]}}]}"
+#define FM_HC "{\"tcp\":[{\"type\":\"header-custom\",\"settings\":{\"clients\":[[{\"packet\":\"GET / HTTP/1.1\\r\\n\\r\\n\",\"type\":\"str\"}]]}}]}"
+#define FM_HC_WS "{ \"tcp\": [ { \"type\": \"header-custom\", \"settings\": { \"clients\": [ [ { \"packet\": \"GET / HTTP/1.1\\r\\n\\r\\n\", \"type\": \"str\" } ] ] } } ] }"
+#define DL_FM(fm) "{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalmask\":" fm "}"
+#define FM_MAIN_Q "type=xhttp&security=tls&sni=m.example&path=/xp&mode=packet-up"
+
+static const char *fm_of(const struct vless_node *n) {
+    return !n->fm ? "(null)" : n->fm == SL_BAD_FM ? "(bad)" : n->fm == SL_FULL ? "(full)" : n->fm;
+}
+
+static const char *fm_pct(const char *s) {
+    static char b[4][16384];
+    static unsigned at;
+    char *o = b[at++ & 3];
+    size_t k = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && k + 4 < sizeof b[0]; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')) o[k++] = (char)*p;
+        else k += (size_t)snprintf(o + k, sizeof b[0] - k, "%%%02X", *p);
+    }
+    o[k] = '\0';
+    return o;
+}
+
+static int fm_link(struct vless_node *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static int fm_link(struct vless_node *n, const char *fmt, ...) {
+    static char q[40000], url[40100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(q, sizeof q, fmt, ap);
+    va_end(ap);
+    snprintf(url, sizeof url, "vless://" XHU "@h.example:443?%s#f", q);
+    return vless_parse_url(url, n);
+}
+
+static const char *fm_xray(const char *stream) {
+    static char js[16384];
+    static struct vless_sub_stats st;
+    struct vless_node out[4];
+    snprintf(js, sizeof js,
+             "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"example.org\","
+             "\"port\":443,\"users\":[{\"id\":\"" XHU "\"}]}]},\"streamSettings\":{%s}}]}", stream);
+    memset(&st, 0, sizeof st);
+    memset(&g_dl_last, 0, sizeof g_dl_last);
+    vless_set_node_hook(dl_hook, NULL);
+    size_t got = vless_parse_sub(js, out, 4, &st);
+    vless_set_node_hook(NULL, NULL);
+    return xhx_reason(got, &st);
+}
+
+static void t_fm_link(void) {
+    struct vless_node n;
+    /* catches: fm= ignored (today's sublink.c:799), or a refused type dialed */
+    check_n("fm link: fragment usable", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_FRAG)));
+    check("fm link: fragment compact", FM_FRAG, fm_of(&n));
+    const char *first = n.fm;
+    check_n("fm link: spaced usable", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_FRAG_WS)));
+    check("fm link: spaced compacted", FM_FRAG, fm_of(&n));
+    check_n("fm link: spaced interned once", 1, n.fm == first);
+    check_n("fm link: sudoku skipped", 1, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_SUDOKU)));
+    check("fm link: sudoku reason", "finalmask: sudoku is not supported yet", n.skip_reason);
+    check_n("fm link: %7B skipped", 1, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%%7B"));
+    check("fm link: %7B reason", "finalmask: does not parse", n.skip_reason);
+    check_n("fm link: empty tcp usable", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct("{\"tcp\":[]}")));
+    check("fm link: empty tcp carries nothing", "(null)", fm_of(&n));
+    check_n("fm link: filter usable", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_FILTER)));
+    check("fm link: filter carried", FM_FILTER, fm_of(&n));
+    check_n("fm link: no fm, no mask", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example"));
+    check("fm link: no fm carries nothing", "(null)", fm_of(&n));
+    check_n("fm link: bad then good, last wins", 0,
+            fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s&fm=%s", fm_pct(FM_SUDOKU), fm_pct(FM_FRAG)));
+    check("fm link: bad then good, the good mask", FM_FRAG, fm_of(&n));
+    check("fm link: bad then good, no stale reason", "", n.skip_reason);
+    check_n("fm link: good then bad, last wins", 1,
+            fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s&fm=%s", fm_pct(FM_FRAG), fm_pct(FM_XMC)));
+    check("fm link: good then bad, reason", "finalmask: xmc is not supported yet", n.skip_reason);
+}
+
+static void t_fm_xray_json(void) {
+    /* catches: the main node's finalmask still skipped (sub.c:615) */
+    check("fm xray: header-custom usable", "(usable)", fm_xray("\"network\":\"tcp\",\"security\":\"none\",\"finalmask\": " FM_HC_WS));
+    check("fm xray: compact, escapes as written", FM_HC, fm_of(&g_dl_last));
+    check("fm xray: xmc skipped", "finalmask: xmc is not supported yet",
+          fm_xray("\"network\":\"tcp\",\"security\":\"none\",\"finalmask\":" FM_XMC));
+    check("fm xray: null usable", "(usable)", fm_xray("\"network\":\"tcp\",\"security\":\"none\",\"finalmask\":null"));
+    check("fm xray: null carries nothing", "(null)", fm_of(&g_dl_last));
+    check("fm xray: before network", "(usable)", fm_xray("\"finalmask\":" FM_FRAG ",\"network\":\"tcp\""));
+    check("fm xray: before network, carried", FM_FRAG, fm_of(&g_dl_last));
+    check("fm xray: string value", "finalmask: invalid finalmask",
+          fm_xray("\"network\":\"tcp\",\"finalmask\":\"x\""));
+    check("fm xray: finalMask key", "finalmask: sudoku is not supported yet",
+          fm_xray("\"network\":\"tcp\",\"finalMask\":" FM_SUDOKU));
+    check("fm xray: FINALMASK key", "finalmask: sudoku is not supported yet",
+          fm_xray("\"network\":\"tcp\",\"FINALMASK\":" FM_SUDOKU));
+    check("fm xray: FinalMask key carried", "(usable)", fm_xray("\"network\":\"tcp\",\"FinalMask\":" FM_FRAG));
+    check("fm xray: FinalMask key, mask", FM_FRAG, fm_of(&g_dl_last));
+    check("fm xray: block finalMask key", "downloadSettings: finalmask: sudoku is not supported yet",
+          fm_xray("\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\",\"downloadSettings\":{\"address\":"
+                  "\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalMask\":" FM_SUDOKU "}}"));
+}
+
+static void t_fm_dl(void) {
+    static const char *const blocks[3] = { DL_FM("{}"), DL_FM(FM_FRAG), DL_FM(FM_SUDOKU) };
+    struct vless_node n;
+    char js[1024], name[96];
+    /* catches: the download block inheriting the main mask */
+    for (int path = 0; path < 3; path++) {
+        static const char *const pn[3] = { "link extra", "xray block", "xray extra" };
+        const char *why[3];
+        const struct vless_node *d[3];
+        for (int i = 0; i < 3; i++) {
+            if (path == 0) {
+                int rc = dl_link(blocks[i], &n);
+                why[i] = rc ? n.skip_reason : "(usable)";
+                g_dl_last = n;
+            } else {
+                snprintf(js, sizeof js, path == 1 ? "{\"path\":\"/x\",\"downloadSettings\":%s}"
+                                                  : "{\"path\":\"/x\",\"extra\":{\"downloadSettings\":%s}}", blocks[i]);
+                why[i] = dl_xray(js);
+            }
+            snprintf(name, sizeof name, "fm dl %s %d: main mask", pn[path], i);
+            check(name, "(null)", fm_of(&g_dl_last));
+            d[i] = dl_of(&g_dl_last);
+            if (i == 0) {
+                snprintf(name, sizeof name, "fm dl %s: {} usable", pn[path]);
+                check(name, "(usable)", why[0]);
+                snprintf(name, sizeof name, "fm dl %s: {} carries nothing", pn[path]);
+                check(name, "(null)", fm_of(d[0]));
+                snprintf(name, sizeof name, "fm dl %s: {} block host", pn[path]);
+                check(name, "d.example", dl_host(&g_dl_last));
+            } else if (i == 1) {
+                snprintf(name, sizeof name, "fm dl %s: fragment usable", pn[path]);
+                check(name, "(usable)", why[1]);
+                snprintf(name, sizeof name, "fm dl %s: fragment on the block", pn[path]);
+                check(name, FM_FRAG, fm_of(d[1]));
+            } else {
+                snprintf(name, sizeof name, "fm dl %s: sudoku refused", pn[path]);
+                check(name, "downloadSettings: finalmask: sudoku is not supported yet", why[2]);
+            }
+        }
+    }
+    snprintf(js, sizeof js, FM_MAIN_Q "&fm=%s", fm_pct(FM_FRAG));
+    check_n("fm dl: main mask, plain block usable", 0, dl_link_as(js, "{\"downloadSettings\":" DL_B("d.example") "}", &n));
+    check("fm dl: main mask kept", FM_FRAG, fm_of(&n));
+    check("fm dl: plain block not masked", "(null)", fm_of(dl_of(&n)));
+    check("fm dl xray: main mask, plain block usable", "(usable)",
+          fm_xray("\"network\":\"xhttp\",\"finalmask\":" FM_FRAG ",\"xhttpSettings\":{\"path\":\"/x\",\"downloadSettings\":"
+                  DL_B("d.example") "}"));
+    check("fm dl xray: main mask kept", FM_FRAG, fm_of(&g_dl_last));
+    check("fm dl xray: plain block not masked", "(null)", fm_of(dl_of(&g_dl_last)));
+}
+
+static void fm_own_case(const char *what, const char *main, const char *block, const char *want_node,
+                        const char *want_block) {
+    char name[128], blk[1024];
+    struct vless_node n;
+    snprintf(blk, sizeof blk, "{\"downloadSettings\":{\"address\":\"d.example\",\"port\":443,\"network\":\"xhttp\","
+                              "\"finalmask\":%s}}", block);
+    for (int order = 0; order < 4; order++) {
+        static const char *const on[4] = { "xray fm first", "xray fm last", "link fm first", "link fm last" };
+        static char st[4096];
+        const char *why;
+        if (order < 2) {
+            if (order == 0)
+                snprintf(st, sizeof st, "\"network\":\"xhttp\",\"finalmask\":%s,\"xhttpSettings\":{\"path\":\"/x\",%s",
+                         main, blk + 1);
+            else
+                snprintf(st, sizeof st, "\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\",%s,\"finalmask\":%s",
+                         blk + 1, main);
+            why = fm_xray(st);
+            n = g_dl_last;
+        } else {
+            static char q[16384];
+            if (order == 2) snprintf(q, sizeof q, FM_MAIN_Q "&fm=%s&extra=%s", fm_pct(main), fm_pct(blk));
+            else snprintf(q, sizeof q, FM_MAIN_Q "&extra=%s&fm=%s", fm_pct(blk), fm_pct(main));
+            why = fm_link(&n, "%s", q) ? n.skip_reason : "(usable)";
+        }
+        snprintf(name, sizeof name, "fm own %s, %s: node reason", what, on[order]);
+        check(name, want_node, why);
+        snprintf(name, sizeof name, "fm own %s, %s: block reason", what, on[order]);
+        check(name, want_block, dl_of(&n)->skip_reason);
+    }
+}
+
+static void t_fm_reason_own_node(void) {
+    /* catches: a shared reason buffer overwritten by the other node */
+    fm_own_case("both bad", FM_SUDOKU, FM_XMC, "finalmask: sudoku is not supported yet",
+                "finalmask: xmc is not supported yet");
+    fm_own_case("main bad", FM_SUDOKU, FM_FRAG, "finalmask: sudoku is not supported yet", "");
+    fm_own_case("block bad", FM_FRAG, FM_XMC, "downloadSettings: finalmask: xmc is not supported yet",
+                "finalmask: xmc is not supported yet");
+}
+
+static void t_fm_clash_singbox(void) {
+    struct vless_node out[4];
+    struct vless_sub_stats st;
+    size_t got;
+    /* catches: a stray key read as finalmask */
+    memset(&st, 0, sizeof st);
+    got = vless_parse_sub("{\"outbounds\":[{\"type\":\"vless\",\"tag\":\"s\",\"server\":\"h.example\",\"server_port\":443,"
+                          "\"uuid\":\"" XHU "\",\"finalmask\":" FM_SUDOKU ",\"fm\":" FM_XMC "}]}", out, 4, &st);
+    check_n("fm sing-box: usable", 1, (long)got);
+    check("fm sing-box: no mask", "(null)", got ? fm_of(&out[0]) : "");
+    memset(&st, 0, sizeof st);
+    got = vless_parse_sub("proxies:\n  - name: c\n    type: vless\n    server: h.example\n    port: 443\n"
+                          "    uuid: " XHU "\n    fm: '" FM_SUDOKU "'\n    finalmask: '" FM_XMC "'\n", out, 4, &st);
+    check_n("fm clash: usable", 1, (long)got);
+    check("fm clash: no mask", "(null)", got ? fm_of(&out[0]) : "");
+}
+
+static void t_fm_full(void) {
+    struct vless_node n;
+    char v[32];
+    sl_intern_reset();
+    for (int i = 0; i < 300; i++) {
+        snprintf(v, sizeof v, "fm-fill-%d", i);
+        sl_intern(v, strlen(v));
+    }
+    /* catches: a full table of long values taken as no mask */
+    check_n("fm full table: skipped", 1, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_FRAG)));
+    check("fm full table: reason", "too many distinct keys", n.skip_reason);
+    sl_intern_reset();
+}
+
+static void t_fm_all(void) {
+    t_fm_full();
+    t_fm_link();
+    t_fm_xray_json();
+    t_fm_dl();
+    t_fm_reason_own_node();
+    t_fm_clash_singbox();
 }
 
 int main(void) {
@@ -2457,6 +2692,7 @@ int main(void) {
     t_intern_blob_full();
     t_dl_all();
     t_xmux_all();
+    t_fm_all();
 
     printf("\n%d checks passed", g_pass);
     if (g_fail) {

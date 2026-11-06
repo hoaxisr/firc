@@ -15,6 +15,7 @@
 /* vencp_b64url_len: the pqv key length uses the same base64url arithmetic as VLESS encryption.
  * Strings only, no cryptography. */
 #include "vencp.h"
+#include "fmask.h"
 
 /* base64 decoding as subscriptions need it: line breaks inside, '=' padding optional, and the
  * URL-safe alphabet accepted too (some panels serve it). */
@@ -282,6 +283,26 @@ static int sl_range(const char *v, unsigned long max, unsigned long *from, unsig
     return 0;
 }
 
+void sl_set_fm(struct vless_node *n, const char *json, size_t len) {
+    static const char pre[] = "finalmask: ";
+    char why[sizeof n->skip_reason - sizeof pre + 1];
+    struct fm_cfg c;
+    if (n->fm == SL_BAD_FM && !strncmp(n->skip_reason, pre, sizeof pre - 1)) n->skip_reason[0] = '\0';
+    n->fm = NULL;
+    if (fm_parse(json, len, &c, why, sizeof why)) {
+        n->fm = SL_BAD_FM;
+        if (!n->skip_reason[0]) snprintf(n->skip_reason, sizeof n->skip_reason, "%s%s", pre, why);
+        return;
+    }
+    size_t masks = c.n;
+    fm_cfg_free(&c);
+    if (!masks) return;
+    char *buf = malloc(len + 1);
+    size_t cl = buf ? fm_compact(json, len, buf, len + 1) : 0;
+    n->fm = cl ? sl_intern(buf, cl) : SL_FULL;
+    free(buf);
+}
+
 void sl_pad_range(struct vless_node *n, const char *v) {
     unsigned long a, b;
     if (sl_range(v, 65535, &a, &b) != 0) return;
@@ -320,6 +341,7 @@ const char SL_BAD_PQV[] = "!pqv";
 const char SL_FULL[] = "!full";
 const char SL_BAD_XHX[] = "!xhx";
 const char SL_BAD_XHX_JSON[] = "!xhx-json";
+const char SL_BAD_FM[] = "!fm";
 const struct vless_node SL_DL_FULL;
 
 static __thread const char *(*g_interner)(const char *v, size_t n);
@@ -714,6 +736,12 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
         char *d = sl_param_dup(v, vlen);
         if (d) { if (sl_truthy(d)) n->allow_insecure = 1; free(d); }
     }
+    else if (klen == 2 && !strncmp(k, "fm", 2)) {
+        char *d = sl_param_dup(v, vlen);
+        if (d) sl_set_fm(n, d[0] ? d : "null", d[0] ? strlen(d) : 4);
+        else n->fm = SL_FULL;
+        free(d);
+    }
     else if (klen == 4 && !strncmp(k, "path", 4)) sl_set_pct(n->path, sizeof(n->path), v, vlen);
     else if (klen == 11 && !strncmp(k, "serviceName", 11)) sl_set_pct(n->service, sizeof(n->service), v, vlen);
     else if (klen == 4 && !strncmp(k, "mode", 4)) sl_set_pct(n->mode, sizeof(n->mode), v, vlen);
@@ -814,6 +842,7 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
 /* First half of the usability check (sublink.h). Reasons must fit in skip_reason (96 bytes). */
 int sl_link_usable_pre(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
+    if (n->fm == SL_BAD_FM) return 1;
 
     /* Post-quantum fields. The markers come from parsing (set_encryption in sub.c, sl_set_pqv): a
      * value that breaks Xray's rule, or a full table of long values. */
@@ -856,7 +885,7 @@ int sl_link_usable_pre(struct vless_node *n) {
             return 1;
     }
     if (n->encryption == SL_FULL || n->pqv == SL_FULL || n->pcs == SL_FULL || n->pks == SL_FULL ||
-        n->vcn == SL_FULL) {
+        n->vcn == SL_FULL || n->fm == SL_FULL) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "too many distinct keys");
         return 1;
     }
@@ -983,7 +1012,7 @@ static int dl_refused(struct sl_dl *d) {
         snprintf(b->skip_reason, sizeof(b->skip_reason), "network %s is not xhttp", b->type);
         return 1;
     }
-    if (!why) why = d->notls ? "reality requires tls" : d->finalmask ? "finalmask is not supported" :
+    if (!why) why = d->notls ? "reality requires tls" :
                     d->quic ? "quicParams is not supported" :
                     d->alpn == 1 ? "alpn h3 is not supported" : d->alpn == 2 ? "alpn http/1.1 is not supported" : NULL;
     if (why) snprintf(b->skip_reason, sizeof(b->skip_reason), "%s", why);

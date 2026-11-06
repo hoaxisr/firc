@@ -16,6 +16,7 @@
 #include "xconn.h"
 #include "reality.h"
 #include "ech.h"
+#include "fmlink.h"
 
 /* ---- link I/O ------------------------------------------------------------------------ */
 
@@ -24,13 +25,10 @@ int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     if (l->plain) {
         size_t sent = 0;
         while (sent < n) {
-            /* send with MSG_NOSIGNAL, not write: a socket closed by the node fails the write
-             * (EPIPE) instead of raising SIGPIPE, even in a process that did not ignore it (the
-             * tests). Over TLS, tls13_write relies on main ignoring SIGPIPE (src/main.c). */
-            ssize_t w = send(l->fd, d + sent, n - sent, MSG_NOSIGNAL);
+            ssize_t w = tr_lk_send(l, d + sent, n - sent);
             if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
-                return TR_EIO;
+                if (w == -1 && errno == EINTR) continue;
+                return w < -1 ? (int)w : TR_EIO;
             }
             sent += (size_t)w;
         }
@@ -53,17 +51,37 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
         if (pending) { *got = pending; return 0; }
     }
     if (l->plain || l->rx_direct) {
-        ssize_t r = read(l->fd, d, cap);
-        if (r <= 0) return r == 0 ? TR_ECLOSED : TR_EIO;
+        ssize_t r = tr_lk_recv(l, d, cap, 0);
+        if (r <= 0) return tr_lk_err(l, r);
         *got = (size_t)r;
         return 0;
     }
     return tls13_read(&l->tls, d, cap, got);
 }
 
+ssize_t tr_lk_send(struct tr_link *l, const void *d, size_t n) {
+    if (l->tls.fm) return fm_send(l->tls.fm, l->fd, d, n);
+    /* send with MSG_NOSIGNAL, not write: a socket closed by the node fails the write (EPIPE)
+     * instead of raising SIGPIPE, even in a process that did not ignore it (the tests). Over
+     * TLS, tls13_write relies on main ignoring SIGPIPE (src/main.c). */
+    return send(l->fd, d, n, MSG_NOSIGNAL);
+}
+
+ssize_t tr_lk_recv(struct tr_link *l, void *d, size_t cap, int flags) {
+    if (l->tls.fm) return fm_recv(l->tls.fm, l->fd, d, cap, flags, l->rx_direct);
+    return recv(l->fd, d, cap, flags);
+}
+
+int tr_lk_err(const struct tr_link *l, ssize_t r) {
+    if (!r) return TR_ECLOSED;
+    return r == -1 && l->tls.fm && errno == EPROTO ? TR_EMASK : TR_EIO;
+}
+
 void tr_link_close(struct tr_link *l) {
     if (l->fd >= 0) close(l->fd);
     l->fd = -1;
+    fm_link_free(l->tls.fm);
+    l->tls.fm = NULL;
     /* The cipher contexts live on the heap and leak over thousands of connections if not freed.
      * Also called for a link that never reached TLS: freeing an empty state is harmless, and
      * this place need not know how far the handshake got. */
@@ -157,6 +175,27 @@ int transport_open(struct transport *t, const struct tr_node *n, int timeout_s) 
     return tr_venc_after(t, n, timeout_s);
 }
 
+void transport_set_loop(struct transport *t) {
+    if (!own_links(t) && t->link.tls.fm) fm_set_loop(t->link.tls.fm, 1);
+}
+
+int transport_idle(const struct transport *t) {
+    return !t->fr || (!t->fr->due && (own_links(t) || !t->link.tls.fm));
+}
+
+int transport_due(struct transport *t, uint64_t now_ms, int *next_ms) {
+    *next_ms = -1;
+    if (!t->fr) return 0;
+    if (t->fr->due) return t->fr->due(t, now_ms, next_ms);
+    if (own_links(t) || !t->link.tls.fm) return 0;
+    return fm_kick(t->link.tls.fm, t->link.fd, now_ms, next_ms);
+}
+
+long transport_mask_room(struct transport *t) {
+    if (!t->fr || own_links(t) || !t->link.tls.fm) return -1;
+    return (long)fm_room(t->link.tls.fm);
+}
+
 int transport_write(struct transport *t, const unsigned char *d, size_t n) {
     if (t->enc) return tr_venc_write(t, d, n);
     return t->fr->write(t, d, n);
@@ -206,6 +245,7 @@ int transport_has_data(const struct transport *t) {
     if (t->enc && tr_venc_pending(t)) return 1;
     if (fr_pending(t)) return 1;
     if (own_links(t)) return 0;
+    if (fm_pending(t->link.tls.fm)) return 1;
     if (t->link.plain) return 0;
     if (t->link.rx_direct) return tls13_buffered(&t->link.tls) > 0;
     return tls13_has_record(&t->link.tls);
@@ -244,6 +284,12 @@ const char *transport_strerror(int rc) {
         case TR_ECONNECT: case TR_ECONNTIMEOUT: case TR_ECONNREFUSED: case TR_EUNREACH:
         case TR_ENONODE: return tr_dial_strerror(rc);
         case TR_EIO: return "I/O error";
+        case TR_EMASK: {
+            static __thread char why[128];
+            const char *d = fm_last_why();
+            snprintf(why, sizeof why, "finalmask: %s", d[0] ? d : "the mask failed");
+            return why;
+        }
         case TR_ECLOSED: return "server closed the connection";
         case TR_ENOH2: return "server did not agree to HTTP/2 (needed for grpc)";
         case TR_EGRPC: return "unexpected gRPC stream format";

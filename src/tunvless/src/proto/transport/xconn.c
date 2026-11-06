@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "xconn.h"
+#include "fmlink.h"
 #include "osrand.h"
 
 #define XC_NONE    UINT16_MAX
@@ -21,12 +22,16 @@ _Static_assert(TLS13_MAX_PLAIN <= XC_CHUNK, "a TLS record's plaintext fits one c
 
 struct xc_chunk {
     struct xc_chunk *next;
-    uint32_t off, len, pt, ctl;
+    uint32_t off, len, pt, ctl, cap;
     size_t pay;
-    unsigned char d[XC_CHUNK];
+    int64_t gap;
+    unsigned char d[];
 };
 
+#define XC_PIECE_COST (sizeof(struct xc_chunk) + 16)
+
 static __thread struct xc_host g_host;
+
 static __thread uint32_t g_pend_max = XC_PEND_MAX;
 static __thread int64_t g_held;
 static __thread uint32_t g_soft = XC_RX_BUDGET, g_hard = XC_RX_HARD, g_resume = XC_RX_RESUME;
@@ -64,22 +69,38 @@ size_t xc_queued(void) { return g_queued; }
 
 unsigned xc_free_n(void) { return g_free_n; }
 
+static struct xc_chunk *chunk_init(struct xc_chunk *c, size_t cap) {
+    c->next = NULL;
+    c->off = c->len = c->pt = c->ctl = 0;
+    c->cap = (uint32_t)cap;
+    c->pay = 0;
+    c->gap = 0;
+    return c;
+}
+
 static struct xc_chunk *chunk_get(void) {
     struct xc_chunk *c = g_free;
     if (c) {
         g_free = c->next;
         g_free_n--;
     } else {
-        c = malloc(sizeof *c);
+        c = malloc(sizeof *c + XC_CHUNK);
         if (!c) return NULL;
     }
-    c->next = NULL;
-    c->off = c->len = c->pt = c->ctl = 0;
-    c->pay = 0;
-    return c;
+    return chunk_init(c, XC_CHUNK);
+}
+
+static struct xc_chunk *chunk_sized(size_t n) {
+    if (n == XC_CHUNK) return chunk_get();
+    struct xc_chunk *c = malloc(sizeof *c + n);
+    return c ? chunk_init(c, n) : NULL;
 }
 
 static void chunk_put(struct xc_chunk *c) {
+    if (c->cap != XC_CHUNK) {
+        free(c);
+        return;
+    }
     if (g_links && g_free_n < XC_FREE_KEEP) {
         c->next = g_free;
         g_free = c;
@@ -101,14 +122,14 @@ static void free_list_drop(void) {
 static int q_push(struct xc_q *q, const unsigned char *d, size_t n) {
     while (n) {
         struct xc_chunk *t = q->tail;
-        if (!t || t->len == XC_CHUNK) {
+        if (!t || t->len >= t->cap) {
             t = chunk_get();
             if (!t) return -1;
             if (q->tail) q->tail->next = t;
             else q->head = t;
             q->tail = t;
         }
-        size_t k = XC_CHUNK - t->len < n ? XC_CHUNK - t->len : n;
+        size_t k = t->cap - t->len < n ? t->cap - t->len : n;
         memcpy(t->d + t->len, d, k);
         t->len += (uint32_t)k;
         q->n += k;
@@ -321,6 +342,43 @@ static void credit(struct xconn *x, struct xc_st *e, size_t n, int give) {
     }
 }
 
+static int x_emit(void *arg, const unsigned char *d, size_t n, int64_t gap) {
+    struct xconn *x = arg;
+    if (gap < 0) gap = 0;
+    if (!n && !gap) return 0;
+    if (!n && x->out.tail) {
+        x->out.tail->gap += gap;
+        return 0;
+    }
+    struct xc_chunk *c = chunk_sized(n);
+    if (!c) return H2_EIO;
+    if (n) memcpy(c->d, d, n);
+    c->len = (uint32_t)n;
+    c->gap = gap;
+    c->pay = XC_PIECE_COST;
+    x->q_pay += XC_PIECE_COST;
+    if (x->shared) g_queued += XC_PIECE_COST;
+    q_link(&x->out, c);
+    return 0;
+}
+
+static int masked(struct xconn *x, const unsigned char *d, size_t n, uint32_t pt) {
+    if (x->q_pay >= 4 * XC_OUT_HIGH) return TR_EIO;
+    struct xc_chunk *t = x->out.tail;
+    int rc = fm_shape(x->link.tls.fm, d, n, x_emit, x);
+    if (rc) return rc == H2_EIO ? rc : TR_EMASK;
+    if (x->out.tail == t) {
+        struct xc_chunk *c = chunk_sized(0);
+        if (!c) return H2_EIO;
+        q_link(&x->out, c);
+    }
+    x->out.tail->pt += pt;
+    x->out.tail->pay += x->stage_pay;
+    x->out.tail->ctl += x->stage_ctl;
+    x->stage_pay = x->stage_ctl = 0;
+    return 0;
+}
+
 static int seal(struct xconn *x) {
     struct xc_chunk *c = x->stage;
     if (!c) return 0;
@@ -328,6 +386,11 @@ static int seal(struct xconn *x) {
     if (!c->len) {
         chunk_put(c);
         return 0;
+    }
+    if (x->link.plain && x->link.tls.fm) {
+        int rc = masked(x, c->d, c->len, c->len);
+        chunk_put(c);
+        return rc;
     }
     if (x->link.plain) {
         c->pay = x->stage_pay;
@@ -343,6 +406,7 @@ static int seal(struct xconn *x) {
     int rc = tls13_seal(&x->link.tls, c->d, c->len, g_seal, sizeof g_seal, &rn);
     chunk_put(c);
     if (rc) return rc;
+    if (x->link.tls.fm) return masked(x, g_seal, rn, pt);
     if (q_push(&x->out, g_seal, rn)) return H2_EIO;
     x->out.tail->pt += pt;
     x->out.tail->pay += x->stage_pay;
@@ -706,20 +770,24 @@ static int feed(struct xconn *x, const unsigned char *d, size_t n) {
     return rc;
 }
 
+static int buffered(const struct xconn *x) {
+    return (!x->link.plain && tls13_has_record(&x->link.tls)) || fm_pending(x->link.tls.fm);
+}
+
 static int at_ceiling(const struct xconn *x) {
-    return bounded(x) && g_held >= (int64_t)g_hard && (x->link.plain || !tls13_has_record(&x->link.tls));
+    return bounded(x) && g_held >= (int64_t)g_hard && !buffered(x);
 }
 
 static int read_pass(struct xconn *x, uint64_t now) {
     size_t total = 0;
-    while (total < XC_READ_MAX || (!x->link.plain && tls13_has_record(&x->link.tls))) {
+    while (total < XC_READ_MAX || buffered(x)) {
         if (x->link.plain) {
-            ssize_t r = recv(x->link.fd, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
+            ssize_t r = tr_lk_recv(&x->link, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
             if (r == 0) return TR_ECLOSED;
             if (r < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-                return TR_EIO;
+                return tr_lk_err(&x->link, r);
             }
             x->last_rx_ms = now;
             total += (size_t)r;
@@ -734,7 +802,7 @@ static int read_pass(struct xconn *x, uint64_t now) {
         int rc = tls13_read_ref(&x->link.tls, &body, &n);
         if (rc) return rc;
         if (!n) {
-            if (x->link.tls.rd_seq == seq && !tls13_has_record(&x->link.tls)) return 0;
+            if (x->link.tls.rd_seq == seq && !buffered(x)) return 0;
             x->last_rx_ms = now;
             continue;
         }
@@ -759,9 +827,9 @@ static int read_shared(struct xconn *x, uint64_t now) {
 
 static int read_one(struct xconn *x) {
     if (x->link.plain) {
-        ssize_t r = recv(x->link.fd, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
+        ssize_t r = tr_lk_recv(&x->link, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
         if (r == 0) return TR_ECLOSED;
-        if (r < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : TR_EIO;
+        if (r < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : tr_lk_err(&x->link, r);
         return feed(x, g_rbuf, (size_t)r);
     }
     const unsigned char *body = NULL;
@@ -804,24 +872,36 @@ static int flush_in(struct xconn *x) {
         fail_in(x, rc);
         return rc;
     }
+    uint64_t now = 0;
     while (x->out.head) {
-        struct xc_chunk *h = x->out.head;
-        ssize_t w = send(x->link.fd, h->d + h->off, h->len - h->off, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            fail_in(x, TR_EIO);
-            return TR_EIO;
+        if (x->out_due) {
+            if (!now) now = tr_mono_ms();
+            if (now < x->out_due) break;
+            x->out_due = 0;
         }
-        h->off += (uint32_t)w;
-        x->out.n -= (size_t)w;
-        if (h->off < h->len) continue;
+        struct xc_chunk *h = x->out.head;
+        if (h->off < h->len) {
+            ssize_t w = send(x->link.fd, h->d + h->off, h->len - h->off, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                fail_in(x, TR_EIO);
+                return TR_EIO;
+            }
+            h->off += (uint32_t)w;
+            x->out.n -= (size_t)w;
+            if (h->off < h->len) continue;
+        }
         x->out.head = h->next;
         if (!x->out.head) x->out.tail = NULL;
         x->pt_s += h->pt;
         x->q_pay -= h->pay;
         x->q_ctl -= h->ctl;
         if (x->shared) g_queued -= h->pay;
+        if (h->gap > 0) {
+            if (!now) now = tr_mono_ms();
+            x->out_due = now + (uint64_t)h->gap;
+        }
         chunk_put(h);
     }
     if (x->h2.hold && x->q_ctl < XC_CTL_RESUME) release(x);
@@ -843,10 +923,21 @@ int xconn_flush(struct xconn *x) {
     return rc;
 }
 
+static int has_out(const struct xconn *x) {
+    return x->out.head || (x->stage && x->stage->len);
+}
+
+int xconn_due(struct xconn *x, uint64_t now_ms) {
+    if (x->state != XC_LIVE || !x->out_due || !has_out(x)) return -1;
+    if (now_ms >= x->out_due) return 0;
+    uint64_t w = x->out_due - now_ms;
+    return w > INT32_MAX ? INT32_MAX : (int)w;
+}
+
 int xconn_wants_in(const struct xconn *x) { return x->state == XC_LIVE && !x->paused; }
 
 int xconn_wants_out(const struct xconn *x) {
-    return x->state == XC_LIVE && (x->out.head || (x->stage && x->stage->len));
+    return x->state == XC_LIVE && has_out(x) && (!x->out_due || tr_mono_ms() >= x->out_due);
 }
 
 int xconn_io(struct xconn *x, uint32_t ev, uint64_t now_ms) {
@@ -1265,38 +1356,39 @@ static int room_open(const struct xs *s) {
     return e && !e->ended && !e->local_end && e->h2slot != XC_NONE && h2m_room(&s->x->h2, e->h2slot) > 0;
 }
 
-static uint64_t mono_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
-}
-
 int xs_wait(const struct xs *s, int timeout_ms) {
     if (!ent(s)) return 1;
     struct xconn *x = s->x;
-    uint64_t dl = mono_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
+    uint64_t dl = tr_mono_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     int had_room = room_open(s);
     for (;;) {
         if (xs_ready(s)) return 1;
         if (x->state != XC_LIVE) return 1;
         if (!had_room && room_open(s)) return 0;
         int queued = xconn_wants_out(x);
-        if (!x->link.plain && tls13_has_record(&x->link.tls)) {
+        if (buffered(x)) {
             int rc = read_one(x);
             if (rc) fail_in(x, rc);
             else flush_in(x);
             continue;
         }
-        uint64_t now = mono_ms();
+        uint64_t now = tr_mono_ms();
         if (now >= dl) return 0;
+        int gap = xconn_due(x, now);
+        if (!gap) {
+            flush_in(x);
+            continue;
+        }
+        int tmo = (int)(dl - now);
+        if (gap > 0 && gap < tmo) tmo = gap;
         struct pollfd p = { .fd = x->link.fd, .events = (short)(POLLIN | (queued ? POLLOUT : 0)) };
-        int pr = poll(&p, 1, (int)(dl - now));
+        int pr = poll(&p, 1, tmo);
         if (pr < 0) {
             if (errno == EINTR) continue;
             fail_in(x, TR_EIO);
             continue;
         }
-        if (!pr) return 0;
+        if (!pr) continue;
         if (p.revents & POLLOUT) {
             if (flush_in(x)) continue;
             if (queued && !xconn_wants_out(x)) return 0;

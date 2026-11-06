@@ -11,7 +11,7 @@
 #include "vless.h"
 #include "vlink.h"
 
-#define LINK_BUF 32768
+#define LINK_BUF VLESS_LINK_MAX
 #define KEY_SUFFIX_ROOM 8
 #define NODES_PER_BODY ((size_t)FIRC_TUN_MAX_NODES * 4)
 #define ROWS_MAX ((size_t)FIRC_TUN_MAX_NODES * 8)

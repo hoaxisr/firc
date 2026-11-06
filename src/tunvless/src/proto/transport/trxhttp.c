@@ -21,6 +21,7 @@
 
 #include "transport.h"
 #include "xconn.h"
+#include "fmlink.h"
 #include "xhreq.h"
 #include "trxmux.h"
 
@@ -964,7 +965,25 @@ static int xhttp_pending(const struct transport *t) {
     const struct xconn *x = x_rdconn(t);
     if (!x) return 0;
     if (x_rd(t)->x && xs_ready(x_rd(t))) return 1;
-    return !x->link.plain && tls13_has_record(&x->link.tls);
+    return (!x->link.plain && tls13_has_record(&x->link.tls)) || fm_pending(x->link.tls.fm);
+}
+
+static int xhttp_due(struct transport *t, uint64_t now_ms, int *next_ms) {
+    *next_ms = -1;
+    for (int i = 0; i < 2; i++) {
+        struct xconn *x = t->xh.priv[i];
+        if (!x) continue;
+        int d = xconn_due(x, now_ms);
+        if (!d) {
+            int rc = xconn_flush(x);
+            if (!rc) rc = out_wait(t, x);
+            if (rc) return rc;
+            d = xconn_due(x, mono_ms());
+            if (!d) d = 1;
+        }
+        if (d > 0 && (*next_ms < 0 || d < *next_ms)) *next_ms = d;
+    }
+    return 0;
 }
 
 static int xhttp_fd(const struct transport *t) {
@@ -1042,7 +1061,7 @@ static long xhttp_room(struct transport *t) {
 const struct transport_ops tr_xhttp = {
     .name = "xhttp", .alpn = "h2", .zc = 0,
     .open = xhttp_open, .write = xhttp_write, .read = xhttp_read, .dial = xhttp_dial, .fd = xhttp_fd,
-    .close = xhttp_close, .pending = xhttp_pending, .room = xhttp_room,
+    .close = xhttp_close, .pending = xhttp_pending, .room = xhttp_room, .due = xhttp_due,
 };
 
 int transport_whole_writes(const struct transport *t) {

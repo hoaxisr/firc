@@ -4,9 +4,10 @@
 #include "vlink.h"
 #include "sublink.h"
 
-struct wbuf { char *p; size_t cap, n; int over, q; };
+struct wbuf { char *p; size_t cap, n, need; int over, q, bad; };
 
 static void put(struct wbuf *w, const char *s, size_t l) {
+    w->need += l;
     if (w->over || w->n + l >= w->cap) { w->over = 1; return; }
     memcpy(w->p + w->n, s, l);
     w->n += l;
@@ -50,7 +51,7 @@ static void param(struct wbuf *w, const char *k, const char *v) {
 
 static int is_marker(const char *v) {
     return v == SL_BAD_PQV || v == SL_FULL || v == SL_BAD_PIN || v == SL_BAD_ECH || v == SL_ECH_DNS ||
-           v == SL_BAD_XHX || v == SL_BAD_XHX_JSON;
+           v == SL_BAD_XHX || v == SL_BAD_XHX_JSON || v == SL_BAD_FM;
 }
 
 static void param_long(struct wbuf *w, const char *k, const char *v) {
@@ -178,6 +179,10 @@ static void dl_json(struct jbuf *b, const struct vless_node *d) {
     jb_put(b, port, strlen(port));
     js_field(b, &k, "network", "xhttp");
     js_field(b, &k, "security", d->security);
+    if (d->fm && !is_marker(d->fm)) {
+        js_key(b, &k, "finalmask", 9);
+        jb_put(b, d->fm, strlen(d->fm));
+    }
     js_open(b, &k, strcmp(d->security, "reality") ? "tlsSettings" : "realitySettings", &at, &kat);
     js_field(b, &s, "serverName", d->sni);
     js_field(b, &s, "fingerprint", d->fp);
@@ -209,7 +214,7 @@ static void extra(struct wbuf *w, const struct vless_node *n) {
         dl_json(&b, n->dl);
     }
     jb_put(&b, "}", 1);
-    if (b.bad) w->over = 1;
+    if (b.bad) w->over = w->bad = 1;
     else if (k) param(w, "extra", b.p);
     free(b.p);
 }
@@ -220,13 +225,13 @@ static int clean(const char *s, const char *bad) {
     return 1;
 }
 
-size_t vless_node_link(const struct vless_node *n, char *out, size_t cap) {
-    if (!out || !cap || n->skip_reason[0] || !n->port || !n->host[0]) return 0;
+static int link_build(const struct vless_node *n, struct wbuf *w0) {
+    if (n->skip_reason[0] || !n->port || !n->host[0]) return -1;
     int v6 = strchr(n->host, ':') != NULL;
-    if (!clean(n->uuid, "@") || !clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return 0;
-    if (v6 && strspn(n->host, "0123456789abcdefABCDEF:.") != strlen(n->host)) return 0;
-    struct wbuf w = { out, cap, 0, 0, 0 };
-    out[0] = '\0';
+    if (!clean(n->uuid, "@") || !clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return -1;
+    if (v6 && strspn(n->host, "0123456789abcdefABCDEF:.") != strlen(n->host)) return -1;
+    struct wbuf w = *w0;
+    if (w.p) w.p[0] = '\0';
     puts_(&w, "vless://");
     puts_(&w, n->uuid);
     put(&w, "@", 1);
@@ -256,13 +261,26 @@ size_t vless_node_link(const struct vless_node *n, char *out, size_t cap) {
     param_long(&w, "pks", n->pks);
     param_long(&w, "vcn", n->vcn);
     param_long(&w, "ech", n->ech);
+    param_long(&w, "fm", n->fm);
     if (n->allow_insecure) param(&w, "allowInsecure", "1");
     if (n->name[0]) {
         put(&w, "#", 1);
         put_name(&w, n->name);
     }
-    if (w.over) { out[0] = '\0'; return 0; }
+    *w0 = w;
+    return w.bad ? -1 : 0;
+}
+
+size_t vless_node_link(const struct vless_node *n, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    struct wbuf w = { out, cap, 0, 0, 0, 0, 0 };
+    if (link_build(n, &w) || w.over) { out[0] = '\0'; return 0; }
     return w.n;
+}
+
+size_t vless_node_link_len(const struct vless_node *n) {
+    struct wbuf w = { NULL, 0, 0, 0, 1, 0, 0 };
+    return link_build(n, &w) ? 0 : w.need;
 }
 
 void vless_name_cut(char *name) {

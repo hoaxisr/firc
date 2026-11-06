@@ -549,6 +549,7 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
 }
 
 static const char *pl_strerror(int rc) { return g_pl.in->strerror(rc); }
+static const char *pl_why(const void *sess, int rc) { return g_pl.in->why(CINNER(sess), rc); }
 
 /* A connect outcome for the slot's health: a streak of failures brings its check forward. */
 static void pl_seen(int slot, unsigned gen, int rc, uint64_t started) {
@@ -634,6 +635,7 @@ static void pl_clear(void *sess) {
 
 static int pl_fd(const void *sess) { return g_pl.in->fd(CINNER(sess)); }
 static int pl_has_data(const void *sess) { return g_pl.in->has_data(CINNER(sess)); }
+static int pl_due(void *sess, uint64_t now_ms, int *next_ms) { return g_pl.in->due(INNER(sess), now_ms, next_ms); }
 
 static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
     (void)ctx;
@@ -862,6 +864,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.peer = pl_peer;
     g_pl_ops.describe = pl_describe;
     g_pl_ops.strerror = pl_strerror;
+    g_pl_ops.why = g_pl.in->why ? pl_why : NULL;
     g_pl_ops.connect = pl_connect;
     g_pl_ops.take = pl_take;
     g_pl_ops.close = pl_close;
@@ -871,6 +874,7 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;
+    g_pl_ops.due = g_pl.in->due ? pl_due : NULL;
     g_pl_ops.up_write = g_pl.in->up_write ? pl_up_write : NULL;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;

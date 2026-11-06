@@ -38,6 +38,8 @@ int tr_dial(const char *host, uint16_t port, int timeout_s) {
     return sv[0];
 }
 
+ssize_t tr_lk_send(struct tr_link *l, const void *d, size_t n) { return send(l->fd, d, n, MSG_NOSIGNAL); }
+
 static int g_closes;
 void tr_link_close(struct tr_link *l) {
     if (l->fd >= 0) close(l->fd);

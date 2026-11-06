@@ -31,6 +31,8 @@
 #include "certverify.h"
 #include "certzip.h"
 #include "tls13.h"
+#include "fmlink.h"
+#include "transport.h"
 
 /* From reality.c: the same X25519, with the peer key from ServerHello. Shared rather than
  * copied, so clamping and byte order cannot diverge between two copies. */
@@ -96,15 +98,16 @@ static void tr_hash(const struct tls13 *t, unsigned char *out) {
 }
 
 /* ---- reading records ------------------------------------------------------- */
-/* Reading straight from the descriptor is for the handshake only, which is synchronous by
- * nature. */
-static int read_full(int fd, unsigned char *buf, size_t n) {
+/* Reading exactly n bytes from the link, never past them, is for the handshake only, which is
+ * synchronous by nature. */
+static int read_full(struct tls13 *t, unsigned char *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
+        ssize_t r = t->fm ? fm_recv(t->fm, t->fd, buf + got, n - got, 0, 0) : read(t->fd, buf + got, n - got);
         if (r == 0) return TLS13_ECLOSED;
         if (r < 0) {
             if (errno == EINTR) continue;
+            if (t->fm && errno == EPROTO) return TR_EMASK;
             /* The handshake socket is blocking with SO_RCVTIMEO, so EAGAIN here means only
              * that the node did not answer in time: not an I/O error (see TLS13_ETIMEOUT). */
             if (errno == EAGAIN || errno == EWOULDBLOCK) return TLS13_ETIMEOUT;
@@ -121,7 +124,7 @@ static int read_full(int fd, unsigned char *buf, size_t n) {
  *
  * The data stream passes may_wait = 0: poll first, never block, and leave an incomplete record
  * in the buffer so the loop moves on to other connections. The handshake, which must wait,
- * reads the descriptor directly (read_record_fd). */
+ * reads the link directly (read_record_fd). */
 /* The remainder moves to the start of the buffer only when the free tail runs short: with
  * medium records (4-8 KB, common with Xray) an unconditional move would memmove kilobytes on
  * every read. The threshold lets one read take a useful chunk rather than a hundred bytes at a
@@ -139,15 +142,18 @@ static int rbuf_fill(struct tls13 *t, int may_wait) {
     }
     if (t->rbuf_n >= sizeof(t->rbuf)) return TLS13_ETOOBIG;
 
-    if (!may_wait) {
+    if (!may_wait && !fm_pending(t->fm)) {
         struct pollfd p = { .fd = t->fd, .events = POLLIN };
         int pr = poll(&p, 1, 0);
         if (pr <= 0 || !(p.revents & POLLIN)) return TLS13_EAGAIN;
     }
-    ssize_t r = read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n);
+    unsigned char *at = t->rbuf + t->rbuf_n;
+    size_t room = sizeof(t->rbuf) - t->rbuf_n;
+    ssize_t r = t->fm ? fm_recv(t->fm, t->fd, at, room, may_wait ? 0 : MSG_DONTWAIT, 0) : read(t->fd, at, room);
     if (r == 0) return TLS13_ECLOSED;
     if (r < 0) {
         if (errno == EINTR) return 0;
+        if (t->fm && errno == EPROTO) return TR_EMASK;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return TLS13_EAGAIN;
         return TLS13_EIO;
     }
@@ -157,14 +163,14 @@ static int rbuf_fill(struct tls13 *t, int may_wait) {
 
 /* For the handshake: it waits, and it reads exactly one record at a time, so nothing past its
  * last record leaves the socket before the connection buffer takes over. */
-static int read_record_fd(int fd, unsigned char *type, unsigned char *body, size_t cap,
+static int read_record_fd(struct tls13 *t, unsigned char *type, unsigned char *body, size_t cap,
                           size_t *body_n) {
     unsigned char h[5];
-    int rc = read_full(fd, h, 5);
+    int rc = read_full(t, h, 5);
     if (rc) return rc;
     size_t len = ((size_t)h[3] << 8) | h[4];
     if (len > cap) return TLS13_ETOOBIG;
-    rc = read_full(fd, body, len);
+    rc = read_full(t, body, len);
     if (rc) return rc;
     *type = h[0];
     *body_n = len;
@@ -191,6 +197,23 @@ static int read_record(struct tls13 *t, unsigned char *type, unsigned char **bod
         if (rc) return rc;
     }
     return TLS13_EAGAIN;
+}
+
+static int send_all(struct tls13 *t, const unsigned char *d, size_t n) {
+    if (t->fm) {
+        ssize_t w = fm_send(t->fm, t->fd, d, n);
+        return w < 0 ? (int)w : 0;
+    }
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(t->fd, d + sent, n - sent);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            return TLS13_EIO;
+        }
+        sent += (size_t)w;
+    }
+    return 0;
 }
 
 /* ---- AEAD ------------------------------------------------------------------ */
@@ -355,8 +378,10 @@ static int handshake_run(struct tls13 *t, int fd,
     const char *host = auth ? auth->host : NULL;
     const unsigned char *rkey = auth ? auth->reality_key : NULL;
     const int want_cert = (host != NULL) || (rkey != NULL);
+    struct fm_link *fm = t->fm;
     memset(t, 0, sizeof(*t));
     t->fd = fd;
+    t->fm = fm;
     g_server_group = 0;
     /* md and H are set after ServerHello: they depend on the cipher suite. */
     enum sc_hash md = SC_SHA256;
@@ -371,7 +396,7 @@ static int handshake_run(struct tls13 *t, int fd,
     size_t n;
 
     /* ServerHello. */
-    int rc = read_record_fd(fd, &type, rec, sizeof(rec), &n);
+    int rc = read_record_fd(t, &type, rec, sizeof(rec), &n);
     if (rc) return rc;
     if (type != 0x16 || n < 44 || rec[0] != 0x02) return TLS13_EBADREC;
     if (!memcmp(rec + 6, HRR_RANDOM, 32)) return TLS13_EHRR;
@@ -563,7 +588,7 @@ static int handshake_run(struct tls13 *t, int fd,
 
     /* Up to 64 records: a long certificate chain arrives in several. */
     for (int guard = 0; guard < 64 && !got_finished; guard++) {
-        rc = read_record_fd(fd, &type, rec, sizeof(rec), &n);
+        rc = read_record_fd(t, &type, rec, sizeof(rec), &n);
         if (rc) return rc;
         if (type == 0x14) continue;             /* ChangeCipherSpec: ignored in 1.3 */
         if (type != 0x17) return TLS13_EBADREC;
@@ -752,12 +777,9 @@ static int handshake_run(struct tls13 *t, int fd,
     memcpy(chash, th2, H);
     if (sc_hmac(md, k->cfkey, H, chash, H, cfin) != 0) return TLS13_ECRYPTO;
 
-    /* Send ChangeCipherSpec (middlebox compatibility, as the browser does) and the encrypted
-     * Finished. */
+    /* ChangeCipherSpec (middlebox compatibility, as the browser does) and the encrypted Finished
+     * leave in one write, as Go and uTLS flush the client's second flight. */
     {
-        unsigned char ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
-        if (write(fd, ccs, 6) != 6) return TLS13_EIO;
-
         unsigned char pt[96];
         size_t pl = 0;
         pt[pl++] = 0x14;
@@ -765,13 +787,15 @@ static int handshake_run(struct tls13 *t, int fd,
         memcpy(pt + pl, cfin, H); pl += H;
         pt[pl++] = 0x16;                        /* inner type */
 
-        unsigned char out[160];
+        unsigned char flight[6 + 160] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+        unsigned char *out = flight + 6;
         size_t total = pl + 16;
         out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
         out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
         memcpy(out + 5, pt, pl);
         if (aead_seal_once(&k->c_hk, 0, out, 5, out + 5, pl, out + 5 + pl) != 0) return TLS13_ECRYPTO;
-        if (write(fd, out, 5 + total) != (ssize_t)(5 + total)) return TLS13_EIO;
+        rc = send_all(t, flight, 6 + 5 + total);
+        if (rc) return rc;
     }
 
     /* Application traffic keys: from the master secret and the full transcript. */
@@ -880,17 +904,11 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
     while (n) {
         size_t lim = tls13_plain_cap(t);
         size_t chunk = n > lim ? lim : n;
-        size_t want = 0, sent = 0;
+        size_t want = 0;
         int rc = tls13_seal(t, data, chunk, out, sizeof out, &want);
         if (rc) return rc;
-        while (sent < want) {
-            ssize_t w = write(t->fd, out + sent, want - sent);
-            if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
-                return TLS13_EIO;
-            }
-            sent += (size_t)w;
-        }
+        rc = send_all(t, out, want);
+        if (rc) return rc;
         data += chunk;
         n -= chunk;
     }

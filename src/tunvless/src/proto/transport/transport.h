@@ -24,6 +24,8 @@
 #define STEER_TRANSPORT_H
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
+#include <sys/types.h>
 #include "tls13.h"
 #include "h2.h"
 #include "xhopts.h"
@@ -40,6 +42,7 @@
 #define TR_ECONNREFUSED (-57)
 #define TR_EUNREACH     (-58)
 #define TR_ENONODE      (-59)
+#define TR_EMASK        (-65)
 /* The transport needs HTTP/2 and the server chose something else. A code of its own because all
  * else works and only the data does not flow: without it the node looks like it connects and
  * stays silent. */
@@ -101,6 +104,7 @@ struct tr_node {
      * none. trvenc.c parses and runs it over the open transport. */
     const char *encryption;
     const char *xhx;
+    const char *fm;
     const struct tr_node *dl;
 };
 
@@ -322,6 +326,7 @@ struct transport_ops {
      * larger than that fails with H2_EWINDOW. NULL: no limit (tcp, ws, httpupgrade: the socket
      * buffer). */
     long (*room)(struct transport *t);
+    int  (*due)(struct transport *t, uint64_t now_ms, int *next_ms);
 };
 
 /* Security, the link's security= field. The kinds differ only in the handshake (see the head). */
@@ -543,5 +548,19 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got);
 /* Close a link: the socket and, for TLS, the keys on the heap. */
 void tr_link_close(struct tr_link *l);
 int tr_link_nonblock(struct tr_link *l);
+
+ssize_t tr_lk_send(struct tr_link *l, const void *d, size_t n);
+ssize_t tr_lk_recv(struct tr_link *l, void *d, size_t cap, int flags);
+int tr_lk_err(const struct tr_link *l, ssize_t r);
+
+static inline uint64_t tr_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+void transport_set_loop(struct transport *t);
+int transport_idle(const struct transport *t);
+int transport_due(struct transport *t, uint64_t now_ms, int *next_ms);
+long transport_mask_room(struct transport *t);
 
 #endif

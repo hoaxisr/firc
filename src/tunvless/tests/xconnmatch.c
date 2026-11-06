@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "xconn.h"
+#include "trxmux.h"
 
 ssize_t __real_send(int fd, const void *b, size_t n, int fl);
 static long g_send_ok, g_send_again;
@@ -3574,6 +3575,620 @@ static void t_stall_holder_fills_late(void) {
     budget_off();
 }
 
+static unsigned char g_fmx_peer[1 << 17];
+
+static size_t fm_peer_post(int pfd, struct tp *tls, uint32_t sid, size_t want, int *same) {
+    size_t have = 0, n = 0, sum = 0;
+    *same = 1;
+    for (int i = 0; i < 200 && sum < want; i++) {
+        if (tls) {
+            unsigned char inner = 0;
+            size_t rn = 0;
+            if (rec_open(tls->cd, tls->s.fd, g_fmx_peer + have, sizeof g_fmx_peer - have, &rn, &inner)) break;
+            have += rn;
+        } else {
+            size_t k = peer_drain(pfd, g_fmx_peer + have, sizeof g_fmx_peer - have, 20);
+            have += k;
+        }
+        struct fv f[256];
+        int k = parse(g_fmx_peer, have, f, 256);
+        sum = 0;
+        n = 0;
+        for (int j = 0; j < k; j++) {
+            if (f[j].type != FR_DATA || f[j].sid != sid) continue;
+            if (n + f[j].len > want || memcmp(f[j].p, g_big + n, f[j].len)) *same = 0;
+            n += f[j].len;
+            sum += f[j].len;
+        }
+    }
+    if (sum != want) *same = 0;
+    return sum;
+}
+
+static size_t fm_get_body(struct xconn *x, const struct xs *g, unsigned char *out, size_t cap) {
+    size_t have = 0;
+    for (int i = 0; i < 100 && have < 3; i++) {
+        if (x->shared) io_in(x, 0);
+        else usleep(2000);
+        size_t got = 0;
+        if (xs_read(g, out + have, cap - have, &got)) break;
+        have += got;
+    }
+    return have;
+}
+
+static void x55_plain(int shared) {
+    const char *nm = shared ? "x55 xconn plain shared" : "x55 xconn plain private";
+    char what[96];
+    int fd0 = fd_count();
+    int l = listen_lo(0);
+    uint16_t sp = g_port;
+    int rl = listen_lo(0);
+    struct fmrelay r;
+    fmrelay_listen(&r, rl, sp);
+    struct tr_node n = plain_node(g_port);
+    fm_use(&FMT_X55, 0);
+    struct xconn *x = xconn_new(&n, 0, shared);
+    int rc = xconn_dial(x, 3);
+    fm_use(NULL, 0);
+    snprintf(what, sizeof what, "%s: dial", nm);
+    check(what, 0, rc);
+    int pfd = rc ? -1 : accept(l, NULL, NULL);
+    close(l);
+    if (pfd < 0) {
+        xconn_free(x);
+        fmrelay_join(&r);
+        return;
+    }
+    if (shared) xconn_adopt(x, 0);
+    unsigned char b[256];
+    size_t got = peer_drain(pfd, b, sizeof b, 100);
+    snprintf(what, sizeof what, "%s: Go's preface through the chain", nm);
+    check(what, 1, got == 70 && !memcmp(b, PREFACE70, 70));
+    struct xs g, u;
+    snprintf(what, sizeof what, "%s: GET opened", nm);
+    check(what, 0, xs_open(x, &RQ_GET, 1, &g));
+    xconn_flush(x);
+    int k = peer_frames(pfd, 100);
+    snprintf(what, sizeof what, "%s: GET HEADERS at the peer", nm);
+    check(what, 1, count_type(k, FR_HEADERS, g.sid));
+    pw(pfd, FR_HEADERS, FLAG_END_HEADERS, g.sid, ST200, 1);
+    pw(pfd, FR_DATA, FLAG_END_STREAM, g.sid, "abc", 3);
+    unsigned char body[8];
+    got = fm_get_body(x, &g, body, sizeof body);
+    snprintf(what, sizeof what, "%s: GET body read", nm);
+    check(what, 1, got == 3 && !memcmp(body, "abc", 3));
+    snprintf(what, sizeof what, "%s: POST opened", nm);
+    check(what, 0, xs_open(x, &RQ_POST, 2, &u));
+    snprintf(what, sizeof what, "%s: 40000 B sent", nm);
+    check(what, 0, xs_send(&u, g_big, 40000, 1));
+    for (int i = 0; i < 50 && xconn_wants_out(x); i++) {
+        xconn_flush(x);
+        usleep(2000);
+    }
+    int same = 0;
+    size_t sum = fm_peer_post(pfd, NULL, u.sid, 40000, &same);
+    snprintf(what, sizeof what, "%s: the peer got 40000 B of POST body", nm);
+    check(what, 40000, (long)sum);
+    snprintf(what, sizeof what, "%s: the body is the bytes sent", nm);
+    check(what, 1, same);
+    xconn_free(x);
+    close(pfd);
+    fmrelay_join(&r);
+    snprintf(what, sizeof what, "%s: descriptors back", nm);
+    check(what, fd0, fd_count());
+}
+
+/* catches: xconn.c:717/762/809 on the bare fd */
+static void t_fm_x55_xconn_plain(void) {
+    x55_plain(0);
+    x55_plain(1);
+}
+
+/* catches: xconn.c:809 or the TLS read of a shared xconn link on the bare fd */
+static void t_fm_x55_xconn_tls(void) {
+    int fd0 = fd_count();
+    struct tp p;
+    check("x55 xconn tls: peer starts", 0, tp_start(&p, "h2"));
+    uint16_t sp = g_port;
+    int rl = listen_lo(0);
+    struct fmrelay r;
+    fmrelay_listen(&r, rl, sp);
+    struct tr_node n = tls_node(g_port);
+    fm_use(&FMT_X55, 0);
+    struct xconn *x = xconn_new(&n, 0, 1);
+    int rc = xconn_dial(x, 3);
+    fm_use(NULL, 0);
+    check("x55 xconn tls: dial", 0, rc);
+    int keys = tp_finish(&p);
+    check("x55 xconn tls: peer keys", 0, keys);
+    if (rc || keys) {
+        xconn_free(x);
+        tp_free(&p);
+        fmrelay_join(&r);
+        return;
+    }
+    xconn_adopt(x, 0);
+    size_t rn = 0;
+    unsigned char inner = 0;
+    check("x55 xconn tls: preface record opens", 0, rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &rn, &inner));
+    check("x55 xconn tls: Go's preface", 1, rn == 70 && !memcmp(g_rec, PREFACE70, 70));
+    struct xs g, u;
+    check("x55 xconn tls: GET opened", 0, xs_open(x, &RQ_GET, 1, &g));
+    xconn_flush(x);
+    struct fv f[8];
+    int k = next_rec(&p, f, 8, &rn);
+    check("x55 xconn tls: GET HEADERS at the peer", 1, k == 1 && f[0].type == FR_HEADERS);
+    unsigned char msg[64];
+    size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, g.sid, ST200);
+    m += frame(msg + m, 3, FR_DATA, FLAG_END_STREAM, g.sid, "abc");
+    check("x55 xconn tls: peer answers", 0, tp_seal(p.sd, p.s.fd, msg, m));
+    unsigned char body[8];
+    size_t got = fm_get_body(x, &g, body, sizeof body);
+    check("x55 xconn tls: GET body read", 1, got == 3 && !memcmp(body, "abc", 3));
+    check("x55 xconn tls: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("x55 xconn tls: 40000 B sent", 0, xs_send(&u, g_big, 40000, 1));
+    for (int i = 0; i < 50 && xconn_wants_out(x); i++) {
+        xconn_flush(x);
+        usleep(2000);
+    }
+    int same = 0;
+    check("x55 xconn tls: the peer got 40000 B of POST body", 40000, (long)fm_peer_post(-1, &p, u.sid, 40000, &same));
+    check("x55 xconn tls: the body is the bytes sent", 1, same);
+    xconn_free(x);
+    tp_free(&p);
+    fmrelay_join(&r);
+    check("x55 xconn tls: descriptors back", fd0, fd_count());
+}
+
+/* catches: CCS and Finished written separately (tls13.c:759, :774), which makes Xray's packets:"1-3" count differ */
+static void t_ccs_fin_one_write(void) {
+    struct tp p;
+    check("ccs+fin: peer starts", 0, tp_start(&p, "h2"));
+    struct tr_node n = tls_node(g_port);
+    struct tr_link l;
+    memset(&l, 0, sizeof l);
+    g_fmt_rec_k = 0;
+    fm_use(&FMT_REC, 0);
+    int rc = tr_link_open(&l, &n, "h2", 3);
+    fm_use(NULL, 0);
+    check("ccs+fin: handshake", 0, rc);
+    int keys = tp_finish(&p);
+    check("ccs+fin: peer keys", 0, keys);
+    if (rc || keys) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    check("ccs+fin: two writes for the handshake", 2, (long)g_fmt_rec_k);
+    size_t hello = 5 + ((size_t)g_fmt_rec_head[0][3] << 8 | g_fmt_rec_head[0][4]);
+    check("ccs+fin: write 1 is the whole ClientHello record", 1,
+          g_fmt_rec_head[0][0] == 0x16 && g_fmt_rec_n[0] == hello);
+    check("ccs+fin: write 2 is 6 + 5 + 4 + 32 + 1 + 16 = 64 B", 64, (long)g_fmt_rec_n[1]);
+    check("ccs+fin: write 2 is CCS then a sealed record", 1,
+          !memcmp(g_fmt_rec_head[1], "\x14\x03\x03\x00\x01\x01\x17\x03", 8));
+    unsigned char buf[3000];
+    memset(buf, 0x2a, sizeof buf);
+    check("ccs+fin: 3000 B written", 0, tls13_write(&l.tls, buf, sizeof buf));
+    check("ccs+fin: one write per record, two records", 4, (long)g_fmt_rec_k);
+    check("ccs+fin: 1186 + 22 then 1814 + 22", 1, g_fmt_rec_n[2] == 1208 && g_fmt_rec_n[3] == 1836);
+    check("ccs+fin: application records counted alone", 2, (long)l.tls.wr_seq);
+    size_t lens[2];
+    check("ccs+fin: the peer opens both", 2, peer_lens(&p, lens, 2, 2));
+    check("ccs+fin: plaintext 1186 and 1814", 1, lens[0] == 1186 && lens[1] == 1814);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+static size_t g_fcc_n[1024];
+static size_t g_fcc_k;
+static unsigned char g_fcc_h[5];
+
+static int fcc_wr(struct fm_layer *me, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
+    (void)me;
+    if (!g_fcc_k && n == 5) memcpy(g_fcc_h, d, 5);
+    if (g_fcc_k < 1024) g_fcc_n[g_fcc_k] = n;
+    g_fcc_k++;
+    return emit(arg, d, n, 0);
+}
+
+static const struct fm_ops FMT_FCC = { .splice = 1, .wr = fcc_wr };
+static const char g_fcc_json[] = "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"1-3\",\"length\":5}}]}";
+
+static struct fm_link *fcc_new(const struct tr_node *n) {
+    (void)n;
+    const struct fm_cfg *c = fm_cfg_get(g_fcc_json);
+    if (!c) return NULL;
+    const struct fm_ops *o[2] = { &fm_frag_ops, &FMT_FCC };
+    const struct fm_mask *m[2] = { &c->m[0], &g_fmt_mask };
+    return fm_link_new_ops(o, m, 2);
+}
+
+static size_t fcc_cut(size_t *at, size_t total) {
+    size_t sum = 0, k = 0;
+    while (*at < g_fcc_k && *at < 1024 && sum < total) {
+        size_t n = g_fcc_n[(*at)++];
+        if (sum + n < total && n != 5) return 0;
+        if (n > 5) return 0;
+        sum += n;
+        k++;
+    }
+    return sum == total ? k : 0;
+}
+
+static void t_frag_ccs_count(void) {
+    /* catches: the write count drifting by one through a separate CCS write */
+    struct tp p;
+    check("frag ccs: peer starts", 0, tp_start(&p, "h2"));
+    struct tr_node n = tls_node(g_port);
+    struct tr_link l;
+    memset(&l, 0, sizeof l);
+    g_fcc_k = 0;
+    g_fm_new = fcc_new;
+    int rc = tr_link_open(&l, &n, "h2", 3);
+    g_fm_new = NULL;
+    check("frag ccs: handshake", 0, rc);
+    int keys = tp_finish(&p);
+    check("frag ccs: peer keys", 0, keys);
+    if (rc || keys) {
+        tr_link_close(&l);
+        tp_free(&p);
+        return;
+    }
+    unsigned char buf[3000];
+    memset(buf, 0x2a, sizeof buf);
+    check("frag ccs: 3000 B written", 0, tls13_write(&l.tls, buf, sizeof buf));
+    size_t at = 0, hello = 5 + ((size_t)g_fcc_h[3] << 8 | g_fcc_h[4]);
+    check("frag ccs: the first piece is a hello header", 1, g_fcc_h[0] == 0x16 && hello > 5);
+    size_t hk = fcc_cut(&at, hello);
+    check("frag ccs: the hello in 5 B pieces", (long)((hello + 4) / 5), (long)hk);
+    size_t ck = at;
+    check("frag ccs: CCS + Finished as 12 x 5 + 4", 13, (long)fcc_cut(&at, 64));
+    check("frag ccs: its last piece 4 B", 4, (long)g_fcc_n[ck + 12]);
+    check("frag ccs: the first record in 5 B pieces, 241 x 5 + 3", 242, (long)fcc_cut(&at, 1208));
+    check("frag ccs: the fourth write whole", 1, at + 1 == g_fcc_k && g_fcc_n[at] == 1836);
+    size_t lens[2];
+    check("frag ccs: the peer opens both", 2, peer_lens(&p, lens, 2, 2));
+    check("frag ccs: plaintext 1186 and 1814", 1, lens[0] == 1186 && lens[1] == 1814);
+    tr_link_close(&l);
+    tp_free(&p);
+}
+
+static unsigned char g_gp[1 << 16];
+static size_t g_gp_n;
+
+static uint64_t gap_ms(void) { return mono_us() / 1000; }
+
+static void gap_drain(int pfd) {
+    for (;;) {
+        ssize_t r = recv(pfd, g_gp + g_gp_n, sizeof g_gp - g_gp_n, MSG_DONTWAIT);
+        if (r <= 0) return;
+        g_gp_n += (size_t)r;
+    }
+}
+
+static long gap_body(uint32_t sid, int *data_last) {
+    struct fv f[256];
+    int k = parse(g_gp, g_gp_n, f, 256);
+    long sum = 0;
+    *data_last = -1;
+    for (int j = 0; j < k; j++) {
+        if (f[j].type != FR_DATA || f[j].sid != sid) continue;
+        if (memcmp(f[j].p, g_big + sum, f[j].len)) return -1;
+        sum += f[j].len;
+        *data_last = j;
+    }
+    return sum;
+}
+
+static int gap_ack(void) {
+    struct fv f[256];
+    int k = parse(g_gp, g_gp_n, f, 256);
+    for (int j = 0; j < k; j++)
+        if (f[j].type == FR_PING && (f[j].flags & FLAG_ACK)) return j;
+    return -1;
+}
+
+static struct xconn *gap_dial(const struct fm_ops *o, int *pfd) {
+    int l = listen_lo(0);
+    struct tr_node n = plain_node(g_port);
+    fm_use(o, 0);
+    struct xconn *x = xconn_new(&n, 0, 0);
+    int rc = x ? xconn_dial(x, 3) : -1;
+    fm_use(NULL, 0);
+    *pfd = rc ? -1 : accept(l, NULL, NULL);
+    close(l);
+    if (*pfd < 0) {
+        xconn_free(x);
+        return NULL;
+    }
+    g_gp_n = 0;
+    peer_drain(*pfd, g_gp, sizeof g_gp, 50);
+    g_gp_n = 0;
+    return x;
+}
+
+static void gap_wait_in(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    poll(&p, 1, 200);
+}
+
+/* catches: the flush sending past a gap, or gaps blocking the read path */
+static void t_xconn_gap(void) {
+    int pfd;
+    struct xconn *x = gap_dial(&FMT_GAP, &pfd);
+    if (!x) {
+        check("gap: dial", 0, 1);
+        return;
+    }
+    struct xs u;
+    uint64_t t0 = gap_ms(), tb = t0;
+    check("gap: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    uint64_t ta = gap_ms();
+    check("gap: 250 B sent", 0, xs_send(&u, g_big, 250, 1));
+    int due = xconn_due(x, tb);
+    check("gap: due 30 ms after the first flush", 1, due >= 30 && (uint64_t)due <= 30 + (ta - tb));
+    check("gap: nothing to poll for while the gap runs", 0, xconn_wants_out(x));
+    usleep(5000);
+    gap_drain(pfd);
+    int last = -1;
+    check("gap: no body before the gap", 0, gap_body(u.sid, &last));
+    pw(pfd, FR_PING, 0, 0, "12345678", 8);
+    gap_wait_in(x->link.fd);
+    check("gap: the PING is read during the gap", 0, xconn_io(x, EPOLLIN, gap_ms()));
+    uint64_t body_at = 0, ack_at = 0;
+    while (gap_ms() < t0 + 500 && !(body_at && ack_at)) {
+        if (xconn_due(x, gap_ms()) == 0) xconn_flush(x);
+        gap_drain(pfd);
+        if (!body_at && gap_body(u.sid, &last) == 250) body_at = gap_ms();
+        if (!ack_at && gap_ack() >= 0) ack_at = gap_ms();
+        usleep(1000);
+    }
+    check("gap: the peer got the 250 B in order", 250, gap_body(u.sid, &last));
+    check("gap: the last 50 not before 60 ms", 1, body_at >= t0 + 60);
+    check("gap: the PING answered after the body", 1, ack_at && gap_ack() > last);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+}
+
+/* catches: the read-side flush sending past out_due */
+static void t_xconn_gap_read_flush(void) {
+    int pfd;
+    struct xconn *x = gap_dial(&FMT_GAPZ, &pfd);
+    if (!x) {
+        check("gap read: dial", 0, 1);
+        return;
+    }
+    struct xs u;
+    uint64_t t0 = gap_ms();
+    check("gap read: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    pw(pfd, FR_PING, 0, 0, "12345678", 8);
+    gap_wait_in(x->link.fd);
+    unsigned char b[16];
+    size_t got = 0;
+    check("gap read: read", 0, xs_read(&u, b, sizeof b, &got));
+    usleep(5000);
+    gap_drain(pfd);
+    check("gap read: the PING ACK waits behind the gap", -1, gap_ack());
+    check("gap read: a due time is reported", 1, xconn_due(x, gap_ms()) > 0);
+    uint64_t ack_at = 0;
+    while (gap_ms() < t0 + 300 && !ack_at) {
+        if (xconn_due(x, gap_ms()) == 0) xconn_flush(x);
+        gap_drain(pfd);
+        if (gap_ack() >= 0) ack_at = gap_ms();
+        usleep(1000);
+    }
+    check("gap read: the ACK leaves, not before its due time", 1, ack_at >= t0 + 30);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+}
+
+/* catches: a zero-length gap piece refused, or a layer that emits nothing leaving its bytes counted */
+static void t_xconn_gap_empty(void) {
+    int pfd;
+    struct xconn *x = gap_dial(&FMT_GAPZ, &pfd);
+    if (!x) {
+        check("gap zero: dial", 0, 1);
+        return;
+    }
+    struct xs u;
+    uint64_t t0 = gap_ms();
+    check("gap zero: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("gap zero: 250 B sent", 0, xs_send(&u, g_big, 250, 1));
+    int last = -1;
+    uint64_t body_at = 0;
+    while (gap_ms() < t0 + 300 && !body_at) {
+        if (xconn_due(x, gap_ms()) == 0) xconn_flush(x);
+        gap_drain(pfd);
+        if (gap_body(u.sid, &last) == 250) body_at = gap_ms();
+        usleep(1000);
+    }
+    check("gap zero: the body after the HEADERS' gap", 1, body_at >= t0 + 30);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+    x = gap_dial(&FMT_EAT, &pfd);
+    if (!x) {
+        check("gap eat: dial", 0, 1);
+        return;
+    }
+    check("gap eat: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("gap eat: 250 B sent", 0, xs_send(&u, g_big, 250, 1));
+    xconn_flush(x);
+    check("gap eat: nothing left queued", 1, !xconn_wants_out(x) && !x->q_pay && !x->q_ctl && !x->out.head);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+}
+
+/* catches: transport_due not kicking the link's own chain, or room not taken from its queue */
+static void t_transport_due(void) {
+    static struct transport t;
+    memset(&t, 0, sizeof t);
+    check("transport due: no transport, nothing waits", 0, transport_due(&t, gap_ms(), &(int){ 0 }));
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp)) {
+        check("transport due: socketpair", 0, 1);
+        return;
+    }
+    t.fr = &tr_tcp;
+    t.link.fd = sp[0];
+    t.link.plain = 1;
+    int next = 7;
+    check("transport due: unmasked link, ok", 0, transport_due(&t, gap_ms(), &next));
+    check("transport due: unmasked link, nothing waits", -1, next);
+    check("transport due: unmasked link, no mask room", -1, transport_mask_room(&t));
+    const struct fm_ops *o[1] = { &FMT_GAP };
+    const struct fm_mask *m[1] = { &g_fmt_mask };
+    t.link.tls.fm = fm_link_new_ops(o, m, 1);
+    transport_set_loop(&t);
+    uint64_t t0 = gap_ms(), tb = t0;
+    check("transport due: 250 B written", 0, transport_write(&t, g_big, 250));
+    uint64_t ta = gap_ms();
+    g_gp_n = 0;
+    gap_drain(sp[1]);
+    check("transport due: the first piece leaves at once", 100, (long)g_gp_n);
+    check("transport due: room is 65536 less 150 B and two pieces", 65536 - 150 - 16, transport_mask_room(&t));
+    check("transport due: ok", 0, transport_due(&t, tb, &next));
+    check("transport due: 30 ms to the next piece", 1, next >= 30 && (uint64_t)next <= 30 + (ta - tb));
+    while (g_gp_n < 250 && gap_ms() < t0 + 300) {
+        if (!transport_due(&t, gap_ms(), &next) && next > 0) usleep(1000);
+        gap_drain(sp[1]);
+    }
+    check("transport due: all 250 B in order", 1, g_gp_n == 250 && !memcmp(g_gp, g_big, 250));
+    check("transport due: not before 60 ms", 1, gap_ms() >= t0 + 60);
+    check("transport due: room back to 65536", 65536, transport_mask_room(&t));
+    tr_link_close(&t.link);
+    close(sp[1]);
+    int pfd;
+    struct xconn *x = gap_dial(&FMT_GAP, &pfd);
+    if (!x) {
+        check("transport due xhttp: dial", 0, 1);
+        return;
+    }
+    memset(&t, 0, sizeof t);
+    t.fr = &tr_xhttp;
+    t.xh.wait_ms = 1000;
+    t.xh.priv[1] = x;
+    struct xs u;
+    t0 = tb = gap_ms();
+    check("transport due xhttp: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    ta = gap_ms();
+    check("transport due xhttp: 250 B sent", 0, xs_send(&u, g_big, 250, 1));
+    check("transport due xhttp: ok", 0, transport_due(&t, tb, &next));
+    check("transport due xhttp: the private link's gap reported", 1,
+          next >= 30 && (uint64_t)next <= 30 + (ta - tb));
+    int last = -1;
+    uint64_t body_at = 0;
+    while (gap_ms() < t0 + 500 && !body_at) {
+        if (!transport_due(&t, gap_ms(), &next) && next > 0) usleep(1000);
+        gap_drain(pfd);
+        if (gap_body(u.sid, &last) == 250) body_at = gap_ms();
+    }
+    check("transport due xhttp: the body leaves through due alone", 250, gap_body(u.sid, &last));
+    check("transport due xhttp: after the gaps", 1, body_at >= t0 + 60);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+}
+
+/* catches: tiny pieces held on a link without counting their chunks, so a masked link grows past every bound */
+static void t_xconn_piece_cost(void) {
+    int pfd;
+    g_fmt_one_gap = 0;
+    struct xconn *x = gap_dial(&FMT_ONE, &pfd);
+    if (!x) {
+        check("piece cost: dial", 0, 1);
+        return;
+    }
+    g_fmt_one_gap = 1000;
+    struct xs u;
+    check("piece cost: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
+    check("piece cost: 8 KiB sent", 0, xs_send(&u, g_big, 8192, 0));
+    check("piece cost: each 1 B piece counted at 32 B or more", 1, x->q_pay >= 8192u * (1 + 32));
+    check("piece cost: the room is down to its floor", 1, xs_room(&u) <= XC_MSS);
+    int rc = 0;
+    for (int i = 0; i < 4 && !rc; i++) rc = xs_send(&u, g_big, 8192, 0);
+    check("piece cost: over the hard cap the link fails", TR_EIO, rc);
+    check("piece cost: nothing counted after the failure", 0, (long)x->q_pay);
+    xs_close(&u);
+    xconn_free(x);
+    close(pfd);
+}
+
+static void *g_gs_link;
+static int *g_gs_done;
+
+static int gs_submit(void *link, int *done) {
+    g_gs_link = link;
+    g_gs_done = done;
+    return 0;
+}
+
+static int gs_watch(unsigned idx, int fd, unsigned ev) {
+    (void)idx; (void)fd; (void)ev;
+    return 0;
+}
+
+static const struct mux_host GS_HOST = { gs_submit, gs_watch, rec_wake, NULL, 1, 8000 };
+
+/* catches: shared xmux links never woken for their delayed pieces */
+static void t_xconn_gap_shared(void) {
+    static struct transport t;
+    static char key[4];
+    memset(&t, 0, sizeof t);
+    g_gs_link = NULL;
+    tr_xmux_host(&GS_HOST, NULL);
+    int l = listen_lo(0);
+    struct tr_node n = plain_node(g_port);
+    n.path = "/x";
+    n.mode = "stream-one";
+    n.xhx = "xmux.maxConnections=1\n";
+    struct xc_ref ref = { key, 0, 0 };
+    tr_xmux_pass(gap_ms(), MUXP_EARLY);
+    check("gap shared: the flow waits for a link", XA_WAIT, tr_xmux_attach(&t, &n, key, NULL, 1, &ref));
+    int rc = -1;
+    if (g_gs_link) {
+        fm_use(&FMT_GAP, 0);
+        rc = tr_xmux_dial(g_gs_link, 3);
+        fm_use(NULL, 0);
+        __atomic_store_n(g_gs_done, 1, __ATOMIC_RELEASE);
+    }
+    check("gap shared: dial", 0, rc);
+    int pfd = rc ? -1 : accept(l, NULL, NULL);
+    close(l);
+    if (pfd >= 0) {
+        peer_drain(pfd, g_gp, sizeof g_gp, 50);
+        g_gp_n = 0;
+        tr_xmux_pass(gap_ms(), MUXP_EARLY);
+        check("gap shared: the flow is on the link", 1, t.xh.f.one.x != NULL);
+        check("gap shared: 250 B written", 0, t.xh.f.one.x ? transport_write(&t, g_big, 250) : -1);
+        uint64_t t0 = gap_ms(), tb = t0;
+        int due = tr_xmux_pass(t0, MUXP_LATE);
+        uint64_t ta = gap_ms();
+        int ld = xconn_due(t.xh.f.one.x, tb);
+        check("gap shared: the link's gap is 30 ms from the pass", 1, ld >= 30 && (uint64_t)ld <= 30 + (ta - tb));
+        check("gap shared: the pass asks to be woken within it", 1, due > 0 && due <= ld);
+        int last = -1;
+        uint64_t body_at = 0;
+        while (gap_ms() < t0 + 500 && !body_at) {
+            int d = tr_xmux_pass(gap_ms(), MUXP_LATE);
+            gap_drain(pfd);
+            if (gap_body(t.xh.f.one.sid, &last) == 250) body_at = gap_ms();
+            usleep(d > 0 ? 1000 : 2000);
+        }
+        check("gap shared: the peer got the 250 B in order", 250, gap_body(t.xh.f.one.sid, &last));
+        check("gap shared: after the gaps", 1, body_at >= t0 + 60);
+    }
+    if (t.fr) transport_close(&t);
+    tr_xmux_pass(gap_ms(), MUXP_EXIT);
+    if (pfd >= 0) close(pfd);
+    tr_xmux_host(NULL, NULL);
+    xc_set_host(&HOST);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3672,6 +4287,16 @@ int main(void) {
     t_storm_bound();
     t_stall_with_reader_elsewhere();
     t_stall_holder_fills_late();
+    t_fm_x55_xconn_plain();
+    t_fm_x55_xconn_tls();
+    t_ccs_fin_one_write();
+    t_frag_ccs_count();
+    t_xconn_gap();
+    t_xconn_gap_read_flush();
+    t_xconn_gap_empty();
+    t_xconn_gap_shared();
+    t_transport_due();
+    t_xconn_piece_cost();
 
     printf("\nxconnmatch: %s (%d failed)\n", fails ? "FAIL" : "ok", fails);
     return fails ? 1 : 0;
