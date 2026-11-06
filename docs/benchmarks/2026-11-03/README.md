@@ -23,7 +23,7 @@
   |---|---|---|
   | оригинал на Go | 0.8.2-2 (последний релиз) | `ad2732a4ab3d25abbf38a65ab8306d22138a959173234f6b2deb5326923fcd93` |
   | mt-c | 0.8.5.4-1 (последний релиз) | `e51eaca3dba273f7a633738af7325ec34cd211e8e58be4d79efaf510e017f0dd` |
-  | firc | 0.5.3, main `6658c57` | `e1c1f216a63e5a31dcd21d6ef239d30bd8b8b4e3269a25a179a7d05022ac6a72` |
+  | firc | 0.6.0, main `6658c57` | `e1c1f216a63e5a31dcd21d6ef239d30bd8b8b4e3269a25a179a7d05022ac6a72` |
 
 - Роутер: Keenetic KN-1810 (MediaTek MT7621, 4 потока MIPS 1004Kc), 254 МБ ОЗУ, без swap, ядро 4.9-ndm-5,
   Entware 2025.05, glibc 2.27, iptables 1.4.21, `AT_CLKTCK` = 100. Генератор `dnsload` работает на том же роутере.
