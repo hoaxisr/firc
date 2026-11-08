@@ -2979,6 +2979,72 @@ static void t_pool_v6_checked_first_node(void) {
     check(g_probes6[0] == 0, "v6: a node not probed at startup waits for its own first check");
 }
 
+static void checks0(int n) { for (int k = 0; k < n; k++) pl_check(0); }
+
+/* catches: a v4-only node dialled for v6 on every check, or the gap not restarting after a failure */
+static void t_pool_v6_gap_on_v4_only_node(void) {
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    pool_new6(1, POOL_BY_CONNECTION, 1, 1);
+    pl_check(0);
+    check(g_pl.slot[0].up && !g_pl.slot[0].v6 && g_probes6[0] == 1, "v6 gap: the first check dials v6 once");
+    checks0(9);
+    check(g_pl.slot[0].up && g_probes6[0] == 1, "v6 gap: the next nine checks of a v4-only node dial no v6");
+    pl_check(0);
+    check(g_probes6[0] == 2, "v6 gap: the tenth check dials v6 again");
+    checks0(9);
+    check(g_probes6[0] == 2, "v6 gap: a failure at the tenth check starts the gap again");
+    pl_check(0);
+    check(g_probes6[0] == 3, "v6 gap: and the next tenth dials it");
+}
+
+/* catches: the gap applied while IPv6 is on, so a node losing v6 keeps it for ten checks */
+static void t_pool_v6_on_checked_every_time(void) {
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    g_v6ok[0] = 1;
+    pool_new6(1, POOL_BY_CONNECTION, 1, 1);
+    checks0(12);
+    check(g_pl.slot[0].v6 && g_probes6[0] == 12, "v6 gap: with IPv6 on every check dials v6");
+    g_v6ok[0] = 0;
+    pl_check(0);
+    check(!g_pl.slot[0].v6 && g_probes6[0] == 13 && g_v6cb_last == 0,
+          "v6 gap: a node losing v6 turns IPv6 off at the next check");
+}
+
+/* catches: the gap gating the v6 check of a node new to the slot */
+static void t_pool_v6_gap_reset_by_node_change(void) {
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    g_v6ok[1] = 1;
+    pool_new6(1, POOL_BY_CONNECTION, 2, 1);
+    pl_check(0);
+    g_fn[0].alive = 0;
+    checks0(2);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 1 && g_probes6[0] == 1 && g_probes6[1] == 1,
+          "v6 gap: the replacement node is dialled for v6 at once");
+    check(g_pl.slot[0].v6 && g_v6cb_last == 1, "v6 gap: a v6 replacement turns IPv6 on");
+    pl_check(0);
+    check(g_probes6[1] == 2, "v6 gap: and its next check dials v6 too");
+    g_fn[0].alive = 1;
+}
+
+/* catches: a v6 check passing after the gap that does not turn IPv6 on */
+static void t_pool_v6_gap_then_pass(void) {
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    pool_new6(1, POOL_BY_CONNECTION, 1, 1);
+    pl_check(0);
+    checks0(9);
+    g_v6ok[0] = 1;
+    check(!g_pl.slot[0].v6 && g_probes6[0] == 1, "v6 gap: the node gained v6, not yet dialled");
+    pl_check(0);
+    check(g_pl.slot[0].v6 && g_probes6[0] == 2 && g_v6cb_n == 1 && g_v6cb_last == 1,
+          "v6 gap: the tenth check passes v6 and turns IPv6 on");
+    pl_check(0);
+    check(g_probes6[0] == 3, "v6 gap: IPv6 on again means a v6 check every time");
+}
+
 static void check_slot0_once(void *arg) { (void)arg; pl_check(0); }
 
 static void t_pool_v6_flag_publishes(void) {
@@ -3011,6 +3077,10 @@ static void pool_v6_part(void) {
     t_pool_v6_null_hooks();
     t_pool_v6_checked_first_node();
     t_pool_v6_flag_publishes();
+    t_pool_v6_gap_on_v4_only_node();
+    t_pool_v6_on_checked_every_time();
+    t_pool_v6_gap_reset_by_node_change();
+    t_pool_v6_gap_then_pass();
     t_addr6_of();
 }
 

@@ -65,6 +65,7 @@
 #define PL_UNPROVEN    2
 #define PL_TIMEOUT_S   8
 #define PL_TIMEOUT6_S  4
+#define PL_GAP6        10
 /* A cut connection brings a check forward at most this often: the connections of a dead node are
  * cut together, and one check is enough. */
 #define PL_LOST_GAP_MS 5000
@@ -99,6 +100,7 @@ struct pl_slot {
     unsigned drained[PL_DRAINED];
     unsigned drained_n;
     int v6;
+    int skip6;
 };
 
 struct pl_sel { struct pl_sel *old; size_t n; int c[]; };
@@ -271,7 +273,10 @@ static void pl_probe6(int i, int node, unsigned gen) {
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
     int cur = sl->gen == gen, was = sl->v6;
-    if (cur) sl->v6 = ok;
+    if (cur) {
+        sl->v6 = ok;
+        sl->skip6 = PL_GAP6 - 1;
+    }
     pthread_mutex_unlock(&g_pl.mu);
     if (!cur) return;
     if (ok && !was)
@@ -432,8 +437,10 @@ static void pl_check(int i) {
     if (rc == 0 && !unproven) {
         sl->fails = sl->streak = 0;
         sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
+        int do6 = sl->v6 || sl->skip6 <= 0;
+        if (!do6) sl->skip6--;
         pthread_mutex_unlock(&g_pl.mu);
-        pl_probe6(i, node, gen);
+        if (do6) pl_probe6(i, node, gen);
         return;
     }
     /* Two failures in a row, against a single loss on a radio link; one is enough when a stall
