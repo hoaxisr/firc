@@ -52,6 +52,7 @@
 #include "transport.h"
 #include "xconn.h"
 #include "osrand.h"
+#include "tstack.h"
 
 #ifndef GRND_NONBLOCK
 #define GRND_NONBLOCK 0x0001
@@ -980,8 +981,7 @@ static void pl_ready_cb(void *arg, const char *dev) {
     pl_publish();
     pthread_attr_t a;
     pthread_attr_init(&a);
-    /* A check holds a connection (struct transport, ~40 KB) on its stack. */
-    pthread_attr_setstacksize(&a, 512 * 1024);
+    tstack_set(&a, 256 * 1024);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
     int err = pthread_create(&t, &a, pl_thread, NULL);

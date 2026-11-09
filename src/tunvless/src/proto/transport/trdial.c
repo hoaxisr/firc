@@ -22,6 +22,7 @@
 
 #include "transport.h"
 #include "ratelog.h"
+#include "tstack.h"
 
 /* ---- TCP connect: EVERY address of the node, not the first ----------------------------
  *
@@ -129,7 +130,7 @@ void transport_set_bind_dev(const char *ifname) {
 #define PIN_MAX 1024
 #define PIN_PAR 16
 #define PIN_POLL_MS 100
-#define PIN_STACK (1024 * 1024)
+#define PIN_STACK (256 * 1024)
 struct pin { char host[128]; struct tr_ip ip[ADDR_MAX]; unsigned n; };
 static struct pin g_pin[PIN_MAX];
 static unsigned g_pin_n;
@@ -254,7 +255,7 @@ static int pin_start(struct pin_wait *w, size_t i) {
     a->i = i;
     pthread_attr_t at;
     if (pthread_attr_init(&at)) { free(a); return -1; }
-    if (pthread_attr_setstacksize(&at, PIN_STACK) ||
+    if (tstack_set(&at, PIN_STACK) ||
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED)) {
         pthread_attr_destroy(&at);
         free(a);

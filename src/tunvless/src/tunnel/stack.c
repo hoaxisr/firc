@@ -51,6 +51,7 @@
 #include "../ctlinb.h"
 #include "ibhs.h"
 #include "nodes.h"
+#include "tstack.h"
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
@@ -1009,21 +1010,13 @@ static int connq_push(const struct connjob *j) {
     if (!g_cq.started) {
         pthread_attr_t a;
         pthread_attr_init(&a);
-        /* A modest stack: the handshake keeps its large buffers in __thread, not on the stack. */
-        pthread_attr_setstacksize(&a, 128 * 1024);
+        tstack_set(&a, 128 * 1024);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         int made = 0, err = 0;
         for (int i = 0; i < CONNECTORS; i++) g_cq_efd[i] = -1;
         for (int i = 0; i < CONNECTORS; i++) {
             pthread_t t;
             err = pthread_create(&t, &a, connector, (void *)(intptr_t)i);
-            /* EINVAL with a modest stack: glibc's minimum thread stack includes the static TLS
-             * of all loaded libraries (thread-local buffers, nearly 300 KB), so 128 KB is below
-             * the minimum. Retry with more; only the part actually used becomes resident. */
-            if (err == EINVAL && !made) {
-                pthread_attr_setstacksize(&a, 1024 * 1024);
-                err = pthread_create(&t, &a, connector, (void *)(intptr_t)i);
-            }
             if (err != 0) break;
             made++;
         }

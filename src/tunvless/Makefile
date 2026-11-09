@@ -117,7 +117,7 @@ TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
 FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/lib/osrand.c
 
-UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch
+UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch
 
 test: unit-test crypto-test
@@ -246,6 +246,10 @@ $(T)/nodesmatch: tests/nodesmatch.c src/tunnel/nodes.c src/proto/transport/trdia
 $(T)/ratelogmatch: tests/ratelogmatch.c src/lib/ratelog.h
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/ratelogmatch.c
+
+$(T)/tstackmatch: tests/tstackmatch.c src/lib/tstack.h
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/tstackmatch.c -lpthread
 
 $(T)/dialmatch: tests/dialmatch.c src/proto/transport/trdial.c $(HDR)
 	@mkdir -p $(T)
