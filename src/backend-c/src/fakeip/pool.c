@@ -631,9 +631,10 @@ bool firc_fakeip_pair_of(const firc_fakeip_t *f, const firc_ip_t *fake, const ch
     if (f == NULL || fake == NULL) { return false; }
     for (const mapping_t *m = f->by_addr[FAM_V4][addr_bucket(fake)]; m != NULL; m = m->rnext[FAM_V4]) {
         if (!ip_equal(&m->addr[FAM_V4], fake)) { continue; }
-        if (!m->has_real[FAM_V4]) { return false; }
+        unsigned fi = m->has_real[FAM_V4] ? FAM_V4 : FAM_V6;
+        if (!m->has_real[fi]) { return false; }
         *group_id = m->owner->id;
-        *real = m->real[FAM_V4];
+        *real = m->real[fi];
         return true;
     }
     for (const group_t *g = f->groups; g != NULL; g = g->next) {
@@ -646,6 +647,17 @@ bool firc_fakeip_pair_of(const firc_fakeip_t *f, const firc_ip_t *fake, const ch
         }
     }
     return false;
+}
+
+void firc_fakeip_clear_real(firc_fakeip_t *f, const char *qname, const char *group_id, int len) {
+    if (f == NULL || qname == NULL || group_id == NULL) { return; }
+    unsigned fi = len == 4 ? FAM_V4 : len == 16 ? FAM_V6 : N_FAM;
+    if (fi == N_FAM) { return; }
+    mapping_t *m = mapping_find(f, qname, group_id);
+    if (m == NULL || !m->has_real[fi]) { return; }
+    m->has_real[fi] = false;
+    m->pair_gen[fi] = ++f->gen;
+    f->dirty = true;
 }
 
 bool firc_fakeip_overlaps(const firc_fakeip_t *f, const firc_ip_t *addr, uint8_t prefix_len) {
@@ -726,7 +738,12 @@ bool firc_fakeip_needs_commit(const firc_fakeip_t *f, const firc_ip_t *fake) {
     unsigned fi = fake->len == 4 ? FAM_V4 : fake->len == 16 ? FAM_V6 : N_FAM;
     if (fi == N_FAM) { return false; }
     for (const mapping_t *m = f->by_addr[fi][addr_bucket(fake)]; m != NULL; m = m->rnext[fi]) {
-        if (ip_equal(&m->addr[fi], fake)) { return m->pair_gen[fi] > f->committed_gen; }
+        if (!ip_equal(&m->addr[fi], fake)) { continue; }
+        uint64_t gen = m->pair_gen[fi];
+        if (fi == FAM_V4 && !m->has_real[FAM_V4] && m->has_real[FAM_V6] && m->pair_gen[FAM_V6] > gen) {
+            gen = m->pair_gen[FAM_V6];
+        }
+        return gen > f->committed_gen;
     }
     return false;
 }
@@ -1082,6 +1099,15 @@ void firc_fakeip_snapshot_walk(const firc_fakeip_snapshot_t *s, firc_fakeip_snap
             fn(ud, s->groups[e->group_idx], fi, &e->fake[fi],
                e->has_real[fi] ? &e->real[fi] : NULL);
         }
+    }
+}
+
+void firc_fakeip_snapshot_cross_walk(const firc_fakeip_snapshot_t *s, firc_fakeip_cross_fn fn, void *ud) {
+    if (s == NULL || fn == NULL) { return; }
+    for (size_t i = 0; i < s->n_maps; i++) {
+        const snap_map_t *e = &s->maps[i];
+        if (e->fake[FAM_V4].len == 0 || e->has_real[FAM_V4] || !e->has_real[FAM_V6]) { continue; }
+        fn(ud, s->groups[e->group_idx], &e->fake[FAM_V4], &e->real[FAM_V6]);
     }
 }
 

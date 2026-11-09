@@ -14,19 +14,22 @@
 #define ASK_MAX 256
 #define CMD_LINES 4096
 #define CLOSE_MAX 16384
+#define CM_V6_CAP 4096
 
 struct slot { uint32_t fake, real; };
-struct ask { uint32_t fake, real; int state; };
+struct ask { uint32_t fake; struct cm_real real; int state; };
 struct pfx { uint32_t base; uint8_t len, none; uint32_t ends; };
-struct pend { uint32_t a, b; };
+struct six { uint32_t fake; uint8_t real[16]; };
+struct pend { uint32_t a, b; uint8_t six[16]; uint8_t v6; };
 
 static struct {
     pthread_mutex_t mu;
     uint32_t pool, mask;
     int on, wake, told_full;
     struct slot *t;
-    size_t n, asks, closes;
+    size_t n, asks, closes, n6;
     struct ask ask[ASK_MAX];
+    struct six six[CM_V6_CAP];
     struct pfx close[CLOSE_MAX];
 } g = { .mu = PTHREAD_MUTEX_INITIALIZER, .wake = -1 };
 
@@ -90,13 +93,46 @@ static void drop(size_t i) {
     g.n--;
 }
 
-int ctlmap_lookup(uint32_t fake_be, uint32_t *real_be) {
+static struct cm_real v4_real(uint32_t a) {
+    struct cm_real r = { { 0 }, 0 };
+    memcpy(r.b, &a, 4);
+    return r;
+}
+
+static struct cm_real v6_real(const uint8_t *b) {
+    struct cm_real r = { { 0 }, 1 };
+    memcpy(r.b, b, 16);
+    return r;
+}
+
+static size_t six_find(uint32_t fake) {
+    size_t i = 0;
+    while (i < g.n6 && g.six[i].fake != fake) i++;
+    return i;
+}
+
+static void six_drop(size_t i) { g.six[i] = g.six[--g.n6]; }
+
+static int known(uint32_t fake, struct cm_real *real) {
     int found = 0;
-    pthread_mutex_lock(&g.mu);
-    if (fake_be && g.t) {
-        size_t i = find(fake_be, &found);
-        if (found) *real_be = g.t[i].real;
+    if (!fake) return 0;
+    if (g.t) {
+        size_t i = find(fake, &found);
+        if (found) *real = v4_real(g.t[i].real);
     }
+    if (!found) {
+        size_t j = six_find(fake);
+        if (j < g.n6) {
+            *real = v6_real(g.six[j].real);
+            found = 1;
+        }
+    }
+    return found;
+}
+
+int ctlmap_lookup(uint32_t fake_be, struct cm_real *real) {
+    pthread_mutex_lock(&g.mu);
+    int found = known(fake_be, real);
     pthread_mutex_unlock(&g.mu);
     return found ? CM_REAL : CM_NONE;
 }
@@ -108,24 +144,24 @@ static struct ask *asked(uint32_t fake) {
 }
 
 int ctlmap_ask(uint32_t fake_be) {
-    int r = 1, found = 0;
+    int r = 1;
+    struct cm_real real;
     pthread_mutex_lock(&g.mu);
-    size_t i = fake_be && g.t ? find(fake_be, &found) : 0;
     if (asked(fake_be)) r = 0;
     else if (g.asks == ASK_MAX) r = -1;
-    else if (found) {
-        g.ask[g.asks++] = (struct ask){ fake_be, g.t[i].real, CM_REAL };
+    else if (known(fake_be, &real)) {
+        g.ask[g.asks++] = (struct ask){ fake_be, real, CM_REAL };
         r = 0;
-    } else g.ask[g.asks++] = (struct ask){ fake_be, 0, CM_PENDING };
+    } else g.ask[g.asks++] = (struct ask){ fake_be, { { 0 }, 0 }, CM_PENDING };
     pthread_mutex_unlock(&g.mu);
     return r;
 }
 
-int ctlmap_answer(uint32_t fake_be, uint32_t *real_be) {
+int ctlmap_answer(uint32_t fake_be, struct cm_real *real) {
     pthread_mutex_lock(&g.mu);
     struct ask *a = asked(fake_be);
     int st = a ? a->state : CM_NONE;
-    if (st == CM_REAL) *real_be = a->real;
+    if (st == CM_REAL) *real = a->real;
     pthread_mutex_unlock(&g.mu);
     return st;
 }
@@ -135,6 +171,14 @@ void ctlmap_unask(uint32_t fake_be) {
     struct ask *a = asked(fake_be);
     if (a) *a = g.ask[--g.asks];
     pthread_mutex_unlock(&g.mu);
+}
+
+static int addr6(const char *s, uint8_t *a) {
+    char b[INET6_ADDRSTRLEN];
+    size_t n = strlen(s);
+    if (n >= sizeof b) return -1;
+    memcpy(b, s, n + 1);
+    return inet_pton(AF_INET6, b, a) == 1 ? 0 : -1;
 }
 
 static int addr(const char *s, size_t n, uint32_t *a) {
@@ -151,7 +195,10 @@ static int addr(const char *s, size_t n, uint32_t *a) {
 static int parse_map(const char *l, struct pend *p) {
     const char *sp = strchr(l, ' ');
     if (!sp || addr(l, (size_t)(sp - l), &p->a) != 0 || !p->a || !ctlmap_in_pool(p->a)) return -1;
-    if (!strcmp(sp + 1, "-")) { p->b = 0; return 0; }
+    p->b = 0;
+    p->v6 = strchr(sp + 1, ':') != NULL;
+    if (p->v6) return addr6(sp + 1, p->six);
+    if (!strcmp(sp + 1, "-")) return 0;
     return addr(sp + 1, strlen(sp + 1), &p->b) != 0 ? -1 : 0;
 }
 
@@ -167,15 +214,16 @@ static int parse_close(const char *l, struct pend *p) {
 }
 
 static int gather(FILE *in, char **line, size_t *cap, const char *what,
-                  int (*parse)(const char *, struct pend *)) {
-    size_t n = 0, lineno = 0, bad = 0;
+                  int (*parse)(const char *, struct pend *), size_t *bad) {
+    size_t n = 0, lineno = 0;
+    *bad = 0;
     int ended = 0;
     ssize_t len;
     while ((len = getline(line, cap, in)) > 0) {
         while (len > 0 && ((*line)[len - 1] == '\n' || (*line)[len - 1] == '\r')) (*line)[--len] = 0;
         if (len == 0) { ended = 1; break; }
         if (++lineno > CMD_LINES) continue;
-        if (parse(*line, &g_buf[n]) != 0) bad++;
+        if (parse(*line, &g_buf[n]) != 0) (*bad)++;
         else n++;
     }
     if (!ended) {
@@ -185,24 +233,41 @@ static int gather(FILE *in, char **line, size_t *cap, const char *what,
     if (lineno > CMD_LINES)
         fprintf(stderr, LOG_W "a %s command over %d lines — the lines after that are left out\n",
                 what, CMD_LINES);
-    if (bad) fprintf(stderr, LOG_W "%s: %zu malformed lines left out\n", what, bad);
     return (int)n;
 }
 
-static int apply_line(const struct pend *p, int *full) {
+static void said_bad(const char *what, size_t bad) {
+    if (bad) fprintf(stderr, LOG_W "%s: %zu malformed lines left out\n", what, bad);
+}
+
+static int apply_line(const struct pend *p, int *full, int *nomem) {
     struct ask *a = asked(p->a);
     if (a) {
-        a->state = p->b ? CM_REAL : CM_DENIED;
-        a->real = p->b;
+        a->state = p->v6 || p->b ? CM_REAL : CM_DENIED;
+        a->real = p->v6 ? v6_real(p->six) : v4_real(p->b);
     }
-    if (!g.t && p->b && !(g.t = calloc(SLOTS, sizeof(*g.t)))) return 0;
-    if (!g.t) return 1;
     int found;
-    size_t i = find(p->a, &found);
-    if (!p->b) {
+    size_t i;
+    if (g.t && !p->b) {
+        i = find(p->a, &found);
         if (found) drop(i);
+    }
+    size_t j = six_find(p->a);
+    if (p->v6) {
+        if (j == g.n6) {
+            if (g.n6 >= CM_V6_CAP) return a ? 1 : -1;
+            g.six[g.n6++].fake = p->a;
+        }
+        memcpy(g.six[j].real, p->six, 16);
         return 1;
     }
+    if (j < g.n6) six_drop(j);
+    if (!p->b) return 1;
+    if (!g.t && !(g.t = calloc(SLOTS, sizeof(*g.t)))) {
+        *nomem = 1;
+        return 0;
+    }
+    i = find(p->a, &found);
     if (!found && g.n >= MAP_MAX) {
         if (a) return 1;
         *full = 1;
@@ -214,27 +279,36 @@ static int apply_line(const struct pend *p, int *full) {
 }
 
 int ctlmap_read_cmd(FILE *in, char **line, size_t *cap, int all) {
-    int n = gather(in, line, cap, all ? "mapall" : "map", parse_map);
+    const char *what = all ? "mapall" : "map";
+    size_t bad;
+    int n = gather(in, line, cap, what, parse_map, &bad);
     if (n < 0) return -1;
-    int took = 0, full = 0, warn = 0;
+    int took = 0, full = 0, warn = 0, nomem = 0;
     pthread_mutex_lock(&g.mu);
     if (all && g.t) {
         memset(g.t, 0, SLOTS * sizeof(*g.t));
         g.n = 0;
     }
-    for (int i = 0; i < n; i++) took += apply_line(&g_buf[i], &full);
+    if (all) g.n6 = 0;
+    for (int i = 0; i < n; i++) {
+        int r = apply_line(&g_buf[i], &full, &nomem);
+        if (r > 0) took++;
+        else if (r < 0) bad++;
+    }
     if (full && !g.told_full) g.told_full = warn = 1;
     bump();
     pthread_mutex_unlock(&g.mu);
+    said_bad(what, bad);
     if (warn) fprintf(stderr, LOG_W "the address map is full (%d), later lines are dropped\n", MAP_MAX);
-    if (took < n && !g.t) fprintf(stderr, LOG_W "no memory for the address map — %s lines left out\n",
-                                  all ? "mapall" : "map");
+    if (nomem) fprintf(stderr, LOG_W "no memory for the address map — %s lines left out\n", what);
     return took;
 }
 
 int ctlmap_read_close(FILE *in, char **line, size_t *cap) {
-    int n = gather(in, line, cap, "close", parse_close);
+    size_t bad;
+    int n = gather(in, line, cap, "close", parse_close, &bad);
     if (n < 0) return -1;
+    said_bad("close", bad);
     int over = 0;
     pthread_mutex_lock(&g.mu);
     for (int i = 0; i < n; i++) {

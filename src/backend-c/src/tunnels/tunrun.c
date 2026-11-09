@@ -370,10 +370,10 @@ static void map_drift(firc_tunrun_t *t, const firc_tunnel_t *tun, int dev, const
 
 static void answer_miss(firc_tunrun_t *t, const firc_tunnel_t *tun, int dev, const uint8_t fake[4])
 {
-    uint8_t real[4];
-    bool known = t->has_k && t->k.real_of != NULL && t->k.real_of((uint8_t)dev, fake, real, t->k.ud);
+    firc_ip_t real = {{0}, 0};
+    bool known = t->has_k && t->k.real_of != NULL && t->k.real_of((uint8_t)dev, fake, &real, t->k.ud);
     firc_ktcp_cmds_t c = {0};
-    if (firc_ktcp_line(&c, fake, known ? real : NULL) == FIRC_OK) {
+    if (firc_ktcp_line(&c, fake, known ? &real : NULL) == FIRC_OK) {
         send_cmds(t, tun, FIRC_TUN_CMD_MAP, &c);
     }
     firc_ktcp_cmds_free(&c);
@@ -1541,7 +1541,7 @@ typedef struct {
     bool failed[FIRC_KTCP_DEVICES];
 } push_t;
 
-static void delta_line(uint8_t dev, const uint8_t fake[4], const uint8_t *real, void *ud)
+static void delta_line(uint8_t dev, const uint8_t fake[4], const firc_ip_t *real, void *ud)
 {
     push_t *p = ud;
     if (dev < FIRC_KTCP_DEVICES && p->to[dev] != NULL && !p->failed[dev] &&

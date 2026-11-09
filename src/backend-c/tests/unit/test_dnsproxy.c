@@ -26,6 +26,7 @@
 #include "firc/loop.h"
 #include "firc/resolveroute.h"
 #include "firc/dnspipeline.h"
+#include "firc/dnsrewrite.h"
 #include "firc/models.h"
 #include "firc/rulesnap.h"
 
@@ -895,7 +896,95 @@ typedef struct {
     _Atomic int drop;
     _Atomic int tc;
     _Atomic int replied;
+    _Atomic int v6only;
+    _Atomic int aaaa_mode;
+    _Atomic int a_delay_ms;
+    _Atomic int aaaa_delay_ms;
+    _Atomic int seen_a;
+    _Atomic int seen_aaaa;
 } stub_t;
+
+enum { V6_ANSWER = 0, V6_NODATA, V6_SERVFAIL, V6_SILENT };
+#define V6_LAST 5
+
+static void put_soa(uint8_t *buf, size_t *pp) {
+    size_t p = *pp;
+    buf[p++] = 0xc0; buf[p++] = 0x0c;
+    buf[p++] = 0x00; buf[p++] = 6;
+    buf[p++] = 0x00; buf[p++] = 0x01;
+    buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 60;
+    buf[p++] = 0x00; buf[p++] = 22;
+    buf[p++] = 0; buf[p++] = 0;
+    for (int k = 0; k < 4; k++) {
+        buf[p++] = 0; buf[p++] = 0; buf[p++] = 0; buf[p++] = 1;
+    }
+    buf[p++] = 0; buf[p++] = 0; buf[p++] = 0; buf[p++] = 60;
+    *pp = p;
+}
+
+static int query_type(const uint8_t *q, size_t qlen, size_t *qd_end) {
+    size_t e = 12;
+    while (e < qlen && q[e] != 0) { e += 1 + q[e]; }
+    e += 1 + 4;
+    if (e > qlen) { return -1; }
+    *qd_end = e;
+    return (int)((unsigned)q[e - 4] << 8 | q[e - 3]);
+}
+
+static size_t build_v6only(const uint8_t *q, size_t qlen, uint8_t *buf, int mode) {
+    size_t qd_end = 0;
+    int qt = query_type(q, qlen, &qd_end);
+    if (qt < 0 || (qt == FIRC_DNS_TYPE_AAAA && mode == V6_SILENT)) { return 0; }
+    memcpy(buf, q, qd_end);
+    buf[2] = 0x81;
+    buf[3] = 0x80;
+    memset(buf + 6, 0, 6);
+    size_t p = qd_end;
+    if (qt == FIRC_DNS_TYPE_AAAA && mode == V6_SERVFAIL) {
+        buf[3] = 0x82;
+        return p;
+    }
+    if (qt == FIRC_DNS_TYPE_AAAA && mode == V6_ANSWER) {
+        buf[7] = 1;
+        buf[p++] = 0xc0; buf[p++] = 0x0c;
+        buf[p++] = 0x00; buf[p++] = FIRC_DNS_TYPE_AAAA;
+        buf[p++] = 0x00; buf[p++] = 0x01;
+        buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x01; buf[p++] = 0x2c;
+        buf[p++] = 0x00; buf[p++] = 0x10;
+        buf[p++] = 0x20; buf[p++] = 0x01; buf[p++] = 0x0d; buf[p++] = 0xb8;
+        for (int k = 0; k < 11; k++) { buf[p++] = 0; }
+        buf[p++] = V6_LAST;
+        return p;
+    }
+    buf[9] = 1;
+    put_soa(buf, &p);
+    return p;
+}
+
+static void v6only_reply(stub_t *s, const uint8_t *q, size_t n, const struct sockaddr_storage *from, socklen_t fl) {
+    size_t qd_end = 0;
+    int qt = query_type(q, n, &qd_end);
+    int delay = 0;
+    int drops = atomic_load(&s->drop);
+    if (drops > 0) {
+        atomic_store(&s->drop, drops - 1);
+        return;
+    }
+    if (qt == FIRC_DNS_TYPE_A) {
+        delay = atomic_load(&s->a_delay_ms);
+    } else if (qt == FIRC_DNS_TYPE_AAAA) {
+        delay = atomic_load(&s->aaaa_delay_ms);
+    }
+    if (delay > 0) {
+        struct timespec ts = {.tv_sec = delay / 1000, .tv_nsec = (delay % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    uint8_t a[STUB_BUF];
+    size_t alen = build_v6only(q, n, a, atomic_load(&s->aaaa_mode));
+    if (alen == 0) { return; }
+    sendto(s->fd, a, alen, 0, (const struct sockaddr *)from, fl);
+    atomic_fetch_add(&s->replied, 1);
+}
 
 #define STUB_A_LAST_OCTET 46
 
@@ -908,6 +997,13 @@ static void *stub_serve(void *arg) {
         ssize_t n = recvfrom(s->fd, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
         if (n <= 0) { continue; }
         atomic_fetch_add(&s->received, 1);
+        if (atomic_load(&s->v6only)) {
+            size_t qd_end = 0;
+            int qt = query_type(q, (size_t)n, &qd_end);
+            atomic_fetch_add(qt == FIRC_DNS_TYPE_AAAA ? &s->seen_aaaa : &s->seen_a, 1);
+            v6only_reply(s, q, (size_t)n, &from, fl);
+            continue;
+        }
         int drops = atomic_load(&s->drop);
         if (drops > 0) {
             atomic_store(&s->drop, drops - 1);
@@ -1016,15 +1112,53 @@ static uint64_t skewed_ms(void) { return 1000000u + atomic_load(&g_cache_skew_ms
 
 static _Atomic int g_live_resolver = -1;
 
+static bool g_live_cross;
+static _Atomic int g_cross_calls;
+static _Atomic int g_cross_null;
+static _Atomic int g_cross_resolver = -1;
+static _Atomic int g_cross_rcode = -1;
+
+static bool has_rr(const firc_dns_msg_t *msg, uint16_t type) {
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        if (msg->answers[i].rtype == type) { return true; }
+    }
+    return false;
+}
+
 static firc_dns_verdict_t live_hook(firc_dns_msg_t *msg, const firc_ip_t *client,
                                     const char *network, firc_dns_resolver_t resolver, void *ud) {
-    (void)msg;
     (void)client;
     (void)network;
     (void)ud;
     atomic_fetch_add(&g_live_hook_calls, 1);
     atomic_store(&g_live_resolver, (int)resolver);
+    if (g_live_cross && msg->n_questions == 1 && msg->questions[0].qtype == FIRC_DNS_TYPE_A &&
+        !has_rr(msg, FIRC_DNS_TYPE_A)) {
+        return FIRC_DNS_ASK_AAAA;
+    }
     return g_live_hold ? FIRC_DNS_HOLD : FIRC_DNS_PASS;
+}
+
+static firc_dns_verdict_t live_cross(firc_dns_msg_t *a_msg, const firc_dns_msg_t *aaaa_msg, const firc_ip_t *client,
+                                     firc_dns_resolver_t resolver, void *ud) {
+    (void)client;
+    (void)ud;
+    atomic_fetch_add(&g_cross_calls, 1);
+    atomic_store(&g_cross_resolver, (int)resolver);
+    if (aaaa_msg == NULL) {
+        atomic_fetch_add(&g_cross_null, 1);
+        return FIRC_DNS_PASS;
+    }
+    atomic_store(&g_cross_rcode, (int)(aaaa_msg->flags & 0x0fu));
+    if ((aaaa_msg->flags & 0x0fu) != 0) { return FIRC_DNS_PASS; }
+    for (size_t i = 0; i < aaaa_msg->n_answers; i++) {
+        const firc_dns_rr_t *rr = &aaaa_msg->answers[i];
+        if (rr->rtype == FIRC_DNS_TYPE_AAAA && rr->rdata_len == 16) {
+            firc_ip_t fake4 = {.b = {198, 18, 0, (uint8_t)(rr->rdata[15] + 100)}, .len = 4};
+            return firc_dns_msg_collapse(a_msg, &fake4, NULL, 60) == FIRC_OK ? FIRC_DNS_REWRITTEN : FIRC_DNS_DROP;
+        }
+    }
+    return FIRC_DNS_PASS;
 }
 
 /* False when the harness could not be set up. */
@@ -1075,6 +1209,11 @@ static bool live_start(live_t *lv) {
         firc_dnsproxy_set_cache(lv->proxy, 0, 0);
     }
     atomic_store(&g_live_hook_calls, 0);
+    atomic_store(&g_cross_calls, 0);
+    atomic_store(&g_cross_null, 0);
+    atomic_store(&g_cross_resolver, -1);
+    atomic_store(&g_cross_rcode, -1);
+    if (g_live_cross) { firc_dnsproxy_set_cross(lv->proxy, live_cross, NULL); }
     if (g_live_route != NULL) { firc_dnsproxy_set_router(lv->proxy, test_route, g_live_route); }
     if (g_live_router != NULL) { firc_dnsproxy_set_router(lv->proxy, firc_resolve_router_decide, g_live_router); }
     if (g_live_route_fn != NULL) { firc_dnsproxy_set_router(lv->proxy, g_live_route_fn, NULL); }
@@ -1124,6 +1263,7 @@ static void live_stop(live_t *lv) {
     g_live_rest_ms = 0;
     g_live_cache = false;
     g_live_health_clock = false;
+    g_live_cross = false;
     atomic_store(&g_cache_skew_ms, 0);
 }
 
@@ -5192,6 +5332,410 @@ TEST a_dropped_or_unparseable_query_is_not_counted(void) {
     PASS();
 }
 
+typedef struct {
+    uint16_t id;
+    uint16_t qtype;
+    int rcode;
+    int n_answers;
+    int n_authority;
+    int a_octets[4];
+} xreply_t;
+
+static bool read_xreply(const uint8_t *r, size_t n, xreply_t *out) {
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(r, n, &msg) != FIRC_OK) { return false; }
+    memset(out, 0, sizeof(*out));
+    out->id = msg->id;
+    out->qtype = msg->n_questions > 0 ? msg->questions[0].qtype : 0;
+    out->rcode = (int)(msg->flags & 0x0fu);
+    out->n_answers = (int)msg->n_answers;
+    out->n_authority = (int)msg->n_authority;
+    for (int k = 0; k < 4; k++) { out->a_octets[k] = -1; }
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        if (msg->answers[i].rtype == FIRC_DNS_TYPE_A && msg->answers[i].rdata_len == 4) {
+            for (int k = 0; k < 4; k++) { out->a_octets[k] = msg->answers[i].rdata[k]; }
+        }
+    }
+    firc_dns_msg_free(msg);
+    return true;
+}
+
+static bool ask_x(uint16_t port, uint16_t id, xreply_t *out) {
+    int c = ask_send(port, id);
+    if (c < 0) { return false; }
+    uint8_t r[2048];
+    ssize_t n = recv(c, r, sizeof(r), 0);
+    close(c);
+    return n > 0 && read_xreply(r, (size_t)n, out);
+}
+
+static bool ask_x_tcp(uint16_t port, uint16_t id, xreply_t *out) {
+    int c = tcp_open(port);
+    if (c < 0) { return false; }
+    uint8_t q[512], framed[514];
+    size_t qlen = build_query(q, id, 0);
+    framed[0] = (uint8_t)(qlen >> 8);
+    framed[1] = (uint8_t)qlen;
+    memcpy(framed + 2, q, qlen);
+    uint8_t hdr[2], r[2048];
+    bool ok = send(c, framed, qlen + 2, MSG_NOSIGNAL) == (ssize_t)(qlen + 2) && recv(c, hdr, 2, MSG_WAITALL) == 2;
+    size_t want = ok ? ((size_t)hdr[0] << 8 | hdr[1]) : 0;
+    ok = ok && want <= sizeof(r) && recv(c, r, want, MSG_WAITALL) == (ssize_t)want;
+    close(c);
+    return ok && read_xreply(r, want, out);
+}
+
+static void v6only_setup(live_t *lv, int mode) {
+    g_troute.ports[0] = lv->b.port;
+    atomic_store(&lv->a.v6only, 1);
+    atomic_store(&lv->b.v6only, 1);
+    atomic_store(&lv->b.aaaa_mode, mode);
+}
+
+/* Catches: ASK_AAAA treated as PASS, the follow-up sent to the common upstream or asked twice, or its slot kept. */
+TEST a_v6_only_name_gets_its_v4_fake_after_one_aaaa_leg(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8601, &r));
+    ASSERT_EQ(0x8601, r.id);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r.qtype);
+    ASSERT_EQ(1, r.n_answers);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(18, r.a_octets[1]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_a));
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(1, atomic_load(&g_cross_calls));
+    ASSERT_EQ(0, atomic_load(&g_cross_null));
+    ASSERT_EQ((int)FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_cross_resolver));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: an AAAA NODATA follow-up answered with the AAAA message, an empty reply, or another id. */
+TEST a_follow_up_without_aaaa_sends_the_first_nodata(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_NODATA);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8602, &r));
+    ASSERT_EQ(0x8602, r.id);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r.qtype);
+    ASSERT_EQ(0, r.rcode);
+    ASSERT_EQ(0, r.n_answers);
+    ASSERT_EQ(1, r.n_authority);
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ(1, atomic_load(&g_cross_calls));
+    ASSERT_EQ(0, atomic_load(&g_cross_null));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a failed follow-up falling back to the common upstream, left unanswered, followed up again, or holding its slot. */
+TEST a_follow_up_that_fails_sends_the_first_nodata(void) {
+    const int modes[2] = {V6_SILENT, V6_SERVFAIL};
+    for (int m = 0; m < 2; m++) {
+        live_t lv;
+        tunnel_setup(0);
+        g_live_cross = true;
+        g_live_timeout_ms = 3000;
+        ASSERT(live_start(&lv));
+        v6only_setup(&lv, modes[m]);
+        long t0 = ms_now();
+        xreply_t r;
+        ASSERT(ask_x(lv.proxy_port, (uint16_t)(0x8610 + m), &r));
+        long took = ms_now() - t0;
+        ASSERT_EQ(0x8610 + m, r.id);
+        ASSERT_EQ(FIRC_DNS_TYPE_A, r.qtype);
+        ASSERT_EQ(0, r.rcode);
+        ASSERT_EQ(0, r.n_answers);
+        ASSERT_EQ(1, r.n_authority);
+        ASSERT(took < 3000);
+        ASSERT_EQ(1, atomic_load(&lv.b.seen_a));
+        ASSERT(atomic_load(&lv.b.seen_aaaa) >= 1);
+        ASSERT_EQ(0, atomic_load(&lv.a.received));
+        ASSERT_EQ(1, atomic_load(&g_cross_calls));
+        ASSERT_EQ(1, atomic_load(&g_cross_null));
+        ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+        live_stop(&lv);
+    }
+    PASS();
+}
+
+typedef struct {
+    int fd;
+    uint16_t port;
+    _Atomic int stop;
+    _Atomic int seen_a;
+    _Atomic int seen_aaaa;
+    pthread_t th;
+} v6tcp_t;
+
+static void *v6tcp_serve(void *arg) {
+    v6tcp_t *u = arg;
+    while (!atomic_load(&u->stop)) {
+        int c = accept(u->fd, NULL, NULL);
+        if (c < 0) { continue; }
+        struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        uint8_t hdr[2], q[512], a[STUB_BUF + 2];
+        size_t qlen = 0;
+        if (recv(c, hdr, 2, MSG_WAITALL) == 2) { qlen = (size_t)hdr[0] << 8 | hdr[1]; }
+        if (qlen > 0 && qlen <= sizeof(q) && recv(c, q, qlen, MSG_WAITALL) == (ssize_t)qlen) {
+            size_t qd_end = 0;
+            int qt = query_type(q, qlen, &qd_end);
+            atomic_fetch_add(qt == FIRC_DNS_TYPE_AAAA ? &u->seen_aaaa : &u->seen_a, 1);
+            size_t alen = build_v6only(q, qlen, a + 2, V6_ANSWER);
+            a[0] = (uint8_t)(alen >> 8);
+            a[1] = (uint8_t)alen;
+            send(c, a, alen + 2, MSG_NOSIGNAL);
+        }
+        close(c);
+    }
+    return NULL;
+}
+
+/* Catches: a TCP follow-up framed twice, with the qtype written at the unframed offset, or never sent. */
+TEST a_tcp_client_gets_the_follow_up_too(void) {
+    v6tcp_t up;
+    memset(&up, 0, sizeof(up));
+    up.fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+    setsockopt(up.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ASSERT(up.fd >= 0 && bind_loopback(up.fd, 0, &up.port) && listen(up.fd, 16) == 0);
+    ASSERT_EQ(0, pthread_create(&up.th, NULL, v6tcp_serve, &up));
+    live_t lv;
+    tunnel_setup(up.port);
+    g_live_cross = true;
+    ASSERT(live_start(&lv));
+    xreply_t r;
+    bool got = ask_x_tcp(lv.proxy_port, 0x8620, &r);
+    uint64_t inflight = inflight_settled(lv.proxy, 0);
+    live_stop(&lv);
+    atomic_store(&up.stop, 1);
+    pthread_join(up.th, NULL);
+    close(up.fd);
+    ASSERT(got);
+    ASSERT_EQ(0x8620, r.id);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r.qtype);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(18, r.a_octets[1]);
+    ASSERT_EQ(0, r.a_octets[2]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT_EQ(1, atomic_load(&up.seen_a));
+    ASSERT_EQ(1, atomic_load(&up.seen_aaaa));
+    ASSERT_EQ((uint64_t)0, inflight);
+    PASS();
+}
+
+/* Catches: the follow-up stored or looked up under the A key, or not stored, so a repeat asks AAAA again or gets no fake. */
+TEST the_aaaa_answer_is_cached_under_its_own_key(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    for (int i = 0; i < 2; i++) {
+        xreply_t r;
+        ASSERT(ask_x(lv.proxy_port, (uint16_t)(0x8630 + i), &r));
+        ASSERT_EQ(0x8630 + i, r.id);
+        ASSERT_EQ(0, r.rcode);
+        ASSERT_EQ(198, r.a_octets[0]);
+        ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    }
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_a));
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ(2, atomic_load(&g_cross_calls));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: the follow-up given what is left of the A's deadline, so an A answered late leaves the AAAA no time. */
+TEST the_follow_up_gets_a_deadline_of_its_own(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_timeout_ms = 1000;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    g_troute.n = 2;
+    g_troute.ports[1] = lv.c.port;
+    atomic_store(&lv.c.drop, 1000);
+    atomic_store(&lv.b.a_delay_ms, 500);
+    atomic_store(&lv.b.aaaa_delay_ms, 500);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8640, &r));
+    ASSERT_EQ(0x8640, r.id);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT_EQ(0, atomic_load(&g_cross_null));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a follow-up after a cached A sent to the common upstream, since a hit leaves no tunnel to reuse. */
+TEST a_cached_a_sends_its_follow_up_through_the_tunnel(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_SILENT);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8650, &r));
+    ASSERT_EQ(0, r.n_answers);
+    int aaaa_before = atomic_load(&lv.b.seen_aaaa);
+    atomic_store(&lv.b.aaaa_mode, V6_ANSWER);
+    ASSERT(ask_x(lv.proxy_port, 0x8651, &r));
+    ASSERT_EQ(0x8651, r.id);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_a));
+    ASSERT_EQ(aaaa_before + 1, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ((int)FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_cross_resolver));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a near-expiry AAAA served to a follow-up never refreshed, or refreshed more than once. */
+TEST a_near_expiry_follow_up_answer_is_refreshed_once(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8660, &r));
+    ASSERT_EQ(1, atomic_load(&lv.b.seen_aaaa));
+    atomic_store(&g_cache_skew_ms, 271000);
+    ASSERT(ask_x(lv.proxy_port, 0x8661, &r));
+    ASSERT_EQ(0x8661, r.id);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(18, r.a_octets[1]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQm("one refresh of the near-expiry AAAA", 2, atomic_load(&lv.b.seen_aaaa));
+    ASSERT(ask_x(lv.proxy_port, 0x8662, &r));
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT(await_no_prefetch(&lv));
+    ASSERT_EQm("the refreshed entry asks no more", 2, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a TCP client's follow-up refresh sent with its TCP length prefix. */
+TEST a_tcp_follow_up_refresh_is_sent_unframed(void) {
+    v6tcp_t up;
+    memset(&up, 0, sizeof(up));
+    up.fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+    setsockopt(up.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ASSERT(up.fd >= 0 && bind_loopback(up.fd, 0, &up.port) && listen(up.fd, 16) == 0);
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval utv = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &utv, sizeof(utv));
+    ASSERT(u >= 0 && bind_loopback(u, up.port, NULL));
+    ASSERT_EQ(0, pthread_create(&up.th, NULL, v6tcp_serve, &up));
+    live_t lv;
+    tunnel_setup(up.port);
+    g_live_cross = true;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    xreply_t r1, r2;
+    bool got1 = ask_x_tcp(lv.proxy_port, 0x8670, &r1);
+    atomic_store(&g_cache_skew_ms, 271000);
+    bool got2 = ask_x_tcp(lv.proxy_port, 0x8671, &r2);
+    uint8_t q[512], a[STUB_BUF];
+    struct sockaddr_storage from;
+    socklen_t fl = sizeof(from);
+    ssize_t n = recvfrom(u, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
+    size_t qd_end = 0;
+    int qt = n > 0 ? query_type(q, (size_t)n, &qd_end) : -1;
+    if (qt == FIRC_DNS_TYPE_AAAA) {
+        size_t alen = build_v6only(q, (size_t)n, a, V6_ANSWER);
+        sendto(u, a, alen, 0, (struct sockaddr *)&from, fl);
+    }
+    bool drained = await_no_prefetch(&lv);
+    live_stop(&lv);
+    atomic_store(&up.stop, 1);
+    pthread_join(up.th, NULL);
+    close(up.fd);
+    close(u);
+    ASSERT(got1 && got2);
+    ASSERT_EQ(100 + V6_LAST, r2.a_octets[3]);
+    ASSERT_EQm("the refresh is a plain AAAA query", FIRC_DNS_TYPE_AAAA, qt);
+    ASSERT_EQ(0x8671 >> 8, q[0]);
+    ASSERT(drained);
+    PASS();
+}
+
+/* Catches: a follow-up after a fallen-back A sent through the failed tunnel, or the cross told the wrong resolver. */
+TEST a_fallen_back_a_asks_aaaa_of_the_common_upstream(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_timeout_ms = 3000;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    atomic_store(&lv.b.drop, 1000);
+    atomic_store(&lv.a.aaaa_mode, V6_ANSWER);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8660, &r));
+    ASSERT_EQ(0x8660, r.id);
+    ASSERT_EQ(198, r.a_octets[0]);
+    ASSERT_EQ(100 + V6_LAST, r.a_octets[3]);
+    ASSERT_EQ(1, atomic_load(&lv.a.seen_a));
+    ASSERT_EQ(1, atomic_load(&lv.a.seen_aaaa));
+    ASSERT_EQ(0, atomic_load(&lv.b.seen_aaaa));
+    ASSERT_EQ((int)FIRC_DNS_RESOLVER_FALLBACK_TIMEOUT, atomic_load(&g_cross_resolver));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
+/* Catches: a SERVFAIL follow-up from the common upstream sent to the client, dropped, or not handed to the cross. */
+TEST a_common_follow_up_that_servfails_sends_the_first_nodata(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_live_cross = true;
+    g_live_timeout_ms = 3000;
+    ASSERT(live_start(&lv));
+    v6only_setup(&lv, V6_ANSWER);
+    atomic_store(&lv.b.drop, 1000);
+    atomic_store(&lv.a.aaaa_mode, V6_SERVFAIL);
+    xreply_t r;
+    ASSERT(ask_x(lv.proxy_port, 0x8670, &r));
+    ASSERT_EQ(0x8670, r.id);
+    ASSERT_EQ(FIRC_DNS_TYPE_A, r.qtype);
+    ASSERT_EQ(0, r.rcode);
+    ASSERT_EQ(0, r.n_answers);
+    ASSERT_EQ(1, r.n_authority);
+    ASSERT_EQ(1, atomic_load(&lv.a.seen_aaaa));
+    ASSERT_EQ(1, atomic_load(&g_cross_calls));
+    ASSERT_EQ(2, atomic_load(&g_cross_rcode));
+    ASSERT_EQ((uint64_t)0, inflight_settled(lv.proxy, 0));
+    live_stop(&lv);
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
@@ -5342,5 +5886,16 @@ int main(int argc, char **argv)
     RUN_TEST(a_tcp_port_held_closes_the_udp_listener_and_names_tcp);
     RUN_TEST(a_busy_port_is_held_by_someone_until_it_is_freed);
     RUN_TEST(an_address_not_on_the_router_is_not_busy);
+    RUN_TEST(a_v6_only_name_gets_its_v4_fake_after_one_aaaa_leg);
+    RUN_TEST(a_follow_up_without_aaaa_sends_the_first_nodata);
+    RUN_TEST(a_follow_up_that_fails_sends_the_first_nodata);
+    RUN_TEST(a_tcp_client_gets_the_follow_up_too);
+    RUN_TEST(the_aaaa_answer_is_cached_under_its_own_key);
+    RUN_TEST(the_follow_up_gets_a_deadline_of_its_own);
+    RUN_TEST(a_cached_a_sends_its_follow_up_through_the_tunnel);
+    RUN_TEST(a_near_expiry_follow_up_answer_is_refreshed_once);
+    RUN_TEST(a_tcp_follow_up_refresh_is_sent_unframed);
+    RUN_TEST(a_fallen_back_a_asks_aaaa_of_the_common_upstream);
+    RUN_TEST(a_common_follow_up_that_servfails_sends_the_first_nodata);
     GREATEST_MAIN_END();
 }

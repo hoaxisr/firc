@@ -356,7 +356,7 @@ void firc_app_set_ktcp_skipped_for_test(firc_app_t *app, const firc_xt_acl_t *ac
                                         firc_ktcp_off_t off); /* test seam: as a report would */
 
 /* real of fake when its group is routed into tunvless<dev> with a port; false answers "-". Loop thread. */
-bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], uint8_t real[4]);
+bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], firc_ip_t *real);
 
 /* stages the pool's FORWARD reject barrier on both engines without committing; every pass does this */
 firc_err_t firc_app_stage_pool_reject(firc_app_t *app);

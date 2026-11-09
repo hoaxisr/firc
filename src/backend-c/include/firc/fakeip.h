@@ -71,6 +71,9 @@ firc_err_t firc_fakeip_set_reals(firc_fakeip_t *f, const char *qname, const char
 /* True when the mapping holding fake has an uncommitted real address in fake's family. */
 bool firc_fakeip_needs_commit(const firc_fakeip_t *f, const firc_ip_t *fake);
 
+/* Drops the real of the family len (4 or 16) of qname's mapping in group_id and advances that pair's generation; unknown mapping: no-op. */
+void firc_fakeip_clear_real(firc_fakeip_t *f, const char *qname, const char *group_id, int len);
+
 /* Pool generation, advanced on every kernel-relevant change; compare before/after a call. */
 uint64_t firc_fakeip_gen(const firc_fakeip_t *f);
 
@@ -82,7 +85,7 @@ size_t firc_fakeip_uncommit_group(firc_fakeip_t *f, const char *group_id);
 
 const char *firc_fakeip_name_of(const firc_fakeip_t *f, const firc_ip_t *addr);
 
-/* The group and real v4 of a live or parked mapping at fake; false when none or no real yet. */
+/* The group and real (its v4, else its v6) of a live or parked mapping at fake; false when none or no real yet. */
 bool firc_fakeip_pair_of(const firc_fakeip_t *f, const firc_ip_t *fake, const char **group_id, firc_ip_t *real);
 
 /* Called once per (name, family) with a fake address; real is NULL if none recorded yet. */
@@ -110,6 +113,10 @@ void firc_fakeip_snapshot_free(firc_fakeip_snapshot_t *s);
 /* Same queries as the live pool, against the copy; safe from any thread. */
 void firc_fakeip_snapshot_walk(const firc_fakeip_snapshot_t *s, firc_fakeip_snap_map_fn fn,
                                void *ud);
+/* One call per mapping with a v4 fake, no v4 real and a v6 real. */
+typedef void (*firc_fakeip_cross_fn)(void *ud, const char *group_id, const firc_ip_t *fake4,
+                                     const firc_ip_t *real6);
+void firc_fakeip_snapshot_cross_walk(const firc_fakeip_snapshot_t *s, firc_fakeip_cross_fn fn, void *ud);
 void firc_fakeip_snapshot_walk_chunks(const firc_fakeip_snapshot_t *s, const char *group_id,
                                       firc_fakeip_chunk_fn fn, void *ud);
 bool firc_fakeip_snapshot_pool_prefix(const firc_fakeip_snapshot_t *s, unsigned family,

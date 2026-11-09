@@ -207,7 +207,7 @@ static const firc_ktcp_image_t *ktcp_image(void *ud)
     return firc_app_ktcp_image(ud);
 }
 
-static bool ktcp_real_of(uint8_t dev, const uint8_t fake[4], uint8_t real[4], void *ud)
+static bool ktcp_real_of(uint8_t dev, const uint8_t fake[4], firc_ip_t *real, void *ud)
 {
     return firc_app_ktcp_real_of(ud, dev, fake, real);
 }
@@ -735,6 +735,17 @@ static firc_dns_verdict_t on_response(firc_dns_msg_t *msg, const firc_ip_t *clie
     bool pool_changed = false;
     firc_dns_verdict_t v = firc_dns_pipeline_handle_message_from(d->pipeline, msg, now_unix(), client,
                                                                  resolver, &pool_changed);
+    if (pool_changed) { firc_app_pool_changed(d->app); }
+    return v;
+}
+
+static firc_dns_verdict_t on_cross(firc_dns_msg_t *a_msg, const firc_dns_msg_t *aaaa_msg, const firc_ip_t *client,
+                                   firc_dns_resolver_t resolver, void *ud)
+{
+    struct daemon *d = ud;
+    bool pool_changed = false;
+    firc_dns_verdict_t v = firc_dns_pipeline_cross_answer(d->pipeline, a_msg, aaaa_msg, now_unix(), client, resolver,
+                                                          &pool_changed);
     if (pool_changed) { firc_app_pool_changed(d->app); }
     return v;
 }
@@ -1393,6 +1404,7 @@ int main(int argc, char **argv)
         firc_dnsproxy_set_pool_prefixes(d.proxy, h4 ? &b4 : NULL, l4, h6 ? &b6 : NULL, l6);
     }
     firc_dnsproxy_set_pool(d.proxy, d.pool, (uint32_t)pool_cfg.clamp_secs);
+    firc_dnsproxy_set_cross(d.proxy, on_cross, &d);
     d.router = firc_resolve_router_new(d.pipeline);
     if (d.router == NULL) {
         FIRC_ERROR("failed to create the resolver router");
@@ -1413,6 +1425,7 @@ int main(int argc, char **argv)
         }
     }
     firc_dns_pipeline_set_v6_fn(d.pipeline, firc_resolve_router_carries_v6, d.router);
+    firc_dns_pipeline_set_cross_fn(d.pipeline, firc_resolve_router_cross_v6, d.router);
 #ifdef FIRC_ENTWARE_KN
     /* Wait (3 s bound) for the first hotspot read: a policy host asking earlier would stay unrouted. */
     if (firc_config_selects_devices(&cfg) && !firc_kn_policies_wait_first(d.policies, 3000)) {

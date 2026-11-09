@@ -107,7 +107,7 @@ void firc_tunrun_free(firc_tunrun_t *t);
 typedef struct firc_tunrun_ktcp {
     void (*ports)(const uint16_t ports[FIRC_KTCP_DEVICES], void *ud);
     const firc_ktcp_image_t *(*image)(void *ud);
-    bool (*real_of)(uint8_t dev, const uint8_t fake[4], uint8_t real[4], void *ud);
+    bool (*real_of)(uint8_t dev, const uint8_t fake[4], firc_ip_t *real, void *ud);
     void *ud;
     void (*closed)(uint8_t dev, void *ud);
     void (*ready)(uint8_t dev, void *ud);

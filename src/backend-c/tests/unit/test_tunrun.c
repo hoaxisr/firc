@@ -1815,12 +1815,14 @@ static const firc_ktcp_image_t *kx_image(void *ud)
     return g_kx.cur != NULL ? g_kx.cur : &g_kx.im[0];
 }
 
-static bool kx_real_of(uint8_t dev, const uint8_t fake[4], uint8_t real[4], void *ud)
+static bool kx_real_of(uint8_t dev, const uint8_t fake[4], firc_ip_t *real, void *ud)
 {
     (void)ud;
     for (size_t i = 0; i < g_kx.real.n; i++) {
         if (g_kx.real.v[i].dev == dev && memcmp(g_kx.real.v[i].fake, fake, 4) == 0) {
-            memcpy(real, g_kx.real.v[i].real, 4);
+            memset(real, 0, sizeof(*real));
+            memcpy(real->b, g_kx.real.v[i].real, 16);
+            real->len = g_kx.real.v[i].real_len;
             return true;
         }
     }
@@ -1852,10 +1854,20 @@ static void kx_attach(fx_t *f)
 static void pair(firc_ktcp_image_t *im, uint8_t dev, const char *fake, const char *real)
 {
     uint8_t a[4];
-    uint8_t b[4];
+    firc_ip_t b = {{0}, 4};
     inet_pton(AF_INET, fake, a);
-    inet_pton(AF_INET, real, b);
-    (void)firc_ktcp_image_add(im, dev, a, b);
+    inet_pton(AF_INET, real, b.b);
+    (void)firc_ktcp_image_add(im, dev, a, &b);
+    firc_ktcp_image_sort(im);
+}
+
+static void pair6(firc_ktcp_image_t *im, uint8_t dev, const char *fake, const char *real)
+{
+    uint8_t a[4];
+    firc_ip_t b = {{0}, 16};
+    inet_pton(AF_INET, fake, a);
+    inet_pton(AF_INET6, real, b.b);
+    (void)firc_ktcp_image_add(im, dev, a, &b);
     firc_ktcp_image_sort(im);
 }
 
@@ -2219,6 +2231,21 @@ TEST a_miss_is_answered_with_one_line(void)
     ASSERT(run_until_tail(&f, "tunvless1", "\nmap\n198.18.1.7 192.0.2.77\n\n", 3000));
     run_ms(&f, 200);
     ASSERT_STR_EQ(KT_FIRST "mapall\n\nmap\n198.18.1.7 192.0.2.77\n\n", stdin_of(&f, "tunvless1"));
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a miss whose real is a v6 address answered with a dash or dotted bytes */
+TEST a_miss_is_answered_with_a_v6_real(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    miss_setup(&f);
+    pair6(&g_kx.real, 1, "198.18.1.7", "2a02:e00:ffec:4b8::1");
+    apply_yaml(&f, "tunnels:\n" KT_TUN("a", "1", KT_ON));
+    ASSERT(run_until_tail(&f, "tunvless1", "\nmap\n198.18.1.7 2a02:e00:ffec:4b8::1\n\n", 3000));
+    run_ms(&f, 200);
+    ASSERT_STR_EQ(KT_FIRST "mapall\n\nmap\n198.18.1.7 2a02:e00:ffec:4b8::1\n\n", stdin_of(&f, "tunvless1"));
     fx_down(&f);
     PASS();
 }
@@ -3229,6 +3256,7 @@ SUITE(tunrun)
     RUN_TEST(deltas_go_only_to_ready_children_with_a_port);
     RUN_TEST(a_map_count_drift_resends_mapall_once);
     RUN_TEST(a_miss_is_answered_with_one_line);
+    RUN_TEST(a_miss_is_answered_with_a_v6_real);
     RUN_TEST(a_miss_for_another_device_s_group_gets_a_dash);
     RUN_TEST(a_miss_from_a_child_without_a_port_is_ignored);
     RUN_TEST(close_goes_to_the_live_child_only);

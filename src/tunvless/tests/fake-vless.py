@@ -94,6 +94,8 @@ class Handler(socketserver.BaseRequestHandler):
         uuid, cmd, port, addr, atype = req
         if uuid != self.server.uuid:
             return                          # wrong key: stay silent, like a real server
+        if atype == ADDR_IPV6 and self.server.no_v6:
+            return
         if self.server.log_dst:
             with open(self.server.log_dst, "a") as f:
                 f.write("%s:%d\n" % (addr, port))
@@ -332,6 +334,7 @@ def main():
     ap.add_argument("--udp-relay", action="store_true",
                     help="forward UDP (command 2) to the address in the request instead of echoing")
     ap.add_argument("--log-dst", help="append each requested address:port to this file")
+    ap.add_argument("--no-v6", action="store_true", help="close a request for an IPv6 address unanswered")
     ap.add_argument("--log-req", help="append each request as \"<ipv4|domain|ipv6> address:port\" to this file")
     a = ap.parse_args()
 
@@ -342,6 +345,7 @@ def main():
     srv.kbps = a.kbps
     srv.log_dst = a.log_dst
     srv.log_req = a.log_req
+    srv.no_v6 = a.no_v6
     srv.filler = FILLER
     print("fake-vless: %s:%d, serves %d MB" % (a.bind, a.port, a.mb), flush=True)
     try:

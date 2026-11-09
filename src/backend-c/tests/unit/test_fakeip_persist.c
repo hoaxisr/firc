@@ -163,6 +163,44 @@ TEST new_names_after_a_restart_avoid_restored_and_recently_freed_addresses(void)
     PASS();
 }
 
+typedef struct {
+    size_t n;
+    firc_ip_t fake, real;
+} cross_seen_t;
+
+static void cross_collect(void *ud, const char *group_id, const firc_ip_t *fake4, const firc_ip_t *real6) {
+    cross_seen_t *w = ud;
+    (void)group_id;
+    w->fake = *fake4;
+    w->real = *real6;
+    w->n++;
+}
+
+/* Catches: a saved v4 fake with only a v6 real losing the real or its commit mark on load. */
+TEST a_saved_v4_fake_with_a_v6_real_restores_its_pair(void) {
+    firc_fakeip_t *f = fresh(64);
+    firc_ip_t a4, a6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", 1000, &a4, &a6));
+    const firc_ip_t r6 = {{0x26, 0x06, [15] = 1}, 16};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &r6, 1));
+    size_t restored = 0;
+    firc_err_t err = FIRC_ERR_INVAL;
+    firc_fakeip_t *g = reloaded(f, 2000, &restored, &err);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT(firc_fakeip_needs_commit(g, &a4));
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(g);
+    ASSERT(s != NULL);
+    cross_seen_t seen = {0};
+    firc_fakeip_snapshot_cross_walk(s, cross_collect, &seen);
+    ASSERT_EQ_FMT((size_t)1, seen.n, "%zu");
+    ASSERT(same_ip(&seen.fake, &a4));
+    ASSERT(same_ip(&seen.real, &r6));
+    firc_fakeip_snapshot_free(s);
+    firc_fakeip_free(f);
+    firc_fakeip_free(g);
+    PASS();
+}
+
 /* Catches: a file written under another pool geometry loaded instead of refused. */
 TEST a_file_from_another_geometry_is_refused(void) {
     firc_fakeip_t *f = fresh(64);
@@ -1386,6 +1424,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_park_above_the_mark_is_not_walked_over);
     RUN_TEST(a_refused_park_or_qchunk_line_makes_the_file_not_exact);
     RUN_TEST(a_restored_pool_names_the_same_addresses);
+    RUN_TEST(a_saved_v4_fake_with_a_v6_real_restores_its_pair);
     RUN_TEST(a_state_that_cannot_be_saved_is_an_error_until_a_save_works);
     GREATEST_MAIN_END();
 }

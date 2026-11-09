@@ -7222,7 +7222,11 @@ static bool ktcp_up(locked_app_t *l, firc_loop_t *loop, ktcp_rec_t *rec, firc_ip
 }
 
 static bool pair_is(const firc_ktcp_pair_t *p, uint8_t dev, const firc_ip_t *fake, const uint8_t real[4]) {
-    return p->dev == dev && memcmp(p->fake, fake->b, 4) == 0 && memcmp(p->real, real, 4) == 0;
+    return p->dev == dev && memcmp(p->fake, fake->b, 4) == 0 && p->real_len == 4 && memcmp(p->real, real, 4) == 0;
+}
+
+static bool pair6_is(const firc_ktcp_pair_t *p, uint8_t dev, const firc_ip_t *fake, const firc_ip_t *real) {
+    return p->dev == dev && memcmp(p->fake, fake->b, 4) == 0 && p->real_len == 16 && memcmp(p->real, real->b, 16) == 0;
 }
 
 static const uint8_t k_issued_real[4] = {93, 184, 216, 34};
@@ -7278,6 +7282,43 @@ TEST the_image_holds_only_redirect_groups_pairs(void) {
     ASSERT_EQ_FMT((size_t)1, im->n, "%zu");
     ASSERT(pair_is(&im->v[0], 3, &f1, k_issued_real));
     ASSERT_EQ_FMT((size_t)1, rec.next_n[0], "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: a v6 real of a v4 fake dropped from the image, or one of a group that is not redirected let in. */
+TEST the_image_pairs_a_v4_fake_with_its_v6_real(void) {
+    locked_app_t l;
+    ktcp_rec_t rec;
+    firc_ip_t f1 = {{0}, 0}, x4 = {{0}, 0}, y4 = {{0}, 0};
+    ASSERT(ktcp_up(&l, NULL, &rec, &f1));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(3, "y.example", NULL, NULL)));
+    char g1[FIRC_ID_STR_LEN], g3[FIRC_ID_STR_LEN];
+    firc_id_format(tag_id(1), g1);
+    firc_id_format(tag_id(3), g3);
+    const firc_ip_t r6 = {{0x2a, 0x02, 0x0e, 0x00, 0xff, 0xec, 0x04, 0xb8, [15] = 1}, 16};
+    firc_app_nf_enter(l.app);
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(l.pool, "x.example", g1, (int64_t)time(NULL), &x4, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "x.example", g1, &r6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(l.pool, "y.example", g3, (int64_t)time(NULL), &y4, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "y.example", g3, &r6, 1));
+    ASSERT_EQ(FIRC_OK, firc_app_refresh_pool_snapshot(l.app));
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ(4, x4.len);
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    const firc_ktcp_image_t *im = firc_app_ktcp_image(l.app);
+    ASSERT_EQ_FMT((size_t)2, im->n, "%zu");
+    size_t plain = 0, cross = 0;
+    for (size_t i = 0; i < im->n; i++) {
+        if (pair_is(&im->v[i], 3, &f1, k_issued_real)) { plain++; }
+        if (pair6_is(&im->v[i], 3, &x4, &r6)) { cross++; }
+    }
+    ASSERT_EQ_FMT((size_t)1, plain, "%zu");
+    ASSERT_EQ_FMT((size_t)1, cross, "%zu");
+    firc_ip_t got = {{0}, 0};
+    ASSERT(firc_app_ktcp_real_of(l.app, 3, x4.b, &got));
+    ASSERT_EQ(16, got.len);
+    ASSERT_EQ(0, memcmp(got.b, r6.b, 16));
     locked_app_down(&l);
     PASS();
 }
@@ -7419,6 +7460,37 @@ TEST ports_change_requests_a_pass(void) {
         if (!there) { sleep_ms(10); }
     }
     ASSERT(there);
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the cross flag not raised by a port, or left up after a refused redirect or a dropped port. */
+TEST a_refused_redirect_takes_the_cross_flag_down(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless3")));
+    firc_resolve_route_t r;
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERT_FALSEm("no port yet", r.ktcp);
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[3] = 3603;
+    firc_app_set_ktcp_ports(l.app, ports);
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERTm("tunvless3 has a port", r.ktcp);
+    firc_xt_acl_t acl;
+    memset(&acl, 0, sizeof(acl));
+    firc_app_set_ktcp_skipped_for_test(l.app, &acl, FIRC_KTCP_OFF_ACL);
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERT_FALSEm("the pass staged no redirect", r.ktcp);
+    firc_app_set_ktcp_skipped_for_test(l.app, &acl, FIRC_KTCP_OFF_NONE);
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERTm("the next pass staged it", r.ktcp);
+    ports[3] = 0;
+    firc_app_set_ktcp_ports(l.app, ports);
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERT_FALSEm("the port is gone", r.ktcp);
     locked_app_down(&l);
     PASS();
 }
@@ -8111,21 +8183,22 @@ TEST a_miss_answers_real_only_for_a_group_routed_into_that_device(void) {
     ports[3] = 3603;
     ports[4] = 3604;
     firc_app_set_ktcp_ports(l.app, ports);
-    uint8_t real[4] = {0};
-    ASSERTm("routed into tunvless3", firc_app_ktcp_real_of(l.app, 3, f1.b, real));
-    ASSERT_EQ(0, memcmp(real, k_issued_real, 4));
-    ASSERT_FALSEm("asked by tunvless4", firc_app_ktcp_real_of(l.app, 4, f1.b, real));
+    firc_ip_t real = {{0}, 0};
+    ASSERTm("routed into tunvless3", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
+    ASSERT_EQ(4, real.len);
+    ASSERT_EQ(0, memcmp(real.b, k_issued_real, 4));
+    ASSERT_FALSEm("asked by tunvless4", firc_app_ktcp_real_of(l.app, 4, f1.b, &real));
     ports[3] = 0;
     firc_app_set_ktcp_ports(l.app, ports);
-    ASSERT_FALSEm("tunvless3 has no port", firc_app_ktcp_real_of(l.app, 3, f1.b, real));
+    ASSERT_FALSEm("tunvless3 has no port", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
     ports[3] = 3603;
     firc_app_set_ktcp_ports(l.app, ports);
 
     ASSERT(issue_unwritten(&l, "a.example", 2, &moved));
-    memset(real, 0, sizeof(real));
-    ASSERTm("the parked pair", firc_app_ktcp_real_of(l.app, 3, f1.b, real));
-    ASSERT_EQ(0, memcmp(real, k_issued_real, 4));
-    ASSERTm("the name's new pair, in tunvless4's group", firc_app_ktcp_real_of(l.app, 4, moved.b, real));
+    memset(&real, 0, sizeof(real));
+    ASSERTm("the parked pair", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
+    ASSERT_EQ(0, memcmp(real.b, k_issued_real, 4));
+    ASSERTm("the name's new pair, in tunvless4's group", firc_app_ktcp_real_of(l.app, 4, moved.b, &real));
 
     firc_group_t *off = tunnel_group(1, "a.example", "tunvless3");
     off->enable = false;
@@ -8133,7 +8206,7 @@ TEST a_miss_answers_real_only_for_a_group_routed_into_that_device(void) {
     const char *gid = NULL;
     firc_ip_t still = {{0}, 0};
     ASSERTm("fixture: the pool still holds the pair", firc_fakeip_pair_of(l.pool, &f1, &gid, &still));
-    ASSERT_FALSEm("its group is not routed", firc_app_ktcp_real_of(l.app, 3, f1.b, real));
+    ASSERT_FALSEm("its group is not routed", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
     locked_app_down(&l);
     PASS();
 }
@@ -8286,10 +8359,10 @@ TEST a_miss_from_a_device_past_the_table_answers_nothing(void) {
     ktcp_rec_t krec;
     firc_ip_t f1 = {{0}, 0};
     ASSERT(ktcp_up(&l, NULL, &krec, &f1));
-    uint8_t real[4] = {0};
-    ASSERT_FALSE(firc_app_ktcp_real_of(l.app, FIRC_KTCP_DEVICES, f1.b, real));
-    ASSERT_FALSE(firc_app_ktcp_real_of(l.app, 255, f1.b, real));
-    ASSERTm("fixture: the same fake answers for its own device", firc_app_ktcp_real_of(l.app, 3, f1.b, real));
+    firc_ip_t real = {{0}, 0};
+    ASSERT_FALSE(firc_app_ktcp_real_of(l.app, FIRC_KTCP_DEVICES, f1.b, &real));
+    ASSERT_FALSE(firc_app_ktcp_real_of(l.app, 255, f1.b, &real));
+    ASSERTm("fixture: the same fake answers for its own device", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
     locked_app_down(&l);
     PASS();
 }
@@ -8985,6 +9058,7 @@ int main(int argc, char **argv) {
     RUN_TEST(ports_change_requests_a_pass);
     RUN_TEST(an_undelivered_report_frees_its_image);
     RUN_TEST(an_unchanged_port_table_interrupts_no_pass);
+    RUN_TEST(a_refused_redirect_takes_the_cross_flag_down);
     RUN_TEST(removing_a_tunnel_group_closes_its_chunks_and_subnets);
     RUN_TEST(a_narrowed_selector_closes_chunks_and_subnets);
     RUN_TEST(a_narrowing_edit_closes_each_prefix_once);
@@ -9007,6 +9081,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_back_on_another_interface_still_pays);
     RUN_TEST(an_overdue_wait_is_paid_by_the_loops_next_report);
     RUN_TEST(a_kept_group_still_sweeps_the_prefix_it_lost);
+    RUN_TEST(the_image_pairs_a_v4_fake_with_its_v6_real);
     RUN_TEST(a_miss_answers_real_only_for_a_group_routed_into_that_device);
     RUN_TEST(a_left_out_tunnel_group_closes_its_chunks_and_subnets);
     RUN_TEST(a_narrowing_sync_that_also_drops_a_subnet_closes_that_subnet);

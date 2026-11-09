@@ -214,7 +214,7 @@ int main(void) {
     /* catches: map and close lines read as nodes, or a nodes command read as map lines */
     check("map and mapall acked apart from nodes", 1,
           wait_for(&g_map_ack_n, 2, 1000) == 2 && g_map_acks[0] == 2 && g_map_acks[1] == 1);
-    uint32_t real = 0;
+    struct cm_real real;
     check("mapall read as mapall", 1, ctlmap_lookup(htonl(0xc6120001u), &real) == CM_NONE &&
           ctlmap_lookup(htonl(0xc6120003u), &real) == CM_REAL);
     check("close posted, not acked", 1,

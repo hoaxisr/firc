@@ -1518,6 +1518,409 @@ static firc_dns_msg_t *plain_answer(const char *const *labels, size_t n, uint8_t
     return msg;
 }
 
+static const char *const k_ntc[] = {"ntc", "example", "com"};
+static const uint8_t k_ntc_v6[16] = {0x2a, 0x02, 0x0e, 0x00, 0xff, 0xec, 0x04, 0xb8, 0, 0, 0, 0, 0, 0, 0, 1};
+
+static firc_dns_msg_t *empty_a(void) {
+    firc_dns_msg_t *msg = plain_answer(k_ntc, 3, 0);
+    free(msg->answers[0].rdata);
+    msg->n_answers = 0;
+    return msg;
+}
+
+static firc_dns_msg_t *follow_up(const uint8_t *addr, uint32_t ttl) {
+    uint8_t buf[512];
+    size_t p = 0;
+    buf[p++] = 0x12; buf[p++] = 0x34;
+    buf[p++] = 0x81; buf[p++] = 0x80;
+    buf[p++] = 0x00; buf[p++] = 0x01;
+    buf[p++] = 0x00; buf[p++] = (uint8_t)(addr != NULL ? 1 : 0);
+    buf[p++] = 0x00; buf[p++] = 0x00;
+    buf[p++] = 0x00; buf[p++] = 0x00;
+    p = put_name(buf, p, k_ntc, 3);
+    buf[p++] = 0x00; buf[p++] = FIRC_DNS_TYPE_AAAA;
+    buf[p++] = 0x00; buf[p++] = 0x01;
+    if (addr != NULL) {
+        p = put_name(buf, p, k_ntc, 3);
+        buf[p++] = 0x00; buf[p++] = FIRC_DNS_TYPE_AAAA;
+        buf[p++] = 0x00; buf[p++] = 0x01;
+        buf[p++] = (uint8_t)(ttl >> 24); buf[p++] = (uint8_t)(ttl >> 16);
+        buf[p++] = (uint8_t)(ttl >> 8); buf[p++] = (uint8_t)ttl;
+        buf[p++] = 0; buf[p++] = 16;
+        memcpy(buf + p, addr, 16);
+        p += 16;
+    }
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(buf, p, &msg) != FIRC_OK) { abort(); }
+    return msg;
+}
+
+static bool cross_for(void *ud, firc_id_t group_id) {
+    return firc_id_equal(*(const firc_id_t *)ud, group_id);
+}
+
+static bool packs_to(const firc_dns_msg_t *msg, const uint8_t *want, size_t want_len) {
+    uint8_t *out = NULL;
+    size_t len = 0;
+    if (firc_dns_msg_pack(msg, &out, &len) != FIRC_OK) { return false; }
+    bool same = len == want_len && memcmp(out, want, len) == 0;
+    free(out);
+    return same;
+}
+
+static bool real_behind(const firc_fakeip_t *f, const firc_ip_t *fake, firc_ip_t *real) {
+    const char *group_id = NULL;
+    return firc_fakeip_pair_of(f, fake, &group_id, real);
+}
+
+static firc_ip_t ntc_fake4(rw_fixture_t *f) {
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format(f->cfg.groups[0]->id, gid);
+    firc_ip_t v4 = {{0}, 0}, v6 = {{0}, 0};
+    if (firc_fakeip_get(f->pool, "ntc.example.com", gid, 1000, &v4, &v6) != FIRC_OK) { abort(); }
+    return v4;
+}
+
+/* Catches: an empty A answer for a cross-capable owner rewritten or issued instead of asking for AAAA. */
+TEST an_a_question_for_a_v6_only_name_asks_for_aaaa(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_dns_msg_t *msg = empty_a();
+    uint8_t *before = NULL;
+    size_t before_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &before_len));
+    uint64_t gen = firc_fakeip_gen(f.pool);
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_EQ_FMT((unsigned long long)gen, (unsigned long long)firc_fakeip_gen(f.pool), "%llu");
+    seen_from(f.pool, &f.seen);
+    ASSERT_EQ_FMT((size_t)0, f.seen.n, "%zu");
+    ASSERT(packs_to(msg, before, before_len));
+    free(before);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: a follow-up asked for an owner the cross test says no for. */
+TEST no_follow_up_without_kernel_tcp_or_v6(void) {
+    firc_id_t other = {{9, 9, 9, 9}};
+    rw_fixture_t f, today;
+    rw_up(&f, 64);
+    rw_up(&today, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &other);
+    firc_dns_msg_t *msg = empty_a(), *ref = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(today.p, ref, 1000, NULL, NULL));
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    ASSERT_EQ_FMT((size_t)0, msg->n_answers, "%zu");
+    uint8_t *want = NULL;
+    size_t want_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(ref, &want, &want_len));
+    ASSERT(packs_to(msg, want, want_len));
+    free(want);
+    firc_dns_msg_free(msg);
+    firc_dns_msg_free(ref);
+    rw_down(&f);
+    rw_down(&today);
+    PASS();
+}
+
+/* Catches: a follow-up asked for an AAAA question, or for an A answer that has an A record. */
+TEST no_follow_up_for_an_aaaa_question_or_a_name_with_an_a(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_dns_msg_t *msg = empty_a();
+    msg->questions[0].qtype = FIRC_DNS_TYPE_AAAA;
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    ASSERT_EQ_FMT((size_t)0, msg->n_answers, "%zu");
+    firc_dns_msg_free(msg);
+    msg = plain_answer(k_ntc, 3, 0);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    firc_ip_t fake = ntc_fake4(&f);
+    ASSERT_MEM_EQ(fake.b, msg->answers[0].rdata, 4);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: the follow-up answering the real v6, the v6 fake, no record, an unclamped TTL or an unrecorded real. */
+TEST the_aaaa_follow_up_answers_the_v4_fake(void) {
+    firc_event_reset_for_test();
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL));
+    firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+    bool changed = false;
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, &client,
+                                                                      FIRC_DNS_RESOLVER_GROUP, &changed));
+    ASSERT(changed);
+    firc_ip_t fake = ntc_fake4(&f);
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_EQ(FIRC_DNS_TYPE_A, msg->answers[0].rtype);
+    ASSERT_EQ_FMT(4u, (unsigned)msg->answers[0].rdata_len, "%u");
+    ASSERT_MEM_EQ(fake.b, msg->answers[0].rdata, 4);
+    ASSERT_EQ_FMT(300u, msg->answers[0].ttl, "%u");
+    firc_ip_t real = {{0}, 0};
+    ASSERT(real_behind(f.pool, &fake, &real));
+    ASSERT_EQ_FMT(16u, (unsigned)real.len, "%u");
+    ASSERT_MEM_EQ(k_ntc_v6, real.b, 16);
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    const firc_event_dns_t *d = &ev[0].u.dns;
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_ISSUED, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_TYPE_A, (unsigned)d->qtype, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_RESOLVER_GROUP, (unsigned)d->resolver, "%u");
+    ASSERT_EQ_FMT(4u, (unsigned)d->fake.len, "%u");
+    ASSERT_MEM_EQ(fake.b, d->fake.b, 4);
+    ASSERT_EQ_FMT(1u, (unsigned)d->n_reals, "%u");
+    ASSERT_MEM_EQ(k_ntc_v6, d->reals[0].b, 16);
+    firc_dns_msg_free(aaaa);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: the follow-up answered with the v4 fake after the tunnel stopped taking the owner's v6. */
+TEST a_follow_up_rechecks_the_tunnel(void) {
+    firc_id_t other = {{9, 9, 9, 9}};
+    for (int i = 0; i < 2; i++) {
+        rw_fixture_t f;
+        rw_up(&f, 64);
+        firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+        firc_dns_msg_t *msg = empty_a();
+        ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+        uint8_t *before = NULL;
+        size_t before_len = 0;
+        ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &before_len));
+        if (i == 0) {
+            firc_dns_pipeline_set_cross_fn(f.p, cross_for, &other);
+        } else {
+            firc_dns_pipeline_set_cross_fn(f.p, NULL, NULL);
+        }
+        firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+        ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, NULL,
+                                                                          FIRC_DNS_RESOLVER_GROUP, NULL));
+        ASSERT(packs_to(msg, before, before_len));
+        firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+        ASSERT_FALSE(real_behind(f.pool, &fake, &real));
+        free(before);
+        firc_dns_msg_free(aaaa);
+        firc_dns_msg_free(msg);
+        rw_down(&f);
+    }
+    PASS();
+}
+
+/* Catches: a loopback or pool AAAA taken as the real behind the v4 fake. */
+TEST a_sink_aaaa_is_no_real_for_a_v4_client(void) {
+    static const uint8_t loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    static const uint8_t in_pool[16] = {0xfd, 0x37, 0x9a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5};
+    const uint8_t *sinks[] = {loopback, in_pool};
+    for (size_t i = 0; i < 2; i++) {
+        rw_fixture_t f;
+        rw_up(&f, 64);
+        firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+        firc_dns_msg_t *msg = empty_a();
+        ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+        uint8_t *before = NULL;
+        size_t before_len = 0;
+        ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &before_len));
+        firc_dns_msg_t *aaaa = follow_up(sinks[i], 600);
+        ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, NULL,
+                                                                          FIRC_DNS_RESOLVER_GROUP, NULL));
+        ASSERT(packs_to(msg, before, before_len));
+        firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+        ASSERT_FALSE(real_behind(f.pool, &fake, &real));
+        free(before);
+        firc_dns_msg_free(aaaa);
+        firc_dns_msg_free(msg);
+        rw_down(&f);
+    }
+    PASS();
+}
+
+/* Catches: an AAAA carried by an error answer taken as the real behind the v4 fake. */
+TEST an_error_aaaa_answer_is_no_real_for_a_v4_client(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_dns_msg_t *msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    uint8_t *before = NULL;
+    size_t before_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &before_len));
+    firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+    aaaa->flags = (uint16_t)((aaaa->flags & 0xfff0u) | 2u);
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, NULL,
+                                                                      FIRC_DNS_RESOLVER_UPSTREAM, NULL));
+    ASSERT(packs_to(msg, before, before_len));
+    firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+    ASSERT_FALSE(real_behind(f.pool, &fake, &real));
+    free(before);
+    firc_dns_msg_free(aaaa);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: a failed follow-up journalled or recalled other than the NODATA answer it stands for, or not at all. */
+TEST a_failed_follow_up_is_journalled_as_the_nodata(void) {
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_event_reset_for_test();
+    rw_fixture_t today;
+    rw_up(&today, 64);
+    firc_dns_msg_t *ref = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(today.p, ref, 1000, &client, NULL));
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    firc_event_dns_t want = ev[0].u.dns;
+    firc_dns_msg_free(ref);
+    rw_down(&today);
+
+    firc_event_reset_for_test();
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_dns_msg_t *msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL));
+    ASSERT_EQ_FMTm("nothing journalled before the follow-up", (size_t)0, dns_events(all, journal(all, 8), ev), "%zu");
+    uint8_t *before = NULL;
+    size_t before_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &before_len));
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, NULL, 1000, &client,
+                                                                      FIRC_DNS_RESOLVER_UPSTREAM, NULL));
+    ASSERT(packs_to(msg, before, before_len));
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    const firc_event_dns_t *d = &ev[0].u.dns;
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_ISSUED, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT((unsigned)want.decision, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_TYPE_A, (unsigned)d->qtype, "%u");
+    ASSERT_EQ_FMT((unsigned)want.rcode, (unsigned)d->rcode, "%u");
+    ASSERT_EQ_FMT((unsigned)want.resolver, (unsigned)d->resolver, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)d->fake.len, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)d->n_reals, "%u");
+    ASSERT_STR_EQ(want.name, d->name);
+    ASSERT_STR_EQ(want.group_id, d->group_id);
+    ASSERT_STR_EQ(want.group_name, d->group_name);
+    ASSERT_MEM_EQ(client.b, d->client.b, 4);
+    firc_recall_answer_t out;
+    ASSERT(firc_recall_last_answer(firc_dns_pipeline_recall(f.p), &client, "ntc.example.com", FIRC_RECALL_V4, 1010,
+                                   &out));
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_ISSUED, (unsigned)out.decision, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)out.fake.len, "%u");
+    free(before);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: a name that lost its A still dialled at the v4 real it held before. */
+TEST an_empty_a_answer_drops_a_held_v4_real(void) {
+    static const uint8_t v4_real[4] = {93, 184, 216, 34};
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = plain_answer(k_ntc, 3, 0);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_dns_msg_free(msg);
+    firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+    ASSERT(real_behind(f.pool, &fake, &real));
+    ASSERT_EQ_FMT(4u, (unsigned)real.len, "%u");
+    ASSERT_MEM_EQ(v4_real, real.b, 4);
+
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1010, NULL, NULL));
+    firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1010, NULL,
+                                                                      FIRC_DNS_RESOLVER_UPSTREAM, NULL));
+    ASSERT(real_behind(f.pool, &fake, &real));
+    ASSERT_EQ_FMT(16u, (unsigned)real.len, "%u");
+    ASSERT_MEM_EQ(k_ntc_v6, real.b, 16);
+    firc_dns_msg_free(aaaa);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: a failed follow-up keeping the v4 real the name held, or leaving the pool unchanged for the commit. */
+TEST a_failed_follow_up_drops_a_held_v4_real(void) {
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_event_t all[8], ev[8];
+    firc_event_reset_for_test();
+    rw_fixture_t today;
+    rw_up(&today, 64);
+    firc_dns_msg_t *msg = plain_answer(k_ntc, 3, 0);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(today.p, msg, 1000, NULL, NULL));
+    firc_dns_msg_free(msg);
+    msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(today.p, msg, 1010, &client, NULL));
+    firc_dns_msg_free(msg);
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    firc_event_dns_t want = ev[0].u.dns;
+    rw_down(&today);
+
+    firc_event_reset_for_test();
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    msg = plain_answer(k_ntc, 3, 0);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_dns_msg_free(msg);
+    firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+    ASSERT(real_behind(f.pool, &fake, &real));
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1010, &client, NULL));
+    bool changed = false;
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, NULL, 1010, &client,
+                                                                      FIRC_DNS_RESOLVER_UPSTREAM, &changed));
+    ASSERT_FALSE(real_behind(f.pool, &fake, &real));
+    ASSERTm("the dropped real reaches the commit", changed);
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    const firc_event_dns_t *d = &ev[0].u.dns;
+    ASSERT_EQ_FMT((unsigned)want.decision, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT((unsigned)want.rcode, (unsigned)d->rcode, "%u");
+    ASSERT_EQ_FMT((unsigned)want.fake.len, (unsigned)d->fake.len, "%u");
+    ASSERT_EQ_FMT((unsigned)want.n_reals, (unsigned)d->n_reals, "%u");
+    ASSERT_STR_EQ(want.group_id, d->group_id);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: an A record riding in the AAAA follow-up recorded as the v4 real, outranking the v6 one. */
+TEST an_a_record_in_the_aaaa_answer_is_not_a_v4_real(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_dns_msg_t *msg = empty_a();
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+    aaaa->answers = realloc(aaaa->answers, 2 * sizeof(*aaaa->answers));
+    aaaa->answers[1] = aaaa->answers[0];
+    aaaa->answers[1].rtype = FIRC_DNS_TYPE_A;
+    aaaa->answers[1].rdata = malloc(4);
+    memcpy(aaaa->answers[1].rdata, (uint8_t[]){203, 0, 113, 7}, 4);
+    aaaa->answers[1].rdata_len = 4;
+    aaaa->n_answers = 2;
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, NULL,
+                                                                      FIRC_DNS_RESOLVER_UPSTREAM, NULL));
+    firc_ip_t fake = ntc_fake4(&f), real = {{0}, 0};
+    ASSERT(real_behind(f.pool, &fake, &real));
+    ASSERT_EQ_FMT(16u, (unsigned)real.len, "%u");
+    ASSERT_MEM_EQ(k_ntc_v6, real.b, 16);
+    firc_dns_msg_free(aaaa);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
 /* Catches: an issued answer not journalled, or journalled without client, name, addresses or group. */
 TEST an_issued_answer_is_journalled_with_both_addresses(void) {
     firc_event_reset_for_test();
@@ -2285,6 +2688,17 @@ int main(int argc, char **argv)
     RUN_TEST(a_ttl_above_the_clamp_is_clamped);
     RUN_TEST(pool_exhaustion_answers_the_blackhole_without_waiting);
     RUN_TEST(a_v4_only_name_gets_nodata_for_aaaa);
+    RUN_TEST(an_a_question_for_a_v6_only_name_asks_for_aaaa);
+    RUN_TEST(no_follow_up_without_kernel_tcp_or_v6);
+    RUN_TEST(no_follow_up_for_an_aaaa_question_or_a_name_with_an_a);
+    RUN_TEST(the_aaaa_follow_up_answers_the_v4_fake);
+    RUN_TEST(a_follow_up_rechecks_the_tunnel);
+    RUN_TEST(a_sink_aaaa_is_no_real_for_a_v4_client);
+    RUN_TEST(an_error_aaaa_answer_is_no_real_for_a_v4_client);
+    RUN_TEST(a_failed_follow_up_is_journalled_as_the_nodata);
+    RUN_TEST(an_empty_a_answer_drops_a_held_v4_real);
+    RUN_TEST(a_failed_follow_up_drops_a_held_v4_real);
+    RUN_TEST(an_a_record_in_the_aaaa_answer_is_not_a_v4_real);
     RUN_TEST(a_non_address_question_is_left_alone);
     RUN_TEST(a_group_applies_only_to_the_devices_it_names);
     RUN_TEST(an_https_question_for_a_matched_name_is_emptied);

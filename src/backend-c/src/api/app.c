@@ -230,6 +230,7 @@ struct firc_app {
 
 /* every entry point that mutates the registry or drives an iptables engine must hold this */
 static void app_nf_enter(firc_app_t *app);
+static bool ktcp_redirected(const firc_app_t *app, const char *iface);
 static void app_nf_leave(firc_app_t *app);
 static void on_tap_readable(firc_loop_t *loop, int fd, uint32_t events, void *ud);
 static void tap_reader_down(firc_app_t *app);
@@ -1015,6 +1016,7 @@ void firc_app_republish_resolve_routes(firc_app_t *app) {
         (void)firc_ruleset_active(rs, &blocked);
         in[i].blackhole = blocked || firc_iface_is_sink(active);
         in[i].v6_route = firc_ruleset_has_iface_route(rs, AF_INET6);
+        in[i].ktcp = ktcp_redirected(app, active) && app->last_off == FIRC_KTCP_OFF_NONE;
         in[i].firmware = fw[i];
         in[i].n_firmware = firc_kn_resolvers_for(app->resolvers, active, fw[i], FIRC_RESOLVE_MAX_SERVERS);
         in[i].n_firmware = drop_pool_addrs(fw[i], in[i].n_firmware, app->pool);
@@ -2755,9 +2757,8 @@ static int redir_id_cmp(const void *a, const void *b) {
     return strcmp(((const redir_id_t *)a)->id, ((const redir_id_t *)b)->id);
 }
 
-static void image_pair(void *ud, const char *group_id, unsigned family, const firc_ip_t *fake, const firc_ip_t *real) {
+static void image_add(void *ud, const char *group_id, const firc_ip_t *fake, const firc_ip_t *real) {
     image_walk_t *w = ud;
-    (void)family;
     if (w->err != FIRC_OK || group_id == NULL || fake == NULL || fake->len != 4 || real == NULL) {
         return;
     }
@@ -2773,7 +2774,12 @@ static void image_pair(void *ud, const char *group_id, unsigned family, const fi
         }
         return;
     }
-    w->err = firc_ktcp_image_add(&w->app->pass_image, hit->dev, fake->b, real->b);
+    w->err = firc_ktcp_image_add(&w->app->pass_image, hit->dev, fake->b, real);
+}
+
+static void image_pair(void *ud, const char *group_id, unsigned family, const firc_ip_t *fake, const firc_ip_t *real) {
+    (void)family;
+    image_add(ud, group_id, fake, real);
 }
 
 static firc_err_t stage_redir(firc_app_t *app, const firc_ruleset_t *skip, const char *prefix, bool full) {
@@ -2860,6 +2866,7 @@ static firc_err_t stage_redir(firc_app_t *app, const firc_ruleset_t *skip, const
         qsort(ids, n, sizeof(*ids), redir_id_cmp);
         image_walk_t w = {.app = app, .ids = ids, .n = n, .err = FIRC_OK};
         firc_fakeip_snapshot_walk(app->pass_snap, image_pair, &w);
+        firc_fakeip_snapshot_cross_walk(app->pass_snap, image_add, &w);
         err = w.err;
         firc_ktcp_image_sort(&app->pass_image);
     }
@@ -4590,7 +4597,9 @@ static void push_image(firc_app_t *app, firc_ktcp_image_t *image) {
 
 static void take_skip(firc_app_t *app, const firc_xt_acl_t *skip, firc_ktcp_off_t off) {
     app->last_skip = *skip;
+    bool moved = app->last_off != off;
     app->last_off = off;
+    if (moved) { firc_app_republish_resolve_routes(app); }
 }
 
 static void drop_report(void *ud) {
@@ -4759,6 +4768,7 @@ void firc_app_set_ktcp_ports(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEV
     app_nf_enter(app);
     memcpy(app->ktcp_ports, ports, sizeof(app->ktcp_ports));
     app_request_more_locked(app);
+    firc_app_republish_resolve_routes(app);
     app_nf_leave(app);
 }
 
@@ -4825,7 +4835,7 @@ void firc_app_set_ktcp_skipped_for_test(firc_app_t *app, const firc_xt_acl_t *ac
     take_skip(app, acl, off);
 }
 
-bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], uint8_t real[4]) {
+bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], firc_ip_t *real) {
     if (app == NULL || dev >= FIRC_KTCP_DEVICES || app->ktcp_ports[dev] == 0) { return false; }
     firc_ip_t f = {{0}, 4}, r = {{0}, 0};
     memcpy(f.b, fake, 4);
@@ -4836,6 +4846,6 @@ bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], 
     if (rs == NULL || !firc_ruleset_routed(rs) || firc_tunvless_index(firc_ruleset_active_iface(rs)) != dev) {
         return false;
     }
-    memcpy(real, r.b, 4);
+    *real = r;
     return true;
 }

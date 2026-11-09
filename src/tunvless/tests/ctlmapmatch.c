@@ -78,9 +78,15 @@ static const char *body_end(struct body *b) {
     return b->s;
 }
 
+static uint32_t v4_of(const struct cm_real *r) {
+    uint32_t a;
+    memcpy(&a, r->b, 4);
+    return a;
+}
+
 static uint32_t real_of(uint32_t fake_h) {
-    uint32_t r = 0;
-    return ctlmap_lookup(be(fake_h), &r) == CM_REAL ? ntohl(r) : 0;
+    struct cm_real r;
+    return ctlmap_lookup(be(fake_h), &r) == CM_REAL && !r.v6 ? ntohl(v4_of(&r)) : 0;
 }
 
 static uint64_t drain(void) {
@@ -133,7 +139,7 @@ static void a_line_maps_and_dash_forgets(void) {
     /* catches: a delete that empties its slot without shifting the probe chain back */
     check("every entry left keeps its real address", N / 2, kept);
     check("every dashed entry reads none", N / 2, gone);
-    check("a fake never sent reads none", CM_NONE, ctlmap_lookup(be(POOL + 0x1ffffu), &(uint32_t){ 0 }));
+    check("a fake never sent reads none", CM_NONE, ctlmap_lookup(be(POOL + 0x1ffffu), &(struct cm_real){ { 0 }, 0 }));
 }
 
 static void mapall_clears_stale_entries(void) {
@@ -165,12 +171,12 @@ static void the_cap_drops_and_does_not_count(void) {
     check("the new entry is there", 0x09090908, real_of(POOL + 65536));
     check("a second drop is not counted", 0, map("198.19.0.1 9.9.9.7\n\n"));
     check_str("the warning is once per run", "", g_err);
-    uint32_t r = 0;
+    struct cm_real r;
     check("a fake past the cap is asked", 1, ctlmap_ask(be(POOL + 70000)));
     /* catches: a miss answer past the cap acked 0, so fircd reads drift and stops resending */
     check("its answer is counted", 1, map("198.19.17.112 9.9.9.6\n\n"));
     check("and recorded for the waiting connection", CM_REAL, ctlmap_answer(be(POOL + 70000), &r));
-    check("with its real address", 0x09090906, ntohl(r));
+    check("with its real address", 0x09090906, ntohl(v4_of(&r)));
     check("but not put in the full table", 0, real_of(POOL + 70000));
     ctlmap_unask(be(POOL + 70000));
 }
@@ -187,7 +193,8 @@ static void a_command_takes_4096_lines(void) {
 }
 
 static void an_asked_fake_records_real_and_dash(void) {
-    uint32_t f = ip("198.18.7.1"), g = ip("198.18.7.2"), r = 0;
+    uint32_t f = ip("198.18.7.1"), g = ip("198.18.7.2");
+    struct cm_real r;
     mapall("\n");
     check("the first ask is the asker", 1, ctlmap_ask(f));
     /* catches: a second miss sent for a fake already asked */
@@ -199,9 +206,8 @@ static void an_asked_fake_records_real_and_dash(void) {
     check("a mapall without the fake keeps it pending", CM_PENDING, ctlmap_answer(f, &r));
     check("and does not make it a new asker", 0, ctlmap_ask(f));
     map("198.18.7.1 5.6.7.8\n\n");
-    r = 0;
     check("the answer is recorded", CM_REAL, ctlmap_answer(f, &r));
-    check("with its real address", (long)ip("5.6.7.8"), (long)r);
+    check("with its real address", (long)ip("5.6.7.8"), (long)v4_of(&r));
     check("and the table has it", 0x05060708, real_of(0xc6120701u));
     check("a second fake is asked", 1, ctlmap_ask(g));
     map("198.18.7.2 -\n\n");
@@ -212,9 +218,8 @@ static void an_asked_fake_records_real_and_dash(void) {
     map("198.18.7.4 4.4.4.4\n\n");
     /* catches: a fake mapped between the loop's lookup and its ask waiting on a miss */
     check("an ask for a mapped fake sends no miss", 0, ctlmap_ask(h));
-    r = 0;
     check("and reads its real address", CM_REAL, ctlmap_answer(h, &r));
-    check("the mapped real", (long)ip("4.4.4.4"), (long)r);
+    check("the mapped real", (long)ip("4.4.4.4"), (long)v4_of(&r));
     ctlmap_unask(h);
     ctlmap_unask(f);
     ctlmap_unask(g);
@@ -233,7 +238,7 @@ static void the_257th_ask_is_refused(void) {
     check("a fake already asked is still known", 0, ctlmap_ask(be(POOL + 0x100u)));
     ctlmap_unask(be(POOL + 0x100u));
     /* catches: an unask that removes another fake than the one named */
-    check("the unasked fake is gone", CM_NONE, ctlmap_answer(be(POOL + 0x100u), &(uint32_t){ 0 }));
+    check("the unasked fake is gone", CM_NONE, ctlmap_answer(be(POOL + 0x100u), &(struct cm_real){ { 0 }, 0 }));
     check("the last asked is kept", 0, ctlmap_ask(be(POOL + 0x1ffu)));
     /* catches: a slot freed by unask never reused */
     check("an unask makes room", 1, ctlmap_ask(be(POOL + 0x200u)));
@@ -264,7 +269,8 @@ static void a_line_outside_the_pool_is_not_taken(void) {
 }
 
 static void a_real_of_zero_is_taken_as_a_dash(void) {
-    uint32_t r = 0, f = ip("198.18.0.15");
+    uint32_t f = ip("198.18.0.15");
+    struct cm_real r;
     mapall("198.18.0.13 1.2.3.4\n\n");
     /* catches: an upstream's 0.0.0.0 answer refused, so fircd reads drift and stops resending */
     check("real 0.0.0.0 lines are counted", 2, map("198.18.0.13 0.0.0.0\n198.18.0.14 0.0.0.0\n\n"));
@@ -399,7 +405,8 @@ static int g_stop;
 
 static void *loop_side(void *arg) {
     (void)arg;
-    uint32_t r, b[8];
+    struct cm_real r;
+    uint32_t b[8];
     uint8_t l[8];
     while (!__atomic_load_n(&g_stop, __ATOMIC_ACQUIRE)) {
         ctlmap_lookup(be(POOL + 5), &r);
@@ -428,6 +435,146 @@ static void the_loop_reads_while_stdin_writes(void) {
     check("after the race the last command stands", 0, real_of(POOL + 5) | real_of(POOL + 6));
 }
 
+static const uint8_t g_db8_7[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07 };
+
+static int is_v6(uint32_t fake_be, const uint8_t *want) {
+    struct cm_real r;
+    return ctlmap_lookup(fake_be, &r) == CM_REAL && r.v6 == 1 && !memcmp(r.b, want, 16);
+}
+
+static int answered_v6(uint32_t fake_be, const uint8_t *want) {
+    struct cm_real r;
+    return ctlmap_answer(fake_be, &r) == CM_REAL && r.v6 == 1 && !memcmp(r.b, want, 16);
+}
+
+static void put_v6_line(struct body *b, uint32_t fake_h, uint32_t tail) {
+    b->n += (size_t)sprintf(b->s + b->n, "%u.%u.%u.%u 2001:db8::%x:%x\n", fake_h >> 24, (fake_h >> 16) & 255,
+                            (fake_h >> 8) & 255, fake_h & 255, tail >> 16, tail & 0xffffu);
+}
+
+static void db8_of(uint8_t *a, uint32_t tail) {
+    static const uint8_t p[12] = { 0x20, 0x01, 0x0d, 0xb8 };
+    memcpy(a, p, 12);
+    a[12] = (uint8_t)(tail >> 24);
+    a[13] = (uint8_t)(tail >> 16);
+    a[14] = (uint8_t)(tail >> 8);
+    a[15] = (uint8_t)tail;
+}
+
+/* Catches: a v6 real refused, stored without its family, or lost on the way to an asked fake */
+static void a_line_maps_a_v6_real(void) {
+    mapall("\n");
+    static const uint8_t full[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0x56, 0x78,
+                                      0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78 };
+    static const uint8_t db8_8[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08 };
+    check("two v6 lines and a v4 one are taken", 3,
+          map("198.18.9.1 2001:db8::7\n198.18.9.2 2001:db8:1234:5678:9abc:def0:1234:5678\n198.18.9.3 1.2.3.4\n\n"));
+    check("the short form reads its 16 bytes, family v6", 1, is_v6(ip("198.18.9.1"), g_db8_7));
+    check("the longest form fits", 1, is_v6(ip("198.18.9.2"), full));
+    check("the v4 line beside them reads v4", 0x01020304, real_of(0xc6120903u));
+    check_str("no warning", "", g_err);
+    check("a mapped v6 fake sends no miss", 0, ctlmap_ask(ip("198.18.9.1")));
+    check("and the ask reads the v6 real", 1, answered_v6(ip("198.18.9.1"), g_db8_7));
+    ctlmap_unask(ip("198.18.9.1"));
+    check("an unmapped fake is asked", 1, ctlmap_ask(ip("198.18.9.4")));
+    map("198.18.9.4 2001:db8::8\n\n");
+    check("its v6 answer is recorded", 1, answered_v6(ip("198.18.9.4"), db8_8));
+    check("and the table has it", 1, is_v6(ip("198.18.9.4"), db8_8));
+    ctlmap_unask(ip("198.18.9.4"));
+}
+
+/* Catches: a malformed v6 text taken, or a bad line counted */
+static void a_bad_v6_real_is_not_taken(void) {
+    mapall("\n");
+    check("only the good line is taken", 1,
+          map("198.18.9.5 2001:db8::zz\n198.18.9.6 2001:db8:::1\n198.18.9.7 1:2:3:4:5:6:7:8:9\n"
+              "198.18.9.8 2001:db8:0000:0000:0000:0000:0000:0000:1\n198.18.9.9 2001:db8::7\n\n"));
+    check_str("the four are malformed", "tunvless[warn]: map: 4 malformed lines left out\n", g_err);
+    check("none of them is there", CM_NONE, ctlmap_lookup(ip("198.18.9.5"), &(struct cm_real){ { 0 }, 0 }) |
+          ctlmap_lookup(ip("198.18.9.6"), &(struct cm_real){ { 0 }, 0 }) |
+          ctlmap_lookup(ip("198.18.9.7"), &(struct cm_real){ { 0 }, 0 }) |
+          ctlmap_lookup(ip("198.18.9.8"), &(struct cm_real){ { 0 }, 0 }));
+    check("the good one is", 1, is_v6(ip("198.18.9.9"), g_db8_7));
+}
+
+/* Catches: an unbounded v6 table, a line past its cap counted, or room never given back */
+static void a_v6_line_past_the_cap_is_counted_bad(void) {
+    mapall("\n");
+    struct body b = body_new(4096);
+    for (uint32_t k = 0; k < 4096; k++) put_v6_line(&b, POOL + k, 0x10000u + k);
+    check("4096 v6 lines are taken", 4096, map(body_end(&b)));
+    free(b.s);
+    uint8_t want[16];
+    db8_of(want, 0x10000u + 4095);
+    check("the last of them is there", 1, is_v6(be(POOL + 4095), want));
+    check("the 4097th is not counted", 0, map("198.18.16.0 2001:db8::1\n\n"));
+    check_str("and counted as malformed", "tunvless[warn]: map: 1 malformed lines left out\n", g_err);
+    check("nor is it there", CM_NONE, ctlmap_lookup(be(POOL + 4096), &(struct cm_real){ { 0 }, 0 }));
+    check("a v4 line for a new fake still goes in", 1, map("198.18.16.1 1.1.1.1\n\n"));
+    check("an update of a v6 fake at the cap is taken", 1, map("198.18.0.0 2001:db8::7\n\n"));
+    check("and applied", 1, is_v6(be(POOL), g_db8_7));
+    check("a dash frees room for a new v6 fake", 2, map("198.18.0.1 -\n198.18.16.0 2001:db8::7\n\n"));
+    check("the new one is there", 1, is_v6(be(POOL + 4096), g_db8_7));
+    check("a v4 line for a v6 fake frees room too", 2, map("198.18.0.2 2.2.2.2\n198.18.16.2 2001:db8::7\n\n"));
+    check("the next new one is there", 1, is_v6(be(POOL + 4098), g_db8_7));
+    check("a fake past the cap is asked", 1, ctlmap_ask(be(POOL + 5000)));
+    check("its v6 answer is counted", 1, map("198.18.19.136 2001:db8::7\n\n"));
+    check("and recorded for the waiting connection", 1, answered_v6(be(POOL + 5000), g_db8_7));
+    check("but not put in the full table", CM_NONE, ctlmap_lookup(be(POOL + 5000), &(struct cm_real){ { 0 }, 0 }));
+    ctlmap_unask(be(POOL + 5000));
+    mapall("\n");
+    check("a mapall clears the v6 table", CM_NONE, ctlmap_lookup(be(POOL + 4095), &(struct cm_real){ { 0 }, 0 }));
+    check("and makes room again", 1, map("198.18.16.3 2001:db8::7\n\n"));
+}
+
+/* Catches: a v6 real left behind a v4 line for its fake, or a v4 real behind a v6 line */
+static void a_v4_line_replaces_a_v6_real_and_back(void) {
+    mapall("\n");
+    uint32_t f = ip("198.18.9.10");
+    map("198.18.9.10 2001:db8::7\n\n");
+    check("first the v6 real", 1, is_v6(f, g_db8_7));
+    check("a v4 line is taken", 1, map("198.18.9.10 5.5.5.5\n\n"));
+    check("and the fake reads v4", 0x05050505, real_of(0xc612090au));
+    check("a v6 line is taken", 1, map("198.18.9.10 2001:db8::7\n\n"));
+    check("and the fake reads v6 again", 1, is_v6(f, g_db8_7));
+    check("asked while mapped, it reads the v6 real", 1, ctlmap_ask(f) == 0 && answered_v6(f, g_db8_7));
+    map("198.18.9.10 6.6.6.6\n\n");
+    struct cm_real r;
+    check("a v4 answer replaces the v6 one in the asked set", 1,
+          ctlmap_answer(f, &r) == CM_REAL && !r.v6 && v4_of(&r) == ip("6.6.6.6") && !memcmp(r.b + 4, (uint8_t[12]){ 0 }, 12));
+    ctlmap_unask(f);
+}
+
+/* Catches: a v6 real kept after a dash or a mapall without it */
+static void a_dash_forgets_a_v6_real(void) {
+    mapall("\n");
+    uint32_t f = ip("198.18.9.11");
+    map("198.18.9.11 2001:db8::7\n\n");
+    check("a dash for a v6 fake is counted", 1, map("198.18.9.11 -\n\n"));
+    check("and forgets it", CM_NONE, ctlmap_lookup(f, &(struct cm_real){ { 0 }, 0 }));
+    map("198.18.9.11 2001:db8::7\n\n");
+    check("asked while mapped", 0, ctlmap_ask(f));
+    map("198.18.9.11 -\n\n");
+    check("a dash answers denied", CM_DENIED, ctlmap_answer(f, &(struct cm_real){ { 0 }, 0 }));
+    ctlmap_unask(f);
+    map("198.18.9.11 2001:db8::7\n\n");
+    mapall("198.18.9.12 1.1.1.1\n\n");
+    check("a mapall without it forgets it", CM_NONE, ctlmap_lookup(f, &(struct cm_real){ { 0 }, 0 }));
+    mapall("\n");
+}
+
+/* Catches: a close dropping the v6 reals of its prefix, so every cross pair of a routed group misses */
+static void a_close_leaves_a_v6_real(void) {
+    mapall("198.18.10.2 1.1.1.1\n\n");
+    map("198.18.10.1 2001:db8::7\n\n");
+    closes("198.18.10.0/24\n\n");
+    while (ctlmap_take_closes((uint32_t[8]){ 0 }, (uint8_t[8]){ 0 }, 8, &(int){ 0 }) > 0) {}
+    drain();
+    check("a close leaves a v6 real inside its prefix", 1, is_v6(ip("198.18.10.1"), g_db8_7));
+    check("as it leaves a v4 real", 0x01010101, real_of(0xc6120a02u));
+    mapall("\n");
+}
+
 int main(void) {
     check("init", 0, ctlmap_init(be(POOL), 15));
     a_line_maps_and_dash_forgets();
@@ -442,5 +589,11 @@ int main(void) {
     a_command_cut_by_eof_is_dropped();
     close_prefixes_are_queued_and_woken();
     the_loop_reads_while_stdin_writes();
+    a_line_maps_a_v6_real();
+    a_bad_v6_real_is_not_taken();
+    a_v6_line_past_the_cap_is_counted_bad();
+    a_v4_line_replaces_a_v6_real_and_back();
+    a_dash_forgets_a_v6_real();
+    a_close_leaves_a_v6_real();
     return unit_done("ctlmapmatch");
 }

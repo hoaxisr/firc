@@ -1,5 +1,6 @@
 #include "greatest.h"
 #include "firc/ktcp.h"
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -7,8 +8,16 @@ static void add(firc_ktcp_image_t *im, uint8_t dev, uint8_t f0, uint8_t f1, uint
                 uint8_t r1, uint8_t r2, uint8_t r3)
 {
     const uint8_t fake[4] = {f0, f1, f2, f3};
-    const uint8_t real[4] = {r0, r1, r2, r3};
-    if (firc_ktcp_image_add(im, dev, fake, real) != FIRC_OK)
+    const firc_ip_t real = {{r0, r1, r2, r3}, 4};
+    if (firc_ktcp_image_add(im, dev, fake, &real) != FIRC_OK)
+        abort();
+}
+
+static void add6(firc_ktcp_image_t *im, uint8_t dev, uint8_t f0, uint8_t f1, uint8_t f2, uint8_t f3, const char *real)
+{
+    const uint8_t fake[4] = {f0, f1, f2, f3};
+    firc_ip_t r = {{0}, 16};
+    if (inet_pton(AF_INET6, real, r.b) != 1 || firc_ktcp_image_add(im, dev, fake, &r) != FIRC_OK)
         abort();
 }
 
@@ -22,17 +31,21 @@ static bool pair_is(const firc_ktcp_pair_t *p, uint8_t dev, const char *fake, co
 
 typedef struct {
     size_t n;
-    char call[16][64];
+    char call[16][96];
 } calls_t;
 
-static void record(uint8_t dev, const uint8_t fake[4], const uint8_t *real, void *ud)
+static void record(uint8_t dev, const uint8_t fake[4], const firc_ip_t *real, void *ud)
 {
     calls_t *c = ud;
     if (c->n >= 16)
         return;
-    if (real)
+    if (real && real->len == 16) {
+        char r[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, real->b, r, sizeof(r));
+        snprintf(c->call[c->n], sizeof(c->call[0]), "%u %u.%u.%u.%u %s", dev, fake[0], fake[1], fake[2], fake[3], r);
+    } else if (real)
         snprintf(c->call[c->n], sizeof(c->call[0]), "%u %u.%u.%u.%u %u.%u.%u.%u", dev, fake[0], fake[1], fake[2],
-                 fake[3], real[0], real[1], real[2], real[3]);
+                 fake[3], real->b[0], real->b[1], real->b[2], real->b[3]);
     else
         snprintf(c->call[c->n], sizeof(c->call[0]), "%u %u.%u.%u.%u -", dev, fake[0], fake[1], fake[2], fake[3]);
     c->n++;
@@ -226,10 +239,10 @@ TEST firc_ktcp_line_opens_a_new_map_at_the_4097th_line(void)
 {
     /* catches: delta lines piling past the line cap into one command that tunvless would cut and ack short */
     firc_ktcp_cmds_t out = {0};
-    const uint8_t real[4] = {212, 193, 11, 97};
+    const firc_ip_t real = {{212, 193, 11, 97}, 4};
     for (unsigned i = 0; i < 4097; i++) {
         const uint8_t fake[4] = {198, 18, (uint8_t)(i >> 8), (uint8_t)i};
-        ASSERT_EQ(FIRC_OK, firc_ktcp_line(&out, fake, i % 2 ? NULL : real));
+        ASSERT_EQ(FIRC_OK, firc_ktcp_line(&out, fake, i % 2 ? NULL : &real));
     }
     ASSERT_EQ(2, out.n_cmds);
     ASSERT_EQ(4096, out.counts[0]);
@@ -240,6 +253,52 @@ TEST firc_ktcp_line_opens_a_new_map_at_the_4097th_line(void)
     ASSERT_EQ(2, count_of(out.text, "\n\n"));
     ASSERT_EQ(4097 + 2 + 2, count_of(out.text, "\n"));
     firc_ktcp_cmds_free(&out);
+    PASS();
+}
+
+/* Catches: a v6 real written as dotted bytes, cut at 4 bytes, or its text overflowing the line buffer. */
+TEST a_v6_real_is_written_as_its_text(void)
+{
+    firc_ktcp_cmds_t out = {0};
+    const uint8_t fake[4] = {198, 18, 1, 2};
+    firc_ip_t r = {{0}, 16};
+    ASSERT_EQ(1, inet_pton(AF_INET6, "2a02:e00:ffec:4b8::1", r.b));
+    ASSERT_EQ(FIRC_OK, firc_ktcp_line(&out, fake, &r));
+    ASSERT_STR_EQ("map\n198.18.1.2 2a02:e00:ffec:4b8::1\n\n", out.text);
+    firc_ktcp_cmds_free(&out);
+    firc_ktcp_image_t im = {0};
+    add6(&im, 5, 198, 18, 1, 3, "2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff");
+    firc_ktcp_image_sort(&im);
+    ASSERT_EQ(FIRC_OK, firc_ktcp_map_cmds(&im, 5, true, &out));
+    ASSERT_STR_EQ("mapall\n198.18.1.3 2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff\n\n", out.text);
+    firc_ktcp_cmds_free(&out);
+    firc_ktcp_image_free(&im);
+    PASS();
+}
+
+/* Catches: a diff comparing four bytes of the real, so a v6 real that begins like the old v4 one is no change. */
+TEST a_real_moving_from_v6_to_v4_is_a_change(void)
+{
+    firc_ktcp_image_t prev = {0}, next = {0};
+    add6(&prev, 1, 198, 18, 0, 1, "5d:b8d8:2200::");
+    add(&next, 1, 198, 18, 0, 1, 0, 93, 184, 216);
+    add6(&prev, 1, 198, 18, 0, 2, "2001:db8::1");
+    add6(&next, 1, 198, 18, 0, 2, "2001:db8::1");
+    add6(&next, 1, 198, 18, 0, 3, "2001:db8::2");
+    firc_ktcp_image_sort(&prev);
+    firc_ktcp_image_sort(&next);
+    calls_t c = {0};
+    firc_ktcp_image_diff(&prev, &next, record, &c);
+    ASSERT_EQ(2, c.n);
+    ASSERT_STR_EQ("1 198.18.0.1 0.93.184.216", c.call[0]);
+    ASSERT_STR_EQ("1 198.18.0.3 2001:db8::2", c.call[1]);
+    memset(&c, 0, sizeof(c));
+    firc_ktcp_image_diff(&next, &prev, record, &c);
+    ASSERT_EQ(2, c.n);
+    ASSERT_STR_EQ("1 198.18.0.1 5d:b8d8:2200::", c.call[0]);
+    ASSERT_STR_EQ("1 198.18.0.3 -", c.call[1]);
+    firc_ktcp_image_free(&prev);
+    firc_ktcp_image_free(&next);
     PASS();
 }
 
@@ -256,5 +315,7 @@ int main(int argc, char **argv)
     RUN_TEST(close_lists_only_v4_prefixes);
     RUN_TEST(close_splits_at_4096_prefixes);
     RUN_TEST(firc_ktcp_line_opens_a_new_map_at_the_4097th_line);
+    RUN_TEST(a_v6_real_is_written_as_its_text);
+    RUN_TEST(a_real_moving_from_v6_to_v4_is_a_change);
     GREATEST_MAIN_END();
 }

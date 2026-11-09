@@ -5561,7 +5561,7 @@ static void t_k_answer(int a, int b) {
     k_cmd("198.18.0.20 10.9.9.9\n\n", 0);
     for (int i = 0; i < 10 && g_park_n; i++) spin(1);
     struct conn *ca = k_conn_of(a), *cb = k_conn_of(b);
-    uint32_t r = 0;
+    struct cm_real r;
     check(!g_park_n && ca && cb && ca->key.dst.v4 == ip4(10, 9, 9, 9) && cb->key.dst.v4 == ip4(10, 9, 9, 9) &&
               ca->odst == FAKE(20) && k_seen(a) == 'W' && k_seen(b) == 'W' &&
               ctlmap_answer(FAKE(20), &r) == CM_NONE,
@@ -5789,7 +5789,7 @@ static void t_k_close(void) {
     out_end(out, sizeof out);
     check(strstr(out, "{\"type\":\"close\",\"count\":3}") != NULL && k_wait(a, 5) == 'R' &&
               k_wait(d, 5) == 'R' && k_wait(p, 5) == 'R' && k_seen(b) == 'W' && k_conn_of(b) == cb &&
-              g_park_n == 0 && ctlmap_answer(ip4(198, 18, 4, 9), &(uint32_t){ 0 }) == CM_NONE,
+              g_park_n == 0 && ctlmap_answer(ip4(198, 18, 4, 9), &(struct cm_real){ { 0 }, 0 }) == CM_NONE,
           "close resets only inside the prefixes and counts them (3)");
     close(a); close(b); close(d); close(p);
 }
@@ -8190,6 +8190,102 @@ static void mux_part(void) {
     t_spares_skip_shared_nodes();
 }
 
+static const unsigned char g_k6_real[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40 };
+
+static int k6_pool(int v6_node) {
+    k_reset();
+    srv_reset();
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    if (v6_node >= 0) g_v6ok[v6_node] = 1;
+    pool_new6(2, POOL_BY_CONNECTION, 2, 1);
+    conn_table_init();
+    pl_check(0);
+    pl_check(1);
+    int six = -1, n6 = 0;
+    for (int i = 0; i < g_pl.n; i++)
+        if (g_pl.slot[i].node >= 0 && g_pl.slot[i].up && g_pl.slot[i].v6) {
+            six = i;
+            n6++;
+        }
+    return n6 == 1 ? six : n6 == 0 ? -1 : -2;
+}
+
+static int k6_on(const struct conn *c, int slot) {
+    return c && c->key.v6 == 1 && !memcmp(c->key.dst.b, g_k6_real, 16) && c->key.dport == 443 &&
+           ((const struct pl_sess *)SESS(c))->slot == slot;
+}
+
+/* Catches: a v6 real dialled with a v4 key, on a node without IPv6, or not at all after a miss */
+static void t_ktcp_v6_real_dials_a_v6_node(void) {
+    int six = k6_pool(1);
+    check(six >= 0 && g_pl.slot[1 - six].up && !g_pl.slot[1 - six].v6, "fixture: two live slots, one carries IPv6");
+    k_cmd("198.18.0.40 2001:db8::40\n\n", 0);
+    int all = 1;
+    for (int i = 0; i < 8; i++) {
+        int fd = k_dial(FAKE(40), 443, 1);
+        struct conn *c = k_ready(fd, 200);
+        if (!k6_on(c, six) || c->odst != FAKE(40)) all = 0;
+        if (fd >= 0) close(fd);
+        k_reset();
+    }
+    check(all, "a fake mapped to a v6 real dials it with a v6 key, always on the v6 node");
+    int fd = k_dial(FAKE(41), 443, 1);
+    for (int i = 0; i < 10 && !g_park_n; i++) spin(1);
+    int parked = g_park_n == 1;
+    k_cmd("198.18.0.41 2001:db8::40\n\n", 0);
+    struct conn *c = k_ready(fd, 200);
+    check(parked && !g_park_n && k6_on(c, six) && c->odst == FAKE(41),
+          "a miss answered with a v6 real opens the parked socket with the v6 key");
+    if (fd >= 0) close(fd);
+    k_vless();
+    k_cmd("198.18.0.42 2001:db8::40\n\n", 0);
+    fd = k_dial(FAKE(42), 8443, 1);
+    c = k_ready(fd, 200);
+    static unsigned char w[4096];
+    uint64_t t0 = now_ns();
+    while (c && (now_ns() - t0) / 1000000 < SERVER_FIRST_MS + 50) spin(1);
+    size_t n = c ? wire_of(c, w, sizeof w) : 0;
+    check(n == 38 && w[0] == 0 && w[17] == 0 && w[18] == 1 && w[19] == 0x20 && w[20] == 0xfb && w[21] == 3 &&
+              !memcmp(w + 22, g_k6_real, 16),
+          "the request names the v6 real: address type 3 and its 16 bytes");
+    if (fd >= 0) close(fd);
+    k_reset();
+}
+
+/* Catches: a v6 real dialled at a v4-only node, or the socket left open when no node carries IPv6 */
+static void t_ktcp_v6_real_without_v6_node_is_refused(void) {
+    int six = k6_pool(-1);
+    check(six == -1 && g_pl.slot[0].up && g_pl.slot[1].up, "fixture: two live slots, none carries IPv6");
+    k_cmd("198.18.0.43 2001:db8::40\n\n", 0);
+    int dials = srv_count();
+    unsigned miss0 = g_miss.miss;
+    int fd = k_dial(FAKE(43), 443, 1);
+    int st = k_wait(fd, 10);
+    check(st == 'R' && !k_conn_of(fd) && srv_count() == dials && g_park_n == 0 && g_miss.miss == miss0,
+          "no v6 node: the socket is reset and nothing is dialled");
+    if (fd >= 0) close(fd);
+    k_reset();
+}
+
+/* Catches: a v4 real given a v6 key or stray address bytes, or kept off the v4-only node */
+static void t_ktcp_v4_real_unchanged(void) {
+    int six = k6_pool(1);
+    k_cmd("198.18.0.44 10.4.4.4\n\n", 0);
+    int all = 1, on[2] = { 0, 0 };
+    static const unsigned char zero[12];
+    for (int i = 0; i < 24; i++) {
+        int fd = k_dial(FAKE(44), 443, 1);
+        struct conn *c = k_ready(fd, 200);
+        if (!c || c->key.v6 || c->key.dst.v4 != ip4(10, 4, 4, 4) || memcmp(c->key.dst.b + 4, zero, 12)) all = 0;
+        else on[((const struct pl_sess *)SESS(c))->slot & 1]++;
+        if (fd >= 0) close(fd);
+        k_reset();
+    }
+    check(six >= 0 && all && on[0] && on[1], "a v4 real dials with a v4 key, on either node");
+    k_reset();
+}
+
 static void sock_part(void) {
     int fl = fcntl(g_tun.fd, F_GETFL, 0);
     fcntl(g_tun.fd, F_SETFL, fl | O_NONBLOCK);
@@ -8252,6 +8348,9 @@ static void sock_part(void) {
     t_k_fin();
     t_k_killed_resets();
     t_k_no_node();
+    t_ktcp_v6_real_dials_a_v6_node();
+    t_ktcp_v6_real_without_v6_node_is_refused();
+    t_ktcp_v4_real_unchanged();
     t_k_two_loops();
     t_k_flush_error();
     t_k_prefixes();

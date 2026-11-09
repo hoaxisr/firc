@@ -1,10 +1,11 @@
 #include "firc/ktcp.h"
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-firc_err_t firc_ktcp_image_add(firc_ktcp_image_t *im, uint8_t dev, const uint8_t fake[4], const uint8_t real[4])
+firc_err_t firc_ktcp_image_add(firc_ktcp_image_t *im, uint8_t dev, const uint8_t fake[4], const firc_ip_t *real)
 {
     if (im->n == im->cap) {
         size_t cap = im->cap ? im->cap * 2 : 64;
@@ -16,7 +17,9 @@ firc_err_t firc_ktcp_image_add(firc_ktcp_image_t *im, uint8_t dev, const uint8_t
     firc_ktcp_pair_t *p = &im->v[im->n++];
     p->dev = dev;
     memcpy(p->fake, fake, 4);
-    memcpy(p->real, real, 4);
+    memset(p->real, 0, sizeof(p->real));
+    memcpy(p->real, real->b, real->len);
+    p->real_len = real->len;
     return FIRC_OK;
 }
 
@@ -140,8 +143,22 @@ void firc_ktcp_image_free(firc_ktcp_image_t *im)
     memset(im, 0, sizeof(*im));
 }
 
+static firc_ip_t real_of_pair(const firc_ktcp_pair_t *p)
+{
+    firc_ip_t r = {{0}, p->real_len};
+    memcpy(r.b, p->real, sizeof(r.b));
+    return r;
+}
+
+static void emit(void (*fn)(uint8_t dev, const uint8_t fake[4], const firc_ip_t *real, void *ud),
+                 const firc_ktcp_pair_t *p, void *ud)
+{
+    firc_ip_t r = real_of_pair(p);
+    fn(p->dev, p->fake, &r, ud);
+}
+
 void firc_ktcp_image_diff(const firc_ktcp_image_t *prev, const firc_ktcp_image_t *next,
-                          void (*fn)(uint8_t dev, const uint8_t fake[4], const uint8_t *real, void *ud), void *ud)
+                          void (*fn)(uint8_t dev, const uint8_t fake[4], const firc_ip_t *real, void *ud), void *ud)
 {
     size_t i = 0, j = 0;
     while (i < prev->n && j < next->n) {
@@ -151,16 +168,16 @@ void firc_ktcp_image_diff(const firc_ktcp_image_t *prev, const firc_ktcp_image_t
             fn(p->dev, p->fake, NULL, ud);
             i++;
         } else if (c > 0) {
-            fn(q->dev, q->fake, q->real, ud);
+            emit(fn, q, ud);
             j++;
         } else {
-            if (memcmp(p->real, q->real, 4) != 0) { fn(q->dev, q->fake, q->real, ud); }
+            if (p->real_len != q->real_len || memcmp(p->real, q->real, sizeof(p->real)) != 0) { emit(fn, q, ud); }
             i++;
             j++;
         }
     }
     for (; i < prev->n; i++) { fn(prev->v[i].dev, prev->v[i].fake, NULL, ud); }
-    for (; j < next->n; j++) { fn(next->v[j].dev, next->v[j].fake, next->v[j].real, ud); }
+    for (; j < next->n; j++) { emit(fn, &next->v[j], ud); }
 }
 
 static size_t room_for(size_t n, size_t min)
@@ -203,10 +220,12 @@ static firc_err_t open_cmd(firc_ktcp_cmds_t *c, const char *word)
     return err;
 }
 
+#define MAP_LINE_MAX (16 + INET6_ADDRSTRLEN)
+
 static firc_err_t add_line(firc_ktcp_cmds_t *c, const char *word, bool open, const char *line)
 {
     bool fresh = open || c->n_cmds == 0 || c->counts[c->n_cmds - 1] == FIRC_KTCP_CMD_LINES;
-    char buf[64];
+    char buf[MAP_LINE_MAX + 8];
     int n = fresh ? snprintf(buf, sizeof(buf), "%s\n%s\n\n", word, line) : snprintf(buf, sizeof(buf), "%s\n\n", line);
     firc_err_t err = fresh ? reserve_cmd(c) : FIRC_OK;
     if (err != FIRC_OK) { return err; }
@@ -224,13 +243,17 @@ static firc_err_t add_line(firc_ktcp_cmds_t *c, const char *word, bool open, con
     return FIRC_OK;
 }
 
-static void map_line(char *buf, size_t cap, const uint8_t fake[4], const uint8_t *real)
+static void map_line(char *buf, size_t cap, const uint8_t fake[4], const firc_ip_t *real)
 {
-    if (real) {
-        snprintf(buf, cap, "%u.%u.%u.%u %u.%u.%u.%u", fake[0], fake[1], fake[2], fake[3], real[0], real[1], real[2],
-                 real[3]);
+    int n = snprintf(buf, cap, "%u.%u.%u.%u ", fake[0], fake[1], fake[2], fake[3]);
+    char *at = buf + n;
+    size_t left = cap - (size_t)n;
+    if (real == NULL) {
+        snprintf(at, left, "-");
+    } else if (real->len == 16) {
+        inet_ntop(AF_INET6, real->b, at, (socklen_t)left);
     } else {
-        snprintf(buf, cap, "%u.%u.%u.%u -", fake[0], fake[1], fake[2], fake[3]);
+        snprintf(at, left, "%u.%u.%u.%u", real->b[0], real->b[1], real->b[2], real->b[3]);
     }
 }
 
@@ -249,8 +272,9 @@ firc_err_t firc_ktcp_map_cmds(const firc_ktcp_image_t *im, uint8_t dev, bool all
     for (size_t i = 0; err == FIRC_OK && i < im->n; i++) {
         const firc_ktcp_pair_t *p = &im->v[i];
         if (p->dev != dev) { continue; }
-        char buf[40];
-        map_line(buf, sizeof(buf), p->fake, p->real);
+        char buf[MAP_LINE_MAX];
+        firc_ip_t r = real_of_pair(p);
+        map_line(buf, sizeof(buf), p->fake, &r);
         err = add_line(out, "map", open, buf);
         open = false;
     }
@@ -258,9 +282,9 @@ firc_err_t firc_ktcp_map_cmds(const firc_ktcp_image_t *im, uint8_t dev, bool all
     return err;
 }
 
-firc_err_t firc_ktcp_line(firc_ktcp_cmds_t *out, const uint8_t fake[4], const uint8_t *real)
+firc_err_t firc_ktcp_line(firc_ktcp_cmds_t *out, const uint8_t fake[4], const firc_ip_t *real)
 {
-    char buf[40];
+    char buf[MAP_LINE_MAX];
     map_line(buf, sizeof(buf), fake, real);
     return add_line(out, "map", false, buf);
 }

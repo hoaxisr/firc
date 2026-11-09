@@ -39,6 +39,13 @@ typedef firc_dns_verdict_t (*firc_dnsproxy_msg_cb)(firc_dns_msg_t *msg, const fi
                                                    const char *network, firc_dns_resolver_t resolver,
                                                    void *ud);
 
+/* Answers a_msg, the A answer the callback asked AAAA for, from that AAAA answer (NULL: none came); PASS sends a_msg. */
+typedef firc_dns_verdict_t (*firc_dnsproxy_cross_cb)(firc_dns_msg_t *a_msg, const firc_dns_msg_t *aaaa_msg,
+                                                     const firc_ip_t *client, firc_dns_resolver_t resolver, void *ud);
+
+/* NULL asks no AAAA: FIRC_DNS_ASK_AAAA is then PASS. Loop thread, or before start. */
+void firc_dnsproxy_set_cross(firc_dnsproxy_t *p, firc_dnsproxy_cross_cb fn, void *ud);
+
 /* Every upstream socket goes through these; each returns what its syscall does. */
 typedef struct firc_dnsproxy_sock_ops {
     int (*open)(void *ud, int family, int type);

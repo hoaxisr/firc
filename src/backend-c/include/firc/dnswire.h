@@ -72,6 +72,7 @@ typedef enum firc_dns_verdict {
     FIRC_DNS_HOLD,       /* rewritten; send after the next commit or at the deadline */
     FIRC_DNS_DROP,       /* answer nothing: the real answer must not go out */
     FIRC_DNS_RETIMED,    /* only a TTL came down; still real, so AAAA stripping applies */
+    FIRC_DNS_ASK_AAAA,   /* an empty A for a cross-capable owner: ask AAAA, then firc_dns_pipeline_cross_answer */
 } firc_dns_verdict_t;
 
 /* Compresses owner names, never rdata. Caller frees *out. */

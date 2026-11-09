@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "firc/err.h"
+#include "firc/fakeip_addr.h"
 #include "firc/ipset_to_link.h"
 
 #define FIRC_KTCP_DEVICES 100
@@ -15,7 +16,8 @@
 typedef struct {
     uint8_t dev;
     uint8_t fake[4];
-    uint8_t real[4];
+    uint8_t real[16];
+    uint8_t real_len;
 } firc_ktcp_pair_t;
 
 typedef struct {
@@ -23,7 +25,7 @@ typedef struct {
     size_t n, cap;
 } firc_ktcp_image_t;
 
-firc_err_t firc_ktcp_image_add(firc_ktcp_image_t *im, uint8_t dev, const uint8_t fake[4], const uint8_t real[4]);
+firc_err_t firc_ktcp_image_add(firc_ktcp_image_t *im, uint8_t dev, const uint8_t fake[4], const firc_ip_t *real);
 
 /* Sorts by (dev, fake) and keeps one pair per key; a later duplicate wins. */
 void firc_ktcp_image_sort(firc_ktcp_image_t *im);
@@ -33,7 +35,7 @@ void firc_ktcp_image_free(firc_ktcp_image_t *im);
 /* Calls fn(dev, fake, real) per pair that entered or changed, real NULL per pair that left; ordered by
    (dev, fake). Both images must be sorted. */
 void firc_ktcp_image_diff(const firc_ktcp_image_t *prev, const firc_ktcp_image_t *next,
-                          void (*fn)(uint8_t dev, const uint8_t fake[4], const uint8_t *real, void *ud), void *ud);
+                          void (*fn)(uint8_t dev, const uint8_t fake[4], const firc_ip_t *real, void *ud), void *ud);
 
 /* Commands for tunvless's stdin, each ended by an empty line; counts[i] is the line count of command i. */
 typedef struct {
@@ -49,7 +51,7 @@ firc_err_t firc_ktcp_map_cmds(const firc_ktcp_image_t *im, uint8_t dev, bool all
 
 /* Appends one delta line ("-" when real is NULL) to the last command, opening a "map" command when there
    is none or it is full; keep delta lines in a cmds of their own. On failure out is left as it was. */
-firc_err_t firc_ktcp_line(firc_ktcp_cmds_t *out, const uint8_t fake[4], const uint8_t *real);
+firc_err_t firc_ktcp_line(firc_ktcp_cmds_t *out, const uint8_t fake[4], const firc_ip_t *real);
 
 /* Appends "close" commands listing the v4 prefixes of p; nothing when there is none. On failure out is left
    as it was. */

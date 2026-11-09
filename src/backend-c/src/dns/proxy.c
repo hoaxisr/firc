@@ -68,6 +68,8 @@ struct firc_dnsproxy {
     firc_loop_t *loop;
     firc_dnsproxy_msg_cb cb;
     void *cb_ud;
+    firc_dnsproxy_cross_cb cross_fn;
+    void *cross_ud;
 
     int udp_fd;
     int tcp_fd;
@@ -221,6 +223,12 @@ void firc_dnsproxy_set_blocked(firc_dnsproxy_t *p, firc_dnsproxy_blocked_cb fn, 
     p->blocked_ud = ud;
 }
 
+void firc_dnsproxy_set_cross(firc_dnsproxy_t *p, firc_dnsproxy_cross_cb fn, void *ud)
+{
+    p->cross_fn = fn;
+    p->cross_ud = ud;
+}
+
 void firc_dnsproxy_set_tally(firc_dnsproxy_t *p, firc_dnsproxy_tally_fn fn, void *ud)
 {
     p->tally_fn = fn;
@@ -296,6 +304,8 @@ typedef struct exchange {
     uint8_t *held;
     size_t held_len;
     firc_dns_msg_t *held_msg;
+    firc_dns_msg_t *cross_a;
+    uint8_t cross_resolver;
     struct exchange *held_next;
     struct exchange *prefetch_next;
 } exchange_t;
@@ -606,6 +616,7 @@ static void exchange_free(exchange_t *ex)
     free(ex->held);
     free(ex->cached);
     firc_dns_msg_free(ex->held_msg);
+    firc_dns_msg_free(ex->cross_a);
     free(ex);
 }
 
@@ -619,10 +630,12 @@ static bool rearm_fd(firc_loop_t *loop, int fd, uint32_t events, firc_fd_cb cb,
 
 static void held_unlink(firc_dnsproxy_t *p, exchange_t *ex);
 static void prefetch_unlink(firc_dnsproxy_t *p, exchange_t *ex);
+static void prefetch_start(firc_dnsproxy_t *p, const exchange_t *src);
 static void leg_failed(exchange_t *ex, firc_dns_resolver_t why);
 static void tunnel_failed(exchange_t *ex, firc_dns_resolver_t why);
 static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex);
 static void on_timeout(firc_loop_t *loop, void *ud);
+static bool follow_up(exchange_t *ex, firc_dns_msg_t *a);
 
 /* Pool by upstream_tunnel, never tunnel: a marked socket must not reach the common pool. */
 static void upstream_release(firc_dnsproxy_t *p, exchange_t *ex, bool reuse)
@@ -933,10 +946,22 @@ static void deliver_parsed(exchange_t *ex, firc_dns_msg_t *msg, const uint8_t *r
         exchange_finish(ex, true);
         return;
     }
-    if (p->cb != NULL) {
-        firc_ip_t client;
-        verdict = p->cb(msg, client_ip(ex, &client) ? &client : NULL, network,
-                       (firc_dns_resolver_t)ex->resolver, p->cb_ud);
+    firc_ip_t client;
+    const firc_ip_t *cp = client_ip(ex, &client) ? &client : NULL;
+    bool repack = false;
+    if (ex->cross_a != NULL) {
+        firc_dns_msg_t *a = ex->cross_a;
+        ex->cross_a = NULL;
+        verdict = p->cross_fn(a, msg, cp, (firc_dns_resolver_t)ex->cross_resolver, p->cross_ud);
+        firc_dns_msg_free(msg);
+        msg = a;
+        repack = true;
+    } else if (p->cb != NULL) {
+        verdict = p->cb(msg, cp, network, (firc_dns_resolver_t)ex->resolver, p->cb_ud);
+    }
+    if (verdict == FIRC_DNS_ASK_AAAA) {
+        if (follow_up(ex, msg)) { return; }
+        verdict = FIRC_DNS_PASS;
     }
     if (verdict == FIRC_DNS_DROP) {
         /* The real answer must not stand in for a rewrite that failed. */
@@ -953,7 +978,7 @@ static void deliver_parsed(exchange_t *ex, firc_dns_msg_t *msg, const uint8_t *r
     uint8_t *packed = NULL;
     /* No AAAA strip after a rewrite: it would delete what the pool just issued. */
     bool stripping = !p->cfg.disable_drop_aaaa && !modified && firc_dns_msg_strip_aaaa(msg);
-    if (modified || retimed || stripping) {
+    if (modified || retimed || stripping || repack) {
         if (firc_dns_msg_pack(msg, &packed, &out_len) != FIRC_OK) {
             firc_dns_msg_free(msg);
             exchange_finish(ex, false);
@@ -1028,7 +1053,7 @@ static void deliver_parsed(exchange_t *ex, firc_dns_msg_t *msg, const uint8_t *r
 static void tunnel_won(exchange_t *ex, const firc_dns_msg_t *msg, const uint8_t *resp, size_t resp_len)
 {
     firc_dnsproxy_t *p = ex->p;
-    if (!ex->prefetch) {
+    if (!ex->prefetch && ex->cross_a == NULL) {
         group_health_t *h = health_lookup(p, ex->route.group_id);
         if (h != NULL) { health_answered(h, health_now(p)); }
     }
@@ -1348,9 +1373,30 @@ static void on_client_writable(firc_loop_t *loop, int fd, uint32_t events,
     exchange_finish(ex, false);
 }
 
+static void follow_up_failed(exchange_t *ex)
+{
+    firc_dnsproxy_t *p = ex->p;
+    if (ex->timer_id > 0) {
+        firc_loop_del_timer(p->loop, ex->timer_id);
+        ex->timer_id = 0;
+    }
+    legs_release(p, ex, true);
+    upstream_release(p, ex, false);
+    ex->tunnel = false;
+    if (ex->is_tcp && firc_loop_add_timer(p->loop, leg_timeout_ms(ex), 0, on_timeout, ex, &ex->timer_id) != FIRC_OK) {
+        exchange_finish(ex, false);
+        return;
+    }
+    deliver_parsed(ex, NULL, NULL, 0);
+}
+
 static void tunnel_failed(exchange_t *ex, firc_dns_resolver_t why)
 {
     firc_dnsproxy_t *p = ex->p;
+    if (ex->cross_a != NULL) {
+        follow_up_failed(ex);
+        return;
+    }
     if (ex->timer_id > 0) {
         firc_loop_del_timer(p->loop, ex->timer_id);
         ex->timer_id = 0;
@@ -1371,6 +1417,10 @@ static void tunnel_failed(exchange_t *ex, firc_dns_resolver_t why)
 static void leg_failed(exchange_t *ex, firc_dns_resolver_t why)
 {
     if (common_leg_open(ex)) { upstream_missed(ex->p); }
+    if (ex->cross_a != NULL) {
+        follow_up_failed(ex);
+        return;
+    }
     if (!ex->tunnel) {
         exchange_finish(ex, false);
         return;
@@ -1477,6 +1527,91 @@ static void start_upstream(firc_dnsproxy_t *p, exchange_t *ex)
     ex->timer_id = tid;
 }
 
+static bool qtype_offset(const uint8_t *m, size_t len, size_t *at)
+{
+    size_t i = 12;
+    for (;;) {
+        if (i >= len) { return false; }
+        uint8_t l = m[i];
+        if (l == 0) {
+            i += 1;
+            break;
+        }
+        if ((l & 0xc0u) == 0xc0u) {
+            i += 2;
+            break;
+        }
+        if ((l & 0xc0u) != 0) { return false; }
+        i += 1u + l;
+    }
+    if (i + 4 > len) { return false; }
+    *at = i;
+    return true;
+}
+
+static bool follow_up(exchange_t *ex, firc_dns_msg_t *a)
+{
+    firc_dnsproxy_t *p = ex->p;
+    size_t off = ex->framed ? 2u : 0u;
+    size_t at = 0;
+    if (p->cross_fn == NULL || ex->n_q != 1 || ex->q.qtype != FIRC_DNS_TYPE_A ||
+        !qtype_offset(ex->req + off, ex->req_len - off, &at)) {
+        return false;
+    }
+    if (ex->timer_id > 0) {
+        firc_loop_del_timer(p->loop, ex->timer_id);
+        ex->timer_id = 0;
+    }
+    upstream_release(p, ex, true);
+    legs_release(p, ex, true);
+    ex->req[off + at] = (uint8_t)((unsigned)FIRC_DNS_TYPE_AAAA >> 8u);
+    ex->req[off + at + 1] = (uint8_t)FIRC_DNS_TYPE_AAAA;
+    ex->q.qtype = FIRC_DNS_TYPE_AAAA;
+    ex->cross_a = a;
+    ex->cross_resolver = ex->resolver;
+    ex->deadline_ms = mono_ms() + p->cfg.timeout_ms;
+    bool routed = ex->route.n_servers > 0;
+    if (routed && ex->resolver == FIRC_DNS_RESOLVER_CACHE) {
+        group_health_t *h = health_lookup(p, ex->route.group_id);
+        bool own = h != NULL && h->gen == ex->route.gen;
+        uint64_t now = health_now(p);
+        bool resting = own && h->rest_until_ms != 0 && (now < h->rest_until_ms || h->probing);
+        ex->tunnel = !resting;
+        ex->server = own ? h->preferred % ex->route.n_servers : 0;
+        ex->resolver = (uint8_t)(resting ? FIRC_DNS_RESOLVER_HEALTH_SKIP : FIRC_DNS_RESOLVER_GROUP);
+    }
+    firc_dns_msg_t *q = NULL;
+    ex->cacheable = routed && firc_dns_msg_parse(ex->req + off, ex->req_len - off, &q) == FIRC_OK &&
+                    firc_anscache_key_of(q, ex->route.group_id, ex->route.gen, &ex->ckey);
+    firc_dns_msg_free(q);
+    firc_anscache_hit_t hit;
+    if (ex->cacheable &&
+        firc_anscache_get(p->cache, &ex->ckey, ex->req + off, ex->req_len - off, p->cache_now(), &hit)) {
+        bool usable = ex->is_tcp || hit.len <= ex->udp_max;
+        if (hit.prefetch && usable) {
+            prefetch_start(p, ex);
+        } else if (hit.prefetch) {
+            firc_anscache_prefetch_done(p->cache, &ex->ckey);
+        }
+        if (usable) {
+            ex->tunnel = false;
+            ex->resolver = FIRC_DNS_RESOLVER_CACHE;
+            if (ex->is_tcp &&
+                firc_loop_add_timer(p->loop, leg_timeout_ms(ex), 0, on_timeout, ex, &ex->timer_id) != FIRC_OK) {
+                free(hit.wire);
+                exchange_finish(ex, false);
+                return true;
+            }
+            deliver_response(ex, hit.wire, hit.len);
+            free(hit.wire);
+            return true;
+        }
+        free(hit.wire);
+    }
+    start_upstream(p, ex);
+    return true;
+}
+
 static void prefetch_start(firc_dnsproxy_t *p, const exchange_t *src)
 {
     group_health_t *h = health_lookup(p, src->route.group_id);
@@ -1484,18 +1619,19 @@ static void prefetch_start(firc_dnsproxy_t *p, const exchange_t *src)
     uint64_t now = health_now(p);
     bool gated = own && h->rest_until_ms != 0 && (now < h->rest_until_ms || h->probing);
     exchange_t *ex = (p->n_prefetch < FIRC_DNSPROXY_MAX_PREFETCH && !gated) ? calloc(1, sizeof(*ex)) : NULL;
-    uint8_t *req = ex != NULL ? malloc(src->req_len) : NULL;
+    size_t off = src->framed ? 2u : 0u;
+    uint8_t *req = ex != NULL ? malloc(src->req_len - off) : NULL;
     if (req == NULL) {
         free(ex);
         firc_anscache_prefetch_done(p->cache, &src->ckey);
         return;
     }
-    memcpy(req, src->req, src->req_len);
+    memcpy(req, src->req + off, src->req_len - off);
     ex->p = p;
     ex->upstream_fd = -1;
     ex->client_fd = -1;
     ex->req = req;
-    ex->req_len = src->req_len;
+    ex->req_len = src->req_len - off;
     ex->udp_max = src->udp_max;
     ex->qid = src->qid;
     ex->n_q = src->n_q;

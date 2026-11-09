@@ -6,11 +6,13 @@
 
 enum { CM_NONE, CM_REAL, CM_DENIED, CM_PENDING };
 
+struct cm_real { uint8_t b[16]; uint8_t v6; };
+
 int ctlmap_init(uint32_t pool_be, int pool_len);
 int ctlmap_in_pool(uint32_t a_be);
-int ctlmap_lookup(uint32_t fake_be, uint32_t *real_be);
+int ctlmap_lookup(uint32_t fake_be, struct cm_real *real);
 int ctlmap_ask(uint32_t fake_be);
-int ctlmap_answer(uint32_t fake_be, uint32_t *real_be);
+int ctlmap_answer(uint32_t fake_be, struct cm_real *real);
 void ctlmap_unask(uint32_t fake_be);
 int ctlmap_read_cmd(FILE *in, char **line, size_t *cap, int all);
 int ctlmap_read_close(FILE *in, char **line, size_t *cap);

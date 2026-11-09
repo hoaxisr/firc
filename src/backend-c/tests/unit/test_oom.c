@@ -679,9 +679,10 @@ static bool cmds_same(cmds_snap_t *s, const firc_ktcp_cmds_t *c) {
 }
 
 static void ktcp_base(firc_ktcp_cmds_t *c) {
-    const uint8_t fake[4] = {198, 18, 200, 1}, real[4] = {8, 8, 4, 4};
+    const uint8_t fake[4] = {198, 18, 200, 1};
+    const firc_ip_t real = {{8, 8, 4, 4}, 4};
     memset(c, 0, sizeof(*c));
-    if (firc_ktcp_line(c, fake, real) != FIRC_OK) { abort(); }
+    if (firc_ktcp_line(c, fake, &real) != FIRC_OK) { abort(); }
 }
 
 static void octets_of_digits(unsigned digits, uint8_t o[4]) {
@@ -692,7 +693,7 @@ static void octets_of_digits(unsigned digits, uint8_t o[4]) {
     }
 }
 
-static firc_err_t line_unchanged_on_failure(firc_ktcp_cmds_t *out, const uint8_t fake[4], const uint8_t *real,
+static firc_err_t line_unchanged_on_failure(firc_ktcp_cmds_t *out, const uint8_t fake[4], const firc_ip_t *real,
                                             long *failed, bool *changed) {
     for (long at = 0;; at++) {
         cmds_snap_t snap;
@@ -714,14 +715,15 @@ TEST a_failed_delta_line_leaves_the_commands_as_they_were(void) {
     bool changed = false;
     for (unsigned first = 9; first <= 31; first++) {
         firc_ktcp_cmds_t out = {0};
-        uint8_t fake[4], real[4];
+        uint8_t fake[4];
+        firc_ip_t real = {{0}, 4};
         if (first <= 17) {
             octets_of_digits(first - 5, fake);
             ASSERT_EQ(FIRC_OK, line_unchanged_on_failure(&out, fake, NULL, &failed, &changed));
         } else {
             octets_of_digits(first - 7 - (first - 7) / 2, fake);
-            octets_of_digits((first - 7) / 2, real);
-            ASSERT_EQ(FIRC_OK, line_unchanged_on_failure(&out, fake, real, &failed, &changed));
+            octets_of_digits((first - 7) / 2, real.b);
+            ASSERT_EQ(FIRC_OK, line_unchanged_on_failure(&out, fake, &real, &failed, &changed));
         }
         ASSERT_EQ_FMT((size_t)first + 6, out.len, "%zu");
         unsigned lines = first == 9 ? 4200 : 300;
@@ -746,8 +748,9 @@ TEST a_failed_map_or_close_set_leaves_the_commands_as_they_were(void) {
     firc_nf_prefix_t *p = __real_calloc(5000, sizeof(*p));
     ASSERT(p != NULL);
     for (unsigned i = 0; i < 5000; i++) {
-        const uint8_t fake[4] = {198, 18, (uint8_t)(i >> 8), (uint8_t)i}, real[4] = {10, 0, (uint8_t)(i >> 8), (uint8_t)i};
-        ASSERT_EQ(FIRC_OK, firc_ktcp_image_add(&im, 1, fake, real));
+        const uint8_t fake[4] = {198, 18, (uint8_t)(i >> 8), (uint8_t)i};
+        const firc_ip_t real = {{10, 0, (uint8_t)(i >> 8), (uint8_t)i}, 4};
+        ASSERT_EQ(FIRC_OK, firc_ktcp_image_add(&im, 1, fake, &real));
         p[i] = (firc_nf_prefix_t){.family = 4, .cidr = 32, .addr = {10, 1, (uint8_t)(i >> 8), (uint8_t)i}};
     }
     for (int kind = 0; kind < 3; kind++) {

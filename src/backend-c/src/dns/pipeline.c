@@ -9,6 +9,7 @@
 #include "firc/events.h"
 #include "firc/log.h"
 #include "firc/logrep.h"
+#include "firc/resolver_addr.h"
 
 #define FIRC_DNS_OUTAGE_RUN 8
 #define FIRC_DNS_OUTAGE_ERROR_AFTER_MS 60000u
@@ -19,6 +20,8 @@ struct firc_dns_pipeline {
     uint32_t unmatched_ttl_secs;
     firc_dns_v6_fn v6_fn;
     void *v6_ud;
+    firc_dns_cross_fn cross_fn;
+    void *cross_ud;
     firc_devsel_policy_fn policy_fn;
     firc_devsel_device_fn device_fn;
     void *policy_ud;
@@ -87,6 +90,12 @@ void firc_dns_pipeline_set_v6_fn(firc_dns_pipeline_t *p, firc_dns_v6_fn fn, void
 {
     p->v6_fn = fn;
     p->v6_ud = ud;
+}
+
+void firc_dns_pipeline_set_cross_fn(firc_dns_pipeline_t *p, firc_dns_cross_fn fn, void *ud)
+{
+    p->cross_fn = fn;
+    p->cross_ud = ud;
 }
 
 void firc_dns_pipeline_set_unmatched_ttl(firc_dns_pipeline_t *p, uint32_t secs)
@@ -261,9 +270,43 @@ static void note_blocked(firc_dns_pipeline_t *p, const firc_dns_msg_t *msg, int6
                        (uint8_t)FIRC_DNS_BLOCKED, NULL, now);
 }
 
-static firc_dns_verdict_t rewrite(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, int64_t now,
-                                  const firc_group_snapshot_t *owner, const char *qname,
-                                  const chain_t *chain, bool *pool_changed, firc_event_t *ev)
+typedef struct {
+    firc_ip_t v[64];
+    size_t n;
+    bool had4, had6;
+    uint32_t ttl;
+} reals_t;
+
+static void chain_reals(const firc_dns_msg_t *msg, const chain_t *chain, uint32_t clamp, reals_t *r)
+{
+    r->n = 0;
+    r->had4 = r->had6 = false;
+    r->ttl = clamp;
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        const firc_dns_rr_t *rr = &msg->answers[i];
+        if (rr->rtype != FIRC_DNS_TYPE_A && rr->rtype != FIRC_DNS_TYPE_AAAA) { continue; }
+        char rr_owner[1100];
+        if (firc_dns_name_to_string(rr->name, rr->name_len, rr_owner, sizeof(rr_owner), NULL) != FIRC_OK) {
+            continue;
+        }
+        trim_fqdn(rr_owner);
+        fold_ascii(rr_owner);
+        if (!chain_has(chain, rr_owner)) { continue; }
+        uint8_t len = rr->rtype == FIRC_DNS_TYPE_A ? 4 : 16;
+        if (rr->rdata_len != len) { continue; }
+        if (len == 4) { r->had4 = true; } else { r->had6 = true; }
+        if (rr->ttl < r->ttl) { r->ttl = rr->ttl; }
+        if (r->n < sizeof(r->v) / sizeof(r->v[0])) {
+            memcpy(r->v[r->n].b, rr->rdata, len);
+            r->v[r->n].len = len;
+            r->n++;
+        }
+    }
+}
+
+static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, int64_t now,
+                                       const firc_group_snapshot_t *owner, const char *qname, const reals_t *r,
+                                       bool cross, bool *pool_changed, firc_event_t *ev)
 {
     char group_id[FIRC_ID_STR_LEN];
     firc_id_format(owner->id, group_id);
@@ -277,55 +320,33 @@ static firc_dns_verdict_t rewrite(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, i
     }
     /* LIMIT/NOMEM answer with the blackhole, never the real address. */
 
-    firc_ip_t reals[64];
-    size_t n_reals = 0;
-    bool had4 = false, had6 = false;
-    uint32_t ttl = p->clamp_secs;
-    for (size_t i = 0; i < msg->n_answers; i++) {
-        const firc_dns_rr_t *rr = &msg->answers[i];
-        if (rr->rtype != FIRC_DNS_TYPE_A && rr->rtype != FIRC_DNS_TYPE_AAAA) { continue; }
-        char rr_owner[1100];
-        if (firc_dns_name_to_string(rr->name, rr->name_len, rr_owner, sizeof(rr_owner), NULL) != FIRC_OK) {
-            continue;
-        }
-        trim_fqdn(rr_owner);
-        fold_ascii(rr_owner);
-        if (!chain_has(chain, rr_owner)) { continue; }
-        uint8_t len = rr->rtype == FIRC_DNS_TYPE_A ? 4 : 16;
-        if (rr->rdata_len != len) { continue; }
-        if (len == 4) { had4 = true; } else { had6 = true; }
-        if (rr->ttl < ttl) { ttl = rr->ttl; }
-        if (n_reals < sizeof(reals) / sizeof(reals[0])) {
-            memcpy(reals[n_reals].b, rr->rdata, len);
-            reals[n_reals].len = len;
-            n_reals++;
-        }
-    }
     if (ev != NULL) {
-        size_t k = n_reals < FIRC_EVENT_REALS ? n_reals : FIRC_EVENT_REALS;
-        memcpy(ev->u.dns.reals, reals, k * sizeof(reals[0]));
+        size_t k = r->n < FIRC_EVENT_REALS ? r->n : FIRC_EVENT_REALS;
+        memcpy(ev->u.dns.reals, r->v, k * sizeof(r->v[0]));
         ev->u.dns.n_reals = (uint8_t)k;
     }
-    if (issue == FIRC_OK && n_reals > 0) {
-        firc_err_t e = firc_fakeip_set_reals(p->pool, qname, group_id, reals, n_reals);
+    if (issue == FIRC_OK && cross) { firc_fakeip_clear_real(p->pool, qname, group_id, 4); }
+    if (issue == FIRC_OK && r->n > 0) {
+        firc_err_t e = firc_fakeip_set_reals(p->pool, qname, group_id, r->v, r->n);
         if (e != FIRC_OK) {
             firc_lograte_say(&p->said_reals, 60000, FIRC_LOG_WARN, NULL, "recording real addresses for %s: %s", qname,
                              firc_err_str(e));
         }
         /* Every real address, not only the event's four. */
-        for (size_t i = 0; i < n_reals; i++) {
-            firc_recall_real(p->recall, &reals[i], qname, group_id, now);
+        for (size_t i = 0; i < r->n; i++) {
+            firc_recall_real(p->recall, &r->v[i], qname, group_id, now);
         }
     }
 
     /* Set whatever happens to the answer below: the pool has already changed. */
     if (pool_changed != NULL) { *pool_changed = firc_fakeip_gen(p->pool) != gen_before; }
 
-    if (p->v6_fn != NULL && !p->v6_fn(p->v6_ud, owner->id)) {
-        had6 = false;
+    bool want4 = r->had4 || cross, want6 = r->had6 && !cross;
+    if (!cross && p->v6_fn != NULL && !p->v6_fn(p->v6_ud, owner->id)) {
+        want6 = false;
         (void)firc_dns_msg_strip_aaaa(msg);
     }
-    firc_err_t e = firc_dns_msg_collapse(msg, had4 ? &fake4 : NULL, had6 ? &fake6 : NULL, ttl);
+    firc_err_t e = firc_dns_msg_collapse(msg, want4 ? &fake4 : NULL, want6 ? &fake6 : NULL, r->ttl);
     if (e != FIRC_OK) {
         /* Neither the real answer nor a broken one may go out. */
         firc_lograte_say(&p->said_collapse, 60000, FIRC_LOG_WARN, NULL, "collapsing the answer for %s: %s", qname,
@@ -334,15 +355,93 @@ static firc_dns_verdict_t rewrite(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, i
     }
     if (ev != NULL) {
         uint16_t qt = msg->questions[0].qtype;
-        if (qt == FIRC_DNS_TYPE_A && had4) { ev->u.dns.fake = fake4; }
-        if (qt == FIRC_DNS_TYPE_AAAA && had6) { ev->u.dns.fake = fake6; }
+        if (qt == FIRC_DNS_TYPE_A && want4) { ev->u.dns.fake = fake4; }
+        if (qt == FIRC_DNS_TYPE_AAAA && want6) { ev->u.dns.fake = fake6; }
     }
     journal_put(p, ev, issue == FIRC_OK ? FIRC_DNS_ISSUED : FIRC_DNS_POOL_REFUSED);
 
     bool waits = issue == FIRC_OK &&
-                 ((had4 && firc_fakeip_needs_commit(p->pool, &fake4)) ||
-                  (had6 && firc_fakeip_needs_commit(p->pool, &fake6)));
+                 ((want4 && firc_fakeip_needs_commit(p->pool, &fake4)) ||
+                  (want6 && firc_fakeip_needs_commit(p->pool, &fake6)));
     return waits ? FIRC_DNS_HOLD : FIRC_DNS_REWRITTEN;
+}
+
+static firc_dns_verdict_t rewrite(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, int64_t now,
+                                  const firc_group_snapshot_t *owner, const char *qname,
+                                  const chain_t *chain, bool *pool_changed, firc_event_t *ev)
+{
+    reals_t r;
+    chain_reals(msg, chain, p->clamp_secs, &r);
+    if (msg->questions[0].qtype == FIRC_DNS_TYPE_A && !r.had4 && p->cross_fn != NULL &&
+        p->cross_fn(p->cross_ud, owner->id)) {
+        return FIRC_DNS_ASK_AAAA;
+    }
+    return answer_fakes(p, msg, now, owner, qname, &r, false, pool_changed, ev);
+}
+
+static bool usable_v6(const firc_dns_pipeline_t *p, const reals_t *r)
+{
+    size_t n6 = 0;
+    for (size_t i = 0; i < r->n; i++) {
+        if (r->v[i].len != 16) { continue; }
+        if (firc_resolver_ip_is_sink(&r->v[i]) || firc_fakeip_overlaps(p->pool, &r->v[i], 128)) { return false; }
+        n6++;
+    }
+    return n6 > 0;
+}
+
+static firc_dns_verdict_t cross_nodata(firc_dns_pipeline_t *p, int64_t now, const firc_group_snapshot_t *owner,
+                                       const char *qname, bool *pool_changed, firc_event_t *ev)
+{
+    char group_id[FIRC_ID_STR_LEN];
+    firc_id_format(owner->id, group_id);
+    uint64_t gen_before = firc_fakeip_gen(p->pool);
+    firc_ip_t fake4 = {{0}, 0}, fake6 = {{0}, 0};
+    firc_err_t issue = firc_fakeip_get(p->pool, qname, group_id, now, &fake4, &fake6);
+    if (issue == FIRC_OK) { firc_fakeip_clear_real(p->pool, qname, group_id, 4); }
+    if (pool_changed != NULL) { *pool_changed = firc_fakeip_gen(p->pool) != gen_before; }
+    if (issue != FIRC_ERR_INVAL) { journal_put(p, ev, issue == FIRC_OK ? FIRC_DNS_ISSUED : FIRC_DNS_POOL_REFUSED); }
+    return FIRC_DNS_PASS;
+}
+
+firc_dns_verdict_t firc_dns_pipeline_cross_answer(firc_dns_pipeline_t *p, firc_dns_msg_t *a_msg,
+                                                  const firc_dns_msg_t *aaaa_msg, int64_t now,
+                                                  const firc_ip_t *client, firc_dns_resolver_t resolver,
+                                                  bool *pool_changed)
+{
+    if (pool_changed != NULL) { *pool_changed = false; }
+    char qname[FIRC_DNS_MAX_NAME * 4 + 2];
+    if (p == NULL || p->pool == NULL || a_msg == NULL || a_msg->n_questions == 0 ||
+        a_msg->questions[0].qtype != FIRC_DNS_TYPE_A || !firc_dns_msg_queried_name(a_msg, qname, sizeof(qname))) {
+        return FIRC_DNS_PASS;
+    }
+    const firc_group_snapshot_t *owner =
+        firc_ruleset_snapshot_owner(p->snapshot, qname, client, p->policy_fn, p->device_fn, p->policy_ud, NULL);
+    if (owner == NULL || owner->block >= 0) { return FIRC_DNS_PASS; }
+
+    firc_event_t ev_store;
+    firc_event_t *ev = covered(p, client) ? &ev_store : NULL;
+    if (ev != NULL) {
+        journal_begin(ev, now, client, qname, a_msg, 0, resolver);
+        journal_group(ev, owner);
+    }
+    if (p->cross_fn == NULL || !p->cross_fn(p->cross_ud, owner->id)) {
+        return cross_nodata(p, now, owner, qname, pool_changed, ev);
+    }
+    reals_t r = {0};
+    if (aaaa_msg != NULL && (aaaa_msg->flags & 0x000fu) == 0) {
+        chain_t chain;
+        chain_build(&chain, aaaa_msg, qname);
+        chain_reals(aaaa_msg, &chain, p->clamp_secs, &r);
+    }
+    if (!usable_v6(p, &r)) { return cross_nodata(p, now, owner, qname, pool_changed, ev); }
+    size_t kept = 0;
+    for (size_t i = 0; i < r.n; i++) {
+        if (r.v[i].len == 16) { r.v[kept++] = r.v[i]; }
+    }
+    r.n = kept;
+    r.had4 = false;
+    return answer_fakes(p, a_msg, now, owner, qname, &r, true, pool_changed, ev);
 }
 
 static uint64_t outage_after(const firc_dns_pipeline_t *p)

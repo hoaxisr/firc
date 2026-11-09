@@ -3475,8 +3475,8 @@ static void park_cap_init(void) {
         g_park_cap = (int)(rl.rlim_cur - FD_RESERVE);
 }
 
-static void sock_open(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t pport, uint32_t dst,
-                      uint32_t od, uint16_t oport) {
+static void sock_open(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t pport,
+                      const struct cm_real *dst, uint32_t od, uint16_t oport) {
     struct conn *c = conn_new(tun);
     if (!c) {
         sock_rst(fd);
@@ -3491,7 +3491,8 @@ static void sock_open(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t
     c->born_turn = g_turn;
     c->room_seen = UINT32_MAX;
     c->key.src.v4 = peer;
-    c->key.dst.v4 = dst;
+    memcpy(c->key.dst.b, dst->b, sizeof c->key.dst.b);
+    c->key.v6 = dst->v6;
     c->key.sport = pport;
     c->key.dport = oport;
     c->key.proto = 6;
@@ -3532,8 +3533,8 @@ static void park(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t ppor
     }
     int a = ctlmap_ask(od);
     if (a < 0) {
-        uint32_t real;
-        if (ctlmap_lookup(od, &real) == CM_REAL) sock_open(tun, fd, peer, pport, real, od, oport);
+        struct cm_real real;
+        if (ctlmap_lookup(od, &real) == CM_REAL) sock_open(tun, fd, peer, pport, &real, od, oport);
         else sock_rst(fd);
         return;
     }
@@ -3546,7 +3547,7 @@ static void park(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t ppor
 
 static void park_pass(const struct tun_dev *tun) {
     for (int i = 0; i < g_park_n;) {
-        uint32_t real = 0;
+        struct cm_real real;
         int st = ctlmap_answer(g_park[i].od, &real);
         uint64_t age = (g_now_ns - g_park[i].at) / 1000000;
         if (st == CM_REAL || st == CM_DENIED) {
@@ -3559,7 +3560,7 @@ static void park_pass(const struct tun_dev *tun) {
             g_miss.timed_out++;
         }
         struct parked q = park_take(i);
-        if (st == CM_REAL) sock_open(tun, q.fd, q.peer, q.pport, real, q.od, q.oport);
+        if (st == CM_REAL) sock_open(tun, q.fd, q.peer, q.pport, &real, q.od, q.oport);
         else sock_rst(q.fd);
     }
 }
@@ -3599,13 +3600,14 @@ static void sock_take(const struct tun_dev *tun, int fd, const struct sockaddr_i
         sock_rst(fd);
         return;
     }
-    uint32_t dst = od.sin_addr.s_addr;
+    struct cm_real dst = { { 0 }, 0 };
+    memcpy(dst.b, &od.sin_addr.s_addr, 4);
     uint16_t pport = ntohs(pa->sin_port), oport = ntohs(od.sin_port);
-    if (ctlmap_in_pool(dst) && ctlmap_lookup(od.sin_addr.s_addr, &dst) != CM_REAL) {
+    if (ctlmap_in_pool(od.sin_addr.s_addr) && ctlmap_lookup(od.sin_addr.s_addr, &dst) != CM_REAL) {
         park(tun, fd, pa->sin_addr.s_addr, pport, od.sin_addr.s_addr, oport);
         return;
     }
-    sock_open(tun, fd, pa->sin_addr.s_addr, pport, dst, od.sin_addr.s_addr, oport);
+    sock_open(tun, fd, pa->sin_addr.s_addr, pport, &dst, od.sin_addr.s_addr, oport);
 }
 
 static void lst_arm(struct loop *L) {

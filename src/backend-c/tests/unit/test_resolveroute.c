@@ -777,6 +777,34 @@ TEST a_published_v6_flag_reaches_the_answer_and_flips_with_the_next_publish(void
     PASS();
 }
 
+/* Catches: the cross flag granted on v6 alone, on kernel TCP alone, or for a group the table lacks. */
+TEST cross_v6_needs_both_v6_and_kernel_tcp(void)
+{
+    firc_group_t *g[4] = {group("none", "tunvless0", 1), group("v6", "tunvless0", 2), group("ktcp", "tunvless0", 3),
+                          group("both", "tunvless0", 4)};
+    firc_resolve_input_t in[] = {
+        {.group = g[0], .mark = MARK1, .v6_route = false, .ktcp = false},
+        {.group = g[1], .mark = MARK1, .v6_route = true, .ktcp = false},
+        {.group = g[2], .mark = MARK1, .v6_route = false, .ktcp = true},
+        {.group = g[3], .mark = MARK1, .v6_route = true, .ktcp = true},
+    };
+    firc_resolve_router_t *r = firc_resolve_router_new(NULL);
+    ASSERT(r != NULL);
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(in, 4, NULL, &t));
+    firc_resolve_router_publish(r, &t);
+    ASSERT_FALSE(firc_resolve_router_cross_v6(r, g[0]->id));
+    ASSERT_FALSE(firc_resolve_router_cross_v6(r, g[1]->id));
+    ASSERT_FALSE(firc_resolve_router_cross_v6(r, g[2]->id));
+    ASSERT(firc_resolve_router_cross_v6(r, g[3]->id));
+    firc_id_t unknown = {0};
+    ASSERT_FALSE(firc_resolve_router_cross_v6(r, unknown));
+    ASSERT_FALSE(firc_resolve_router_cross_v6(NULL, g[3]->id));
+    firc_resolve_router_free(r);
+    for (size_t i = 0; i < 4; i++) { firc_group_free(g[i]); }
+    PASS();
+}
+
 TEST a_route_names_the_active_entry_not_the_first(void)
 {
     firc_group_t *g = group("listed", "up0", 1);
@@ -816,6 +844,7 @@ int main(int argc, char **argv)
     RUN_TEST(the_stale_groups_are_the_removed_and_the_rewired);
     RUN_TEST(a_published_v6_flag_reaches_the_answer_and_flips_with_the_next_publish);
     RUN_TEST(a_route_names_the_active_entry_not_the_first);
+    RUN_TEST(cross_v6_needs_both_v6_and_kernel_tcp);
     RUN_TEST(a_block_owner_is_claimed_without_a_route);
     RUN_TEST(the_owner_is_reported_when_the_route_is_declined);
     GREATEST_MAIN_END();

@@ -1946,6 +1946,148 @@ TEST the_reverse_index_agrees_with_a_walk_through_churn(void) {
     PASS();
 }
 
+typedef struct {
+    size_t n;
+    char group[4][16];
+    char fake[4][16];
+    char real[4][40];
+} cross_log_t;
+
+static void cross_entry(void *ud, const char *group_id, const firc_ip_t *fake4, const firc_ip_t *real6) {
+    cross_log_t *w = ud;
+    if (w->n >= 4) { return; }
+    snprintf(w->group[w->n], sizeof(w->group[0]), "%s", group_id);
+    s4(fake4, w->fake[w->n]);
+    s6(real6, w->real[w->n]);
+    w->n++;
+}
+
+static const firc_ip_t R6A = {{0x26, 0x06, [15] = 1}, 16};
+static const firc_ip_t R4A = {{9, 8, 7, 6}, 4};
+
+/* Catches: the cross walk missing a v4 fake whose only real is a v6, or changing the plain walk. */
+TEST a_v6_real_pairs_with_the_v4_fake_when_no_v4_real(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &R6A, 1));
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
+    ASSERT(s != NULL);
+    cross_log_t w = {0};
+    firc_fakeip_snapshot_cross_walk(s, cross_entry, &w);
+    ASSERT_EQ_FMT((size_t)1, w.n, "%zu");
+    ASSERT_STR_EQ("g1", w.group[0]);
+    ASSERT_STR_EQ("198.18.0.1", w.fake[0]);
+    ASSERT_STR_EQ("2606:0000:0000:0000:0000:0000:0000:0001", w.real[0]);
+    firc_fakeip_snapshot_free(s);
+
+    walk_log_t p = {0};
+    firc_fakeip_walk(f, log_entry, &p);
+    int i4 = find_fake(&p, "198.18.0.1");
+    ASSERT(i4 >= 0);
+    ASSERT_FALSEm("the plain walk still shows no v4 real", p.has_real[i4]);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+static bool real_behind(const firc_fakeip_t *f, const firc_ip_t *fake, firc_ip_t *real) {
+    const char *group_id = NULL;
+    return firc_fakeip_pair_of(f, fake, &group_id, real);
+}
+
+/* Catches: a v6 real chosen over an existing v4 real for a v4 fake. */
+TEST a_v4_real_beats_the_v6_one_for_the_v4_fake(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t both[] = {R6A, R4A};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
+    cross_log_t w = {0};
+    firc_fakeip_snapshot_cross_walk(s, cross_entry, &w);
+    ASSERT_EQ_FMT((size_t)0, w.n, "%zu");
+    firc_fakeip_snapshot_free(s);
+    firc_ip_t got = {{0}, 0};
+    ASSERT(real_behind(f, &v4, &got));
+    ASSERT_EQ(4, got.len);
+    ASSERT_MEM_EQ(R4A.b, got.b, 4);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: pair_of answering true for an address no mapping holds, or for a mapping with no real. */
+TEST pair_of_an_unknown_fake_is_false(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6, got = {{0}, 0};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    const firc_ip_t nobody = {{198, 18, 0, 99}, 4};
+    ASSERT_FALSE(real_behind(f, &nobody, &got));
+    ASSERT_FALSEm("a mapping with no real at all", real_behind(f, &v4, &got));
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: needs_commit reading only the v4 pair, so an answer holding a v6-backed v4 fake is released early. */
+TEST a_v6_real_for_the_v4_fake_needs_a_commit(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &R6A, 1));
+    ASSERT(firc_fakeip_needs_commit(f, &v4));
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
+    firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s));
+    firc_fakeip_snapshot_free(s);
+    ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: clear_real leaving the family's real, bumping nothing, touching the other family or an unknown mapping. */
+TEST a_cleared_v4_real_lets_the_v6_pair(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6, got = {{0}, 0};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t both[] = {R6A, R4A};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
+    firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s));
+    firc_fakeip_snapshot_free(s);
+    ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
+
+    uint64_t g0 = firc_fakeip_gen(f);
+    firc_fakeip_clear_real(f, "nobody.example.com", "g1", 4);
+    firc_fakeip_clear_real(f, "a.example.com", "g9", 4);
+    ASSERT_EQ_FMTm("an unknown mapping is a no-op", (unsigned long long)g0,
+                   (unsigned long long)firc_fakeip_gen(f), "%llu");
+    firc_fakeip_clear_real(f, "a.example.com", "g1", 4);
+    ASSERT(firc_fakeip_gen(f) > g0);
+    ASSERT(firc_fakeip_needs_commit(f, &v4));
+    ASSERT(real_behind(f, &v4, &got));
+    ASSERT_EQ(16, got.len);
+    ASSERT_MEM_EQ(R6A.b, got.b, 16);
+    s = firc_fakeip_snapshot_take(f);
+    cross_log_t w = {0};
+    firc_fakeip_snapshot_cross_walk(s, cross_entry, &w);
+    ASSERT_EQ_FMT((size_t)1, w.n, "%zu");
+    firc_fakeip_snapshot_free(s);
+
+    firc_fakeip_clear_real(f, "a.example.com", "g1", 16);
+    ASSERT_FALSE(real_behind(f, &v4, &got));
+    firc_fakeip_free(f);
+    PASS();
+}
+
 /* Catches: a parked pair missed, a pair without a real answered, the wrong group, a v6 address taken, or a dropped group's pair kept. */
 TEST pair_of_finds_parked_mappings(void) {
     firc_fakeip_cfg_t c = base_cfg();
@@ -2058,5 +2200,10 @@ int main(int argc, char **argv) {
     RUN_TEST(a_released_address_names_nothing_until_issued_again);
     RUN_TEST(the_reverse_index_agrees_with_a_walk_through_churn);
     RUN_TEST(pair_of_finds_parked_mappings);
+    RUN_TEST(a_v6_real_pairs_with_the_v4_fake_when_no_v4_real);
+    RUN_TEST(a_v4_real_beats_the_v6_one_for_the_v4_fake);
+    RUN_TEST(pair_of_an_unknown_fake_is_false);
+    RUN_TEST(a_v6_real_for_the_v4_fake_needs_a_commit);
+    RUN_TEST(a_cleared_v4_real_lets_the_v6_pair);
     GREATEST_MAIN_END();
 }

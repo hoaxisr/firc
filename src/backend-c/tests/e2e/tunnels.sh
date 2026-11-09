@@ -400,7 +400,7 @@ FP=
 check "no tunvless process is left after the subscription case" "" "$(ours)"
 
 X=tfl
-LAN=10.80.0.1 CL=10.80.0.2 C=10.79.0.3 REAL=10.85.0.9 STUBP=5354 DNSP=13597
+LAN=10.80.0.1 CL=10.80.0.2 C=10.79.0.3 REAL=10.85.0.9 REAL6=2001:db8:85::9 STUBP=5354 DNSP=13597
 LX() { ip netns exec $X "$@"; }
 miss=
 command -v iptables-legacy >/dev/null && command -v iptables-legacy-save >/dev/null || miss=" iptables-legacy"
@@ -433,20 +433,23 @@ def qname(q, i):
     return ".".join(labels).lower(), i + 1
 
 
-def serve(port, name, addr):
+def serve(port, name, addr, name6="", addr6=""):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", int(port)))
-    raw = socket.inet_aton(addr)
     while True:
         q, peer = s.recvfrom(4096)
         n, end = qname(q, 12)
-        hit = n == name and struct.unpack("!H", q[end:end + 2])[0] == 1
-        hdr = q[:2] + struct.pack("!HHHHH", 0x8180 if n == name else 0x8183, 1, int(hit), 0, 0)
-        ans = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + raw if hit else b""
+        qt = struct.unpack("!H", q[end:end + 2])[0]
+        ans = b""
+        if n == name and qt == 1:
+            ans = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton(addr)
+        elif n == name6 and qt == 28:
+            ans = b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 60, 16) + socket.inet_pton(socket.AF_INET6, addr6)
+        hdr = q[:2] + struct.pack("!HHHHH", 0x8180 if n in (name, name6) else 0x8183, 1, int(bool(ans)), 0, 0)
         s.sendto(hdr + q[12:end + 4] + ans, peer)
 
 
-def q(server, port, name):
+def q(server, port, name, rc=""):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(3)
     m = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
@@ -455,13 +458,15 @@ def q(server, port, name):
     r = s.recv(4096)
     _, i = qname(r, 12)
     i += 4
+    out = []
     for _ in range(struct.unpack("!H", r[6:8])[0]):
         i += 2
         t, _, _, ln = struct.unpack("!HHIH", r[i:i + 10])
         i += 10
         if t == 1:
-            print(socket.inet_ntoa(r[i:i + 4]))
+            out.append(socket.inet_ntoa(r[i:i + 4]))
         i += ln
+    print(" ".join(["rcode%d" % (r[3] & 15)] + out) if rc else "\n".join(out))
 
 
 def conn(host, port, wait, sport="0", started=""):
@@ -582,7 +587,7 @@ NX python3 "$TV/tests/fake-vless.py" --port $PORT --uuid $UUID --mb 1 --bind $A 
 SRV_A=$!
 NX python3 "$TV/tests/fake-vless.py" --port $PORT --uuid $UUID --mb 16 --kbps 256 --bind $C \
     --log-dst "$W/dst-slow" > "$W/srv-C.log" 2>&1 &
-python3 "$KT" serve $STUBP dl.test $REAL &
+python3 "$KT" serve $STUBP dl.test $REAL v6.test $REAL6 &
 STUB=$!
 : > "$W/dst"
 : > "$W/dst-slow"
@@ -618,6 +623,7 @@ groups() {
     rules:
       - { id: 0000ab01, type: domain, rule: dl.test, enable: true }
       - { id: 0000ab02, type: subnet, rule: 10.81.0.0/24, enable: true }
+      - { id: 0000ab04, type: domain, rule: v6.test, enable: true }
 ${2:-}
 EOF
         cat <<EOF
@@ -958,6 +964,73 @@ nat > "$W/nat"
 # catches: --purge leaving the REDIR chain or its jump
 check "fircd --purge drops FIRC_REDIR and its jump" "0 1 0 0" \
     "$rc $(grep -c '^\*nat' "$W/nat") $(grep -c '^:FIRC_REDIR ' "$W/nat") $(grep -cxF -- "$JUMP" "$W/nat")"
+
+nodev6() {
+    curl -s --unix-socket "$SOCK" http://firc/api/v1/tunnels/state 2>/dev/null | python3 -c '
+import json, sys
+t = [t for t in json.load(sys.stdin)["tunnels"] if t["device"] == sys.argv[1]]
+n = t[0]["nodes"] if t else []
+print(" ".join("%s %s" % (x["state"], "v6" if x.get("v6") else "v4") for x in n) or "none")' "$1" 2>/dev/null
+}
+wait_v6() {
+    i=0
+    while [ $i -lt $(($2 * 5)) ]; do
+        [ "$(nodev6 "$1")" = "$3" ] && return 0
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+wait_a() {
+    i=0
+    while [ $i -lt $(($2 * 5)) ]; do
+        r=$(LX python3 "$KT" q $LAN $DNSP v6.test rc 2>/dev/null)
+        case "$r" in $1) echo "$r"; return 0 ;; esac
+        sleep 0.2; i=$((i + 1))
+    done
+    echo "$r"
+    return 1
+}
+node_a() {
+    for p in $(ip netns pids $N); do
+        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- "fake-vless.py .*--bind $A " && kill "$p"
+    done
+    i=0
+    while [ $i -lt 25 ] && NX ss -Htln "src $A:$PORT" | grep -q .; do sleep 0.2; i=$((i + 1)); done
+    NX python3 "$TV/tests/fake-vless.py" --port $PORT --uuid $UUID --mb 1 --bind $A --log-req "$W/req" "$@" \
+        > "$W/srv-A.log" 2>&1 &
+    SRV_A=$!
+}
+
+node_a
+: > "$W/req"
+groups with0
+ktun $A true
+FIRC_TUNVLESS_BIN="$TV/out/tunvless" "$BE/build/host/fircd" --config /etc/firc/firc.conf >> "$W/fircd.log" 2>&1 &
+FP=$!
+wait_state tunvless0 15 "up 3600"
+wait_v6 tunvless0 15 "active v6"
+# catches: a stand whose node never passes the IPv6 check, so the v6-only cases below prove nothing
+check "tunvless0's node is active and v6-capable" "active v6" "$(nodev6 tunvless0)"
+r=$(wait_a "rcode0 198.18.*" 10)
+F6=${r#rcode0 }
+# catches: an A question for a name with only AAAA answered NODATA although the group's tunnel carries v6 by kernel TCP
+check "a v4 client's A for a v6-only name gets a v4 fake ($r)" "rcode0 yes" \
+    "${r%% *} $(case "$F6" in 198.18.*) echo yes ;; *) echo no ;; esac)"
+r=$(LX python3 "$KT" conn "$F6" 80 10 | cut -d' ' -f1,2)
+# catches: the v4 fake mapped to no real, to the fake itself, or the v6 real dialled as IPv4 instead of address type 3
+check "TCP to the v4 fake reaches the node as the v6 real" "data 1048576 1 0" \
+    "$r $(seen "$W/req" "ipv6 $REAL6:80") $(grep -c '^ipv4 198\.18\.' "$W/req")"
+
+node_a --no-v6
+wait_v6 tunvless0 30 "active v4"
+# catches: a node-v6-off check that proves nothing because the node kept its v6 flag
+check "tunvless0's node is active without v6" "active v4" "$(nodev6 tunvless0)"
+r=$(wait_a "rcode0" 10)
+# catches: a v4 fake handed out for a v6-only name while no active node can carry v6
+check "with the node's v6 off the A answer is NODATA" rcode0 "$r"
+kill -TERM "$FP"
+wait "$FP"
+FP=
 
 echo "tunnels e2e: $pass ok, $fail fail"
 [ "$fail" = 0 ]
