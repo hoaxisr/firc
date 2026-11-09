@@ -39,7 +39,7 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-old-names xhttp-data-header xhttp-data-cookie xhttp-data-cookie-small
            xhttp-obfs-header xhttp-obfs-cookie xhttp-obfs-query xhttp-obfs-qih xhttp-tokenish
            xhttp-method-put xhttp-method-get xhttp-table xhttp-headers xhttp-no-grpc xhttp-max-hdr
-           xhttp-neg-obfs xhttp-neg-sess xhttp-neg-data
+           xhttp-neg-obfs xhttp-neg-sess xhttp-neg-data xhttp-reality-firefox xhttp-tls-p384 xhttp-tls-p384-neg
            v6-carry-tcp v6-carry-xhttp v6-second v6-none v6-noroute
            node6-tcp node6-xhttp node6-name node6-dual
            xhttp-dl-reality-auto xhttp-dl-packet-tls xhttp-dl-none xhttp-dl-extra xhttp-dl-post-main
@@ -111,6 +111,26 @@ PUB=$(awk '/PublicKey/ {print $NF}' "$W/keys.txt")
 [ -n "$PRIV" ] && [ -n "$PUB" ] || { echo "run-xray: xray x25519 gave no keys:"; cat "$W/keys.txt"; exit 1; }
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
     -keyout "$W/mask.key" -out "$W/mask.pem" -subj "/CN=$MASK" -addext "subjectAltName=DNS:$MASK" >/dev/null 2>&1
+printf '%s\n' '[ca]' 'basicConstraints=critical,CA:TRUE' 'keyUsage=critical,keyCertSign,cRLSign' 'subjectKeyIdentifier=hash' \
+    '[inter]' 'basicConstraints=critical,CA:TRUE,pathlen:0' 'keyUsage=critical,keyCertSign,cRLSign' \
+    'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' \
+    '[leaf]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth' \
+    'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' "subjectAltName=DNS:$MASK" > "$W/p384.cnf"
+for r in root384 other384; do
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -sha384 -days 2 -keyout "$W/$r.key" \
+        -out "$W/$r.pem" -subj "/CN=$r" -config "$W/p384.cnf" -extensions ca >/dev/null 2>&1
+done
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -keyout "$W/inter384.key" \
+    -subj "/CN=inter384" -out "$W/inter384.csr" >/dev/null 2>&1
+openssl x509 -req -in "$W/inter384.csr" -CA "$W/root384.pem" -CAkey "$W/root384.key" -set_serial 2 -sha384 -days 2 \
+    -extfile "$W/p384.cnf" -extensions inter -out "$W/inter384.pem" >/dev/null 2>&1
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$W/leaf384.key" \
+    -subj "/CN=$MASK" -out "$W/leaf384.csr" >/dev/null 2>&1
+openssl x509 -req -in "$W/leaf384.csr" -CA "$W/inter384.pem" -CAkey "$W/inter384.key" -set_serial 3 -sha384 -days 2 \
+    -extfile "$W/p384.cnf" -extensions leaf -out "$W/leaf384.pem" >/dev/null 2>&1
+cat "$W/leaf384.pem" "$W/inter384.pem" > "$W/chain384.pem"
+openssl verify -CAfile "$W/root384.pem" -untrusted "$W/inter384.pem" "$W/leaf384.pem" >/dev/null ||
+    { echo "run-xray: the P-384 test chain does not verify in OpenSSL"; exit 1; }
 
 # The Reality cover site: any TLS 1.3 server with h2 in ALPN.
 bg_in "$NSS" "$W/mask.log" openssl s_server -accept "$S_IP:8443" -cert "$W/mask.pem" -key "$W/mask.key" \
@@ -181,7 +201,7 @@ fmfrag() { fmraw; CFM="{\"tcp\":[{\"type\":\"fragment\",\"settings\":$1}]}"; LPO
 fmxh() { XP="{\"path\":\"/xp/\",\"mode\":\"$1\"}"; Q="type=xhttp&path=%2Fxp%2F&mode=$1"; }
 neg() { EXPECT=fail; XP="{\"path\":\"/xp/\",\"mode\":\"packet-up\",$1}"; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up"; }
 case_cfg() {
-    SEC=reality; TUN_ARGS=""; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
+    SEC=reality; TUN_ARGS=""; TUN_ENV=""; FP=chrome; SCERT=mask; SKEY=mask; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
     XCNET=""; FLOW=""; XALPN=h2; DL=""; DH="$S_IP2"; BP=/xp/
     CFM=""; SFM=""; BFM=""; DPORT=""; TAPLENS=""; TAP2=""
     XP='{"path":"/xp/"}'
@@ -191,6 +211,11 @@ case_cfg() {
         NET="\"network\":\"grpc\",\"grpcSettings\":{\"serviceName\":\"$SVC\",\"multiMode\":$multi}"
         Q="type=grpc&serviceName=$SVC&mode=$m" ;;
     xhttp-auto)        Q="type=xhttp&path=%2Fxp%2F" ;;
+    xhttp-reality-firefox) FP=firefox; Q="type=xhttp&path=%2Fxp%2F" ;;
+    xhttp-tls-p384)    SEC=tls; TUN_ENV="SSL_CERT_FILE=$W/root384.pem"; SCERT=chain384; SKEY=leaf384
+                       Q="type=xhttp&path=%2Fxp%2F&mode=stream-up" ;;
+    xhttp-tls-p384-neg) SEC=tls; TUN_ENV="SSL_CERT_FILE=$W/other384.pem"; SCERT=chain384; SKEY=leaf384
+                       Q="type=xhttp&path=%2Fxp%2F&mode=stream-up"; EXPECT=fail ;;
     xhttp-stream-one|xhttp-stream-up|xhttp-packet-up)
                        Q="type=xhttp&path=%2Fxp%2F&mode=${1#xhttp-}" ;;
     # TLS instead of Reality: the client verifies the server's certificate against --ca.
@@ -322,10 +347,10 @@ case_cfg() {
         SECJ='"security":"none"'; LSEC="security=none"
     elif [ "$SEC" = reality ]; then
         SECJ="\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"$S_IP:8443\",\"xver\":0,\"serverNames\":[\"$MASK\"],\"privateKey\":\"$PRIV\",\"shortIds\":[\"$SID\"]$KL}"
-        LSEC="security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=chrome"
+        LSEC="security=reality&sni=$MASK&pbk=$PUB&sid=$SID&fp=$FP"
     else
-        SECJ="\"security\":\"tls\",\"tlsSettings\":{\"alpn\":[\"h2\",\"http/1.1\"],\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"keyFile\":\"$W/mask.key\"}]$KL}"
-        LSEC="security=tls&sni=$MASK&alpn=$(enc "$XALPN")&fp=chrome"
+        SECJ="\"security\":\"tls\",\"tlsSettings\":{\"alpn\":[\"h2\",\"http/1.1\"],\"certificates\":[{\"certificateFile\":\"$W/$SCERT.pem\",\"keyFile\":\"$W/$SKEY.key\"}]$KL}"
+        LSEC="security=tls&sni=$MASK&alpn=$(enc "$XALPN")&fp=$FP"
     fi
 }
 
@@ -1372,7 +1397,7 @@ JSON
     RPID=""; [ -z "$KEYLOG" ] || tap_up p || { FAIL=1; kill "$XPID" 2>/dev/null || true; continue; }
 
     sub_write
-    probe() { ip netns exec "$NSC" "$BIN" --probe --timeout 5 $TUN_ARGS "$W/sub.txt" 2>&1 || true; }
+    probe() { ip netns exec "$NSC" env $TUN_ENV "$BIN" --probe --timeout 5 $TUN_ARGS "$W/sub.txt" 2>&1 || true; }
     is_ok() { printf '%s' "$1" | awk -F '\t' '$3 == "ok" { f = 1 } END { exit !f }'; }
     case "$MODE" in fm-*)
         SPID=""; CPID=""; LPID=""
@@ -1400,6 +1425,12 @@ $(dl_delta "$D0" "$(dl_snap)")
 EOF
         if [ "$warm" -eq 1 ]; then
             echo "run-xray: FAIL — the server accepted a request it must refuse: $out"; FAIL=1
+            echo "run-xray: case $MODE — FAIL"
+        elif [ "$MODE" = xhttp-tls-p384-neg ] && ! openssl x509 -in "$W/leaf384.pem" -noout -checkhost "$MASK" | grep -q 'does match'; then
+            echo "run-xray: FAIL — the leaf does not name $MASK, so the refusal proves nothing about the chain"; FAIL=1
+            echo "run-xray: case $MODE — FAIL"
+        elif [ "$MODE" = xhttp-tls-p384-neg ] && ! printf '%s' "$out" | grep -q 'does not chain to a root'; then
+            echo "run-xray: FAIL — refused, but not for the chain: $out"; FAIL=1
             echo "run-xray: case $MODE — FAIL"
         elif [ -n "$DL" ] && [ "$dsyn2" -eq 0 ]; then
             echo "run-xray: FAIL — refused before the GET reached $S_IP2: $out"; FAIL=1
@@ -1441,7 +1472,7 @@ EOF
     # 2-3. The tunnel and the load. The pool checks the node every 10 s instead of every minute,
     # so a false "dead" (two failures in a row) shows up within the run.
     mark1=$(wc -l < "$W/probe1-6.log"); mark2=$(wc -l < "$W/probe2-6.log"); markx=$(wc -l < "$W/xray-access-$MODE.log")
-    ip netns exec "$NSC" "$BIN" $TUN_ARGS "$W/sub.txt" -d vl -n 0 --interval 10 > "$W/tun-$MODE.log" 2>&1 &
+    ip netns exec "$NSC" env $TUN_ENV "$BIN" $TUN_ARGS "$W/sub.txt" -d vl -n 0 --interval 10 > "$W/tun-$MODE.log" 2>&1 &
     SPID=$!; PIDS="$PIDS $SPID"
     for _ in $(seq 60); do ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 && break; sleep 0.25; done
     ip netns exec "$NSC" ip link show vl >/dev/null 2>&1 || {

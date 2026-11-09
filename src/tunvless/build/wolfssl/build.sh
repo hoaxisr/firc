@@ -40,7 +40,7 @@ wolfssl_c_files() {
     # its own assembly (aarch64, CURVED25519_ASM_64BIT); on other targets the file is empty.
     for f in aes asn chacha chacha20_poly1305 coding cpuid curve25519 ecc error fe_operations \
              ge_operations hash hmac kdf logging md5 memory poly1305 random rsa sha sha256 sha3 sha512 \
-             sp_int wc_encrypt wc_mldsa wc_mlkem wc_mlkem_poly wc_port wolfmath; do
+             sp_c32 sp_int wc_encrypt wc_mldsa wc_mlkem wc_mlkem_poly wc_port wolfmath; do
         echo "wolfcrypt/src/$f.c"
     done
     # aarch64 inline assembly (WOLFSSL_ARMASM_INLINE in user_settings.h). Listed for every target:

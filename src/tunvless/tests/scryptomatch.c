@@ -543,7 +543,8 @@ static size_t pem_der(const char *pem, unsigned char *out, size_t cap) {
 }
 
 struct der { unsigned char b[2048]; size_t n; };
-static struct der D_LEAF, D_INTER, D_RSALEAF, D_P384, D_INTER521, D_P521, D_FAKECA, D_FAKELEAF, D_EXPIRED;
+static struct der D_LEAF, D_INTER, D_RSALEAF, D_P384, D_INTER521, D_P521, D_FAKECA, D_FAKELEAF, D_EXPIRED,
+    D_INTER384, D_P384C;
 
 static struct sc_roots *roots_of(const char *pem) {
     struct sc_roots *r = NULL;
@@ -670,11 +671,34 @@ static void test_chain(void) {
     sc_roots_free(r);
 }
 
+static struct der tampered(const struct der *d) {
+    struct der t = *d;
+    t.b[t.n - 1] ^= 0x01;
+    return t;
+}
+
+static void p384_signed_chain_verifies_and_a_tampered_one_does_not(void) {
+    struct sc_roots *r = roots_of(PEM_ROOT384);
+    check("P-384 root store loaded", 1, r != NULL);
+    if (!r) return;
+    struct der bad_leaf = tampered(&D_P384C), bad_inter = tampered(&D_INTER384);
+    /* catches: P-384 certificate signatures that fail when valid or pass when tampered */
+    check("P-256 leaf <- P-384 intermediate <- P-384 root", 0,
+          chain(r, "p384chain.example", 2, &D_P384C, &D_INTER384));
+    check("leaf with a tampered P-384 signature rejected", SC_ECHAIN,
+          chain(r, "p384chain.example", 2, &bad_leaf, &D_INTER384));
+    check("intermediate with a tampered P-384 signature rejected", SC_ECHAIN,
+          chain(r, "p384chain.example", 2, &D_P384C, &bad_inter));
+    check("leaf alone after the failures rejected", SC_ECHAIN, chain(r, "p384chain.example", 1, &D_P384C));
+    sc_roots_free(r);
+}
+
 int main(void) {
     struct { const char *pem; struct der *d; } all[] = {
         { PEM_LEAF, &D_LEAF }, { PEM_INTER, &D_INTER }, { PEM_RSALEAF, &D_RSALEAF }, { PEM_P384, &D_P384 },
         { PEM_INTER521, &D_INTER521 }, { PEM_P521, &D_P521 },
         { PEM_FAKECA, &D_FAKECA }, { PEM_FAKELEAF, &D_FAKELEAF }, { PEM_EXPIRED, &D_EXPIRED },
+        { PEM_INTER384, &D_INTER384 }, { PEM_P384C, &D_P384C },
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         all[i].d->n = pem_der(all[i].pem, all[i].d->b, sizeof(all[i].d->b));
@@ -694,5 +718,6 @@ int main(void) {
     test_mldsa();
     test_sig();
     test_chain();
+    p384_signed_chain_verifies_and_a_tampered_one_does_not();
     return unit_done("scryptomatch");
 }

@@ -155,9 +155,8 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
 #define WC_RSA_BLINDING
 #define TFM_TIMING_RESISTANT
 #define WOLFSSL_SP_MATH_ALL
-/* Big-number math serves only the certificate checks of security=tls (chain and
- * CertificateVerify), a few operations per handshake, so code size matters more than speed. */
-#define WOLFSSL_SP_SMALL
+#define WOLFSSL_HAVE_SP_ECC
+#define WOLFSSL_SP_384
 
 #define WOLFSSL_ASN_TEMPLATE
 /* A certificate name can be an IP address (DoH on 1.1.1.1): without these two an IP SAN is not

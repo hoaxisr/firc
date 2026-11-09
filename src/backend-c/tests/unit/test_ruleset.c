@@ -793,7 +793,7 @@ TEST a_denied_address_renders_every_host_that_lists_it(void) {
     PASS();
 }
 
-/* Catches: a policy's segments not asked for, or a deny's segment returning a host of another policy on it. */
+/* Catches: a policy's segments not asked for, so a peer with no host entry is matched by mark only. */
 TEST a_policy_renders_its_segments(void) {
     firc_kn_policy_map_t *m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse("{\"host\":[]}", "{\"Policy9\":{\"description\":\"Guests\"}}", &m));
@@ -831,8 +831,8 @@ TEST a_policy_renders_its_segments(void) {
     lk.ud = m;
     g = selector(NULL, 0, list, 1);
     ASSERT_EQ(FIRC_OK, firc_ruleset_render_devices(g, &lk, &d));
-    ASSERT_EQ_FMTm("the mark alone", (size_t)1, d.n_deny, "%zu");
-    ASSERT_EQ(FIRC_NF_SRC_MARK, d.deny[0].kind);
+    ASSERT_EQ_FMT((size_t)2, d.n_deny, "%zu");
+    ASSERT(is_addr(&d.deny[1], 4, net, 24));
     firc_nf_devices_clear(&d);
     firc_group_free(g);
     g = selector(list, 1, NULL, 0);
