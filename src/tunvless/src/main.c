@@ -552,24 +552,71 @@ static int pin_candidates(void) {
     }
 }
 
+static int pool_reach(const void *const *nodes, size_t n, int timeout_ms, char *ok, int *err) {
+    const char **h = malloc((n ? n : 1) * sizeof(*h));
+    uint16_t *p = malloc((n ? n : 1) * sizeof(*p));
+    int rc = -1;
+    if (h && p) {
+        for (size_t k = 0; k < n; k++) {
+            const struct vless_node *v = nodes[k];
+            h[k] = v->host;
+            p[k] = v->port;
+        }
+        rc = tr_reach(h, p, n, timeout_ms, ok, err);
+    }
+    free(h);
+    free(p);
+    return rc;
+}
+
+static int probe_walk(const int *c, size_t n) {
+    const void *nd[POOL_WALK_DOWN] = { 0 };
+    char ok[POOL_WALK_DOWN];
+    int err[POOL_WALK_DOWN] = { 0 };
+    for (size_t k = 0; k < n; k++) nd[k] = vnode(c[k]);
+    if (pool_reach(nd, n, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
+    for (size_t k = 0; k < n; k++) {
+        const struct vless_node *v = vnode(c[k]);
+        if (!ok[k]) {
+            pool_note(c[k], 0);
+            const char *t = tr_dial_strerror(err[k]);
+            fprintf(stderr, LOG_I "%s — %s\n", v->name, t ? t : "no TCP answer");
+            continue;
+        }
+        char why[256] = "";
+        int rc = vless_probe(v, g.timeout_s, why, sizeof(why));
+        pool_note(c[k], rc == 0);
+        if (rc == 0) {
+            fprintf(stderr, LOG_I "chose %s (%s)\n", v->name, why);
+            return c[k];
+        }
+        fprintf(stderr, LOG_I "%s — %s\n", v->name, why);
+    }
+    return -1;
+}
+
 /* The node to bring the device up with: a named one, or with --no-probe the first candidate, as it
  * is; otherwise the first candidate that answers a probe. -1 — none. *checked — it was probed. */
 static int choose_node(int *checked) {
     *checked = 0;
     if (named() || g.no_probe) return g_sel[0];
     unsigned step = 5;
-    for (;;) {
-        for (size_t k = 0; k < g_sel_n; k++) {
-            const struct vless_node *n = vnode(g_sel[k]);
-            char why[256] = "";
-            if (vless_probe(n, g.timeout_s, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I "chose %s (%s)\n", n->name, why);
-                *checked = 1;
-                return g_sel[k];
-            }
-            fprintf(stderr, LOG_I "%s — %s\n", n->name, why);
+    for (size_t at = 0; at < g_sel_n; at += POOL_WALK_DOWN) {
+        size_t m = g_sel_n - at < POOL_WALK_DOWN ? g_sel_n - at : POOL_WALK_DOWN;
+        int c = probe_walk(g_sel + at, m);
+        if (c >= 0) {
+            *checked = 1;
+            return c;
         }
+    }
+    for (;;) {
         if (!retry_wait(&step, "no node answered")) return -1;
+        int out[POOL_WALK_DOWN];
+        int c = probe_walk(out, pool_order(g_sel, g_sel_n, out, POOL_WALK_DOWN));
+        if (c >= 0) {
+            *checked = 1;
+            return c;
+        }
     }
 }
 
@@ -688,7 +735,7 @@ static void *ctl_thread(void *arg) {
 static void ctl_start(void) {
     static const struct ctln_hooks h = {
         .select = pool_select, .ack = ctl_emit_nodes, .pins_full = ctl_emit_pins_full,
-        .resolve_ms = CTL_RESOLVE_MS, .map_ack = ctl_emit_map,
+        .resolve_ms = CTL_RESOLVE_MS, .map_ack = ctl_emit_map, .wake = pool_wake,
     };
     int err = ctln_start(&h);
     pthread_attr_t a;
@@ -814,7 +861,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     static const struct pool_proto proto = {
-        .ops = &vless_dialer, .probe = pool_probe, .probe6 = pool_probe6, .name = pool_name,
+        .ops = &vless_dialer, .probe = pool_probe, .probe6 = pool_probe6, .reach = pool_reach, .name = pool_name,
     };
     struct pool_cfg pc = {
         .proto = &proto,

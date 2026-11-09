@@ -313,12 +313,22 @@ static void hx_stop(hx_t *h)
     }
 }
 
+static char g_wake_dir[64];
+
 static void teardown(void *ud)
 {
     (void)ud;
     hx_stop(g_hx);
     g_wan_name = NULL;
     unsetenv("FAKE_AFTER");
+    unsetenv("FAKE_STDIN_DIR");
+    if (g_wake_dir[0] != 0) {
+        char cmd[128];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_wake_dir);
+        if (system(cmd) != 0) {
+        }
+        g_wake_dir[0] = 0;
+    }
     setenv("FAKE_MODE", "ok", 1);
 }
 
@@ -974,6 +984,59 @@ TEST a_saved_probe_clears_down_only_for_the_nodes_that_answered(void)
     ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\"}", NULL));
     ASSERT_STR_EQ("reserve", node_state("0000000c:B"));
     ASSERT_STR_EQ("down", node_state("0000000d:B"));
+    PASS();
+}
+
+static bool wake_of_line(const char *path, const char *host)
+{
+    char buf[4096];
+    slurp(path, buf, sizeof buf);
+    const char *w = strstr(buf, "\nwake\n");
+    const char *h = strstr(buf, host);
+    if (w == NULL || h == NULL || h > w) {
+        return false;
+    }
+    const char *start = h;
+    while (start > buf && start[-1] != '\n') {
+        start--;
+    }
+    const char *end = strchr(h, '\n');
+    char want[512];
+    snprintf(want, sizeof want, "\nwake\n%.*s\n\n", (int)(end - start), start);
+    return strstr(buf, want) == w;
+}
+
+/* catches: a wake for a draft or with no answer, the wrong node's link, or a link text other than the node line, which tunvless would never find */
+TEST a_saved_probe_wakes_the_child_with_the_answered_links(void)
+{
+    snprintf(g_wake_dir, sizeof g_wake_dir, "/tmp/firc_tunwake_XXXXXX");
+    ASSERT(mkdtemp(g_wake_dir) != NULL);
+    const char *dir = g_wake_dir;
+    setenv("FAKE_STDIN_DIR", dir, 1);
+    ASSERT(hx_start("tunnels:\n  - id: a\n    device: tunvless0\n    sources:\n"
+                    "      - id: 0000000a\n        link: \"" LINK_A "\"\n"
+                    "      - id: 0000000d\n        link: \"vless://" U "@fail.example.invalid:443?security=none#F\"\n"
+                    "  - id: b\n    device: tunvless1\n    sources:\n"
+                    "      - id: 0000000e\n        link: \"vless://" U "@fail.example.invalid:443?security=none#G\"\n",
+                    0) != NULL);
+    ASSERT(wait_for_status("a", "up", 3000));
+    ASSERT(wait_for_status("b", "up", 3000));
+    char in_a[128], in_b[128];
+    snprintf(in_a, sizeof in_a, "%s/tunvless0", dir);
+    snprintf(in_b, sizeof in_b, "%s/tunvless1", dir);
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\"}", NULL));
+    sleep_ms(300);
+    ASSERT_EQ(1, lines_of(in_a, "wake"));
+    ASSERT(wake_of_line(in_a, "@a.example.invalid"));
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe",
+                            "{\"tunnel\":{\"id\":\"a\",\"device\":\"tunvless0\",\"sources\":[{\"id\":\"0000000a\","
+                            "\"kind\":\"link\",\"link\":\"" LINK_A "\"}]}}",
+                            NULL));
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"b\"}", NULL));
+    sleep_ms(300);
+    ASSERT_EQ(1, lines_of(in_a, "wake"));
+    ASSERT_EQ(0, lines_of(in_b, "wake"));
+    ASSERT(lines_of(in_b, "vless://") > 0);
     PASS();
 }
 
@@ -1928,6 +1991,7 @@ SUITE(tunnels_api)
     RUN_TEST(probe_answers_per_node_key_without_links);
     RUN_TEST(a_probe_carries_the_tunnels_fingerprint);
     RUN_TEST(a_saved_probe_clears_down_only_for_the_nodes_that_answered);
+    RUN_TEST(a_saved_probe_wakes_the_child_with_the_answered_links);
     RUN_TEST(a_second_probe_is_refused_while_one_runs);
     RUN_TEST(a_probe_through_an_uplink_needs_the_saved_mark);
     RUN_TEST(the_routes_need_a_session);

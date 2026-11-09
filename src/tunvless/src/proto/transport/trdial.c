@@ -52,22 +52,29 @@ static int ip_eq(const struct tr_ip *a, const struct tr_ip *b) {
 
 /* The winning address per name, per thread: no lock is needed, and each thread learning on its
  * own costs one extra search per thread at startup. */
-#define GOOD_MAX 8
-static __thread struct { char host[96]; struct tr_ip ip; uint16_t port; } g_good[GOOD_MAX];
-static __thread unsigned g_good_n;
+#define GOOD_MAX 24
+static __thread struct { uint64_t key; struct tr_ip ip; } g_good[GOOD_MAX];
+static __thread unsigned g_good_n, g_good_next;
+
+static uint64_t good_key(const char *host, uint16_t port) {
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) h = (h ^ *p) * 1099511628211ull;
+    h = (h ^ (port >> 8)) * 1099511628211ull;
+    return (h ^ (port & 0xff)) * 1099511628211ull;
+}
 
 static struct tr_ip *good_get(const char *host, uint16_t port) {
+    uint64_t k = good_key(host, port);
     for (unsigned i = 0; i < g_good_n; i++)
-        if (g_good[i].port == port && strcmp(g_good[i].host, host) == 0) return &g_good[i].ip;
+        if (g_good[i].key == k) return &g_good[i].ip;
     return NULL;
 }
 
 static void good_put(const char *host, uint16_t port, struct tr_ip ip) {
     struct tr_ip *p = good_get(host, port);
     if (p) { *p = ip; return; }
-    unsigned i = g_good_n < GOOD_MAX ? g_good_n++ : GOOD_MAX - 1;
-    snprintf(g_good[i].host, sizeof(g_good[i].host), "%s", host);
-    g_good[i].port = port;
+    unsigned i = g_good_n < GOOD_MAX ? g_good_n++ : g_good_next++ % GOOD_MAX;
+    g_good[i].key = good_key(host, port);
     g_good[i].ip = ip;
 }
 
@@ -410,6 +417,132 @@ static int dial_fail(unsigned in_flight, int err) {
     if (err == ECONNREFUSED) return TR_ECONNREFUSED;
     if (err == EHOSTUNREACH || err == ENETUNREACH || err == ENETDOWN) return TR_EUNREACH;
     return TR_ECONNECT;
+}
+
+struct reach_at { size_t h; struct tr_ip ip; };
+struct reach_host { struct tr_ip v6; int has6, last_err, no_fd; };
+
+struct reach {
+    struct pollfd *pv;
+    struct reach_at *at;
+    struct reach_host *hs;
+    size_t nf;
+    const char *const *hosts;
+    const uint16_t *ports;
+    char *ok;
+};
+
+static int reach_v4_left(const struct reach *r, size_t h) {
+    for (size_t i = 0; i < r->nf; i++)
+        if (r->at[i].h == h && !r->at[i].ip.v6) return 1;
+    return 0;
+}
+
+static void reach_settle(struct reach *r, size_t h) {
+    if (r->ok[h] && r->hs[h].has6 && !reach_v4_left(r, h)) {
+        good_put(r->hosts[h], r->ports[h], r->hs[h].v6);
+        r->hs[h].has6 = 0;
+    }
+}
+
+static void reach_drop(struct reach *r, size_t i) {
+    size_t h = r->at[i].h;
+    close(r->pv[i].fd);
+    r->nf--;
+    r->pv[i] = r->pv[r->nf];
+    r->at[i] = r->at[r->nf];
+    reach_settle(r, h);
+}
+
+static void reach_won(struct reach *r, size_t h, const struct tr_ip *ip) {
+    r->ok[h] = 1;
+    if (!ip->v6) {
+        r->hs[h].has6 = 0;
+        good_put(r->hosts[h], r->ports[h], *ip);
+    } else if (!r->hs[h].has6) {
+        r->hs[h].v6 = *ip;
+        r->hs[h].has6 = 1;
+    }
+    for (size_t i = 0; i < r->nf;)
+        if (r->at[i].h == h && (r->at[i].ip.v6 || !ip->v6)) reach_drop(r, i);
+        else i++;
+    reach_settle(r, h);
+}
+
+int tr_reach(const char *const *hosts, const uint16_t *ports, size_t n, int timeout_ms, char *ok, int *err) {
+    memset(ok, 0, n);
+    memset(err, 0, n * sizeof(*err));
+    size_t cap = n ? n * ADDR_MAX : 1;
+    struct reach r = { calloc(cap, sizeof(struct pollfd)), calloc(cap, sizeof(struct reach_at)),
+                       calloc(n ? n : 1, sizeof(struct reach_host)), 0, hosts, ports, ok };
+    if (!r.pv || !r.at || !r.hs) {
+        free(r.pv);
+        free(r.at);
+        free(r.hs);
+        return -1;
+    }
+    int64_t end = now_ms() + timeout_ms;
+    for (size_t h = 0; h < n; h++) {
+        struct tr_ip addr[ADDR_MAX];
+        unsigned an = pinned(hosts[h], addr);
+        if (an == 0) an = resolve(hosts[h], addr);
+        if (an == 0) err[h] = TR_EDNS;
+        for (unsigned a = 0; a < an && !ok[h]; a++) {
+            int d = 0;
+            int s = attempt_start(&addr[a], ports[h], &d);
+            if (s < 0) {
+                r.hs[h].last_err = errno;
+                if (errno == EMFILE || errno == ENFILE) r.hs[h].no_fd = 1;
+                continue;
+            }
+            r.pv[r.nf].fd = s;
+            r.pv[r.nf].events = POLLOUT;
+            r.at[r.nf].h = h;
+            r.at[r.nf].ip = addr[a];
+            r.nf++;
+            if (d) reach_won(&r, h, &addr[a]);
+        }
+    }
+    while (r.nf) {
+        int64_t t = now_ms();
+        if (t >= end) break;
+        for (size_t i = 0; i < r.nf; i++) r.pv[i].revents = 0;
+        int pr = poll(r.pv, (nfds_t)r.nf, (int)(end - t));
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) break;
+        for (size_t i = 0; i < r.nf;) {
+            if (!r.pv[i].revents) { i++; continue; }
+            int e = 0;
+            socklen_t el = sizeof e;
+            getsockopt(r.pv[i].fd, SOL_SOCKET, SO_ERROR, &e, &el);
+            size_t h = r.at[i].h;
+            if (e == 0 && !(r.pv[i].revents & (POLLERR | POLLHUP))) {
+                struct tr_ip w = r.at[i].ip;
+                reach_won(&r, h, &w);
+                i = 0;
+                continue;
+            }
+            r.hs[h].last_err = e;
+            reach_drop(&r, i);
+        }
+    }
+    for (size_t h = 0; h < n; h++) {
+        if (ok[h] || err[h]) continue;
+        if (r.hs[h].no_fd) { ok[h] = 1; continue; }
+        int pending = 0;
+        for (size_t i = 0; i < r.nf && !pending; i++) pending = r.at[i].h == h;
+        err[h] = dial_fail(pending, r.hs[h].last_err);
+    }
+    while (r.nf) {
+        close(r.pv[r.nf - 1].fd);
+        r.nf--;
+    }
+    free(r.pv);
+    free(r.at);
+    free(r.hs);
+    int c = 0;
+    for (size_t h = 0; h < n; h++) c += ok[h];
+    return c;
 }
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_s) {

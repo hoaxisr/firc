@@ -2107,6 +2107,43 @@ TEST inbounds_command_reaches_the_child(void)
     PASS();
 }
 
+static void inbounds_then_wake_cb(firc_loop_t *loop, void *ud)
+{
+    (void)loop;
+    rec_t *r = ud;
+    r->cmd_rc = firc_tunsup_command(r->s, "a", FIRC_TUN_CMD_INBOUNDS, k_inb_line, sizeof k_inb_line - 1, NULL, 0);
+    r->cmd_rc2 = firc_tunsup_command(r->s, "a", FIRC_TUN_CMD_WAKE, "L1\nL2\n", 6, NULL, 0);
+}
+
+TEST wake_command_is_the_verb_the_links_and_the_empty_line(void)
+{
+    /* catches: wake sent unframed, framed as inbounds (counted in inb_sent), or its links indexed as inbound links */
+    env_setup("ktcp");
+    log_to_file();
+    char *l1[] = {"vless://u@h1:1#x"};
+    two_lists(l1, 1, l1, 1);
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &g_set1, NULL));
+    ASSERT(run_until_ready(&r, 2000));
+    firc_loop_add_timer(r.loop, 10, 0, inbounds_then_wake_cb, &r, NULL);
+    firc_loop_add_timer(r.loop, 200, 0, inbounds_cb, &r, NULL);
+    run_ms(&r, 500);
+    ASSERT_EQ(FIRC_OK, r.cmd_rc);
+    ASSERT_EQ(FIRC_OK, r.cmd_rc2);
+    rec_close(&r);
+    log_done();
+    char buf[1024];
+    read_file(g_stdin, buf, sizeof buf);
+    ASSERT(strstr(buf, "inbounds\n127.0.0.1:1081 - - -\n\nwake\nL1\nL2\n\ninbounds\n127.0.0.1:1081 - - -\n\n") != NULL);
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(0, count_of(log, "inbound lines"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
 static void inbounds_empty_cb(firc_loop_t *loop, void *ud)
 {
     (void)loop;
@@ -2458,6 +2495,7 @@ int main(int argc, char **argv)
     RUN_TEST(an_unanswered_map_restarts_the_child_after_10_s);
     RUN_TEST(a_command_before_ready_is_refused);
     RUN_TEST(inbounds_command_reaches_the_child);
+    RUN_TEST(wake_command_is_the_verb_the_links_and_the_empty_line);
     RUN_TEST(an_empty_inbounds_command_is_the_verb_and_the_empty_line);
     RUN_TEST(an_inbounds_ack_count_mismatch_is_warned_once);
     RUN_TEST(an_inbounds_ack_count_mismatch_stops_trusting_node_numbers);

@@ -528,6 +528,7 @@ int tr_ws_parse(struct ws_rx *r, const unsigned char *in, size_t n,
 
 /* TCP to the node over every address of its name (trdial.c). A descriptor or a negative TR_*. */
 int tr_dial(const char *host, uint16_t port, int timeout_s);
+int tr_reach(const char *const *hosts, const uint16_t *ports, size_t n, int timeout_ms, char *ok, int *err);
 
 /* Security by the link field: none, tls, otherwise reality (trsec.c). */
 const struct security_ops *tr_security(const char *name);

@@ -31,9 +31,13 @@
  *   - checks come early after three failed connects in a row and after a live connection is cut
  *     by the kernel for silence (lost: stack.c, node_sock_silence);
  *   - a dead node: its connections are reset (generation) and a replacement is searched at once
- *     among the free candidates in order of preference. None answers — another round after 15 s
- *     (own node first, then the free candidates), doubling up to 30 s. An empty slot (fewer
- *     candidates answered at startup than `active`) searches the same way.
+ *     among the free candidates. A round probes its own node first, then at most 8 free
+ *     candidates while another slot is up (one that failed recently waits out its backoff); the
+ *     next round comes 5 min later after a round that probed a free candidate, otherwise after
+ *     15 s, then 30 s. With no slot up only the first slot that is not up probes free
+ *     candidates, 16 a round, every one in turn, and the next round comes after 15 s, 30 s once
+ *     all were tried. An empty slot (fewer candidates answered at startup than `active`) searches
+ *     the same way.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -70,6 +74,9 @@
  * cut together, and one check is enough. */
 #define PL_LOST_GAP_MS 5000
 #define PL_DRAINED 8
+#define PL_BACK_S      300
+#define PL_BACK_MAX_S  1800
+#define PL_EXTRA_S     300
 
 /* The pool's session header; the protocol's session follows at PL_HDR. */
 struct pl_sess {
@@ -101,9 +108,13 @@ struct pl_slot {
     unsigned drained_n;
     int v6;
     int skip6;
+    unsigned woke;
+    uint64_t rot;
 };
 
 struct pl_sel { struct pl_sel *old; size_t n; int c[]; };
+
+struct pl_cand { uint32_t fails; uint64_t next, last; };
 
 static struct {
     pthread_mutex_t mu;
@@ -123,13 +134,18 @@ static struct {
     int v6_retry;
     int *down;                  /* nodes reported down and not reported up since */
     size_t down_n, down_cap;
+    struct pl_cand *cand;
+    size_t cand_n;
 } g_pl = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 static const void *pl_node(int i) {
     return g_pl.cf.node(i);
 }
 
+static uint64_t g_pl_clock_ms;
+
 static uint64_t pl_now_ms(void) {
+    if (g_pl_clock_ms) return g_pl_clock_ms;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
@@ -330,19 +346,131 @@ static int pl_in(const struct pl_sel *sel, int c) {
     return 0;
 }
 
-/* Give slot i a live node: its own previous one (if own), then the free candidates in order.
- * 1 — found. Probes run without the lock (up to eight seconds each); the state is logged after
- * every failure, so "no node answers" is said at once, not after the whole round. */
+static struct pl_cand *pl_peek(int c) {
+    return c >= 0 && (size_t)c < g_pl.cand_n ? &g_pl.cand[c] : NULL;
+}
+
+static struct pl_cand *pl_rec(int c) {
+    if (c < 0) return NULL;
+    if ((size_t)c >= g_pl.cand_n) {
+        size_t n = g_pl.cand_n * 2 > (size_t)c + 1 ? g_pl.cand_n * 2 : (size_t)c + 1;
+        struct pl_cand *r = realloc(g_pl.cand, n * sizeof(*r));
+        if (!r) return NULL;
+        memset(r + g_pl.cand_n, 0, (n - g_pl.cand_n) * sizeof(*r));
+        g_pl.cand = r;
+        g_pl.cand_n = n;
+    }
+    return &g_pl.cand[c];
+}
+
+static uint64_t pl_backoff_ms(uint32_t fails) {
+    uint64_t s = PL_BACK_S;
+    for (uint32_t k = 1; k < fails && s < PL_BACK_MAX_S; k++) s *= 2;
+    return (s < PL_BACK_MAX_S ? s : PL_BACK_MAX_S) * 1000ull;
+}
+
+static void pl_note(int c, int ok, uint64_t now) {
+    struct pl_cand *r = ok ? pl_peek(c) : pl_rec(c);
+    if (!r) return;
+    if (ok) {
+        r->fails = 0;
+        r->next = r->last = 0;
+        return;
+    }
+    if (r->fails < UINT32_MAX) r->fails++;
+    r->last = now;
+    r->next = now + pl_backoff_ms(r->fails);
+}
+
+struct pl_key { uint64_t tier, last; size_t at; };
+
+static int pl_key_lt(const struct pl_key *a, const struct pl_key *b) {
+    if (a->tier != b->tier) return a->tier < b->tier;
+    if (a->last != b->last) return a->last < b->last;
+    return a->at < b->at;
+}
+
+static size_t pl_order(const int *sel, size_t n, int self, int prev, int down, uint64_t now, int *out,
+                       size_t k) {
+    struct pl_key after = { 0, 0, 0 };
+    size_t m = 0;
+    while (m < k) {
+        struct pl_key best = { 0, 0, 0 };
+        int found = 0;
+        for (size_t j = 0; j < n; j++) {
+            int c = sel[j];
+            if (c == prev || pl_taken(c, self)) continue;
+            const struct pl_cand *r = pl_peek(c);
+            int failed = r && r->fails;
+            if (!down && failed && now < r->next) continue;
+            struct pl_key key = { (uint64_t)(down && failed), down && failed ? r->last : 0, j };
+            if (m && !pl_key_lt(&after, &key)) continue;
+            if (found && !pl_key_lt(&key, &best)) continue;
+            best = key;
+            found = 1;
+        }
+        if (!found) break;
+        out[m++] = sel[best.at];
+        after = best;
+    }
+    return m;
+}
+
+size_t pool_order(const int *sel, size_t n, int *out, size_t k) {
+    pthread_mutex_lock(&g_pl.mu);
+    size_t m = pl_order(sel, n, -1, -1, 1, pl_now_ms(), out, k);
+    pthread_mutex_unlock(&g_pl.mu);
+    return m;
+}
+
+void pool_note(int c, int ok) {
+    pthread_mutex_lock(&g_pl.mu);
+    pl_note(c, ok, pl_now_ms());
+    pthread_mutex_unlock(&g_pl.mu);
+}
+
+static int pl_none_up(void) {
+    for (int k = 0; k < g_pl.n; k++)
+        if (g_pl.slot[k].node >= 0 && g_pl.slot[k].up) return 0;
+    return 1;
+}
+
+static int pl_leader(void) {
+    for (int k = 0; k < g_pl.n; k++)
+        if (g_pl.slot[k].node < 0 || !g_pl.slot[k].up) return k;
+    return -1;
+}
+
+static size_t pl_free_n(int i, int prev, uint64_t rot, int *rotated) {
+    size_t f = 0;
+    *rotated = 1;
+    for (size_t k = 0; k < g_pl.sel->n; k++) {
+        int c = g_pl.sel->c[k];
+        if (c == prev || pl_taken(c, i)) continue;
+        f++;
+        const struct pl_cand *r = pl_peek(c);
+        if (!r || !r->fails || r->last < rot) *rotated = 0;
+    }
+    return f;
+}
+
+/* Give slot i a live node: its own previous one (if own), then a bounded number of free
+ * candidates in the round's order. 1 — found. Probes run without the lock; the state is logged
+ * after every failure, so "no node answers" is said at once, not after the whole round. */
 static int pl_refill(int i, int own) {
     char why[256];
     pthread_mutex_lock(&g_pl.mu);
     int prev = g_pl.slot[i].node;
-    unsigned gen = g_pl.slot[i].gen;
+    unsigned gen = g_pl.slot[i].gen, woke = g_pl.slot[i].woke;
     const struct pl_sel *sel = g_pl.sel;
+    uint64_t now = pl_now_ms();
+    int down = pl_none_up(), leader = pl_leader() == i;
     pthread_mutex_unlock(&g_pl.mu);
     if (own && prev >= 0) {
-        if (pl_probe(prev, why, sizeof why) == 0) {
-            pthread_mutex_lock(&g_pl.mu);
+        int rc = pl_probe(prev, why, sizeof why);
+        pthread_mutex_lock(&g_pl.mu);
+        pl_note(prev, rc == 0, now);
+        if (rc == 0) {
             if (g_pl.slot[i].gen != gen) { pthread_mutex_unlock(&g_pl.mu); return 0; }
             pl_slot_alive(&g_pl.slot[i]);
             pl_unmark_down(prev);
@@ -353,23 +481,55 @@ static int pl_refill(int i, int own) {
             pl_probe6(i, prev, gen);
             return 1;
         }
+        pthread_mutex_unlock(&g_pl.mu);
         snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
         pl_publish();
     }
-    for (size_t k = 0; k < sel->n; k++) {
-        int c = sel->c[k];
+    int out[POOL_WALK_DOWN];
+    size_t m = 0, probed = 0;
+    if (!down || leader) {
+        pthread_mutex_lock(&g_pl.mu);
+        m = pl_order(sel->c, sel->n, i, prev, down, now, out, down ? POOL_WALK_DOWN : POOL_WALK);
+        pthread_mutex_unlock(&g_pl.mu);
+    }
+    char ok[POOL_WALK_DOWN];
+    int err[POOL_WALK_DOWN] = { 0 };
+    memset(ok, 1, sizeof ok);
+    if (m && g_pl.cf.proto->reach) {
+        const void *nd[POOL_WALK_DOWN];
+        for (size_t k = 0; k < m; k++) nd[k] = pl_node(out[k]);
+        if (g_pl.cf.proto->reach(nd, m, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
+    }
+    for (size_t k = 0; k < m; k++) {
+        int c = out[k];
         pthread_mutex_lock(&g_pl.mu);
         int moved = g_pl.slot[i].gen != gen;
         int busy = c == prev || pl_taken(c, i);
         pthread_mutex_unlock(&g_pl.mu);
         if (moved) return 0;
         if (busy) continue;
-        if (pl_probe(c, why, sizeof why) != 0) {
+        if (!ok[k]) {
+            probed++;
+            pthread_mutex_lock(&g_pl.mu);
+            pl_note(c, 0, now);
+            pthread_mutex_unlock(&g_pl.mu);
+            if (!g_pl.why[0]) {
+                const char *t = tr_dial_strerror(err[k]);
+                snprintf(g_pl.why, sizeof g_pl.why, "%s", t ? t : "no TCP answer");
+                pl_publish();
+            }
+            continue;
+        }
+        int rc = pl_probe(c, why, sizeof why);
+        probed++;
+        pthread_mutex_lock(&g_pl.mu);
+        pl_note(c, rc == 0, now);
+        if (rc != 0) {
+            pthread_mutex_unlock(&g_pl.mu);
             if (!g_pl.why[0]) snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
             pl_publish();
             continue;
         }
-        pthread_mutex_lock(&g_pl.mu);
         if (g_pl.slot[i].gen != gen) { pthread_mutex_unlock(&g_pl.mu); return 0; }
         if (pl_taken(c, i) || !pl_in(g_pl.sel, c)) { pthread_mutex_unlock(&g_pl.mu); continue; }
         struct pl_slot *sl = &g_pl.slot[i];
@@ -397,16 +557,20 @@ static int pl_refill(int i, int own) {
     }
     pthread_mutex_lock(&g_pl.mu);
     struct pl_slot *sl = &g_pl.slot[i];
-    if (sl->gen != gen || g_pl.sel != sel) { pthread_mutex_unlock(&g_pl.mu); return 0; }
-    int retry_s = (int)sl->retry;
-    sl->due = pl_now_ms() + sl->retry * 1000ull;
-    sl->retry = sl->retry * 2 > PL_RETRY_MAX_S ? PL_RETRY_MAX_S : sl->retry * 2;
-    int none_up = 1;
-    for (int k = 0; k < g_pl.n; k++)
-        if (g_pl.slot[k].node >= 0 && g_pl.slot[k].up) none_up = 0;
+    if (sl->gen != gen || g_pl.sel != sel || sl->woke != woke) { pthread_mutex_unlock(&g_pl.mu); return 0; }
+    int none_up = pl_none_up(), rotated;
+    size_t free_n = pl_free_n(i, prev, sl->rot, &rotated);
+    int pause_s = !none_up && probed ? PL_EXTRA_S : (int)sl->retry;
+    sl->due = pl_now_ms() + (uint64_t)pause_s * 1000ull;
+    if (!none_up || rotated) {
+        sl->retry = sl->retry * 2 > PL_RETRY_MAX_S ? PL_RETRY_MAX_S : sl->retry * 2;
+        if (none_up) sl->rot = now + 1;
+    }
     pthread_mutex_unlock(&g_pl.mu);
+    fprintf(stderr, PL_LOG_D "slot %d: %zu of %zu free candidates probed, none answers; next round in %d s\n",
+            i + 1, probed, free_n, pause_s);
     pl_publish();
-    if (none_up) ctl_emit_no_node(retry_s);
+    if (none_up) ctl_emit_no_node(pause_s);
     return 0;
 }
 
@@ -435,6 +599,7 @@ static void pl_check(int i) {
     sl->checked_at = pl_now_ms();
     int unproven = rc == 0 && kicked && !lost && ++sl->unproven >= PL_UNPROVEN && pl_has_free(i);
     if (rc == 0 && !unproven) {
+        pl_note(node, 1, sl->checked_at);
         sl->fails = sl->streak = 0;
         sl->due = sl->checked_at + (uint64_t)g_pl.cf.interval_s * 1000ull;
         int do6 = sl->v6 || sl->skip6 <= 0;
@@ -460,6 +625,16 @@ static void pl_check(int i) {
     __atomic_add_fetch(&sl->gen, 1, __ATOMIC_RELEASE);
     if (!unproven) sl->retry = PL_RETRY_S;
     pl_mark_down(node);
+    pl_note(node, 0, sl->checked_at);
+    sl->rot = sl->checked_at;
+    if (pl_none_up())
+        for (int k = 0; k < g_pl.n; k++) {
+            struct pl_slot *o = &g_pl.slot[k];
+            if (k == i || (o->node >= 0 && o->up)) continue;
+            o->retry = PL_RETRY_S;
+            o->due = o->rot = sl->checked_at;
+            o->woke++;
+        }
     pthread_mutex_unlock(&g_pl.mu);
     snprintf(g_pl.why, sizeof g_pl.why, "%s", why);
     fprintf(stderr, PL_LOG_D "node %s does not answer: %s — looking for a replacement\n",
@@ -926,6 +1101,8 @@ int pool_select(const int *c, size_t n) {
     pthread_mutex_lock(&g_pl.mu);
     sel->old = g_pl.sel;
     g_pl.sel = sel;
+    for (size_t k = 0; k < n; k++)
+        if (!sel->old || !pl_in(sel->old, c[k])) pl_note(c[k], 1, now);
     int want = (size_t)g_pl.cf.active < n ? g_pl.cf.active : (int)n;
     if (want > g_pl.n) g_pl.n = want;
     for (int i = 0; i < g_pl.n; i++) {
@@ -941,7 +1118,8 @@ int pool_select(const int *c, size_t n) {
         }
         if (sl->node < 0 || !sl->up) {
             sl->retry = PL_RETRY_S;
-            sl->due = now;
+            sl->due = sl->rot = now;
+            sl->woke++;
         }
     }
     if (drained) g_pl.pub = 1;
@@ -952,4 +1130,20 @@ int pool_select(const int *c, size_t n) {
                 gone[k]);
     if (drained) stack_nodes_changed();
     return drained;
+}
+
+int pool_wake(const int *idx, size_t n) {
+    pthread_mutex_lock(&g_pl.mu);
+    uint64_t now = pl_now_ms();
+    for (size_t k = 0; k < n; k++) pl_note(idx[k], 1, now);
+    for (int i = 0; i < g_pl.n; i++) {
+        struct pl_slot *sl = &g_pl.slot[i];
+        if (sl->node >= 0 && sl->up) continue;
+        sl->retry = PL_RETRY_S;
+        sl->due = sl->rot = now;
+        sl->woke++;
+    }
+    pthread_cond_signal(&g_pl.cv);
+    pthread_mutex_unlock(&g_pl.mu);
+    return 0;
 }

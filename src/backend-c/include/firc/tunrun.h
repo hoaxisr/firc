@@ -84,6 +84,9 @@ bool firc_tunrun_node_down(const firc_tunrun_t *t, const char *id, const char *k
 /* Forgets that the node with this key of tunnel id was reported down: it answered a probe. */
 void firc_tunrun_node_answered(firc_tunrun_t *t, const char *id, const char *key);
 
+/* Sends tunnel id's ready child a wake with these node links, nothing when n is 0. */
+void firc_tunrun_wake(firc_tunrun_t *t, const char *id, const char *const *links, size_t n);
+
 /* True while the node with this key of tunnel id is among tunvless's active ones. */
 bool firc_tunrun_node_active(const firc_tunrun_t *t, const char *id, const char *key);
 

@@ -90,7 +90,7 @@ int main(void) {
     nodes_init(sizeof(struct vless_node));
     ctl_init(1);
     ctlinb_init();
-    static const struct ctln_hooks h = { on_select, on_ack, on_full, 2000, NULL };
+    static const struct ctln_hooks h = { on_select, on_ack, on_full, 2000, NULL, NULL };
     check("resolver thread started", 0, ctln_start(&h));
     struct ib_cfg c[20];
     unsigned gen0, gen;

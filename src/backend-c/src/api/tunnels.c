@@ -20,6 +20,7 @@ struct tun_probe_call {
     firc_tunprobe_t *probe;
     firc_http_deferred_t *pending;
     char (*keys)[192];
+    char **links;
     size_t n;
     char *saved;
 };
@@ -1378,6 +1379,10 @@ static void handle_preview(firc_http_req_t *req, firc_http_res_t *res, void *ud)
 
 static void call_free(tun_probe_call_t *c)
 {
+    for (size_t i = 0; c->links != NULL && i < c->n; i++) {
+        free(c->links[i]);
+    }
+    free(c->links);
     free(c->saved);
     free(c->keys);
     free(c);
@@ -1413,6 +1418,17 @@ static void probe_done(const firc_tunprobe_row_t *rows, size_t n, void *ud)
         a = NULL;
     }
     cJSON_Delete(a);
+    size_t m = 0;
+    for (size_t i = 0; c->saved != NULL && i < n && i < c->n; i++) {
+        if (rows[i].have && rows[i].ok) {
+            char *x = c->links[m];
+            c->links[m++] = c->links[i];
+            c->links[i] = x;
+        }
+    }
+    if (m > 0 && c->ctx->run != NULL) {
+        firc_tunrun_wake(c->ctx->run, c->saved, (const char *const *)c->links, m);
+    }
     char *text = ok ? firc_json_dump(o) : NULL;
     cJSON_Delete(o);
     if (text == NULL) {
@@ -1470,13 +1486,12 @@ static void start_probe(firc_tunnels_ctx_t *ctx, firc_http_res_t *res, const fir
         return;
     }
     tun_probe_call_t *c = calloc(1, sizeof *c);
-    char **links = calloc(nodes.n + 1, sizeof *links);
     if (c != NULL) {
+        c->links = calloc(nodes.n + 1, sizeof *c->links);
         c->keys = calloc(nodes.n + 1, sizeof *c->keys);
         c->saved = saved ? strdup(t->id) : NULL;
     }
-    if (c == NULL || links == NULL || c->keys == NULL || (saved && c->saved == NULL)) {
-        free(links);
+    if (c == NULL || c->links == NULL || c->keys == NULL || (saved && c->saved == NULL)) {
         if (c != NULL) {
             call_free(c);
         }
@@ -1486,13 +1501,13 @@ static void start_probe(firc_tunnels_ctx_t *ctx, firc_http_res_t *res, const fir
     }
     for (size_t i = 0; i < nodes.n; i++) {
         if (nodes.v[i].link != NULL) {
-            links[c->n] = nodes.v[i].link;
+            c->links[c->n] = nodes.v[i].link;
+            nodes.v[i].link = NULL;
             snprintf(c->keys[c->n], sizeof c->keys[c->n], "%s", nodes.v[i].key);
             c->n++;
         }
     }
     if (c->n == 0) {
-        free(links);
         call_free(c);
         firc_tun_nodes_free(&nodes);
         cJSON *o = cJSON_CreateObject();
@@ -1512,14 +1527,19 @@ static void start_probe(firc_tunnels_ctx_t *ctx, firc_http_res_t *res, const fir
                               .timeout_s = PROBE_TIMEOUT_S,
                               .kill_after_ms = firc_tunprobe_deadline_ms(c->n)};
     c->ctx = ctx;
-    err = firc_tunprobe_start(firc_http_res_loop(res), &o, links, c->n, probe_done, c, &c->probe);
-    free(links);
+    err = firc_tunprobe_start(firc_http_res_loop(res), &o, c->links, c->n, probe_done, c, &c->probe);
     firc_tun_nodes_free(&nodes);
     if (err != FIRC_OK) {
         call_free(c);
         FIRC_WARN("tunnels: probe not started: %s", firc_err_str(err));
         firc_http_res_write_error(res, 500, "probe not started");
         return;
+    }
+    if (!saved) {
+        for (size_t i = 0; i < c->n; i++) {
+            free(c->links[i]);
+            c->links[i] = NULL;
+        }
     }
     c->pending = firc_http_res_defer(res, probe_client_left, c);
     if (c->pending == NULL) {

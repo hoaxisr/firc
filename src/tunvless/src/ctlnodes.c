@@ -244,6 +244,43 @@ static int command(FILE *in, char **line, size_t *cap) {
     return 0;
 }
 
+static int wake(FILE *in, char **line, size_t *cap) {
+    int *idx = NULL;
+    size_t n = 0, icap = 0, total = 0, lineno = 0;
+    int over = 0;
+    ssize_t len;
+    while ((len = getline(line, cap, in)) > 0) {
+        total += (size_t)len;
+        while (len > 0 && ((*line)[len - 1] == '\n' || (*line)[len - 1] == '\r')) (*line)[--len] = 0;
+        if (len == 0) {
+            if (over)
+                fprintf(stderr, LOG_W "wake over %zu bytes — the lines after that are left out\n",
+                        VLESS_CTL_NODES_MAX);
+            if (g_cn.h.wake) g_cn.h.wake(idx, n);
+            free(idx);
+            return 0;
+        }
+        lineno++;
+        if (over || total > VLESS_CTL_NODES_MAX) { over = 1; continue; }
+        int i = nodes_find(*line);
+        if (i < 0) continue;
+        if (n == icap) {
+            size_t nc = icap ? icap * 2 : 16;
+            int *p = realloc(idx, nc * sizeof(*p));
+            if (!p) {
+                fprintf(stderr, LOG_W "wake line %zu: no memory — left out\n", lineno);
+                continue;
+            }
+            idx = p;
+            icap = nc;
+        }
+        idx[n++] = i;
+    }
+    fprintf(stderr, LOG_W "stdin closed in the middle of a wake command — it is dropped\n");
+    free(idx);
+    return -1;
+}
+
 void ctln_read(FILE *in) {
     sl_set_interner(nodes_intern);
     char *line = NULL;
@@ -260,6 +297,8 @@ void ctln_read(FILE *in) {
             if (r >= 0 && g_cn.h.map_ack) g_cn.h.map_ack(r);
         } else if (!strcmp(line, "inbounds")) {
             r = ctlinb_read_cmd(in, &line, &cap);
+        } else if (!strcmp(line, "wake")) {
+            r = wake(in, &line, &cap);
         } else if (!strcmp(line, "close")) {
             r = ctlmap_read_close(in, &line, &cap);
         } else {

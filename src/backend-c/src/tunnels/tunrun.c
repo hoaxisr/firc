@@ -1417,6 +1417,34 @@ void firc_tunrun_node_answered(firc_tunrun_t *t, const char *id, const char *key
     }
 }
 
+void firc_tunrun_wake(firc_tunrun_t *t, const char *id, const char *const *links, size_t n)
+{
+    if (n == 0 || !firc_tunsup_ready(t->sup, id)) {
+        return;
+    }
+    size_t len = 0;
+    for (size_t i = 0; i < n; i++) {
+        len += strlen(links[i]) + 1;
+    }
+    char *text = malloc(len + 1);
+    if (text == NULL) {
+        FIRC_WARN("tunnels: out of memory, %s not woken", id);
+        return;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(links[i]);
+        memcpy(text + at, links[i], l);
+        text[at + l] = '\n';
+        at += l + 1;
+    }
+    firc_err_t err = firc_tunsup_command(t->sup, id, FIRC_TUN_CMD_WAKE, text, len, NULL, 0);
+    free(text);
+    if (err != FIRC_OK) {
+        FIRC_WARN("tunnels: wake of %s not sent: %s", id, firc_err_str(err));
+    }
+}
+
 bool firc_tunrun_node_active(const firc_tunrun_t *t, const char *id, const char *key)
 {
     ssize_t i = find(&t->cur, id);

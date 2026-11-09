@@ -24,11 +24,15 @@ struct pool_proto {
     /* The same check that chose the node at startup: 0 — alive, otherwise why says what failed. */
     int (*probe)(const void *node, int timeout_s, char *why, size_t why_n);
     int (*probe6)(const void *node, int timeout_s, char *why, size_t why_n);
+    int (*reach)(const void *const *nodes, size_t n, int timeout_ms, char *ok, int *err);
     const char *(*name)(const void *node);
 };
 
 #define POOL_INTERVAL_S 60
 #define POOL_SILENCE_S  20
+#define POOL_WALK       8
+#define POOL_WALK_DOWN  16
+#define POOL_REACH_MS   3000
 
 struct pool_cfg {
     const struct pool_proto *proto;
@@ -49,6 +53,12 @@ struct pool_cfg {
 int pool_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready, void *arg);
 
 int pool_select(const int *sel, size_t n);
+
+int pool_wake(const int *idx, size_t n);
+
+size_t pool_order(const int *sel, size_t n, int *out, size_t k);
+
+void pool_note(int c, int ok);
 
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host);
 

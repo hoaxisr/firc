@@ -1561,7 +1561,8 @@ static void t_spare_slot(void) {
 /* ---- fake protocol: node and link ----------------------------------------------------------- */
 
 struct fnode { char name[16]; char host[16]; int alive; };
-static struct fnode g_fn[5];
+#define FN_N 24
+static struct fnode g_fn[FN_N];
 
 struct fsess { int fd; const struct fnode *node; int flow_opens; int udp; char host[256]; };
 
@@ -1770,16 +1771,22 @@ static void pm_sweep(void) {
  * Checks (pl_check) are called by hand instead of from the health thread, so every step of a
  * failover is deterministic. */
 
-static int g_probes[5];                 /* probes per node */
+static int g_probes[FN_N];              /* probes per node */
 static int g_hook_node = -1;
 static const int *g_hook_sel;
 static size_t g_hook_n;
+static int g_hook_wake_node = -1;
+static int g_hook_wake_idx[1];
 static int f_probe(const void *node, int t, char *why, size_t n) {
     (void)t;
     g_probes[(const struct fnode *)node - g_fn]++;
     if ((const struct fnode *)node - g_fn == g_hook_node) {
         g_hook_node = -1;
         pool_select(g_hook_sel, g_hook_n);
+    }
+    if ((const struct fnode *)node - g_fn == g_hook_wake_node) {
+        g_hook_wake_node = -1;
+        pool_wake(g_hook_wake_idx, 1);
     }
     if (((const struct fnode *)node)->alive) return 0;
     snprintf(why, n, "test node is silent");
@@ -1789,11 +1796,11 @@ static const char *f_name(const void *node) { return ((const struct fnode *)node
 static const struct pool_proto f_proto = { .ops = &f_ops, .probe = f_probe, .name = f_name };
 static const struct pool_proto *g_pproto = &f_proto;
 
-static int g_cand[5] = { 0, 1, 2, 3, 4 };
+static int g_cand[FN_N] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 };
 static const void *f_at(int i) { return &g_fn[i]; }
 
 /* A fresh pool: `active` slots, candidates 0..ncand-1, node 0 chosen at startup. */
-static void pool_new_ex(int active, int by, int ncand, int checked) {
+static void pool_build(int active, int by, int ncand, int checked) {
     while (g_conns && g_live_n) conn_drop(&g_conns[g_live[0]]);
     free(g_pl.slot);
     memset(&g_pl.cf, 0, sizeof g_pl.cf);
@@ -1812,6 +1819,14 @@ static void pool_new_ex(int active, int by, int ncand, int checked) {
     g_spare_want = 0;
     stack_setup(d);
 }
+static void pool_new_ex(int active, int by, int ncand, int checked) {
+    free(g_pl.cand);
+    g_pl.cand = NULL;
+    g_pl.cand_n = 0;
+    g_pl_clock_ms = 0;
+    pool_build(active, by, ncand, checked);
+}
+static void pool_new_keep(int active, int by, int ncand) { pool_build(active, by, ncand, 1); }
 static void pool_new(int active, int by, int ncand) { pool_new_ex(active, by, ncand, 1); }
 
 static void all_alive(void) { for (int i = 0; i < 5; i++) g_fn[i].alive = 1; }
@@ -2042,9 +2057,9 @@ static void t_pool_refill(void) {
     uint64_t t0 = pl_now_ms();
     pl_check(0);
     uint64_t t1 = pl_now_ms();
-    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].due >= t0 + 15000 &&
-              g_pl.slot[0].due <= t1 + 15000 && g_pl.slot[0].retry == 30,
-          "no replacement answers — the slot waits 15 s for the next round, the pause doubles");
+    check(!g_pl.slot[0].up && g_pl.slot[0].node == 0 && g_pl.slot[0].due >= t0 + 300000 &&
+              g_pl.slot[0].due <= t1 + 300000 && g_pl.slot[0].retry == 30,
+          "no replacement answers while other slots live — the slot waits 5 min for the next round, the pause doubles");
     check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep,
           "a dead node without a replacement still tells the stack the node set changed");
     check(pl_stale(&g_pl, &on_live),
@@ -2059,15 +2074,18 @@ static void t_pool_refill(void) {
     pl_check(0);
     check(!g_pl.slot[0].up, "a round: the node a dead slot waits for is not given to another slot");
     pl_check(2);
-    check(g_pl.slot[2].up && g_pl.slot[2].node == 3 && g_pl.said_up == 1,
+    check(g_pl.slot[2].up && g_pl.slot[2].node == 3 && g_pl.said_up == 1 && g_pl.cand_n > 3 &&
+              g_pl.cand[3].fails == 0,
           "a round: the slot's own node answers again — the slot lives on it, the pool is up again");
     g_fn[4].alive = 1;
     ep = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
+    g_pl_clock_ms = pl_now_ms() + 600000;
     pl_check(0);
     check(g_pl.slot[0].up && g_pl.slot[0].node == 4 &&
               __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep,
           "a round: a free candidate answers — the slot takes it, the stack is told");
     check(pl_stale(&g_pl, &on_dead), "  connections bound to the slot's dead node are stale then");
+    g_pl_clock_ms = 0;
     int dup = 0;
     for (int i = 0; i < 3; i++)
         for (int j = i + 1; j < 3; j++)
@@ -3084,11 +3102,574 @@ static void pool_v6_part(void) {
     t_addr6_of();
 }
 
+#define CT 1000000ull
+
+static int ints_are(const int *got, size_t n, const int *want, size_t wn) {
+    return n == wn && !memcmp(got, want, n * sizeof *got);
+}
+
+static void cand_pool(void) {
+    pool_new(2, POOL_BY_CONNECTION, 5);
+    g_pl.slot[0].node = g_pl.slot[1].node = -1;
+}
+
+static void t_pool_cand_backoff(void) {
+    /* catches: a schedule that does not start at 300 s, does not double, has no 30-min cap, overflows on a long run, or a pass that leaves the backoff */
+    pool_new(2, POOL_BY_CONNECTION, 5);
+    static const uint64_t back[5] = { 300000, 600000, 1200000, 1800000, 1800000 };
+    int ok = 1;
+    for (int j = 0; j < 5; j++) {
+        pl_note(3, 0, CT + (uint64_t)j);
+        ok = ok && g_pl.cand_n > 3 && g_pl.cand[3].fails == (uint32_t)j + 1 &&
+             g_pl.cand[3].last == CT + (uint64_t)j && g_pl.cand[3].next == CT + (uint64_t)j + back[j];
+    }
+    check(ok, "a candidate failing in a row backs off 300, 600, 1200, 1800, 1800 s from its last failure");
+    pl_note(3, 1, CT + 5);
+    check(g_pl.cand_n > 3 && g_pl.cand[3].fails == 0 && g_pl.cand[3].next == 0 && g_pl.cand[3].last == 0,
+          "a passing probe clears the record");
+    for (int j = 0; j < 40; j++) pl_note(3, 0, CT + 10 + (uint64_t)j);
+    check(g_pl.cand_n > 3 && g_pl.cand[3].fails == 40 && g_pl.cand[3].last == CT + 49 &&
+              g_pl.cand[3].next == CT + 49 + 1800000,
+          "forty failures in a row stay at the 30-min cap");
+    pl_note(4096, 0, CT);
+    check(g_pl.cand_n > 4096 && g_pl.cand[4096].fails == 1 && g_pl.cand[4096].next == CT + 300000,
+          "a record far past the others is grown on demand");
+    pl_note(4097, 0, CT);
+    check(g_pl.cand_n == 8194, "the records grow to twice their size, not one at a time");
+    size_t n = g_pl.cand_n;
+    pl_note(-1, 0, CT);
+    check(g_pl.cand_n == n && pl_rec(-1) == NULL, "a negative index has no record and is not noted");
+}
+
+static void t_pool_cand_order_clean_is_fircd_order(void) {
+    /* catches: candidates sorted by index instead of fircd's order, or the slot's previous node or another slot's node offered */
+    cand_pool();
+    static const int sel[5] = { 4, 2, 0, 3, 1 };
+    static const int all[5] = { 4, 2, 0, 3, 1 }, no2[4] = { 4, 0, 3, 1 }, no0[4] = { 4, 2, 3, 1 };
+    int out[8];
+    int ok = 1;
+    for (int down = 0; down < 2; down++) {
+        ok = ok && ints_are(out, pl_order(sel, 5, -1, -1, down, CT, out, 8), all, 5);
+        ok = ok && ints_are(out, pl_order(sel, 5, -1, 2, down, CT, out, 8), no2, 4);
+    }
+    check(ok, "no records: both orders are fircd's, without the slot's previous node");
+    g_pl.slot[1].node = 0;
+    ok = 1;
+    for (int down = 0; down < 2; down++) {
+        ok = ok && ints_are(out, pl_order(sel, 5, 0, -1, down, CT, out, 8), no0, 4);
+        ok = ok && ints_are(out, pl_order(sel, 5, 1, -1, down, CT, out, 8), all, 5);
+    }
+    check(ok, "another slot's node is left out; the asking slot's own is not another's");
+}
+
+static void t_pool_cand_order_extra_waits(void) {
+    /* catches: backoff ignored in extra mode, an expiry compared with > instead of >=, or an expired candidate kept behind clean ones */
+    cand_pool();
+    static const int sel[5] = { 0, 1, 2, 3, 4 }, wait[4] = { 0, 2, 3, 4 };
+    int out[8];
+    pl_note(1, 0, CT);
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 0, CT + 299999, out, 8), wait, 4),
+          "extra mode: a candidate in backoff is left out");
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 0, CT + 300000, out, 8), sel, 5),
+          "extra mode: an expired backoff is clean again, in fircd's order");
+}
+
+static void t_pool_cand_order_extra_heals(void) {
+    /* catches: extra mode ordered by last failure, so a healed pool never returns to fircd's order */
+    cand_pool();
+    static const int sel[5] = { 0, 1, 2, 3, 4 };
+    int out[8];
+    for (int c = 4; c >= 0; c--) pl_note(c, 0, CT + (uint64_t)(4 - c));
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 0, CT + 400000, out, 8), sel, 5),
+          "extra mode: a healed pool is back in fircd's order, not in the order of failures");
+}
+
+static void t_pool_cand_order_down_rotates(void) {
+    /* catches: down mode leaving out candidates in backoff (the tunnel stays down), not oldest-first, ordered by next, or a cleared candidate not first */
+    cand_pool();
+    static const int sel[5] = { 0, 1, 2, 3, 4 }, three[3] = { 3, 1, 4 }, five[5] = { 3, 1, 4, 2, 0 };
+    static const int tie[5] = { 0, 1, 2, 3, 4 }, two[5] = { 2, 0, 1, 3, 4 };
+    int out[16];
+    pl_note(0, 0, CT + 4);
+    pl_note(1, 0, CT + 1);
+    pl_note(2, 0, CT + 3);
+    pl_note(4, 0, CT + 2);
+    pl_note(3, 0, CT - 1000);
+    pl_note(3, 0, CT);
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 1, CT + 5, out, 3), three, 3),
+          "down mode: all in backoff, the oldest failures first, capped");
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 1, CT + 5, out, 16), five, 5),
+          "down mode: nobody is left out");
+    for (int c = 0; c < 5; c++) pl_note(c, 0, CT);
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 1, CT + 5, out, 16), tie, 5),
+          "down mode: failures at one moment fall back to fircd's order");
+    pl_note(2, 1, CT + 6);
+    check(ints_are(out, pl_order(sel, 5, -1, -1, 1, CT + 6, out, 16), two, 5),
+          "down mode: a clean candidate comes before the failed ones");
+}
+
+static void t_pool_order_start(void) {
+    /* catches: the start's later rounds probing the same first sixteen, or never coming back to the ones that failed */
+    cand_pool();
+    int sel[20], want[16], out[16];
+    for (int c = 0; c < 20; c++) sel[c] = c;
+    check(ints_are(out, pool_order(sel, 20, out, 16), sel, 16), "the start's order: fircd's first sixteen");
+    g_pl_clock_ms = CT;
+    for (int c = 0; c < 16; c++) pool_note(c, 0);
+    for (int c = 0; c < 16; c++) want[c] = c < 4 ? 16 + c : c - 4;
+    check(ints_are(out, pool_order(sel, 20, out, 16), want, 16) && g_pl.cand_n > 15 &&
+              g_pl.cand[15].last == CT && g_pl.cand[15].next == CT + 300000,
+          "after sixteen failures the untried four come first, then the failed ones");
+    g_pl_clock_ms = 0;
+}
+
+static void tick(void) { g_pl_clock_ms += 31000; }
+
+static void fn_alive(int a, int b, int alive) {
+    for (int i = a; i <= b; i++) g_fn[i].alive = alive;
+}
+
+static int probes_are(int a, int b, int n) {
+    for (int i = a; i <= b; i++)
+        if (g_probes[i] != n) return 0;
+    return 1;
+}
+
+static void t_pool_walk_extra_capped(void) {
+    /* catches: an uncapped walk, the same eight every round, backoff ignored in extra mode, the extra slot searching after 15 s, or a 5-min pause after a round that probed nothing */
+    all_alive();
+    fn_alive(1, 20, 0);
+    pool_new(2, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(1);
+    check(probes_are(1, 8, 1) && probes_are(9, 20, 0) && g_probes[0] == 0 && g_pl.slot[1].node == -1 &&
+              g_pl.slot[1].due == b + 300000,
+          "extra mode: a round probes the first eight free candidates, then waits 5 min");
+    tick();
+    pl_check(1);
+    check(probes_are(1, 16, 1) && probes_are(17, 20, 0), "extra mode: the next round takes the next eight");
+    tick();
+    pl_check(1);
+    check(probes_are(1, 20, 1) && g_probes[0] == 0, "extra mode: the third round takes the last four");
+    tick();
+    pl_check(1);
+    check(probes_are(1, 20, 1) && g_pl.slot[1].due == b + 93000 + 30000,
+          "extra mode: every candidate in backoff, no probe, and the round pause is 30 s, not 5 min");
+    g_pl_clock_ms = b + 300000;
+    pl_check(1);
+    check(probes_are(1, 8, 2) && probes_are(9, 20, 1) && g_probes[0] == 0,
+          "extra mode: the expired backoffs come back in fircd's order");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_extra_own_node_cadence(void) {
+    /* catches: a dead slot whose free candidates are in backoff re-probing its own node only every 5 min */
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(1);
+    check(g_pl.slot[1].up && g_pl.slot[1].node == 1, "own node cadence: the empty slot takes node 1");
+    pl_note(2, 0, b);
+    g_fn[1].alive = 0;
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(1);
+    pl_check(1);
+    check(!g_pl.slot[1].up && g_pl.slot[1].due == b + 15000 && g_pl.slot[1].retry == 30 && g_probes[2] == 0,
+          "own node cadence: dead, no free candidate to probe, the next round in 15 s");
+    check(g_pl.cand_n > 1 && g_pl.cand[1].fails == 1 && g_pl.cand[1].next == b + 300000,
+          "own node cadence: the death backs the node off");
+    tick();
+    pl_check(1);
+    check(g_probes[1] == 3 && g_probes[2] == 0 && g_pl.slot[1].due == b + 31000 + 30000,
+          "own node cadence: the own node probed again, the next round in 30 s");
+    check(g_pl.cand[1].fails == 2 && g_pl.cand[1].last == b + 31000 && g_pl.cand[1].next == b + 31000 + 600000,
+          "own node cadence: the own node's failed probe is noted at the round's time");
+    g_pl_clock_ms = 0;
+    all_alive();
+}
+
+static void t_pool_walk_down_rotates(void) {
+    /* catches: down mode honouring backoff (no probe and the tunnel stays down), a quota other than 16, the pause doubling before a full rotation (retry 30 after round 1), no rotation, or the own node skipped */
+    fn_alive(0, 20, 0);
+    pool_new(1, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(0);
+    pl_check(0);
+    check(!g_pl.slot[0].up && probes_are(1, 16, 1) && probes_are(17, 20, 0) && g_pl.slot[0].due == b + 15000 &&
+              g_pl.slot[0].retry == 15,
+          "down mode: the death's round probes sixteen, the pause stays 15 s before a full rotation");
+    tick();
+    pl_check(0);
+    check(g_probes[0] == 3 && probes_are(17, 20, 1) && probes_are(1, 12, 2) && probes_are(13, 16, 1) &&
+              g_pl.slot[0].due == b + 31000 + 15000 && g_pl.slot[0].retry == 30,
+          "down mode: own node, the untried four, then the oldest failures; the rotation done, the pause doubles");
+    g_fn[14].alive = 1;
+    tick();
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 14 && g_probes[13] == 2 && g_probes[14] == 2 &&
+              g_probes[15] == 1 && g_probes[16] == 1 && g_pl.cand[14].fails == 0,
+          "down mode: the oldest failures first, the round stops at the node that answers");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_walk_one_leader(void) {
+    /* catches: every dead slot walking the free candidates, or the last death leaving the leader on its 5-min extra pause */
+    all_alive();
+    pool_new(3, POOL_BY_CONNECTION, 6);
+    pl_check(1);
+    pl_check(2);
+    check(g_pl.slot[1].node == 1 && g_pl.slot[2].node == 2, "one leader: slots 1 and 2 take nodes 1 and 2");
+    fn_alive(0, 5, 0);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(0);
+    pl_check(0);
+    check(probes_are(3, 5, 1) && g_pl.slot[0].due == b + 300000,
+          "one leader: slot 0 dies while others live, probes the free three, waits 5 min");
+    pl_check(1);
+    pl_check(1);
+    check(probes_are(3, 5, 1), "one leader: slot 1 dies, the free three are in backoff");
+    unsigned w0 = g_pl.slot[0].woke, w1 = g_pl.slot[1].woke;
+    pl_check(2);
+    pl_check(2);
+    check(g_pl.slot[0].due <= b && g_pl.slot[0].retry == 15 && g_pl.slot[1].retry == 15 &&
+              g_pl.slot[0].woke != w0 && g_pl.slot[1].woke != w1,
+          "one leader: the last death re-arms the other slots at once");
+    check(probes_are(3, 5, 1), "one leader: the last dying slot is not the leader and probes no free candidate");
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(1);
+    check(g_probes[1] == 1 && probes_are(3, 5, 0), "one leader: a slot that is not the leader probes its own node only");
+    pl_check(0);
+    check(g_probes[0] == 1 && probes_are(3, 5, 1), "one leader: the leader probes its own node and the free ones");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_start_records_carry(void) {
+    /* catches: pool_setup wiping the start's records, so the first spare-slot round probes again what the start just saw fail */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 5);
+    g_pl_clock_ms = CT;
+    for (int c = 1; c <= 3; c++) pool_note(c, 0);
+    pool_new_keep(2, POOL_BY_CONNECTION, 5);
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(1);
+    check(g_pl.slot[1].up && g_pl.slot[1].node == 4 && probes_are(1, 3, 0),
+          "the start's failures carry into the pool: the spare slot skips them");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_select_clears_new_only(void) {
+    /* catches: a node list resetting every record (a refresh of one node makes all N probed again), or a new node inheriting a stale record */
+    all_alive();
+    g_fn[1].alive = g_fn[2].alive = 0;
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(1);
+    pl_note(3, 0, b);
+    unsigned w = g_pl.slot[1].woke;
+    static const int sel[4] = { 0, 1, 2, 3 };
+    pool_select(sel, 4);
+    check(g_pl.cand_n > 3 && g_pl.cand[3].fails == 0 && g_pl.cand[3].next == 0 && g_pl.cand[1].fails == 1 &&
+              g_pl.cand[2].fails == 1,
+          "a node list: a node new to the selection starts clean, kept ones keep their records");
+    check(g_pl.slot[1].due <= b && g_pl.slot[1].woke != w, "a node list re-arms the empty slot");
+    g_fn[3].alive = 0;
+    tick();
+    pl_check(1);
+    check(g_probes[3] == 1 && g_probes[1] == 1 && g_probes[2] == 1,
+          "a node list: the new node is probed, the kept ones stay in backoff");
+    g_pl_clock_ms = 0;
+    all_alive();
+}
+
+static void t_pool_check_pass_clears(void) {
+    /* catches: a live node that passes its check keeping an old backoff, so it is skipped as a spare once its slot moves */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 2);
+    g_pl_clock_ms = CT;
+    pl_note(0, 0, CT);
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.cand_n > 0 && g_pl.cand[0].fails == 0 && g_pl.cand[0].next == 0,
+          "a passing check clears the node's record");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_walk_down_old_records(void) {
+    /* catches: a rotation that does not start at the death, the re-arm or a node list, so failures from earlier extra rounds count and the pause doubles before every candidate was tried */
+    all_alive();
+    fn_alive(1, 20, 0);
+    pool_new(2, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(1);
+    tick();
+    pl_check(1);
+    tick();
+    pl_check(1);
+    check(probes_are(1, 20, 1) && g_pl.slot[1].node == -1, "old records: the extra rounds tried all twenty");
+    tick();
+    g_fn[0].alive = 0;
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(0);
+    pl_check(0);
+    check(!g_pl.slot[0].up && probes_are(1, 16, 1) && probes_are(17, 20, 0) && g_pl.slot[0].retry == 15,
+          "old records: the death's round probes sixteen, and failures before the death do not finish the rotation");
+    pl_check(1);
+    check(g_pl.slot[1].retry == 15, "old records: the re-armed slot's rotation starts at the death too");
+    tick();
+    pl_check(0);
+    check(g_pl.slot[0].retry == 30, "old records: every candidate tried since the death, the pause doubles");
+    tick();
+    pool_select(g_cand, 21);
+    pl_check(1);
+    check(g_pl.slot[1].retry == 15, "old records: a node list starts a new rotation");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static char g_reach_ok[FN_N];
+static int g_reach_calls;
+static size_t g_reach_n;
+static int g_reach_at[FN_N];
+static int f_reach(const void *const *nodes, size_t n, int t, char *ok, int *err) {
+    (void)t;
+    g_reach_calls++;
+    g_reach_n = n;
+    for (size_t k = 0; k < n; k++) {
+        int i = (int)((const struct fnode *)nodes[k] - g_fn);
+        if (k < FN_N) g_reach_at[k] = i;
+        ok[k] = g_reach_ok[i];
+        err[k] = ok[k] ? 0 : TR_ECONNREFUSED;
+    }
+    return 0;
+}
+static const struct pool_proto fr_proto = { .ops = &f_ops, .probe = f_probe, .reach = f_reach, .name = f_name };
+
+static int reach_at_are(const int *want, size_t n) {
+    if (g_reach_n != n) return 0;
+    for (size_t k = 0; k < n; k++)
+        if (g_reach_at[k] != want[k]) return 0;
+    return 1;
+}
+
+static int fails_are(int a, int b, uint32_t n, uint64_t last) {
+    if (g_pl.cand_n <= (size_t)b) return 0;
+    for (int i = a; i <= b; i++)
+        if (g_pl.cand[i].fails != n || g_pl.cand[i].last != last) return 0;
+    return 1;
+}
+
+static void t_pool_prepass(void) {
+    /* catches: unreachable candidates handshaked, a pre-pass per candidate, or a pre-pass failure not noted (it would lead every round) */
+    fn_alive(0, 20, 0);
+    memset(g_reach_ok, 0, sizeof g_reach_ok);
+    memset(g_reach_ok + 11, 1, 10);
+    g_pproto = &fr_proto;
+    pool_new(1, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    g_reach_calls = 0;
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(0);
+    check(g_reach_calls == 0, "pre-pass: a live slot's check runs no pre-pass");
+    pl_check(0);
+    static const int r1[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    check(g_reach_calls == 1 && reach_at_are(r1, 16),
+          "pre-pass: the death's round runs one pre-pass over its sixteen candidates in order");
+    check(probes_are(1, 10, 0) && probes_are(11, 16, 1) && probes_are(17, 20, 0),
+          "pre-pass: only the candidates that connected are probed");
+    check(fails_are(1, 10, 1, b) && fails_are(11, 16, 1, b), "pre-pass: a candidate that did not connect is noted failed");
+    tick();
+    g_reach_calls = 0;
+    pl_check(0);
+    static const int r2[16] = { 17, 18, 19, 20, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    check(g_reach_calls == 1 && reach_at_are(r2, 16),
+          "pre-pass: the next round's pre-pass takes the untried four, then the oldest failures");
+    check(probes_are(1, 10, 0) && probes_are(11, 12, 2) && probes_are(13, 20, 1),
+          "pre-pass: the next round probes only the candidates that connected");
+    g_pl_clock_ms = 0;
+    g_pproto = &f_proto;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_prepass_none_reached(void) {
+    /* catches: a round with only pre-pass failures read as one that probed nothing, or their reason lost */
+    fn_alive(0, 20, 0);
+    memset(g_reach_ok, 0, sizeof g_reach_ok);
+    g_pproto = &fr_proto;
+    pool_new(1, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    g_reach_calls = 0;
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(0);
+    pl_check(0);
+    check(g_reach_calls == 1 && g_reach_n == 16 && probes_are(1, 20, 0) && fails_are(1, 16, 1, b) &&
+              g_pl.slot[0].due == b + 15000 && g_pl.slot[0].retry == 15,
+          "pre-pass, none connects, down mode: nothing probed, sixteen noted, the pause is the retry");
+    fn_alive(0, 0, 1);
+    pool_new(2, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    g_reach_calls = 0;
+    g_pl_clock_ms = b;
+    pl_check(1);
+    check(g_reach_calls == 1 && g_reach_n == 8 && probes_are(1, 20, 0) && fails_are(1, 8, 1, b) &&
+              g_pl.slot[1].due == b + 300000,
+          "pre-pass, none connects, extra mode: the round counts eight probed and waits 5 min");
+    check(!strcmp(g_pl.why, "node refused the TCP connection (nothing listens on that port)"),
+          "pre-pass, none connects: the reason is the connect's own");
+    g_pl_clock_ms = 0;
+    g_pproto = &f_proto;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_wake_extra(void) {
+    /* catches: wake not reaching the backoff (node 3 waits 5-30 min), wake clearing every record, or wake touching a live slot */
+    all_alive();
+    fn_alive(1, 4, 0);
+    pool_new(2, POOL_BY_CONNECTION, 5);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(1);
+    check(probes_are(1, 4, 1) && g_pl.slot[1].node == -1 && g_pl.slot[1].due == b + 300000,
+          "wake, extra mode: the round fails 1..4 and waits 5 min");
+    g_fn[3].alive = 1;
+    uint64_t due0 = g_pl.slot[0].due;
+    unsigned gen0 = g_pl.slot[0].gen;
+    static const int w[1] = { 3 };
+    check(pool_wake(w, 1) == 0, "wake returns 0");
+    check(g_pl.slot[1].due <= b && g_pl.slot[1].retry == 15, "wake: the empty slot searches at once, retry 15 s");
+    check(g_pl.cand[3].fails == 0 && g_pl.cand[1].fails == 1 && g_pl.cand[2].fails == 1 && g_pl.cand[4].fails == 1,
+          "wake: only the woken node's record is cleared");
+    check(g_pl.slot[0].due == due0 && g_pl.slot[0].gen == gen0, "wake: the live slot is untouched");
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(1);
+    check(g_pl.slot[1].up && g_pl.slot[1].node == 3 && g_probes[1] == 0 && g_probes[2] == 0 && g_probes[4] == 0,
+          "wake, extra mode: the next round takes the woken node, the others stay in backoff");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_wake_down_first(void) {
+    /* catches: a woken node left behind the oldest-first queue */
+    fn_alive(0, 20, 0);
+    pool_new(1, POOL_BY_CONNECTION, 21);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    pl_check(0);
+    pl_check(0);
+    tick();
+    pl_check(0);
+    check(!g_pl.slot[0].up && probes_are(17, 20, 1) && probes_are(1, 12, 2) && probes_are(13, 16, 1),
+          "wake, down mode: two rounds probe every candidate");
+    g_fn[20].alive = 1;
+    static const int w[1] = { 20 };
+    pool_wake(w, 1);
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(0);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 20 && g_probes[0] == 1 && probes_are(1, 19, 0),
+          "wake, down mode: the woken node is probed first, right after the own node");
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static void t_pool_wake_mid_round(void) {
+    /* catches: the end of a round overwriting a wake fired while it ran */
+    all_alive();
+    fn_alive(1, 4, 0);
+    pool_new(2, POOL_BY_CONNECTION, 5);
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t b = pl_now_ms();
+    g_pl_clock_ms = b;
+    g_hook_wake_node = 2;
+    g_hook_wake_idx[0] = 4;
+    pl_check(1);
+    check(g_hook_wake_node == -1 && probes_are(1, 4, 1), "wake mid-round: fired while node 2 was probed");
+    check(g_pl.slot[1].node == -1 && g_pl.slot[1].due <= b && g_pl.slot[1].retry == 15,
+          "wake mid-round: the round's end keeps the wake, not its 5-min pause");
+    g_hook_wake_node = -1;
+    g_pl_clock_ms = 0;
+    fn_alive(0, FN_N - 1, 1);
+}
+
+static int g_next_got = -2;
+static void *next_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_pl.mu);
+    int i = pl_next();
+    pthread_mutex_unlock(&g_pl.mu);
+    __atomic_store_n(&g_next_got, i, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void t_pool_wake_signals(void) {
+    /* catches: a wake that never signals the health thread, so the slot waits out its old due */
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    uint64_t far = pl_now_ms() + 600000;
+    g_pl.slot[0].due = g_pl.slot[1].due = far;
+    g_next_got = -2;
+    pthread_t t;
+    pthread_create(&t, NULL, next_thread, NULL);
+    struct timespec ts = { 0, 100000000 };
+    nanosleep(&ts, NULL);
+    pool_wake(NULL, 0);
+    uint64_t t0 = pl_now_ms();
+    while (__atomic_load_n(&g_next_got, __ATOMIC_ACQUIRE) == -2 && pl_now_ms() - t0 < 1000) {
+        struct timespec s = { 0, 5000000 };
+        nanosleep(&s, NULL);
+    }
+    uint64_t took = pl_now_ms() - t0;
+    int got = __atomic_load_n(&g_next_got, __ATOMIC_ACQUIRE);
+    if (got == -2) {
+        pthread_mutex_lock(&g_pl.mu);
+        g_pl.slot[1].due = 0;
+        pthread_cond_signal(&g_pl.cv);
+        pthread_mutex_unlock(&g_pl.mu);
+    }
+    pthread_join(t, NULL);
+    check(got == 1 && took < 100, "wake: the health thread takes the woken slot at once");
+}
+
 static void pool_part(void) {
     t_pool_setup();
+    t_pool_cand_backoff();
+    t_pool_cand_order_clean_is_fircd_order();
+    t_pool_cand_order_extra_waits();
+    t_pool_cand_order_extra_heals();
+    t_pool_cand_order_down_rotates();
+    t_pool_order_start();
     t_pool_stale();
     t_pool_pick();
     t_pool_refill();
+    t_pool_walk_extra_capped();
+    t_pool_extra_own_node_cadence();
+    t_pool_walk_down_rotates();
+    t_pool_walk_one_leader();
+    t_pool_start_records_carry();
+    t_pool_select_clears_new_only();
+    t_pool_check_pass_clears();
+    t_pool_walk_down_old_records();
+    t_pool_prepass();
+    t_pool_prepass_none_reached();
+    t_pool_wake_extra();
+    t_pool_wake_down_first();
+    t_pool_wake_mid_round();
+    t_pool_wake_signals();
     t_pool_dead_slot_refuses();
     t_pool_up_write();
     t_connq_full_cause();
@@ -4321,7 +4902,7 @@ static void t6_same_low_bytes(void) {
 
 static int stack_part(void) {
     signal(SIGPIPE, SIG_IGN);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < FN_N; i++) {
         snprintf(g_fn[i].name, sizeof g_fn[i].name, "n%d", i);
         snprintf(g_fn[i].host, sizeof g_fn[i].host, "h%d", i);
         g_fn[i].alive = 1;

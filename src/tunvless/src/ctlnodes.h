@@ -9,6 +9,7 @@ struct ctln_hooks {
     void (*pins_full)(void);
     int resolve_ms;
     void (*map_ack)(int count);
+    int (*wake)(const int *idx, size_t n);
 };
 
 int ctln_start(const struct ctln_hooks *h);

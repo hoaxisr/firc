@@ -372,6 +372,7 @@ e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
 	TUNVLESS=$(O)/tunvless sh tests/routes.sh
 	TUNVLESS=$(O)/tunvless sh tests/failover.sh
+	TUNVLESS=$(O)/tunvless sh tests/refill.sh
 	TUNVLESS=$(O)/tunvless sh tests/control.sh
 
 clean:

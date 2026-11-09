@@ -33,7 +33,7 @@ answer() {
     first=1
     ib=0
     while IFS= read -r l; do
-        case "$l" in nodes | map | mapall | close | inbounds) ;; *) continue ;; esac
+        case "$l" in nodes | map | mapall | close | inbounds | wake) ;; *) continue ;; esac
         printf '%s\n' "$l" >> "$IN"
         n=0
         while IFS= read -r x; do
@@ -41,6 +41,7 @@ answer() {
             [ -z "$x" ] && break
             n=$((n + 1))
         done
+        [ "$l" != wake ] || continue
         if [ -z "${FAKE_NOACK:-}" ]; then
             case "$l" in
             nodes) printf '{"type":"nodes","count":%d}\n' "${FAKE_ACK_COUNT:-$n}" ;;

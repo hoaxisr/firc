@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+#include <dirent.h>
+#include <sys/resource.h>
 #include "unit.h"
 #include "../src/proto/transport/trdial.c"
 
@@ -240,6 +242,247 @@ static int have_lo6(void) {
     if (s < 0) return 0;
     close(s);
     return 1;
+}
+
+static int fd_count(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+
+static int mark_settable(void) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    uint32_t m = 1;
+    int r = s >= 0 && setsockopt(s, SOL_SOCKET, SO_MARK, &m, sizeof m) == 0;
+    if (s >= 0) close(s);
+    return r;
+}
+
+static void t_reach_parallel(void) {
+    /* catches: a refused or unroutable host read as reached or told as another failure, the call waiting out the deadline with nothing pending, or a leaked fd */
+    uint16_t open_p = 0, shut_p = 0;
+    int lo = listener(&open_p), ls = listener(&shut_p);
+    close(ls);
+    check("reach: six pinned", 1, transport_pin_host("six"));
+    const char *hosts[3] = { "127.0.0.1", "127.0.0.1", "six" };
+    uint16_t ports[3] = { open_p, shut_p, 443 };
+    char ok[3] = { 7, 7, 7 };
+    int err[3] = { 7, 7, 7 };
+    int before = fd_count();
+    int64_t t0 = now_ms();
+    int rc = tr_reach(hosts, ports, 3, 3000, ok, err);
+    int64_t el = now_ms() - t0;
+    int after = fd_count();
+    check("reach: the listening host connects", 1, ok[0]);
+    check("reach: the refused host does not", 0, ok[1]);
+    check("reach: the unroutable host does not", 0, ok[2]);
+    check("reach: the reached host has no error", 0, err[0]);
+    check("reach: the refused host told as refused", TR_ECONNREFUSED, err[1]);
+    check("reach: the unroutable host told as unreachable", TR_EUNREACH, err[2]);
+    check("reach: one host reached", 1, rc);
+    check("reach: nothing pending, no wait for the deadline", 1, el < 1000);
+    check("reach: no fd left open", before, after);
+    if (lo >= 0) close(lo);
+}
+
+static void t_reach_mark_refused(void) {
+    /* catches: a socket whose required mark cannot be set used for the pre-pass, so it leaves unmarked into the tunnel */
+    if (mark_settable()) {
+        printf("dialmatch: the mark can be set here, the refused mark is not checked\n");
+        return;
+    }
+    uint16_t open_p = 0;
+    int lo = listener(&open_p);
+    const char *hosts[1] = { "127.0.0.1" };
+    uint16_t ports[1] = { open_p };
+    char ok[1] = { 7 };
+    int err[1] = { 7 };
+    transport_set_sock_mark(1, 1);
+    int before = fd_count();
+    int64_t t0 = now_ms();
+    tr_reach(hosts, ports, 1, 3000, ok, err);
+    int64_t el = now_ms() - t0;
+    transport_set_sock_mark(0, 0);
+    check("reach: no mark, a listening host not reached", 0, ok[0]);
+    check("reach: no mark, told as a failed connect", TR_ECONNECT, err[0]);
+    check("reach: no mark, at once", 1, el < 1000);
+    check("reach: no mark, no fd left open", before, fd_count());
+    if (lo >= 0) close(lo);
+}
+
+static void t_reach_deadline(void) {
+    /* catches: a silent host waited for sequentially, past the deadline, or told as other than a timeout */
+    uint16_t p = 0;
+    int filler = -1;
+    int ls = full_listener(AF_INET, &p, &filler);
+    check("reach: a full listener on 127.0.0.1", 1, ls >= 0);
+    const char *hosts[2] = { "127.0.0.1", "127.0.0.1" };
+    uint16_t ports[2] = { p, p };
+    char ok[2] = { 7, 7 };
+    int err[2] = { 7, 7 };
+    int before = fd_count();
+    int64_t t0 = now_ms();
+    tr_reach(hosts, ports, 1, 300, ok, err);
+    int64_t el = now_ms() - t0;
+    check("reach: a silent host is not reached", 0, ok[0]);
+    check("reach: a silent host told as a timeout", TR_ECONNTIMEOUT, err[0]);
+    check("reach: a silent host costs the deadline, no more", 1, el >= 300 && el < 600);
+    ok[0] = ok[1] = 7;
+    t0 = now_ms();
+    tr_reach(hosts, ports, 2, 300, ok, err);
+    el = now_ms() - t0;
+    check("reach: two silent hosts, neither reached", 1, ok[0] == 0 && ok[1] == 0);
+    check("reach: two silent hosts share one wait", 1, el >= 300 && el < 600);
+    check("reach: no fd left open after the deadline", before, fd_count());
+    if (ls >= 0) { close(filler); close(ls); }
+}
+
+static void t_reach_no_fd(void) {
+    /* catches: a pre-pass out of descriptors failing the host instead of leaving it to the probe */
+    uint16_t shut_p = 0;
+    int ls = listener(&shut_p);
+    close(ls);
+    const char *hosts[1] = { "127.0.0.1" };
+    uint16_t ports[1] = { shut_p };
+    char ok[1] = { 7 };
+    int err[1] = { 7 };
+    struct rlimit rl, low;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    int fd = dup(0);
+    close(fd);
+    low = rl;
+    low.rlim_cur = (rlim_t)fd;
+    setrlimit(RLIMIT_NOFILE, &low);
+    tr_reach(hosts, ports, 1, 3000, ok, err);
+    setrlimit(RLIMIT_NOFILE, &rl);
+    check("reach: out of descriptors, the probe decides", 1, ok[0]);
+}
+
+struct late { int ls, filler; };
+
+static void *close_late(void *arg) {
+    struct late *l = arg;
+    struct timespec d = { .tv_sec = 0, .tv_nsec = 300000000L };
+    nanosleep(&d, NULL);
+    close(l->filler);
+    close(l->ls);
+    return NULL;
+}
+
+static void t_reach_v4_first(void) {
+    /* catches: an IPv6 winner cached while an IPv4 address of the node is still connecting, so later dials go IPv6 first, or never cached once IPv4 fails */
+    uint16_t ps = 0;
+    int filler = -1, l4 = -1, l6 = -1;
+    for (int tries = 0; tries < 50 && l6 < 0; tries++) {
+        ps = 0;
+        l4 = full_listener(AF_INET, &ps, &filler);
+        if (l4 < 0) break;
+        l6 = listener6(ps);
+        if (l6 < 0) { close(filler); close(l4); l4 = -1; }
+    }
+    check("reach: a full listener on 127.0.0.1 and one on ::1, one port", 1, l4 >= 0 && l6 >= 0);
+    struct tr_ip rv[2];
+    put4(&rv[0], 0x7f000001u);
+    put6(&rv[1], "::1");
+    check("reach: rv pinned", 1, pin_add("rv", rv, 2) == 2 && pin_add("rw", rv, 2) == 2 && pin_add("rx", rv, 2) == 2);
+    pthread_t th;
+    int th_ok = l4 >= 0 && pthread_create(&th, NULL, accept_late, &l4) == 0;
+    const char *hosts[1] = { "rv" };
+    uint16_t ports[1] = { ps };
+    char ok[1] = { 7 };
+    int err[1] = { 7 };
+    tr_reach(hosts, ports, 1, 3000, ok, err);
+    if (th_ok) pthread_join(th, NULL);
+    const struct tr_ip *g = good_get("rv", ps);
+    check("reach: IPv6 first, IPv4 later: reached", 1, ok[0]);
+    check("reach: IPv6 first, IPv4 later: IPv4 remembered", 1, g && is4(g, 0x7f000001u));
+    if (l4 >= 0) { close(filler); close(l4); }
+    if (l6 >= 0) close(l6);
+    struct late lt;
+    l6 = -1;
+    for (int tries = 0; tries < 50 && l6 < 0; tries++) {
+        ps = 0;
+        lt.ls = full_listener(AF_INET, &ps, &lt.filler);
+        if (lt.ls < 0) break;
+        l6 = listener6(ps);
+        if (l6 < 0) { close(lt.filler); close(lt.ls); lt.ls = -1; }
+    }
+    check("reach: a full listener on 127.0.0.1 to close, one on ::1", 1, lt.ls >= 0 && l6 >= 0);
+    th_ok = lt.ls >= 0 && pthread_create(&th, NULL, close_late, &lt) == 0;
+    hosts[0] = "rw";
+    ports[0] = ps;
+    tr_reach(hosts, ports, 1, 3000, ok, err);
+    if (th_ok) pthread_join(th, NULL);
+    g = good_get("rw", ps);
+    check("reach: IPv6 first, IPv4 refused later: IPv6 remembered", 1, ok[0] == 1 && g && is6(g, "::1"));
+    if (l6 >= 0) close(l6);
+    l6 = -1;
+    for (int tries = 0; tries < 50 && l6 < 0; tries++) {
+        ps = 0;
+        l4 = full_listener(AF_INET, &ps, &filler);
+        if (l4 < 0) break;
+        l6 = listener6(ps);
+        if (l6 < 0) { close(filler); close(l4); l4 = -1; }
+    }
+    check("reach: a full listener on 127.0.0.1 left silent, one on ::1", 1, l4 >= 0 && l6 >= 0);
+    hosts[0] = "rx";
+    ports[0] = ps;
+    tr_reach(hosts, ports, 1, 300, ok, err);
+    check("reach: IPv6 answers, IPv4 silent: reached", 1, ok[0]);
+    check("reach: IPv6 answers, IPv4 silent: no family remembered", 1, !good_get("rx", ps));
+    if (l4 >= 0) { close(filler); close(l4); }
+    if (l6 >= 0) close(l6);
+}
+
+static void t_reach_cache_keeps_the_round(void) {
+    /* catches: the winner cache keeping its first entries forever, so a round's pre-pass winner is gone before the probe dials */
+    uint16_t p = 0, l = 0;
+    int filler = -1;
+    int dead = full_listener(AF_INET, &p, &filler);
+    int live = dead >= 0 ? listen4_at(0x7f000002u, p) : -1;
+    int many = listen_on(AF_INET, &l, 64);
+    check("reach: a full listener, a live one on the same port, a third", 1, dead >= 0 && live >= 0 && many >= 0);
+    struct tr_ip one;
+    put4(&one, 0x7f000001u);
+    for (int i = 0; i < GOOD_MAX; i++) {
+        char h[16];
+        snprintf(h, sizeof h, "o%d", i);
+        good_put(h, l, one);
+    }
+    struct tr_ip pp[5];
+    for (int i = 0; i < 4; i++) put4(&pp[i], 0x7f000001u);
+    put4(&pp[4], 0x7f000002u);
+    check("reach: pp pinned", 5, pin_add("pp", pp, 5));
+    const char *hosts[16];
+    uint16_t ports[16];
+    char names[16][16];
+    hosts[0] = "pp";
+    ports[0] = p;
+    for (int i = 1; i < 16; i++) {
+        snprintf(names[i], sizeof names[i], "q%d", i);
+        pin_add(names[i], &one, 1);
+        hosts[i] = names[i];
+        ports[i] = l;
+    }
+    char ok[16];
+    int err[16];
+    int rc = tr_reach(hosts, ports, 16, 3000, ok, err);
+    check("reach: the round of sixteen all reached", 16, rc);
+    pin_add("q16", &one, 1);
+    const char *last[1] = { "q16" };
+    tr_reach(last, &l, 1, 3000, ok, err);
+    int64_t t0 = now_ms();
+    int fd = tr_dial("pp", p, 2);
+    int64_t el = now_ms() - t0;
+    check("reach: the probe dials the pre-pass winner first", 1, fd >= 0 && el < 1000);
+    if (fd >= 0) close(fd);
+    close(many);
+    close(live);
+    close(filler);
+    close(dead);
 }
 
 int main(void) {
@@ -548,5 +791,11 @@ int main(void) {
         check("IPv6 socket without its mark is not used", 1, !strncmp(g_err, pre, strlen(pre)));
     }
     transport_set_sock_mark(0, 0);
+    t_reach_parallel();
+    t_reach_mark_refused();
+    t_reach_deadline();
+    t_reach_no_fd();
+    t_reach_v4_first();
+    t_reach_cache_keeps_the_round();
     return unit_done("dialmatch");
 }

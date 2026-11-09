@@ -6,6 +6,7 @@
 #include "../src/ctlmap.h"
 #include "nodes.h"
 #include "vless.h"
+#include "vlink.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
@@ -89,6 +90,17 @@ static void on_map_ack(int count) {
     if (g_map_ack_n < 4) g_map_acks[g_map_ack_n++] = count;
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
+}
+
+static int g_wake_calls, g_wake_idx[8];
+static size_t g_wake_n;
+static int on_wake(const int *idx, size_t n) {
+    pthread_mutex_lock(&g_mu);
+    g_wake_calls++;
+    g_wake_n = n;
+    for (size_t i = 0; i < n && i < 8; i++) g_wake_idx[i] = idx[i];
+    pthread_mutex_unlock(&g_mu);
+    return 0;
 }
 
 static void on_full(void) {
@@ -185,7 +197,7 @@ int main(void) {
     transport_pin_host("six1");
     transport_pin_host("dlpin1");
     ctlmap_init(htonl(0xc6120000u), 15);
-    static const struct ctln_hooks h = { on_select, on_ack, on_full, 2000, on_map_ack };
+    static const struct ctln_hooks h = { on_select, on_ack, on_full, 2000, on_map_ack, on_wake };
     check("resolver thread started", 0, ctln_start(&h));
     int p[2];
     if (pipe(p) != 0) return 2;
@@ -328,6 +340,23 @@ int main(void) {
     check("nodes_with_two_pqv_fit: 256 lines over 1 MiB, all taken", 1,
           bo > (1u << 20) && g_ack_n == acks + 1 && g_acks[acks] == 256 && g_pub_n == pubs + 1 && g_pub[pubs].n == 256);
 
+    acks = g_ack_n;
+    char w0[256], w1[256], wx[256], wbuf[2048];
+    link_of(w0, sizeof w0, "pinned1", "wake0");
+    link_of(w1, sizeof w1, "pinned1", "wake1");
+    link_of(wx, sizeof wx, "pinned1", "wakex");
+    snprintf(wbuf, sizeof wbuf, "nodes\n%s%s\nwake\n%s%s\nnodes\n%s\n", w0, w1, w1, wx, w0);
+    put(wbuf);
+    wait_for(&g_ack_n, acks + 2, 2000);
+    w1[strlen(w1) - 1] = 0;
+    int i1 = nodes_find(w1);
+    w1[strlen(w1)] = '\n';
+    /* catches: a wake read as a node list or the other way round, an unknown link passed as -1, or the empty line not ending it */
+    check("t_wake_reads_links", 1,
+          i1 >= 0 && g_ack_n == acks + 2 && g_acks[acks] == 2 && g_acks[acks + 1] == 1 && g_wake_calls == 1 &&
+              g_wake_n == 1 && g_wake_idx[0] == i1);
+    settle();
+
     pubs = g_pub_n;
     acks = g_ack_n;
     char l[256];
@@ -358,5 +387,45 @@ int main(void) {
     check("pin table full: the node is left out", 1, pub_is(pubs, 0, NULL));
     close(g_wfd);
     pthread_join(rt, NULL);
+
+    if (pipe(p) != 0) return 2;
+    g_wfd = p[1];
+    in = fdopen(p[0], "r");
+    pthread_create(&rt, NULL, reader, in);
+    acks = g_ack_n;
+    int wakes0 = g_wake_calls;
+    size_t ocap = VLESS_CTL_NODES_MAX + 8192;
+    char *over = malloc(ocap);
+    size_t oo = (size_t)snprintf(over, ocap, "wake\n");
+    while (oo < VLESS_CTL_NODES_MAX + 1) oo += (size_t)snprintf(over + oo, ocap - oo, "%s", wx);
+    oo += (size_t)snprintf(over + oo, ocap - oo, "%s\nnodes\n%s\n", w1, w0);
+    char ep2[] = "/tmp/ctlnodeso-XXXXXX";
+    int eo = mkstemp(ep2);
+    unlink(ep2);
+    int se2 = dup(2);
+    dup2(eo, 2);
+    put(over);
+    free(over);
+    wait_for(&g_ack_n, acks + 1, 20000);
+    fflush(stderr);
+    dup2(se2, 2);
+    close(se2);
+    char oe[4096];
+    ssize_t ok2 = pread(eo, oe, sizeof oe - 1, 0);
+    oe[ok2 > 0 ? ok2 : 0] = 0;
+    close(eo);
+    int warned = 0;
+    for (const char *q = oe; (q = strstr(q, "wake over")) != NULL; q++) warned++;
+    /* catches: a wake read without the size cap, its lines past the cap taken, or the warning repeated */
+    check("t_wake_over_cap", 1,
+          g_ack_n == acks + 1 && g_wake_calls == wakes0 + 1 && g_wake_n == 0 && warned == 1);
+    settle();
+    int wakes = g_wake_calls;
+    snprintf(wbuf, sizeof wbuf, "wake\n%s", w1);
+    put(wbuf);
+    close(g_wfd);
+    pthread_join(rt, NULL);
+    /* catches: a wake cut by EOF applied as if complete */
+    check("t_wake_cut_by_eof", wakes, g_wake_calls);
     return unit_done("ctlnodesmatch");
 }

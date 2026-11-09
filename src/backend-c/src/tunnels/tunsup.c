@@ -32,6 +32,7 @@ extern char **environ;
 #define INDEX_MAX 4096
 
 static const char k_inb_verb[] = "inbounds\n";
+static const char k_wake_verb[] = "wake\n";
 
 typedef struct slot {
     firc_tunsup_t *s;
@@ -1506,18 +1507,22 @@ firc_err_t firc_tunsup_command(firc_tunsup_t *s, const char *id, firc_tun_cmd_t 
         sl->map_want = grown;
     }
     char *framed = NULL;
-    if (kind == FIRC_TUN_CMD_INBOUNDS) {
-        framed = malloc(sizeof k_inb_verb - 1 + len + 1);
+    if (kind == FIRC_TUN_CMD_INBOUNDS || kind == FIRC_TUN_CMD_WAKE) {
+        const char *verb = kind == FIRC_TUN_CMD_WAKE ? k_wake_verb : k_inb_verb;
+        size_t vl = strlen(verb);
+        framed = malloc(vl + len + 1);
         if (framed == NULL) {
             return FIRC_ERR_NOMEM;
         }
-        memcpy(framed, k_inb_verb, sizeof k_inb_verb - 1);
+        memcpy(framed, verb, vl);
         if (len > 0) {
-            memcpy(framed + sizeof k_inb_verb - 1, text, len);
+            memcpy(framed + vl, text, len);
         }
-        framed[sizeof k_inb_verb - 1 + len] = '\n';
+        framed[vl + len] = '\n';
         text = framed;
-        len += sizeof k_inb_verb;
+        len += vl + 1;
+    }
+    if (kind == FIRC_TUN_CMD_INBOUNDS) {
         sl->inb_sent = 0;
         for (size_t i = 0; i < len; i++) {
             sl->inb_sent += text[i] == '\n';
