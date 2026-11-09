@@ -39,7 +39,7 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-old-names xhttp-data-header xhttp-data-cookie xhttp-data-cookie-small
            xhttp-obfs-header xhttp-obfs-cookie xhttp-obfs-query xhttp-obfs-qih xhttp-tokenish
            xhttp-method-put xhttp-method-get xhttp-table xhttp-headers xhttp-no-grpc xhttp-max-hdr
-           xhttp-neg-obfs xhttp-neg-sess xhttp-neg-data xhttp-reality-firefox xhttp-tls-p384 xhttp-tls-p384-neg
+           xhttp-neg-obfs xhttp-neg-sess xhttp-neg-data xhttp-reality-firefox xhttp-tls-p384 xhttp-tls-p384-neg xhttp-tls-p384-cache
            v6-carry-tcp v6-carry-xhttp v6-second v6-none v6-noroute
            node6-tcp node6-xhttp node6-name node6-dual
            xhttp-dl-reality-auto xhttp-dl-packet-tls xhttp-dl-none xhttp-dl-extra xhttp-dl-post-main
@@ -216,6 +216,8 @@ case_cfg() {
                        Q="type=xhttp&path=%2Fxp%2F&mode=stream-up" ;;
     xhttp-tls-p384-neg) SEC=tls; TUN_ENV="SSL_CERT_FILE=$W/other384.pem"; SCERT=chain384; SKEY=leaf384
                        Q="type=xhttp&path=%2Fxp%2F&mode=stream-up"; EXPECT=fail ;;
+    xhttp-tls-p384-cache) SEC=tls; TUN_ENV="SSL_CERT_FILE=$W/root384.pem STEER_CHAIN_TRACE=1"; SCERT=chain384; SKEY=leaf384
+                       Q="type=xhttp&path=%2Fxp%2F&mode=stream-up" ;;
     xhttp-stream-one|xhttp-stream-up|xhttp-packet-up)
                        Q="type=xhttp&path=%2Fxp%2F&mode=${1#xhttp-}" ;;
     # TLS instead of Reality: the client verifies the server's certificate against --ca.
@@ -1590,6 +1592,13 @@ for size in (1, 200, 1200):
     fi
     if [ "$NODE" != v4 ] || [ -n "$V6" ]; then
         case "$V6" in carry|second) v6_routes_clean target || rc=1 ;; *) v6_routes_clean || rc=1 ;; esac
+    fi
+    if [ "$MODE" = xhttp-tls-p384-cache ]; then
+        nv=$(grep -c 'chain: .* verified, cached until' "$W/tun-$MODE.log" || true)
+        nh=$(grep -c 'chain: .* from the cache' "$W/tun-$MODE.log" || true)
+        echo "run-xray: chain verified $nv, from the cache $nh"
+        [ "$nv" -eq 1 ] || { echo "run-xray: FAIL — the chain was verified $nv times, not once"; rc=1; }
+        [ "$nh" -ge 1 ] || { echo "run-xray: FAIL — no handshake took the chain from the cache"; rc=1; }
     fi
     kill "$SPID" 2>/dev/null || true
     sleep 0.5

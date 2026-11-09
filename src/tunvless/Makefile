@@ -327,14 +327,14 @@ $(T)/echmatch: tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c $(T_CRYPTO)
 
 # vlessmatch includes trdial.c, roots.c and trsec.c (it reaches their static seams).
-VLM_SRC := $(filter-out src/proto/transport/trsec.c,$(CLIENT_SRC))
+VLM_SRC := $(filter-out src/proto/transport/trsec.c src/proto/tls/certverify.c,$(CLIENT_SRC))
 $(T)/vlessmatch: tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c \
                  $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
-	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -o $@ tests/vlessmatch.c $(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
+	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=time -Wl,--wrap=__time64 -o $@ tests/vlessmatch.c $(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c \
                  src/proto/tls/roots.c $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
-	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=malloc -o $@ tests/xconnmatch.c \
+	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=malloc -Wl,--wrap=time -Wl,--wrap=__time64 -o $@ tests/xconnmatch.c \
 		$(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/probematch: tests/probematch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)
@@ -374,6 +374,8 @@ e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/run-tunnel-fin.sh
 	TUNVLESS=$(O)/tunvless sh tests/rcvwnd.sh
 	TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
+	SIGPIPE_CHAIN=1 TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
+	TUNVLESS=$(O)/tunvless sh tests/chain-cache.sh
 	TUNVLESS=$(O)/tunvless sh tests/routes.sh
 	TUNVLESS=$(O)/tunvless sh tests/failover.sh
 	TUNVLESS=$(O)/tunvless sh tests/refill.sh

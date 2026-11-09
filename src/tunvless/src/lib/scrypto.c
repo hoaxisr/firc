@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 #include <wolfssl/wolfcrypt/settings.h>
@@ -657,9 +658,9 @@ int sc_cert_verify_sig(const unsigned char *cert_der, size_t cert_n,
  *
  * The cost is one check at a time: verify_cert adds the intermediates to the store's CertManager
  * as temporary and removes ALL temporary ones when done, so two concurrent checks on one store
- * would interfere (x509_str.c says so). Hence the mutex: one chain check per security=tls
- * handshake takes milliseconds, so waiting for it costs nothing, while a store per thread would
- * cost a hundred KB of roots per connector. */
+ * would interfere (x509_str.c says so). Hence the mutex, taken only by chain checks that miss the
+ * verified-chain cache (certverify.c), while a store per thread would cost a hundred KB of roots
+ * per connector. */
 struct sc_roots {
     WOLFSSL_X509_STORE *store;
     pthread_mutex_t mu;
@@ -716,8 +717,62 @@ void sc_roots_free(struct sc_roots *r) {
     free(r);
 }
 
+static int asn1_epoch(const WOLFSSL_ASN1_TIME *t, int64_t *out) {
+    struct tm tm;
+    if (!t || wolfSSL_ASN1_TIME_to_tm(t, &tm) != 1) return -1;
+    int64_t y = (int64_t)tm.tm_year + 1900, m = tm.tm_mon + 1;
+    if (m <= 2) y--;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + tm.tm_mday - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+    *out = days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+    return 0;
+}
+
+static void chain_window(WOLFSSL_X509_STORE_CTX *ctx, int64_t *nb, int64_t *na) {
+    WOLF_STACK_OF(WOLFSSL_X509) *path = wolfSSL_X509_STORE_CTX_get_chain(ctx);
+    int n = path ? wolfSSL_sk_X509_num(path) : 0;
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    for (int i = 0; i < n; i++) {
+        WOLFSSL_X509 *x = wolfSSL_sk_X509_value(path, i);
+        int64_t b, a;
+        if (!x || asn1_epoch(wolfSSL_X509_get_notBefore(x), &b) != 0 ||
+            asn1_epoch(wolfSSL_X509_get_notAfter(x), &a) != 0) {
+            *nb = INT64_MAX;
+            *na = INT64_MIN;
+            return;
+        }
+        if (b > lo) lo = b;
+        if (a < hi) hi = a;
+    }
+    if (n <= 0) { lo = INT64_MAX; hi = INT64_MIN; }
+    *nb = lo;
+    *na = hi;
+}
+
+int sc_cert_window(const unsigned char *der, size_t n, int64_t *nb, int64_t *na) {
+    if (!der || !n || n > INT32_MAX || !nb || !na) return SC_EINVAL;
+    pthread_once(&g_init_once, lib_init);
+    if (g_init_rc != 0) return SC_ECRYPTO;
+    WOLFSSL_X509 *x = wolfSSL_X509_d2i(NULL, der, (int)n);
+    if (!x) return SC_EPARSE;
+    int64_t b, a;
+    int rc = asn1_epoch(wolfSSL_X509_get_notBefore(x), &b) == 0 &&
+             asn1_epoch(wolfSSL_X509_get_notAfter(x), &a) == 0 ? 0 : SC_EPARSE;
+    wolfSSL_X509_free(x);
+    if (rc == 0) { *nb = b; *na = a; }
+    return rc;
+}
+
 int sc_chain_verify(struct sc_roots *r, const unsigned char *const *der, const size_t *der_n,
                     size_t count, const char *host) {
+    return sc_chain_verify_ex(r, der, der_n, count, host, NULL, NULL);
+}
+
+int sc_chain_verify_ex(struct sc_roots *r, const unsigned char *const *der, const size_t *der_n,
+                       size_t count, const char *host, int64_t *nb, int64_t *na) {
     if (!r || !der || !der_n || !count || !host || !host[0]) return SC_EINVAL;
     for (size_t i = 0; i < count; i++) if (!der[i] || !der_n[i] || der_n[i] > INT32_MAX) return SC_EINVAL;
 
@@ -745,7 +800,10 @@ int sc_chain_verify(struct sc_roots *r, const unsigned char *const *der, const s
         int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
         int set = param && (is_ip ? wolfSSL_X509_VERIFY_PARAM_set1_ip_asc(param, host)
                                   : wolfSSL_X509_VERIFY_PARAM_set1_host(param, host, strlen(host)));
-        if (set == WOLFSSL_SUCCESS && wolfSSL_X509_verify_cert(ctx) == WOLFSSL_SUCCESS) rc = 0;
+        if (set == WOLFSSL_SUCCESS && wolfSSL_X509_verify_cert(ctx) == WOLFSSL_SUCCESS) {
+            rc = 0;
+            if (nb && na) chain_window(ctx, nb, na);
+        }
     }
     pthread_mutex_unlock(&r->mu);
 out:

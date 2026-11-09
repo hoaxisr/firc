@@ -84,8 +84,28 @@ C ip route add default via 10.77.1.1
 # The node address is on lo: a node in 127.0.0.0/8 is refused as "nobody to answer" (sublink.c).
 ip addr add 10.77.0.1/32 dev lo
 
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
-    -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -subj "/CN=node.test" >/dev/null 2>&1
+if [ "${SIGPIPE_CHAIN:-}" = 1 ]; then
+    printf '%s\n' 'basicConstraints=critical,CA:TRUE,pathlen:0' 'keyUsage=critical,keyCertSign,cRLSign' > "$tmp/ca.ext"
+    printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
+        'extendedKeyUsage=serverAuth' 'subjectAltName=DNS:node.test' > "$tmp/leaf.ext"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 2 -sha384 \
+        -keyout "$tmp/root.key" -out "$tmp/root.pem" -subj "/CN=sigpipe root" \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -keyout "$tmp/inter.key" \
+        -out "$tmp/inter.csr" -subj "/CN=sigpipe inter" >/dev/null 2>&1
+    openssl x509 -req -in "$tmp/inter.csr" -CA "$tmp/root.pem" -CAkey "$tmp/root.key" -sha384 -days 2 \
+        -extfile "$tmp/ca.ext" -out "$tmp/inter.pem" >/dev/null 2>&1
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$tmp/key.pem" \
+        -out "$tmp/leaf.csr" -subj "/CN=node.test" >/dev/null 2>&1
+    openssl x509 -req -in "$tmp/leaf.csr" -CA "$tmp/inter.pem" -CAkey "$tmp/inter.key" -sha384 -days 2 \
+        -extfile "$tmp/leaf.ext" -out "$tmp/leaf.pem" >/dev/null 2>&1
+    cat "$tmp/leaf.pem" "$tmp/inter.pem" > "$tmp/cert.pem"
+    TLSQ="" TLSARG="" TLSENV="SSL_CERT_FILE=$tmp/root.pem"
+else
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+        -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -subj "/CN=node.test" >/dev/null 2>&1
+    TLSQ="&allowInsecure=1" TLSARG="--insecure" TLSENV=""
+fi
 python3 "$HERE/sigpipe-node.py" --bind 10.77.0.1 --port 10443 --uuid "$UUID" --tls "$tmp/cert.pem" "$tmp/key.pem" \
     >"$tmp/node-tls.out" 2>"$tmp/node-tls.err" & NT=$!
 python3 "$HERE/sigpipe-node.py" --bind 10.77.0.1 --port 10444 --uuid "$UUID" \
@@ -93,8 +113,8 @@ python3 "$HERE/sigpipe-node.py" --bind 10.77.0.1 --port 10444 --uuid "$UUID" \
 wait_for 'grep -q ready "$tmp/node-tls.out" && grep -q ready "$tmp/node-none.out"' 10
 
 # The client's traffic to .7 goes into the TLS tunnel, to .8 into the plain one: --route on each.
-"$BIN" "vless://$UUID@10.77.0.1:10443?encryption=none&type=tcp&security=tls&sni=node.test&allowInsecure=1#tls" \
-    --insecure -d vlt -a 198.51.100.1/32 -r $TLS/32 >"$tmp/t-tls.log" 2>&1 & T1=$!
+env $TLSENV "$BIN" "vless://$UUID@10.77.0.1:10443?encryption=none&type=tcp&security=tls&sni=node.test$TLSQ#tls" \
+    $TLSARG -d vlt -a 198.51.100.1/32 -r $TLS/32 >"$tmp/t-tls.log" 2>&1 & T1=$!
 "$BIN" "vless://$UUID@10.77.0.1:10444?encryption=none&type=tcp&security=none#none" \
     -d vln -a 198.51.100.2/32 -r $NONE/32 >"$tmp/t-none.log" 2>&1 & T2=$!
 wait_for 'ip route show $TLS/32 | grep -q vlt && ip route show $NONE/32 | grep -q vln' 20

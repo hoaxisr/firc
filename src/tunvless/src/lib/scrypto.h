@@ -237,8 +237,16 @@ void sc_roots_free(struct sc_roots *r);
  * intermediates, path length limit), each certificate's validity now, and host in the leaf
  * (SAN; an address by SAN IP). 0 if the server is genuine; SC_ECHAIN if not, one reason for all
  * ("does not chain to the roots or not issued for this name", as certverify.c puts it);
- * SC_EPARSE if the leaf does not parse. */
+ * SC_EPARSE if the leaf does not parse. The _ex form, on 0 with nb and na set, gives the latest
+ * notBefore and the earliest notAfter of the verified path in UTC seconds (empty if a date does not
+ * convert); on failure it leaves them untouched. */
 int sc_chain_verify(struct sc_roots *r, const unsigned char *const *der, const size_t *der_n,
                     size_t count, const char *host);
+int sc_chain_verify_ex(struct sc_roots *r, const unsigned char *const *der, const size_t *der_n,
+                       size_t count, const char *host, int64_t *nb, int64_t *na);
+/* One DER certificate's notBefore and notAfter in UTC seconds. 0, or SC_EPARSE if it does not parse
+ * or a date does not convert, SC_EINVAL for bad arguments, SC_ECRYPTO if the library does not start;
+ * on any failure the outputs are untouched. */
+int sc_cert_window(const unsigned char *der, size_t n, int64_t *nb, int64_t *na);
 
 #endif

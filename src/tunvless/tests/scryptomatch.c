@@ -544,7 +544,7 @@ static size_t pem_der(const char *pem, unsigned char *out, size_t cap) {
 
 struct der { unsigned char b[2048]; size_t n; };
 static struct der D_LEAF, D_INTER, D_RSALEAF, D_P384, D_INTER521, D_P521, D_FAKECA, D_FAKELEAF, D_EXPIRED,
-    D_INTER384, D_P384C;
+    D_INTER384, D_P384C, D_DATED_INTER, D_DATED_LEAF;
 
 static struct sc_roots *roots_of(const char *pem) {
     struct sc_roots *r = NULL;
@@ -693,12 +693,66 @@ static void p384_signed_chain_verifies_and_a_tampered_one_does_not(void) {
     sc_roots_free(r);
 }
 
+static int dated_chain(struct sc_roots *r, const char *host, int64_t *nb, int64_t *na) {
+    const unsigned char *d[2] = { D_DATED_LEAF.b, D_DATED_INTER.b };
+    size_t dn[2] = { D_DATED_LEAF.n, D_DATED_INTER.n };
+    return sc_chain_verify_ex(r, d, dn, 2, host, nb, na);
+}
+
+static void chain_window_is_the_path(void) {
+    /* catches: a window from the leaf only, the root's dates added, min/max swapped, or local time instead of UTC */
+    struct sc_roots *r = roots_of(PEM_DATED_ROOT);
+    check("dated root store loaded", 1, r != NULL);
+    if (!r) return;
+    int64_t nb = 0, na = 0;
+    check("dated chain verifies", 0, dated_chain(r, "dated.example", &nb, &na));
+    check("window starts at the intermediate's notBefore", 1, nb == 1772323200);
+    check("window ends at the leaf's notAfter", 1, na == 2190499200);
+    sc_roots_free(r);
+}
+
+static void chain_window_untouched_on_failure(void) {
+    /* catches: a window written for a chain that failed, which a caller could cache */
+    struct sc_roots *r = roots_of(PEM_DATED_ROOT);
+    if (!r) { check("dated root store loaded", 1, 0); return; }
+    int64_t nb = 7, na = 9;
+    check("dated chain for another name fails", SC_ECHAIN, dated_chain(r, "other.example", &nb, &na));
+    check("notBefore left as it was", 1, nb == 7);
+    check("notAfter left as it was", 1, na == 9);
+    sc_roots_free(r);
+}
+
+static void chain_window_null_ok(void) {
+    /* catches: the old entry point broken by the new outputs */
+    struct sc_roots *r = roots_of(PEM_DATED_ROOT);
+    if (!r) { check("dated root store loaded", 1, 0); return; }
+    check("dated chain without window outputs", 0, dated_chain(r, "dated.example", NULL, NULL));
+    sc_roots_free(r);
+}
+
+static void cert_window_is_its_own_dates(void) {
+    /* catches: a pinned CA's dates read wrong, swapped, or written for a certificate that does not parse */
+    int64_t nb = 0, na = 0;
+    check("intermediate's window read", 0, sc_cert_window(D_DATED_INTER.b, D_DATED_INTER.n, &nb, &na));
+    check("intermediate's notBefore", 1, nb == 1772323200);
+    check("intermediate's notAfter", 1, na == 2222121600);
+    check("leaf's window read", 0, sc_cert_window(D_DATED_LEAF.b, D_DATED_LEAF.n, &nb, &na));
+    check("leaf's notBefore", 1, nb == 1769904000);
+    check("leaf's notAfter", 1, na == 2190499200);
+    static const unsigned char junk[] = { 0x30, 0x03, 0x02, 0x01, 0x00 };
+    nb = 7;
+    na = 9;
+    check("garbage refused", 1, sc_cert_window(junk, sizeof junk, &nb, &na) != 0);
+    check("garbage leaves the window", 1, nb == 7 && na == 9);
+}
+
 int main(void) {
     struct { const char *pem; struct der *d; } all[] = {
         { PEM_LEAF, &D_LEAF }, { PEM_INTER, &D_INTER }, { PEM_RSALEAF, &D_RSALEAF }, { PEM_P384, &D_P384 },
         { PEM_INTER521, &D_INTER521 }, { PEM_P521, &D_P521 },
         { PEM_FAKECA, &D_FAKECA }, { PEM_FAKELEAF, &D_FAKELEAF }, { PEM_EXPIRED, &D_EXPIRED },
         { PEM_INTER384, &D_INTER384 }, { PEM_P384C, &D_P384C },
+        { PEM_DATED_INTER, &D_DATED_INTER }, { PEM_DATED_LEAF, &D_DATED_LEAF },
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         all[i].d->n = pem_der(all[i].pem, all[i].d->b, sizeof(all[i].d->b));
@@ -719,5 +773,9 @@ int main(void) {
     test_sig();
     test_chain();
     p384_signed_chain_verifies_and_a_tampered_one_does_not();
+    chain_window_is_the_path();
+    chain_window_untouched_on_failure();
+    chain_window_null_ok();
+    cert_window_is_its_own_dates();
     return unit_done("scryptomatch");
 }

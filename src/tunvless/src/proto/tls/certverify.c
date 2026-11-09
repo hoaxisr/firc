@@ -10,7 +10,7 @@
  * WHAT IS NOT. No OCSP and no revocation lists: a router has neither the means nor the time to
  * fetch them, and a silent imitation of a check is worse than an honest absence. The library
  * checks the validity period of every chain certificate against the current time
- * (sc_chain_verify); that is the only time check we rely on.
+ * (sc_chain_verify); a cached chain is held to the same dates on every use.
  *
  * The X.509 work is behind the primitives layer (src/lib/scrypto.h): wolfSSL builds and checks
  * the path to a root, the CA flags and the name; wolfCrypt checks the CertificateVerify
@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <time.h>
 
 #include "scrypto.h"
 #include "certverify.h"
@@ -235,7 +237,7 @@ static int spki_of(const unsigned char *der, size_t n, const unsigned char **spk
 
 /* The chain against ONE store and a list of names; any name will do (verifyPeerCertByName). */
 static int chain_by_names(struct sc_roots *roots, const unsigned char *const *der, const size_t *der_n,
-                          size_t count, const char *names) {
+                          size_t count, const char *names, int64_t *nb, int64_t *na) {
     int rc = CERTV_ECHAIN;
     for (const char *p = names; *p;) {
         const char *e = strchr(p, ',');
@@ -244,13 +246,198 @@ static int chain_by_names(struct sc_roots *roots, const unsigned char *const *de
         if (n && n < sizeof one) {
             memcpy(one, p, n);
             one[n] = '\0';
-            int vr = sc_chain_verify(roots, der, der_n, count, one);
+            int vr = sc_chain_verify_ex(roots, der, der_n, count, one, nb, na);
             if (vr == 0) return 0;
             if (vr == SC_EPARSE) rc = CERTV_EPARSE;
         }
         if (!e) break;
         p = e + 1;
     }
+    return rc;
+}
+
+#define CC_SLOTS 64
+#define CC_TTL_MS 3600000u
+#define CC_JITTER_MS 2000u
+#define CC_STRIPES 8
+
+struct cc_ent {
+    unsigned char key[32];
+    int64_t nb, na;
+    uint64_t born, used;
+};
+
+static struct cc_ent g_cc[CC_SLOTS];
+static pthread_mutex_t g_cc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cc_miss[CC_STRIPES] = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+};
+static int64_t g_cc_wall_s;
+static uint64_t g_cc_mono_ms;
+static unsigned long g_cc_checked;
+
+static int64_t cc_wall(void) {
+    return g_cc_wall_s ? g_cc_wall_s : (int64_t)time(NULL);
+}
+
+static uint64_t cc_mono(void) {
+    if (g_cc_mono_ms) return g_cc_mono_ms;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return ms ? ms : 1;
+}
+
+static uint64_t cc_ttl(const unsigned char key[32]) {
+    return CC_TTL_MS - (uint64_t)key[0] * CC_JITTER_MS;
+}
+
+static int cc_str(struct sc_hash_ctx *h, const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n > 0xffff) return -1;
+    unsigned char l[2] = { (unsigned char)(n >> 8), (unsigned char)n };
+    if (sc_hash_update(h, l, 2) != 0) return -1;
+    return n && sc_hash_update(h, s, n) != 0 ? -1 : 0;
+}
+
+static int cc_key(int anchor, const char *names, const struct cert_policy *pol, const unsigned char *const *der,
+                  const size_t *der_n, size_t count, unsigned char out[32]) {
+    static const char label[] = "tunvless chain cache 1";
+    struct sc_hash_ctx h;
+    if (count > 255 || sc_hash_init(&h, SC_SHA256) != 0) return -1;
+    unsigned char a = (unsigned char)(anchor ? 1 : 0), c = (unsigned char)count;
+    int rc = sc_hash_update(&h, label, sizeof label) != 0 || sc_hash_update(&h, &a, 1) != 0 ||
+             cc_str(&h, names) != 0 || cc_str(&h, pol ? pol->pcs : NULL) != 0 ||
+             cc_str(&h, pol ? pol->pks : NULL) != 0 || sc_hash_update(&h, &c, 1) != 0;
+    for (size_t i = 0; !rc && i < count; i++) {
+        if (der_n[i] > 0xffffff) { rc = 1; break; }
+        unsigned char l[3] = { (unsigned char)(der_n[i] >> 16), (unsigned char)(der_n[i] >> 8),
+                               (unsigned char)der_n[i] };
+        rc = sc_hash_update(&h, l, 3) != 0 || sc_hash_update(&h, der[i], der_n[i]) != 0;
+    }
+    if (!rc) rc = sc_hash_final(&h, out) != 0;
+    sc_hash_free(&h);
+    return rc ? -1 : 0;
+}
+
+static int cc_get(const unsigned char key[32]) {
+    int64_t wall = cc_wall();
+    uint64_t mono = cc_mono(), ttl = cc_ttl(key);
+    int hit = 0;
+    pthread_mutex_lock(&g_cc_mu);
+    for (int i = 0; i < CC_SLOTS; i++) {
+        struct cc_ent *e = &g_cc[i];
+        if (!e->born || memcmp(e->key, key, 32) != 0) continue;
+        if (e->nb <= wall && wall < e->na && mono >= e->born && mono - e->born < ttl) {
+            e->used = mono;
+            hit = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_cc_mu);
+    return hit;
+}
+
+static void cc_put(const unsigned char key[32], int64_t nb, int64_t na) {
+    if (nb >= na) return;
+    uint64_t mono = cc_mono();
+    pthread_mutex_lock(&g_cc_mu);
+    struct cc_ent *v = NULL;
+    for (int i = 0; i < CC_SLOTS && !v; i++)
+        if (g_cc[i].born && !memcmp(g_cc[i].key, key, 32)) v = &g_cc[i];
+    for (int i = 0; i < CC_SLOTS && !v; i++)
+        if (!g_cc[i].born) v = &g_cc[i];
+    if (!v) {
+        v = &g_cc[0];
+        for (int i = 1; i < CC_SLOTS; i++)
+            if (g_cc[i].used < v->used) v = &g_cc[i];
+    }
+    memcpy(v->key, key, 32);
+    v->nb = nb;
+    v->na = na;
+    v->born = v->used = mono;
+    pthread_mutex_unlock(&g_cc_mu);
+}
+
+static void cc_trace(const char *names, int rc, int hit, int cached, int64_t na) {
+    if (!getenv("STEER_CHAIN_TRACE")) return;
+    if (hit) fprintf(stderr, "tunvless[debug] chain: %s from the cache\n", names);
+    else if (rc) fprintf(stderr, "tunvless[debug] chain: %s refused\n", names);
+    else if (cached) fprintf(stderr, "tunvless[debug] chain: %s verified, cached until %lld\n", names, (long long)na);
+    else fprintf(stderr, "tunvless[debug] chain: %s verified, not cached\n", names);
+}
+
+static int pin_listed(const char *list, const unsigned char h[32]);
+
+static int cc_check(struct sc_roots *store, const unsigned char *pinned_der, size_t pinned_n,
+                    const unsigned char *const *der, const size_t *der_n, size_t count, const char *names,
+                    const struct cert_policy *pol, int64_t *nb, int64_t *na) {
+    struct sc_roots *ca = NULL;
+    const unsigned char *ca_der = pinned_der;
+    size_t ca_n = pinned_n;
+    if (pinned_der) {
+        if (sc_roots_load_der(&ca, pinned_der, pinned_n) != 0) ca = NULL;
+        int after = 0;
+        for (size_t i = 1; i < count && !ca; i++) {
+            unsigned char h[32];
+            if (!after) { after = der[i] == pinned_der; continue; }
+            if (sc_hash(SC_SHA256, der[i], der_n[i], h) == 0 && pin_listed(pol ? pol->pcs : NULL, h)) {
+                if (sc_roots_load_der(&ca, der[i], der_n[i]) == 0) { ca_der = der[i]; ca_n = der_n[i]; }
+                else ca = NULL;
+            }
+        }
+        if (!ca) return CERTV_EPIN;
+        store = ca;
+    }
+    int rc = chain_by_names(store, der, der_n, count, names, nb, na);
+    if (ca) {
+        int64_t cb = INT64_MAX, ce = INT64_MIN;
+        if (rc == 0) {
+            sc_cert_window(ca_der, ca_n, &cb, &ce);
+            if (cb > *nb) *nb = cb;
+            if (ce < *na) *na = ce;
+        }
+        sc_roots_free(ca);
+    }
+    pthread_mutex_lock(&g_cc_mu);
+    g_cc_checked++;
+    pthread_mutex_unlock(&g_cc_mu);
+    return rc;
+}
+
+static int cc_chain(struct sc_roots *store_or_null, const unsigned char *pinned_der, size_t pinned_n,
+                    const unsigned char *const *der, const size_t *der_n, size_t count, const char *names,
+                    const struct cert_policy *pol, const char *roots) {
+    struct sc_roots *store = store_or_null;
+    if (!pinned_der && !store) {
+        g_roots_path = roots;
+        pthread_once(&g_roots_once, roots_load);
+        if (g_roots_rc != 0) return CERTV_ENOROOTS;
+        store = g_roots;
+    }
+    unsigned char key[32];
+    int64_t nb = INT64_MAX, na = INT64_MIN;
+    if (cc_key(pinned_der != NULL, names, pol, der, der_n, count, key) != 0) {
+        int rc = cc_check(store, pinned_der, pinned_n, der, der_n, count, names, pol, &nb, &na);
+        cc_trace(names, rc, 0, 0, 0);
+        return rc;
+    }
+    if (cc_get(key)) {
+        cc_trace(names, 0, 1, 0, 0);
+        return 0;
+    }
+    pthread_mutex_t *stripe = &g_cc_miss[key[0] & (CC_STRIPES - 1)];
+    pthread_mutex_lock(stripe);
+    if (cc_get(key)) {
+        pthread_mutex_unlock(stripe);
+        cc_trace(names, 0, 1, 0, 0);
+        return 0;
+    }
+    int rc = cc_check(store, pinned_der, pinned_n, der, der_n, count, names, pol, &nb, &na);
+    if (!rc) cc_put(key, nb, na);
+    pthread_mutex_unlock(stripe);
+    cc_trace(names, rc, 0, !rc && nb < na, na);
     return rc;
 }
 
@@ -271,7 +458,7 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
 
     const int have_pin = pol && ((pol->pcs && pol->pcs[0]) || (pol->pks && pol->pks[0]));
     const char *names = pol && pol->vcn && pol->vcn[0] ? pol->vcn : host;
-    struct sc_roots *pinned_ca = NULL;
+    size_t pinned = 0;
     int leaf_pinned = 0;
 
     if (have_pin) {
@@ -288,25 +475,17 @@ int cert_verify_server_ex(const unsigned char *cert_body, size_t cert_n,
         if (!leaf_pinned) {
             /* An intermediate or a root: Xray uses it as the root store if it is a CA
              * (verifyChain). A non-CA does not load into the store: same as no match. */
-            for (size_t i = 1; i < count && !pinned_ca; i++)
-                if (sc_hash(SC_SHA256, der[i], der_n[i], h) == 0 && pin_listed(pol->pcs, h))
-                    if (sc_roots_load_der(&pinned_ca, der[i], der_n[i]) != 0) pinned_ca = NULL;
-            if (!pinned_ca) return CERTV_EPIN;
+            for (size_t i = 1; i < count && !pinned; i++)
+                if (sc_hash(SC_SHA256, der[i], der_n[i], h) == 0 && pin_listed(pol->pcs, h)) pinned = i;
+            if (!pinned) return CERTV_EPIN;
         }
     }
 
     if (!leaf_pinned) {
-        struct sc_roots *store = pinned_ca;
-        if (!store) {
-            g_roots_path = roots;
-            pthread_once(&g_roots_once, roots_load);
-            if (g_roots_rc != 0) return CERTV_ENOROOTS;
-            store = g_roots;
-        }
         /* The name is checked HERE, with the chain: a separate check would be a second SAN
          * parser, and it would drift from the library's. */
-        rc = chain_by_names(store, der, der_n, count, names);
-        if (pinned_ca) sc_roots_free(pinned_ca);
+        rc = cc_chain(NULL, pinned ? der[pinned] : NULL, pinned ? der_n[pinned] : 0, der, der_n, count, names,
+                      pol, roots);
         if (rc) return rc;
     }
     return check_signature(der[0], der_n[0], cv_body, cv_n, transcript, thash_n);

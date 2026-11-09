@@ -14,8 +14,9 @@
 # under the root with a P-521 leaf (SAN p521.example) under it; a "fake CA", a leaf
 # without the CA flag that signs another leaf (a chain through it must fail); an expired leaf
 # (2020-2021); an unrelated root; a second root (P-384, SHA-384) -> intermediate (P-384, SHA-384,
-# pathlen 0) -> leaf (P-256, SAN p384chain.example) signed with SHA-384. The rest are valid for 30
-# years from issue.
+# pathlen 0) -> leaf (P-256, SAN p384chain.example) signed with SHA-384; a dated chain (P-256 root
+# 2026-01-01..2039-01-01 -> intermediate 2026-03-01..2040-06-01 -> leaf 2026-02-01..2039-06-01, SAN
+# dated.example). The rest are valid for 30 years from issue.
 set -eu
 command -v openssl >/dev/null || { echo "scrypto-pki: needs openssl" >&2; exit 2; }
 W=$(mktemp -d)
@@ -36,6 +37,8 @@ printf '%s\n' '[req]' 'distinguished_name=dn' '[dn]' \
   'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' 'subjectAltName=DNS:p521.example' \
   '[p384c]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
   'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' 'subjectAltName=DNS:p384chain.example' \
+  '[datedleaf]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
+  'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' 'subjectAltName=DNS:dated.example' \
   '[fakeca]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
   'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' 'subjectAltName=DNS:fake.example' \
   '[fakeleaf]' 'basicConstraints=critical,CA:FALSE' 'subjectKeyIdentifier=hash' 'authorityKeyIdentifier=keyid' \
@@ -75,6 +78,17 @@ q openssl x509 -req -in inter384.csr -CA root384.pem -CAkey root384.key -set_ser
 q openssl ecparam -name prime256v1 -genkey -noout -out p384c.key
 q openssl req -new -key p384c.key -subj "/CN=p384c" -config ext.cnf -out p384c.csr
 q openssl x509 -req -in p384c.csr -CA inter384.pem -CAkey inter384.key -set_serial 31 -sha384 -days $D -extfile ext.cnf -extensions p384c -out p384c.pem
+q openssl ecparam -name prime256v1 -genkey -noout -out dated-root.key
+q openssl req -x509 -new -key dated-root.key -sha256 -not_before 20260101000000Z -not_after 20390101000000Z \
+    -subj "/CN=steer dated root" -extensions ca -config ext.cnf -out dated-root.pem
+q openssl ecparam -name prime256v1 -genkey -noout -out dated-inter.key
+q openssl req -new -key dated-inter.key -subj "/CN=steer dated intermediate" -config ext.cnf -out dated-inter.csr
+q openssl x509 -req -in dated-inter.csr -CA dated-root.pem -CAkey dated-root.key -set_serial 40 -sha256 \
+    -not_before 20260301000000Z -not_after 20400601000000Z -extfile ext.cnf -extensions inter -out dated-inter.pem
+q openssl ecparam -name prime256v1 -genkey -noout -out dated-leaf.key
+q openssl req -new -key dated-leaf.key -subj "/CN=dated" -config ext.cnf -out dated-leaf.csr
+q openssl x509 -req -in dated-leaf.csr -CA dated-inter.pem -CAkey dated-inter.key -set_serial 41 -sha256 \
+    -not_before 20260201000000Z -not_after 20390601000000Z -extfile ext.cnf -extensions datedleaf -out dated-leaf.pem
 mkdir new
 : > index.txt
 echo 20 > serial
@@ -95,8 +109,9 @@ echo "/* Test PKI for tests/scryptomatch.c: sh tests/scrypto-pki.sh > tests/scry
 echo " * ($(openssl version | cut -d' ' -f1-2), $(date -u +%Y-%m-%d)). Generated; do not edit by hand, regenerate it whole. */"
 echo "#ifndef STEER_TESTS_SCRYPTO_PKI_H"
 echo "#define STEER_TESTS_SCRYPTO_PKI_H"
-for c in root inter leaf rsaleaf p384 inter521 p521 fakeca fakeleaf expired other root384 inter384 p384c; do
-    echo "static const char PEM_$(echo $c | tr a-z A-Z)[] ="
+for c in root inter leaf rsaleaf p384 inter521 p521 fakeca fakeleaf expired other root384 inter384 p384c \
+         dated-root dated-inter dated-leaf; do
+    echo "static const char PEM_$(echo $c | tr a-z- A-Z_)[] ="
     sed 's/.*/    "&\\n"/' $c.pem
     echo "    ;"
 done

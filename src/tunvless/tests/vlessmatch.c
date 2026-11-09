@@ -68,6 +68,7 @@
 #include "../src/proto/transport/trdial.c"
 #include "../src/proto/tls/roots.c"
 #include "../src/proto/transport/trsec.c"
+#include "../src/proto/tls/certverify.c"
 #include "fmrelay.h"
 #include "client.h"
 
@@ -171,6 +172,7 @@ struct plan {
     int hold;
     int after_peer;
     int tell_peer;
+    int send_root;
 };
 
 struct srv {
@@ -321,6 +323,8 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
 #define LEAF_OK   1
 #define LEAF_NAME 2
 #define LEAF_SELF 3
+#define LEAF_LATE 4
+#define LEAF_EARLY 5
 
 /* The name the good leaf is issued for, also the node's SNI: the certificate is checked against
  * sni, not host (trsec.c, verify_host). */
@@ -332,7 +336,25 @@ struct leaf {
     struct tcg_key *key;         /* the leaf's key: it signs CertificateVerify */
 };
 
-static struct leaf g_leaf[4];        /* [0] unused: indexes match LEAF_* */
+static int64_t g_time_shift;
+time_t __real_time(time_t *t);
+time_t __wrap_time(time_t *t) {
+    time_t now = __real_time(NULL) + (time_t)g_time_shift;
+    if (t) *t = now;
+    return now;
+}
+#if (defined(__GLIBC__) && defined(__USE_TIME_BITS64) && __TIMESIZE == 32) || (defined(_REDIR_TIME64) && _REDIR_TIME64)
+time_t __real___time64(time_t *t);
+time_t __wrap___time64(time_t *t) {
+    time_t now = __real___time64(NULL) + (time_t)g_time_shift;
+    if (t) *t = now;
+    return now;
+}
+#endif
+
+static struct leaf g_leaf[6];        /* [0] unused: indexes match LEAF_* */
+static unsigned char g_root_der[2048];
+static size_t g_root_n;
 static char g_roots_file[64];
 static int g_chain_ready;
 
@@ -353,19 +375,25 @@ static int chain_build(void) {
         tcg_key_free(root_key);
         return -1;
     }
+    memcpy(g_root_der, root_der, root_n);
+    g_root_n = root_n;
 
     struct { int idx; const char *cn; int self; } want[] = {
         { LEAF_OK,   TLS_SNI,          0 },
         { LEAF_NAME, "other.invalid",  0 },
         { LEAF_SELF, TLS_SNI,          1 },
+        { LEAF_LATE, TLS_SNI,          0 },
+        { LEAF_EARLY, TLS_SNI,         0 },
     };
     for (size_t i = 0; i < sizeof(want) / sizeof(*want); i++) {
         struct leaf *l = &g_leaf[want[i].idx];
         if (!(l->key = tcg_key_new())) { tcg_key_free(root_key); return -1; }
+        g_time_shift = want[i].idx == LEAF_LATE ? 82800 : want[i].idx == LEAF_EARLY ? -172800 : 0;
         int rc = want[i].self
             ? tcg_issue(l->key, want[i].cn, NULL, 0, NULL, NULL, 0, l->der, sizeof(l->der), &l->der_n)
             : tcg_issue(l->key, want[i].cn, NULL, 0, root_key, root_der, root_n,
                         l->der, sizeof(l->der), &l->der_n);
+        g_time_shift = 0;
         if (rc != 0) { tcg_key_free(root_key); return -1; }
     }
     tcg_key_free(root_key);
@@ -382,7 +410,7 @@ static int chain_build(void) {
 }
 
 static void chain_free(void) {
-    for (int i = 1; i <= LEAF_SELF; i++) { tcg_key_free(g_leaf[i].key); g_leaf[i].key = NULL; }
+    for (int i = 1; i <= LEAF_EARLY; i++) { tcg_key_free(g_leaf[i].key); g_leaf[i].key = NULL; }
     if (g_roots_file[0]) unlink(g_roots_file);
 }
 
@@ -390,11 +418,12 @@ static void chain_free(void) {
  * length, holding one entry "3-byte length + DER + 2-byte extensions". The root is left out on
  * purpose: it is already in the store, and the chain must verify without it, or the test would
  * check the server's generosity instead of the verification. */
-static size_t cert_msg(const struct leaf *l, int dc, unsigned char *out, size_t cap) {
+static size_t cert_msg(const struct leaf *l, int dc, int send_root, unsigned char *out, size_t cap) {
     static const unsigned char dcx[] = { 0x00, 0x0C, 0x00, 0x22, 0x00, 0x08, 0x00, 0x01, 0x51, 0x80,
                                          0x04, 0x03, 0x00, 0x00 };
     size_t xn = dc ? sizeof dcx : 2;
-    size_t body = 1 + 3 + 3 + l->der_n + xn;
+    size_t rn = send_root ? 3 + g_root_n + 2 : 0;
+    size_t body = 1 + 3 + 3 + l->der_n + xn + rn;
     if (4 + body > cap) return 0;
     size_t n = 0;
     out[n++] = 0x0B;
@@ -402,7 +431,7 @@ static size_t cert_msg(const struct leaf *l, int dc, unsigned char *out, size_t 
     out[n++] = (unsigned char)(body >> 8);
     out[n++] = (unsigned char)body;
     out[n++] = 0x00;                                     /* certificate_request_context */
-    size_t list = 3 + l->der_n + xn;
+    size_t list = 3 + l->der_n + xn + rn;
     out[n++] = (unsigned char)(list >> 16);
     out[n++] = (unsigned char)(list >> 8);
     out[n++] = (unsigned char)list;
@@ -412,6 +441,13 @@ static size_t cert_msg(const struct leaf *l, int dc, unsigned char *out, size_t 
     memcpy(out + n, l->der, l->der_n); n += l->der_n;
     if (dc) { memcpy(out + n, dcx, sizeof dcx); n += sizeof dcx; }
     else { out[n++] = 0x00; out[n++] = 0x00; }
+    if (send_root) {
+        out[n++] = (unsigned char)(g_root_n >> 16);
+        out[n++] = (unsigned char)(g_root_n >> 8);
+        out[n++] = (unsigned char)g_root_n;
+        memcpy(out + n, g_root_der, g_root_n); n += g_root_n;
+        out[n++] = 0x00; out[n++] = 0x00;
+    }
     return n;
 }
 
@@ -889,7 +925,7 @@ static void *server_half(void *arg) {
     if (pl->chain) {
         const struct leaf *l = &g_leaf[pl->chain];
         unsigned char msg[3072];
-        size_t mn = cert_msg(l, pl->dc, msg, sizeof(msg));
+        size_t mn = cert_msg(l, pl->dc, pl->send_root, msg, sizeof(msg));
         if (mn && mn < sizeof msg && pl->cert_trail) {
             msg[mn++] = 0x00;
             msg[1] = (unsigned char)((mn - 4) >> 16); msg[2] = (unsigned char)((mn - 4) >> 8); msg[3] = (unsigned char)(mn - 4);
@@ -1145,6 +1181,348 @@ static int run_case(const struct plan *pl, struct vless_node *n, char *reason, s
 /* A ws or httpupgrade run through to data: setup, the first data after the 101 answer (it came
  * in ONE TLS record with the answer), the client's reply. 0 if all of it worked; *s holds what
  * the server saw. */
+#if defined(STEER_HAVE_X509WRITE)
+_Static_assert(sizeof(struct cc_ent) == 64, "a cache entry is 64 bytes");
+
+#define CC_M 1000000ull
+
+static void cc_reset(void) {
+    pthread_mutex_lock(&g_cc_mu);
+    memset(g_cc, 0, sizeof g_cc);
+    g_cc_checked = 0;
+    pthread_mutex_unlock(&g_cc_mu);
+    g_cc_wall_s = 0;
+    g_cc_mono_ms = 0;
+}
+
+static int cc_hs(const struct plan *pl, const char *vcn, const char *pcs, char *why, size_t wn) {
+    struct vless_node tn;
+    node_tls(&tn, "tcp");
+    tn.vcn = vcn;
+    tn.pcs = pcs;
+    return run_case(pl, &tn, why, wn, NULL);
+}
+
+static void cc_hex(const unsigned char *d, size_t n, char out[65]) {
+    static const char HEX[] = "0123456789abcdef";
+    unsigned char h[32];
+    sc_hash(SC_SHA256, d, n, h);
+    for (int k = 0; k < 32; k++) { out[2 * k] = HEX[h[k] >> 4]; out[2 * k + 1] = HEX[h[k] & 15]; }
+    out[64] = '\0';
+}
+
+static void t_cc_hit_skips_chain(void) {
+    /* catches: no cache (2 checks), or a cache that never hits */
+    cc_reset();
+    struct plan ok = { .name = "cc ok", .chain = LEAF_OK };
+    check("cache: first handshake verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache: first handshake checks the chain", 1, (long)g_cc_checked);
+    check("cache: second handshake verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache: second handshake checks no chain", 1, (long)g_cc_checked);
+}
+
+static void t_cc_hit_still_checks_signature(void) {
+    /* catches: a hit that returns before check_signature, or a cached CertificateVerify verdict */
+    cc_reset();
+    struct plan ok = { .name = "cc ok", .chain = LEAF_OK };
+    struct plan sig = { .name = "cc sig", .chain = LEAF_OK, .cv_bad_sig = 1 };
+    struct plan alg = { .name = "cc alg", .chain = LEAF_OK, .cv_bad_alg = 1 };
+    char why[256] = "";
+    check("cache hit: good chain verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache hit: chain checked once", 1, (long)g_cc_checked);
+    check("cache hit: bad signature refused", TLS13_ECERT, cc_hs(&sig, NULL, NULL, why, sizeof why));
+    check("cache hit: bad signature was a hit", 1, (long)g_cc_checked);
+    check_str("cache hit: bad signature reason", "bad server signature", why);
+    check("cache hit: scheme not offered refused", TLS13_ECERT, cc_hs(&alg, NULL, NULL, NULL, 0));
+}
+
+static void t_cc_failure_not_cached(void) {
+    /* catches: a failed chain remembered */
+    cc_reset();
+    struct plan name = { .name = "cc name", .chain = LEAF_NAME };
+    struct plan self = { .name = "cc self", .chain = LEAF_SELF };
+    check("cache: wrong name refused", TLS13_ECERT, cc_hs(&name, NULL, NULL, NULL, 0));
+    check("cache: wrong name refused again", TLS13_ECERT, cc_hs(&name, NULL, NULL, NULL, 0));
+    check("cache: wrong name checked both times", 2, (long)g_cc_checked);
+    check("cache: self-signed refused", TLS13_ECERT, cc_hs(&self, NULL, NULL, NULL, 0));
+    check("cache: self-signed refused again", TLS13_ECERT, cc_hs(&self, NULL, NULL, NULL, 0));
+    check("cache: self-signed checked both times", 4, (long)g_cc_checked);
+}
+
+static void t_cc_name_change_misses(void) {
+    /* catches: names left out of the key */
+    cc_reset();
+    struct plan ok = { .name = "cc ok", .chain = LEAF_OK };
+    check("cache names: sni verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache names: sni checked", 1, (long)g_cc_checked);
+    check("cache names: another vcn refused", TLS13_ECERT, cc_hs(&ok, "other.invalid", NULL, NULL, 0));
+    check("cache names: another vcn checked", 2, (long)g_cc_checked);
+    check("cache names: a vcn list verifies", 0, cc_hs(&ok, "other.invalid," TLS_SNI, NULL, NULL, 0));
+    check("cache names: a vcn list checked", 3, (long)g_cc_checked);
+    check("cache names: the same list verifies", 0, cc_hs(&ok, "other.invalid," TLS_SNI, NULL, NULL, 0));
+    check("cache names: the same list is a hit", 3, (long)g_cc_checked);
+}
+
+static void t_cc_pin_change_misses(void) {
+    /* catches: pcs or the anchor kind left out of the key, or the cache consulted before the pin decision */
+    char h_root[65], h_name[65], both[140], why[256] = "";
+    cc_hex(g_root_der, g_root_n, h_root);
+    cc_hex(g_leaf[LEAF_NAME].der, g_leaf[LEAF_NAME].der_n, h_name);
+    snprintf(both, sizeof both, "%s,%s", h_root, h_name);
+    struct plan rt = { .name = "cc root", .chain = LEAF_OK, .send_root = 1 };
+    cc_reset();
+    check("cache pin: a chain carrying the trusted root verifies", 0, cc_hs(&rt, NULL, NULL, NULL, 0));
+    cc_reset();
+    check("cache pin: pinned CA verifies", 0, cc_hs(&rt, NULL, h_root, NULL, 0));
+    check("cache pin: pinned CA checked", 1, (long)g_cc_checked);
+    check("cache pin: same chain on the process store verifies", 0, cc_hs(&rt, NULL, NULL, NULL, 0));
+    check("cache pin: process store is another entry", 2, (long)g_cc_checked);
+    check("cache pin: pinned CA again verifies", 0, cc_hs(&rt, NULL, h_root, NULL, 0));
+    check("cache pin: pinned CA again is a hit", 2, (long)g_cc_checked);
+    check("cache pin: two fingerprints verify", 0, cc_hs(&rt, NULL, both, NULL, 0));
+    check("cache pin: another pcs is another entry", 3, (long)g_cc_checked);
+    check("cache pin: an unrelated fingerprint refused", TLS13_ECERT, cc_hs(&rt, NULL, h_name, why, sizeof why));
+    check_str("cache pin: unrelated fingerprint reason", "matches no pinned fingerprint", why);
+    check("cache pin: refused before the cache", 3, (long)g_cc_checked);
+}
+
+static void t_cc_key_binds_inputs(void) {
+    /* catches: an unordered or unframed key (pieces or strings concatenated without lengths), or a field not hashed */
+    const struct leaf *a = &g_leaf[LEAF_OK];
+    static unsigned char b[2048], ab[4096];
+    memcpy(b, g_root_der, g_root_n);
+    struct cert_policy none = { 0 }, pks = { .pks = "ab" }, pc = { .pcs = "c" }, pbc = { .pcs = "bc" };
+    unsigned char k0[32], k1[32];
+    const unsigned char *d[2] = { a->der, b };
+    size_t dn[2] = { a->der_n, g_root_n };
+    int rc = cc_key(0, "n", &none, d, dn, 2, k0);
+    rc |= cc_key(0, "n", &none, d, dn, 2, k1);
+    check("cache key: equal inputs, equal keys", 1, !rc && !memcmp(k0, k1, 32));
+    const unsigned char *ds[2] = { b, a->der };
+    size_t dns[2] = { g_root_n, a->der_n };
+    rc = cc_key(0, "n", &none, ds, dns, 2, k1);
+    check("cache key: swapped pieces differ", 1, !rc && memcmp(k0, k1, 32));
+    b[g_root_n / 2] ^= 1;
+    rc = cc_key(0, "n", &none, d, dn, 2, k1);
+    b[g_root_n / 2] ^= 1;
+    check("cache key: one flipped byte differs", 1, !rc && memcmp(k0, k1, 32));
+    memcpy(ab, a->der, a->der_n);
+    ab[a->der_n] = b[0];
+    const unsigned char *dm[2] = { ab, b + 1 };
+    size_t dnm[2] = { a->der_n + 1, g_root_n - 1 };
+    rc = cc_key(0, "n", &none, dm, dnm, 2, k1);
+    check("cache key: a moved boundary differs", 1, !rc && memcmp(k0, k1, 32));
+    rc = cc_key(0, "n", &pks, d, dn, 2, k1);
+    check("cache key: pks differs", 1, !rc && memcmp(k0, k1, 32));
+    rc = cc_key(1, "n", &none, d, dn, 2, k1);
+    check("cache key: anchor kind differs", 1, !rc && memcmp(k0, k1, 32));
+    rc = cc_key(0, "ab", &pc, d, dn, 2, k0);
+    rc |= cc_key(0, "a", &pbc, d, dn, 2, k1);
+    check("cache key: names and pcs framed apart", 1, !rc && memcmp(k0, k1, 32));
+}
+
+static void t_cc_key_too_long_falls_back(void) {
+    /* catches: a key built over a truncated length (65,536 hashed as 0), or a key failure that refuses the chain or stores an entry */
+    static char big[65537], list[65537];
+    memset(big, 'a', 65536);
+    big[65536] = '\0';
+    const struct leaf *a = &g_leaf[LEAF_OK];
+    const unsigned char *d[1] = { a->der };
+    size_t dn[1] = { a->der_n };
+    unsigned char k[32];
+    struct cert_policy pcs = { .pcs = big }, pks = { .pks = big }, none = { 0 };
+    check("cache key: 65,536-byte pcs refused", 1, cc_key(0, "n", &pcs, d, dn, 1, k) != 0);
+    check("cache key: 65,536-byte pks refused", 1, cc_key(0, "n", &pks, d, dn, 1, k) != 0);
+    check("cache key: 65,536-byte names refused", 1, cc_key(0, big, &none, d, dn, 1, k) != 0);
+    check("cache key: 65,535-byte names keyed", 0, cc_key(0, big + 1, &none, d, dn, 1, k));
+    size_t sn = strlen(TLS_SNI);
+    memset(list, ',', 65536 - sn);
+    memcpy(list + 65536 - sn, TLS_SNI, sn + 1);
+    struct cert_policy vcn = { .vcn = list };
+    cc_reset();
+    check("cache key failure: chain still verifies", 0, cc_chain(g_roots, NULL, 0, d, dn, 1, list, &vcn, g_cert_roots));
+    check("cache key failure: chain checked", 1, (long)g_cc_checked);
+    check("cache key failure: chain verifies again", 0, cc_chain(g_roots, NULL, 0, d, dn, 1, list, &vcn, g_cert_roots));
+    check("cache key failure: nothing stored", 2, (long)g_cc_checked);
+    int used = 0;
+    for (int i = 0; i < CC_SLOTS; i++) used += g_cc[i].born != 0;
+    check("cache key failure: table empty", 0, used);
+}
+
+static void t_cc_window_bounds(void) {
+    /* catches: an open/closed bound swapped, notBefore not checked, no TTL, or a TTL counted from the last use */
+    cc_reset();
+    unsigned char k[32] = { 0 };
+    g_cc_mono_ms = CC_M;
+    cc_put(k, 1000, 2000);
+    g_cc_wall_s = 999;
+    check("cache window: before notBefore misses", 0, cc_get(k));
+    g_cc_wall_s = 1000;
+    check("cache window: at notBefore hits", 1, cc_get(k));
+    g_cc_wall_s = 1999;
+    check("cache window: a second before notAfter hits", 1, cc_get(k));
+    g_cc_wall_s = 2000;
+    check("cache window: at notAfter misses", 0, cc_get(k));
+    g_cc_mono_ms = CC_M;
+    cc_put(k, 1000, 2000);
+    g_cc_wall_s = 1500;
+    g_cc_mono_ms = CC_M + 3599999;
+    check("cache ttl: last millisecond hits", 1, cc_get(k));
+    g_cc_mono_ms = CC_M + 3600000;
+    check("cache ttl: one hour after the insert misses", 0, cc_get(k));
+    cc_reset();
+}
+
+static void t_cc_ttl_jitter(void) {
+    /* catches: no jitter (all entries of a burst expire together), jitter with the wrong sign, or a fixed TTL */
+    cc_reset();
+    unsigned char k[32] = { 255 };
+    g_cc_wall_s = 1500;
+    g_cc_mono_ms = CC_M;
+    cc_put(k, 1000, 2000);
+    g_cc_mono_ms = CC_M + 3089999;
+    check("cache jitter 255: last millisecond hits", 1, cc_get(k));
+    g_cc_mono_ms = CC_M + 3090000;
+    check("cache jitter 255: expired", 0, cc_get(k));
+    k[0] = 1;
+    g_cc_mono_ms = CC_M;
+    cc_put(k, 1000, 2000);
+    g_cc_mono_ms = CC_M + 3597999;
+    check("cache jitter 1: last millisecond hits", 1, cc_get(k));
+    g_cc_mono_ms = CC_M + 3598000;
+    check("cache jitter 1: expired", 0, cc_get(k));
+    cc_reset();
+}
+
+static void t_cc_expired_entry_reverifies(int64_t w) {
+    /* catches: a hit that ignores the wall clock, so an expired chain keeps passing */
+    cc_reset();
+    struct plan ok = { .name = "cc ok", .chain = LEAF_OK };
+    check("cache dates: first handshake verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache dates: chain checked", 1, (long)g_cc_checked);
+    g_cc_wall_s = w + 6 * 365 * 86400LL;
+    check("cache dates: past notAfter verifies on the real clock", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache dates: past notAfter is a miss", 2, (long)g_cc_checked);
+    g_cc_wall_s = w - 3 * 86400LL;
+    check("cache dates: before notBefore verifies on the real clock", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache dates: before notBefore is a miss", 3, (long)g_cc_checked);
+    cc_reset();
+}
+
+static void t_cc_lru(void) {
+    /* catches: FIFO instead of LRU, an off-by-one table, or a full table that refuses inserts */
+    cc_reset();
+    unsigned char k[65][32];
+    memset(k, 0, sizeof k);
+    for (int i = 0; i < 65; i++) k[i][1] = (unsigned char)i;
+    g_cc_wall_s = 1500;
+    for (int i = 0; i < 64; i++) { g_cc_mono_ms = CC_M + (uint64_t)i; cc_put(k[i], 1000, 2000); }
+    g_cc_mono_ms = CC_M + 64;
+    cc_get(k[0]);
+    g_cc_mono_ms = CC_M + 65;
+    cc_put(k[64], 1000, 2000);
+    check("cache lru: the entry used last stays", 1, cc_get(k[0]));
+    check("cache lru: the entry used least is gone", 0, cc_get(k[1]));
+    check("cache lru: the new entry is in", 1, cc_get(k[64]));
+    int kept = 0;
+    for (int i = 2; i < 64; i++) kept += cc_get(k[i]);
+    check("cache lru: the other 62 stay", 62, kept);
+    cc_reset();
+    unsigned char a[32] = { 0 }, b[32] = { 0 };
+    b[31] = 1;
+    g_cc_wall_s = 1500;
+    g_cc_mono_ms = CC_M;
+    cc_put(a, 1000, 2000);
+    check("cache key: the last byte tells keys apart", 0, cc_get(b));
+    check("cache key: the stored key still hits", 1, cc_get(a));
+    cc_reset();
+}
+
+static pthread_barrier_t g_cc_bar;
+
+static void *cc_burst(void *arg) {
+    const struct leaf *a = &g_leaf[LEAF_OK];
+    const unsigned char *d[1] = { a->der };
+    size_t dn[1] = { a->der_n };
+    pthread_barrier_wait(&g_cc_bar);
+    *(int *)arg = cc_chain(g_roots, NULL, 0, d, dn, 1, TLS_SNI, NULL, g_cert_roots);
+    return NULL;
+}
+
+static void t_cc_cold_burst_verifies_once(void) {
+    /* catches: no re-lookup under the miss lock (8 serial checks), or a missing lock (TSan) */
+    cc_reset();
+    pthread_t th[8];
+    int rc[8], made = 0, bad = 0;
+    pthread_barrier_init(&g_cc_bar, NULL, 8);
+    for (int i = 0; i < 8; i++) if (pthread_create(&th[i], NULL, cc_burst, &rc[i]) == 0) made++;
+    for (int i = 0; i < made; i++) { pthread_join(th[i], NULL); bad += rc[i] != 0; }
+    pthread_barrier_destroy(&g_cc_bar);
+    check("cache burst: 8 threads started", 8, made);
+    check("cache burst: all verified", 0, bad);
+    check("cache burst: one chain check", 1, (long)g_cc_checked);
+}
+
+static void t_cc_pinned_ca_expires(void) {
+    /* catches: a hit that outlives the pinned CA's notAfter, which a full check refuses */
+    char h_root[65], why[256] = "";
+    cc_hex(g_root_der, g_root_n, h_root);
+    struct plan late = { .name = "cc late", .chain = LEAF_LATE, .send_root = 1 };
+    cc_reset();
+    check("cache pinned CA: verifies", 0, cc_hs(&late, NULL, h_root, NULL, 0));
+    check("cache pinned CA: chain checked", 1, (long)g_cc_checked);
+    check("cache pinned CA: verifies again", 0, cc_hs(&late, NULL, h_root, NULL, 0));
+    check("cache pinned CA: again is a hit", 1, (long)g_cc_checked);
+    g_time_shift = 1825 * 86400LL + 43200;
+    check("cache pinned CA: refused once the CA expired", TLS13_ECERT, cc_hs(&late, NULL, h_root, why, sizeof why));
+    check_str("cache pinned CA: refused as main refuses", "matches no pinned fingerprint", why);
+    check("cache pinned CA: the leaf still verifies on the process store", 0, cc_hs(&late, NULL, NULL, NULL, 0));
+    g_time_shift = 0;
+    cc_reset();
+    struct plan early = { .name = "cc early", .chain = LEAF_EARLY, .send_root = 1 };
+    char why2[256] = "";
+    check("cache pinned CA: early leaf verifies", 0, cc_hs(&early, NULL, h_root, NULL, 0));
+    check("cache pinned CA: early leaf again is a hit", 0, cc_hs(&early, NULL, h_root, NULL, 0));
+    check("cache pinned CA: early leaf checked once", 1, (long)g_cc_checked);
+    g_time_shift = -172800;
+    check("cache pinned CA: refused before the CA is valid", TLS13_ECERT, cc_hs(&early, NULL, h_root, why2, sizeof why2));
+    check_str("cache pinned CA: refused before validity as main refuses", "matches no pinned fingerprint", why2);
+    check("cache pinned CA: the early leaf still verifies on the process store", 0, cc_hs(&early, NULL, NULL, NULL, 0));
+    g_time_shift = 0;
+    cc_reset();
+}
+
+static void t_cc_compressed_same_entry(void) {
+    /* catches: a key over the raw message instead of the decompressed pieces */
+    cc_reset();
+    struct plan ok = { .name = "cc ok", .chain = LEAF_OK };
+    struct plan br = { .name = "cc brotli", .chain = LEAF_OK, .compress = 2 };
+    check("cache: plain certificate verifies", 0, cc_hs(&ok, NULL, NULL, NULL, 0));
+    check("cache: plain certificate checked", 1, (long)g_cc_checked);
+    check("cache: brotli certificate verifies", 0, cc_hs(&br, NULL, NULL, NULL, 0));
+    check("cache: brotli certificate is a hit", 1, (long)g_cc_checked);
+}
+
+static void cc_tests(void) {
+    int64_t w = (int64_t)time(NULL);
+    t_cc_hit_skips_chain();
+    t_cc_hit_still_checks_signature();
+    t_cc_failure_not_cached();
+    t_cc_name_change_misses();
+    t_cc_pin_change_misses();
+    t_cc_key_binds_inputs();
+    t_cc_key_too_long_falls_back();
+    t_cc_window_bounds();
+    t_cc_ttl_jitter();
+    t_cc_expired_entry_reverifies(w);
+    t_cc_lru();
+    t_cc_cold_burst_verifies_once();
+    t_cc_compressed_same_entry();
+    t_cc_pinned_ca_expires();
+    cc_reset();
+}
+#endif
+
 static int run_upg(const struct plan *pl, struct vless_node *n, struct srv *s) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -100;
@@ -2220,6 +2598,7 @@ int main(void) {
             int rc = run_case(&up, &tn, NULL, 0, NULL);
             check("tls + ws: server chose h2, refused with TR_ENOH1", TR_ENOH1, rc);
         }
+        cc_tests();
         g_cert_roots = NULL;
         chain_free();
     }
