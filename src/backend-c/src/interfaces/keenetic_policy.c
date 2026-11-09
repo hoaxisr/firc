@@ -596,7 +596,7 @@ static bool segments_overlap(const segment_t *a, const segment_t *b) {
     return (a->net & b->mask) == b->net || (b->net & a->mask) == a->net;
 }
 
-/* An allow writes a segment only if every client on it is in the policy; otherwise the firmware mark alone matches. */
+/* A segment is written only if every client on it is in the policy; otherwise the firmware mark alone matches. */
 static bool segment_is_policy_s_alone(const firc_kn_policy_map_t *m, size_t i, const char *name) {
     const segment_t *s = &m->segments[i];
     for (size_t j = 0; j < i; j++) {
@@ -620,8 +620,8 @@ static void policy_nets(const firc_kn_policy_map_t *m, const char *policy, bool 
     for (size_t i = 0; i < m->n_segments; i++) {
         const segment_t *s = &m->segments[i];
         if (strcmp(s->policy, name) != 0) { continue; }
-        if (!deny && !segment_is_policy_s_alone(m, i, name)) {
-            (*skipped)++;
+        if (!segment_is_policy_s_alone(m, i, name)) {
+            if (!deny) { (*skipped)++; }
             continue;
         }
         firc_ip_t net = {{(uint8_t)(s->net >> 24), (uint8_t)(s->net >> 16), (uint8_t)(s->net >> 8), (uint8_t)s->net},
