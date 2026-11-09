@@ -526,6 +526,35 @@ TEST a_listed_host_reports_its_effective_policy(void) {
     PASS();
 }
 
+static int host_from_segment(const cJSON *arr, const char *mac) {
+    const cJSON *h = NULL;
+    cJSON_ArrayForEach(h, arr) {
+        if (strcmp(str_of(h, "mac"), mac) != 0) { continue; }
+        const cJSON *f = cJSON_GetObjectItemCaseSensitive(h, "policyFromSegment");
+        return cJSON_IsBool(f) ? cJSON_IsTrue(f) : -1;
+    }
+    return -2;
+}
+
+/* Catches: a segment's policy not told apart from a host's own, or a host with none told it came from a segment. */
+TEST a_listed_host_says_whether_its_policy_is_the_segment_s(void) {
+    firc_kn_policy_map_t *m = NULL;
+    ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse(HOTSPOT, POLICIES, &m));
+    cJSON *arr = firc_kn_policy_map_hosts_json(m);
+    ASSERT_EQ_FMTm("no segments, no policy", 0, host_from_segment(arr, "aa:00:00:00:00:03"), "%d");
+    cJSON_Delete(arr);
+    firc_kn_segment_t seg[8];
+    size_t n = firc_kn_hotspot_segments_parse(RC_HOTSPOT, seg, 8);
+    ASSERT_EQ(FIRC_OK, firc_kn_policy_map_add_segments(m, seg, n, INTERFACES));
+    arr = firc_kn_policy_map_hosts_json(m);
+    ASSERT_EQ_FMTm("Bridge1's", 1, host_from_segment(arr, "aa:00:00:00:00:03"), "%d");
+    ASSERT_EQ_FMTm("its own inside a segment", 0, host_from_segment(arr, "aa:00:00:00:00:01"), "%d");
+    ASSERT_EQ_FMTm("its own, no address", 0, host_from_segment(arr, "aa:00:00:00:00:04"), "%d");
+    cJSON_Delete(arr);
+    firc_kn_policy_map_free(m);
+    PASS();
+}
+
 /* Catches: a dual-stack host's v6 query missing its v4 segment's policy. */
 TEST a_host_is_in_its_segments_policy_from_its_v6_address(void) {
     static const char DUAL[] =
@@ -2162,6 +2191,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_resolver_answers_from_the_latest_map);
     RUN_TEST(each_host_is_recorded_with_its_mac_and_names);
     RUN_TEST(a_listed_host_reports_its_effective_policy);
+    RUN_TEST(a_listed_host_says_whether_its_policy_is_the_segment_s);
     RUN_TEST(a_host_is_in_its_segments_policy_from_its_v6_address);
     RUN_TEST(a_client_is_known_by_the_mac_of_its_host);
     RUN_TEST(a_policy_counts_its_devices_not_their_addresses);

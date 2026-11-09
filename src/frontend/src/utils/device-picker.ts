@@ -20,6 +20,7 @@ export type Host = {
   registered: boolean;
   policy: string;
   segment?: string;
+  policyFromSegment?: boolean;
   intercepted?: boolean;
 };
 
@@ -245,11 +246,11 @@ export function flipPolicy(p: Picked, id: string, policies: PickerPolicy[], mode
 }
 
 export type RowNote =
-  | { kind: "policy-off"; policy: string }
+  | { kind: "policy-off"; policy: string; segment?: string }
   | { kind: "manual-off" }
-  | { kind: "excluded-from"; policy: string }
+  | { kind: "excluded-from"; policy: string; segment?: string }
   | { kind: "excluded" }
-  | { kind: "via"; policy: string }
+  | { kind: "via"; policy: string; segment?: string }
   | { kind: "manual-on" }
   | null;
 
@@ -259,14 +260,18 @@ function rowPolicy(
   row: HostRow,
   p: Picked,
   policies: PickerPolicy[],
-): { label: string; side: Side | null } | null {
+): { side: Side | null; from: { policy: string; segment?: string } } | null {
   if (row.policy === "") return null;
   const pol = policies.find((x) => x.name === row.policy);
   const side = [...p.policies]
     .filter(([k]) => namesPolicy(k, row.policy, policies))
     .map(([, s]) => s)
     .reduce<Side | null>((acc, s) => (acc === "deny" || s === "deny" ? "deny" : s), null);
-  return { label: pol ? policyLabel(pol) : row.policy, side };
+  const label = pol ? policyLabel(pol) : row.policy;
+  const from = row.policyFromSegment
+    ? { policy: label, segment: row.segment ?? "" }
+    : { policy: label };
+  return { side, from };
 }
 
 function manualCovers(entry: string, row: HostRow, policies: PickerPolicy[]): boolean {
@@ -281,17 +286,16 @@ function manualCovers(entry: string, row: HostRow, policies: PickerPolicy[]): bo
 export function rowState(row: HostRow, p: Picked, policies: PickerPolicy[], mode: Mode): RowState {
   const pol = rowPolicy(row, p, policies);
   if (pol?.side === "deny")
-    return { on: false, locked: true, note: { kind: "policy-off", policy: pol.label } };
+    return { on: false, locked: true, note: { kind: "policy-off", ...pol.from } };
   if (p.manual.deny.some((e) => manualCovers(e, row, policies)))
     return { on: false, locked: true, note: { kind: "manual-off" } };
   if (row.side === "deny") {
     const note: RowNote =
-      pol?.side === "allow" ? { kind: "excluded-from", policy: pol.label } : { kind: "excluded" };
+      pol?.side === "allow" ? { kind: "excluded-from", ...pol.from } : { kind: "excluded" };
     return { on: false, locked: false, note };
   }
   if (mode === "all" || row.side === "allow") return { on: true, locked: false, note: null };
-  if (pol?.side === "allow")
-    return { on: true, locked: false, note: { kind: "via", policy: pol.label } };
+  if (pol?.side === "allow") return { on: true, locked: false, note: { kind: "via", ...pol.from } };
   if (p.manual.allow.some((e) => manualCovers(e, row, policies)))
     return { on: true, locked: false, note: { kind: "manual-on" } };
   return { on: false, locked: false, note: null };

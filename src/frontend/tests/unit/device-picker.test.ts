@@ -325,6 +325,36 @@ describe("a device's switch, as the daemon decides", () => {
     );
   });
 
+  // Catches a segment's policy shown as the device's own, or a device's own shown as a segment's.
+  it("names the segment when the policy is the segment's", () => {
+    const fromSeg: Host = {
+      ...HOSTS[1],
+      policy: "Policy0",
+      segment: "br1",
+      policyFromSegment: true,
+    };
+    const row = { ...fromSeg, side: null, unknown: false };
+    const at = (sel: Sel, mode: Mode) => rowState(row, draftOf(sel), POLICIES, mode).note;
+    deepStrictEqual(at({ allow: [], deny: ["policy:Kids"] }, "all"), {
+      kind: "policy-off",
+      policy: "Kids",
+      segment: "br1",
+    });
+    deepStrictEqual(at({ allow: ["policy:Kids"], deny: [] }, "only"), {
+      kind: "via",
+      policy: "Kids",
+      segment: "br1",
+    });
+    const own = { ...row, policyFromSegment: false };
+    deepStrictEqual(
+      rowState(own, draftOf({ allow: [], deny: ["policy:Kids"] }), POLICIES, "all").note,
+      {
+        kind: "policy-off",
+        policy: "Kids",
+      },
+    );
+  });
+
   // Catches a manual deny covering the host's address not being read or not locking it.
   it("is locked off by a manual deny that covers its address", () => {
     deepStrictEqual(stateOf({ allow: [], deny: ["192.168.1.8"] }, "all", "04"), {

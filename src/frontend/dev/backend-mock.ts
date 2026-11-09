@@ -1193,6 +1193,7 @@ const HOSTS = {
       registered: true,
       policy: "Policy0",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1204,6 +1205,7 @@ const HOSTS = {
       registered: true,
       policy: "",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1215,6 +1217,7 @@ const HOSTS = {
       registered: true,
       policy: "Policy0",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1226,6 +1229,7 @@ const HOSTS = {
       registered: true,
       policy: "",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1237,6 +1241,7 @@ const HOSTS = {
       registered: true,
       policy: "",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1248,6 +1253,7 @@ const HOSTS = {
       registered: false,
       policy: "Policy1",
       segment: "br0",
+      policyFromSegment: false,
       intercepted: true,
     },
     {
@@ -1259,6 +1265,7 @@ const HOSTS = {
       registered: true,
       policy: "Policy0",
       segment: "br1",
+      policyFromSegment: true,
       intercepted: false,
     },
   ],

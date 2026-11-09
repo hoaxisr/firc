@@ -136,18 +136,25 @@
   const segmentTitle = (id: string) =>
     ifaceTitle(interfaces.list.find((i) => i.id === id) ?? { id }).title;
 
+  const policyOf = (note: { policy: string; segment?: string }) =>
+    note.segment === undefined
+      ? note.policy
+      : t("{policy} of segment {segment}")
+          .replace("{policy}", () => note.policy)
+          .replace("{segment}", () => segmentTitle(note.segment ?? ""));
+
   function noteText(note: NonNullable<RowNote>): string {
     switch (note.kind) {
       case "policy-off":
-        return t("off by policy {name}").replace("{name}", () => note.policy);
+        return t("off by policy {name}").replace("{name}", () => policyOf(note));
       case "manual-off":
         return t("off by a manual entry");
       case "excluded-from":
-        return t("excluded from {name}").replace("{name}", () => note.policy);
+        return t("excluded from {name}").replace("{name}", () => policyOf(note));
       case "excluded":
         return t("excluded");
       case "via":
-        return t("on through policy {name}").replace("{name}", () => note.policy);
+        return t("on through policy {name}").replace("{name}", () => policyOf(note));
       case "manual-on":
         return t("on through a manual entry");
     }

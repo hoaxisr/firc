@@ -371,6 +371,7 @@
   "Switch off the devices the group must leave alone.": "Выключите устройства, которых группа не должна касаться.",
   "Switch on the devices the group works for.": "Включите устройства, для которых работает группа.",
   "off by policy {name}": "выключено политикой {name}",
+  "{policy} of segment {segment}": "{policy} сегмента {segment}",
   "excluded": "исключено",
   "on through policy {name}": "включено через политику {name}",
   "on through a manual entry": "включено ручной записью",

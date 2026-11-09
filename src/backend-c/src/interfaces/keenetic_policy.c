@@ -662,7 +662,9 @@ static bool host_json_fill(cJSON *o, const firc_kn_policy_map_t *m, size_t idx) 
     }
     return cJSON_AddBoolToObject(o, "active", h->active) != NULL &&
            cJSON_AddBoolToObject(o, "registered", h->registered) != NULL &&
-           cJSON_AddStringToObject(o, "policy", host_effective_policy(m, h)) != NULL;
+           cJSON_AddStringToObject(o, "policy", host_effective_policy(m, h)) != NULL &&
+           cJSON_AddBoolToObject(o, "policyFromSegment", h->policy[0] == '\0' && host_effective_policy(m, h)[0] != '\0') !=
+               NULL;
 }
 
 cJSON *firc_kn_policy_map_hosts_json(const firc_kn_policy_map_t *m) {

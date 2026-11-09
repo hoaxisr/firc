@@ -5,11 +5,13 @@
   import Button from "../../../components/ui/Button.svelte";
   import GenericDialog from "../../../components/ui/GenericDialog.svelte";
   import { fetchHosts, hosts } from "../../../data/hosts.svelte";
+  import { interfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
   import { fetchPolicies, policies } from "../../../data/policies.svelte";
   import { GROUPS_STORE_CONTEXT, groupTitle, type GroupsStore } from "../groups.svelte";
 
   import { Search, SelectOpen } from "../../../components/ui/icons";
+  import { ifaceTitle } from "../../../data/iface-choices";
   import type { DeviceSelector, Group } from "../../../types";
   import {
     aggregate,
@@ -118,9 +120,19 @@
 
   function reasonText(refusal: Extract<Refusal, { kind: "locked" }>): string {
     const note = refusal.note;
-    return note?.kind === "policy-off"
-      ? t("off by policy {name}").replace("{name}", () => note.policy)
-      : t("off by a manual entry");
+    if (note?.kind !== "policy-off") return t("off by a manual entry");
+    const segment = note.segment;
+    const policy =
+      segment === undefined
+        ? note.policy
+        : t("{policy} of segment {segment}")
+            .replace("{policy}", () => note.policy)
+            .replace(
+              "{segment}",
+              () =>
+                ifaceTitle(interfaces.list.find((i) => i.id === segment) ?? { id: segment }).title,
+            );
+    return t("off by policy {name}").replace("{name}", () => policy);
   }
 
   function refusalText(group: Group, refusal: Refusal): string {

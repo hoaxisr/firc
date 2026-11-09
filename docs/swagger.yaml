@@ -41,6 +41,12 @@ definitions:
           of the segment its address falls in; empty if neither
         example: Policy0
         type: string
+      policyFromSegment:
+        description: >-
+          policy is the segment's, not the device's own: the device has none
+          of its own and its address falls in a segment bound to a policy
+        example: false
+        type: boolean
       registered:
         description: 'The device is registered in the firmware'
         example: true
