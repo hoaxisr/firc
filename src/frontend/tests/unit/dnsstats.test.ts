@@ -7,6 +7,8 @@ installSvelteRunesMocks();
 
 const {
   blockTargets,
+  nextLastSort,
+  sortByLast,
   deviceAddresses,
   ownerAbove,
   relativeTime,
@@ -306,5 +308,36 @@ describe("row status", () => {
     assert.strictEqual(rowAbove(row(low) as any, groups as any, null), "");
     assert.strictEqual(rowAbove(row(null) as any, groups as any, null), "");
     assert.strictEqual(rowAbove(row(ex) as any, groups.slice(0, 1) as any, null), "");
+  });
+});
+
+describe("sort by last request", () => {
+  const r = (name: string, last: number) => ({ name, last }) as any;
+  const rows = [r("a", 100), r("b", 300), r("c", 200), r("d", 300)];
+  const names = (x: { name: string }[]) => x.map((v) => v.name).join("");
+
+  // catches ascending order on the first click, or ties reshuffled
+  it("puts the newest first and keeps the daemon's order among equals", () => {
+    assert.strictEqual(names(sortByLast(rows, "newest")), "bdca");
+  });
+
+  // catches oldest-first sharing the newest-first comparator
+  it("puts the oldest first, equals in the daemon's order", () => {
+    assert.strictEqual(names(sortByLast(rows, "oldest")), "acbd");
+  });
+
+  // catches the off state reordering, or the input being mutated
+  it("leaves rows alone when off and never mutates the input", () => {
+    assert.strictEqual(names(sortByLast(rows, "")), "abcd");
+    sortByLast(rows, "newest");
+    assert.strictEqual(names(rows), "abcd");
+  });
+
+  // catches a click cycle that skips a state or never returns to the daemon's order
+  it("cycles off, newest, oldest, off", () => {
+    assert.deepStrictEqual(
+      [nextLastSort(""), nextLastSort("newest"), nextLastSort("oldest")],
+      ["newest", "oldest", ""],
+    );
   });
 });

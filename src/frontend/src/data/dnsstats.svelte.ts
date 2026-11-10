@@ -46,6 +46,23 @@ export const dnsStats = $state({
 
 export const statsFilter = $state({ device: "", q: "", arpa: false, seen: [] as string[] });
 
+export type LastSort = "" | "newest" | "oldest";
+
+export const statsSort = $state({ last: "" as LastSort });
+
+export function nextLastSort(s: LastSort): LastSort {
+  return s === "" ? "newest" : s === "newest" ? "oldest" : "";
+}
+
+export function sortByLast(rows: DnsStatsRow[], sort: LastSort): DnsStatsRow[] {
+  if (sort === "") return rows;
+  const sign = sort === "newest" ? -1 : 1;
+  return rows
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => sign * (a.r.last - b.r.last) || a.i - b.i)
+    .map((x) => x.r);
+}
+
 let generation = 0;
 
 export function statsPath(query: StatsQuery): string {

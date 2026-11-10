@@ -288,6 +288,37 @@ test.describe("DNS stats", () => {
     expect(daemon.stats.at(-1)!.searchParams.get("q")).toBe("GOO");
   });
 
+  // Catches a sort that starts oldest-first, never returns to the daemon's order, or a header that is not a button.
+  test("the Последний header sorts by last request, newest first on the first click", async ({
+    page,
+  }) => {
+    await setup(page, [EXAMPLE_GROUP, ADS_GROUP]);
+    const sort = page.locator(".head .sort");
+    await sort.click();
+    await expect(page.locator(".stats-row .dom")).toHaveText([
+      "googlevideo.com",
+      "ads.doubleclick.net",
+      "ya.ru",
+      "graph.facebook.com",
+      "github.com",
+      "my printer.local",
+      "low.example.org",
+    ]);
+    await sort.click();
+    await expect(page.locator(".stats-row .dom")).toHaveText([
+      "low.example.org",
+      "my printer.local",
+      "github.com",
+      "graph.facebook.com",
+      "ya.ru",
+      "ads.doubleclick.net",
+      "googlevideo.com",
+    ]);
+    await sort.click();
+    await expect(page.locator(".stats-row .dom").first()).toHaveText("googlevideo.com");
+    await expect(page.locator(".stats-row .dom").nth(1)).toHaveText("ya.ru");
+  });
+
   // Catches reverse lookups shown by default, or the switch not reaching the daemon as arpa=1.
   test("service names are hidden until показать служебные is ticked", async ({ page }) => {
     const daemon = await setup(page, [ADS_GROUP]);

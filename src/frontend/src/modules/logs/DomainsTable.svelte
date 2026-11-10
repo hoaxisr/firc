@@ -3,8 +3,11 @@
   import type { Snippet } from "svelte";
 
   import {
+    nextLastSort,
     relativeTime,
     rowDevices,
+    sortByLast,
+    statsSort,
     type DnsStatsRow,
     type StatsDevice,
   } from "../../data/dnsstats.svelte";
@@ -28,23 +31,42 @@
     note?: Snippet<[DnsStatsRow]>;
   } = $props();
 
+  const sorted = $derived(sortByLast(rows, statsSort.last));
+  const sortLabel = $derived(
+    statsSort.last === "newest"
+      ? t("newest first")
+      : statsSort.last === "oldest"
+        ? t("oldest first")
+        : t("by queries"),
+  );
+
   const pct = (r: DnsStatsRow) => (r.queries > 0 ? Math.round((r.blocked / r.queries) * 100) : 0);
 </script>
 
 <div class="card">
   <div class="pane">
-    <div class="head" aria-hidden="true">
-      <span>{t("Domain")}</span>
-      <span class="num">{t("Queries")}</span>
-      <span>{t("Blocked")}</span>
-      <span>{t("Devices")}</span>
-      <span>{t("Last")}</span>
-      <span></span>
+    <div class="head">
+      <span aria-hidden="true">{t("Domain")}</span>
+      <span class="num" aria-hidden="true">{t("Queries")}</span>
+      <span aria-hidden="true">{t("Blocked")}</span>
+      <span aria-hidden="true">{t("Devices")}</span>
+      <button
+        type="button"
+        class="sort"
+        class:on={statsSort.last !== ""}
+        aria-label="{t('Last')}: {sortLabel}"
+        title={sortLabel}
+        onclick={() => (statsSort.last = nextLastSort(statsSort.last))}
+        >{t("Last")}<span class="arrow" aria-hidden="true"
+          >{statsSort.last === "newest" ? "↓" : statsSort.last === "oldest" ? "↑" : ""}</span
+        ></button
+      >
+      <span aria-hidden="true"></span>
     </div>
     {#if rows.length === 0}
       <p class="empty">{empty}</p>
     {/if}
-    {#each rows as r (r.name)}
+    {#each sorted as r (r.name)}
       {@const devs = rowDevices(r.clients, devices)}
       {@const more = devs.length - 2 + (r.clientsTotal - r.clients.length)}
       <div class="stats-row">
@@ -142,6 +164,23 @@
     color: var(--text-2);
     font-size: 0.74rem;
     letter-spacing: 0.03em;
+  }
+  .sort {
+    all: unset;
+    display: inline-flex;
+    gap: 0.2rem;
+    align-items: center;
+    justify-self: start;
+    cursor: pointer;
+    letter-spacing: inherit;
+  }
+  .sort:hover,
+  .sort.on {
+    color: var(--text);
+  }
+  .sort:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   .stats-row {
     border-bottom: 1px solid color-mix(in srgb, var(--bg-light-extra) 60%, transparent);
@@ -309,6 +348,11 @@
   }
   @container (max-width: 760px) {
     .head {
+      display: flex;
+      justify-content: flex-end;
+      padding: 0.3rem 0.8rem;
+    }
+    .head > span {
       display: none;
     }
     .stats-row {
