@@ -12,7 +12,7 @@
  * datagram: frames of several datagrams in one write, and a frame that does not fit into one TLS
  * record with a small MTU.
  *
- * The stack is replaced by stubs below: vldial.c calls two of its functions, and the stack is
+ * The stack is replaced by stubs below: vldial.c calls four of its functions, and the stack is
  * not linked in. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,12 +25,18 @@
 #include "vldial.h"
 #include "dialer.h"
 #include "stack.h"
+#include "pool.h"
 
 time_t stack_now_s(void) { return time(NULL); }
 int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn ready, void *arg) {
     (void)tc; (void)d; (void)ready; (void)arg;
     return 1;
 }
+int pool_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready, void *arg) {
+    (void)tc; (void)pc; (void)ready; (void)arg;
+    return 1;
+}
+int pool_ref_stale(const struct xc_ref *r) { (void)r; return 0; }
 
 static int g_got;
 static int emit(void *arg, const unsigned char *p, size_t n) {

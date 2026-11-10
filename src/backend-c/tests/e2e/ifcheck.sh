@@ -158,9 +158,10 @@ uplink() {
     ip addr add "$3/24" dev "$1"
     ip link set "$1" up
     NS "$2" ip link set lo up
-    NS "$2" sysctl -qw net.ipv4.conf.all.rp_filter=0
+    NS "$2" sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.all.arp_ignore=0 net.ipv4.conf.default.arp_ignore=0
     NS "$2" ip addr add "$4/24" dev p0
     NS "$2" ip link set p0 up
+    NS "$2" sysctl -qw net.ipv4.conf.p0.arp_ignore=0
     NS "$2" ip route add default via "$3"
     NS "$2" ip addr add 10.99.0.1/32 dev lo
     NS "$2" ip addr add 10.98.0.1/32 dev lo

@@ -477,6 +477,9 @@ jobs:
       - name: Unit tests
         run: make -C src/tunvless test
 
+      - name: Interop probes build
+        run: make -C src/tunvless out/tests/vencprobe out/tests/xudpprobe out/tests/h2tap out/tunvless
+
       - name: Unit tests under AddressSanitizer
         run: make -C src/tunvless O=out-asan SANITIZE=address test
 
