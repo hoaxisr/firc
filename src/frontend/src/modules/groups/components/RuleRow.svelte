@@ -222,6 +222,7 @@
           <input
             type="text"
             placeholder={t("rule pattern...")}
+            title={rule.rule}
             class="table-input pattern-input"
             class:search-text-hidden={hasPatternSearchHighlight}
             bind:value={rule.rule}
@@ -454,6 +455,7 @@
     width: 100%;
     padding: 0;
     margin: 0;
+    text-overflow: ellipsis;
   }
   .table-input:focus-visible {
     outline: none;
