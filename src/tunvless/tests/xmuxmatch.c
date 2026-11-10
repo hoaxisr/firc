@@ -4166,7 +4166,7 @@ static void t_dl_place_keeps_its_main_link(void) {
     check("dl place pin: no new link", 3, P_ACCEPTS());
     check("dl place pin: the idle main link kept for it", 1, P_OPEN(p_first_on(0)));
     gl_close(1);
-    UNTIL(gl_ready(2));
+    UNTIL(gl_ready(2) && P_NSID_AT(1) == 3);
     check("dl place pin: runs once the block frees", 1, gl_ready(2));
     check("dl place pin: no link added meanwhile", 3, P_ACCEPTS());
     check("dl place pin: echo", 1, gl_echo(2, "kept"));

@@ -337,7 +337,7 @@ static int xh_range_obj(struct sj *j, char *buf, size_t cap) {
     int f = 1, r;
     char k[16], from[24] = "", to[24] = "";
     while ((r = sj_obj_key(j, &f, k, sizeof k)) == 0) {
-        char *dst = !strcmp(k, "from") ? from : !strcmp(k, "to") ? to : NULL;
+        char *dst = !strcasecmp(k, "from") ? from : !strcasecmp(k, "to") ? to : NULL;
         sj_ws(j);
         if (!dst || *j->p == '"') sj_skip(j);
         else if (xh_token(j, dst, sizeof from)) return -1;
@@ -361,8 +361,8 @@ static int xh_value(struct sj *j, struct sl_xh *a, const char *k) {
     char v[sizeof a->buf];
     sj_ws(j);
     if (!strncmp(j->p, "null", 4)) { j->p += 4; return 0; }
-    if (*j->p == '{' && (!strcmp(k, "uplinkChunkSize") || !strcmp(k, "sessionIDLength") ||
-                         !strcmp(k, "scMinPostsIntervalMs"))) {
+    if (*j->p == '{' && (!strcasecmp(k, "uplinkChunkSize") || !strcasecmp(k, "sessionIDLength") ||
+                         !strcasecmp(k, "scMinPostsIntervalMs"))) {
         int r = xh_range_obj(j, v, sizeof v);
         if (r < 0) return -1;
         if (r) { sl_xh_put(a, k, XH_NOT_A_STRING, 1); return 0; }
@@ -390,7 +390,7 @@ static int xh_xmux(struct sj *j, struct sl_xh *a) {
     while ((r = sj_obj_key(j, &f, k, sizeof k)) == 0) {
         snprintf(name, sizeof name, "xmux.%s", k);
         sj_ws(j);
-        if (!strcmp(k, "hKeepAlivePeriod") && *j->p == '"') {
+        if (!strcasecmp(k, "hKeepAlivePeriod") && *j->p == '"') {
             const char *b = j->p;
             sj_skip(j);
             if (j->p == b) return -1;
@@ -418,20 +418,20 @@ static int xh_obj(struct sj *j, struct xh_set *s, struct xh_set *ex, int *ex_on,
     char k[64], v[48];
     while ((r = sj_obj_key(j, &f, k, sizeof k)) == 0) {
         sj_ws(j);
-        if (ex && !strcmp(k, "path")) { if (sj_str(j, s->n.path, sizeof s->n.path)) return -1; }
-        else if (ex && !strcmp(k, "mode")) { if (sj_str(j, s->n.mode, sizeof s->n.mode)) return -1; }
-        else if (ex && !strcmp(k, "host")) { if (sj_str(j, s->n.http_host, sizeof s->n.http_host)) return -1; }
-        else if (!strcmp(k, "downloadSettings")) { if (xh_dl(j, s, dl_ok)) return -1; }
-        else if (!strcmp(k, "xmux")) { if (xh_xmux(j, &s->a)) return -1; }
-        else if (!strcmp(k, "xPaddingBytes") || !strcmp(k, "scMaxEachPostBytes")) {
+        if (ex && !strcasecmp(k, "path")) { if (sj_str(j, s->n.path, sizeof s->n.path)) return -1; }
+        else if (ex && !strcasecmp(k, "mode")) { if (sj_str(j, s->n.mode, sizeof s->n.mode)) return -1; }
+        else if (ex && !strcasecmp(k, "host")) { if (sj_str(j, s->n.http_host, sizeof s->n.http_host)) return -1; }
+        else if (!strcasecmp(k, "downloadSettings")) { if (xh_dl(j, s, dl_ok)) return -1; }
+        else if (!strcasecmp(k, "xmux")) { if (xh_xmux(j, &s->a)) return -1; }
+        else if (!strcasecmp(k, "xPaddingBytes") || !strcasecmp(k, "scMaxEachPostBytes")) {
             if (*j->p == '{' ? xh_range_obj(j, v, sizeof v) < 0 : xh_token(j, v, sizeof v)) return -1;
-            if (k[0] == 'x') sl_pad_range(&s->n, v); else sl_post_range(&s->n, v);
+            if (!strcasecmp(k, "xPaddingBytes")) sl_pad_range(&s->n, v); else sl_post_range(&s->n, v);
         }
-        else if (!strcmp(k, "headers")) {
+        else if (!strcasecmp(k, "headers")) {
             if (*j->p == '{') xray_headers(j, &s->h, 1);
             else { sj_skip(j); s->h.bad = 1; }
         }
-        else if (ex && !strcmp(k, "extra")) {
+        else if (ex && !strcasecmp(k, "extra")) {
             free(ex->dl);
             memset(ex, 0, sizeof *ex);
             *ex_on = 1;

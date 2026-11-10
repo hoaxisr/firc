@@ -386,13 +386,14 @@ static const char *const xh_names[] = {
 
 static size_t xh_index(const char *k, size_t kn) {
     size_t i = 0;
-    while (i < XH_NAMES && !(strlen(xh_names[i]) == kn && !memcmp(xh_names[i], k, kn))) i++;
+    while (i < XH_NAMES && !(strlen(xh_names[i]) == kn && !strncasecmp(xh_names[i], k, kn))) i++;
     return i;
 }
 
 void sl_xh_put(struct sl_xh *a, const char *key, const char *val, size_t vlen) {
     size_t idx = xh_index(key, strlen(key));
     if (idx == XH_NAMES) return;
+    key = xh_names[idx];
     for (size_t i = 0; i < vlen; i++) {
         unsigned char c = (unsigned char)val[i];
         if (c < 0x20 || c == 0x7f || strchr("\"\\=;,", c)) { a->bad = 1; return; }

@@ -238,7 +238,7 @@ static int hello_meet(void) {
 /* Static key pair of the Reality server for plan.reality_ok: the node's pbk is its public half. */
 static unsigned char g_rs_priv[32], g_rs_pub[32];
 /* What the server saw in the ALPN of the last ClientHello (for runs through run_case). */
-static volatile int g_seen_h11 = -1;
+static int g_seen_h11 = -1;
 /* After the last run_case: 1 if the client's Finished came and verifies, 0 if the client sent
  * nothing after its ClientHello, -1 for anything else. */
 static int g_cfin = -1;
@@ -825,7 +825,7 @@ static void *server_half(void *arg) {
      * name included. */
     static const char H11[] = "\x00\x10\x00\x0b\x00\x09\x08http/1.1";
     s->alpn_h11 = memmem(ch, ch_n, H11, sizeof(H11) - 1) != NULL;
-    g_seen_h11 = s->alpn_h11;
+    __atomic_store_n(&g_seen_h11, s->alpn_h11, __ATOMIC_SEQ_CST);
 
     unsigned char cpub[32], sid[32];
     size_t sid_n = 0;
@@ -2067,8 +2067,9 @@ static void t_fm_mask_error(void) {
     fm_use(NULL, 0);
     check("mask error: a layer's read error fails the handshake as TR_EMASK", TR_EMASK, rc);
     check_str("mask error: the text names the layer's reason", "finalmask: test: bad read", transport_strerror(rc));
-    close(sv[1]);
+    shutdown(sv[1], SHUT_RDWR);
     pthread_join(th, NULL);
+    close(sv[1]);
     rn.fm = "{\"tcp\":[{\"type\":";
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
         g_give_fd = sv[0];
@@ -2239,11 +2240,11 @@ int main(void) {
             static struct srv s;
             int rc;
             if (u == 0) {
-                g_seen_h11 = -1;
+                __atomic_store_n(&g_seen_h11, -1, __ATOMIC_SEQ_CST);
                 rc = run_case(&up, &rn, NULL, 0, NULL);
                 check("reality: temporary certificate accepted, connection established", 0, rc);
                 check("reality: the server verified the client's Finished", 1, g_cfin);
-                check("reality + tcp: ALPN is not http/1.1 alone", 0, g_seen_h11);
+                check("reality + tcp: ALPN is not http/1.1 alone", 0, __atomic_load_n(&g_seen_h11, __ATOMIC_SEQ_CST));
                 check("reality + tcp: descriptor count restored", fd0, fd_count());
                 continue;
             }

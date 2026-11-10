@@ -191,6 +191,20 @@ static void t_xhx_long_extra_read_whole_and_cut_one_does_not_parse(void) {
             vless_parse_url("vless://" XHU "@example.org:443?type=tcp&security=none&extra=%7B#t", &n));
 }
 
+/* catches: xhttp keys matched case-exactly where Xray folds case */
+static void t_xhx_keys_fold_case_like_go(void) {
+    struct vless_node out[4], n;
+    struct vless_sub_stats st;
+    size_t got = xhx_xray("{\"Path\":\"/x\",\"SessionIDPlacement\":\"query\",\"XPADDINGBYTES\":{\"From\":30,\"TO\":60},"
+                          "\"Xmux\":{\"MaxConnections\":2}}", out, &st);
+    check("xhx case: usable", "(usable)", xhx_reason(got, &st));
+    check("xhx case: canonical names", "sessionIDPlacement=query\nxmux.maxConnections=2\n", got ? xhx_of(&out[0]) : "");
+    check_n("xhx case: padding key folded", 60, got ? out[0].pad_to : -1);
+    check("xhx case: path key folded", "/x", got ? out[0].path : "");
+    xhx_link("", "{\"sessionIDKey\":\"a\",\"sessionidkey\":\"b\"}", &n);
+    check("xhx case: two spellings are one key, the last wins", "sessionIDKey=b\n", xhx_of(&n));
+}
+
 static void t_xhx_xray_json_nested_extra_replaces_top_level(void) {
     struct vless_node out[4];
     struct vless_sub_stats st;
@@ -433,6 +447,7 @@ static void t_xhx_min_posts_interval_from_link_and_xray(void) {
 }
 
 static void t_xhx_all(void) {
+    t_xhx_keys_fold_case_like_go();
     t_xhx_min_posts_interval_from_link_and_xray();
     t_xhx_server_max_header_bytes_from_link_and_xray();
     t_xhx_no_grpc_header_from_every_format();
