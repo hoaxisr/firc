@@ -583,7 +583,7 @@ static void t_gather(void) {
     g_recv_n = 0;
     cli_send_more(seq, 2, TCP_ACK, 65535, d, sizeof(d));
     up_flush(&g_tun);
-    check(c->client_seq == 1001 && g_up.c == NULL,
+    check(c->client_seq == 1001 && g_ls->up.c == NULL,
           "gather: a refused send when full, the next segment is not taken either");
     g_send_again_n = 0;
     conn_drop(c);
@@ -673,7 +673,7 @@ static void t_up_cut_partial(void) {
     struct flow_key last;
     memset(&last, 0, sizeof last);
     dev_drain(&last);
-    check(c->client_seq == seq + 8192 && g_up.c == NULL && c->used && !c->srv_closed &&
+    check(c->client_seq == seq + 8192 && g_ls->up.c == NULL && c->used && !c->srv_closed &&
               last.ack == seq + 8192,
           "up cut partial: exactly the 8192 taken bytes acknowledged, nothing left gathered");
     g_send_szn = 0;

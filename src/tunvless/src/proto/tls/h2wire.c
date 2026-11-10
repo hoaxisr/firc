@@ -3,6 +3,7 @@
 #include <strings.h>
 
 #include "h2wire.h"
+#include "tscratch.h"
 
 /* ---- HPACK on send for gRPC ---------------------------------------------------------
  *
@@ -188,10 +189,11 @@ static const char *const go_drop[] = {
     "host", "content-length", "connection", "proxy-connection", "transfer-encoding", "upgrade", "keep-alive",
 };
 
-static __thread struct h2_field g_rest[H2W_FIELDS_MAX];
-static __thread uint16_t g_unit[H2W_FIELDS_MAX], g_first[H2W_FIELDS_MAX], g_perm[H2W_FIELDS_MAX];
+struct gl { struct h2w_list *o; struct h2wire_scratch *s; size_t rn, bn; int over; };
 
-struct gl { struct h2w_list *o; size_t rn, bn; int over; };
+static struct h2wire_scratch *scratch(void) {
+    return ts_get(TS_H2WIRE, sizeof(struct h2wire_scratch));
+}
 
 uint64_t h2w_rng(uint64_t *state) {
     uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
@@ -202,7 +204,7 @@ uint64_t h2w_rng(uint64_t *state) {
 
 static void gl_rest(struct gl *g, const char *name, const char *value) {
     if (g->rn >= H2W_FIELDS_MAX) { g->over = 1; return; }
-    g_rest[g->rn++] = (struct h2_field){ name, value };
+    g->s->rest[g->rn++] = (struct h2_field){ name, value };
 }
 
 static const char *gl_copy(struct gl *g, const char *s, size_t n, int lower) {
@@ -260,7 +262,7 @@ static void gl_out(struct gl *g, const char *name, const char *value) {
 
 static int gl_has(const struct gl *g, const char *name) {
     for (size_t i = 0; i < g->rn; i++)
-        if (strcmp(g_rest[i].name, name) == 0) return 1;
+        if (strcmp(g->s->rest[i].name, name) == 0) return 1;
     return 0;
 }
 
@@ -271,7 +273,9 @@ static int go_cl(const struct h2_req *r) {
 }
 
 int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
-    struct gl g = { out, 0, 0, 0 };
+    struct h2wire_scratch *s = scratch();
+    if (!s) return H2_EIO;
+    struct gl g = { out, s, 0, 0, 0 };
     out->n = 0;
     gl_out(&g, ":authority", r->authority);
     gl_out(&g, ":method", r->method);
@@ -286,23 +290,23 @@ int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
     size_t units = 0;
     for (size_t i = 0; i < g.rn; i++) {
         size_t u = 0;
-        while (u < units && strcmp(g_rest[g_first[u]].name, g_rest[i].name)) u++;
+        while (u < units && strcmp(s->rest[s->first[u]].name, s->rest[i].name)) u++;
         if (u == units) {
-            g_first[units] = (uint16_t)i;
-            g_perm[units] = (uint16_t)units;
+            s->first[units] = (uint16_t)i;
+            s->perm[units] = (uint16_t)units;
             units++;
         }
-        g_unit[i] = (uint16_t)u;
+        s->unit[i] = (uint16_t)u;
     }
     for (size_t i = units; i > 1; i--) {
         size_t j = (size_t)(h2w_rng(rng) % i);
-        uint16_t t = g_perm[i - 1];
-        g_perm[i - 1] = g_perm[j];
-        g_perm[j] = t;
+        uint16_t t = s->perm[i - 1];
+        s->perm[i - 1] = s->perm[j];
+        s->perm[j] = t;
     }
     for (size_t j = 0; j < units; j++)
         for (size_t i = 0; i < g.rn; i++)
-            if (g_unit[i] == g_perm[j]) gl_out(&g, g_rest[i].name, g_rest[i].value);
+            if (s->unit[i] == s->perm[j]) gl_out(&g, s->rest[i].name, s->rest[i].value);
     if (go_cl(r)) {
         char n[24];
         int k = snprintf(n, sizeof n, "%lld", (long long)r->body_len);
@@ -315,12 +319,12 @@ int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out) {
 }
 
 size_t h2w_list_size(const struct h2_req *r, int browser) {
-    static __thread struct h2w_list l;
     size_t s = 0;
     if (browser) {
+        struct h2wire_scratch *x = scratch();
         uint64_t rng = 0;
-        if (h2w_go_fields(r, &rng, &l)) return SIZE_MAX;
-        for (size_t i = 0; i < l.n; i++) s += strlen(l.f[i].name) + strlen(l.f[i].value) + 32;
+        if (!x || h2w_go_fields(r, &rng, &x->l)) return SIZE_MAX;
+        for (size_t i = 0; i < x->l.n; i++) s += strlen(x->l.f[i].name) + strlen(x->l.f[i].value) + 32;
         return s;
     }
     s = strlen(":method") + strlen(r->method) + 32;

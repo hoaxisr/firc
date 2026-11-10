@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "transport.h"
+#include "tscratch.h"
 
 /* The gRPC request path.
  *
@@ -135,23 +136,34 @@ static int grpc_open(struct transport *t, const struct tr_node *n, int timeout_s
     return h2_start(&t->h2, &io, authority, path, "application/grpc", NULL);
 }
 
+struct grpc_scratch {
+    unsigned char msg[H2_MIN_READ_CAP + 16];
+    unsigned char raw[H2_MIN_READ_CAP];
+};
+
+static struct grpc_scratch *scratch(void) {
+    return ts_get(TS_GRPC, sizeof(struct grpc_scratch));
+}
+
 static int grpc_write(struct transport *t, const unsigned char *d, size_t n) {
-    static __thread unsigned char msg[H2_MIN_READ_CAP + 16];
-    size_t mn = grpc_wrap(d, n, msg, sizeof(msg));
+    struct grpc_scratch *s = scratch();
+    if (!s) return TR_EIO;
+    size_t mn = grpc_wrap(d, n, s->msg, sizeof s->msg);
     if (!mn) return H2_ETOOBIG;
-    return h2_write(&t->h2, msg, mn);
+    return h2_write(&t->h2, s->msg, mn);
 }
 
 static int grpc_read(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     /* One buffer per THREAD, not per connection: 16 KB per connection adds up on a router, and
      * there are only a few threads. A buffer shared between threads would mix chunks of different
      * connections. */
-    static __thread unsigned char raw[H2_MIN_READ_CAP];
+    struct grpc_scratch *s = scratch();
+    if (!s) return TR_EIO;
     size_t rn = 0;
-    int rc = h2_read(&t->h2, raw, sizeof(raw), &rn);
+    int rc = h2_read(&t->h2, s->raw, sizeof s->raw, &rn);
     if (rc) return rc;
     if (!rn) return 0;
-    return grpc_unwrap(&t->de, raw, rn, d, cap, got);
+    return grpc_unwrap(&t->de, s->raw, rn, d, cap, got);
 }
 
 /* h2 keeps a pointer to the connection's link (io.ctx); once the struct moves it would point to

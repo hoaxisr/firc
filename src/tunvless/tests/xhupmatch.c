@@ -77,6 +77,20 @@ void tls13_free(struct tls13 *t) { (void)t; }
 
 /* ---- test -------------------------------------------------------------------------- */
 
+void *__real_calloc(size_t k, size_t n);
+static size_t g_cfail;
+static int g_cfail_tries;
+
+void *__wrap_calloc(size_t k, size_t n) {
+    if (g_cfail && k * n == g_cfail) {
+        g_cfail_tries++;
+        g_cfail = 0;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_calloc(k, n);
+}
+
 static int g_fail;
 static void check(int ok, const char *what) {
     printf("%-74s %s\n", what, ok ? "ok" : "FAIL");
@@ -685,6 +699,72 @@ static void t_budget_too_small_fails_with_reason(void) {
           !strcmp(c.why, "xhttp: the server's header limit leaves no room for data") &&
           hr_count_frames(g_seen + before, g_seen_n - before, 0x01) == 0,
           "header limit 500: the write fails with TR_EIO and the reason, nothing sent");
+    xclose(fds);
+}
+
+struct wb { struct transport *c; int rc[2], tries; size_t mid; const char *why; };
+
+static void *wb_run(void *a) {
+    struct wb *s = a;
+    g_cfail_tries = 0;
+    g_cfail = sizeof(struct h2wire_scratch);
+    s->rc[0] = transport_write(s->c, piece, sizeof piece);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->why = s->c->why;
+    srv_drain();
+    s->mid = g_seen_n;
+    s->rc[1] = transport_write(s->c, piece, sizeof piece);
+    srv_drain();
+    return NULL;
+}
+
+static void t_xhttp_worst_base_retries(void) {
+    /* catches: SIZE_MAX cached in worst_base, so the flow never sends again */
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("packet-up", "uplinkDataPlacement=header", NULL);
+    int rc = xopen(&c, &n, fds);
+    size_t before = g_seen_n;
+    struct wb s = { &c, { 1, 1 }, 0, 0, NULL };
+    pthread_t th;
+    int up = rc == 0 && pthread_create(&th, NULL, wb_run, &s) == 0;
+    if (up) pthread_join(th, NULL);
+    static struct hr_block b;
+    int k = 0;
+    while (s.mid && !hr_nth_headers(g_seen + s.mid, g_seen_n - s.mid, k, &b)) k++;
+    const char *m = k ? fval(&b, ":method") : NULL;
+    check(rc == 0 && up, "worst base: flow opened, writer thread ran");
+    check(s.tries == 1, "worst base: one h2wire scratch block asked for");
+    check(s.rc[0] == TR_EIO, "worst base: the write without scratch fails with TR_EIO");
+    check(hr_count_frames(g_seen + before, s.mid - before, 0x01) == 0, "worst base: nothing sent by it");
+    check(s.why && !strcmp(s.why, "xhttp: no memory for the request"), "worst base: the reason says no memory");
+    check(s.rc[1] == 0, "worst base: the next write on the flow succeeds");
+    check(k == 1 && m && !strcmp(m, "POST"), "worst base: and goes out as one POST");
+    xclose(fds);
+}
+
+struct fr { struct transport *c; int rc; size_t got; };
+
+static void *fr_run(void *a) {
+    struct fr *s = a;
+    unsigned char b[TRANSPORT_MIN_READ_CAP];
+    s->rc = transport_read(s->c, b, sizeof b, &s->got);
+    return NULL;
+}
+
+static void t_xhttp_read_on_a_fresh_thread(void) {
+    /* catches: a private link's first read on a thread that never dialled going through a NULL scratch */
+    int fds[2];
+    struct transport c;
+    struct tr_node n = xnode("packet-up", NULL, NULL);
+    int rc = xopen(&c, &n, fds);
+    struct fr s = { &c, 1, 1 };
+    pthread_t th;
+    int up = rc == 0 && pthread_create(&th, NULL, fr_run, &s) == 0;
+    if (up) pthread_join(th, NULL);
+    check(rc == 0 && up, "fresh read: flow opened, reader thread ran");
+    check(s.rc == 0 && s.got == 0, "fresh read: nothing to read, no error");
     xclose(fds);
 }
 
@@ -1727,6 +1807,8 @@ int main(void) {
     t_data_budget_first_request();
     t_data_budget_after_settings();
     t_budget_too_small_fails_with_reason();
+    t_xhttp_worst_base_retries();
+    t_xhttp_read_on_a_fresh_thread();
     t_server_max_header_bytes_before_settings();
     t_custom_headers_first();
     t_content_length_per_mode();

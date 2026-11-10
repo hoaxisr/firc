@@ -52,6 +52,7 @@
 #include "transport.h"
 #include "reality.h"
 #include "vencp.h"
+#include "tscratch.h"
 
 #define REC_MAX_DATA 8192              /* data per sent record (Xray: no extra copy at the peer) */
 #define REC_MAX_LEN  16640             /* max record body length accepted on receive */
@@ -553,9 +554,13 @@ out:
 
 /* ---- records -------------------------------------------------------------------------------- */
 
+struct venc_scratch { unsigned char obuf[5 + REC_MAX_DATA + 16]; };
+
 int tr_venc_write(struct transport *t, const unsigned char *d, size_t n) {
     struct venc *e = t->enc;
-    static __thread unsigned char obuf[5 + REC_MAX_DATA + 16];
+    struct venc_scratch *s = ts_get(TS_VENC, sizeof(struct venc_scratch));
+    if (!s) return TR_EIO;
+    unsigned char *obuf = s->obuf;
     size_t done = 0;
     while (done < n) {
         size_t ch = n - done > REC_MAX_DATA ? REC_MAX_DATA : n - done;

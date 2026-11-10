@@ -12,6 +12,8 @@
  * The transport and h2.c are real; the link is plain (security=none) over a socket pair whose
  * other end the test writes HTTP/2 frames to by hand, in one write so that h2_read sees one
  * record. TLS and Reality are stubbed out: they are never reached. */
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -55,6 +57,19 @@ int tls13_read_ref(struct tls13 *t, const unsigned char **b, size_t *bn)
 void tls13_free(struct tls13 *t) { (void)t; }
 
 static int fails;
+
+void *__real_calloc(size_t k, size_t n);
+static size_t g_cfail;
+static int g_cfail_tries;
+
+void *__wrap_calloc(size_t k, size_t n) {
+    if (g_cfail && k * n == g_cfail) {
+        g_cfail_tries++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_calloc(k, n);
+}
 
 static void check(int ok, const char *what) {
     printf("%-84s %s\n", what, ok ? "ok" : "FAIL");
@@ -274,8 +289,53 @@ static void t_trailers_only(const char *what) {
     transport_close(&c);
 }
 
+struct ns { struct transport *c; int rc[2]; ssize_t peek; int peek_err; };
+
+static void *ns_write(void *a) {
+    struct ns *s = a;
+    unsigned char d[100];
+    for (int i = 0; i < 100; i++) d[i] = (unsigned char)(i + 1);
+    g_cfail_tries = 0;
+    g_cfail = sizeof(struct grpc_scratch);
+    s->rc[0] = grpc_write(s->c, d, sizeof d);
+    g_cfail = 0;
+    unsigned char b[1];
+    s->peek = recv(g_srv, b, 1, MSG_DONTWAIT | MSG_PEEK);
+    s->peek_err = errno;
+    s->rc[1] = grpc_write(s->c, d, sizeof d);
+    return NULL;
+}
+
+static void t_grpc_write_no_scratch(void) {
+    /* catches: writing through a NULL scratch, or a failure that sticks */
+    struct transport c;
+    check(open_stream(&c) == 0, "no scratch: stream opened");
+    struct ns s = { &c, { 1, 1 }, 0, 0 };
+    pthread_t th;
+    int up = pthread_create(&th, NULL, ns_write, &s) == 0;
+    if (up) pthread_join(th, NULL);
+    unsigned char want[9 + 107] = { 0, 0, 107, 0x00, 0, 0, 0, 0, 1, 0, 0, 0, 0, 102, 0x0A, 100 };
+    for (int i = 0; i < 100; i++) want[16 + i] = (unsigned char)(i + 1);
+    unsigned char got[sizeof want + 16];
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(g_srv, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    size_t gn = 0;
+    ssize_t r;
+    while (gn < sizeof want && (r = recv(g_srv, got + gn, sizeof got - gn, 0)) > 0) gn += (size_t)r;
+    ssize_t more = recv(g_srv, got, sizeof got, MSG_DONTWAIT);
+    check(up, "no scratch: thread ran");
+    check(g_cfail_tries == 1, "no scratch: one scratch block asked for");
+    check(s.rc[0] == TR_EIO, "no scratch: the write fails with TR_EIO");
+    check(s.peek < 0 && s.peek_err == EAGAIN, "no scratch: the peer has nothing to read");
+    check(s.rc[1] == 0, "no scratch: the next write succeeds");
+    check(gn == sizeof want && !memcmp(got, want, sizeof want), "no scratch: the peer reads one DATA frame, one 100-byte message");
+    check(more < 0, "no scratch: nothing after it");
+    transport_close(&c);
+}
+
 int main(void) {
     t_framing();
+    t_grpc_write_no_scratch();
     t_authority_of_ipv6("2001:db8::1", "[2001:db8::1]", "IPv6 address as :authority: in brackets");
     t_authority_of_ipv6("10.0.0.1", "10.0.0.1", "IPv4 address as :authority: as it is");
     t_end_in_one_record(1, 1, "data + END_STREAM + RST_STREAM in one record");

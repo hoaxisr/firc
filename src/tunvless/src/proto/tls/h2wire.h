@@ -99,6 +99,12 @@ struct h2w_list {
     char buf[2048];
 };
 
+struct h2wire_scratch {
+    struct h2w_list l;
+    struct h2_field rest[H2W_FIELDS_MAX];
+    uint16_t unit[H2W_FIELDS_MAX], first[H2W_FIELDS_MAX], perm[H2W_FIELDS_MAX];
+};
+
 uint64_t h2w_rng(uint64_t *state);
 int h2w_go_fields(const struct h2_req *r, uint64_t *rng, struct h2w_list *out);
 size_t h2w_headers(unsigned char *out, size_t cap, const struct h2_req *r);

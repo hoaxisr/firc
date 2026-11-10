@@ -20,14 +20,33 @@ static long g_send_ok, g_send_again;
 
 void *__real_malloc(size_t n);
 static int g_chunk_fail;
+static int g_hs_fail, g_hs_tries;
 
 void *__wrap_malloc(size_t n) {
+    if (g_hs_fail && n == 81920) {
+        g_hs_tries++;
+        errno = ENOMEM;
+        return NULL;
+    }
     if (g_chunk_fail && n >= XC_CHUNK) {
         g_chunk_fail = 0;
         errno = ENOMEM;
         return NULL;
     }
     return __real_malloc(n);
+}
+
+void *__real_calloc(size_t k, size_t n);
+static size_t g_cfail;
+static int g_cfail_tries;
+
+void *__wrap_calloc(size_t k, size_t n) {
+    if (g_cfail && k * n == g_cfail) {
+        g_cfail_tries++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_calloc(k, n);
 }
 
 ssize_t __wrap_send(int fd, const void *b, size_t n, int fl) {
@@ -4189,6 +4208,235 @@ static void t_xconn_gap_shared(void) {
     xc_set_host(&HOST);
 }
 
+/* catches: a handshake that runs on a NULL buffer or sends a Hello it cannot finish */
+static void t_handshake_no_memory(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) {
+        check("no memory: socketpair", 0, 1);
+        return;
+    }
+    static const unsigned char alert[7] = { 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50 };
+    check("no memory: alert queued", 0, wr_all(sv[1], alert, sizeof alert));
+    shutdown(sv[1], SHUT_WR);
+    unsigned char hello[64] = { 0x16, 0x03, 0x01, 0x00, 59, 0x01 };
+    unsigned char priv[32] = { 1 };
+    struct tls13 *t = calloc(1, sizeof *t);
+    if (!t) {
+        check("no memory: tls13", 0, 1);
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    g_hs_tries = 0;
+    g_hs_fail = 1;
+    int rc = tls13_handshake(t, sv[0], hello, sizeof hello, priv);
+    g_hs_fail = 0;
+    int unread = -1;
+    ioctl(sv[0], FIONREAD, &unread);
+    unsigned char b, left[sizeof alert];
+    while (recv(sv[0], left, sizeof left, MSG_DONTWAIT) > 0) {}
+    close(sv[0]);
+    struct timeval tv = { .tv_sec = 2 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ssize_t r = recv(sv[1], &b, 1, 0);
+    check("no memory: TLS13_EIO", TLS13_EIO, rc);
+    check("no memory: one block of 81920 asked for", 1, g_hs_tries);
+    check("no memory: the server's record left unread", (long)sizeof alert, unread);
+    check("no memory: EOF before any byte", 0, (long)r);
+    close(sv[1]);
+    free(t);
+}
+
+struct nsx { struct xconn *x; int rc, state, xrc, tries, again; };
+
+static void nsx_fail(void) {
+    g_cfail_tries = 0;
+    g_cfail = sizeof(struct xconn_scratch);
+}
+
+static void *nsx_new(void *a) {
+    struct nsx *s = a;
+    nsx_fail();
+    struct tr_node n = plain_node(g_port);
+    s->x = xconn_new(&n, 0, 0);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    struct xconn *y = xconn_new(&n, 0, 0);
+    s->again = y != NULL;
+    xconn_free(y);
+    return NULL;
+}
+
+static void *nsx_dial(void *a) {
+    struct nsx *s = a;
+    nsx_fail();
+    s->rc = xconn_dial(s->x, 3);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->state = s->x->state;
+    s->xrc = s->x->rc;
+    return NULL;
+}
+
+static void *nsx_adopt(void *a) {
+    struct nsx *s = a;
+    nsx_fail();
+    s->rc = xconn_adopt(s->x, 0);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->state = s->x->state;
+    s->xrc = s->x->rc;
+    xconn_free(s->x);
+    s->x = NULL;
+    return NULL;
+}
+
+static int nsx_run(void *(*f)(void *), struct nsx *s) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, f, s)) return 0;
+    pthread_join(th, NULL);
+    return 1;
+}
+
+/* catches: new, dial or adopt going on without a scratch, or a link left open and silent */
+static void t_xconn_adopt_no_scratch(void) {
+    struct nsx s;
+    memset(&s, 0, sizeof s);
+    int l = listen_lo(0);
+    check("no scratch: listener", 1, l >= 0);
+    if (l < 0) return;
+    check("no scratch: new ran", 1, nsx_run(nsx_new, &s));
+    check("no scratch: new asks for one scratch block", 1, s.tries);
+    check("no scratch: new gives NULL", 1, s.x == NULL);
+    check("no scratch: the next new succeeds", 1, s.again);
+
+    struct tr_node n = plain_node(g_port);
+    memset(&s, 0, sizeof s);
+    s.x = xconn_new(&n, 0, 0);
+    check("no scratch: dial ran", 1, s.x && nsx_run(nsx_dial, &s));
+    struct pollfd pl = { .fd = l, .events = POLLIN };
+    int pending = poll(&pl, 1, 300);
+    check("no scratch: dial asks for one scratch block", 1, s.tries);
+    check("no scratch: dial fails with H2_EIO", H2_EIO, s.rc);
+    check("no scratch: dial leaves the link dead", XC_DEAD, s.state);
+    check("no scratch: dial keeps the error", H2_EIO, s.xrc);
+    check("no scratch: dial connects nowhere", 0, pending);
+    if (s.x) xconn_free(s.x);
+
+    memset(&s, 0, sizeof s);
+    s.x = xconn_new(&n, 0, 1);
+    int rc = s.x ? xconn_dial(s.x, 3) : -1;
+    int pfd = accept(l, NULL, NULL);
+    unsigned char b[128];
+    if (pfd >= 0) peer_drain(pfd, b, sizeof b, 30);
+    check("no scratch: shared link dialled", 0, rc);
+    check("no scratch: adopt ran", 1, s.x && nsx_run(nsx_adopt, &s));
+    check("no scratch: adopt asks for one scratch block", 1, s.tries);
+    check("no scratch: adopt fails with H2_EIO", H2_EIO, s.rc);
+    check("no scratch: adopt leaves the link dead", XC_DEAD, s.state);
+    check("no scratch: adopt keeps the error", H2_EIO, s.xrc);
+    long eof = -1;
+    if (pfd >= 0) {
+        struct timeval tv = { .tv_sec = 2 };
+        setsockopt(pfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        eof = (long)recv(pfd, b, sizeof b, 0);
+        close(pfd);
+    }
+    check("no scratch: the peer sees the link closed", 0, eof);
+    close(l);
+}
+
+struct nsl { struct xconn *x; struct xs *s; int rc, state, xrc, tries; };
+
+static void *nsl_seal(void *a) {
+    struct nsl *s = a;
+    nsx_fail();
+    s->rc = xs_open(s->x, &RQ_GET, 1, s->s);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->state = s->x->state;
+    s->xrc = s->x->rc;
+    return NULL;
+}
+
+static void *nsl_read_one(void *a) {
+    struct nsl *s = a;
+    unsigned char b[64];
+    size_t got = 0;
+    nsx_fail();
+    s->rc = xs_read(s->s, b, sizeof b, &got);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->state = s->x->state;
+    s->xrc = s->x->rc;
+    return NULL;
+}
+
+static void *nsl_read_pass(void *a) {
+    struct nsl *s = a;
+    nsx_fail();
+    s->rc = xconn_io(s->x, EPOLLIN, 0);
+    g_cfail = 0;
+    s->tries = g_cfail_tries;
+    s->state = s->x->state;
+    s->xrc = s->x->rc;
+    return NULL;
+}
+
+static int nsl_run(void *(*f)(void *), struct nsl *s) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, f, s)) return 0;
+    pthread_join(th, NULL);
+    return 1;
+}
+
+/* catches: a TLS record sealed through a NULL scratch, or the failure swallowed so the stream opens */
+static void t_xconn_seal_no_scratch(void) {
+    struct tp p;
+    tp_start(&p, "h2");
+    struct tr_node n = tls_node(g_port);
+    struct xconn *x = xconn_new(&n, 0, 0);
+    struct xs st;
+    check("seal no scratch: dial", 0, x ? xconn_dial(x, 3) : -1);
+    check("seal no scratch: peer", 0, tp_finish(&p));
+    struct nsl s = { x, &st, 1, 0, 0, 0 };
+    check("seal no scratch: thread ran", 1, x && nsl_run(nsl_seal, &s));
+    check("seal no scratch: one scratch block asked for", 1, s.tries);
+    check("seal no scratch: open fails with H2_EIO", H2_EIO, s.rc);
+    check("seal no scratch: the link is dead", XC_DEAD, s.state);
+    check("seal no scratch: with H2_EIO", H2_EIO, s.xrc);
+    if (x) xconn_free(x);
+    tp_free(&p);
+}
+
+/* catches: a private link's read through a NULL scratch, or the failure swallowed so the reader waits on */
+static void t_xconn_read_one_no_scratch(void) {
+    struct pl p;
+    check("read_one no scratch: private link", 0, open_plain(&p, 0, 0, 0, 0));
+    struct xs st;
+    check("read_one no scratch: stream", 0, p.x ? xs_open(p.x, &RQ_GET, 1, &st) : -1);
+    struct nsl s = { p.x, &st, 1, 0, 0, 0 };
+    check("read_one no scratch: thread ran", 1, p.x && nsl_run(nsl_read_one, &s));
+    check("read_one no scratch: one scratch block asked for", 1, s.tries);
+    check("read_one no scratch: the read fails with H2_EIO", H2_EIO, s.rc);
+    check("read_one no scratch: the link is dead", XC_DEAD, s.state);
+    check("read_one no scratch: with H2_EIO", H2_EIO, s.xrc);
+    close_plain(&p);
+}
+
+/* catches: a shared link's read pass through a NULL scratch, or the failure swallowed so the link stays live */
+static void t_xconn_read_pass_no_scratch(void) {
+    struct pl p;
+    check("read_pass no scratch: shared link", 0, open_plain(&p, 1, 0, 0, 0));
+    struct nsl s = { p.x, NULL, 1, 0, 0, 0 };
+    check("read_pass no scratch: thread ran", 1, p.x && nsl_run(nsl_read_pass, &s));
+    check("read_pass no scratch: one scratch block asked for", 1, s.tries);
+    check("read_pass no scratch: io fails with H2_EIO", H2_EIO, s.rc);
+    check("read_pass no scratch: the link is dead", XC_DEAD, s.state);
+    check("read_pass no scratch: with H2_EIO", H2_EIO, s.xrc);
+    close_plain(&p);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -4297,6 +4545,11 @@ int main(void) {
     t_xconn_gap_shared();
     t_transport_due();
     t_xconn_piece_cost();
+    t_handshake_no_memory();
+    t_xconn_adopt_no_scratch();
+    t_xconn_seal_no_scratch();
+    t_xconn_read_one_no_scratch();
+    t_xconn_read_pass_no_scratch();
 
     printf("\nxconnmatch: %s (%d failed)\n", fails ? "FAIL" : "ok", fails);
     return fails ? 1 : 0;

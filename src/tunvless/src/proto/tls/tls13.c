@@ -363,6 +363,11 @@ struct hs_secrets {
     struct tls13_keys c_hk, s_hk;
 };
 
+struct hs_bufs {
+    unsigned char hs[40960];
+    unsigned char cert[40960];
+};
+
 /* Takes the ClientHello record already sent (for the transcript) and our ephemeral private key.
  *
  * auth->host != NULL turns on the certificate check (security=tls); auth->reality_key, the
@@ -373,7 +378,8 @@ struct hs_secrets {
 static int handshake_run(struct tls13 *t, int fd,
                          const unsigned char *client_hello, size_t hello_n,
                          const unsigned char *our_priv,
-                         const struct tls13_auth *auth, struct hs_secrets *k) {
+                         const struct tls13_auth *auth, struct hs_secrets *k,
+                         struct hs_bufs *b) {
     /* Computed once, so the checks in the parsing loop cannot drift apart. */
     const char *host = auth ? auth->host : NULL;
     const unsigned char *rkey = auth ? auth->reality_key : NULL;
@@ -570,15 +576,14 @@ static int handshake_run(struct tls13 *t, int fd,
      * connection, which looks like "the node no longer recognises the client" even with a
      * valid authenticator.
      *
-     * One buffer per thread: a thread runs one handshake at a time, and 40 KB per connection
-     * would be 2.5 MB at 64 connections. */
-    static __thread unsigned char hsbuf[40960];
+     * One buffer per running handshake. */
+    unsigned char *hsbuf = b->hs;
     size_t hs_have = 0;
 
     /* Messages the authentication needs. Copied, not kept by pointer: hsbuf shifts as it is
      * parsed, and by check time the old place would hold the next message. The chain can be
      * eight kilobytes or more, so the buffer is as large as hsbuf. */
-    static __thread unsigned char certbuf[40960];
+    unsigned char *certbuf = b->cert;
     size_t cert_n = 0;
     unsigned char cv_buf[1024];
     size_t cv_n = 0;
@@ -605,7 +610,7 @@ static int handshake_run(struct tls13 *t, int fd,
         if (inner != 0x16) continue;            /* not handshake: skip */
 
         /* Append to what is left from earlier records. */
-        if (hs_have + pt > sizeof(hsbuf)) return TLS13_ETOOBIG;
+        if (hs_have + pt > sizeof b->hs) return TLS13_ETOOBIG;
         memcpy(hsbuf + hs_have, rec, pt);
         hs_have += pt;
 
@@ -671,7 +676,7 @@ static int handshake_run(struct tls13 *t, int fd,
                 size_t declared = ((size_t)c[2] << 16) | ((size_t)c[3] << 8) | c[4];
                 size_t zn = ((size_t)c[5] << 16) | ((size_t)c[6] << 8) | c[7];
                 if (declared == 0 || 8 + zn != mlen ||
-                    certzip_inflate((int)alg, c + 8, zn, declared, certbuf, sizeof(certbuf)) != 0) {
+                    certzip_inflate((int)alg, c + 8, zn, declared, certbuf, sizeof b->cert) != 0) {
                     snprintf(g_verify_reason, sizeof(g_verify_reason),
                              "cannot decompress the server certificate");
                     return TLS13_ECERT;
@@ -679,7 +684,7 @@ static int handshake_run(struct tls13 *t, int fd,
                 cert_n = declared;
             }
             if (want_cert && msg == 0x0B) {   /* Certificate */
-                if (mlen > sizeof(certbuf)) return TLS13_ETOOBIG;
+                if (mlen > sizeof b->cert) return TLS13_ETOOBIG;
                 memcpy(certbuf, hsbuf + p + 4, mlen);
                 cert_n = mlen;
             }
@@ -822,9 +827,13 @@ static int handshake(struct tls13 *t, int fd,
                      const unsigned char *client_hello, size_t hello_n,
                      const unsigned char *our_priv,
                      const struct tls13_auth *auth) {
+    struct hs_bufs *b = malloc(sizeof *b);
+    if (!b) return TLS13_EIO;
     struct hs_secrets k;
-    int rc = handshake_run(t, fd, client_hello, hello_n, our_priv, auth, &k);
+    int rc = handshake_run(t, fd, client_hello, hello_n, our_priv, auth, &k, b);
     sc_wipe(&k, sizeof k);
+    sc_wipe(b, sizeof *b);
+    free(b);
     return rc;
 }
 

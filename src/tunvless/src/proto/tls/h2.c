@@ -29,11 +29,24 @@
 #include "h2.h"
 #include "h2wire.h"
 #include "tls13.h"
+#include "tscratch.h"
 
 /* How the server last ended a stream, for h2_strerror. Per thread, like g_last_status. */
 static __thread char g_reset_why[64];
 
 struct wbuf { unsigned char *p; size_t n, cap; };
+
+#define H2_MAX_BLOCK DEFAULT_MAX_FRAME
+
+struct h2_scratch {
+    unsigned char one[9 + DEFAULT_MAX_FRAME];
+    unsigned char req_out[H2_PREFACE_LEN + 9 + H2_MAX_BLOCK];
+    unsigned char rec[TLS13_MAX_PLAIN + sizeof(((struct h2 *)0)->pend)];
+};
+
+static struct h2_scratch *scratch(void) {
+    return ts_get(TS_H2, sizeof(struct h2_scratch));
+}
 
 /* ---- frames ------------------------------------------------------------------ */
 static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint32_t sid,
@@ -45,19 +58,16 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     put32(hdr + 5, sid);
     /* Header and body in one write: split across TLS records they make a recognizable length
      * pattern (9 + N, 9 + N, …), the very thing Vision exists to remove. */
-    static __thread unsigned char one[9 + DEFAULT_MAX_FRAME];
     if (n > DEFAULT_MAX_FRAME) return H2_ETOOBIG;
-    memcpy(one, hdr, 9);
-    if (n) memcpy(one + 9, body, n);
-    return h->io.write(h->io.ctx, one, 9 + n);
+    struct h2_scratch *s = scratch();
+    if (!s) return H2_EIO;
+    memcpy(s->one, hdr, 9);
+    if (n) memcpy(s->one + 9, body, n);
+    return h->io.write(h->io.ctx, s->one, 9 + n);
 }
 
 /* HEADERS of the request. Pseudo-headers must come before the other fields (RFC 7540
  * §8.1.2.1). */
-#define H2_MAX_BLOCK DEFAULT_MAX_FRAME
-
-static __thread unsigned char g_req_out[H2_PREFACE_LEN + 9 + H2_MAX_BLOCK];
-
 static int put_headers(struct h2 *h, struct wbuf *b, const struct h2_req *r) {
     size_t at = b->n;
     if (at + 9 > b->cap) return H2_ETOOBIG;
@@ -87,13 +97,15 @@ static int h2_start_req(struct h2 *h, const struct h2_io *io, const struct h2_re
     h->send_win_conn = 65535;
     h->peer_init_win = 65535;            /* the same default; shifts count from it */
 
-    struct wbuf b = { g_req_out, 0, sizeof(g_req_out) };
-    b.n = h2w_preface(g_req_out, sizeof(g_req_out), 1);
+    struct h2_scratch *s = scratch();
+    if (!s) return H2_EIO;
+    struct wbuf b = { s->req_out, 0, sizeof s->req_out };
+    b.n = h2w_preface(s->req_out, sizeof s->req_out, 1);
 
     int rc = put_headers(h, &b, r);
     if (rc) return rc;
 
-    if (b.n > sizeof(g_req_out)) return H2_ETOOBIG;
+    if (b.n > sizeof s->req_out) return H2_ETOOBIG;
     /* All in one write: preface, SETTINGS, WINDOW_UPDATE and the request leave together, as a
      * browser sends them; separately they would make a run of records of telltale lengths.
      *
@@ -101,7 +113,7 @@ static int h2_start_req(struct h2 *h, const struct h2_io *io, const struct h2_re
      * for them would add a round trip before the first data byte, and HTTP/2 allows sending
      * data at once. The status shows on the first read. */
     h->started = 1;
-    return h->io.write(h->io.ctx, g_req_out, b.n);
+    return h->io.write(h->io.ctx, s->req_out, b.n);
 }
 
 int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
@@ -262,7 +274,9 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
 
     /* One buffer per thread, not per connection: 16 KB per connection would add up to
      * megabytes. */
-    static __thread unsigned char rec[TLS13_MAX_PLAIN + sizeof(h->pend)];
+    struct h2_scratch *s = scratch();
+    if (!s) return H2_EIO;
+    unsigned char *rec = s->rec;
     size_t avail = 0;
     if (h->pend_n) {
         memcpy(rec, h->pend, h->pend_n);
@@ -271,7 +285,7 @@ static int h2_read_in(struct h2 *h, unsigned char *out, size_t cap, size_t *got)
     }
 
     size_t r = 0;
-    int rc = h->io.read(h->io.ctx, rec + avail, sizeof(rec) - avail, &r);
+    int rc = h->io.read(h->io.ctx, rec + avail, sizeof s->rec - avail, &r);
     if (rc) return rc;
     avail += r;
 

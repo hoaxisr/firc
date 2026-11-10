@@ -611,7 +611,7 @@ static int h1_wait(struct transport *t, int ws, int timeout_s) {
     struct h1_resp r;
     memset(&r, 0, sizeof(r));
     int64_t deadline = mono_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
-    static __thread unsigned char raw[4096];
+    unsigned char raw[4096];
     for (;;) {
         const unsigned char *in = NULL;
         size_t got = 0;

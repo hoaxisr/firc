@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "h2mux.h"
+#include "tscratch.h"
 
 #define ST_LIVE      0x01
 #define ST_LOCAL_END 0x02
@@ -18,9 +19,9 @@
 
 #define FRAME_MAX 16777215
 
-static __thread unsigned char g_frame[9 + DEFAULT_MAX_FRAME];
-static __thread unsigned char g_block[H2M_BLOCK_MAX];
-static __thread struct h2w_list g_list;
+static struct h2mux_scratch *scratch(void) {
+    return ts_get(TS_H2MUX, sizeof(struct h2mux_scratch));
+}
 
 static int die(struct h2m *m, int rc) {
     if (!m->dead) m->dead = rc;
@@ -29,9 +30,11 @@ static int die(struct h2m *m, int rc) {
 
 static int emit(struct h2m *m, unsigned char type, unsigned char flags, uint32_t sid,
                 const unsigned char *body, size_t n) {
-    h2w_frame_hdr(g_frame, (uint32_t)n, type, flags, sid);
-    if (n) memcpy(g_frame + 9, body, n);
-    int rc = m->cb.out(m->cb.ctx, g_frame, 9 + n, H2M_CTL | H2M_END);
+    struct h2mux_scratch *s = scratch();
+    if (!s) return die(m, H2_EIO);
+    h2w_frame_hdr(s->frame, (uint32_t)n, type, flags, sid);
+    if (n) memcpy(s->frame + 9, body, n);
+    int rc = m->cb.out(m->cb.ctx, s->frame, 9 + n, H2M_CTL | H2M_END);
     return rc ? die(m, rc) : 0;
 }
 
@@ -138,6 +141,8 @@ static int grow(struct h2m *m) {
 
 int h2m_start(struct h2m *m, const struct h2m_cb *cb, uint64_t seed) {
     memset(m, 0, sizeof(*m));
+    struct h2mux_scratch *s = scratch();
+    if (!s) return H2_EIO;
     m->cb = *cb;
     m->rng = seed;
     m->peer_max_frame = DEFAULT_MAX_FRAME;
@@ -150,8 +155,8 @@ int h2m_start(struct h2m *m, const struct h2m_cb *cb, uint64_t seed) {
     m->peer_init_win = 65535;
     m->in_conn.avail = 65535 + H2M_CONN_INC;
     m->f_slot = NO_SLOT;
-    size_t n = h2w_go_preface(g_frame, sizeof(g_frame));
-    int rc = m->cb.out(m->cb.ctx, g_frame, n, H2M_END);
+    size_t n = h2w_go_preface(s->frame, sizeof s->frame);
+    int rc = m->cb.out(m->cb.ctx, s->frame, n, H2M_END);
     return rc ? die(m, rc) : 0;
 }
 
@@ -175,7 +180,7 @@ uint32_t h2m_header_budget(const struct h2m *m, uint32_t server_max) {
 
 unsigned h2m_open_n(const struct h2m *m) { return m->open_n; }
 
-static int headers_out(struct h2m *m, size_t bn, int end_stream) {
+static int headers_out(struct h2m *m, const unsigned char *block, size_t bn, int end_stream) {
     size_t at = 0;
     unsigned char type = FR_HEADERS, es = end_stream ? FLAG_END_STREAM : 0;
     do {
@@ -184,7 +189,7 @@ static int headers_out(struct h2m *m, size_t bn, int end_stream) {
         unsigned char h[9];
         h2w_frame_hdr(h, (uint32_t)k, type, (unsigned char)(es | (last ? FLAG_END_HEADERS : 0)), m->next_sid);
         int rc = m->cb.out(m->cb.ctx, h, 9, 0);
-        if (!rc) rc = m->cb.out(m->cb.ctx, g_block + at, k, last ? H2M_END : 0u);
+        if (!rc) rc = m->cb.out(m->cb.ctx, block + at, k, last ? H2M_END : 0u);
         if (rc) return die(m, rc);
         at += k;
         type = FR_CONTINUATION;
@@ -200,14 +205,16 @@ int h2m_open(struct h2m *m, const struct h2_req *r, uint16_t *slot) {
     uint16_t s = 0;
     while (s < m->st_cap && (m->st[s].state & ST_LIVE)) s++;
     if (s == m->st_cap && grow(m)) return H2_EFULL;
+    struct h2mux_scratch *x = scratch();
+    if (!x) return H2_EIO;
     uint64_t rng = m->rng;
-    int rc = h2w_go_fields(r, &rng, &g_list);
+    int rc = h2w_go_fields(r, &rng, &x->list);
     if (rc) return rc;
-    if (hpe_bound(g_list.f, g_list.n) > H2M_BLOCK_MAX) return H2_ETOOBIG;
-    size_t bn = hpe_block(&m->enc, g_list.f, g_list.n, g_block, sizeof g_block);
-    if (!bn || bn > sizeof g_block) return H2_ETOOBIG;
+    if (hpe_bound(x->list.f, x->list.n) > H2M_BLOCK_MAX) return H2_ETOOBIG;
+    size_t bn = hpe_block(&m->enc, x->list.f, x->list.n, x->block, sizeof x->block);
+    if (!bn || bn > sizeof x->block) return H2_ETOOBIG;
     m->rng = rng;
-    rc = headers_out(m, bn, r->end_stream);
+    rc = headers_out(m, x->block, bn, r->end_stream);
     if (rc) return rc;
     struct h2m_stream *st = &m->st[s];
     st->sid = m->next_sid;

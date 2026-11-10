@@ -523,6 +523,11 @@ jobs:
             CC=${{ matrix.arch }}-linux-gnu-gcc AR=${{ matrix.arch }}-linux-gnu-ar
           file src/tunvless/out-${{ matrix.arch }}/tunvless
 
+      - name: Static TLS bound
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: sh src/tunvless/tests/tlssize.sh src/tunvless/out-$ARCH/tunvless $ARCH-linux-gnu-readelf
+
       - name: Tests under qemu
         working-directory: src/tunvless
         env:
@@ -534,7 +539,7 @@ jobs:
           tests="h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
                  rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch xhoptsmatch xmuxmatch tun6match vreqmatch \
                  scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch dialmatch probematch xconnmatch \
-                 fmaskmatch fmlinkmatch"
+                 fmaskmatch fmlinkmatch tscratchmatch"
           run=""
           for t in $tests; do
             case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac

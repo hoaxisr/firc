@@ -620,17 +620,57 @@ static int node_sock_aborted(int fd) {
     return ti.tcpi_state == TCP_CLOSE;
 }
 
-/* One mapping per loop thread: the hot table, lists and buckets, then the sessions. */
+/* Client data gathered for one send to the node: see "gathering the client's segments". */
+#define UP_MAX (TUNNEL_BUF - 2048)          /* the dialer's room for a header and a Vision frame */
+struct up_gather {
+    struct conn *c;
+    uint32_t n;
+    unsigned char buf[UP_MAX];
+};
+
+struct defrag {
+    uint32_t src, dst;
+    uint16_t id;
+    uint16_t next_off;         /* IP payload bytes collected so far */
+    uint64_t at;               /* when the first fragment came */
+    int active;
+    unsigned char buf[8 + UDP_DGRAM_MAX];   /* UDP header plus data */
+};
+
+#define FIN_RECENT   64
+struct fin_recent {
+    union fk_addr src, dst;     /* the client's flow, as in its packets */
+    uint8_t v6;
+    uint16_t sport, dport;
+    uint32_t fin_end;           /* our FIN's sequence number + 1: what the client acknowledges */
+    uint16_t win;               /* the window field our FIN carried, repeated in the last ACK */
+    time_t at;
+};
+
+struct loop_scratch {
+    unsigned char pump[TUNNEL_BUF];
+    struct up_gather up;
+    unsigned char sock[UP_MAX];
+    unsigned char dgram[UDP_DGRAM_MAX + 64];
+    struct defrag defrag;
+    unsigned char asm_pkt[20 + 8 + UDP_DGRAM_MAX];
+    struct fin_recent fin_recent[FIN_RECENT];
+};
+
+/* One mapping per loop thread: the hot table, lists, buckets, loop buffers, then the sessions. */
 struct conn_tables {
     struct conn conns[MAX_CONNS];
     uint16_t live[MAX_CONNS];
     uint16_t freelist[MAX_CONNS];
     int16_t bucket[CONN_BUCKETS];
+    struct loop_scratch ls;
 };
+_Static_assert(offsetof(struct conn_tables, conns) == 0, "conn_table_free unmaps from g_conns");
 /* Sessions start on a cache line boundary, and the stride keeps them there. */
 #define SESS_ALIGN 64
 #define TABLES_HEAD (((sizeof(struct conn_tables)) + SESS_ALIGN - 1) & ~(size_t)(SESS_ALIGN - 1))
 static __thread size_t g_tables_len;
+static __thread struct loop_scratch *g_ls;
 
 static inline unsigned flow_hash(const struct flow_key *k) {
     /* Ports along with addresses: connections to one server differ only by source port, and a
@@ -1274,6 +1314,7 @@ static int conn_table_init(void) {
         g_freelist = t->freelist;
         g_bucket = t->bucket;
         g_sess = (unsigned char *)m + TABLES_HEAD;
+        g_ls = &t->ls;
         g_tables_len = len;
     }
     g_live_n = 0;
@@ -1298,6 +1339,7 @@ static void conn_table_free(void) {
     g_live = g_freelist = NULL;
     g_bucket = NULL;
     g_sess = NULL;
+    g_ls = NULL;
     g_tables_len = 0;
 }
 
@@ -1344,14 +1386,6 @@ static void conn_unlink(struct conn *c) {
 }
 
 static void conn_drop(struct conn *c);
-
-/* Client data gathered for one send to the node: see "gathering the client's segments". */
-#define UP_MAX (TUNNEL_BUF - 2048)          /* the dialer's room for a header and a Vision frame */
-static __thread struct {
-    struct conn *c;
-    uint32_t n;
-    unsigned char buf[UP_MAX];
-} g_up;
 
 static void ctl_reply(const struct tun_dev *tun, const struct flow_key *k, uint32_t seq,
                       uint32_t ack, unsigned char flags, uint16_t win) {
@@ -1482,7 +1516,7 @@ static void ib_udp_forget(const struct conn *c) {
 static void conn_drop(struct conn *c) {
     TR("closing conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     if (c->ib_udp) ib_udp_forget(c);
-    if (g_up.c == c) g_up.c = NULL;                 /* gathered bytes: never acknowledged */
+    if (g_ls->up.c == c) g_ls->up.c = NULL;                 /* gathered bytes: never acknowledged */
     if (c->sock && c->cfd >= 0) sock_rst(c->cfd);
     if (c->used) {
         g_dl->ops->close(SESS(c));
@@ -1646,9 +1680,9 @@ static __thread uint16_t g_ip_id;
  * 64 bytes of room for the framing: for VLESS it is a two-byte length, but the stack's buffer
  * should not depend on whose framing it is. */
 static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
-    static __thread unsigned char fr[UDP_DGRAM_MAX + 64];
+    unsigned char *fr = g_ls->dgram;
     if (n > UDP_DGRAM_MAX) return SEND_FATAL;
-    size_t fn = g_dl->ops->dgram_frame(p, n, fr, sizeof(fr));
+    size_t fn = g_dl->ops->dgram_frame(p, n, fr, sizeof g_ls->dgram);
     if (!fn) return SEND_FATAL;
     /* The session is still being set up: it must not be written to — a connector is working in
      * it — but the datagram can be held. The check is HERE, in the only place that knows the
@@ -1865,14 +1899,13 @@ static int conn_can_take(struct conn *c) {
 #define PUMP_DUE (-1000)
 
 static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
-    /* Static rather than on the stack: TUNNEL_BUF would be 18 KB of stack per call. */
-    static __thread unsigned char buf[TUNNEL_BUF];
+    unsigned char *buf = g_ls->pump;
     size_t got = 0;
     void *s = SESS(c);
     TR("read conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     uint64_t r0 = g_stats ? now_ns() : 0;
     const unsigned char *rx = buf;
-    int rc = g_dl->ops->read(s, buf, sizeof(buf), &rx, &got);
+    int rc = g_dl->ops->read(s, buf, sizeof g_ls->pump, &rx, &got);
     if (g_stats) g_st.recv_ns += now_ns() - r0;
     g_rx_total += got;
     if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
@@ -1919,14 +1952,6 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
  * A reassembly lives one second: an abandoned tail would otherwise hold the slot until the next
  * datagram with the same ID, and poison it. */
 #define DEFRAG_TTL_NS 1000000000ull
-static __thread struct {
-    uint32_t src, dst;
-    uint16_t id;
-    uint16_t next_off;         /* IP payload bytes collected so far */
-    uint64_t at;               /* when the first fragment came */
-    int active;
-    unsigned char buf[8 + UDP_DGRAM_MAX];   /* UDP header plus data */
-} g_defrag;
 
 /* Reassemble a datagram from fragments. Returns the length of the finished packet in out (it
  * looks like an ordinary unfragmented packet and goes through the same ip_parse); 0 while waiting
@@ -1946,49 +1971,49 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     memcpy(&src, pkt + 12, 4);
     memcpy(&dst, pkt + 16, 4);
 
-    if (g_defrag.active && g_now_ns - g_defrag.at > DEFRAG_TTL_NS)
-        g_defrag.active = 0;                         /* the tail was abandoned — the slot is free */
+    if (g_ls->defrag.active && g_now_ns - g_ls->defrag.at > DEFRAG_TTL_NS)
+        g_ls->defrag.active = 0;                    /* the tail was abandoned — the slot is free */
 
     if (off == 0) {
         /* First fragment: start over even if something is in the slot. Only an abandoned
          * reassembly can be there; a live one's continuation follows right after. */
-        if (payload_n < 8 || payload_n > sizeof(g_defrag.buf)) return 0;
-        memcpy(g_defrag.buf, pkt + ihl, payload_n);
-        g_defrag.src = src;
-        g_defrag.dst = dst;
-        g_defrag.id = id;
-        g_defrag.next_off = (uint16_t)payload_n;
-        g_defrag.at = g_now_ns;
-        g_defrag.active = 1;
+        if (payload_n < 8 || payload_n > sizeof(g_ls->defrag.buf)) return 0;
+        memcpy(g_ls->defrag.buf, pkt + ihl, payload_n);
+        g_ls->defrag.src = src;
+        g_ls->defrag.dst = dst;
+        g_ls->defrag.id = id;
+        g_ls->defrag.next_off = (uint16_t)payload_n;
+        g_ls->defrag.at = g_now_ns;
+        g_ls->defrag.active = 1;
     } else {
-        if (!g_defrag.active || g_defrag.src != src || g_defrag.dst != dst ||
-            g_defrag.id != id || g_defrag.next_off != off) {
+        if (!g_ls->defrag.active || g_ls->defrag.src != src || g_ls->defrag.dst != dst ||
+            g_ls->defrag.id != id || g_ls->defrag.next_off != off) {
             /* Someone else's, or out of order. A foreign packet does NOT drop the reassembly in
              * progress: it has nothing to do with it, and that datagram would be lost for
              * nothing. */
-            if (g_defrag.active && g_defrag.src == src && g_defrag.dst == dst &&
-                g_defrag.id == id)
-                g_defrag.active = 0;                 /* ours, but out of order — reassembly over */
+            if (g_ls->defrag.active && g_ls->defrag.src == src && g_ls->defrag.dst == dst &&
+                g_ls->defrag.id == id)
+                g_ls->defrag.active = 0;            /* ours, but out of order — reassembly over */
             return 0;
         }
-        if (payload_n > sizeof(g_defrag.buf) - g_defrag.next_off) {
-            g_defrag.active = 0;                     /* the datagram exceeds our limit */
+        if (payload_n > sizeof(g_ls->defrag.buf) - g_ls->defrag.next_off) {
+            g_ls->defrag.active = 0;                     /* the datagram exceeds our limit */
             return 0;
         }
-        memcpy(g_defrag.buf + g_defrag.next_off, pkt + ihl, payload_n);
-        g_defrag.next_off = (uint16_t)(g_defrag.next_off + payload_n);
+        memcpy(g_ls->defrag.buf + g_ls->defrag.next_off, pkt + ihl, payload_n);
+        g_ls->defrag.next_off = (uint16_t)(g_ls->defrag.next_off + payload_n);
     }
     if (more) return 0;                              /* the rest is still on its way */
 
     /* Done. Return it as an ordinary packet: a 20-byte IP header, the actual length, no
      * fragmentation flags; from here it takes the same path as everything else. */
-    size_t asm_total = 20 + g_defrag.next_off;
-    g_defrag.active = 0;
+    size_t asm_total = 20 + g_ls->defrag.next_off;
+    g_ls->defrag.active = 0;
     if (asm_total > out_cap) return 0;
     /* The UDP header's length must match what was assembled: the server reads it, and a
      * fragment lost by the client's kernel would give a short datagram with a wrong length. */
-    size_t udp_len = (size_t)((g_defrag.buf[4] << 8) | g_defrag.buf[5]);
-    if (udp_len != g_defrag.next_off) return 0;
+    size_t udp_len = (size_t)((g_ls->defrag.buf[4] << 8) | g_ls->defrag.buf[5]);
+    if (udp_len != g_ls->defrag.next_off) return 0;
     memset(out, 0, 20);
     out[0] = 0x45;
     out[2] = (unsigned char)(asm_total >> 8);
@@ -1999,7 +2024,7 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     out[9] = 17;
     memcpy(out + 12, &src, 4);
     memcpy(out + 16, &dst, 4);
-    memcpy(out + 20, g_defrag.buf, g_defrag.next_off);
+    memcpy(out + 20, g_ls->defrag.buf, g_ls->defrag.next_off);
     return asm_total;
 }
 
@@ -2115,21 +2140,12 @@ static int udp_out(struct conn *c, const unsigned char *p, size_t dn) {
  * for FIN_RECENT_S seconds: the ACK of our FIN is taken silently, the client's FIN is
  * acknowledged, everything else for the flow still gets RST. Searched only for segments without a
  * connection, which are rare. */
-#define FIN_RECENT   64
 #define FIN_RECENT_S 60
 
-static __thread struct fin_recent {
-    union fk_addr src, dst;     /* the client's flow, as in its packets */
-    uint8_t v6;
-    uint16_t sport, dport;
-    uint32_t fin_end;           /* our FIN's sequence number + 1: what the client acknowledges */
-    uint16_t win;               /* the window field our FIN carried, repeated in the last ACK */
-    time_t at;
-} g_fin_recent[FIN_RECENT];
 static __thread unsigned g_fin_recent_i;
 
 static void fin_recent_add(const struct conn *c) {
-    struct fin_recent *r = &g_fin_recent[g_fin_recent_i++ % FIN_RECENT];
+    struct fin_recent *r = &g_ls->fin_recent[g_fin_recent_i++ % FIN_RECENT];
     r->src = c->key.src;
     r->dst = c->key.dst;
     r->v6 = c->key.v6;
@@ -2144,7 +2160,7 @@ static void fin_recent_add(const struct conn *c) {
  * silently or its FIN acknowledged), 0 — not ours or carrying data, the caller answers RST. */
 static int fin_recent_take(const struct tun_dev *tun, const struct flow_key *k, size_t data_n) {
     for (unsigned i = 0; i < FIN_RECENT; i++) {
-        struct fin_recent *r = &g_fin_recent[i];
+        struct fin_recent *r = &g_ls->fin_recent[i];
         if (!r->at || !fk_same_addr(&r->src, &k->src) || !fk_same_addr(&r->dst, &k->dst) || r->v6 != k->v6 || r->sport != k->sport ||
             r->dport != k->dport || g_now_s - r->at > FIN_RECENT_S ||
             !(k->tcp_flags & TCP_ACK) || k->ack != r->fin_end)
@@ -2213,24 +2229,24 @@ static int send_or_wait(struct conn *c, const struct tun_dev *tun, const unsigne
  * a bare ACK, a gap) sends the gathered bytes first, and so does the end of the batch
  * (up_flush in worker_loop, before flush_acks). Until then client_seq does not include them:
  * the bytes are not acknowledged until the node took them, as before. */
-/* (UP_MAX and g_up: declared before conn_drop, which forgets a dropped connection's bytes.) */
+/* (UP_MAX and g_ls->up: declared with the loop's tables, before conn_drop.) */
 
 /* Send what is gathered, piece by piece. Each piece the node took is acknowledged; at the first
  * refused piece the rest is not, and the client resends it (SEND_AGAIN) or gets RST (failure). */
 static void up_flush(const struct tun_dev *tun) {
-    struct conn *c = g_up.c;
+    struct conn *c = g_ls->up.c;
     if (!c) return;
-    g_up.c = NULL;
-    TR("client data %u bytes (gathered) -> server\n", g_up.n);
-    for (size_t off = 0; off < g_up.n;) {
+    g_ls->up.c = NULL;
+    TR("client data %u bytes (gathered) -> server\n", g_ls->up.n);
+    for (size_t off = 0; off < g_ls->up.n;) {
         size_t cut = g_dl->ops->up_write ? g_dl->ops->up_write(g_dl->ctx, SESS(c)) : 0;
-        if (!cut) cut = g_up.n;
-        size_t n = g_up.n - off < cut ? g_up.n - off : cut;
-        int sr = send_or_wait(c, tun, g_up.buf + off, n);
+        if (!cut) cut = g_ls->up.n;
+        size_t n = g_ls->up.n - off < cut ? g_ls->up.n - off : cut;
+        int sr = send_or_wait(c, tun, g_ls->up.buf + off, n);
         if (sr == SEND_CLOSED) return;
         if (sr == SEND_AGAIN) {
             TR("window closed, %u gathered bytes not acknowledged — the client will resend\n",
-               (unsigned)(g_up.n - off));
+               (unsigned)(g_ls->up.n - off));
             return;
         }
         if (sr != SEND_OK) {
@@ -2246,26 +2262,26 @@ static void up_flush(const struct tun_dev *tun) {
 
 /* Gather the in-order segment (seq, d, n) of c (the caller checked the order). Sends what was
  * gathered first when the segment would not fit after it. 0 — the segment is gathered
- * (g_up.c == c), or too big to gather and the caller sends it itself; -1 — it does not go now:
+ * (g_ls->up.c == c), or too big to gather and the caller sends it itself; -1 — it does not go now:
  * c closed, or the send before it failed and it no longer lines up (not acknowledged, the client
  * resends it). */
 static int up_add(struct conn *c, const struct tun_dev *tun, uint32_t seq, const unsigned char *d,
                   size_t n) {
     long room = conn_room(c);
-    if (g_up.c == c && (g_up.n + n > UP_MAX || (room >= 0 && g_up.n + n > (size_t)room)))
+    if (g_ls->up.c == c && (g_ls->up.n + n > UP_MAX || (room >= 0 && g_ls->up.n + n > (size_t)room)))
         up_flush(tun);
-    if (g_up.c && g_up.c != c) up_flush(tun);
+    if (g_ls->up.c && g_ls->up.c != c) up_flush(tun);
     if (!c->used || c->srv_closed || c->aborted) return -1;
-    if (g_up.c != c && seq != c->client_seq) return -1;
+    if (g_ls->up.c != c && seq != c->client_seq) return -1;
     if (n > UP_MAX) return 0;
-    if (!g_up.c) {
-        g_up.c = c;
-        g_up.n = 0;
-    } else if (g_up.c != c) {
+    if (!g_ls->up.c) {
+        g_ls->up.c = c;
+        g_ls->up.n = 0;
+    } else if (g_ls->up.c != c) {
         return 0;
     }
-    memcpy(g_up.buf + g_up.n, d, n);
-    g_up.n += (uint32_t)n;
+    memcpy(g_ls->up.buf + g_ls->up.n, d, n);
+    g_ls->up.n += (uint32_t)n;
     return 0;
 }
 
@@ -2278,8 +2294,8 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * path, so nothing else needs to know about fragments. */
     if (n >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 &&
         (((pkt[6] << 8) | pkt[7]) & 0x3FFF)) {
-        static __thread unsigned char asm_pkt[20 + 8 + UDP_DGRAM_MAX];
-        size_t an = udp_defrag(pkt, n, asm_pkt, sizeof(asm_pkt));
+        unsigned char *asm_pkt = g_ls->asm_pkt;
+        size_t an = udp_defrag(pkt, n, asm_pkt, sizeof g_ls->asm_pkt);
         if (!an) { TR("UDP fragment: %s\n", "waiting for the rest, or refused"); return; }
         TR("datagram reassembled from fragments: %zu bytes\n", an);
         pkt = asm_pkt;
@@ -2290,11 +2306,11 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
     if (k.v6) n = 40 + (((size_t)pkt[4] << 8) | pkt[5]);
     /* Anything but the next plain data segment of the gathered flow sends the gathered bytes
      * first: they come before it in the stream, or belong to another flow. */
-    if (g_up.c) {
-        const struct conn *u = g_up.c;
+    if (g_ls->up.c) {
+        const struct conn *u = g_ls->up.c;
         if (k.proto != 6 || !fk_same_addr(&k.src, &u->key.src) || !fk_same_addr(&k.dst, &u->key.dst) || k.v6 != u->key.v6 ||
             k.sport != u->key.sport || k.dport != u->key.dport || n == off ||
-            (k.tcp_flags & (TCP_SYN | TCP_RST | TCP_FIN)) || k.seq != u->client_seq + g_up.n)
+            (k.tcp_flags & (TCP_SYN | TCP_RST | TCP_FIN)) || k.seq != u->client_seq + g_ls->up.n)
             up_flush(tun);
     }
     TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
@@ -2509,7 +2525,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
      * the one before it was lost, and duplicate ACKs trigger the client's fast retransmit;
      * without them the hole closes only on timeout. A repeat of data already taken means our ACK
      * was lost, and without an answer the client would retry until it gives up. */
-    uint32_t exp = c->client_seq + (g_up.c == c ? g_up.n : 0);
+    uint32_t exp = c->client_seq + (g_ls->up.c == c ? g_ls->up.n : 0);
     if ((int32_t)(k.seq - exp) < 0 && (int32_t)(k.seq + (uint32_t)data_n + (uint32_t)fin - exp) > 0) {
         uint32_t head = exp - k.seq;
         off += head;
@@ -2527,10 +2543,10 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         if (fr > 0) return;
     }
 
-    /* Plain data, no FIN: gather it with the segments after it (see g_up). */
+    /* Plain data, no FIN: gather it with the segments after it (see g_ls->up). */
     if (data_n && !fin) {
         if (up_add(c, tun, k.seq, pkt + off, data_n) != 0) return;
-        if (g_up.c == c) return;                    /* gathered: sent and acknowledged later */
+        if (g_ls->up.c == c) return;                    /* gathered: sent and acknowledged later */
         /* Larger than the gathering buffer: on its own, below. */
     }
 
@@ -2678,7 +2694,7 @@ static void drain_conn_reads(struct conn *c, const struct tun_dev *tun) {
 }
 
 static int sock_read(struct conn *c, const struct tun_dev *tun) {
-    static __thread unsigned char buf[UP_MAX];
+    unsigned char *buf = g_ls->sock;
     size_t total = 0;
     while (!c->early && !c->client_fin && !c->srv_closed && total < DRAIN_MAX_BYTES) {
         size_t cap = EARLY_CAP - c->early_n;

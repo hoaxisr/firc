@@ -271,14 +271,10 @@ static int chrome_body(struct buf *b, size_t *xl, const struct reality_cfg *cfg,
     struct pend px[20];
     size_t pn = 0;
 
-    /* The post-quantum share (1216 bytes) is per thread, not on the stack, like b_ks below. */
-    static __thread unsigned char b_pq[REALITY_MLKEM_SHARE];
+    unsigned char b_pq[REALITY_MLKEM_SHARE];
     unsigned char b_sni[300], b_alpn[16], b_cc[1 + 2 * 32], b_ech[220], b_alps[8], b_reneg[1];
     unsigned char b_ocsp[5], b_vers[8], b_sigs[20], b_grp[12], b_pskm[2];
-    /* With the post-quantum share the key_share body is over a kilobyte, too much for the small
-     * stacks of connector threads. __thread rather than a shared static: handshakes run in
-     * parallel, and a shared buffer would be overwritten by another one. */
-    static __thread unsigned char b_ks[64 + REALITY_MLKEM_SHARE];
+    unsigned char b_ks[64 + REALITY_MLKEM_SHARE];
     unsigned char b_ecpf[2], b_last[1];
 
     /* First: an empty GREASE extension. */
@@ -452,7 +448,7 @@ static int firefox_body(struct buf *b, size_t *xl, const struct reality_cfg *cfg
     static const unsigned sigs[] = {
         0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201,
     };
-    static __thread unsigned char ks[2 + 4 + REALITY_MLKEM_SHARE + 4 + 32 + 4 + 65];
+    unsigned char ks[2 + 4 + REALITY_MLKEM_SHARE + 4 + 32 + 4 + 65];
     unsigned char sni[300], alpn[16], grp[2 + 2 * 7], dc[2 + 2 * 4], sg[2 + 2 * 11], cc[1 + 2 * 32];
     unsigned char ech[1 + 2 + 2 + 1 + 2 + 32 + 2 + 239], noise[1 + 32 + 239 + 1];
     unsigned char seed[SC_MLKEM768_SEED], p256[32], p256_pub[65];
@@ -658,11 +654,8 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
          * signing (`copy(hello.Raw[39:], hello.SessionId)` with a freshly zeroed SessionId),
          * and the server does the same; 39 = 4+2+32+1 here too. With session_id filled in, the
          * tag does not match and the server silently answers with its camouflage site, which
-         * looks exactly like a wrong key. Zeroed in a copy: the Hello itself goes out signed.
-         *
-         * __thread, not a shared static: connector threads handshake in parallel, and a shared
-         * buffer would let one overwrite another's AAD in the middle of AES-GCM. */
-        static __thread unsigned char aad[4096];
+         * looks exactly like a wrong key. Zeroed in a copy: the Hello itself goes out signed. */
+        unsigned char aad[4096];
         size_t aad_n = b.len - 5;
         if (aad_n > sizeof(aad)) return REALITY_ETOOBIG;
         memcpy(aad, raw, aad_n);
@@ -685,11 +678,9 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                     (const unsigned char *)"REALITY", 7, authkey, 32) != 0)
             return REALITY_ECRYPTO;
 
-        /* AES-256-GCM with a one-time key: one encryption per handshake. The context is per
-         * thread, not on the stack: it is over a kilobyte, and connector threads have small
-         * stacks (see b_ks above). */
+        /* AES-256-GCM with a one-time key: one encryption per handshake. */
         unsigned char tag[16];
-        static __thread struct sc_aead gcm;
+        struct sc_aead gcm;
         memcpy(sid_at, plain, 16);
         int crc = sc_aead_setkey(&gcm, SC_AES256_GCM, authkey);
         if (crc == 0) crc = sc_aead_seal(&gcm, random + 20, aad, aad_n, sid_at, 16, tag);

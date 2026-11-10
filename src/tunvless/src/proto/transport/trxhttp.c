@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <poll.h>
 #include "osrand.h"
+#include "tscratch.h"
 
 #include <sys/epoll.h>
 #include <time.h>
@@ -92,11 +93,11 @@ struct xh_rq {
 
 struct xh_scratch { struct xh_rq q; char arena[XH_ARENA]; unsigned char blk[XH_BLOCK]; };
 
-static __thread struct xh_scratch *g_xs;
+static struct xh_scratch *rq_held(void) { return ts_g[TS_XHTTP]; }
 
 static struct xh_rq *rq_get(void) {
-    if (!g_xs) g_xs = malloc(sizeof *g_xs);
-    return g_xs ? &g_xs->q : NULL;
+    struct xh_scratch *s = ts_get(TS_XHTTP, sizeof(struct xh_scratch));
+    return s ? &s->q : NULL;
 }
 
 static void rq_field(struct xh_rq *q, const char *name, const char *value) {
@@ -307,7 +308,7 @@ static int rq_build(struct transport *t, enum xh_kind k, const char *seq, int wo
     if (!q) return TR_EIO;
     memset(&q->r, 0, sizeof q->r);
     q->main_n = q->ck_n = q->dat_n = q->kv_n = q->lead = 0;
-    q->a = (struct xh_ar){ g_xs->arena, 0, sizeof g_xs->arena, 0 };
+    q->a = (struct xh_ar){ rq_held()->arena, 0, sizeof rq_held()->arena, 0 };
     rq_custom(q, x->headers);
 
     const char *sid = k == XK_ONE ? NULL : t->xh.sid;
@@ -399,7 +400,9 @@ static size_t packet_cap(struct transport *t) {
     struct xh_state *x = &t->xh;
     if (!x->worst_base) {
         if (rq_build(t, XK_PACKET, XH_SEQ_WORST, 1)) return 0;
-        x->worst_base = h2w_list_size(&g_xs->q.r, 1);
+        size_t s = h2w_list_size(&rq_held()->q.r, 1);
+        if (s == SIZE_MAX) return 0;
+        x->worst_base = s;
     }
     size_t hi = x->post_max ? x->post_max : XH_BLOCK;
     return data_fit(&x->main_side.opts, x->worst_base, meta_budget(t), hi, NULL);
@@ -418,7 +421,7 @@ static void b64_put(struct xh_ar *a, const unsigned char *d, size_t m, size_t fr
 static int rq_data(struct transport *t, const unsigned char *d, size_t n, size_t *took) {
     struct xh_state *x = &t->xh;
     const struct xh_opts *o = &x->main_side.opts;
-    struct xh_rq *q = &g_xs->q;
+    struct xh_rq *q = &rq_held()->q;
     uint32_t cs[XH_PIECES], r[XH_PIECES];
     uint32_t span = o->chunk_to - o->chunk_from + 1;
     if (os_getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) memset(r, 0, sizeof r);
@@ -601,12 +604,12 @@ static int up_reap(struct transport *t) {
 
 static int up_open(struct transport *t, struct xconn *main) {
     int rc = rq_build(t, XK_UP, NULL, 0);
-    return rc ? rc : xs_open(main, &g_xs->q.r, t->xh.f.owner, &t->xh.f.up);
+    return rc ? rc : xs_open(main, &rq_held()->q.r, t->xh.f.owner, &t->xh.f.up);
 }
 
 int xh_get_open(struct transport *t, struct xconn *x) {
     int rc = rq_build(t, XK_DOWN, NULL, 0);
-    return rc ? rc : xs_open(x, &g_xs->q.r, t->xh.f.owner, &t->xh.f.down);
+    return rc ? rc : xs_open(x, &rq_held()->q.r, t->xh.f.owner, &t->xh.f.down);
 }
 
 void xh_posts_drop(struct transport *t) {
@@ -638,7 +641,7 @@ int xh_flow_start(struct transport *t, struct xconn *main, struct xconn *down, u
      * first send. */
     int one = x->mode == XH_STREAM_ONE;
     int rc = rq_build(t, one ? XK_ONE : XK_DOWN, NULL, 0);
-    if (!rc) rc = xs_open(one ? main : down, &g_xs->q.r, owner, one ? &x->f.one : &x->f.down);
+    if (!rc) rc = xs_open(one ? main : down, &rq_held()->q.r, owner, one ? &x->f.one : &x->f.down);
     if (!rc && x->mode == XH_STREAM_UP) rc = up_open(t, main);
     if (!rc) rc = out_wait(t, main);
     if (!rc && down != main) rc = out_wait(t, down);
@@ -723,8 +726,8 @@ static int post_open(struct transport *t, const unsigned char *d, size_t n, int 
     int rc = rq_build(t, XK_PACKET, seq, 0);
     if (!rc && meta) rc = rq_data(t, d, n, took);
     struct xh_post *p = &f->post[f->post_n];
-    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
-    if (!rc) rc = xs_open(x_post(t), &g_xs->q.r, f->owner, &p->s);
+    if (!rc && !meta) rq_held()->q.r.body_len = (int64_t)n;
+    if (!rc) rc = xs_open(x_post(t), &rq_held()->q.r, f->owner, &p->s);
     if (rc) return rc;
     p->seq = x->seq++;
     f->post_n++;
@@ -739,8 +742,8 @@ static int packet_meta_write(struct transport *t, const unsigned char *d, size_t
     if (rc) return rc;
     size_t w = packet_cap(t);
     if (!w) {
-        t->why = g_xs ? "xhttp: the server's header limit leaves no room for data"
-                      : "xhttp: no memory for the request";
+        t->why = rq_held() && ts_g[TS_H2WIRE] ? "xhttp: the server's header limit leaves no room for data"
+                                              : "xhttp: no memory for the request";
         return TR_EIO;
     }
     long pieces = (long)((n + w - 1) / w);
@@ -774,12 +777,12 @@ static int post_redo(struct transport *t, struct xconn *m, struct xh_post *p) {
     int rc = rq_build(t, XK_PACKET, seq, 0);
     if (!rc && meta) {
         size_t took = n;
-        xc_q_peek(&p->keep, g_xs->blk, n);
-        rc = rq_data(t, g_xs->blk, n, &took);
+        xc_q_peek(&p->keep, rq_held()->blk, n);
+        rc = rq_data(t, rq_held()->blk, n, &took);
         if (!rc && took != n) rc = TR_EIO;
     }
-    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
-    if (!rc) rc = xs_open(m, &g_xs->q.r, f->owner, &p->s);
+    if (!rc && !meta) rq_held()->q.r.body_len = (int64_t)n;
+    if (!rc) rc = xs_open(m, &rq_held()->q.r, f->owner, &p->s);
     if (rc) return rc;
     p->redo = 0;
     f->redo_n--;
@@ -829,20 +832,20 @@ int xh_post_flush(struct transport *t) {
     rc = rq_build(t, XK_PACKET, seq, 0);
     size_t took = n;
     if (!rc && meta) {
-        xc_q_peek(&f->bat, g_xs->blk, n);
-        rc = rq_data(t, g_xs->blk, n, &took);
+        xc_q_peek(&f->bat, rq_held()->blk, n);
+        rc = rq_data(t, rq_held()->blk, n, &took);
     }
     struct xh_post *p = &f->post[f->post_n];
-    if (!rc && !meta) g_xs->q.r.body_len = (int64_t)n;
-    if (!rc) rc = xs_open(m, &g_xs->q.r, f->owner, &p->s);
+    if (!rc && !meta) rq_held()->q.r.body_len = (int64_t)n;
+    if (!rc) rc = xs_open(m, &rq_held()->q.r, f->owner, &p->s);
     if (rc) return rc;
     p->seq = x->seq++;
     p->keep = (struct xc_q){ 0 };
     p->tries = p->redo = 0;
     f->post_n++;
     if (meta) {
-        xc_q_pop(&f->bat, g_xs->blk, took);
-        if (keep && xc_q_push(&p->keep, g_xs->blk, took)) xc_q_drop(&p->keep);
+        xc_q_pop(&f->bat, rq_held()->blk, took);
+        if (keep && xc_q_push(&p->keep, rq_held()->blk, took)) xc_q_drop(&p->keep);
         return (int)took;
     }
     if (keep && xc_q_copy(&p->keep, &f->bat, n)) xc_q_drop(&p->keep);

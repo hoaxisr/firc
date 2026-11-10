@@ -1,10 +1,26 @@
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "unit.h"
 #include "hpackread.h"
 #include "h2mux.h"
+
+void *__real_calloc(size_t k, size_t n);
+static size_t g_cfail;
+static int g_cfail_tries;
+
+void *__wrap_calloc(size_t k, size_t n) {
+    if (g_cfail && k * n == g_cfail) {
+        g_cfail_tries++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_calloc(k, n);
+}
 
 struct rec {
     struct h2m *m;
@@ -1638,6 +1654,209 @@ static void t_cancel_ping(void) {
     h2m_free(&g_m);
 }
 
+#define TW_N 500
+
+struct tw {
+    struct h2m m;
+    int k, gate, rc;
+    unsigned char sent[1 << 17];
+    size_t n;
+};
+
+static pthread_mutex_t g_tw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tw_cv = PTHREAD_COND_INITIALIZER;
+static int g_tw_in, g_tw_done, g_tw_late;
+static struct timespec g_tw_dl;
+
+static void tw_wait(const int *v, int want) {
+    pthread_mutex_lock(&g_tw_mu);
+    while (*v < want && !g_tw_late)
+        if (pthread_cond_timedwait(&g_tw_cv, &g_tw_mu, &g_tw_dl) == ETIMEDOUT) g_tw_late = 1;
+    pthread_mutex_unlock(&g_tw_mu);
+}
+
+static void tw_set(int *v, int to) {
+    pthread_mutex_lock(&g_tw_mu);
+    *v = to;
+    pthread_cond_broadcast(&g_tw_cv);
+    pthread_mutex_unlock(&g_tw_mu);
+}
+
+static int tw_out(void *ctx, const unsigned char *d, size_t n, unsigned flags) {
+    struct tw *w = ctx;
+    if (w->gate && (flags & H2M_END)) {
+        w->gate = 0;
+        tw_set(&g_tw_in, g_tw_in + 1);
+        tw_wait(&g_tw_done, g_tw_in);
+    }
+    if (w->n + n > sizeof w->sent) return H2_EIO;
+    memcpy(w->sent + w->n, d, n);
+    w->n += n;
+    return 0;
+}
+
+static void tw_data(void *c, uint16_t s, const unsigned char *d, size_t n) { (void)c; (void)s; (void)d; (void)n; }
+static void tw_status(void *c, uint16_t s, int st) { (void)c; (void)s; (void)st; }
+static void tw_end(void *c, uint16_t s, int code, const struct h2m_in *in) { (void)c; (void)s; (void)code; (void)in; }
+static void tw_goaway(void *c, uint32_t l, uint32_t code) { (void)c; (void)l; (void)code; }
+static void tw_ping_ack(void *c) { (void)c; }
+static void tw_room(void *c, uint16_t s) { (void)c; (void)s; }
+
+static void tw_op(int k, int i, unsigned char op[8]) {
+    unsigned char o[8] = { (unsigned char)k, (unsigned char)(i >> 8), (unsigned char)i, 0xa5, 0x5a, 0xc3, 0x3c, 0x99 };
+    memcpy(op, o, 8);
+}
+
+static void *tw_run(void *a) {
+    struct tw *w = a;
+    struct h2m_cb cb = { w, tw_out, tw_data, tw_status, tw_end, tw_goaway, tw_ping_ack, tw_room };
+    w->rc = h2m_start(&w->m, &cb, (uint64_t)w->k + 7);
+    for (int i = 0; i < TW_N && !w->rc; i++) {
+        char path[24];
+        snprintf(path, sizeof path, "/%d/%d", w->k, i);
+        struct h2_req q = REQ_POST;
+        q.path = path;
+        unsigned char op[8];
+        tw_op(w->k, i, op);
+        uint16_t slot = UINT16_MAX;
+        if (w->k) tw_wait(&g_tw_in, 2 * i + 1);
+        else w->gate = 1;
+        w->rc = h2m_open(&w->m, &q, &slot);
+        if (!w->rc) w->rc = h2m_reset(&w->m, slot, 0);
+        if (w->k) {
+            tw_set(&g_tw_done, 2 * i + 1);
+            tw_wait(&g_tw_in, 2 * i + 2);
+        } else {
+            w->gate = 1;
+        }
+        if (!w->rc) w->rc = h2m_ping(&w->m, op);
+        if (w->k) tw_set(&g_tw_done, 2 * i + 2);
+    }
+    if (w->rc) tw_set(&g_tw_late, 1);
+    h2m_free(&w->m);
+    return NULL;
+}
+
+static int tw_bad(const struct tw *w, int *heads, int *pings) {
+    static struct hr_ctx c;
+    static struct hr_block b;
+    hr_ctx_init(&c, 4096);
+    const unsigned char *d = w->sent;
+    size_t p = w->n >= 24 && !memcmp(d, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) ? 24 : 0;
+    int bad = p ? 0 : 1;
+    *heads = *pings = 0;
+    while (p + 9 <= w->n) {
+        uint32_t len = ((uint32_t)d[p] << 16) | ((uint32_t)d[p + 1] << 8) | d[p + 2];
+        if (p + 9 + len > w->n) return bad + 1;
+        if (d[p + 3] == 0x01) {
+            char want[24];
+            snprintf(want, sizeof want, "/%d/%d", w->k, *heads);
+            int j = !(d[p + 4] & 0x04) || hr_decode_ctx(&c, d + p + 9, len, &b) ? -1 : hr_find(&b, ":path");
+            if (j < 0 || strcmp(b.f[j].value, want)) bad++;
+            (*heads)++;
+        } else if (d[p + 3] == 0x06) {
+            unsigned char op[8];
+            tw_op(w->k, *pings, op);
+            if (len != 8 || memcmp(d + p + 9, op, 8)) bad++;
+            (*pings)++;
+        }
+        p += 9 + len;
+    }
+    return bad;
+}
+
+static void t_h2mux_two_threads(void) {
+    /* catches: the frame or block scratch shared between threads */
+    static struct tw w[2];
+    pthread_t th[2];
+    int up = 0;
+    g_tw_in = g_tw_done = g_tw_late = 0;
+    clock_gettime(CLOCK_REALTIME, &g_tw_dl);
+    g_tw_dl.tv_sec += 20;
+    for (int k = 0; k < 2; k++) {
+        memset(&w[k], 0, sizeof w[k]);
+        w[k].k = k;
+        if (pthread_create(&th[k], NULL, tw_run, &w[k]) == 0) up++;
+    }
+    for (int k = 0; k < up; k++) pthread_join(th[k], NULL);
+    check("two threads: both ran", 2, up);
+    check("two threads: in step, no deadline hit", 0, g_tw_late);
+    for (int k = 0; k < 2; k++) {
+        int heads, pings;
+        int bad = tw_bad(&w[k], &heads, &pings);
+        check(k ? "two threads: thread 1 every call succeeded" : "two threads: thread 0 every call succeeded", 0, w[k].rc);
+        check(k ? "two threads: thread 1 500 HEADERS" : "two threads: thread 0 500 HEADERS", TW_N, heads);
+        check(k ? "two threads: thread 1 500 PINGs" : "two threads: thread 0 500 PINGs", TW_N, pings);
+        check(k ? "two threads: thread 1 every block and PING its own" : "two threads: thread 0 every block and PING its own", 0, bad);
+    }
+}
+
+static struct h2m g_ns_m;
+static struct rec g_ns_r;
+static int g_ns_rc[2], g_ns_outs, g_ns_open_n;
+
+static void *ns_run(void *a) {
+    (void)a;
+    uint16_t slot = UINT16_MAX;
+    g_cfail_tries = 0;
+    g_cfail = sizeof(struct h2mux_scratch);
+    g_ns_rc[0] = h2m_open(&g_ns_m, &REQ_POST, &slot);
+    g_cfail = 0;
+    g_ns_outs = (int)g_ns_r.outs;
+    g_ns_open_n = (int)h2m_open_n(&g_ns_m);
+    g_ns_rc[1] = h2m_open(&g_ns_m, &REQ_POST, &slot);
+    return NULL;
+}
+
+static void t_h2mux_open_no_scratch(void) {
+    /* catches: a HEADERS frame built in a NULL block */
+    check("open no scratch: started", 0, start(&g_ns_m, &g_ns_r));
+    r_clear(&g_ns_r);
+    pthread_t th;
+    int up = pthread_create(&th, NULL, ns_run, NULL) == 0;
+    if (up) pthread_join(th, NULL);
+    check("open no scratch: thread ran", 1, up);
+    check("open no scratch: one scratch block asked for", 1, g_cfail_tries);
+    check("open no scratch: H2_EIO", H2_EIO, g_ns_rc[0]);
+    check("open no scratch: nothing through cb.out", 0, g_ns_outs);
+    check("open no scratch: no stream open", 0, g_ns_open_n);
+    check("open no scratch: the next open succeeds", 0, g_ns_rc[1]);
+    check("open no scratch: then one HEADERS", 1, hr_count_frames(g_ns_r.sent, g_ns_r.sent_n, 0x01));
+    h2m_free(&g_ns_m);
+}
+
+static int g_st_rc[2];
+static unsigned g_st_outs[2];
+
+static void *st_run(void *a) {
+    (void)a;
+    static struct h2m m;
+    static struct rec r;
+    g_cfail_tries = 0;
+    g_cfail = sizeof(struct h2mux_scratch);
+    g_st_rc[0] = start(&m, &r);
+    g_cfail = 0;
+    g_st_outs[0] = r.outs;
+    h2m_free(&m);
+    g_st_rc[1] = start(&m, &r);
+    g_st_outs[1] = r.outs;
+    h2m_free(&m);
+    return NULL;
+}
+
+static void t_h2mux_start_no_scratch(void) {
+    /* catches: a preface written from a NULL frame buffer */
+    pthread_t th;
+    int up = pthread_create(&th, NULL, st_run, NULL) == 0;
+    if (up) pthread_join(th, NULL);
+    check("start no scratch: thread ran", 1, up);
+    check("start no scratch: one scratch block asked for", 1, g_cfail_tries);
+    check("start no scratch: H2_EIO", H2_EIO, g_st_rc[0]);
+    check("start no scratch: nothing through cb.out", 0, g_st_outs[0]);
+    check("start no scratch: the next start succeeds", 0, g_st_rc[1]);
+    check("start no scratch: with the preface in one call", 1, g_st_outs[1]);
+}
+
 int main(void) {
     t_preface_go();
     t_preface_bytes();
@@ -1686,5 +1905,8 @@ int main(void) {
     t_send_begin_put();
     t_inbound_frame_size();
     t_cancel_ping();
+    t_h2mux_two_threads();
+    t_h2mux_open_no_scratch();
+    t_h2mux_start_no_scratch();
     return unit_done("h2muxmatch");
 }

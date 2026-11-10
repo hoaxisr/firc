@@ -148,14 +148,14 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
         struct vision vis;
         vless_uuid_parse(node->uuid, uuid);
         vision_init(&vis, uuid);
-        static __thread unsigned char framed[8192];
+        unsigned char framed[8192];
         size_t header_n = req_n - http_used;
         size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
                                 framed, sizeof(framed));
         if (!fn) { transport_close(&c); snprintf(why, why_n, "cannot build the Vision frame"); return TR_EIO; }
         /* One write: the header and the frame must leave together, or their split across
          * records becomes a recognisable feature itself. */
-        static __thread unsigned char together[8704];
+        unsigned char together[8704];
         if (header_n + fn > sizeof(together)) { transport_close(&c); snprintf(why, why_n, "request too large"); return TR_EIO; }
         memcpy(together, req, header_n);
         memcpy(together + header_n, framed, fn);
@@ -168,7 +168,7 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
 
     /* Sized by the transport's minimum: over HTTP/2 one read returns up to a whole TLS record,
      * and a smaller buffer would fail on a legal frame. */
-    static __thread unsigned char buf[VLESS_MIN_RECV_CAP];
+    unsigned char buf[VLESS_MIN_RECV_CAP];
     unsigned char head[2 + 255];
     size_t head_n = 0, total = 0, skip = 0;
     int pr = VLESS_EAGAIN;

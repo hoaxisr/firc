@@ -50,6 +50,7 @@
 #include <fcntl.h>
 
 #include "transport.h"
+#include "tscratch.h"
 
 #define WS_FRAG 4096               /* send frame size: Xray's gorilla write buffer */
 
@@ -209,15 +210,19 @@ static int ws_open(struct transport *t, const struct tr_node *n, int timeout_s) 
 }
 
 /* One write is one message, in WS_FRAG frames (gorilla's WriteMessage). */
+struct ws_scratch { unsigned char fb[WS_FRAG + 14]; };
+
 static int ws_frames(struct transport *t, const unsigned char *d, size_t n) {
-    static __thread unsigned char fb[WS_FRAG + 14];
+    struct ws_scratch *s = ts_get(TS_WS, sizeof(struct ws_scratch));
+    if (!s) return TR_EIO;
+    unsigned char *fb = s->fb;
     size_t off = 0;
     int op = 2;                                /* binary, then continuation */
     while (off < n) {
         size_t take = n - off > WS_FRAG ? WS_FRAG : n - off;
         unsigned char key[4];
         if (mask_key(key) != 0) return TR_EIO;
-        size_t fl = tr_ws_frame(fb, sizeof(fb), op, off + take == n, key, d + off, take);
+        size_t fl = tr_ws_frame(fb, sizeof s->fb, op, off + take == n, key, d + off, take);
         int rc = tr_link_write(&t->link, fb, fl);
         if (rc) return rc;
         off += take;

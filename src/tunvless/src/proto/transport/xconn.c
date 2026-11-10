@@ -11,6 +11,7 @@
 #include "xconn.h"
 #include "fmlink.h"
 #include "osrand.h"
+#include "tscratch.h"
 
 #define XC_NONE    UINT16_MAX
 #define XC_CANCEL  8
@@ -41,12 +42,12 @@ static __thread size_t g_queued, g_pend;
 static __thread struct xc_chunk *g_free;
 static __thread unsigned g_free_n, g_links;
 static __thread struct xconn *g_list;
-static __thread unsigned char g_rbuf[XC_CHUNK];
-static __thread unsigned char g_seal[TLS13_MAX_REC + 5];
 
-struct xc_wake { uint16_t owner; uint8_t what; int rc; };
-static __thread struct xc_wake g_wq[2 * XC_ENTRIES];
-static __thread unsigned g_wq_n;
+static struct xconn_scratch *scratch(void) {
+    return ts_get(TS_XCONN, sizeof(struct xconn_scratch));
+}
+
+static struct xconn_scratch *scratch_now(void) { return ts_g[TS_XCONN]; }
 
 void xc_set_host(const struct xc_host *h) {
     if (h) g_host = *h;
@@ -180,19 +181,22 @@ static size_t q_clear(struct xc_q *q) {
 
 static void wq_add(uint16_t owner, unsigned what, int rc) {
     if (owner == XS_NOWNER) return;
-    for (unsigned i = 0; i < g_wq_n; i++)
-        if (g_wq[i].owner == owner && g_wq[i].what == what) {
-            if (!g_wq[i].rc) g_wq[i].rc = rc;
+    struct xconn_scratch *s = scratch_now();
+    for (unsigned i = 0; i < s->wq_n; i++)
+        if (s->wq[i].owner == owner && s->wq[i].what == what) {
+            if (!s->wq[i].rc) s->wq[i].rc = rc;
             return;
         }
-    if (g_wq_n < sizeof g_wq / sizeof g_wq[0]) g_wq[g_wq_n++] = (struct xc_wake){ owner, (uint8_t)what, rc };
+    if (s->wq_n < sizeof s->wq / sizeof s->wq[0]) s->wq[s->wq_n++] = (struct xc_wake){ owner, (uint8_t)what, rc };
 }
 
 static void wq_run(void) {
-    unsigned n = g_wq_n;
-    struct xc_wake w[sizeof g_wq / sizeof g_wq[0]];
-    memcpy(w, g_wq, n * sizeof w[0]);
-    g_wq_n = 0;
+    struct xconn_scratch *s = scratch_now();
+    if (!s) return;
+    unsigned n = s->wq_n;
+    struct xc_wake w[sizeof s->wq / sizeof s->wq[0]];
+    memcpy(w, s->wq, n * sizeof w[0]);
+    s->wq_n = 0;
     if (!g_host.wake) return;
     for (unsigned i = 0; i < n; i++) g_host.wake(g_host.arg, w[i].owner, w[i].what, w[i].rc);
 }
@@ -401,13 +405,18 @@ static int seal(struct xconn *x) {
         q_link(&x->out, c);
         return 0;
     }
+    struct xconn_scratch *s = scratch();
+    if (!s) {
+        chunk_put(c);
+        return H2_EIO;
+    }
     size_t rn = 0;
     uint32_t pt = c->len;
-    int rc = tls13_seal(&x->link.tls, c->d, c->len, g_seal, sizeof g_seal, &rn);
+    int rc = tls13_seal(&x->link.tls, c->d, c->len, s->seal, sizeof s->seal, &rn);
     chunk_put(c);
     if (rc) return rc;
-    if (x->link.tls.fm) return masked(x, g_seal, rn, pt);
-    if (q_push(&x->out, g_seal, rn)) return H2_EIO;
+    if (x->link.tls.fm) return masked(x, s->seal, rn, pt);
+    if (q_push(&x->out, s->seal, rn)) return H2_EIO;
     x->out.tail->pt += pt;
     x->out.tail->pay += x->stage_pay;
     x->out.tail->ctl += x->stage_ctl;
@@ -625,6 +634,7 @@ static void budget(void) {
 }
 
 struct xconn *xconn_new(const struct tr_node *n, int64_t keepalive_s, int shared) {
+    if (!scratch()) return NULL;
     struct xconn *x = calloc(1, sizeof *x);
     if (!x) return NULL;
     x->node = *n;
@@ -673,6 +683,7 @@ static int dial_failed(struct xconn *x, int rc) {
 
 int xconn_dial(struct xconn *x, int timeout_s) {
     if (x->state != XC_DIALING) return x->state == XC_DEAD ? x->rc : H2_EPROTO;
+    if (!scratch()) return dial_failed(x, H2_EIO);
     int rc = tr_link_open(&x->link, &x->node, "h2", timeout_s);
     return rc ? dial_failed(x, rc) : xconn_start(x);
 }
@@ -697,7 +708,7 @@ int xconn_dial2(struct xconn *a, struct xconn *b, int timeout_s) {
 int xconn_adopt(struct xconn *x, uint64_t now_ms) {
     if (x->state == XC_DEAD) return x->rc;
     if (x->state != XC_DIALING || x->link.fd < 0) return H2_EPROTO;
-    int rc = tr_link_nonblock(&x->link);
+    int rc = scratch() ? tr_link_nonblock(&x->link) : H2_EIO;
     if (rc) {
         x->state = XC_LIVE;
         xconn_fail(x, rc);
@@ -782,7 +793,9 @@ static int read_pass(struct xconn *x, uint64_t now) {
     size_t total = 0;
     while (total < XC_READ_MAX || buffered(x)) {
         if (x->link.plain) {
-            ssize_t r = tr_lk_recv(&x->link, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
+            struct xconn_scratch *s = scratch();
+            if (!s) return H2_EIO;
+            ssize_t r = tr_lk_recv(&x->link, s->rbuf, sizeof s->rbuf, MSG_DONTWAIT);
             if (r == 0) return TR_ECLOSED;
             if (r < 0) {
                 if (errno == EINTR) continue;
@@ -791,7 +804,7 @@ static int read_pass(struct xconn *x, uint64_t now) {
             }
             x->last_rx_ms = now;
             total += (size_t)r;
-            int rc = feed(x, g_rbuf, (size_t)r);
+            int rc = feed(x, s->rbuf, (size_t)r);
             if (rc) return rc;
             if (at_ceiling(x)) return 0;
             continue;
@@ -827,10 +840,12 @@ static int read_shared(struct xconn *x, uint64_t now) {
 
 static int read_one(struct xconn *x) {
     if (x->link.plain) {
-        ssize_t r = tr_lk_recv(&x->link, g_rbuf, sizeof g_rbuf, MSG_DONTWAIT);
+        struct xconn_scratch *s = scratch();
+        if (!s) return H2_EIO;
+        ssize_t r = tr_lk_recv(&x->link, s->rbuf, sizeof s->rbuf, MSG_DONTWAIT);
         if (r == 0) return TR_ECLOSED;
         if (r < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : tr_lk_err(&x->link, r);
-        return feed(x, g_rbuf, (size_t)r);
+        return feed(x, s->rbuf, (size_t)r);
     }
     const unsigned char *body = NULL;
     size_t n = 0;
@@ -1108,21 +1123,19 @@ int xs_open(struct xconn *x, const struct h2_req *r, uint16_t owner, struct xs *
     return 0;
 }
 
-#define XC_MARKS 1024
-static __thread uint32_t g_mark[XC_MARKS], g_mark_ep;
-
 static unsigned uploaders(const struct xconn *x, uint16_t owner) {
-    if (!++g_mark_ep) {
-        memset(g_mark, 0, sizeof g_mark);
-        g_mark_ep = 1;
+    struct xconn_scratch *s = scratch_now();
+    if (s && !++s->mark_ep) {
+        memset(s->mark, 0, sizeof s->mark);
+        s->mark_ep = 1;
     }
     unsigned u = 1;
     for (uint16_t i = 0; i < x->st_cap; i++) {
         const struct xc_st *e = &x->st[i];
         if (!e->used || !e->up_last || e->owner == owner) continue;
-        if (e->owner < XC_MARKS) {
-            if (g_mark[e->owner] == g_mark_ep) continue;
-            g_mark[e->owner] = g_mark_ep;
+        if (s && e->owner < XC_MARKS) {
+            if (s->mark[e->owner] == s->mark_ep) continue;
+            s->mark[e->owner] = s->mark_ep;
         }
         u++;
     }

@@ -931,9 +931,8 @@ int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
                         uint16_t sport, uint16_t dport,
                         const unsigned char *data, size_t n, uint16_t ip_id) {
     /* UDP header plus the datagram: the UDP checksum covers the WHOLE datagram, not a piece, so
-     * it is built whole first and split afterwards. A static buffer, not the stack, which in this
-     * loop already holds a TLS record buffer. */
-    static __thread unsigned char l4[8 + UDP_DGRAM_MAX];
+     * it is built whole first and split afterwards. */
+    unsigned char l4[8 + UDP_DGRAM_MAX];
     if (n > UDP_DGRAM_MAX) return -1;
 
     size_t udp_len = 8 + n;

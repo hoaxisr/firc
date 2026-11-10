@@ -36,6 +36,17 @@
 #define XC_STALL_NEXT_MS   1000
 
 #define XS_NOWNER UINT16_MAX
+#define XC_MARKS  1024
+
+struct xc_wake { uint16_t owner; uint8_t what; int rc; };
+
+struct xconn_scratch {
+    unsigned char rbuf[XC_CHUNK];
+    unsigned char seal[TLS13_MAX_REC + 5];
+    struct xc_wake wq[2 * XC_ENTRIES];
+    unsigned wq_n;
+    uint32_t mark[XC_MARKS], mark_ep;
+};
 
 enum { XC_DIALING, XC_LIVE, XC_DEAD };
 

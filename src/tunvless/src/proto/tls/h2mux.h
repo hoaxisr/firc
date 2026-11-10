@@ -11,6 +11,12 @@
 #define H2M_BLOCK_MAX 32768
 #define H2M_SEND_SCRATCH 524288
 
+struct h2mux_scratch {
+    struct h2w_list list;
+    unsigned char frame[9 + DEFAULT_MAX_FRAME];
+    unsigned char block[H2M_BLOCK_MAX];
+};
+
 #define H2M_CTL 1u
 #define H2M_PAY 2u
 #define H2M_END 4u

@@ -347,7 +347,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     /* out is needed only to join the header or the Vision frame and the data into one buffer.
      * Usually there is nothing to join (the header goes once per connection, and Vision ends
      * padding with its first frame), and the data goes straight from the packet, uncopied. */
-    static __thread unsigned char out[TUNNEL_BUF];
+    unsigned char out[TUNNEL_BUF];
     const unsigned char *body = data;
     size_t len = 0;
 
@@ -356,7 +356,7 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      * TCP: Vision, then the write. */
     const int xudp = udp && node->flow[0];
     if (xudp) {
-        static __thread unsigned char xb[TUNNEL_BUF];
+        unsigned char xb[TUNNEL_BUF];
         size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
         if (!xn) return SEND_FATAL;
         data = xb;
