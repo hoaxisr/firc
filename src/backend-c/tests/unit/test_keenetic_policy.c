@@ -1579,28 +1579,27 @@ TEST a_policy_s_segment_is_its_network(void) {
     PASS();
 }
 
-/* Catches: an allow writing a segment that holds another policy's host, or a deny leaving one out. */
-TEST an_allowed_segment_that_holds_another_policy_s_host_is_not_written(void) {
+/* Catches: a deny or an allow writing a segment that holds another policy's host. */
+TEST a_segment_that_holds_another_policy_s_host_is_not_written(void) {
     static const char ON_SEG[] =
         "{\"host\":[{\"mac\":\"aa:00:00:00:00:0b\",\"ip\":\"10.99.0.5\",\"policy\":\"Policy0\",\"active\":true}]}";
     firc_kn_policy_map_t *m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse(ON_SEG, POLICIES, &m));
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_add_segment(m, "Policy9", "10.99.0.1", "255.255.255.0"));
-    firc_ip_t own = v4(10, 99, 0, 5), peer = v4(10, 99, 0, 9), net = v4(10, 99, 0, 0);
+    firc_ip_t own = v4(10, 99, 0, 5), peer = v4(10, 99, 0, 9);
     ASSERT_FALSE(firc_kn_policy_map_has(m, "Guests", &own));
     ASSERT(firc_kn_policy_map_has(m, "Guests", &peer));
     nets_t x = {.n = 0};
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_policy_nets(m, "Guests", false, collect_net, &x));
     ASSERT_EQ_FMT((size_t)0, x.n, "%zu");
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_policy_nets(m, "Guests", true, collect_net, &x));
-    ASSERT_EQ_FMT((size_t)1, x.n, "%zu");
-    ASSERT(nets_have(&x, &net, 24));
+    ASSERT_EQ_FMT((size_t)0, x.n, "%zu");
     firc_kn_policy_map_free(m);
     PASS();
 }
 
-/* Catches: an allow segment ignoring an earlier overlapping one, or blocked by a later one. */
-TEST an_allowed_segment_behind_an_overlapping_one_is_not_written(void) {
+/* Catches: a segment ignoring an earlier overlapping one, or blocked by a later one. */
+TEST a_segment_behind_an_overlapping_one_is_not_written(void) {
     firc_kn_policy_map_t *m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse("{\"host\":[]}", POLICIES, &m));
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_add_segment(m, "Policy0", "10.99.0.1", "255.255.255.128"));
@@ -1616,8 +1615,7 @@ TEST an_allowed_segment_behind_an_overlapping_one_is_not_written(void) {
     ASSERT(nets_have(&x, &net, 25));
     x.n = 0;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_policy_nets(m, "Guests", true, collect_net, &x));
-    ASSERT_EQ_FMT((size_t)1, x.n, "%zu");
-    ASSERT(nets_have(&x, &net, 24));
+    ASSERT_EQ_FMT((size_t)0, x.n, "%zu");
     firc_kn_policy_map_free(m);
 
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_parse("{\"host\":[]}", POLICIES, &m));
@@ -1693,7 +1691,7 @@ TEST the_packet_path_agrees_with_the_answer_client_by_client(void) {
         v4(10, 99, 0, 9), v4(10, 98, 0, 9), v4(192, 168, 1, 51),
     };
     const char *entries[] = {"192.168.1.50", "fd00::60", "fd00::/16", "10.99.0.3", "policy:Kids", "policy:Guests"};
-    size_t refused = 0, allowed = 0;
+    size_t refused = 0, allowed = 0, by_mark = 0;
     for (size_t e = 0; e < sizeof(entries) / sizeof(entries[0]); e++) {
         for (int deny = 0; deny <= 1; deny++) {
             cover_t x = {.n = 0};
@@ -1712,7 +1710,9 @@ TEST the_packet_path_agrees_with_the_answer_client_by_client(void) {
                 if (deny) {
                     bool out = !answer_allows(m, entries[e], true, &cand[c]);
                     refused += out;
-                    if (out && !covers(&x, &cand[c])) { FAILm(txt); }
+                    if (!out || covers(&x, &cand[c])) { continue; }
+                    if (strcmp(entries[e], "policy:Guests") != 0 || strcmp(txt, "10.99.0.9") != 0) { FAILm(txt); }
+                    by_mark++;
                 } else {
                     bool in = covers(&x, &cand[c]);
                     allowed += in;
@@ -1722,6 +1722,7 @@ TEST the_packet_path_agrees_with_the_answer_client_by_client(void) {
         }
     }
     ASSERT(refused > 0 && allowed > 0);
+    ASSERT_EQ_FMTm("an unlisted client on a mixed segment, by the mark alone", (size_t)1, by_mark, "%zu");
     firc_kn_policy_map_free(m);
     PASS();
 }
@@ -1775,10 +1776,40 @@ TEST a_skipped_allow_segment_is_said_once(void) {
     free(log);
     ASSERT(e1 == FIRC_OK && e2 == FIRC_OK && e3 == FIRC_OK && e4 == FIRC_OK);
     ASSERT_EQ_FMTm("allow skipped it", (size_t)0, x.n, "%zu");
-    ASSERT_EQ_FMTm("deny wrote it", (size_t)1, d.n, "%zu");
+    ASSERT_EQ_FMTm("deny skipped it", (size_t)0, d.n, "%zu");
     ASSERT_EQ_FMTm("Kids' segment written", (size_t)1, k.n, "%zu");
     ASSERT_EQ_FMTm("said once", (size_t)1, said, "%zu");
     ASSERT_EQ_FMTm("naming the policy", (size_t)1, said_guests, "%zu");
+    PASS();
+}
+
+/* Catches: a deny's skipped segment warned as an allow's. */
+TEST a_skipped_deny_segment_is_not_said(void) {
+    static const char ON_SEG[] =
+        "{\"host\":[{\"mac\":\"aa:00:00:00:00:0b\",\"ip\":\"10.99.0.5\",\"policy\":\"Policy0\",\"active\":true}]}";
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    firc_kn_policy_map_t *m = NULL;
+    if (firc_kn_policy_map_parse(ON_SEG, POLICIES, &m) != FIRC_OK ||
+        firc_kn_policy_map_add_segment(m, "Policy9", "10.99.0.1", "255.255.255.0") != FIRC_OK) {
+        firc_kn_policies_stop(p);
+        FAIL();
+    }
+    firc_kn_policies_swap(p, m);
+    int fd = log_file();
+    if (fd < 0) { firc_kn_policies_stop(p); }
+    ASSERT(fd >= 0);
+    firc_log_set_fd(fd);
+    nets_t d = {.n = 0};
+    firc_err_t e1 = firc_kn_policies_policy_nets("Guests", true, collect_net, &d, p);
+    firc_err_t e2 = firc_kn_policies_policy_nets("Guests", true, collect_net, &d, p);
+    char *log = log_back(fd);
+    firc_kn_policies_stop(p);
+    size_t said = log != NULL ? count_of(log, "is not written") : 99;
+    free(log);
+    ASSERT(e1 == FIRC_OK && e2 == FIRC_OK);
+    ASSERT_EQ_FMT((size_t)0, d.n, "%zu");
+    ASSERT_EQ_FMT((size_t)0, said, "%zu");
     PASS();
 }
 
@@ -2201,11 +2232,12 @@ int main(int argc, char **argv) {
     RUN_TEST(an_allow_past_the_answer_s_window_brings_no_host);
     RUN_TEST(a_denied_policy_writes_what_the_answer_refuses_and_no_more);
     RUN_TEST(a_policy_s_segment_is_its_network);
-    RUN_TEST(an_allowed_segment_that_holds_another_policy_s_host_is_not_written);
-    RUN_TEST(an_allowed_segment_behind_an_overlapping_one_is_not_written);
+    RUN_TEST(a_segment_that_holds_another_policy_s_host_is_not_written);
+    RUN_TEST(a_segment_behind_an_overlapping_one_is_not_written);
     RUN_TEST(a_segment_whose_mask_is_not_a_prefix_is_refused);
     RUN_TEST(the_packet_path_agrees_with_the_answer_client_by_client);
     RUN_TEST(the_loop_s_segment_lookup_answers_from_the_latest_map);
     RUN_TEST(a_skipped_allow_segment_is_said_once);
+    RUN_TEST(a_skipped_deny_segment_is_not_said);
     GREATEST_MAIN_END();
 }
