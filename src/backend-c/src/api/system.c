@@ -222,15 +222,10 @@ static void handle_events(firc_http_req_t *req, firc_http_res_t *res, void *ud) 
 }
 
 /* an empty list is an answer, not a failure: this router may have none configured */
-static void handle_policies(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
-    (void)req;
+static cJSON *policies_body(firc_system_ctx_t *ctx) {
     cJSON *out = cJSON_CreateObject();
-    if (out == NULL) {
-        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
-        return;
-    }
+    if (out == NULL) { return NULL; }
     cJSON *arr = cJSON_AddArrayToObject(out, "policies");
-    firc_system_ctx_t *ctx = ud;
     firc_kn_policy_info_t list[64];
     size_t n = firc_kn_policies_list(ctx->policies, list, sizeof(list) / sizeof(list[0]));
     for (size_t i = 0; i < n; i++) {
@@ -242,7 +237,7 @@ static void handle_policies(firc_http_req_t *req, firc_http_res_t *res, void *ud
         cJSON_AddNumberToObject(item, "devices", (double)list[i].devices);
         cJSON_AddItemToArray(arr, item);
     }
-    firc_http_res_write_json(res, 200, out);
+    return out;
 }
 
 void firc_system_hosts_mark(cJSON *hosts, const firc_ifnet4_t *nets, size_t n, char *const *link, size_t n_link,
@@ -268,16 +263,13 @@ void firc_system_hosts_mark_running(cJSON *hosts, firc_ifnet4_t *nets, size_t n,
 }
 
 /* answered from the policy refresher's latest cached table, never a live RCI call */
-static void handle_hosts(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
-    (void)req;
-    firc_system_ctx_t *ctx = ud;
+static cJSON *hosts_body(firc_system_ctx_t *ctx) {
     cJSON *out = cJSON_CreateObject();
     cJSON *hosts = firc_kn_policies_hosts_json(ctx->policies);
     if (out == NULL || hosts == NULL) {
         cJSON_Delete(out);
         cJSON_Delete(hosts);
-        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
-        return;
+        return NULL;
     }
     firc_ifnet4_t nets[64];
     size_t n = firc_ifnet4_list(nets, sizeof(nets) / sizeof(nets[0]));
@@ -285,10 +277,111 @@ static void handle_hosts(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     if (!cJSON_AddItemToObject(out, "hosts", hosts)) {
         cJSON_Delete(hosts);
         cJSON_Delete(out);
-        firc_http_res_write_error(res, 500, firc_err_str(FIRC_ERR_NOMEM));
-        return;
+        return NULL;
     }
-    firc_http_res_write_json(res, 200, out);
+    return out;
+}
+
+static const unsigned FRESH_MS = 5000;
+static const uint64_t FRESH_WAIT_MS = 2000;
+static const uint64_t FRESH_TICK_MS = 100;
+
+typedef cJSON *(*fresh_body_fn)(firc_system_ctx_t *ctx);
+
+typedef struct fresh_waiter {
+    struct fresh_waiter *next;
+    firc_system_ctx_t *ctx;
+    firc_http_deferred_t *d;
+    fresh_body_fn build;
+    uint64_t round;
+    uint64_t until_ms;
+    int timer;
+    bool left;
+} fresh_waiter_t;
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint8_t *fresh_answer(firc_system_ctx_t *ctx, fresh_body_fn build, int *status, size_t *len) {
+    cJSON *out = build(ctx);
+    *status = out != NULL ? 200 : 500;
+    if (out == NULL) { out = firc_json_error(firc_err_str(FIRC_ERR_NOMEM)); }
+    char *text = out != NULL ? firc_json_dump(out) : NULL;
+    cJSON_Delete(out);
+    if (text == NULL) {
+        *status = 500;
+        text = strdup("{\"error\":\"internal error\"}");
+    }
+    *len = text != NULL ? strlen(text) : 0;
+    return (uint8_t *)text;
+}
+
+static void fresh_unlink(fresh_waiter_t *w) {
+    for (fresh_waiter_t **link = &w->ctx->fresh_waiters; *link != NULL; link = &(*link)->next) {
+        if (*link == w) {
+            *link = w->next;
+            break;
+        }
+    }
+}
+
+static void fresh_tick(firc_loop_t *loop, void *ud) {
+    fresh_waiter_t *w = ud;
+    if (firc_kn_policies_rounds(w->ctx->policies) < w->round && mono_ms() < w->until_ms) { return; }
+    (void)firc_loop_del_timer(loop, w->timer);
+    fresh_unlink(w);
+    int status = 200;
+    size_t len = 0;
+    uint8_t *body = w->left ? NULL : fresh_answer(w->ctx, w->build, &status, &len);
+    firc_http_deferred_finish(w->d, status, "application/json; charset=utf-8", body, len);
+    free(w);
+}
+
+static void fresh_left(void *ud) {
+    ((fresh_waiter_t *)ud)->left = true;
+}
+
+static void answer_fresh(firc_http_res_t *res, firc_system_ctx_t *ctx, fresh_body_fn build) {
+    uint64_t round = firc_kn_policies_wake(ctx->policies, FRESH_MS);
+    fresh_waiter_t *w = round != 0 ? calloc(1, sizeof(*w)) : NULL;
+    firc_loop_t *loop = firc_http_res_loop(res);
+    if (w != NULL) {
+        w->ctx = ctx;
+        w->build = build;
+        w->round = round;
+        w->until_ms = mono_ms() + FRESH_WAIT_MS;
+        if (firc_loop_add_timer(loop, FRESH_TICK_MS, FRESH_TICK_MS, fresh_tick, w, &w->timer) != FIRC_OK) {
+            free(w);
+            w = NULL;
+        }
+    }
+    if (w != NULL) {
+        w->d = firc_http_res_defer(res, fresh_left, w);
+        if (w->d != NULL) {
+            w->next = ctx->fresh_waiters;
+            ctx->fresh_waiters = w;
+            return;
+        }
+        (void)firc_loop_del_timer(loop, w->timer);
+        free(w);
+    }
+    int status;
+    size_t len;
+    uint8_t *body = fresh_answer(ctx, build, &status, &len);
+    firc_http_res_take(res, status, "application/json; charset=utf-8", body, len);
+}
+
+static void handle_policies(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    answer_fresh(res, ud, policies_body);
+}
+
+static void handle_hosts(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    answer_fresh(res, ud, hosts_body);
 }
 
 /* empty is an answer */
@@ -882,6 +975,12 @@ static void stats_drop(firc_system_ctx_t *ctx) {
 void firc_system_close(firc_system_ctx_t *ctx) {
     (void)firc_app_set_dnsstats(ctx->app, NULL, NULL);
     stats_drop(ctx);
+    while (ctx->fresh_waiters != NULL) {
+        fresh_waiter_t *w = ctx->fresh_waiters;
+        ctx->fresh_waiters = w->next;
+        firc_http_deferred_drop(w->d);
+        free(w);
+    }
     ifaces_read_t *r = ctx->ifaces_read;
     if (r == NULL) { return; }
     ctx->ifaces_read = NULL;

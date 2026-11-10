@@ -1,6 +1,7 @@
 #include "greatest.h"
 
 #include <arpa/inet.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -208,7 +209,7 @@ static int connect_tcp(uint16_t port) {
 }
 
 static ssize_t recv_response(int fd, char *buf, size_t cap) {
-    struct timeval tv = {2, 0};
+    struct timeval tv = {5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     size_t total = 0;
     char *body_start = NULL;
@@ -1944,6 +1945,261 @@ TEST a_start_without_memory_is_turned_on_by_a_later_put(void) {
     PASS();
 }
 
+typedef struct {
+    atomic_int policy;
+    atomic_int asked;
+    atomic_long delay_ms;
+} hosts_rci_t;
+
+static hosts_rci_t g_rci;
+
+static firc_err_t hosts_get(void *ud, const char *path, char **body) {
+    hosts_rci_t *r = ud;
+    char doc[512];
+    if (strcmp(path, "/rci/show/ip/hotspot") == 0) {
+        atomic_fetch_add(&r->asked, 1);
+        long ms = atomic_load(&r->delay_ms);
+        if (ms > 0) {
+            struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+        snprintf(doc, sizeof doc,
+                 "{\"host\":[{\"mac\":\"AA:BB:CC:DD:EE:01\",\"name\":\"TV\",\"ip\":\"192.168.1.5\","
+                 "\"policy\":\"%s\",\"active\":true,\"registered\":true}]}",
+                 atomic_load(&r->policy) == 0 ? "Policy0" : "");
+    } else if (strcmp(path, "/rci/show/rc/ip/policy") == 0) {
+        snprintf(doc, sizeof doc, "{\"Policy0\":{\"description\":\"Kids\"}}");
+    } else if (strcmp(path, "/rci/show/ip/policy") == 0) {
+        snprintf(doc, sizeof doc, "{}");
+    } else if (strcmp(path, "/rci/show/rc/ip/hotspot") == 0) {
+        snprintf(doc, sizeof doc, "{\"policy\":[]}");
+    } else {
+        return FIRC_ERR_NOENT;
+    }
+    *body = strdup(doc);
+    return *body != NULL ? FIRC_OK : FIRC_ERR_NOMEM;
+}
+
+static void rci_reset(long delay_ms) {
+    atomic_store(&g_rci.policy, 0);
+    atomic_store(&g_rci.asked, 0);
+    atomic_store(&g_rci.delay_ms, delay_ms);
+}
+
+static bool rounds_reach(firc_kn_policies_t *p, uint64_t n) {
+    for (int i = 0; i < 400 && firc_kn_policies_rounds(p) < n; i++) {
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    return firc_kn_policies_rounds(p) >= n;
+}
+
+static const char *tv_policy(const cJSON *out) {
+    const cJSON *tv = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(out, "hosts"), 0);
+    const cJSON *pol = cJSON_GetObjectItemCaseSensitive(tv, "policy");
+    return cJSON_IsString(pol) ? pol->valuestring : "(none)";
+}
+
+typedef struct {
+    pthread_t th;
+    int status;
+    cJSON *out;
+    int64_t took;
+} timed_call_t;
+
+static void *policies_call_thread(void *ud) {
+    timed_call_t *c = ud;
+    int64_t t0 = mono_ms();
+    c->status = do_request("GET", "/api/v1/system/policies", NULL, &c->out);
+    c->took = mono_ms() - t0;
+    return NULL;
+}
+
+static bool asked_reach(int n) {
+    for (int i = 0; i < 400 && atomic_load(&g_rci.asked) < n; i++) {
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    return atomic_load(&g_rci.asked) >= n;
+}
+
+/* catches: a stale list answered as it is, a fresh one asking for a round, two requests costing two rounds, or a slow tick */
+TEST a_stale_host_list_is_read_again_before_the_answer(void) {
+    rci_reset(0);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(hosts_get, &g_rci, 3600);
+    ASSERT(p != NULL);
+    g_policies = p;
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    bool first = rounds_reach(p, 1);
+    cJSON *a = NULL, *b = NULL, *c = NULL;
+    int64_t t0 = mono_ms();
+    int sa = do_request("GET", "/api/v1/system/hosts", NULL, &a);
+    int64_t took_a = mono_ms() - t0;
+    atomic_store(&g_rci.policy, 1);
+    int sb = do_request("GET", "/api/v1/system/hosts", NULL, &b);
+    uint64_t rounds_fresh = firc_kn_policies_rounds(p);
+    atomic_store(&g_rci.delay_ms, 150);
+    struct timespec ts = {5, 200000000L};
+    nanosleep(&ts, NULL);
+    timed_call_t pol = {0};
+    pthread_create(&pol.th, NULL, policies_call_thread, &pol);
+    bool woken = asked_reach(2);
+    t0 = mono_ms();
+    int sc = do_request("GET", "/api/v1/system/hosts", NULL, &c);
+    int64_t took_c = mono_ms() - t0;
+    pthread_join(pol.th, NULL);
+    struct timespec settle = {0, 300000000L};
+    nanosleep(&settle, NULL);
+    uint64_t rounds_stale = firc_kn_policies_rounds(p);
+    int asked = atomic_load(&g_rci.asked);
+    harness_stop(h);
+    firc_kn_policies_stop(p);
+    g_policies = NULL;
+    char pa[16], pb[16], pc[16];
+    snprintf(pa, sizeof pa, "%s", tv_policy(a));
+    snprintf(pb, sizeof pb, "%s", tv_policy(b));
+    snprintf(pc, sizeof pc, "%s", tv_policy(c));
+    cJSON_Delete(a);
+    cJSON_Delete(b);
+    cJSON_Delete(c);
+    ASSERT(first);
+    ASSERT_EQ(200, sa);
+    ASSERT_EQ(200, sb);
+    ASSERT_EQ(200, sc);
+    ASSERT_STR_EQ("Policy0", pa);
+    ASSERT_LTm("a fresh map answers at once", took_a, 500);
+    ASSERT_STR_EQm("a fresh map is not read again", "Policy0", pb);
+    ASSERT_EQ_FMTm("no round for a fresh map", (uint64_t)1, rounds_fresh, "%" PRIu64);
+    cJSON_Delete(pol.out);
+    ASSERT(woken);
+    ASSERT_EQ(200, pol.status);
+    ASSERT_STR_EQm("a stale map is read again first", "", pc);
+    ASSERT_EQ_FMTm("both answered by one round", (uint64_t)2, rounds_stale, "%" PRIu64);
+    ASSERT_EQ(2, asked);
+    ASSERT_LTm("answered at the tick after the round", pol.took, 400);
+    ASSERT_LT(took_c, 400);
+    PASS();
+}
+
+/* catches: the policies route answered before the first round, or waiting for a second one */
+TEST the_policies_wait_for_a_first_round_under_way(void) {
+    rci_reset(300);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(hosts_get, &g_rci, 3600);
+    ASSERT(p != NULL);
+    g_policies = p;
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    int64_t t0 = mono_ms();
+    int st = do_request("GET", "/api/v1/system/policies", NULL, &out);
+    int64_t took = mono_ms() - t0;
+    struct timespec settle = {0, 300000000L};
+    nanosleep(&settle, NULL);
+    int asked = atomic_load(&g_rci.asked);
+    harness_stop(h);
+    firc_kn_policies_stop(p);
+    g_policies = NULL;
+    const cJSON *first = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(out, "policies"), 0);
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(first, "name");
+    char got[16];
+    snprintf(got, sizeof got, "%s", cJSON_IsString(name) ? name->valuestring : "(none)");
+    cJSON_Delete(out);
+    ASSERT_EQ(200, st);
+    ASSERT_STR_EQm("answered from the round", "Policy0", got);
+    ASSERT_EQm("the round under way at start serves it", 1, asked);
+    ASSERT_LT(took, 700);
+    PASS();
+}
+
+/* catches: a deferred answer waiting past its bound for a round that does not end, or never ending */
+TEST a_round_that_does_not_end_still_gets_an_answer_in_two_seconds(void) {
+    rci_reset(4000);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(hosts_get, &g_rci, 3600);
+    ASSERT(p != NULL);
+    firc_kn_policy_map_t *m = NULL;
+    firc_err_t perr = firc_kn_policy_map_parse("{\"host\":[{\"mac\":\"AA:BB:CC:DD:EE:01\",\"name\":\"TV\","
+                                               "\"ip\":\"192.168.1.5\",\"policy\":\"Policy0\",\"active\":true}]}",
+                                               NULL, &m);
+    if (perr == FIRC_OK) { firc_kn_policies_swap(p, m); }
+    g_policies = p;
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    int64_t t0 = mono_ms();
+    int st = do_request("GET", "/api/v1/system/hosts", NULL, &out);
+    int64_t took = mono_ms() - t0;
+    harness_stop(h);
+    firc_kn_policies_stop(p);
+    g_policies = NULL;
+    char got[16];
+    snprintf(got, sizeof got, "%s", tv_policy(out));
+    cJSON_Delete(out);
+    ASSERT_EQ(FIRC_OK, perr);
+    ASSERT_EQ(200, st);
+    ASSERT_STR_EQm("the map held", "Policy0", got);
+    ASSERT_GTm("waited for the round", took, 1900);
+    ASSERT_LTm("but no longer than the bound", took, 2300);
+    PASS();
+}
+
+/* catches: a client leaving a deferred answer taking the loop down or leaking the answer */
+TEST a_client_that_leaves_a_deferred_answer_costs_nothing(void) {
+    rci_reset(1500);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(hosts_get, &g_rci, 3600);
+    ASSERT(p != NULL);
+    g_policies = p;
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    int fd = connect_tcp(TEST_PORT);
+    const char req[] = "GET /api/v1/system/hosts HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    ssize_t sent = fd >= 0 ? send(fd, req, sizeof req - 1, 0) : -1;
+    struct timespec ts = {0, 200000000L};
+    nanosleep(&ts, NULL);
+    if (fd >= 0) { close(fd); }
+    struct timespec ts2 = {2, 200000000L};
+    nanosleep(&ts2, NULL);
+    cJSON *out = NULL;
+    int st = do_request("GET", "/api/v1/system/events", NULL, &out);
+    cJSON_Delete(out);
+    harness_stop(h);
+    firc_kn_policies_stop(p);
+    g_policies = NULL;
+    ASSERT(sent > 0);
+    ASSERT_EQm("the loop keeps serving", 200, st);
+    PASS();
+}
+
+static void *hosts_call_thread(void *ud) {
+    iface_call_t *c = ud;
+    c->status = do_request("GET", "/api/v1/system/hosts", NULL, &c->out);
+    return NULL;
+}
+
+/* catches: a stop leaving a deferred hosts answer or its timer behind */
+TEST a_stop_drops_a_deferred_hosts_answer(void) {
+    rci_reset(3000);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(hosts_get, &g_rci, 3600);
+    ASSERT(p != NULL);
+    g_policies = p;
+    harness_t *h = harness_start(false);
+    ASSERT(h != NULL);
+    iface_call_t c = {0};
+    pthread_create(&c.th, NULL, hosts_call_thread, &c);
+    struct timespec ts = {0, 300000000L};
+    nanosleep(&ts, NULL);
+    int64_t t0 = mono_ms();
+    harness_stop(h);
+    pthread_join(c.th, NULL);
+    int64_t took = mono_ms() - t0;
+    firc_kn_policies_stop(p);
+    g_policies = NULL;
+    cJSON_Delete(c.out);
+    ASSERT(c.status != 200);
+    ASSERT_LTm("the client is let go at once", took, 1000);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -1968,6 +2224,11 @@ int main(int argc, char **argv) {
     RUN_TEST(a_bypass_event_without_a_last_answer_has_no_last);
     RUN_TEST(only_loopback_ezcfg_and_radio_names_are_hidden);
     RUN_TEST(the_hosts_route_answers_the_refreshers_table);
+    RUN_TEST(a_stale_host_list_is_read_again_before_the_answer);
+    RUN_TEST(the_policies_wait_for_a_first_round_under_way);
+    RUN_TEST(a_round_that_does_not_end_still_gets_an_answer_in_two_seconds);
+    RUN_TEST(a_client_that_leaves_a_deferred_answer_costs_nothing);
+    RUN_TEST(a_stop_drops_a_deferred_hosts_answer);
     RUN_TEST(the_netfilter_route_says_whether_the_committer_is_failing);
     RUN_TEST(the_netfilter_route_says_the_first_write_is_pending);
     RUN_TEST(each_interface_gets_its_role);

@@ -793,8 +793,14 @@ struct firc_kn_policies {
     firc_kn_policy_map_t *retired;
     const firc_kn_policy_map_t *newest;
     char *base_url;
+    firc_kn_rci_get_fn get;
+    void *get_ud;
     unsigned refresh_secs;
     bool running, stop;
+    bool in_round, wake;
+    uint64_t rounds;
+    uint64_t round_start_ms;
+    uint64_t round_end_ms;
     /* Threads inside wait_first: stop must not free the struct under them. */
     unsigned n_waiters;
     pthread_t th;
@@ -984,16 +990,25 @@ firc_err_t firc_kn_policies_round_for_test(firc_kn_policies_t *p, firc_kn_rci_ge
     return refresh_round(p, get, ud);
 }
 
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 static void *refresher(void *ud) {
     firc_kn_policies_t *p = ud;
     unsigned retry = 1;
     firc_logrep_t failing = {0};
     pthread_mutex_lock(&p->mu);
     while (!p->stop) {
+        p->in_round = true;
+        p->wake = false;
+        p->round_start_ms = mono_ms();
         pthread_mutex_unlock(&p->mu);
         rci_t rci = {p->base_url};
         /* RCI bytes change on every read, so map_same compares parsed maps; an equal map is freed without a swap. */
-        firc_err_t err = refresh_round(p, rci_get, &rci);
+        firc_err_t err = p->get != NULL ? refresh_round(p, p->get, p->get_ud) : refresh_round(p, rci_get, &rci);
         unsigned wait;
         if (err == FIRC_OK) {
             (void)firc_logrep_ok(&failing, NULL, "keenetic policies: RCI");
@@ -1006,18 +1021,24 @@ static void *refresher(void *ud) {
             if (retry < p->refresh_secs) { retry *= 2; }
         }
         pthread_mutex_lock(&p->mu);
-        if (p->stop) { break; }
+        p->in_round = false;
+        p->rounds++;
+        p->round_end_ms = mono_ms();
+        pthread_cond_broadcast(&p->cv);
         struct timespec until;
         clock_gettime(CLOCK_MONOTONIC, &until);
         until.tv_sec += (time_t)wait;
-        pthread_cond_timedwait(&p->cv, &p->mu, &until);
+        while (!p->stop && !p->wake) {
+            if (pthread_cond_timedwait(&p->cv, &p->mu, &until) == ETIMEDOUT) { break; }
+        }
     }
     pthread_mutex_unlock(&p->mu);
     return NULL;
 }
 
-firc_kn_policies_t *firc_kn_policies_start_notify(const char *base_url, unsigned refresh_secs,
-                                                  firc_kn_policies_changed_fn on_change, void *ud) {
+static firc_kn_policies_t *start_with(const char *base_url, unsigned refresh_secs,
+                                      firc_kn_policies_changed_fn on_change, void *ud, firc_kn_rci_get_fn get,
+                                      void *get_ud) {
     firc_kn_policies_t *p = calloc(1, sizeof(*p));
     if (p == NULL) { return NULL; }
     pthread_mutex_init(&p->mu, NULL);
@@ -1030,15 +1051,26 @@ firc_kn_policies_t *firc_kn_policies_start_notify(const char *base_url, unsigned
     p->refresh_secs = refresh_secs ? refresh_secs : 30;
     p->on_change = on_change;
     p->on_change_ud = ud;
-    if (base_url != NULL) {
-        p->base_url = strdup(base_url);
-        if (p->base_url == NULL || pthread_create(&p->th, NULL, refresher, p) != 0) {
+    p->get = get;
+    p->get_ud = get_ud;
+    if (base_url != NULL || get != NULL) {
+        p->base_url = base_url != NULL ? strdup(base_url) : NULL;
+        if ((base_url != NULL && p->base_url == NULL) || pthread_create(&p->th, NULL, refresher, p) != 0) {
             firc_kn_policies_stop(p);
             return NULL;
         }
         p->running = true;
     }
     return p;
+}
+
+firc_kn_policies_t *firc_kn_policies_start_notify(const char *base_url, unsigned refresh_secs,
+                                                  firc_kn_policies_changed_fn on_change, void *ud) {
+    return start_with(base_url, refresh_secs, on_change, ud, NULL, NULL);
+}
+
+firc_kn_policies_t *firc_kn_policies_start_for_test(firc_kn_rci_get_fn get, void *ud, unsigned refresh_secs) {
+    return start_with(NULL, refresh_secs, NULL, NULL, get, ud);
 }
 
 firc_kn_policies_t *firc_kn_policies_start(const char *base_url, unsigned refresh_secs) {
@@ -1287,4 +1319,30 @@ firc_err_t firc_kn_policies_policy_nets(const char *policy, bool deny, firc_devs
                   skipped, skipped == 1 ? "" : "s", policy, skipped == 1 ? "is" : "are");
     }
     return FIRC_OK;
+}
+
+uint64_t firc_kn_policies_wake(firc_kn_policies_t *p, unsigned fresh_ms) {
+    if (p == NULL) { return 0; }
+    pthread_mutex_lock(&p->mu);
+    uint64_t want = 0;
+    uint64_t now = mono_ms();
+    if (p->running && !p->stop && (p->rounds == 0 || now - p->round_end_ms > fresh_ms)) {
+        if (p->in_round && now - p->round_start_ms <= fresh_ms) {
+            want = p->rounds + 1u;
+        } else {
+            p->wake = true;
+            pthread_cond_broadcast(&p->cv);
+            want = p->rounds + (p->in_round ? 2u : 1u);
+        }
+    }
+    pthread_mutex_unlock(&p->mu);
+    return want;
+}
+
+uint64_t firc_kn_policies_rounds(firc_kn_policies_t *p) {
+    if (p == NULL) { return 0; }
+    pthread_mutex_lock(&p->mu);
+    uint64_t n = p->rounds;
+    pthread_mutex_unlock(&p->mu);
+    return n;
 }

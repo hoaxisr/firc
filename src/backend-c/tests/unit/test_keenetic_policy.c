@@ -1,5 +1,7 @@
 #include "greatest.h"
 
+#include <errno.h>
+#include <inttypes.h>
 #include <sched.h>
 #include <signal.h>
 #include <unistd.h>
@@ -2167,6 +2169,230 @@ TEST a_mark_for_a_name_the_router_lacks_is_said_as_unknown(void) {
     PASS();
 }
 
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool hold;
+    bool fail;
+    int entered;
+} gate_rci_t;
+
+static firc_err_t gate_get(void *ud, const char *path, char **body) {
+    gate_rci_t *g = ud;
+    if (strcmp(path, "/rci/show/ip/hotspot") == 0) {
+        pthread_mutex_lock(&g->mu);
+        g->entered++;
+        pthread_cond_broadcast(&g->cv);
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += 5;
+        while (g->hold) {
+            if (pthread_cond_timedwait(&g->cv, &g->mu, &until) == ETIMEDOUT) { break; }
+        }
+        bool fail = g->fail;
+        pthread_mutex_unlock(&g->mu);
+        if (fail) { return FIRC_ERR_IO; }
+    }
+    rci_fake_t r = {NULL, 0, NULL, NULL, NULL};
+    return fake_get(&r, path, body);
+}
+
+static void gate_init(gate_rci_t *g) {
+    pthread_mutex_init(&g->mu, NULL);
+    pthread_cond_init(&g->cv, NULL);
+    g->hold = false;
+    g->fail = false;
+    g->entered = 0;
+}
+
+static void gate_set(gate_rci_t *g, bool hold) {
+    pthread_mutex_lock(&g->mu);
+    g->hold = hold;
+    pthread_cond_broadcast(&g->cv);
+    pthread_mutex_unlock(&g->mu);
+}
+
+static int gate_entered(gate_rci_t *g) {
+    pthread_mutex_lock(&g->mu);
+    int n = g->entered;
+    pthread_mutex_unlock(&g->mu);
+    return n;
+}
+
+static void nap_ms(long ms) {
+    struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+static bool rounds_reach(firc_kn_policies_t *p, uint64_t n, long ms) {
+    for (long t = 0; t < ms; t += 5) {
+        if (firc_kn_policies_rounds(p) >= n) { return true; }
+        nap_ms(5);
+    }
+    return firc_kn_policies_rounds(p) >= n;
+}
+
+static bool entered_reach(gate_rci_t *g, int n, long ms) {
+    for (long t = 0; t < ms; t += 5) {
+        if (gate_entered(g) >= n) { return true; }
+        nap_ms(5);
+    }
+    return gate_entered(g) >= n;
+}
+
+/* catches: a wake on a fresh map starting a round, or a wake without a refresher asking for one */
+TEST a_wake_on_a_fresh_map_asks_for_no_round(void) {
+    ASSERT_EQ_FMT((uint64_t)0, firc_kn_policies_wake(NULL, 0), "%" PRIu64);
+    firc_kn_policies_t *q = firc_kn_policies_start(NULL, 0);
+    ASSERT(q != NULL);
+    uint64_t idle = firc_kn_policies_wake(q, 0);
+    firc_kn_policies_stop(q);
+    ASSERT_EQ_FMTm("no refresher: nothing to wait for", (uint64_t)0, idle, "%" PRIu64);
+    gate_rci_t g;
+    gate_init(&g);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    bool first = rounds_reach(p, 1, 2000);
+    uint64_t w = firc_kn_policies_wake(p, 5000);
+    nap_ms(300);
+    uint64_t rounds = firc_kn_policies_rounds(p);
+    int entered = gate_entered(&g);
+    firc_kn_policies_stop(p);
+    ASSERTm("the first round runs at start", first);
+    ASSERT_EQ_FMTm("fresh: answer at once", (uint64_t)0, w, "%" PRIu64);
+    ASSERT_EQ_FMTm("and no round asked for", (uint64_t)1, rounds, "%" PRIu64);
+    ASSERT_EQ(1, entered);
+    PASS();
+}
+
+/* catches: a wake on a stale map left to the period, or the round to wait for off by one */
+TEST a_wake_on_a_stale_map_runs_a_round_at_once(void) {
+    gate_rci_t g;
+    gate_init(&g);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    bool first = rounds_reach(p, 1, 2000);
+    nap_ms(50);
+    uint64_t w = firc_kn_policies_wake(p, 10);
+    bool second = rounds_reach(p, 2, 2000);
+    nap_ms(200);
+    uint64_t rounds = firc_kn_policies_rounds(p);
+    firc_kn_policies_stop(p);
+    ASSERT(first);
+    ASSERT_EQ_FMTm("the round after the wake", (uint64_t)2, w, "%" PRIu64);
+    ASSERTm("runs long before the hour", second);
+    ASSERT_EQ_FMTm("one wake, one round", (uint64_t)2, rounds, "%" PRIu64);
+    PASS();
+}
+
+/* catches: a failed round not counted, or not dated, so its waiter waits out the bound */
+TEST a_failed_round_counts_as_finished(void) {
+    gate_rci_t g;
+    gate_init(&g);
+    g.fail = true;
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    firc_log_set_output_floor(FIRC_LOG_ERROR);
+    bool first = rounds_reach(p, 1, 500);
+    uint64_t fresh = firc_kn_policies_wake(p, 5000);
+    nap_ms(50);
+    uint64_t w = firc_kn_policies_wake(p, 10);
+    bool second = rounds_reach(p, 2, 500);
+    firc_kn_policies_stop(p);
+    firc_log_set_output_floor(FIRC_LOG_DEBUG);
+    ASSERTm("a failed round is a finished round", first);
+    ASSERT_EQ_FMTm("and ends a wait like any other", (uint64_t)0, fresh, "%" PRIu64);
+    ASSERT_EQ_FMT((uint64_t)2, w, "%" PRIu64);
+    ASSERTm("woken before the retry", second);
+    PASS();
+}
+
+/* catches: a wake during a round taken as served by it, or lost when that round ends */
+TEST a_wake_during_a_round_waits_for_the_next(void) {
+    gate_rci_t g;
+    gate_init(&g);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    bool first = rounds_reach(p, 1, 2000);
+    gate_set(&g, true);
+    nap_ms(20);
+    uint64_t w1 = firc_kn_policies_wake(p, 0);
+    bool in_round = entered_reach(&g, 2, 2000);
+    nap_ms(20);
+    uint64_t w2 = firc_kn_policies_wake(p, 0);
+    gate_set(&g, false);
+    bool third = rounds_reach(p, 3, 2000);
+    firc_kn_policies_stop(p);
+    ASSERT(first);
+    ASSERT_EQ_FMT((uint64_t)2, w1, "%" PRIu64);
+    ASSERT(in_round);
+    ASSERT_EQ_FMTm("the round under way does not count", (uint64_t)3, w2, "%" PRIu64);
+    ASSERTm("the next starts once it ends", third);
+    PASS();
+}
+
+/* catches: a wake during a round that started within fresh_ms asking for one more round */
+TEST a_wake_during_a_fresh_round_is_served_by_it(void) {
+    gate_rci_t g;
+    gate_init(&g);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    bool first = rounds_reach(p, 1, 2000);
+    gate_set(&g, true);
+    nap_ms(150);
+    uint64_t w1 = firc_kn_policies_wake(p, 100);
+    bool in_round = entered_reach(&g, 2, 2000);
+    uint64_t w2 = firc_kn_policies_wake(p, 100);
+    gate_set(&g, false);
+    bool second = rounds_reach(p, 2, 2000);
+    nap_ms(200);
+    uint64_t rounds = firc_kn_policies_rounds(p);
+    int entered = gate_entered(&g);
+    firc_kn_policies_stop(p);
+    ASSERT(first);
+    ASSERT_EQ_FMT((uint64_t)2, w1, "%" PRIu64);
+    ASSERT(in_round);
+    ASSERT_EQ_FMTm("the round under way serves it", (uint64_t)2, w2, "%" PRIu64);
+    ASSERT(second);
+    ASSERT_EQ_FMTm("and no round follows", (uint64_t)2, rounds, "%" PRIu64);
+    ASSERT_EQ(2, entered);
+    PASS();
+}
+
+static void *open_later(void *ud) {
+    nap_ms(100);
+    gate_set(ud, false);
+    return NULL;
+}
+
+/* catches: a stop with a wake pending starting another round, or hanging on it */
+TEST a_stop_with_a_wake_pending_joins(void) {
+    gate_rci_t g;
+    gate_init(&g);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(gate_get, &g, 3600);
+    ASSERT(p != NULL);
+    bool first = rounds_reach(p, 1, 2000);
+    gate_set(&g, true);
+    nap_ms(20);
+    (void)firc_kn_policies_wake(p, 0);
+    bool in_round = entered_reach(&g, 2, 2000);
+    nap_ms(20);
+    uint64_t pending = firc_kn_policies_wake(p, 0);
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, open_later, &g));
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_kn_policies_stop(p);
+    long took = ms_since(&t0);
+    pthread_join(th, NULL);
+    ASSERT(first);
+    ASSERT(in_round);
+    ASSERT_EQ_FMT((uint64_t)3, pending, "%" PRIu64);
+    ASSERTm("stop ends with the round under way", took < 2000);
+    ASSERT_EQm("and starts no other", 2, gate_entered(&g));
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2239,5 +2465,11 @@ int main(int argc, char **argv) {
     RUN_TEST(the_loop_s_segment_lookup_answers_from_the_latest_map);
     RUN_TEST(a_skipped_allow_segment_is_said_once);
     RUN_TEST(a_skipped_deny_segment_is_not_said);
+    RUN_TEST(a_wake_on_a_fresh_map_asks_for_no_round);
+    RUN_TEST(a_wake_on_a_stale_map_runs_a_round_at_once);
+    RUN_TEST(a_failed_round_counts_as_finished);
+    RUN_TEST(a_wake_during_a_round_waits_for_the_next);
+    RUN_TEST(a_wake_during_a_fresh_round_is_served_by_it);
+    RUN_TEST(a_stop_with_a_wake_pending_joins);
     GREATEST_MAIN_END();
 }

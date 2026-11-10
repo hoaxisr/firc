@@ -80,6 +80,12 @@ typedef bool (*firc_kn_policies_changed_fn)(void *ud);
 /* As start, announcing every changed map to on_change (nullable). */
 firc_kn_policies_t *firc_kn_policies_start_notify(const char *base_url, unsigned refresh_secs,
                                                   firc_kn_policies_changed_fn on_change, void *ud);
+/* As start, reading RCI through get instead of HTTP. */
+firc_kn_policies_t *firc_kn_policies_start_for_test(firc_kn_rci_get_fn get, void *ud, unsigned refresh_secs);
+/* 0 when the last finished round ended <= fresh_ms ago (or no refresher); else wakes it, returns the round to wait for. */
+uint64_t firc_kn_policies_wake(firc_kn_policies_t *p, unsigned fresh_ms);
+/* Rounds finished so far, failed ones included. */
+uint64_t firc_kn_policies_rounds(firc_kn_policies_t *p);
 /* Ends the refresher and frees everything; blocks until it and every wait_first caller are gone; p is dead after. */
 void firc_kn_policies_stop(firc_kn_policies_t *p);
 /* Hands over the next map (takes ownership, any thread); the reading thread collects it on its next check. */

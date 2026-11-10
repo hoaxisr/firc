@@ -28,6 +28,7 @@ typedef struct firc_system_ctx {
     const struct firc_dnsproxy *dnsproxy; /* its listening state for the settings answer; NULL: not reported */
     firc_update_t *update; /* the updater, whose install refuses a restart; NULL if none */
     struct ifaces_read *ifaces_read; /* the interface read in flight, NULL if none; loop thread only */
+    struct fresh_waiter *fresh_waiters; /* hosts and policies answers waiting for a refresh; loop thread only */
     void (*iface_event)(void *ud, const char *iface); /* an NDM layer event on iface; NULL ignores them */
     void *iface_event_ud;
     firc_dnsstat_t *dnsstat; /* the day's DNS counts, owned, loop thread only; NULL while the stats are off */
@@ -50,8 +51,8 @@ void firc_system_hosts_mark_running(struct cJSON *hosts, firc_ifnet4_t *nets, si
  * FIRC_ERR_NOMEM: no store, the stats stay off */
 firc_err_t firc_system_dnsstats_start(firc_system_ctx_t *ctx);
 
-/* waits out an interface read in flight and drops its callers, frees the DNS stats; after the loop stops, before the
- * servers go */
+/* waits out an interface read in flight and drops its callers and those waiting for a policy refresh, frees the
+ * DNS stats; after the loop stops, before the servers go */
 void firc_system_close(firc_system_ctx_t *ctx);
 
 /* names each tunnel device in ifaces by its tunnel's description, over any alias; ts NULL changes nothing */
