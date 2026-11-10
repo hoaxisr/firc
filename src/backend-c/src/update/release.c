@@ -9,6 +9,7 @@
 #include <curl/curl.h>
 
 #include "firc/json.h"
+#include "firc/utf8.h"
 
 static const char *part(const char *s, uint32_t *out) {
     uint32_t v = 0;
@@ -82,7 +83,7 @@ size_t firc_release_asset_name(char *buf, size_t cap, const firc_version_t *v, c
 }
 
 static void copy_clamped(char *dst, size_t cap, const char *src) {
-    int n = firc_api_utf8_clamp(src, (int)cap - 1);
+    int n = firc_utf8_clamp(src, (int)cap - 1);
     memcpy(dst, src, (size_t)n);
     dst[n] = '\0';
 }
@@ -167,7 +168,7 @@ firc_err_t firc_release_parse(const char *json, size_t len, const firc_release_w
     }
     const char *body = string_of(root, "body");
     if (body == NULL) { body = ""; }
-    int nn = firc_api_utf8_clamp(body, FIRC_RELEASE_NOTES_MAX);
+    int nn = firc_utf8_clamp(body, FIRC_RELEASE_NOTES_MAX);
     out->notes = malloc((size_t)nn + 1);
     if (out->notes == NULL) {
         cJSON_Delete(root);

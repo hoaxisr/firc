@@ -18,6 +18,7 @@
 #include "firc/keenetic_rci.h"
 #include "firc/mark.h"
 #include "firc/json.h"
+#include "firc/utf8.h"
 #include "firc/hash.h"
 #include "firc/log.h"
 #include "firc/logrep.h"
@@ -1738,7 +1739,7 @@ firc_err_t firc_app_patch_list_rules(firc_app_t *app, firc_id_t id, const firc_l
         const char *why = NULL;
         if (!firc_rule_spec_is_usable(edits[i].type, text, proto, ports, &why)) {
             snprintf(msg, msg_len, "rule \"%.*s\" (type \"%.*s\"): %.90s",
-                     firc_api_utf8_clamp(text, 120), text, firc_api_utf8_clamp(edits[i].type, 20),
+                     firc_utf8_clamp(text, 120), text, firc_utf8_clamp(edits[i].type, 20),
                      edits[i].type, why != NULL ? why : "unusable");
             err = FIRC_ERR_INVAL;
             break;

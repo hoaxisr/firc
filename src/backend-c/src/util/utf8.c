@@ -40,3 +40,11 @@ bool firc_text_has_control(const char *s)
     }
     return false;
 }
+
+int firc_utf8_clamp(const char *s, int max_bytes) {
+    int n = 0;
+    while (n < max_bytes && s[n] != '\0') { n++; } /* cppcheck arrayIndexThenCheck */
+    if (s[n] == '\0') { return n; }
+    while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80) { n--; }
+    return n;
+}

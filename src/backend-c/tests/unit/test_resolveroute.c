@@ -86,6 +86,22 @@ TEST precedence_is_server_then_firmware_then_none(void)
     PASS();
 }
 
+/* Catches: the route's group name cut by bytes, leaving half an emoji. */
+TEST a_long_group_name_is_cut_on_a_character_in_the_route(void)
+{
+    char name[200] = "a";
+    for (int i = 0; i < 20; i++) { strcat(name, "\xf0\x9f\x98\x80"); }
+    firc_group_t *g = group(name, "nwg0", 1);
+    firc_resolve_input_t in[] = {{.group = g, .mark = MARK1}};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(in, 1, NULL, &t));
+    ASSERT_EQ((size_t)61, strlen(t.items[0].group_name));
+    ASSERT(memcmp(name, t.items[0].group_name, 61) == 0);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
 /* Catches: a group with mark 0 counted as usable, so its query leaves by the WAN. */
 TEST a_group_with_no_mark_is_not_usable(void)
 {
@@ -828,6 +844,7 @@ int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(precedence_is_server_then_firmware_then_none);
+    RUN_TEST(a_long_group_name_is_cut_on_a_character_in_the_route);
     RUN_TEST(a_group_with_no_mark_is_not_usable);
     RUN_TEST(v4_first_and_v6_only_with_a_v6_route);
     RUN_TEST(a_groups_own_servers_are_all_routed_in_order);

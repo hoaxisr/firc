@@ -30,14 +30,6 @@ char *firc_json_dump(const cJSON *obj) {
     return cJSON_PrintUnformatted(obj);
 }
 
-int firc_api_utf8_clamp(const char *s, int max_bytes) {
-    int n = 0;
-    while (n < max_bytes && s[n] != '\0') { n++; } /* "scan at most max_bytes"; cppcheck arrayIndexThenCheck */
-    if (s[n] == '\0') { return n; }
-    while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80) { n--; } /* step back to the lead byte of a split char */
-    return n;
-}
-
 static cJSON *strings_to_json_array(char *const *items, size_t n) {
     cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; arr != NULL && i < n; i++) {

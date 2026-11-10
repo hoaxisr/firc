@@ -482,3 +482,35 @@ describe("matchesQuery by device", () => {
     assert.strictEqual(matchesQuery(dns({ client: "192.168.1.43" }), "phone", names), false);
   });
 });
+
+describe("the group's current name", () => {
+  const names = new Map([["g1", "Instagram & FB [Сейчас работает]"]]);
+  it("replaces the stored name in a DNS tail when the id is known", () => {
+    // catches: the stored, cut name shown though the group is known by id
+    const e = dns({ group: { id: "g1", name: "Instagram & FB [Сейчас рабо\ufffd" } });
+    assert.strictEqual(
+      describeDnsTail(e, id, names),
+      "A → Instagram & FB [Сейчас работает] · issued 198.18.0.5 (142.250.1.1)",
+    );
+  });
+  it("keeps the stored name of a DNS event whose group is deleted", () => {
+    // catches: a deleted group's events losing their name, or showing another group's
+    const e = dns({ group: { id: "gone", name: "old" } });
+    assert.strictEqual(describeDnsTail(e, id, names), "A → old · issued 198.18.0.5 (142.250.1.1)");
+    assert.strictEqual(describeDnsTail(e, id), "A → old · issued 198.18.0.5 (142.250.1.1)");
+  });
+  it("replaces the stored name in a bypass tail when the id is known", () => {
+    // catches: the bypass row still showing the stored name
+    const e = bypass({ group: { id: "g1", name: "Instagram & FB [Сейчас рабо\ufffd" } });
+    assert.ok(
+      describeBypassTail(e, id, stamp, names).includes(
+        " · Instagram & FB [Сейчас работает] · by address",
+      ),
+    );
+  });
+  it("keeps the stored name of a bypass event whose group is deleted", () => {
+    // catches: a deleted group's bypass row losing its name
+    const e = bypass({ group: { id: "gone", name: "old" } });
+    assert.ok(describeBypassTail(e, id, stamp, names).includes(" · old · by address"));
+  });
+});

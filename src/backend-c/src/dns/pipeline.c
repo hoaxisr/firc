@@ -10,6 +10,7 @@
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/resolver_addr.h"
+#include "firc/utf8.h"
 
 #define FIRC_DNS_OUTAGE_RUN 8
 #define FIRC_DNS_OUTAGE_ERROR_AFTER_MS 60000u
@@ -235,7 +236,9 @@ static void journal_group(firc_event_t *ev, const firc_group_snapshot_t *g)
 {
     if (ev == NULL || g == NULL) { return; }
     firc_id_format(g->id, ev->u.dns.group_id);
-    snprintf(ev->u.dns.group_name, sizeof(ev->u.dns.group_name), "%s", g->name ? g->name : "");
+    const char *gn = g->name ? g->name : "";
+    snprintf(ev->u.dns.group_name, sizeof(ev->u.dns.group_name), "%.*s",
+             firc_utf8_clamp(gn, (int)sizeof(ev->u.dns.group_name) - 1), gn);
 }
 
 /* The recall gets only rcode-0 A/AAAA answers for owned names; others evict useful pairs. */

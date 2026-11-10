@@ -11,6 +11,7 @@
 #include "firc/ifacename.h"
 #include "firc/log.h"
 #include "firc/json.h"
+#include "firc/utf8.h"
 #include "firc/resolve_check.h"
 #include "firc/resolver_addr.h"
 #include "firc/sub_fetch.h"
@@ -115,13 +116,13 @@ static const char *locate_rule(char *buf, size_t len, const char *group_name, co
     snprintf(num, sizeof(num), "%d", index + 1);
     const char *q = by_pattern ? "\"" : "";
     const char *which = by_pattern ? pattern : num;
-    int wn = firc_api_utf8_clamp(which, 120); /* bounded so the whole message fits FIRC_RULE_WHERE_MAX */
+    int wn = firc_utf8_clamp(which, 120); /* bounded so the whole message fits FIRC_RULE_WHERE_MAX */
     const char *cut = (by_pattern && which[wn] != '\0') ? "..." : ""; /* a truncated pattern must not read as one that exists */
     const char *t = (type != NULL && *type != '\0') ? type : "?";
-    int tn = firc_api_utf8_clamp(t, 20); /* client-supplied too; must stay UTF-8-clamped like the pattern */
+    int tn = firc_utf8_clamp(t, 20); /* client-supplied too; must stay UTF-8-clamped like the pattern */
     if (group_name != NULL && *group_name != '\0') {
         snprintf(buf, len, "group \"%.*s\", rule %s%.*s%s%s (type \"%.*s\"): %.90s",
-                 firc_api_utf8_clamp(group_name, 60), group_name, q, wn, which, cut, q, tn, t, why);
+                 firc_utf8_clamp(group_name, 60), group_name, q, wn, which, cut, q, tn, t, why);
     } else {
         snprintf(buf, len, "rule %s%.*s%s%s (type \"%.*s\"): %.90s", q, wn, which, cut, q, tn, t,
                  why);

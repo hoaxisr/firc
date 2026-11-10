@@ -7,6 +7,7 @@
 #include "firc/events.h"
 #include "firc/id.h"
 #include "firc/tappacket.h"
+#include "firc/utf8.h"
 
 typedef struct {
     firc_tap_drain_t *w;
@@ -32,8 +33,9 @@ static void put_bypass(drain_turn_t *t, const firc_tap_find_t *f, const firc_ip_
     b->how = f->how;
     snprintf(b->name, sizeof(b->name), "%s", f->name);
     firc_id_format(f->group->id, b->group_id);
-    snprintf(b->group_name, sizeof(b->group_name), "%s",
-             f->group->name != NULL ? f->group->name : "");
+    const char *gn = f->group->name != NULL ? f->group->name : "";
+    snprintf(b->group_name, sizeof(b->group_name), "%.*s",
+             firc_utf8_clamp(gn, (int)sizeof(b->group_name) - 1), gn);
     /* What firc last told this address about this name; the address may not be the one that asked. */
     firc_recall_answer_t a;
     const unsigned family = dst->len == 16 ? FIRC_RECALL_V6 : FIRC_RECALL_V4;

@@ -2000,6 +2000,28 @@ TEST an_unmatched_name_from_a_covered_client_is_journalled(void) {
     PASS();
 }
 
+/* Catches: the journal's group name cut by bytes, leaving half a Cyrillic letter. */
+TEST a_long_group_name_is_cut_on_a_character_in_the_event(void) {
+    firc_event_reset_for_test();
+    char name[200] = "";
+    for (int i = 0; i < 30; i++) { strcat(name, "\xd0\x96"); }
+    firc_config_t cfg = make_cfg();
+    add_group(&cfg, 1, name, FIRC_RULE_NAMESPACE, "example.com");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    static const char *q[] = {"nx", "example", "com"};
+    firc_dns_msg_t *msg = plain_answer(q, 3, 3);
+    (void)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL);
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    ASSERT_EQ_FMT((size_t)46, strlen(ev[0].u.dns.group_name), "%zu");
+    ASSERT(memcmp(name, ev[0].u.dns.group_name, 46) == 0);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
 /* Catches: an NXDOMAIN not journalled, or journalled without its rcode. */
 TEST a_failed_answer_is_journalled_with_its_rcode(void) {
     firc_event_reset_for_test();
@@ -2724,6 +2746,7 @@ int main(int argc, char **argv)
     RUN_TEST(the_journal_says_where_the_answer_came_from);
     RUN_TEST(an_unmatched_name_from_a_covered_client_is_journalled);
     RUN_TEST(a_failed_answer_is_journalled_with_its_rcode);
+    RUN_TEST(a_long_group_name_is_cut_on_a_character_in_the_event);
     RUN_TEST(a_blocked_answer_is_journalled_with_its_rcode);
     RUN_TEST(an_upstream_answer_for_a_block_owner_is_blocked_not_issued);
     RUN_TEST(a_notify_for_a_block_owner_is_not_blocked);

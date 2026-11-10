@@ -15,12 +15,14 @@ static firc_ip_t v4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     return ip;
 }
 
+static const char *snap_group_name = "media";
+
 static firc_ruleset_snapshot_t *make_snap(void) {
     firc_config_t cfg;
     firc_config_init_defaults(&cfg);
     firc_group_t *g = firc_group_new();
     g->id = (firc_id_t){{1, 0, 0, 0}};
-    firc_strset(&g->name, "media");
+    firc_strset(&g->name, snap_group_name);
     g->enable = true;
     g->devices.allow = calloc(2, sizeof(char *));
     g->devices.allow[0] = strdup("192.168.1.0/24");
@@ -263,6 +265,24 @@ TEST a_bypass_reads_the_answer_of_its_own_family(void) {
     PASS();
 }
 
+/* Catches: the bypass event's group name cut by bytes, leaving half a character. */
+TEST a_long_group_name_is_cut_on_a_character_in_the_bypass_event(void) {
+    char name[200] = "\xd0\x96";
+    for (int i = 0; i < 20; i++) { strcat(name, "\xf0\x9f\x98\x80"); }
+    snap_group_name = name;
+    rig_t r;
+    ASSERT(rig_up(&r));
+    snap_group_name = "media";
+    firc_ip_t real = v4(104, 21, 0, 5), asked = v4(192, 168, 1, 42);
+    firc_recall_real(r.recall, &real, "video.example.com", "01000000", 900);
+    ASSERT_EQ_FMT((size_t)1, syn(&r, &asked, &real, 443), "%zu");
+    ASSERT_EQ_FMT((size_t)1, read_events(ev, 8), "%zu");
+    ASSERT_EQ_FMT((size_t)46, strlen(ev[0].u.bypass.group_name), "%zu");
+    ASSERT(memcmp(name, ev[0].u.bypass.group_name, 46) == 0);
+    rig_down(&r);
+    PASS();
+}
+
 /* Catches: a hello to an unrecalled address not judged by its SNI. */
 TEST a_hello_becomes_a_bypass_event_by_sni(void) {
     rig_t r;
@@ -476,6 +496,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_new_connection_to_a_recalled_address_becomes_a_bypass_event);
     RUN_TEST(a_bypass_reads_the_answer_of_its_own_family);
     RUN_TEST(a_hello_becomes_a_bypass_event_by_sni);
+    RUN_TEST(a_long_group_name_is_cut_on_a_character_in_the_bypass_event);
     RUN_TEST(the_same_flow_on_both_sockets_is_one_event);
     RUN_TEST(an_uncovered_client_is_no_event);
     RUN_TEST(a_datagram_the_reader_could_not_finish_is_lost_packets);

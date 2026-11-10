@@ -7,6 +7,7 @@
 #include "firc/log.h"
 #include "firc/models.h"
 #include "firc/rulesnap.h"
+#include "firc/utf8.h"
 
 struct firc_resolve_router {
     firc_dns_pipeline_t *pipeline;
@@ -55,7 +56,9 @@ static void route_fill(const firc_resolve_input_t *in, firc_resolve_route_t *r)
     memset(r, 0, sizeof(*r));
     const firc_group_t *g = in->group;
     r->group_id = g->id;
-    snprintf(r->group_name, sizeof(r->group_name), "%s", g->name != NULL ? g->name : "");
+    const char *gn = g->name != NULL ? g->name : "";
+    snprintf(r->group_name, sizeof(r->group_name), "%.*s",
+             firc_utf8_clamp(gn, (int)sizeof(r->group_name) - 1), gn);
     snprintf(r->iface, sizeof(r->iface), "%s", in->iface != NULL ? in->iface : (g->iface != NULL ? g->iface : ""));
     r->blackhole = in->blackhole;
     r->mark = in->mark;

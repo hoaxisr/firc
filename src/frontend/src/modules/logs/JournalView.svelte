@@ -77,6 +77,8 @@
     groupFilterOptions(knownGroups.loaded ? knownGroups.list : null, journal.seenGroups, t),
   );
 
+  const groupNames = $derived(new Map(knownGroups.list.map((g) => [g.id, g.name])));
+
   const captureClock = $derived.by(() => {
     const m = Math.floor(capture.secondsLeft / 60);
     const s = capture.secondsLeft % 60;
@@ -154,7 +156,7 @@
   const decisionClass = (e: DnsEvent) => `dns ${e.decision}`;
 
   function dnsTail(e: DnsEvent): [string, string] {
-    const tail = describeDnsTail(e, t);
+    const tail = describeDnsTail(e, t, groupNames);
     const red = blockedPart(e, t);
     if (!red || !tail.endsWith(red)) return [tail, ""];
     return [tail.slice(0, tail.length - red.length), red];
@@ -305,7 +307,7 @@
           {/if}
         </span>
         <span class="name">{e.name}</span>
-        <span class="tail">{describeBypassTail(e, t, stamp)}</span>
+        <span class="tail">{describeBypassTail(e, t, stamp, groupNames)}</span>
       </span>
     </div>
   {/if}

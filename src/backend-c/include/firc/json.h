@@ -13,9 +13,6 @@ typedef struct firc_group_list firc_group_list_t; /* full definition in firc/mod
 /* {"error": "<msg>"}; caller owns the result (cJSON_Delete) */
 cJSON *firc_json_error(const char *msg);
 
-/* longest prefix of s that is <= max_bytes and ends on a UTF-8 boundary */
-int firc_api_utf8_clamp(const char *s, int max_bytes);
-
 /* true and *out set when j is a whole number in 0..max, checked on the double before any cast */
 bool firc_json_whole(const cJSON *j, double max, uint64_t *out);
 

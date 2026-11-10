@@ -111,8 +111,14 @@ export function matchesQuery(
   );
 }
 
-export function describeDns(e: DnsEvent, t: (s: string) => string): string {
-  return `${e.name} ${describeDnsTail(e, t)}`;
+export type GroupNames = ReadonlyMap<string, string>;
+
+function groupLabel(g: { id: string; name: string } | undefined, names?: GroupNames): string {
+  return g ? `${names?.get(g.id) ?? g.name} · ` : "";
+}
+
+export function describeDns(e: DnsEvent, t: (s: string) => string, names?: GroupNames): string {
+  return `${e.name} ${describeDnsTail(e, t, names)}`;
 }
 
 export function resolverNote(r: DnsResolverSource | undefined, t: (s: string) => string): string {
@@ -140,9 +146,9 @@ export function resolverNote(r: DnsResolverSource | undefined, t: (s: string) =>
   }
 }
 
-export function describeDnsTail(e: DnsEvent, t: (s: string) => string): string {
+export function describeDnsTail(e: DnsEvent, t: (s: string) => string, names?: GroupNames): string {
   const note = e.decision === "blocked" ? "" : resolverNote(e.resolver, t);
-  const tail = decisionTail(e, t);
+  const tail = decisionTail(e, t, names);
   return note ? `${tail} · ${note}` : tail;
 }
 
@@ -159,9 +165,9 @@ export function blockedPart(e: DnsEvent, t: (s: string) => string): string | nul
   return t("blocked: {code}").replace("{code}", () => code);
 }
 
-function decisionTail(e: DnsEvent, t: (s: string) => string): string {
+function decisionTail(e: DnsEvent, t: (s: string) => string, names?: GroupNames): string {
   const head = `${e.qtype} →`;
-  const group = e.group ? `${e.group.name} · ` : "";
+  const group = groupLabel(e.group, names);
   switch (e.decision) {
     case "issued": {
       if (e.fake === undefined) {
@@ -207,9 +213,10 @@ export function describeBypassTail(
   e: BypassEvent,
   t: (s: string) => string,
   stamp: (at: number) => string,
+  names?: GroupNames,
 ): string {
   const port = e.port !== undefined ? `:${e.port}` : "";
-  const group = e.group ? `${e.group.name} · ` : "";
+  const group = groupLabel(e.group, names);
   const how = e.how === "addr" ? t("by address") : t("by SNI");
   const times = e.repeats > 0 ? ` (×${e.repeats})` : "";
   return `→ ${e.dst}${port}/${e.proto} · ${group}${how} · ${describeBypassLast(e, t, stamp)}${times}`;

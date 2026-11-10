@@ -10,6 +10,7 @@
 #include <cjson/cJSON.h>
 
 #include "firc/json.h"
+#include "firc/utf8.h"
 #include "firc/log.h"
 
 #define JSON_TYPE "application/json; charset=utf-8"
@@ -243,7 +244,7 @@ static void handle_install(firc_http_req_t *req, firc_http_res_t *res, void *ud)
         firc_http_res_write_error(res, 400, "the body is {\"version\": \"<tag>\"}");
         return;
     }
-    int shown = firc_api_utf8_clamp(tag, 64);
+    int shown = firc_utf8_clamp(tag, 64);
     if (ctx->sys != NULL && firc_system_restart_under_way(ctx->sys)) {
         firc_http_res_write_error(res, 409, "a restart is under way");
         cJSON_Delete(json);
