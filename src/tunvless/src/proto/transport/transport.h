@@ -118,6 +118,7 @@ struct tr_link {
      * carries our TLS records but the target connection's stream as is. Set from outside by the
      * Vision frame parser (transport_direct), because the command lives in those frames. */
     int rx_direct;
+    int tx_direct;
     int nopq;
     struct tls13 tls;
 };
@@ -402,6 +403,9 @@ int transport_has_data(const struct transport *t);
 /* The server announced direct copy (Vision): from now on the socket carries the stream as is, not
  * TLS records. Called by the protocol frame parser. */
 void transport_direct(struct transport *t);
+
+void transport_tx_direct(struct transport *t);
+int  transport_can_tx_direct(const struct transport *t);
 
 /* The struct moved in memory: fix the pointers to itself (transport_ops.moved). */
 void transport_moved(struct transport *t);

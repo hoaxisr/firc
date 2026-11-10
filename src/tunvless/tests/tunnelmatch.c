@@ -93,6 +93,8 @@ static int g_send_calls;
 static size_t g_send_last_n;          /* length of the last transport_write */
 static size_t g_send_sz[64];
 static int g_send_szn;
+static int g_tx_direct_n;
+static int g_send_dir[64];
 static int g_send_ok_first;
 static int g_whole;
 static long g_grpc_win = -1;
@@ -156,7 +158,10 @@ int vless_connect(const struct vless_node *node, struct transport *conn, int tim
 int transport_write(struct transport *c, const unsigned char *d, size_t n) {
     g_send_calls++;
     g_send_last_n = n;
-    if (g_send_szn < 64) g_send_sz[g_send_szn++] = n;
+    if (g_send_szn < 64) {
+        g_send_dir[g_send_szn] = g_tx_direct_n;
+        g_send_sz[g_send_szn++] = n;
+    }
     if (g_grpc_win >= 0) {
         long cost = (long)n + 6 + (n < 128 ? 1 : n < 16384 ? 2 : 3);
         if (cost > g_grpc_win) return H2_EWINDOW;
@@ -247,6 +252,9 @@ int transport_due(struct transport *c, uint64_t now_ms, int *next_ms) {
 }
 long transport_mask_room(struct transport *c) { (void)c; return g_mask_room; }
 void transport_direct(struct transport *c) { c->link.rx_direct = 1; }
+static int g_can_direct = 1;
+void transport_tx_direct(struct transport *c) { (void)c; g_tx_direct_n++; }
+int transport_can_tx_direct(const struct transport *c) { (void)c; return g_can_direct; }
 int tr_xmux_shares(const struct tr_node *n) { (void)n; return 0; }
 int tr_xmux_attach(struct transport *t, const struct tr_node *n, const void *key, const void *dl_key,
                    uint16_t owner, const struct xc_ref *ref)
@@ -413,16 +421,15 @@ static void server_first(const char *flow, size_t header_n) {
              flow[0] ? ", Vision" : "");
     check(g_send_calls == calls && c->our_seq == 2, what);
     cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
-    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS / 2) * 1000000ull);
-    snprintf(what, sizeof(what), "server first%s: nothing sent before %d ms", flow[0] ? ", Vision" : "",
-             SERVER_FIRST_MS);
+    conn_deadlines(c, &g_tun, c->estab_ns + 499 * 1000000ull);
+    snprintf(what, sizeof(what), "server first%s: nothing sent at 499 ms", flow[0] ? ", Vision" : "");
     check(g_send_calls == calls, what);
-    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 50) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + 500 * 1000000ull);
     const struct vl_sess *vs = SESS(c);
-    snprintf(what, sizeof(what), "server first%s: then the %zu-byte header alone",
+    snprintf(what, sizeof(what), "server first%s: then at 500 ms the %zu-byte header alone",
              flow[0] ? ", Vision" : "", header_n);
     check(g_send_calls == calls + 1 && g_send_last_n == header_n && vs->header_sent, what);
-    conn_deadlines(c, &g_tun, c->estab_ns + (SERVER_FIRST_MS + 100) * 1000000ull);
+    conn_deadlines(c, &g_tun, c->estab_ns + 600 * 1000000ull);
     snprintf(what, sizeof(what), "server first%s: and only once", flow[0] ? ", Vision" : "");
     check(g_send_calls == calls + 1, what);
     conn_drop(c);
@@ -433,6 +440,151 @@ static void server_first(const char *flow, size_t header_n) {
 static void t_server_first(void) {
     server_first("", 26);                    /* version, UUID, no addons, cmd, port, IPv4 */
     server_first("xtls-rprx-vision", 44);    /* plus the flow addon: 0a 10 "xtls-rprx-vision" */
+}
+
+static struct conn *sf_pending(int connect_ms) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
+    __atomic_store_n(&g_connect_ms, connect_ms, __ATOMIC_RELEASE);
+    struct flow_key k = cli_key();
+    g_now_ns = now_ns();
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    struct conn *c = conn_find(&k);
+    return c && c->pending ? c : NULL;
+}
+
+static int sf_ready(struct conn *c) {
+    for (int i = 0; i < 3000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    __atomic_store_n(&g_connect_ms, 0, __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) return -1;
+    g_now_ns = now_ns();
+    return conn_ready(c, &g_tun);
+}
+
+static void sf_end(struct conn *c) {
+    __atomic_store_n(&g_connect_ms, 0, __ATOMIC_RELEASE);
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    g_node.flow[0] = 0;
+}
+
+/* catches: the wait counted from the client's handshake while the link was still dialing */
+static void t_server_first_from_ready(void) {
+    struct conn *c = sf_pending(301);
+    if (!c) {
+        check(0, "server first from ready: fixture pending connection");
+        sf_end(NULL);
+        return;
+    }
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    uint64_t t0 = c->estab_ns;
+    int calls = g_send_calls;
+    if (sf_ready(c) != 0) {
+        check(0, "server first from ready: fixture flow ready");
+        sf_end(NULL);
+        return;
+    }
+    check(t0 && c->estab_ns >= t0 + 300 * 1000000ull,
+          "server first from ready: the wait starts when the link is ready");
+    conn_deadlines(c, &g_tun, t0 + 600 * 1000000ull);
+    check(g_send_calls == calls, "server first from ready: nothing 600 ms after the client's handshake");
+    conn_deadlines(c, &g_tun, c->estab_ns + 500 * 1000000ull);
+    check(g_send_calls == calls + 1 && g_send_last_n == 44,
+          "server first from ready: the header alone 500 ms after the link is ready");
+    sf_end(c);
+}
+
+/* catches: the helper's condition without sent_any, which keeps a flow that spoke waiting and spins the loop */
+static void t_server_first_early_twin(void) {
+    struct conn *c = sf_pending(100);
+    if (!c) {
+        check(0, "server first early: fixture pending connection");
+        sf_end(NULL);
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'e', sizeof d);
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    int held = c->early_n == 100;
+    int calls = g_send_calls;
+    g_send_szn = 0;
+    if (!held || sf_ready(c) != 0) {
+        check(0, "server first early: fixture early data and flow ready");
+        sf_end(NULL);
+        return;
+    }
+    check(g_send_calls == calls + 1 && g_send_last_n > 44 + 100 && !c->early,
+          "server first early: the header and the data in one send at ready");
+    int gone = conn_deadlines(c, &g_tun, c->estab_ns + 500 * 1000000ull);
+    if (!gone) gone = conn_deadlines(c, &g_tun, c->estab_ns + 1000 * 1000000ull);
+    int lone = 0;
+    for (int i = 0; i < g_send_szn; i++) lone |= g_send_sz[i] == 44;
+    check(!gone && g_send_calls == calls + 1 && !lone && first_wait_left(c, c->estab_ns + 1000 * 1000000ull) < 0,
+          "server first early: no lone header after the data");
+    sf_end(gone ? NULL : c);
+}
+
+/* catches: a flow the node already ended still waiting for its first payload */
+static void t_server_first_srv_closed(void) {
+    struct flow_key k = cli_key();
+    cli_send(1000, 0, TCP_SYN, 65535, NULL, 0);
+    struct conn *c = conn_find(&k);
+    if (!c || wait_ready(c, 2000) != 0) {
+        check(0, "server first closed: fixture connection");
+        if (c) conn_drop(c);
+        return;
+    }
+    g_now_ns = now_ns();
+    cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
+    g_recv_rc = -1;
+    g_recv_n = 0;
+    drain_conn(c, &g_tun);
+    g_recv_rc = 0;
+    c = conn_find(&k);
+    if (!c || !c->srv_closed || c->sent_any) {
+        check(0, "server first closed: fixture stream ended by the node");
+        if (c) conn_drop(c);
+        dev_drain(NULL);
+        return;
+    }
+    int calls = g_send_calls;
+    int64_t left = first_wait_left(c, c->estab_ns + 600 * 1000000ull);
+    int gone = conn_deadlines(c, &g_tun, c->estab_ns + 600 * 1000000ull);
+    check(left < 0 && g_send_calls == calls, "server first closed: no header into a stream the node ended");
+    if (!gone) conn_drop(c);
+    dev_drain(NULL);
+}
+
+/* catches: the helper's condition without early, which sends a lone header ahead of refused early data */
+static void t_server_first_early_refused(void) {
+    struct conn *c = sf_pending(100);
+    if (!c) {
+        check(0, "server first early refused: fixture pending connection");
+        sf_end(NULL);
+        return;
+    }
+    unsigned char d[100];
+    memset(d, 'e', sizeof d);
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+    int held = c->early_n == 100;
+    g_send_szn = 0;
+    g_send_again_n = 2;
+    if (!held || sf_ready(c) != 0 || !c->early) {
+        g_send_again_n = 0;
+        check(0, "server first early refused: fixture early data held at ready");
+        sf_end(NULL);
+        return;
+    }
+    int gone = conn_deadlines(c, &g_tun, c->estab_ns + 500 * 1000000ull);
+    int lone = 0;
+    for (int i = 0; i < g_send_szn; i++) lone |= g_send_sz[i] == 44;
+    if (!gone) gone = conn_deadlines(c, &g_tun, c->estab_ns + 600 * 1000000ull);
+    g_send_again_n = 0;
+    check(!gone && !lone && !c->early && g_send_last_n > 44 + 100,
+          "server first early refused: the data goes with the header, never a lone header first");
+    sf_end(gone ? NULL : c);
 }
 
 /* The node's room caps the client's window (dialer_ops.room). Before, the client was granted the
@@ -858,7 +1010,7 @@ static size_t first_header(int vision, unsigned char *h) {
 }
 
 static void t_first_write_as_xray(void) {
-    /* catches: header and data cut at the gather's own pieces (8192, 26, 808), not packed as Xray's BufferedWriter packs them */
+    /* catches: header and data cut at the gather's own pieces (8192, 26, 808), not packed as Xray's BufferedWriter packs them, or the Vision gather's first piece cut at 8148 with 44 B sent unframed */
     up_stream_fill();
     unsigned char h[64];
     size_t hn = first_header(0, h);
@@ -877,17 +1029,30 @@ static void t_first_write_as_xray(void) {
     if (!c) { check(0, "first write: Vision connection did not open"); up_close(NULL); return; }
     up_gather(1001, 9);
     up_flush(&g_tun);
-    const unsigned char *f = g_wire + 44;
-    size_t pad = g_wire_n >= 44 + 21 ? ((size_t)f[19] << 8) | f[20] : 999;
-    size_t clen = g_wire_n >= 44 + 21 ? ((size_t)f[17] << 8) | f[18] : 0;
-    check(hn == 44 && g_send_szn == 3 && g_send_sz[0] == 8192 && pad < 256 &&
-              g_send_sz[1] == 21 + pad && g_send_sz[2] == 852,
-          "first write, Vision, tunvless's deferred form (not Xray's): 8192, 21 + pad, 852");
-    check(g_wire_n == 44 + 21 + 8148 + pad + 852 && !memcmp(g_wire, h, 44) &&
-              !memcmp(f, g_hdr_uuid, 16) && f[16] == VISION_CMD_END && clen == 8148 &&
-              !memcmp(f + 21, g_up_stream, 8148) &&
-              !memcmp(f + 21 + 8148 + pad, g_up_stream + 8148, 852) && c->client_seq == 10001,
-          "first write, Vision, tunvless's deferred form: header, frame of 8148, then 852");
+    size_t vf[3][3] = {{0}};
+    size_t at = 44 + 16, vfn = 0;
+    int vok = g_wire_n >= at && !memcmp(g_wire, h, 44) && !memcmp(g_wire + 44, g_hdr_uuid, 16);
+    while (vok && vfn < 3 && at + 5 <= g_wire_n) {
+        const unsigned char *f = g_wire + at;
+        vf[vfn][0] = f[0];
+        vf[vfn][1] = ((size_t)f[1] << 8) | f[2];
+        vf[vfn][2] = ((size_t)f[3] << 8) | f[4];
+        at += 5 + vf[vfn][1] + vf[vfn][2];
+        vfn++;
+    }
+    vok = vok && vfn == 3 && at == g_wire_n;
+    size_t pa = vf[0][2], pb = vf[1][2], pc = vf[2][2];
+    check(hn == 44 && vok && g_send_szn == 3 && g_send_sz[0] == 8192 &&
+              g_send_sz[1] == 70 + pa + pb && g_send_sz[2] == 813 + pc &&
+              pa < 256 && pb < 256 && pc < 256,
+          "first write, Vision, as Xray: writes 8192, 70 + pads, 813 + pad");
+    check(vok && vf[0][0] == VISION_CMD_CONTINUE && vf[1][0] == VISION_CMD_CONTINUE &&
+              vf[2][0] == VISION_CMD_CONTINUE && vf[0][1] == 4096 && vf[1][1] == 4096 &&
+              vf[2][1] == 808 && !memcmp(g_wire + 60 + 5, g_up_stream, 4096) &&
+              !memcmp(g_wire + 60 + 5 + 4096 + pa + 5, g_up_stream + 4096, 4096) &&
+              !memcmp(g_wire + 60 + 15 + 8192 + pa + pb, g_up_stream + 8192, 808) &&
+              c->client_seq == 10001,
+          "Vision, as Xray: header + 4096 + 4096, then 808");
     up_close(c);
 
     hn = first_header(0, h);
@@ -946,9 +1111,333 @@ static void t_up_write_size(void) {
     vless_dialer.flow_open(&g_node, &s, &k, 0);
     vis = vless_dialer.up_write(&g_node, &s);
     g_node.flow[0] = 0;
-    check(v4 == 8192 - 26 && host == 8192 - 34 && v6 == 8192 - 38 && vis == 8192 - 44 &&
+    check(v4 == 8192 - 26 && host == 8192 - 34 && v6 == 8192 - 38 && vis == 8192 &&
               sent == 8192 && whole == 0,
-          "up_write: 8192 less the unsent header (IPv4 26, host 34, IPv6 38, Vision 44), then 8192");
+          "up_write: 8192 less the unsent header (IPv4 26, host 34, IPv6 38), Vision 8192, then 8192");
+}
+
+static size_t sh(unsigned char *o, unsigned cipher, int sv) {
+    size_t ext = sv ? 46 : 40, hl = 72 + ext, i = 0;
+    o[i++] = 0x16; o[i++] = 0x03; o[i++] = 0x03;
+    o[i++] = (unsigned char)((hl + 4) >> 8); o[i++] = (unsigned char)(hl + 4);
+    o[i++] = 0x02; o[i++] = 0x00; o[i++] = (unsigned char)(hl >> 8); o[i++] = (unsigned char)hl;
+    o[i++] = 0x03; o[i++] = 0x03;
+    memset(o + i, 0x11, 32); i += 32;
+    o[i++] = 0x20;
+    memset(o + i, 0x22, 32); i += 32;
+    o[i++] = (unsigned char)(cipher >> 8); o[i++] = (unsigned char)cipher;
+    o[i++] = 0x00;
+    o[i++] = (unsigned char)(ext >> 8); o[i++] = (unsigned char)ext;
+    if (sv) {
+        static const unsigned char v[6] = {0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
+        memcpy(o + i, v, 6); i += 6;
+    }
+    static const unsigned char ks[8] = {0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
+    memcpy(o + i, ks, 8); i += 8;
+    memset(o + i, 0x33, 32); i += 32;
+    return i;
+}
+
+static size_t vframe(unsigned char *o, int cmd, const unsigned char *d, size_t n) {
+    o[0] = (unsigned char)cmd;
+    o[1] = (unsigned char)(n >> 8);
+    o[2] = (unsigned char)n;
+    o[3] = 0;
+    o[4] = 0;
+    memcpy(o + 5, d, n);
+    return 5 + n;
+}
+
+static size_t down_head(unsigned char *o) {
+    o[0] = 0;
+    o[1] = 0;
+    memcpy(o + 2, g_hdr_uuid, 16);
+    return 18;
+}
+
+static int g_emit_n;
+static int down_emit(void *arg, const unsigned char *p, size_t n) {
+    (void)arg; (void)p; (void)n;
+    g_emit_n++;
+    return 0;
+}
+
+static size_t up_ch(unsigned char *b) {
+    static const unsigned char h[6] = {0x16, 0x03, 0x01, 0x05, 0xc1, 0x01};
+    memset(b, 0x42, 1478);
+    memcpy(b, h, 6);
+    return 1478;
+}
+
+static size_t up_fl(unsigned char *b) {
+    static const unsigned char h[11] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01, 0x17, 0x03, 0x03, 0x00, 0x35};
+    memcpy(b, h, 11);
+    memset(b + 11, 0xaa, 53);
+    return 64;
+}
+
+static size_t up_get(unsigned char *b) {
+    static const unsigned char h[5] = {0x17, 0x03, 0x03, 0x00, 0x77};
+    memcpy(b, h, 5);
+    memset(b + 5, 0x47, 119);
+    return 124;
+}
+
+static int wire_frame(size_t at, const unsigned char *d, size_t n) {
+    if (at + 5 + n > g_wire_n || ((size_t)g_wire[at + 1] << 8 | g_wire[at + 2]) != n) return -1;
+    if (memcmp(g_wire + at + 5, d, n)) return -1;
+    return g_wire[at];
+}
+
+static void switch_up(int can, int again) {
+    char what[112];
+    const char *tag = again ? ", resent" : can ? "" : ", gate shut";
+    static unsigned char d[2048];
+    unsigned char r[256], hs[160];
+    g_can_direct = can;
+    g_tx_direct_n = 0;
+    struct conn *c = first_open("xtls-rprx-vision");
+    if (!c) {
+        snprintf(what, sizeof what, "vision switch up%s: test connection did not open", tag);
+        check(0, what);
+        up_close(NULL);
+        g_can_direct = 1;
+        return;
+    }
+    struct vl_sess *vs = SESS(c);
+    size_t n = up_ch(d);
+    int s1 = upstream_send(c, d, n);
+    int ch = g_wire_n > 60 && !memcmp(g_wire + 44, g_hdr_uuid, 16) ? wire_frame(60, d, n) : -1;
+    size_t rn = down_head(r);
+    rn += vframe(r + rn, 0, hs, sh(hs, 0x1301, 1));
+    int dr = vless_dialer.deliver(&g_node, vs, 0, r, rn, down_emit, NULL);
+    int xtls = vs->vis.enable_xtls;
+    size_t at = g_wire_n;
+    n = up_fl(d);
+    int s2 = upstream_send(c, d, n);
+    int fl = wire_frame(at, d, n);
+    snprintf(what, sizeof what, "vision switch up%s: CH and Finished continue, the ServerHello enables", tag);
+    check(s1 == SEND_OK && s2 == SEND_OK && dr == 0 && ch == VISION_CMD_CONTINUE && xtls == 1 &&
+              fl == VISION_CMD_CONTINUE && g_tx_direct_n == 0, what);
+    n = up_get(d);
+    int refused = 0;
+    if (again) {
+        g_send_again_n = 1;
+        int sa = upstream_send(c, d, n);
+        refused = sa == SEND_AGAIN && g_tx_direct_n == 0 && vs->vis.is_padding == 1 && vs->vis.tx_switch == 0;
+        snprintf(what, sizeof what, "vision switch up%s: a refused GET keeps padding and does not switch", tag);
+        check(refused, what);
+    }
+    at = g_wire_n;
+    int wi = g_send_szn;
+    int s3 = upstream_send(c, d, n);
+    int get = wire_frame(at, d, n);
+    snprintf(what, sizeof what, "vision switch up%s: GET frame %s, switch %s", tag,
+             can ? "direct" : "end", can ? "once, after its write" : "never");
+    if (can)
+        check(s3 == SEND_OK && get == VISION_CMD_DIRECT && g_tx_direct_n == 1 && wi < 64 &&
+                  g_send_szn == wi + 1 && g_send_dir[wi] == 0, what);
+    else
+        check(s3 == SEND_OK && get == VISION_CMD_END && g_tx_direct_n == 0, what);
+    unsigned char u[100];
+    memset(u, 'u', sizeof u);
+    int s4 = upstream_send(c, u, sizeof u);
+    snprintf(what, sizeof what, "vision switch up%s: the next 100 B go as they are", tag);
+    check(s4 == SEND_OK && g_send_last_n == 100 && g_wire_n >= 100 &&
+              !memcmp(g_wire + g_wire_n - 100, u, 100) && g_tx_direct_n == (can ? 1 : 0), what);
+    up_close(c);
+    g_can_direct = 1;
+}
+
+/* catches: direct where the gate forbids it, the switch before the frame left, a retry that loses it */
+static void t_vision_switch_up(void) {
+    switch_up(1, 0);
+    switch_up(0, 0);
+    switch_up(1, 1);
+}
+
+/* catches: the uplink filter stopped with the padding, so a later upload is never filtered */
+static void t_vision_filter_up_after_padding(void) {
+    static unsigned char d[2048];
+    struct conn *c = first_open("xtls-rprx-vision");
+    if (!c) { check(0, "vision filter up: test connection did not open"); up_close(NULL); return; }
+    struct vl_sess *vs = SESS(c);
+    int s1 = upstream_send(c, d, up_ch(d));
+    size_t at = g_wire_n;
+    size_t n = up_get(d);
+    int s2 = upstream_send(c, d, n);
+    int get = wire_frame(at, d, n);
+    int mid = vs->vis.filter_left, pad = vs->vis.is_padding;
+    unsigned char u[100];
+    memset(u, 'u', sizeof u);
+    int s3 = upstream_send(c, u, sizeof u);
+    check(s1 == SEND_OK && s2 == SEND_OK && s3 == SEND_OK && get == VISION_CMD_END && mid == 6 &&
+              pad == 0 && vs->vis.filter_left == 5 && g_send_last_n == 100 &&
+              !memcmp(g_wire + g_wire_n - 100, u, 100),
+          "vision filter up: padding over, the next upload still filtered, 6 -> 5, sent as is");
+    up_close(c);
+}
+
+/* catches: the XUDP uplink framed with the old first-frame end, or left out of the writer */
+static void t_vision_xudp_up(void) {
+    snprintf(g_node.flow, sizeof g_node.flow, "xtls-rprx-vision");
+    struct conn *c = conn_new(&g_tun);
+    memset(c, 0, sizeof(*c));
+    c->used = 1;
+    c->fd = -1;
+    c->key = cli_key();
+    c->key.proto = 17;
+    c->key.sport = 30002;
+    c->key.dport = 53;
+    c->is_udp = 1;
+    conn_link(c);
+    struct vl_sess *s = SESS(c);
+    memset(s, 0, offsetof(struct vl_sess, dg));
+    s->t.link.fd = -1;
+    vless_dialer.clear(s);
+    int fo = vless_dialer.flow_open(&g_node, s, &c->key, 1);
+    g_wire_on = 1;
+    g_wire_n = 0;
+    g_send_szn = 0;
+    unsigned char d[102];
+    int ok = fo == 0, cmd[9], plain[9];
+    size_t at[10], pad[9];
+    for (int i = 0; i < 9; i++) {
+        d[0] = 0;
+        d[1] = 100;
+        memset(d + 2, 'a' + i, 100);
+        at[i] = g_wire_n;
+        ok = ok && upstream_send(c, d, sizeof d) == SEND_OK;
+        at[i + 1] = g_wire_n;
+    }
+    static const unsigned char hd[37 - 17] = { 18, 0x0a, 16, 'x', 't', 'l', 's', '-', 'r', 'p', 'r', 'x',
+                                               '-', 'v', 'i', 's', 'i', 'o', 'n', 3 };
+    static const unsigned char m1[12] = { 0, 20, 0, 0, 1, 1, 2, 0, 53, 1, 0xcb, 0xcb };
+    static const unsigned char mk[8] = { 0, 4, 0, 0, 2, 1, 0, 100 };
+    ok = ok && g_wire_n > 58 && g_wire[0] == 0 && !memcmp(g_wire + 1, g_hdr_uuid, 16) &&
+         !memcmp(g_wire + 17, hd, sizeof hd) && !memcmp(g_wire + 37, g_hdr_uuid, 16);
+    for (int i = 0; ok && i < 9; i++) {
+        size_t f = i ? at[i] : 53, len = i ? 108 : 124;
+        const unsigned char *x = g_wire + f;
+        plain[i] = at[i + 1] - at[i] == len;
+        if (plain[i]) {
+            cmd[i] = -1;
+            pad[i] = 0;
+            ok = !memcmp(x, mk, 6) && x[6] == 0 && x[7] == 100 && x[8] == 'a' + i;
+            continue;
+        }
+        cmd[i] = x[0];
+        pad[i] = ((size_t)x[3] << 8) | x[4];
+        ok = (((size_t)x[1] << 8) | x[2]) == len && at[i + 1] == f + 5 + len + pad[i] &&
+             !memcmp(x + 5, i ? mk : m1, i ? 6 : sizeof m1) && x[5 + len - 100] == 'a' + i &&
+             x[5 + len - 1] == 'a' + i;
+        for (size_t j = 0; ok && j < pad[i]; j++) ok = x[5 + len + j] == 0;
+    }
+    int framed = ok;
+    for (int i = 0; ok && i < 9; i++) ok = i < 7 ? !plain[i] && pad[i] < 256 : plain[i];
+    check(framed && ok && cmd[0] == VISION_CMD_CONTINUE && cmd[1] == VISION_CMD_CONTINUE &&
+              cmd[5] == VISION_CMD_CONTINUE && cmd[6] == VISION_CMD_END && s->vis.filter_left == 0 &&
+              s->vis.is_padding == 0,
+          "vision XUDP up: six datagrams continue, the seventh ends, short pads, the rest unframed");
+    g_wire_on = 0;
+    g_node.flow[0] = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+static struct vl_sess *down_sess(int udp) {
+    static struct vl_sess s;
+    struct flow_key k = cli_key();
+    if (udp) k.proto = 17;
+    memset(&s, 0, offsetof(struct vl_sess, dg));
+    s.t.link.fd = -1;
+    vless_dialer.clear(&s);
+    snprintf(g_node.flow, sizeof g_node.flow, "xtls-rprx-vision");
+    vless_dialer.flow_open(&g_node, &s, &k, udp);
+    return &s;
+}
+
+/* catches: the filter fed per Vision piece, cut other than 8 KiB after the response header, fed an empty slice, or after the server's direct */
+static void t_vision_filter_down_slices(void) {
+    static unsigned char r[9100], x[9000];
+    unsigned char hs[160];
+    memset(x, 'x', sizeof x);
+    struct vl_sess *s = down_sess(0);
+    size_t rn = down_head(r);
+    rn += vframe(r + rn, 0, x, 9000);
+    int before = s->vis.filter_left;
+    int dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(rn == 2 + 9021 && dr == 0 && before == 8 && s->vis.filter_left == 6,
+          "vision filter down: 9021 B after the response header are two slices, 8 -> 6");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, 0, x, 10);
+    rn += vframe(r + rn, 0, hs, sh(hs, 0x1301, 1));
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(dr == 0 && s->vis.enable_xtls == 0 && s->vis.filter_left == 7,
+          "vision filter down: two frames in one slice are one buffer starting with x");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, VISION_CMD_DIRECT, x, 5);
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    int mid = s->vis.filter_left, direct = s->t.link.rx_direct;
+    rn = sh(r, 0x1301, 1);
+    int dr2 = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(dr == 0 && dr2 == 0 && direct == 1 && mid == 7 && s->vis.filter_left == 7 &&
+              s->vis.enable_xtls == 0,
+          "vision filter down: nothing is filtered after the server's direct");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, 0, x, 8171);
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(rn == 2 + 8192 && dr == 0 && s->vis.filter_left == 7,
+          "vision filter down: 8192 B after the response header are one slice, 8 -> 7");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, 0, x, 8172);
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(rn == 2 + 8193 && dr == 0 && s->vis.filter_left == 6,
+          "vision filter down: 8193 B after the response header are two slices, 8 -> 6");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, VISION_CMD_DIRECT, x, 8171);
+    rn += sh(r + rn, 0x1301, 1);
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(dr == 0 && s->vis.filter_left == 7 && s->vis.enable_xtls == 0,
+          "vision filter down: the slice after direct in the same delivery is not filtered");
+
+    s = down_sess(0);
+    rn = down_head(r);
+    rn += vframe(r + rn, 0, x, 10) - 10;
+    dr = vless_dialer.deliver(&g_node, s, 0, r, rn, down_emit, NULL);
+    check(dr == 0 && s->vis.filter_left == 8, "vision filter down: a slice with no payload is not filtered");
+    g_node.flow[0] = 0;
+}
+
+/* catches: the XUDP branch of vl_deliver left without the filter */
+static void t_vision_filter_down_xudp(void) {
+    static const unsigned char ka[6] = {0x00, 0x04, 0x00, 0x00, 0x04, 0x00};
+    unsigned char r[64];
+    struct vl_sess *s = down_sess(1);
+    g_emit_n = 0;
+    size_t rn = down_head(r);
+    rn += vframe(r + rn, 0, ka, sizeof ka);
+    int before = s->vis.filter_left;
+    int dr = vless_dialer.deliver(&g_node, s, 1, r, rn, down_emit, NULL);
+    int first = s->vis.filter_left;
+    int ok = dr == 0;
+    for (int i = 0; i < 7; i++) {
+        rn = vframe(r, 0, ka, sizeof ka);
+        ok = ok && vless_dialer.deliver(&g_node, s, 1, r, rn, down_emit, NULL) == 0;
+    }
+    check(ok && before == 8 && first == 7 && s->vis.filter_left == 0 && g_emit_n == 0,
+          "vision filter down, XUDP: each KeepAlive delivery is one slice, 8 -> 7 -> 0");
+    g_node.flow[0] = 0;
 }
 
 static void t_up_cut_grpc_room(void) {
@@ -1013,12 +1502,19 @@ static void first_room(const char *flow) {
     int sr = upstream_send(c, g_up_stream, 8192);
     snprintf(what, sizeof what, "first write room%s: refused before any write", tag);
     check(sr == SEND_AGAIN && g_send_szn == 0 && !vs->header_sent &&
-              vs->vis.need_uuid == before.need_uuid && vs->vis.sent_end == before.sent_end &&
+              vs->vis.need_uuid == before.need_uuid && vs->vis.is_padding == before.is_padding &&
+              vs->vis.filter_left == before.filter_left &&
               vs->vis.sent_frames == before.sent_frames, what);
     g_room = -1;
     sr = upstream_send(c, g_up_stream, 8192);
     size_t rest = hn;
-    if (flow[0]) rest = g_wire_n >= hn + 21 ? 21 + (((size_t)g_wire[hn + 19] << 8) | g_wire[hn + 20]) + hn : 0;
+    if (flow[0] && g_wire_n >= hn + 21) {
+        size_t pa = ((size_t)g_wire[hn + 19] << 8) | g_wire[hn + 20];
+        size_t nx = hn + 21 + 4096 + pa;
+        rest = g_wire_n >= nx + 5 ? 70 + pa + (((size_t)g_wire[nx + 3] << 8) | g_wire[nx + 4]) : 0;
+    } else if (flow[0]) {
+        rest = 0;
+    }
     snprintf(what, sizeof what, "first write room%s: the resend goes as 8192 + the rest", tag);
     check(sr == SEND_OK && g_send_szn == 2 && g_send_sz[0] == 8192 && g_send_sz[1] == rest && rest &&
               !memcmp(g_wire, h, hn) && vs->header_sent, what);
@@ -3993,6 +4489,89 @@ static void t_due_fatal(void) {
     due_close(&g_L_due);
 }
 
+/* catches: the deadline checked only when the loop wakes, or a busy loop */
+static void t_server_first_wakes_loop(void) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
+    g_now_ns = now_ns();
+    struct conn *c = due_open(&g_L_due);
+    if (!c || c->sent_any || c->rtx.len || !c->estab_ns) {
+        check(0, "server first loop: fixture silent connection");
+        if (c) due_close(&g_L_due);
+        g_node.flow[0] = 0;
+        return;
+    }
+    uint64_t est = c->estab_ns;
+    int calls = g_send_calls, turns = 0;
+    while (g_send_calls == calls && now_ns() < est + 2000 * 1000000ull && g_live_n) {
+        loop_turn(&g_L_due, 1000);
+        turns++;
+    }
+    uint64_t at = now_ns();
+    check(g_send_calls == calls + 1 && g_send_last_n == 44, "server first loop: the header alone leaves");
+    check(at >= est + 500 * 1000000ull && at < est + 900 * 1000000ull,
+          "server first loop: at 500 ms, not at the loop's next wake");
+    check(turns <= 4, "server first loop: without spinning");
+    due_close(&g_L_due);
+    g_node.flow[0] = 0;
+}
+
+/* catches: a flow already due when the loop computes its sleep, left to the loop's next wake */
+static void t_server_first_due_at_sleep(void) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
+    g_now_ns = now_ns();
+    struct conn *c = due_open(&g_L_due);
+    if (!c || c->sent_any || c->rtx.len || !c->estab_ns) {
+        check(0, "server first due: fixture silent connection");
+        if (c) due_close(&g_L_due);
+        g_node.flow[0] = 0;
+        return;
+    }
+    c->estab_ns = now_ns() - 600 * 1000000ull;
+    int calls = g_send_calls;
+    uint64_t t = now_ns();
+    loop_turn(&g_L_due, 1000);
+    uint64_t took = now_ns() - t;
+    check(g_send_calls == calls + 1 && g_send_last_n == 44 && took < 300 * 1000000ull,
+          "server first due: a flow past its deadline sends on a turn that does not sleep");
+    due_close(&g_L_due);
+    g_node.flow[0] = 0;
+}
+
+/* catches: a refused deadline send that keeps the wait at 0 and spins the loop */
+static void t_server_first_again_no_spin(void) {
+    snprintf(g_node.flow, sizeof(g_node.flow), "xtls-rprx-vision");
+    g_now_ns = now_ns();
+    struct conn *c = due_open(&g_L_due);
+    if (!c || c->sent_any || c->rtx.len || !c->estab_ns) {
+        check(0, "server first again: fixture silent connection");
+        if (c) due_close(&g_L_due);
+        g_node.flow[0] = 0;
+        return;
+    }
+    g_send_hold = 1;
+    uint64_t est = c->estab_ns;
+    int calls = g_send_calls;
+    while (g_send_calls == calls && now_ns() < est + 2000 * 1000000ull && g_live_n) loop_turn(&g_L_due, 1000);
+    check(g_send_calls > calls && !c->sent_any && c->fw_again,
+          "server first again: the refused header send backs off");
+    int slow = 1, flagged = 1;
+    for (int i = 0; i < 5; i++) {
+        uint64_t t = now_ns();
+        loop_turn(&g_L_due, 200);
+        if (now_ns() - t < 150 * 1000000ull) slow = 0;
+        if (!c->fw_again) flagged = 0;
+    }
+    check(slow && flagged, "server first again: the loop sleeps while the window stays closed");
+    g_send_hold = 0;
+    calls = g_send_calls;
+    loop_turn(&g_L_due, 200);
+    int sent = g_send_calls == calls + 1 && g_send_last_n == 44 && c->sent_any && !c->fw_again;
+    loop_turn(&g_L_due, 50);
+    check(sent && g_send_calls == calls + 1, "server first again: the header leaves once on the next turn");
+    due_close(&g_L_due);
+    g_node.flow[0] = 0;
+}
+
 /* catches: room ignoring the queue, so a delayed flow buffers without limit */
 static void t_room_held(void) {
     struct conn *c = open_conn(65535);
@@ -5209,6 +5788,7 @@ static int room_send(int vision, long *bare) {
     long_host(host, 255);
     memcpy(flow, g_node.flow, sizeof flow);
     if (!vision) g_node.flow[0] = 0;
+    else snprintf(g_node.flow, sizeof g_node.flow, "xtls-rprx-vision");
     struct flow_key k = cli_key();
     memset(&s, 0, offsetof(struct vl_sess, dg));
     s.t.link.fd = -1;
@@ -5228,12 +5808,32 @@ static int room_send(int vision, long *bare) {
     return sr;
 }
 
+static void t_room_vision_reserve(void) {
+    /* catches: the Vision reserve kept after padding ends, or dropped while Vision pads */
+    static struct vl_sess s;
+    struct flow_key k = cli_key();
+    snprintf(g_node.flow, sizeof g_node.flow, "xtls-rprx-vision");
+    memset(&s, 0, offsetof(struct vl_sess, dg));
+    s.t.link.fd = -1;
+    vless_dialer.clear(&s);
+    vless_dialer.flow_open(&g_node, &s, &k, 0);
+    g_room = TUNNEL_BUF;
+    long padding = vless_dialer.room(&g_node, &s);
+    s.vis.is_padding = 0;
+    long over = vless_dialer.room(&g_node, &s);
+    g_room = -1;
+    g_node.flow[0] = 0;
+    check(padding == TUNNEL_BUF - 64 - 2048 && over == TUNNEL_BUF - 64,
+          "room, Vision: 2048 reserved while padding, none after");
+}
+
 /* Catches a room that reserves 64 bytes for a request header that carries a 255-byte host. */
 static void t_room_covers_a_long_host(void) {
     long bare = 0;
     check(room_send(0, &bare) == SEND_OK && bare == TUNNEL_BUF - 64,
           "a first write of the whole room with a 255-byte host is sent; no host keeps 64");
-    check(room_send(1, NULL) == SEND_OK, "  and with Vision too");
+    check(room_send(1, &bare) == SEND_OK && bare == TUNNEL_BUF - 64 - 2048,
+          "  and with Vision too, 2048 more kept");
 }
 
 /* Catches a host over 255 bytes cut to fit instead of refused, at the dialer and the pool. */
@@ -8441,10 +9041,15 @@ int main(void) {
     t_host_is_cleared_on_reuse();
     t_pin_carries_the_host();
     t_room_covers_a_long_host();
+    t_room_vision_reserve();
     t_long_host_refused();
     t_host_needs_set_host();
     t_udp_early_bounds();
     t_server_first();
+    t_server_first_from_ready();
+    t_server_first_early_twin();
+    t_server_first_early_refused();
+    t_server_first_srv_closed();
     t_room_window();
     t_gather();
     t_up_cut();
@@ -8461,6 +9066,11 @@ int main(void) {
     t_first_write_room_edge();
     t_first_write_room_grpc();
     t_up_write_size();
+    t_vision_switch_up();
+    t_vision_filter_up_after_padding();
+    t_vision_filter_down_slices();
+    t_vision_filter_down_xudp();
+    t_vision_xudp_up();
     t_up_cut_grpc_room();
     t_stop_resets();
     t_stop_wakes_the_loop();
@@ -8469,6 +9079,9 @@ int main(void) {
     t_due_idle_latched();
     t_due_writable();
     t_due_fatal();
+    t_server_first_wakes_loop();
+    t_server_first_due_at_sleep();
+    t_server_first_again_no_spin();
     t_room_held();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
     sock_part();

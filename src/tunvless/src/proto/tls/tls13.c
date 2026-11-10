@@ -201,7 +201,7 @@ static int read_record(struct tls13 *t, unsigned char *type, unsigned char **bod
 
 static int send_all(struct tls13 *t, const unsigned char *d, size_t n) {
     if (t->fm) {
-        ssize_t w = fm_send(t->fm, t->fd, d, n);
+        ssize_t w = fm_send(t->fm, t->fd, d, n, 0);
         return w < 0 ? (int)w : 0;
     }
     size_t sent = 0;

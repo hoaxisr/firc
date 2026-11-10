@@ -187,15 +187,29 @@ int fm_lower_write(struct fm_layer *me, const unsigned char *d, size_t n, int64_
     return down(me, d, n, gap_ms);
 }
 
-int fm_shape(struct fm_link *l, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
+static int shape_at(struct fm_link *l, size_t top, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
     fm_emit_fn se = l->emit;
     void *sa = l->arg;
     l->emit = emit;
     l->arg = arg;
-    int rc = n ? write_at(l, l->n, d, n) : 0;
+    int rc = n ? write_at(l, top, d, n) : 0;
     l->emit = se;
     l->arg = sa;
     return rc;
+}
+
+int fm_shape(struct fm_link *l, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
+    return shape_at(l, l->n, d, n, emit, arg);
+}
+
+static size_t splice_top(const struct fm_link *l) {
+    size_t top = l->n;
+    while (top && l->lay[top - 1].ops->splice) top--;
+    return top;
+}
+
+int fm_splices(const struct fm_link *l) {
+    return !l || !splice_top(l);
 }
 
 void fm_sleep_ms(int64_t ms) {
@@ -309,10 +323,11 @@ static int emit_loop(void *arg, const unsigned char *d, size_t n, int64_t gap) {
     return enqueue(l, d, n, gap);
 }
 
-ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n) {
+ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n, int direct) {
     if (l->err) return l->err;
     if (!n) return 0;
     l->fd = fd;
+    size_t top = direct ? splice_top(l) : l->n;
     int rc;
     if (l->loop) {
         if (q_mem(l) >= FM_Q_HARD) {
@@ -320,9 +335,9 @@ ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n) {
             return l->err = TR_EIO;
         }
         l->now = tr_mono_ms();
-        rc = fm_shape(l, d, n, emit_loop, l);
+        rc = shape_at(l, top, d, n, emit_loop, l);
     } else {
-        rc = fm_shape(l, d, n, emit_block, l);
+        rc = shape_at(l, top, d, n, emit_block, l);
     }
     if (rc) return l->err = rc;
     return (ssize_t)n;
@@ -400,10 +415,7 @@ static ssize_t read_up(struct fm_link *l, int fd, size_t top, unsigned char *d, 
 }
 
 ssize_t fm_recv(struct fm_link *l, int fd, void *d, size_t cap, int flags, int direct) {
-    size_t top = l->n;
-    if (direct)
-        while (top && l->lay[top - 1].ops->splice) top--;
-    return read_up(l, fd, top, d, cap, flags);
+    return read_up(l, fd, direct ? splice_top(l) : l->n, d, cap, flags);
 }
 
 static int hs_poll(struct fm_link *l, int fd, size_t top) {

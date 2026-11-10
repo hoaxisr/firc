@@ -1693,7 +1693,9 @@ static int fm_read_n(struct transport *c, unsigned char *out, size_t want) {
     return have == want ? 0 : -112;
 }
 
-enum { FM_RECORDS, FM_DIRECT_RAW, FM_DIRECT_MASKED };
+enum { FM_RECORDS, FM_DIRECT_RAW, FM_DIRECT_MASKED, FM_TX_DIRECT };
+
+static unsigned char g_fmx_raw[3000];
 
 static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
     int sv[2];
@@ -1725,11 +1727,13 @@ static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
     for (size_t i = 0; i < sizeof g_fmx_down; i++) g_fmx_down[i] = (unsigned char)(i * 29 + 3);
     if (!rc) rc = transport_write(&c, g_fmx_up, sizeof g_fmx_up);
     size_t have = 0;
+    int recs = 0;
     while (!rc && have < sizeof g_fmx_up) {
         size_t k = 0;
         unsigned char inner = 0;
         if (tls) {
             if (rec_open(cd, s.fd, g_fmx_in + have, sizeof g_fmx_in - have, &k, &inner) || inner != 0x17) rc = -104;
+            recs++;
         } else {
             ssize_t r = read(s.fd, g_fmx_in + have, sizeof g_fmx_up - have);
             if (r <= 0) rc = -104;
@@ -1738,7 +1742,23 @@ static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
         have += k;
     }
     if (!rc && memcmp(g_fmx_in, g_fmx_up, sizeof g_fmx_up)) rc = -105;
-    if (!rc && how != FM_RECORDS) {
+    if (!rc && how == FM_TX_DIRECT) {
+        if (recs != 2) rc = -120;
+        for (size_t i = 0; i < sizeof g_fmx_raw; i++) g_fmx_raw[i] = (unsigned char)(i * 7 + 1);
+        if (!rc && g_relay.on) fmrelay_off(&g_relay, 0);
+        if (!rc) transport_tx_direct(&c);
+        if (!rc) rc = transport_write(&c, g_fmx_raw, sizeof g_fmx_raw);
+        size_t got = 0;
+        while (!rc && got < sizeof g_fmx_raw) {
+            ssize_t r = read(s.fd, g_fmx_in + got, sizeof g_fmx_raw - got);
+            if (r <= 0) rc = -121;
+            else got += (size_t)r;
+        }
+        if (!rc && memcmp(g_fmx_in, g_fmx_raw, sizeof g_fmx_raw)) rc = -122;
+        struct pollfd pf = { .fd = s.fd, .events = POLLIN, .revents = 0 };
+        if (!rc && poll(&pf, 1, 200) != 0) rc = -123;
+    }
+    if (!rc && how != FM_RECORDS && how != FM_TX_DIRECT) {
         if (how == FM_DIRECT_RAW) fmrelay_off(&g_relay, 1);
         transport_direct(&c);
         if (wr_all(s.fd, g_fmx_down, sizeof g_fmx_down)) rc = -106;
@@ -1910,6 +1930,76 @@ static void t_fm_direct(void) {
     fm_use(NULL, 0);
     check("direct: descriptor count restored", fd0, fd_count());
     check("direct: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+static int can_tx(const struct plan *pl, struct vless_node *n, int enc) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -100;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = pl;
+    pthread_t th;
+    if (pthread_create(&th, NULL, server_half, &s)) {
+        close(sv[0]);
+        close(sv[1]);
+        return -101;
+    }
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(n, &c, 3);
+    g_tcp_dial = NULL;
+    pthread_join(th, NULL);
+    if (!rc) {
+        struct venc *e = c.enc;
+        if (enc) c.enc = (struct venc *)&s;
+        rc = transport_can_tx_direct(&c);
+        c.enc = e;
+        transport_close(&c);
+    } else {
+        rc = -102;
+    }
+    close(s.fd);
+    fmrelay_join(&g_relay);
+    return rc;
+}
+
+/* catches: tr_link_write sealing after the switch, the raw write going through a splice layer, or the gate ignoring enc */
+static void t_tx_direct(void) {
+    struct plan ok = { .name = "tx direct", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    int fd0 = fd_count();
+    fm_use(NULL, 0);
+    check("tx direct, unmasked: raw bytes after the switch", 0, fm_data(&ok, &rn, FM_TX_DIRECT));
+    check("tx direct, unmasked: may switch", 1, can_tx(&ok, &rn, 0));
+    check("tx direct, under encryption: may not switch", 0, can_tx(&ok, &rn, 1));
+    fm_use(&FMT_X55, 1);
+    check("tx direct, splice layer: raw bytes past it", 0, fm_data(&ok, &rn, FM_TX_DIRECT));
+    check("tx direct, splice layer: may switch", 1, can_tx(&ok, &rn, 0));
+    fm_use(&FMT_X55_NOSPLICE, 1);
+    check("tx direct, non-splice layer: may not switch", 0, can_tx(&ok, &rn, 0));
+    fm_use(NULL, 0);
+    static const struct { const char *what; const struct transport_ops *fr; int plain; int want; } k[] = {
+        { "tx direct, raw tcp: may switch", &tr_tcp, 0, 1 },
+        { "tx direct, security none: may not switch", &tr_tcp, 1, 0 },
+        { "tx direct, ws: may not switch", &tr_ws, 0, 0 },
+        { "tx direct, grpc: may not switch", &tr_grpc, 0, 0 },
+        { "tx direct, httpupgrade: may not switch", &tr_httpupgrade, 0, 0 },
+        { "tx direct, xhttp: may not switch", &tr_xhttp, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        static struct transport t;
+        memset(&t, 0, sizeof t);
+        t.fr = k[i].fr;
+        if (t.fr != &tr_xhttp) t.link.plain = k[i].plain;
+        check(k[i].what, k[i].want, transport_can_tx_direct(&t));
+    }
+    check("tx direct: descriptor count restored", fd0, fd_count());
+    check("tx direct: nothing left on the heap", 0, LEAK_CHECK());
 }
 
 static void *silent_half(void *arg) {
@@ -2268,6 +2358,7 @@ int main(void) {
     t_fm_x55();
     t_lk_err_unmasked();
     t_fm_direct();
+    t_tx_direct();
     t_fm_free_paths();
     t_fm_pending_ready();
     t_fm_mask_error();

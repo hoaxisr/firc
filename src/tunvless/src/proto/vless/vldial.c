@@ -344,9 +344,9 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
                    const unsigned char *data, size_t n) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
-    /* out is needed only to join the header or the Vision frame and the data into one buffer.
-     * Usually there is nothing to join (the header goes once per connection, and Vision ends
-     * padding with its first frame), and the data goes straight from the packet, uncopied. */
+    /* out is needed only to join the header or the Vision frames and the data into one buffer.
+     * Usually there is nothing to join (the header goes once per connection, and Vision pads
+     * only the first few writes), and the data goes straight from the packet, uncopied. */
     unsigned char out[TUNNEL_BUF];
     const unsigned char *body = data;
     size_t len = 0;
@@ -355,8 +355,8 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
      * The data framed by dgram_frame is repacked into xb; from there the path is shared with
      * TCP: Vision, then the write. */
     const int xudp = udp && node->flow[0];
+    unsigned char xb[TUNNEL_BUF];
     if (xudp) {
-        unsigned char xb[TUNNEL_BUF];
         size_t xn = xudp_frames(k, !s->header_sent, data, n, xb, sizeof xb);
         if (!xn) return SEND_FATAL;
         data = xb;
@@ -384,23 +384,27 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
     }
 
     /* n == 0 (the stack's call for a silent client, dialer.h): the header alone, as Xray's client
-     * flushes it after 100 ms without data. Vision starts with the first real data. */
+     * flushes it after 500 ms without data. Vision starts with the first real data. */
     if (!n && !len) return SEND_OK;
 
-    /* Wrap only until Vision has ended padding: after the end frame vision_wrap is a plain
-     * copy, and the data would be copied for nothing (tls13_write copies it once more, which
+    /* Wrap only while Vision pads or still reads the stream: after that vision_wrap leaves the
+     * data as is, and it would be copied for nothing (tls13_write copies it once more, which
      * it must: encryption is done in place in the record). So there are zero or one copies
      * before encryption.
      *
      * The Vision state is saved before wrapping and restored if the send fails. Otherwise the
      * first frame is lost for good on a closed HTTP/2 window: vision_wrap has marked the UUID
-     * sent and padding ended, while h2_write sent nothing (it sends all or nothing). The client
-     * retransmits the same packet, it goes out without the frame and the UUID, and the server
-     * closes the stream. */
+     * sent and moved its padding state, while h2_write sent nothing (it sends all or nothing).
+     * The client retransmits the same packet, it goes out without the frame and the UUID, and
+     * the server closes the stream. */
     struct vision vis_before = s->vis;
-    if (node->flow[0] && !s->vis.sent_end && n) {
-        size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
-        if (!fn) return SEND_FATAL;
+    int wr = VISION_PLAIN;
+    size_t fn = 0;
+    if (node->flow[0] && n && (s->vis.is_padding || vision_filtering(&s->vis)))
+        wr = vision_wrap(&s->vis, data, n, transport_can_tx_direct(&s->t), out + len,
+                         sizeof(out) - len, &fn);
+    if (wr == VISION_EFIT) return SEND_FATAL;
+    if (!wr) {
         len += fn;
         body = out;
     } else if (len) {
@@ -451,6 +455,11 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
                     ratelog_more(more, sizeof more, held));
     }
     if (rc) return SEND_FATAL;
+    if (s->vis.tx_switch) {
+        transport_tx_direct(&s->t);
+        s->vis.tx_switch = 0;
+        TR("client switched to direct copy\n");
+    }
     /* Mark the header sent only now: marked earlier, a retry would go without it, and the
      * server would not know where to connect. */
     s->header_sent = 1;
@@ -548,6 +557,59 @@ static int udp_downstream(struct vl_sess *s, const unsigned char *d, size_t n,
     return 0;
 }
 
+static int vl_pass(struct vl_sess *s, int udp, const unsigned char *p, size_t n,
+                   dialer_emit_fn emit, void *arg) {
+    return udp ? xudp_downstream(s, p, n, emit, arg) : emit(arg, p, n);
+}
+
+static int vl_pass_filtered(struct vl_sess *s, int udp, const unsigned char *p, size_t n,
+                            dialer_emit_fn emit, void *arg) {
+    if (vision_filtering(&s->vis)) vision_filter(&s->vis, p, n);
+    return vl_pass(s, udp, p, n, emit, arg);
+}
+
+static int vl_unwrap(struct vl_sess *s, int udp, const unsigned char *cur, size_t left,
+                     unsigned char *gb, size_t *gn, dialer_emit_fn emit, void *arg) {
+    while (left) {
+        size_t used = 0, pl_n = 0;
+        const unsigned char *pl = NULL;
+        int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
+        /* An invalid frame command ends the connection; it is not a pause. The parser
+         * returns EPROTO without resetting the collected header, so every later call
+         * rereads the same bad frame and consumes nothing. A plain break would keep the
+         * connection alive: the tunnel would read and decrypt records (the costliest work
+         * on this hardware) and throw them away, while the client waits until the idle
+         * eviction. */
+        if (ur == VISION_EPROTO) {
+            TR("invalid Vision frame: closing the connection, %zu left\n", left);
+            return -1;
+        }
+        if (ur != 0 || (!used && !pl_n)) {
+            /* A short read is not an error: the parser is streaming and collects the
+             * start of the stream itself (rx_pre in vision.h). Nothing consumed and
+             * nothing returned means there is no progress to make. */
+            TR("frame not parsed: ur=%d, %zu left\n", ur, left);
+            return 1;
+        }
+        cur += used;
+        left -= used;
+        if (!pl_n) continue;
+        /* Past the filter each piece goes out at once: collecting them in one buffer would
+         * copy all traffic and add a size limit. */
+        if (!gb) {
+            if (vl_pass(s, udp, pl, pl_n, emit, arg) != 0) return -1;
+            continue;
+        }
+        if (*gn + pl_n > VISION_BUF) {
+            if (vl_pass_filtered(s, udp, gb, *gn, emit, arg) != 0) return -1;
+            *gn = 0;
+        }
+        memcpy(gb + *gn, pl, pl_n);
+        *gn += pl_n;
+    }
+    return 0;
+}
+
 static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char *rx, size_t got,
                       dialer_emit_fn emit, void *arg) {
     const struct vless_node *node = ctx;
@@ -571,64 +633,26 @@ static int vl_deliver(const void *ctx, void *sess, int udp, const unsigned char 
         TR("response header stripped (%zu bytes), %zu left\n", skip, left);
     }
 
-    /* UDP to a node with flow: Vision frames carrying XUDP frames. */
-    if (udp && node->flow[0]) {
-        while (left) {
-            size_t used = 0, pl_n = 0;
-            const unsigned char *pl = NULL;
-            int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
-            if (ur == VISION_EPROTO) return -1;
-            if (ur != 0 || (!used && !pl_n)) break;
-            cur += used;
-            left -= used;
-            if (pl_n && xudp_downstream(s, pl, pl_n, emit, arg) != 0) return -1;
-        }
-        return 0;
-    }
     /* Here the paths split: TCP is a stream in Vision frames, UDP without flow is datagrams with
-     * a two-byte length and no Vision (the UDP request did not declare it). */
-    if (udp)
-        return left ? udp_downstream(s, cur, left, emit, arg) : 0;
-
-    while (left) {
-        const unsigned char *p = cur;
-        size_t pn = left;
-
-        if (node->flow[0]) {
-            size_t used = 0;
-            const unsigned char *pl = NULL;
-            size_t pl_n = 0;
-            int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
-            /* An invalid frame command ends the connection; it is not a pause. The parser
-             * returns EPROTO without resetting the collected header, so every later call
-             * rereads the same bad frame and consumes nothing. A plain break would keep the
-             * connection alive: the tunnel would read and decrypt records (the costliest work
-             * on this hardware) and throw them away, while the client waits until the idle
-             * eviction. */
-            if (ur == VISION_EPROTO) {
-                TR("invalid Vision frame: closing the connection, %zu left\n", left);
-                return -1;
-            }
-            if (ur != 0 || (!used && !pl_n)) {
-                /* A short read is not an error: the parser is streaming and collects the
-                 * start of the stream itself (rx_pre in vision.h). Nothing consumed and
-                 * nothing returned means there is no progress to make. */
-                TR("frame not parsed: ur=%d, %zu left\n", ur, left);
-                break;
-            }
-            p = pl;
-            pn = pl_n;
-            cur += used;
-            left -= used;
-
-        } else {
-            cur += left;
-            left = 0;
+     * a two-byte length and no Vision (the UDP request did not declare it). UDP to a node with
+     * flow: Vision frames carrying XUDP frames. */
+    if (node->flow[0]) {
+        unsigned char gb[VISION_BUF];
+        while (left) {
+            const int filt = vision_filtering(&s->vis) && !s->vis.recv_direct;
+            size_t sn = filt && left > VISION_BUF ? VISION_BUF : left, gn = 0;
+            int ur = vl_unwrap(s, udp, cur, sn, filt ? gb : NULL, &gn, emit, arg);
+            if (ur < 0) return -1;
+            cur += sn;
+            left -= sn;
+            if (gn && vl_pass_filtered(s, udp, gb, gn, emit, arg) != 0) return -1;
+            if (ur) break;
         }
-
-        /* Each piece goes out at once: collecting them in one buffer would copy all traffic
-         * and add a size limit. */
-        if (pn && emit(arg, p, pn) != 0) return -1;
+        if (udp) return 0;
+    } else if (udp) {
+        return left ? udp_downstream(s, cur, left, emit, arg) : 0;
+    } else if (left && emit(arg, cur, left) != 0) {
+        return -1;
     }
 
     /* The server announced direct copy: tell the link, so the next read bypasses decryption.
@@ -662,8 +686,8 @@ int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_
 }
 
 /* What vl_send takes now (dialer_ops.room): the transport's room, or its mask queue's when that is
- * smaller, less what vl_send adds in front of the data — the request header until it is sent, a
- * Vision frame (with padding of up to about 1400 bytes) until Vision has ended padding. */
+ * smaller, less what vl_send adds to the data — the request header until it is sent, the Vision
+ * frames' headers and padding (up to about 1700 bytes on a write) while Vision pads. */
 static long vl_room(const void *ctx, void *sess) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
@@ -672,7 +696,7 @@ static long vl_room(const void *ctx, void *sess) {
     if (r < 0) return -1;
     if (s->t.fr == &tr_grpc) r -= VL_GRPC_FRAME * (r / VL_UP_WRITE);
     if (!s->header_sent) r -= 64 + (s->host[0] ? 1 + (long)strlen(s->host) : 0);
-    if (node->flow[0] && !s->vis.sent_end) r -= 2048;
+    if (node->flow[0] && s->vis.is_padding) r -= 2048;
     return r > 0 ? r : 0;
 }
 
@@ -689,7 +713,7 @@ static size_t vl_up_write(const void *ctx, void *sess) {
     const struct vless_node *node = ctx;
     struct vl_sess *s = sess;
     if (transport_whole_writes(&s->t)) return 0;
-    if (s->header_sent) return VL_UP_WRITE;
+    if (s->header_sent || node->flow[0]) return VL_UP_WRITE;
     static const unsigned char ip[16];
     unsigned char h[512];
     size_t hl = vless_build_request(s->uuid, VLESS_CMD_TCP, s->host[0] ? s->host : NULL, ip,

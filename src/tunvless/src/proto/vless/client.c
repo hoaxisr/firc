@@ -150,9 +150,8 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
         vision_init(&vis, uuid);
         unsigned char framed[8192];
         size_t header_n = req_n - http_used;
-        size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
-                                framed, sizeof(framed));
-        if (!fn) { transport_close(&c); snprintf(why, why_n, "cannot build the Vision frame"); return TR_EIO; }
+        size_t fn = 0;
+        if (vision_wrap(&vis, req + header_n, req_n - header_n, 0, framed, sizeof(framed), &fn)) { transport_close(&c); snprintf(why, why_n, "cannot build the Vision frame"); return TR_EIO; }
         /* One write: the header and the frame must leave together, or their split across
          * records becomes a recognisable feature itself. */
         unsigned char together[8704];

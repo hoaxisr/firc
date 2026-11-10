@@ -186,7 +186,7 @@ $(T)/b3match: tests/b3match.c src/lib/blake3.h
 
 $(T)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/lib/osrand.c $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/visionmatch.c src/proto/vless/vision.c src/lib/osrand.c -lpthread
+	$(CC) $(T_CFLAGS) -Wl,--wrap=os_getrandom -o $@ tests/visionmatch.c src/proto/vless/vision.c src/lib/osrand.c -lpthread
 
 SUB_SRC := src/proto/vless/sublink.c src/proto/vless/vlink.c src/proto/transport/trpath.c src/proto/transport/xhopts.c \
            src/proto/transport/fmask.c

@@ -50,7 +50,10 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            ua-golang ua-edge ua-firefox ua-safari ua-curl ua-empty
            fm-frag-hello-tls fm-frag-hello-reality fm-frag-range fm-frag-loop fm-frag-xhttp
            fm-hc-raw fm-hc-vision fm-hc-xhttp fm-hc-ws fm-hc-neg fm-filter-ok fm-filter-neg
-           fm-chain-hf fm-chain-fh fm-dl-same fm-dl-noinherit fm-dl-frag fm-refuse-sudoku fm-refuse-xmc"
+           fm-chain-hf fm-chain-fh fm-dl-same fm-dl-noinherit fm-dl-frag fm-refuse-sudoku fm-refuse-xmc
+           vis-up vis-up-tls vis-up-shapes vis-up-tls12 vis-up-ccm8 vis-plain-end vis-wait vis-reshape
+           fm-frag-vision-up fm-hc-vision-up"
+VCASES="vis-up vis-up-tls vis-up-shapes vis-up-tls12 vis-up-ccm8 vis-plain-end vis-wait vis-reshape fm-frag-vision-up fm-hc-vision-up"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -136,8 +139,18 @@ openssl verify -CAfile "$W/root384.pem" -untrusted "$W/inter384.pem" "$W/leaf384
 bg_in "$NSS" "$W/mask.log" openssl s_server -accept "$S_IP:8443" -cert "$W/mask.pem" -key "$W/mask.key" \
     -tls1_3 -alpn h2,http/1.1 -www -quiet
 # The target, and the targets of the node probe.
-bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080
-case " $CASES " in *" vis-"*|*" fm-hc-vision "*) bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0 ;; esac
+is_v() { case " $VCASES " in *" $1 "*) return 0 ;; esac; return 1; }
+TPID=""; OPID=""; VPID=""; OWANT=""; NOLD=""; NNEW=""
+for m in $CASES; do if is_v "$m"; then NNEW=1; else NOLD=1; fi; done
+[ -z "$NOLD" ] || { bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080; TPID=$!; }
+case " $CASES " in *" vis-dl"*|*" fm-hc-vision "*) OWANT=1; bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0; OPID=$! ;; esac
+if [ -n "$NNEW" ]; then
+    printf '%s\n' 'openssl_conf = c' '[c]' 'ssl_conf = s' '[s]' 'system_default = d' '[d]' 'CipherString = DEFAULT@SECLEVEL=0' > "$W/ccm8.cnf"
+    bg_in "$NSS" "$W/vorigin.log" python3 tests/vision-origin.py "$TARGET" 9443 "$W/mask.pem" "$W/mask.key" 0
+    bg_in "$NSS" "$W/vorigin12.log" python3 tests/vision-origin.py "$TARGET" 9444 "$W/mask.pem" "$W/mask.key" 0 1.2
+    bg_in "$NSS" "$W/ccm8.log" env OPENSSL_CONF="$W/ccm8.cnf" openssl s_server -accept "$TARGET:8445" -cert "$W/mask.pem" \
+        -key "$W/mask.key" -tls1_3 -ciphersuites TLS_AES_128_CCM_8_SHA256 -www -quiet
+fi
 bg_in "$NSS" "$W/probe1.log" python3 tests/grpc-target.py 1.1.1.1 80
 bg_in "$NSS" "$W/probe2.log" python3 tests/grpc-target.py 8.8.8.8 80
 bg_in "$NSS" "$W/target6.log" python3 tests/grpc-target.py "$TARGET6" 8080
@@ -201,6 +214,7 @@ fmfrag() { fmraw; CFM="{\"tcp\":[{\"type\":\"fragment\",\"settings\":$1}]}"; LPO
 fmxh() { XP="{\"path\":\"/xp/\",\"mode\":\"$1\"}"; Q="type=xhttp&path=%2Fxp%2F&mode=$1"; }
 neg() { EXPECT=fail; XP="{\"path\":\"/xp/\",\"mode\":\"packet-up\",$1}"; Q="type=xhttp&path=%2Fxp%2F&mode=packet-up"; }
 case_cfg() {
+    SLOG="${XLOG:-warning}"
     SEC=reality; TUN_ARGS=""; TUN_ENV=""; FP=chrome; SCERT=mask; SKEY=mask; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
     XCNET=""; FLOW=""; XALPN=h2; DL=""; DH="$S_IP2"; BP=/xp/
     CFM=""; SFM=""; BFM=""; DPORT=""; TAPLENS=""; TAP2=""
@@ -331,6 +345,10 @@ case_cfg() {
     fm-dl-same)              fmtls h2; dl tls packet-up packet-up ""; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; BFM=$CFM ;;
     fm-dl-noinherit)         fmtls h2; dl tls packet-up packet-up ""; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; EXPECT=fail ;;
     fm-dl-frag)              dl reality packet-up packet-up ""; BFM="{\"tcp\":[$FR10]}"; LPORT=18444; DPORT=18444; TAP2=1 ;;
+    vis-up|vis-up-shapes|vis-up-tls12|vis-up-ccm8|vis-plain-end|vis-wait|vis-reshape) fmraw; vcfg ;;
+    vis-up-tls)              fmtls; fmraw; vcfg ;;
+    fm-frag-vision-up)       fmfrag '{"packets":"1-3","length":"10-20"}'; vcfg ;;
+    fm-hc-vision-up)         fmtls; fmraw; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; vcfg ;;
     fm-refuse-sudoku)        fmraw; CFM='{"tcp":[{"type":"sudoku","settings":{"password":"p"}}]}'; SFM=$CFM ;;
     fm-refuse-xmc)           fmtls; fmraw; CFM='{"tcp":[{"type":"xmc","settings":{"password":"p","profiles":[{"username":"Steve_1","uuid":"00112233-4455-6677-8899-aabbccddeeff","texturesValue":"v","texturesSignature":"s"}]}}]}'; SFM=$CFM ;;
     *) echo "run-xray: unknown case $1"; exit 2 ;;
@@ -1302,6 +1320,251 @@ EOF
     return $XR
 }
 
+vcfg() { Q="$Q&flow=xtls-rprx-vision"; FLOW=xtls-rprx-vision; LPORT=18444; TAPCAP=4294967296; SLOG=debug; }
+pstop() { eval "p=\$$1"; [ -z "$p" ] || { kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }; eval "$1=''"; }
+lwait() {
+    for _ in $(seq 40); do ip netns exec "$NSS" ss -ltn | grep -q "$1 " && return 0; sleep 0.25; done
+    echo "run-xray: FAIL — nothing listens on $1"; return 1
+}
+v_own() {
+    pstop TPID; pstop OPID
+    [ -n "$VPID" ] || { bg_in "$NSS" "$W/vtargets.log" python3 tests/vtargets.py "$TARGET"; VPID=$!; }
+    lwait "$TARGET:8080"; lwait "$TARGET:2222"; lwait "$TARGET:9443"; lwait "$TARGET:9444"; lwait "$TARGET:8445"
+}
+o_own() {
+    pstop VPID
+    [ -z "$NOLD" ] || [ -n "$TPID" ] || { bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080; TPID=$!; lwait "$TARGET:8080"; }
+    [ -z "$OWANT" ] || [ -n "$OPID" ] || {
+        bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0; OPID=$!
+        lwait "$TARGET:8443"; }
+}
+OT1=""; OT2=""
+votap_up() {
+    bg_in "$NSS" "$W/otap-$MODE-$1.log" python3 tests/tlstap.py --listen "$TARGET:8443" --to "$TARGET:9443" --dir "$W/otap-$MODE-$1"; OT1=$!
+    bg_in "$NSS" "$W/otap12-$MODE-$1.log" python3 tests/tlstap.py --listen "$TARGET:8444" --to "$TARGET:9444" --dir "$W/otap12-$MODE-$1"; OT2=$!
+    lwait "$TARGET:8443" && lwait "$TARGET:8444"
+}
+votap_down() { pstop OT1; pstop OT2; }
+vxc_up() {
+    case "$SEC" in
+    reality) CS="\"security\":\"reality\",\"realitySettings\":{\"serverName\":\"$MASK\",\"publicKey\":\"$PUB\",\"shortId\":\"$SID\",\"fingerprint\":\"chrome\"}" ;;
+    *)       CS="\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"$MASK\",\"alpn\":[\"$XALPN\"],\"fingerprint\":\"chrome\",\"certificates\":[{\"certificateFile\":\"$W/mask.pem\",\"usage\":\"verify\"}]}" ;;
+    esac
+    IN=""; i=0
+    for tp in 8080 2222 8443 8444 8445; do
+        IN="$IN${IN:+,}{\"listen\":\"127.0.0.1\",\"port\":$((18080 + i)),\"protocol\":\"dokodemo-door\",\"settings\":{\"address\":\"$TARGET\",\"port\":$tp,\"network\":\"tcp\"}}"
+        i=$((i + 1))
+    done
+    cat > "$W/xc-$MODE.json" <<JSON
+{"log":{"loglevel":"warning"},
+ "inbounds":[$IN],
+ "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$S_IP","port":$LPORT,"users":[{"id":"$UUID","encryption":"none"$FJ}]}]},
+   "streamSettings":{$XCNET,$CS}}]}
+JSON
+    ip netns exec "$NSC" "$XRAY" run -c "$W/xc-$MODE.json" > "$W/xc-$MODE-$1.log" 2>&1 &
+    CPID=$!; PIDS="$PIDS $CPID"
+    for _ in $(seq 40); do ip netns exec "$NSC" ss -ltn 2>/dev/null | grep -q "127.0.0.1:18084 " && break; sleep 0.25; done
+    ip netns exec "$NSC" ss -ltn 2>/dev/null | grep -q "127.0.0.1:18084 " || {
+        echo "run-xray: FAIL — the Xray client did not start:"; tail -5 "$W/xc-$MODE-$1.log"; return 1; }
+    sleep 1
+}
+vhost() { if [ "$C" = t ]; then echo "$TARGET"; else echo 127.0.0.1; fi; }
+vport() {
+    [ "$C" = t ] && { echo "$1"; return; }
+    case "$1" in 8080) echo 18080 ;; 2222) echo 18081 ;; 8443) echo 18082 ;; 8444) echo 18083 ;; 8445) echo 18084 ;; esac
+}
+vframes() {
+    awk -v p="$2" '
+        NR == FNR { if (/received request for tcp:/ && $NF ~ (":" p "$")) { n++; id = $4 } next }
+        n == 1 && $4 == id && /Xtls Unpadding new block, content / { printf "%s%s/%s/%s", s, $(NF - 4), $(NF - 2), $NF; s = " " }
+        END { print ""; if (n != 1) { print "vframes: " n + 0 " sessions name port " p > "/dev/stderr"; exit 1 } }' "$1" "$1"
+}
+vreq_ms() {
+    python3 -c '
+import re, sys, time
+port, t0 = sys.argv[2], float(sys.argv[3])
+hits = [l for l in open(sys.argv[1]) if re.search(r"received request for tcp:\S+:%s$" % port, l.rstrip())]
+if len(hits) != 1:
+    sys.exit("vreq_ms: %d sessions name port %s" % (len(hits), port))
+d, t = hits[0].split()[:2]
+e = time.mktime(time.strptime(d + " " + t[:8], "%Y/%m/%d %H:%M:%S")) + float("0" + t[8:])
+print(int(round((e - t0) * 1000)))' "$@"
+}
+fld() { printf '%s\n' "$1" | tr ' ' '\n' | awk -F/ -v k="$2" 'NF { printf "%s%s", s, $k; s = " " } END { print "" }'; }
+fsum() { printf '%s\n' "$1" | tr ' ' '\n' | awk -F/ 'NF { t += $1 } END { print t + 0 }'; }
+fbad() {
+    printf '%s\n' "$1" | tr ' ' '\n' | awk -F/ -v e="$2" 'NF { n++; f = n == 1 ? 16 : 0
+        if (e == "pad" && $2 >= 256 || e == "cut" && $1 >= 8171 || e == "cap" && f + 5 + $1 + $2 > 8192) b++ }
+        END { print n ? b + 0 : "none" }'
+}
+rx() {
+    if printf '%s\n' "$2" | grep -Eqx "$3"; then echo "run-xray: $1: $2 (matches $3)"
+    else echo "run-xray: FAIL — $1: ${2:-none}, expected to match $3"; XR=1; fi
+}
+vcn() { if [ "$C" = t ]; then echo tunvless; else echo "Xray client"; fi; }
+vgo() {
+    G=$1; shift
+    tap_up "$C-$G" || return 1
+    votap_up "$C-$G" || return 1
+    if [ "$C" = t ]; then TUN_TRACE=1 tun_up "$BIN" "$G" || return 1; else vxc_up "$G" || return 1; fi
+    mk=$(wc -l < "$W/xray-$MODE.log")
+    "$@" > "$W/drv-$MODE-$C-$G.log" 2>&1 && vr=0 || vr=$?
+    sed 's/^/    /' "$W/drv-$MODE-$C-$G.log"
+    if [ "$vr" -eq 0 ]; then echo "run-xray: $(vcn) $G: the drive passed (answer checked)"
+    else echo "run-xray: FAIL — $(vcn) $G: the drive failed ($vr)"; XR=1; fi
+    if [ "$C" = t ] && [ -n "${VPROBE:-}" ]; then
+        sleep 1; mp=$(wc -l < "$W/xray-$MODE.log")
+        echo "run-xray: probe: $(probe)"
+        sleep 1; tail -n +$((mp + 1)) "$W/xray-$MODE.log" > "$W/slog-$MODE-$C-probe"
+    fi
+    sleep 1
+    tun_down; xc_down; sleep 0.5; tap_down; votap_down
+    tail -n +$((mk + 1)) "$W/xray-$MODE.log" > "$W/slog-$MODE-$C-$G"
+    VL="$W/slog-$MODE-$C-$G"; VCC=""; VOC=""
+    n=$(rec_conn "$W/tap-$MODE-$C-$G" largest) && VCC="$W/tap-$MODE-$C-$G/$n.c2s"
+    for d in "$W/otap-$MODE-$C-$G" "$W/otap12-$MODE-$C-$G"; do
+        k=$(ls "$d" 2>/dev/null | grep -c '\.c2s$' || true)
+        [ "$k" -eq 0 ] || { VOC=$(ls "$d"/*.c2s | head -1); [ "$k" -eq 1 ] || { echo "run-xray: FAIL — $k origin connections in $d"; XR=1; }; }
+    done
+    VF=$(vframes "$VL" "$VP") || { echo "run-xray: FAIL — $(vcn) $G: no single session for port $VP"; XR=1; }
+    echo "run-xray: $(vcn) $G: frames $VF"
+}
+dcurl() {
+    f=$1; p=$2; shift 2
+    h=$(ip netns exec "$NSC" timeout 120 curl -sS -k -m 100 "$@" -T - "https://$(vhost):$(vport "$p")/up" < "$f") || return 1
+    echo "answered $h, local $(sha256sum < "$f" | cut -c1-64)"
+    [ "$h" = "$(sha256sum < "$f" | cut -c1-64)" ]
+}
+ddrive() { ip netns exec "$NSC" timeout 60 python3 tests/vdrive.py "$1" "$(vhost)" "$(vport "$2")" "$3" "$4" ${5:-} ${6:-}; }
+dshape() { ip netns exec "$NSC" timeout 60 python3 tests/vshapes.py "$1" "$(vhost)" "$(vport 8443)" "$MASK" "$W/mask.pem" 1000000; }
+vtail() {
+    [ -n "$VCC" ] && [ -n "$VOC" ] || { echo "run-xray: FAIL — $(vcn) $G: no client or origin capture"; XR=1; return; }
+    o=$(python3 tests/vtail.py "$VCC" "$VOC" "$1" ${2:-}) && r=0 || r=1
+    echo "run-xray: $(vcn) $G: $o"
+    [ "$r" -eq 0 ] || { echo "run-xray: FAIL — $(vcn) $G: vtail.py ${2:-}exit 1"; XR=1; }
+}
+vconn() { python3 -c 'import sys; print(sys.argv[1].split("connect=")[1].split()[0])' "$(cat "$W/drv-$MODE-$C-$G.log")"; }
+vshape_check() {
+    [ -n "$VOC" ] || { echo "run-xray: FAIL — $(vcn) $G: no origin capture"; XR=1; return; }
+    set -- $(python3 tests/vrecs.py "$VOC") 0 0 0 0 0
+    case "$G" in
+    split)  e="$(($1 + 5)) $(($2 + $3 + 10)) $(($4 + 5))"; k="0 0 2" ;;
+    joined) e="$(($1 + 5)) $(($2 + $3 + $4 + 15)) $(($5 + 5))"; k="0 0 2" ;;
+    nocss)  e="$(($1 + 5)) $(($2 + 5))"; k="0 2" ;;
+    esac
+    echo "run-xray: $(vcn) $G: origin records $1 $2 $3 $4 ${5:-}"
+    same "$(vcn) $G commands" "$(fld "$VF" 3)" "$k"
+    same "$(vcn) $G contents" "$(fld "$VF" 1)" "$e"
+    s=$(fsum "$VF")
+    vtail "$s"
+    want "$(vcn) $G origin bytes after S" "$(($(wc -c < "$VOC") - s))" ge 1000000
+    eval "SK_${C}_$G=\"\$(fld \"\$VF\" 3)\" SC_${C}_$G=\"\$(fld \"\$VF\" 1)\""
+}
+v_up_check() {
+    rx "$(vcn) commands" "$(fld "$VF" 3)" '0( 0)+ 2'
+    s=$(fsum "$VF")
+    vtail "$s"
+    [ -z "$VOC" ] || want "$(vcn) origin bytes after S" "$(($(wc -c < "$VOC") - s))" ge 3000000
+    [ "$C" != t ] || want "tunvless traces the client switch" "$(grep -c 'client switched to direct copy' "$W/tun-$MODE-$G.log")" ge 1
+}
+vapp() { [ -n "$VCC" ] && python3 tests/vrecs.py "$VCC" --after-handshake || true; }
+v_case() {
+    XR=0
+    tap_up w || return 1
+    warm=0; for _ in $(seq 12); do out=$(probe); is_ok "$out" && { warm=1; break; }; sleep 1; done
+    tap_down
+    [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; return 1; }
+    case "$MODE" in
+    vis-up-ccm8)
+        e=$(ip netns exec "$NSS" env OPENSSL_CONF="$W/ccm8.cnf" timeout 20 curl -sS -k --tlsv1.3 --tls13-ciphers TLS_AES_128_CCM_8_SHA256 \
+            -o /dev/null -w '%{http_code}' "https://$TARGET:8445/" 2>&1) || e="$e failed"
+        [ "$e" = 200 ] || { echo "run-xray: FAIL — no CCM_8 on this host: $e"; return 1; }
+        echo "run-xray: CCM_8 directly in the server namespace: $e" ;;
+    vis-up|vis-up-tls|vis-up-tls12) head -c "$([ "$MODE" = vis-up-tls12 ] && echo 1000000 || echo 3000000)" /dev/urandom > "$W/up-$MODE.bin" ;;
+    esac
+    for C in t x; do
+        case "$MODE" in
+        vis-up|vis-up-tls)
+            VP=8443; vgo up dcurl "$W/up-$MODE.bin" 8443 --tlsv1.3 || return 1
+            v_up_check ;;
+        vis-up-tls12)
+            VP=8444; vgo up dcurl "$W/up-$MODE.bin" 8444 --tls-max 1.2 || return 1
+            rx "$(vcn) commands" "$(fld "$VF" 3)" '0( 0)+ 1'
+            want "$(vcn) frames with command 2" "$(fld "$VF" 3 | tr ' ' '\n' | grep -c '^2$')" eq 0
+            vtail "$(fsum "$VF")" --not ;;
+        vis-up-ccm8)
+            VP=8445
+            vgo get sh -c 'ip netns exec "$0" env OPENSSL_CONF="$1" timeout 30 curl -sS -k -m 20 --tlsv1.3 --tls13-ciphers TLS_AES_128_CCM_8_SHA256 -o /dev/null -w "status %{http_code}\n" "$2" | tee /dev/stderr | grep -qx "status 200"' \
+                "$NSC" "$W/ccm8.cnf" "https://$(vhost):$(vport 8445)/" || return 1
+            rx "$(vcn) commands" "$(fld "$VF" 3)" '0( 0)+ 1'
+            want "$(vcn) frames with command 2" "$(fld "$VF" 3 | tr ' ' '\n' | grep -c '^2$')" eq 0 ;;
+        vis-up-shapes)
+            for m in split joined nocss; do VP=8443; vgo "$m" dshape "$m" || return 1; vshape_check; done ;;
+        fm-frag-vision-up|fm-hc-vision-up)
+            VP=8443; vgo split dshape split || return 1; vshape_check ;;
+        vis-plain-end)
+            VP=8080; VPROBE=1 vgo plain ddrive plain 8080 0 1000 10 50 || return 1
+            same "$(vcn) frames" "$(printf '%s\n' "$VF" | sed 's|/[0-9]*/|/P/|g')" "100/P/0 100/P/0 100/P/0 100/P/0 100/P/0 100/P/0 100/P/1"
+            want "$(vcn) frames with padding of 256 B or more" "$(fbad "$VF" pad)" eq 0
+            if [ "$C" = t ]; then
+                PF=$(vframes "$W/slog-$MODE-t-probe" 80) || { echo "run-xray: FAIL — no single probe session"; XR=1; }
+                echo "run-xray: tunvless probe: frames $PF"
+                same "tunvless probe commands" "$(fld "$PF" 3)" 0
+                want "tunvless probe frames with padding of 256 B or more" "$(fbad "$PF" pad)" eq 0
+            fi ;;
+        vis-wait)
+            VP=2222; vgo greet ddrive greet 2222 0 8192 || return 1
+            want "$(vcn) greet: ms to the request" "$(vreq_ms "$VL" 2222 "$(vconn)")" ge 500
+            want "$(vcn) greet: ms to the request" "$(vreq_ms "$VL" 2222 "$(vconn)")" le 800
+            a=$(vapp); echo "run-xray: $(vcn) greet: records after the handshake $(echo "$a" | cut -c1-60)"
+            same "$(vcn) greet: first record after the handshake" "${a%% *}" 61
+            want "$(vcn) greet: frames with content 0" "$(fld "$VF" 1 | tr ' ' '\n' | grep -c '^0$')" eq 0
+            VP=8080; vgo w700 ddrive plain 8080 700 2000 || return 1
+            want "$(vcn) 700: ms to the request" "$(vreq_ms "$VL" 8080 "$(vconn)")" ge 500
+            want "$(vcn) 700: ms to the request" "$(vreq_ms "$VL" 8080 "$(vconn)")" le 800
+            a=$(vapp); echo "run-xray: $(vcn) 700: records after the handshake $(echo "$a" | cut -c1-60)"
+            set -- $a 0 0
+            pp=$(fld "$VF" 2 | cut -d' ' -f1)
+            same "$(vcn) 700: first two records after the handshake" "$1 $2" "61 $((2038 + ${pp:-0}))"
+            same "$(vcn) 700: frames" "$(printf '%s\n' "$VF" | sed 's|/[0-9]*/|/P/|g')" "2000/P/0"
+            vgo w300 ddrive plain 8080 300 2000 || return 1
+            want "$(vcn) 300: ms to the request" "$(vreq_ms "$VL" 8080 "$(vconn)")" ge 300
+            want "$(vcn) 300: ms to the request" "$(vreq_ms "$VL" 8080 "$(vconn)")" le 550
+            a=$(vapp); echo "run-xray: $(vcn) 300: records after the handshake $(echo "$a" | cut -c1-60)"
+            want "$(vcn) 300: records after the handshake" "$(echo "$a" | wc -w)" ge 1
+            want "$(vcn) 300: records of 61 B after the handshake" "$(echo "$a" | tr ' ' '\n' | grep -c '^61$')" eq 0 ;;
+        vis-reshape)
+            for g in "g8k greet 2222 0 8192" "p0 plain 8080 0 8192" "p150 plain 8080 150 8192" "g20k greet 2222 0 20000"; do
+                set -- $g; VP=$3
+                vgo "$1" ddrive "$2" "$3" "$4" "$5" || return 1
+                case "$1" in
+                g20k)
+                    same "$(vcn) $1 contents in all" "$(fsum "$VF")" 20000
+                    want "$(vcn) $1 frames with content of 8171 B or more" "$(fbad "$VF" cut)" eq 0
+                    rx "$(vcn) $1 commands" "$(fld "$VF" 3)" '0( 0)*' ;;
+                g8k|p0|p150)
+                    same "$(vcn) $1 contents" "$(fld "$VF" 1)" "4096 4096"
+                    same "$(vcn) $1 commands" "$(fld "$VF" 3)" "0 0" ;;
+                esac
+                case "$1" in p0|p150)
+                    a=$(vapp); set -- "$1" $a
+                    same "$(vcn) $1 first four records after the handshake" "$2 $3 $4 $5" "1203 2389 3575 1093" ;;
+                esac
+                want "$(vcn) $1 frames over 8192 B" "$(fbad "$VF" cap)" eq 0
+            done ;;
+        esac
+    done
+    case "$MODE" in
+    vis-up-shapes|fm-frag-vision-up|fm-hc-vision-up)
+        ms="split"; [ "$MODE" = vis-up-shapes ] && ms="split joined nocss"
+        for m in $ms; do
+            eval "a=\$SK_t_$m b=\$SK_x_$m c=\$SC_t_$m d=\$SC_x_$m"
+            same "$m commands, tunvless as Xray's client" "$a" "$b"
+            same "$m contents, tunvless as Xray's client" "$c" "$d"
+        done ;;
+    esac
+    return $XR
+}
 for MODE in $CASES; do
     rm -rf "/etc/netns/$NSC" 2>/dev/null || true
     srv_v6 replace
@@ -1387,7 +1650,7 @@ for MODE in $CASES; do
         echo "run-xray: the server namespace has no IPv6 route to the check targets"
     fi
     cat > "$W/xray.json" <<JSON
-{"log":{"loglevel":"warning","access":"$W/xray-access-$MODE.log"},
+{"log":{"loglevel":"$SLOG","access":"$W/xray-access-$MODE.log"},
  "inbounds":[$INB],
  "outbounds":[{"protocol":"freedom","tag":"direct","settings":{"finalRules":[$FR]}}]}
 JSON
@@ -1399,8 +1662,18 @@ JSON
     RPID=""; [ -z "$KEYLOG" ] || tap_up p || { FAIL=1; kill "$XPID" 2>/dev/null || true; continue; }
 
     sub_write
+    if is_v "$MODE"; then v_own; else o_own; fi
     probe() { ip netns exec "$NSC" env $TUN_ENV "$BIN" --probe --timeout 5 $TUN_ARGS "$W/sub.txt" 2>&1 || true; }
     is_ok() { printf '%s' "$1" | awk -F '\t' '$3 == "ok" { f = 1 } END { exit !f }'; }
+    if is_v "$MODE"; then
+        SPID=""; CPID=""; LPID=""
+        rc=0; v_case || rc=1
+        tun_down; xc_down; tap_down; votap_down
+        kill "$XPID" 2>/dev/null || true
+        sleep 0.5
+        if [ "$rc" -ne 0 ]; then FAIL=1; echo "run-xray: case $MODE — FAIL"; else echo "run-xray: case $MODE — ok"; fi
+        continue
+    fi
     case "$MODE" in fm-*)
         SPID=""; CPID=""; LPID=""
         rc=0; fm_case || rc=1

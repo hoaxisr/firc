@@ -54,7 +54,8 @@ struct fm_link *fm_link_new_ops(const struct fm_ops *const *ops, const struct fm
 void    fm_link_free(struct fm_link *l);
 int     fm_link_hs(struct fm_link *l, int fd, int timeout_ms);
 int     fm_shape(struct fm_link *l, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg);
-ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n);
+ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n, int direct);
+int     fm_splices(const struct fm_link *l);
 ssize_t fm_recv(struct fm_link *l, int fd, void *d, size_t cap, int flags, int direct);
 int     fm_pending_any(const struct fm_link *l);
 static inline int fm_pending(const struct fm_link *l) { return l && fm_pending_any(l); }

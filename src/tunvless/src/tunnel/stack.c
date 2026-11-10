@@ -216,8 +216,9 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
-    /* When the client completed the handshake (its first ACK; 0 — not yet), and whether anything
-     * went to the node yet: a client silent for SERVER_FIRST_MS after that waits for the server
+    /* When the client completed the handshake (its first ACK; 0 — not yet), moved to the moment
+     * the link became ready if that came later, and whether anything went to the node yet: a
+     * client silent for SERVER_FIRST_MS after that waits for the server
      * to speak first, and the node must be told where to connect without data (conn_deadlines).
      * Not counted from the SYN: a client whose SYN-ACK was lost is not silent, it does not have
      * the connection yet. Opening the flow then let the server's answer go out ahead of the
@@ -228,6 +229,7 @@ struct conn {
      * not yet. room_watch compares the room now with it to tell the client it grew. */
     uint32_t room_seen;
     uint8_t sent_any;
+    uint8_t fw_again;
     /* The client gave up (RST) while the connector was working: the record must not be
      * touched, so only mark it, and close once the connector is done. */
     uint8_t client_gone;
@@ -268,8 +270,9 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 224 ? 1 : -1];
 
 /* How long a client may stay silent before the flow is opened without its data: SSH, SMTP, FTP
  * and the like wait for the server's greeting, and VLESS carries the destination only with the
- * first data. 100 ms, as Xray's own client (buf.CopyOnceTimeout in its VLESS outbound). */
-#define SERVER_FIRST_MS 100
+ * first data. 500 ms, as Xray's VLESS outbound, counted from the later of the client's handshake
+ * and the ready link. */
+#define SERVER_FIRST_MS 500
 
 /* Unacknowledged bytes kept per connection, and therefore our in-flight limit.
  *
@@ -1920,8 +1923,8 @@ static int downstream_pump(struct conn *c, const struct tun_dev *tun) {
     TR("%zu bytes from server\n", got);
 
     /* Parsing — response header, wrappers, datagram reassembly — is the dialer's. It delivers the
-     * payload at once, piece by piece, not into a common buffer, which would cost a copy of all
-     * traffic and a "did not fit" limit. */
+     * payload at once, piece by piece once Vision's filter is done, not into a common buffer, which
+     * would cost a copy of all traffic and a "did not fit" limit. */
     struct emit_ctx e = { .c = c, .tun = tun, .total = 0 };
     if (g_dl->ops->deliver(g_dl->ctx, s, c->is_udp, rx, got,
                            c->is_udp ? (c->ib_udp ? emit_ib_dgram : emit_dgram) : c->sock ? emit_sock : emit_stream,
@@ -2801,6 +2804,7 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
         conn_reset(c, tun);
         return 1;
     }
+    if (c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
     c->last = g_now_s;
     TR("flow ready (conn#%ld), early data sent\n", (long)(c - g_conns));
     if (c->sock) return sock_read(c, tun);
@@ -2825,6 +2829,12 @@ static void nodes_sweep(unsigned *seen, uint64_t now) {
     }
 }
 
+static int64_t first_wait_left(const struct conn *c, uint64_t now) {
+    if (c->is_udp || c->sent_any || c->early || c->srv_closed || !c->estab_ns) return -1;
+    uint64_t due = c->estab_ns + SERVER_FIRST_MS * 1000000ull;
+    return now >= due ? 0 : (int64_t)((due - now + 999999) / 1000000);
+}
+
 /* Deadlines of one connection: retransmission, the early data tail, close after the server or a
  * cut, idle cleanup. The loop's single pass calls it for each live connection (worker_loop); a
  * separate function so tests/tunnelmatch.c can drive it, since deadlines show from outside only
@@ -2838,16 +2848,17 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
-    /* A client silent since the handshake: open the flow without data, so a server that speaks
+    /* A client silent since the handshake and the ready link: open the flow without data, so a server that speaks
      * first can (dialer.h, send with n == 0). The early data path above covers a client that
      * spoke. */
-    if (!c->is_udp && !c->sent_any && !c->early && !c->srv_closed && c->estab_ns &&
-        now - c->estab_ns >= SERVER_FIRST_MS * 1000000ull) {
+    if (first_wait_left(c, now) == 0) {
+        c->fw_again = 0;
         int sr = upstream_send(c, NULL, 0);
         if (sr == SEND_FATAL) {
             conn_reset(c, tun);
             return 1;
         }
+        if (sr != SEND_OK) c->fw_again = 1;
     }
 
     room_watch(c);
@@ -3849,7 +3860,8 @@ static int loop_turn(struct loop *L, int max_ms) {
 
     /* ONE pass over the live connections before the wait (see struct conn for why). It
      * computes everything the wait needs: the epoll set, the number of pending jobs, the
-     * connections with data already read, and the nearest retransmission deadline. */
+     * connections with data already read, and the nearest retransmission or first-payload
+     * deadline. */
     int pend = 0, forced = 0;
     /* Wait until the nearest retransmission deadline, not always a second: otherwise a
      * resend waits for the loop to wake by itself. With live traffic that is at once, but
@@ -3922,6 +3934,10 @@ static int loop_turn(struct loop *L, int max_ms) {
             int64_t left = (int64_t)c->rto_ms - (int64_t)((now - c->rtx_at) / 1000000);
             if (left < 0) left = 0;
             if (left < wait_ms) wait_ms = (int)left;
+        }
+        if (!c->fw_again) {
+            int64_t left = first_wait_left(c, now);
+            if (left >= 0 && left < wait_ms) wait_ms = (int)left;
         }
     }
     if (g_stats) g_st.conns = (uint32_t)g_live_n;

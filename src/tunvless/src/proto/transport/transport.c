@@ -22,7 +22,7 @@
 
 int tr_link_write(void *ctx, const unsigned char *d, size_t n) {
     struct tr_link *l = ctx;
-    if (l->plain) {
+    if (l->plain || l->tx_direct) {
         size_t sent = 0;
         while (sent < n) {
             ssize_t w = tr_lk_send(l, d + sent, n - sent);
@@ -60,7 +60,7 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
 }
 
 ssize_t tr_lk_send(struct tr_link *l, const void *d, size_t n) {
-    if (l->tls.fm) return fm_send(l->tls.fm, l->fd, d, n);
+    if (l->tls.fm) return fm_send(l->tls.fm, l->fd, d, n, l->tx_direct);
     /* send with MSG_NOSIGNAL, not write: a socket closed by the node fails the write (EPIPE)
      * instead of raising SIGPIPE, even in a process that did not ignore it (the tests). Over
      * TLS, tls13_write relies on main ignoring SIGPIPE (src/main.c). */
@@ -253,6 +253,14 @@ int transport_has_data(const struct transport *t) {
 
 void transport_direct(struct transport *t) {
     if (!own_links(t)) t->link.rx_direct = 1;
+}
+
+void transport_tx_direct(struct transport *t) {
+    if (!own_links(t)) t->link.tx_direct = 1;
+}
+
+int transport_can_tx_direct(const struct transport *t) {
+    return !t->enc && t->fr == &tr_tcp && !t->link.plain && fm_splices(t->link.tls.fm);
 }
 
 void transport_moved(struct transport *t) {

@@ -8,6 +8,11 @@
 #define VISION_CMD_END      1
 #define VISION_CMD_DIRECT   2
 
+#define VISION_FILTER_N 8
+#define VISION_BUF      8192
+#define VISION_PLAIN    1
+#define VISION_EFIT   (-3)
+
 /* Never returned: a short read is not an error, the start of the stream is collected in
  * rx_pre. The value stays reserved so that -1 never gets another meaning. */
 #define VISION_EAGAIN (-1)
@@ -18,10 +23,6 @@ struct vision {
     /* The UUID goes only in the first frame: it marks the start of the stream, and repeating
      * it would hand an observer a fixed byte sequence. */
     int need_uuid;
-    /* Padding is over in the sending direction. After the end frame the server no longer
-     * expects frames, so a further 5-byte header would land in the data stream: invisible on
-     * a short request (one frame), silent corruption on any longer upload. */
-    int sent_end;
     int recv_uuid_seen;      /* the UUID of the server's first frame is consumed */
     int recv_done;           /* padding is over: the rest of the stream is passed as is */
     /* The server sent direct: it switches to direct copy and writes the destination's stream
@@ -48,11 +49,20 @@ struct vision {
     int rx_direct_after;
 
     unsigned long sent_frames;
+
+    int filter_left;
+    int32_t sh_left;
+    uint16_t cipher;
+    uint8_t is_tls, tls12_or_above, enable_xtls;
+    uint8_t is_padding;
+    uint8_t tx_switch;
 };
 
 void vision_init(struct vision *v, const unsigned char uuid[16]);
-size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
-                   unsigned char *out, size_t cap);
+int vision_wrap(struct vision *v, const unsigned char *d, size_t n, int may_direct,
+                unsigned char *out, size_t cap, size_t *out_n);
 int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
                   size_t *consumed, const unsigned char **payload, size_t *payload_n);
+int vision_filter(struct vision *v, const unsigned char *b, size_t n);
+static inline int vision_filtering(const struct vision *v) { return v->filter_left > 0; }
 #endif

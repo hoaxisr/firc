@@ -158,8 +158,8 @@ struct dialer_ops {
     /* Client bytes to the node; for UDP, one datagram framed by dgram_frame per call. Returns
      * SEND_*. For TCP, n == 0 before any data means "the client is silent, the server may speak
      * first" (SSH, SMTP, FTP): send whatever the node needs to open the flow now (for VLESS the
-     * request header alone). The stack makes that call once, SERVER_FIRST_MS after the client
-     * completed the handshake. */
+     * request header alone). The stack makes that call once, SERVER_FIRST_MS after the later of
+     * the client's handshake and the ready link. */
     int  (*send)(const void *ctx, void *sess, const struct flow_key *k, int udp,
                  const unsigned char *d, size_t n);
     /* How many client bytes send would take right now (TCP), after the dialer's own framing;

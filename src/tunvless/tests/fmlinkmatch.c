@@ -108,8 +108,11 @@ static int hold_pending(const struct fm_layer *me) {
     return s->nheld > 0;
 }
 
+static int g_gapn;
+
 static int gap_wr(struct fm_layer *me, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
     struct tst *s = me->st;
+    g_gapn++;
     size_t k = (size_t)s->a;
     for (size_t off = 0; off < n; off += k) {
         int rc = emit(arg, d + off, n - off < k ? n - off : k, s->b);
@@ -236,7 +239,7 @@ static void t_chain_order(void) {
     check("order: chain built", 1, l != NULL);
     unsigned char d[11] = "0123456789", got[32];
     g_nlog = 0;
-    check("order: fm_send 10", 10, (long)fm_send(l, sv[0], d, 10));
+    check("order: fm_send 10", 10, (long)fm_send(l, sv[0], d, 10, 0));
     check("order: two writes logged", 2, (long)g_nlog);
     check("order: rec_a first", 'a', g_log[0].tag);
     check("order: rec_a 10 B", 10, (long)g_log[0].n);
@@ -273,7 +276,7 @@ static void t_hs_through_lower(void) {
     send(sv[1], "OK", 2, MSG_NOSIGNAL);
     g_nlog = 0;
     check("hs lower: hs ok", 0, fm_link_hs(l, sv[0], 0));
-    check("hs lower: fm_send 5", 5, (long)fm_send(l, sv[0], "data!", 5));
+    check("hs lower: fm_send 5", 5, (long)fm_send(l, sv[0], "data!", 5, 0));
     check("hs lower: rec saw two writes", 2, (long)g_nlog);
     check("hs lower: first is the 3 B hello", 3, (long)g_log[0].n);
     check("hs lower: then the 5 B of data", 5, (long)g_log[1].n);
@@ -295,7 +298,7 @@ static void t_blocking_gap(void) {
     unsigned char d[30], got[64];
     for (int i = 0; i < 30; i++) d[i] = (unsigned char)i;
     uint64_t t0 = mono_ms();
-    check("blocking gap: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30));
+    check("blocking gap: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30, 0));
     uint64_t el = mono_ms() - t0;
     check("blocking gap: elapsed >= 60 ms", 1, el >= 60);
     check("blocking gap: elapsed <= 1 s", 1, el <= 1000);
@@ -320,7 +323,7 @@ static void t_loop_queue(void) {
     unsigned char d[30], got[64];
     for (int i = 0; i < 30; i++) d[i] = (unsigned char)(0x40 + i);
     uint64_t t0 = mono_ms();
-    check("loop queue: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30));
+    check("loop queue: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30, 0));
     check("loop queue: returned within 5 ms", 1, mono_ms() - t0 < 5);
     check("loop queue: one message out", 10, (long)peek_msg(sv[1], got, sizeof got));
     check_mem("loop queue: first piece", d, got, 10);
@@ -334,7 +337,7 @@ static void t_loop_queue(void) {
     check_mem("loop queue: second piece", d + 10, got, 10);
     check("loop queue: no third yet", -1, (long)peek_msg(sv[1], got, sizeof got));
     check("loop queue: next_ms 20", 20, nx);
-    check("loop queue: later fm_send 4", 4, (long)fm_send(l, sv[0], "wxyz", 4));
+    check("loop queue: later fm_send 4", 4, (long)fm_send(l, sv[0], "wxyz", 4, 0));
     check("loop queue: the 4 B waits", -1, (long)peek_msg(sv[1], got, sizeof got));
     check("loop queue: 14 queued", 14, (long)fm_queued(l));
     check("loop queue: kick at +42", 0, fm_kick(l, sv[0], t0 + 42, &nx));
@@ -361,7 +364,7 @@ static void t_kick_stale_now(void) {
     fm_set_loop(l, 1);
     unsigned char d[30], got[64];
     memset(d, 0x61, sizeof d);
-    check("stale kick: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30));
+    check("stale kick: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30, 0));
     check("stale kick: first piece out", 10, (long)peek_msg(sv[1], got, sizeof got));
     struct timespec ts = { 0, 60 * 1000000L };
     nanosleep(&ts, NULL);
@@ -408,7 +411,7 @@ static void t_loop_short_write(void) {
     struct fm_mask m[1] = { mk(1 << 20, 1) };
     struct fm_link *l = chain(1, ops, m);
     fm_set_loop(l, 1);
-    check("short write: fm_send returns 4 MiB", (long)BIG, (long)fm_send(l, c, d, BIG));
+    check("short write: fm_send returns 4 MiB", (long)BIG, (long)fm_send(l, c, d, BIG, 0));
     check("short write: the rest is queued", 1, fm_queued(l) > 0);
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33) && !defined(__SANITIZE_ADDRESS__)
     struct mallinfo2 mb = mallinfo2();
@@ -454,7 +457,7 @@ static void t_gap_through_lower(void) {
     for (int i = 0; i < 20; i++) d[i] = (unsigned char)(0x61 + i);
     struct fm_link *l = chain(2, ops, m);
     uint64_t t0 = mono_ms();
-    check("gap lower: blocking fm_send 20", 20, (long)fm_send(l, sv[0], d, 20));
+    check("gap lower: blocking fm_send 20", 20, (long)fm_send(l, sv[0], d, 20, 0));
     check("gap lower: blocking slept both gaps", 1, mono_ms() - t0 >= 40);
     for (int i = 0; i < 4; i++) {
         check("gap lower: blocking piece of 5", 5, (long)peek_msg(sv[1], got, sizeof got));
@@ -464,7 +467,7 @@ static void t_gap_through_lower(void) {
     l = chain(2, ops, m);
     fm_set_loop(l, 1);
     t0 = mono_ms();
-    check("gap lower: loop fm_send 20", 20, (long)fm_send(l, sv[0], d, 20));
+    check("gap lower: loop fm_send 20", 20, (long)fm_send(l, sv[0], d, 20, 0));
     check("gap lower: loop first 5", 5, (long)peek_msg(sv[1], got, sizeof got));
     check("gap lower: loop second 5", 5, (long)peek_msg(sv[1], got, sizeof got));
     check_mem("gap lower: loop second bytes", d + 5, got, 5);
@@ -478,7 +481,7 @@ static void t_gap_through_lower(void) {
     check("gap lower: fourth 5", 5, (long)peek_msg(sv[1], got, sizeof got));
     check_mem("gap lower: fourth bytes", d + 15, got, 5);
     check("gap lower: queue empty", -1, nx);
-    check("gap lower: a later send waits the last gap", 1, (long)fm_send(l, sv[0], "z", 1));
+    check("gap lower: a later send waits the last gap", 1, (long)fm_send(l, sv[0], "z", 1, 0));
     check("gap lower: it is queued", 1, (long)fm_queued(l));
     check("gap lower: kick at +40 too early", 0, fm_kick(l, sv[0], t0 + 40, &nx));
     check("gap lower: next_ms > 0", 1, nx > 0);
@@ -499,12 +502,12 @@ static void t_queue_cap(void) {
     fm_set_loop(l, 1);
     size_t n = 100 * 1024;
     unsigned char *d = calloc(1, (size_t)FM_Q_HARD);
-    check("queue cap: first send", (long)n, (long)fm_send(l, sv[0], d, n));
+    check("queue cap: first send", (long)n, (long)fm_send(l, sv[0], d, n, 0));
     check("queue cap: over FM_Q_MAX queued", 1, fm_queued(l) > FM_Q_MAX);
-    check("queue cap: still taken past FM_Q_MAX", (long)n, (long)fm_send(l, sv[0], d, n));
-    check("queue cap: a third send fills it", (long)n, (long)fm_send(l, sv[0], d, n));
+    check("queue cap: still taken past FM_Q_MAX", (long)n, (long)fm_send(l, sv[0], d, n, 0));
+    check("queue cap: a third send fills it", (long)n, (long)fm_send(l, sv[0], d, n, 0));
     check("queue cap: over FM_Q_HARD queued", 1, fm_queued(l) >= FM_Q_HARD - 1024);
-    check("queue cap: refused when full", TR_EIO_WANT, (long)fm_send(l, sv[0], d, 10));
+    check("queue cap: refused when full", TR_EIO_WANT, (long)fm_send(l, sv[0], d, 10, 0));
     check_str("queue cap: why", "the send queue is full", fm_why(l));
     int nx;
     check("queue cap: kick reports the error", TR_EIO_WANT, fm_kick(l, sv[0], mono_ms() + 100000, &nx));
@@ -579,10 +582,10 @@ static void t_loop_after_due(void) {
     fm_set_loop(l, 1);
     unsigned char d[30], got[64];
     for (int i = 0; i < 30; i++) d[i] = (unsigned char)(0x30 + i);
-    check("after due: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30));
+    check("after due: fm_send 30", 30, (long)fm_send(l, sv[0], d, 30, 0));
     check("after due: first out", 10, (long)peek_msg(sv[1], got, sizeof got));
     poll(NULL, 0, 30);
-    check("after due: fm_send 4 later", 4, (long)fm_send(l, sv[0], "wxyz", 4));
+    check("after due: fm_send 4 later", 4, (long)fm_send(l, sv[0], "wxyz", 4, 0));
     check("after due: the 4 B did not jump", -1, (long)peek_msg(sv[1], got, sizeof got));
     uint64_t end = mono_ms() + 2000;
     while (fm_queued(l) && mono_ms() < end) {
@@ -608,10 +611,10 @@ static void t_errors(void) {
     struct fm_link *l = chain(1, ops, m);
     unsigned char got[16];
     g_fail = 1;
-    check("errors: failed write", -7, (long)fm_send(l, sv[0], "ab", 2));
+    check("errors: failed write", -7, (long)fm_send(l, sv[0], "ab", 2, 0));
     check_str("errors: why", "fail: broken", fm_why(l));
     g_fail = 0;
-    check("errors: later write still fails", -7, (long)fm_send(l, sv[0], "cd", 2));
+    check("errors: later write still fails", -7, (long)fm_send(l, sv[0], "cd", 2, 0));
     check("errors: nothing reached the peer", -1, (long)peek_msg(sv[1], got, sizeof got));
     check("errors: kick fails too", -7, fm_kick(l, sv[0], mono_ms(), &nx));
     fm_link_free(l);
@@ -687,7 +690,7 @@ static void t_blocking_short_write(void) {
     struct slow sd = { .fd = s, .b = rb };
     pthread_t th;
     pthread_create(&th, NULL, slow_drain, &sd);
-    check("blocking short: fm_send 4 MiB", (long)BIG, (long)fm_send(l, c, d, BIG));
+    check("blocking short: fm_send 4 MiB", (long)BIG, (long)fm_send(l, c, d, BIG, 0));
     shutdown(c, SHUT_WR);
     pthread_join(th, NULL);
     check("blocking short: peer got 4 MiB", (long)BIG, (long)sd.got);
@@ -714,13 +717,13 @@ static void t_room(void) {
     check("room: all of it at first", FM_Q_MAX, (long)fm_room(l));
     for (int i = 0; i < 10000 && fm_room(l) > 0; i++) {
         size_t k = fm_room(l) < sizeof d ? fm_room(l) : sizeof d;
-        if (fm_send(l, sv[0], d, k) != (ssize_t)k) refused = 1;
+        if (fm_send(l, sv[0], d, k, 0) != (ssize_t)k) refused = 1;
     }
     check("room: never refused while room > 0", 0, refused);
     check("room: reaches 0", 0, (long)fm_room(l));
     check("room: 9 B per 1-byte piece, at least 7282 queued", 1, fm_queued(l) >= 7282);
     check("room: and under 7282 + 1000", 1, fm_queued(l) < 7282 + 1000);
-    check("room: a control write still taken", 3, (long)fm_send(l, sv[0], d, 3));
+    check("room: a control write still taken", 3, (long)fm_send(l, sv[0], d, 3, 0));
     fm_link_free(l);
     close(sv[0]);
     close(sv[1]);
@@ -737,12 +740,12 @@ static void t_two_gaps(void) {
     struct fm_link *l = chain(2, ops, m);
     fm_set_loop(l, 1);
     uint64_t t0 = mono_ms();
-    check("two gaps queued: send 10", 10, (long)fm_send(l, sv[0], d, 10));
+    check("two gaps queued: send 10", 10, (long)fm_send(l, sv[0], d, 10, 0));
     check("two gaps queued: first 5 out", 5, (long)peek_msg(sv[1], got, sizeof got));
     check("two gaps queued: 5 waiting", 5, (long)fm_queued(l));
     check("two gaps queued: kick at +8", 0, fm_kick(l, sv[0], t0 + 8, &nx));
     check("two gaps queued: second 5 out", 5, (long)peek_msg(sv[1], got, sizeof got));
-    check("two gaps queued: later 1 B", 1, (long)fm_send(l, sv[0], "z", 1));
+    check("two gaps queued: later 1 B", 1, (long)fm_send(l, sv[0], "z", 1, 0));
     check("two gaps queued: kick at +34 too early", 0, fm_kick(l, sv[0], t0 + 34, &nx));
     check("two gaps queued: nothing at +34", -1, (long)peek_msg(sv[1], got, sizeof got));
     check("two gaps queued: next 1", 1, nx);
@@ -752,10 +755,10 @@ static void t_two_gaps(void) {
     l = chain(2, ops, m);
     fm_set_loop(l, 1);
     t0 = mono_ms();
-    check("two gaps empty: send 5", 5, (long)fm_send(l, sv[0], d, 5));
+    check("two gaps empty: send 5", 5, (long)fm_send(l, sv[0], d, 5, 0));
     check("two gaps empty: 5 out", 5, (long)peek_msg(sv[1], got, sizeof got));
     check("two gaps empty: nothing queued", 0, (long)fm_queued(l));
-    check("two gaps empty: later 1 B", 1, (long)fm_send(l, sv[0], "z", 1));
+    check("two gaps empty: later 1 B", 1, (long)fm_send(l, sv[0], "z", 1, 0));
     check("two gaps empty: kick at +26 too early", 0, fm_kick(l, sv[0], t0 + 26, &nx));
     check("two gaps empty: nothing at +26", -1, (long)peek_msg(sv[1], got, sizeof got));
     check("two gaps empty: next 1..2", 1, nx >= 1 && nx <= 2);
@@ -775,7 +778,7 @@ static void t_loop_no_sleep(void) {
     struct fm_link *l = chain(1, ops, m);
     fm_set_loop(l, 1);
     uint64_t t0 = mono_ms();
-    check("no sleep: fm_send 3", 3, (long)fm_send(l, sv[0], "abc", 3));
+    check("no sleep: fm_send 3", 3, (long)fm_send(l, sv[0], "abc", 3, 0));
     check("no sleep: within 10 ms", 1, mono_ms() - t0 < 10);
     check("no sleep: 2 queued", 2, (long)fm_queued(l));
     fm_link_free(l);
@@ -813,6 +816,90 @@ static void t_direct_splice(void) {
     direct_case("direct [s0]", &op_x55s0, NULL, 1, "5457", "5457");
     direct_case("direct [s0,s1]", &op_x55s0, &op_x55s1, 2, "0102", "0102");
     direct_case("direct [s1,s0]", &op_x55s1, &op_x55s0, 2, "5457", "0102");
+}
+
+static void send_case(const char *what, const struct fm_ops *a, const struct fm_ops *b, size_t n, int direct,
+                      const char *want) {
+    int sv[2];
+    seqpair(sv);
+    const struct fm_ops *ops[2] = { a, b };
+    struct fm_link *l = fm_link_new_ops(ops, (const struct fm_mask *const[2]){ NULL, NULL }, n);
+    unsigned char got[8];
+    char w[96];
+    snprintf(w, sizeof w, "%s: fm_send 3", what);
+    check(w, 3, (long)fm_send(l, sv[0], "abc", 3, direct));
+    snprintf(w, sizeof w, "%s: peer read 3", what);
+    check(w, 3, (long)peek_msg(sv[1], got, sizeof got));
+    snprintf(w, sizeof w, "%s: bytes", what);
+    check_mem(w, want, got, 3);
+    fm_link_free(l);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void t_direct_send_splice(void) {
+    /* catches: fm_send ignoring direct, lowering past a non-splice layer, or walking from the wrong end */
+    send_case("send [s1] masked", &op_x55s1, NULL, 1, 0, "\x34\x37\x36");
+    send_case("send [s1] direct", &op_x55s1, NULL, 1, 1, "abc");
+    send_case("send [s0] direct", &op_x55s0, NULL, 1, 1, "\x34\x37\x36");
+    send_case("send lay [s0,s1] direct", &op_x55s1, &op_x55s0, 2, 1, "\x34\x37\x36");
+}
+
+static void t_direct_send_behind_queue(void) {
+    /* catches: a raw write sent ahead of queued outer pieces, or passed through the splice layer */
+    int sv[2], nx = 99;
+    seqpair(sv);
+    const struct fm_ops *ops[1] = { &op_gap };
+    struct fm_mask m[1] = { mk(10, 20) };
+    struct fm_link *l = chain(1, ops, m);
+    fm_set_loop(l, 1);
+    unsigned char d[30], got[64];
+    for (int i = 0; i < 30; i++) d[i] = (unsigned char)(0x40 + i);
+    uint64_t t0 = mono_ms();
+    g_gapn = 0;
+    check("behind queue: outer send 30", 30, (long)fm_send(l, sv[0], d, 30, 0));
+    check("behind queue: one gap write", 1, g_gapn);
+    check("behind queue: first piece out", 10, (long)peek_msg(sv[1], got, sizeof got));
+    check("behind queue: direct send 2", 2, (long)fm_send(l, sv[0], "BB", 2, 1));
+    check("behind queue: gap layer not called", 1, g_gapn);
+    check("behind queue: nothing new before the gap", -1, (long)peek_msg(sv[1], got, sizeof got));
+    check("behind queue: 22 queued", 22, (long)fm_queued(l));
+    check("behind queue: kick at +21", 0, fm_kick(l, sv[0], t0 + 21, &nx));
+    check("behind queue: kick at +42", 0, fm_kick(l, sv[0], t0 + 42, &nx));
+    check("behind queue: kick at +63", 0, fm_kick(l, sv[0], t0 + 63, &nx));
+    check("behind queue: second piece", 10, (long)peek_msg(sv[1], got, sizeof got));
+    check_mem("behind queue: second bytes", d + 10, got, 10);
+    check("behind queue: third piece", 10, (long)peek_msg(sv[1], got, sizeof got));
+    check_mem("behind queue: third bytes", d + 20, got, 10);
+    check("behind queue: then the raw 2 B", 2, (long)peek_msg(sv[1], got, sizeof got));
+    check_mem("behind queue: raw bytes", "BB", got, 2);
+    check("behind queue: nothing after", -1, (long)peek_msg(sv[1], got, sizeof got));
+    check("behind queue: queue empty", 0, (long)fm_queued(l));
+    fm_link_free(l);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void t_splices(void) {
+    /* catches: the hook reading one layer only, or NULL taken as a mask */
+    check("splices: no chain", 1, fm_splices(NULL));
+    const struct fm_ops *one[1] = { &op_x55s1 };
+    struct fm_link *l = fm_link_new_ops(one, (const struct fm_mask *const[1]){ NULL }, 1);
+    check("splices: [s1]", 1, fm_splices(l));
+    fm_link_free(l);
+    const struct fm_ops *gr[2] = { &op_gap, &op_rec };
+    struct fm_mask m[2] = { mk(10, 0), mk('r', 0) };
+    l = chain(2, gr, m);
+    check("splices: [gap, rec]", 1, fm_splices(l));
+    fm_link_free(l);
+    const struct fm_ops *mix[2] = { &op_x55s0, &op_x55s1 };
+    l = fm_link_new_ops(mix, (const struct fm_mask *const[2]){ NULL, NULL }, 2);
+    check("splices: lay [s1, s0]", 0, fm_splices(l));
+    fm_link_free(l);
+    const struct fm_ops *xim[2] = { &op_x55s1, &op_x55s0 };
+    l = fm_link_new_ops(xim, (const struct fm_mask *const[2]){ NULL, NULL }, 2);
+    check("splices: lay [s0, s1]", 0, fm_splices(l));
+    fm_link_free(l);
 }
 
 static void t_pending(void) {
@@ -958,7 +1045,7 @@ static void t_free(void) {
     for (int i = 0; i < 1000; i++) {
         struct fm_link *l = chain(3, ops, m);
         fm_set_loop(l, 1);
-        if (fm_send(l, sv[0], "abc", 3) != 3 || fm_queued(l) != 2) ok = 0;
+        if (fm_send(l, sv[0], "abc", 3, 0) != 3 || fm_queued(l) != 2) ok = 0;
         while (peek_msg(sv[1], got, sizeof got) > 0) {}
         fm_link_free(l);
     }
@@ -1026,7 +1113,7 @@ static void t_frag_hello_merged(void) {
     int sv[2];
     seqpair(sv);
     struct fm_link *l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":10}"));
-    check("hello merged: sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hello merged: sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("hello merged: one write", 1, (long)g_nfw);
     check("hello merged: 52 x 5 + 517 = 777 B", 777, (long)g_fw[0]);
@@ -1047,7 +1134,7 @@ static void t_frag_hello_delayed(void) {
     seqpair(sv);
     struct fm_link *l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":10,\"delay\":\"5-6\"}"));
     uint64_t t0 = mono_ms();
-    check("hello delayed: sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hello delayed: sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     uint64_t el = mono_ms() - t0;
     frag_take(sv[1]);
     check("hello delayed: 52 writes", 52, (long)g_nfw);
@@ -1076,7 +1163,7 @@ static void t_frag_hello_two_zero_delays(void) {
     seqpair(sv);
     struct fm_link *l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":10,\"delays\":[0,0]}"));
     uint64_t t0 = mono_ms();
-    check("hello two zero: sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hello two zero: sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     check("hello two zero: no sleep", 1, mono_ms() - t0 < 200);
     frag_take(sv[1]);
     check("hello two zero: 52 writes", 52, (long)g_nfw);
@@ -1091,7 +1178,7 @@ static void t_frag_hello_maxsplit(void) {
     int sv[2];
     seqpair(sv);
     struct fm_link *l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":10,\"maxSplit\":2}"));
-    check("hello maxsplit: sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hello maxsplit: sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("hello maxsplit: one write", 1, (long)g_nfw);
     check("hello maxsplit: 5 + 10 + 5 + 507 = 527 B", 527, (long)g_fw[0]);
@@ -1111,7 +1198,7 @@ static void t_frag_hello_tail(void) {
     d[523] = 0xbb;
     d[524] = 0xcc;
     struct fm_link *l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":10}"));
-    check("hello tail: sent", 525, (long)fm_send(l, sv[0], d, 525));
+    check("hello tail: sent", 525, (long)fm_send(l, sv[0], d, 525, 0));
     frag_take(sv[1]);
     check("hello tail: two writes", 2, (long)g_nfw);
     check("hello tail: records first", 1, g_fw[0] == 777 && records_ok(g_fwd, 777, 10, 52, 7));
@@ -1134,24 +1221,24 @@ static void t_frag_hello_only_first(void) {
     seqpair(sv);
     static const char js[] = FRAG("{\"packets\":\"tlshello\",\"length\":10}");
     struct fm_link *l = frag_open(js);
-    check("hello first: write 1 not 22", 6, (long)fm_send(l, sv[0], "\x17\x03\x03\x00\x01\x00", 6));
-    check("hello first: write 2 a hello", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hello first: write 1 not 22", 6, (long)fm_send(l, sv[0], "\x17\x03\x03\x00\x01\x00", 6, 0));
+    check("hello first: write 2 a hello", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("hello first: two whole writes", 1, g_nfw == 2 && g_fw[0] == 6 && g_fw[1] == 522);
     check_mem("hello first: the hello as is", g_hello, g_fwd + 6, 522);
     fm_link_free(l);
     l = frag_open(js);
-    check("hello first: 5 B record", 5, (long)fm_send(l, sv[0], "\x16\x03\x01\x00\x00", 5));
+    check("hello first: 5 B record", 5, (long)fm_send(l, sv[0], "\x16\x03\x01\x00\x00", 5, 0));
     frag_take(sv[1]);
     check("hello first: 5 B whole", 1, g_nfw == 1 && g_fw[0] == 5);
     fm_link_free(l);
     l = frag_open(js);
-    check("hello first: partial record", 105, (long)fm_send(l, sv[0], g_hello, 105));
+    check("hello first: partial record", 105, (long)fm_send(l, sv[0], g_hello, 105, 0));
     frag_take(sv[1]);
     check("hello first: partial whole", 1, g_nfw == 1 && g_fw[0] == 105);
     fm_link_free(l);
     l = frag_open(FRAG("{\"packets\":\"tlshello\",\"length\":1}"));
-    check("hello first: 7 B record of 2", 7, (long)fm_send(l, sv[0], "\x16\x03\x01\x00\x02\x41\x42", 7));
+    check("hello first: 7 B record of 2", 7, (long)fm_send(l, sv[0], "\x16\x03\x01\x00\x02\x41\x42", 7, 0));
     frag_take(sv[1]);
     check("hello first: 7 B cut into two records of 1", 1, g_nfw == 1 && g_fw[0] == 12);
     check_mem("hello first: the two records", "\x16\x03\x01\x00\x01\x41\x16\x03\x01\x00\x01\x42", g_fwd, 12);
@@ -1170,7 +1257,7 @@ static int frag_sizes(const char *json, const size_t *wr, size_t nwr, const size
     unsigned char got[8192];
     int ok = 1;
     for (size_t i = 0; i < nwr; i++) {
-        if (fm_send(l, sv[0], d, wr[i]) != (ssize_t)wr[i]) ok = 0;
+        if (fm_send(l, sv[0], d, wr[i], 0) != (ssize_t)wr[i]) ok = 0;
         frag_take(sv[1]);
         memcpy(got + tot, g_fwd, g_fwn);
         tot += g_fwn;
@@ -1222,7 +1309,7 @@ static void t_frag_range(void) {
     l = frag_open(FRAG("{\"packets\":\"\",\"length\":\"5-9\"}"));
     for (int k = 0; k < 20; k++) {
         unsigned char x[300] = { 0 };
-        fm_send(l, sv[0], x, r5[0]);
+        fm_send(l, sv[0], x, r5[0], 0);
         frag_take(sv[1]);
         for (size_t i = 0; i + 1 < g_nfw; i++) {
             if (g_fw[i] < 5 || g_fw[i] > 8) in = 0;
@@ -1251,7 +1338,7 @@ static void t_frag_range_zero_piece(void) {
     unsigned char d[25];
     for (int i = 0; i < 25; i++) d[i] = (unsigned char)i;
     g_nlog = 0;
-    check("zero piece: sent", 25, (long)fm_send(l, sv[0], d, 25));
+    check("zero piece: sent", 25, (long)fm_send(l, sv[0], d, 25, 0));
     check("zero piece: rec saw 0 10 10 5", 1,
           g_nlog == 4 && g_log[0].n == 0 && g_log[1].n == 10 && g_log[2].n == 10 && g_log[3].n == 5);
     frag_take(sv[1]);
@@ -1259,7 +1346,7 @@ static void t_frag_range_zero_piece(void) {
     check_mem("zero piece: bytes in order", d, g_fwd, 25);
     fm_link_free(l);
     l = frag_open(FRAG("{\"packets\":\"tlshello\",\"lengths\":[0,10]}"));
-    check("zero piece hello: sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("zero piece hello: sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("zero piece hello: 5 + 51 x 15 + 12 = 782 B", 1, g_nfw == 1 && g_fw[0] == 782);
     check_mem("zero piece hello: an empty record first", "\x16\x03\x01\x00\x00\x16\x03\x01\x00\x0a", g_fwd, 10);
@@ -1277,7 +1364,7 @@ static int frag_seq(const char *json, const struct fwr *w, size_t nw, const size
     size_t all = 0;
     int ok = 1;
     for (size_t i = 0; i < nw; i++) {
-        if (fm_send(l, sv[0], w[i].d, w[i].n) != (ssize_t)w[i].n) ok = 0;
+        if (fm_send(l, sv[0], w[i].d, w[i].n, 0) != (ssize_t)w[i].n) ok = 0;
         frag_take(sv[1]);
         for (size_t k = 0; k < g_nfw; k++) {
             if (all >= nwant || g_fw[k] != want[all]) ok = 0;
@@ -1564,7 +1651,7 @@ static void t_hc_conn(void) {
     struct fm_link *l = hc_open(js);
     pthread_create(&th, NULL, hc_peer, &h);
     check("hc conn: hs ok", 0, fm_link_hs(l, sv[0], 0));
-    check("hc conn: send data", 4, (long)fm_send(l, sv[0], "data", 4));
+    check("hc conn: send data", 4, (long)fm_send(l, sv[0], "data", 4, 0));
     unsigned char got[16];
     check("hc conn: answer's tail read upward", 4, (long)fm_recv(l, sv[0], got, sizeof got, 0, 0));
     check_mem("hc conn: tail unchanged", "back", got, 4);
@@ -1591,7 +1678,7 @@ static void t_hc_conn(void) {
     pthread_create(&th, NULL, hc_peer, &hg);
     check("hc conn: a later exchange ok", 0, fm_link_hs(l, sv[0], 2000));
     check_str("hc conn: last why cleared", "", fm_last_why());
-    check("hc conn: data again", 4, (long)fm_send(l, sv[0], "data", 4));
+    check("hc conn: data again", 4, (long)fm_send(l, sv[0], "data", 4, 0));
     check("hc conn: tail again", 4, (long)fm_recv(l, sv[0], got, sizeof got, 0, 0));
     pthread_join(th, NULL);
     fm_link_free(l);
@@ -1725,7 +1812,7 @@ static void t_hc_empty_seq(void) {
     uint64_t t0 = mono_ms();
     check("hc empty: hs ok", 0, fm_link_hs(l, sv[0], 0));
     check("hc empty: the delay slept", 1, mono_ms() - t0 >= 5);
-    check("hc empty: data", 1, (long)fm_send(l, sv[0], "x", 1));
+    check("hc empty: data", 1, (long)fm_send(l, sv[0], "x", 1, 0));
     pthread_join(th, NULL);
     check("hc empty: nothing before the answer", 0, (long)h.r[0].n);
     check("hc empty: the first message is the data", 1, h.r[2].n == 1 && h.r[2].b[0] == 'x');
@@ -1734,7 +1821,7 @@ static void t_hc_empty_seq(void) {
     t0 = mono_ms();
     check("hc empty chain: hs ok", 0, fm_link_hs(l, sv[0], 0));
     check("hc empty chain: the delay slept", 1, mono_ms() - t0 >= 5);
-    check("hc empty chain: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hc empty chain: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("hc empty chain: the hello is fragment's write 1", 1, g_nfw == 1 && g_fw[0] == 777);
     fm_link_free(l);
@@ -1848,7 +1935,7 @@ static void t_hc_through_fragment(void) {
     seqpair(sv);
     struct fm_link *l = hc_open(hf);
     check("hc+frag: hs ok", 0, fm_link_hs(l, sv[0], 0));
-    check("hc+frag: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("hc+frag: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("hc+frag: header then the uncut hello", 1, g_nfw == 2 && g_fw[0] == 18 && g_fw[1] == 522);
     check_mem("hc+frag: header bytes", "GET / HTTP/1.1\r\n\r\n", g_fwd, 18);
@@ -1856,7 +1943,7 @@ static void t_hc_through_fragment(void) {
     fm_link_free(l);
     l = hc_open(fh);
     check("frag+hc: hs ok", 0, fm_link_hs(l, sv[0], 0));
-    check("frag+hc: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522));
+    check("frag+hc: hello sent", 522, (long)fm_send(l, sv[0], g_hello, 522, 0));
     frag_take(sv[1]);
     check("frag+hc: header whole, then the cut hello", 1, g_nfw == 2 && g_fw[0] == 18 && g_fw[1] == 777);
     check_mem("frag+hc: header bytes", "GET / HTTP/1.1\r\n\r\n", g_fwd, 18);
@@ -1964,6 +2051,9 @@ int main(void) {
     t_queue_cap();
     t_hs_fail();
     t_direct_splice();
+    t_direct_send_splice();
+    t_direct_send_behind_queue();
+    t_splices();
     t_pending();
     t_rand_between();
     t_open();
