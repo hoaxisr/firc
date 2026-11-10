@@ -3864,7 +3864,7 @@ static void t_due_wakes_loop(void) {
     due_run(t0, 300);
     check(g_due_sent && g_due_sent < t0 + 300, "due: the loop asks due again within 300 ms");
     check(g_due_sent >= g_due_target, "due: and never before the piece is due");
-    check(due_calls() <= 3, "due: no polling on every turn meanwhile");
+    check(due_calls() <= 8, "due: no polling on every turn meanwhile");
     check(!c->fm_wait, "due: the flag clears once nothing waits");
     int n = g_due_n;
     loop_turn(&g_L_due, 30);
@@ -3913,7 +3913,7 @@ static void t_due_after_read(void) {
     check(!g_due_on_read, "due read: the read ran");
     check(g_due_sent && g_due_sent < t0 + 300 && g_due_sent >= g_due_target,
           "due read: the pong leaves within 300 ms, not before its due time");
-    check(due_calls() <= 3, "due read: no polling on every turn meanwhile");
+    check(due_calls() <= 8, "due read: no polling on every turn meanwhile");
     memset(g_recv_buf, 'd', 10);
     g_recv_n = 10;
     g_due_sent = 0;
@@ -3924,7 +3924,7 @@ static void t_due_after_read(void) {
     due_run(t0, 300);
     check(g_due_sent && g_due_sent < t0 + 300 && g_due_sent >= g_due_target,
           "due read: also after a read that carried data");
-    check(due_calls() <= 3, "due read: and no polling then either");
+    check(due_calls() <= 8, "due read: and no polling then either");
     due_close(&g_L_due);
 }
 

@@ -5256,16 +5256,21 @@ static int ask_ptr_udp(uint16_t port, uint16_t id, const firc_ip_t *ip) {
 TEST every_kind_of_query_is_tallied_once(void) {
     firc_ip_t v4, v6;
     firc_fakeip_t *pool = ptr_pool(&v4, &v6);
-    rec_reset();
-    g_live_ops = &REC_OPS;
-    g_live_cache = true;
-    g_live_pool = pool;
-    g_live_route_fn = tally_route;
     live_t lv;
-    ASSERT(live_start(&lv));
-    g_tally_port = lv.b.port;
     int lfd = -1;
-    ASSERT_EQ(lv.b.port, tcp_probe_listen_on(lv.loop, lv.b.port, &lfd));
+    uint16_t tcp_port = 0;
+    for (int i = 0; i < 20 && tcp_port == 0; i++) {
+        rec_reset();
+        g_live_ops = &REC_OPS;
+        g_live_cache = true;
+        g_live_pool = pool;
+        g_live_route_fn = tally_route;
+        ASSERT(live_start(&lv));
+        tcp_port = tcp_probe_listen_on(lv.loop, lv.b.port, &lfd);
+        if (tcp_port == 0) { live_stop(&lv); }
+    }
+    ASSERT_EQ(lv.b.port, tcp_port);
+    g_tally_port = lv.b.port;
     atomic_store(&g_tcp_probe.go, 1);
     ASSERT_EQ(3, ask_tcp(lv.proxy_port, 0x7101));
     ASSERT_EQ(1, atomic_load(&g_tcp_probe.received));
