@@ -76,7 +76,8 @@ if (processObj) {
     writable: true,
   });
 }
-const { GroupsStore, invalidRulesByGroup } = await import("../../src/modules/groups/groups.svelte");
+const { GroupsStore, invalidRulesByGroup, mergeOutside } =
+  await import("../../src/modules/groups/groups.svelte");
 const { answer, confirmation } = await import("../../src/utils/confirm.svelte");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
@@ -402,5 +403,86 @@ describe("GroupsStore mutations and validation", () => {
 
     assert.strictEqual(store.data[0].name, "group-g1");
     assert.strictEqual(store.data[0].rules[0].rule, "r1.example.com");
+  });
+});
+
+describe("mergeOutside", () => {
+  const r = (id: string, extra = {}) => ({ id, rule: id, type: "domain", enable: true, ...extra });
+  const g = (id: string, rules: any[], extra = {}) =>
+    ({ id, name: id, interface: "nwg0", enable: true, rules, ...extra }) as any;
+  const merge = (current: any[], base: any[], daemon: any[]) =>
+    mergeOutside(structuredClone(current), structuredClone(base), structuredClone(daemon));
+  const ids = (groups: any[]) => groups.map((x) => [x.id, x.rules.map((y: any) => y.id)]);
+
+  /* catches: a save putting back a rule the daemon added or removed since the load */
+  it("rules: daemon additions and removals in, the operator's own kept", () => {
+    const base = [g("a", [r("r1"), r("r2"), r("r3")])];
+    const current = [g("a", [r("r1"), r("r3"), r("mine")])];
+    const daemon = [g("a", [r("r1"), r("r2"), r("out")])];
+    assert.deepStrictEqual(ids(merge(current, base, daemon)), [["a", ["r1", "mine", "out"]]]);
+  });
+
+  /* catches: an id-only merge switching an automatic-list rule back on and dropping its marker */
+  it("a rule the daemon changed in place takes the daemon's fields the operator left alone", () => {
+    const base = [g("a", [r("r1", { autolist: "h" }), r("r2")])];
+    const current = [g("a", [r("r1", { autolist: "h" }), r("r2", { rule: "edited" })])];
+    const daemon = [
+      g("a", [r("r1", { autolist: "h", enable: false }), r("r2", { enable: false })]),
+    ];
+    const [a] = merge(current, base, daemon);
+    assert.deepStrictEqual(a.rules[0], r("r1", { autolist: "h", enable: false }));
+    assert.deepStrictEqual(a.rules[1], r("r2", { rule: "edited", enable: false }));
+  });
+
+  /* catches: a removed rule coming back, or an edited one lost, when the daemon deleted it */
+  it("a rule the daemon deleted goes unless the operator changed it", () => {
+    const base = [g("a", [r("r1"), r("r2")])];
+    const current = [g("a", [r("r1"), r("r2", { rule: "edited" })])];
+    const [a] = merge(current, base, [g("a", [])]);
+    assert.deepStrictEqual(a.rules, [r("r2", { rule: "edited" })]);
+  });
+
+  /* catches: groups the daemon created or deleted overwritten, or the operator's choice undone */
+  it("groups: born and lost on the daemon, created and deleted by the operator", () => {
+    const base = [g("a", []), g("b", []), g("c", []), g("d", [])];
+    const current = [g("a", []), g("c", [], { name: "renamed" }), g("d", []), g("new", [])];
+    const daemon = [
+      g("a", [], { live: true, liveReason: "x", active: "nwg0", interfaces: [] }),
+      g("b", []),
+      g("born", [r("x")], { live: true }),
+    ];
+    const out = merge(current, base, daemon);
+    assert.deepStrictEqual(
+      out.map((x: any) => x.id),
+      ["a", "c", "new", "born"],
+    );
+    assert.strictEqual(out[1].name, "renamed");
+    assert.ok(out.every((x: any) => !("live" in x) && !("interfaces" in x)));
+  });
+
+  /* catches: a list group another tab deleted put back because a sync changed its state here */
+  it("a list group lost on the daemon goes although its sync state changed here", () => {
+    const list = {
+      url: "https://l/x.txt",
+      interval: 86400,
+      rulesTotal: 3,
+      sync: { state: "idle" },
+    };
+    const base = [g("a", [], { list })];
+    const current = [g("a", [], { list: { ...list, rulesTotal: 9, sync: { state: "fetching" } } })];
+    assert.deepStrictEqual(merge(current, base, []), []);
+  });
+
+  /* catches: group fields from the daemon ignored, or the operator's edit of a field lost */
+  it("group fields: the daemon's where the operator left a field, the operator's where changed", () => {
+    const base = [g("a", [], { name: "A", enable: true, devices: { allow: [], deny: [] } })];
+    const current = [g("a", [], { name: "mine", enable: true, devices: { allow: [], deny: [] } })];
+    const daemon = [
+      g("a", [], { name: "theirs", enable: false, devices: { allow: ["x"], deny: [] } }),
+    ];
+    const [a] = merge(current, base, daemon);
+    assert.strictEqual(a.name, "mine");
+    assert.strictEqual(a.enable, false);
+    assert.deepStrictEqual(a.devices, { allow: ["x"], deny: [] });
   });
 });

@@ -110,10 +110,8 @@ test.describe("Groups Management", () => {
 
     await groupsPage.save();
 
-    expect(saveRequestReceived).toBe(true);
-
+    await expect.poll(() => saveRequestReceived).toBe(true);
     await expect(page.getByText("Saved")).toBeVisible();
-    expect(saveRequestReceived).toBe(true);
   });
 
   // Catches a group added while the list is still loading, wiped when the list arrives.

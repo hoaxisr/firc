@@ -18,9 +18,18 @@ export class HttpError extends Error {
   }
 }
 
+type WriteListener = (method: string, url: string) => void;
+const writeListeners = new Set<WriteListener>();
+
+export function onWrite(listener: WriteListener): () => void {
+  writeListeners.add(listener);
+  return () => writeListeners.delete(listener);
+}
+
 export async function fetcher<T>(...args: any[]): Promise<T> {
   const url = args.shift();
   const options = args[0] || {};
+  const method = String(options.method ?? "GET").toUpperCase();
 
   const quiet = options.quiet === true;
   delete options.quiet;
@@ -66,6 +75,8 @@ export async function fetcher<T>(...args: any[]): Promise<T> {
       toast.error(errorMessage);
     }
     throw e;
+  } finally {
+    if (method !== "GET") for (const listener of writeListeners) listener(method, url);
   }
 }
 

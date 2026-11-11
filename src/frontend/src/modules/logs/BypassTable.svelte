@@ -98,11 +98,6 @@
     busy = next;
   }
 
-  function syncGroups() {
-    const st = groupsBridge.store;
-    if (st?.dataLoaded && !st.tracker.isDirty) void st.mount();
-  }
-
   async function add(a: AutolistAddress, groupId: string) {
     const k = key(a);
     mark(k, true);
@@ -121,7 +116,6 @@
           .replace("{address}", a.address)
           .replace("{group}", groupName(groupId)),
       );
-      syncGroups();
     } catch {
     } finally {
       mark(k, false);

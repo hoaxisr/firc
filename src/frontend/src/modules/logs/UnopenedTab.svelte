@@ -10,7 +10,6 @@
     whyLabel,
   } from "../../data/autolist.svelte";
   import { relativeTime, rowDevices, statsDevices } from "../../data/dnsstats.svelte";
-  import { groupsBridge } from "../../data/groups-bridge.svelte";
   import { hosts } from "../../data/hosts.svelte";
   import { knownGroups } from "../../data/known-groups.svelte";
   import { locale, t } from "../../data/locale.svelte";
@@ -139,11 +138,6 @@
     busy = next;
   }
 
-  function syncGroups() {
-    const store = groupsBridge.store;
-    if (store?.dataLoaded && !store.tracker.isDirty) void store.mount();
-  }
-
   async function add(c: AutolistCandidate) {
     mark(c.domain, true);
     try {
@@ -154,7 +148,6 @@
           .replace("{group}", groupName)
           .replace("{n}", String(ttl)),
       );
-      syncGroups();
     } catch {
     } finally {
       mark(c.domain, false);
@@ -193,7 +186,6 @@
         await fetcher.delete(`/groups/${data.group}/rules/${rule.id}?save=true`);
       }
       await autolist.dismiss(c.domain);
-      syncGroups();
     } catch {
     } finally {
       mark(c.domain, false);

@@ -76,6 +76,8 @@ type Init = {
 };
 type Handler = Answer | ((init: Init) => Answer | Promise<Answer>);
 
+let seeded: unknown[] | null = null;
+
 function installFetchStub(handlers: Record<string, Handler>) {
   const calls: string[] = [];
   const requests: { path: string; body?: unknown }[] = [];
@@ -89,6 +91,9 @@ function installFetchStub(handlers: Record<string, Handler>) {
     requests.push({ path, body: init?.body !== undefined ? JSON.parse(init.body) : undefined });
     headers.push(init?.headers ?? {});
 
+    if (path === "/groups?with_rules=true" && !(path in handlers) && seeded) {
+      return { ok: true, status: 200, json: async () => ({ groups: structuredClone(seeded) }) };
+    }
     if (!(path in handlers)) {
       throw new Error(`unstubbed fetch: ${path}`);
     }
@@ -112,6 +117,7 @@ function installFetchStub(handlers: Record<string, Handler>) {
     requests,
     headers,
     restore: () => {
+      seeded = null;
       (globalThis as any).fetch = original;
     },
   };
@@ -243,6 +249,7 @@ const rulesPage = (count: number) => ({
 
 function seed(store: any, groups: ReturnType<typeof makeGroup>[]) {
   const cloned = structuredClone(groups);
+  seeded = structuredClone(groups);
   store.tracker.reset(cloned);
   store.resetListMetaBaseline(cloned);
 }

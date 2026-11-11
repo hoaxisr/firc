@@ -16,7 +16,10 @@ async function setup(
     route.fulfill({ json: { interfaces: [{ id: "nwg0" }, { id: "blackhole" }, { id: "eth1" }] } }),
   );
   await page.route("**/system/resolvers", (route) => route.fulfill({ json: RESOLVERS }));
-  await page.route("**/groups?with_rules=true", (route) => route.fulfill({ json: { groups } }));
+  let live = groups;
+  await page.route("**/groups?with_rules=true", (route) =>
+    route.fulfill({ json: { groups: live } }),
+  );
   const saved: any[] = [];
   await page.route(/\/groups(\?.*)?$/, async (route) => {
     if (route.request().method() !== "PUT") {
@@ -26,6 +29,7 @@ async function setup(
     const body = route.request().postDataJSON();
     saved.push(body);
     const answer = putAnswer ? putAnswer(body) : { status: 200, json: { groups: body.groups } };
+    if (answer.status === 200) live = body.groups;
     await route.fulfill({ status: answer.status, json: answer.json });
   });
   await page.route("**/system/config/save", (route) => route.fulfill({ json: {} }));

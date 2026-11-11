@@ -22,9 +22,11 @@ export class ChangeTracker<T extends object> {
   private dirtyArrays = new Set<object>();
 
   private version = $state(0);
+  baseline: T;
 
   constructor(initialData: T) {
     this.state = $state(initialData);
+    this.baseline = structuredClone(initialData);
     this.init(structuredClone(initialData));
     this.proxy = this.createProxy(this.state);
   }
@@ -324,6 +326,7 @@ export class ChangeTracker<T extends object> {
       Object.assign(s, newData);
     }
 
+    this.baseline = structuredClone(snapshot);
     this.init(snapshot);
     this.proxy = this.createProxy(this.state);
     this.notify();

@@ -106,8 +106,6 @@
           .replace("{group}", autoGroup)
           .replace("{n}", String(ttl)),
       );
-      const st = groupsBridge.store;
-      if (st?.dataLoaded && !st.tracker.isDirty) void st.mount();
     } catch {}
   }
 

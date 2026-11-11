@@ -55,6 +55,7 @@ if (processObj) {
   });
 }
 const { GroupsStore } = await import("../../src/modules/groups/groups.svelte");
+const { fetcher } = await import("../../src/utils/fetcher");
 if (processObj) {
   if (originalProcessEnvDescriptor) {
     Object.defineProperty(processObj, "env", originalProcessEnvDescriptor);
@@ -65,6 +66,8 @@ if (processObj) {
 restoreLocalStorage();
 
 type FetchHandler = unknown | (() => unknown);
+
+let seeded: unknown[] | null = null;
 
 function installFetchStub(handlers: Record<string, FetchHandler>) {
   const calls: string[] = [];
@@ -86,6 +89,9 @@ function installFetchStub(handlers: Record<string, FetchHandler>) {
     }
     requests.push({ path, method: init?.method, body });
 
+    if (path === "/groups?with_rules=true" && !(path in handlers) && seeded) {
+      return { ok: true, status: 200, json: async () => ({ groups: structuredClone(seeded) }) };
+    }
     if (!(path in handlers)) {
       throw new Error(`unstubbed fetch: ${path}`);
     }
@@ -118,6 +124,7 @@ function installFetchStub(handlers: Record<string, FetchHandler>) {
     calls,
     requests,
     restore: () => {
+      seeded = null;
       (globalThis as any).fetch = original;
     },
   };
@@ -165,6 +172,7 @@ const makeGroup = (id: string, withList = false) => ({
 
 function seed(store: any, groups: ReturnType<typeof makeGroup>[]) {
   const cloned = structuredClone(groups);
+  seeded = structuredClone(groups);
   store.tracker.reset(cloned);
   store.resetListMetaBaseline(cloned);
 }
@@ -269,7 +277,7 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
         !stub.calls.some((c) => c.includes("/list/rules")),
         `expected no PATCH request, got: ${stub.calls.join(", ")}`,
       );
-      assert.deepStrictEqual(stub.calls, ["/groups?save=true"]);
+      assert.deepStrictEqual(stub.calls, ["/groups?with_rules=true", "/groups?save=true"]);
     } finally {
       stub.restore();
     }
@@ -296,7 +304,7 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
 
       assert.deepStrictEqual(
         stub.calls.slice(before),
-        ["/groups", `/groups/${id}/list/rules?save=true`],
+        ["/groups?with_rules=true", "/groups", `/groups/${id}/list/rules?save=true`],
         "the metadata PUT carries no query, the trailing PATCH is the only `?save=true`",
       );
     } finally {
@@ -991,6 +999,254 @@ describe("GroupsStore live state, fix round 1", () => {
       await withWindowStub(() => store.saveChanges());
       assert.strictEqual(store.groupDirty(byId(store, id)), true);
     } finally {
+      stub.restore();
+    }
+  });
+});
+
+describe("a Save with the daemon changed since the load", () => {
+  /* catches: a Save sending its own snapshot instead of the merge with what the daemon holds now */
+  it("sends the operator's edit together with the rule the daemon added meanwhile", async () => {
+    const id = "5a5e0101";
+    const group = makeGroup(id);
+    const daemon = structuredClone(group);
+    daemon.rules.push({ id: "aa00aa00", enable: true, rule: "added.example", type: "domain" });
+    const stub = installFetchStub({
+      "/groups?with_rules=true": { groups: [daemon] },
+      "/groups?save=true": { groups: [] },
+    });
+    try {
+      const store = new GroupsStore();
+      seed(store, [group]);
+      store.data[0].name = "renamed";
+      await withWindowStub(() => store.saveChanges());
+      const put = stub.requests.find((r) => r.path === "/groups?save=true");
+      const sent = (put!.body as any).groups[0];
+      assert.strictEqual(sent.name, "renamed");
+      assert.deepStrictEqual(
+        sent.rules.map((r: any) => r.rule),
+        [`${id}.example.com`, "added.example"],
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  /* catches: a malformed read before the Save taken as "no groups", which deletes every group */
+  it("sends nothing when the daemon's groups answer has no array", async () => {
+    const id = "5a5e0102";
+    const stub = installFetchStub({
+      "/groups?with_rules=true": {},
+      "/groups?save=true": { groups: [] },
+    });
+    try {
+      const store = new GroupsStore();
+      seed(store, [makeGroup(id)]);
+      store.data[0].name = "renamed";
+      await withWindowStub(() => store.saveChanges());
+      assert.deepStrictEqual(stub.calls, ["/groups?with_rules=true"]);
+      assert.ok(store.tracker.isDirty);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+describe("a write to a group route outside the store", () => {
+  const loaded = async (store: any, id: string) => {
+    store.dataLoaded = true;
+    seed(store, [makeGroup(id)]);
+  };
+
+  /* catches: the hook firing only for POST, or missing the automatic list's add */
+  it("every write method and the automatic list's add reload a clean store", async () => {
+    const id = "5a5e0105";
+    const writes: [string, () => Promise<unknown>][] = [
+      ["PUT", () => fetcher.put(`/groups/${id}`, {})],
+      ["PATCH", () => fetcher.patch(`/groups/${id}/rules/r1`, {})],
+      ["DELETE", () => fetcher.delete(`/groups/${id}/rules/r1?save=true`)],
+      ["add", () => fetcher.post("/system/autolist/candidates/x.org/add", undefined)],
+    ];
+    const stub = installFetchStub({
+      [`/groups/${id}`]: {},
+      [`/groups/${id}/rules/r1`]: {},
+      [`/groups/${id}/rules/r1?save=true`]: {},
+      "/system/autolist/candidates/x.org/add": {},
+      "/groups?with_rules=true": { groups: [makeGroup(id)] },
+      "/system/netfilter": {},
+    });
+    const store = new GroupsStore();
+    try {
+      await loaded(store, id);
+      for (const [name, write] of writes) {
+        const before = stub.calls.filter((c) => c === "/groups?with_rules=true").length;
+        await write();
+        await new Promise((r) => setTimeout(r, 0));
+        const after = stub.calls.filter((c) => c === "/groups?with_rules=true").length;
+        assert.strictEqual(after, before + 1, name);
+      }
+    } finally {
+      store.destroy();
+      stub.restore();
+    }
+  });
+
+  /* catches: a clean store left stale after the Journal adds a rule, or a reload on a read */
+  it("reloads a clean store after a non-GET to a group route, not after a GET", async () => {
+    const id = "5a5e0103";
+    const fresh = makeGroup(id);
+    fresh.rules.push({ id: "bb00bb00", enable: true, rule: "new.example", type: "domain" });
+    const stub = installFetchStub({
+      [`/groups/${id}/rules?save=true`]: { id: "bb00bb00" },
+      "/groups": { groups: [] },
+      "/groups?with_rules=true": { groups: [fresh] },
+      "/system/netfilter": {},
+    });
+    const store = new GroupsStore();
+    try {
+      await loaded(store, id);
+      await fetcher.get("/groups");
+      assert.ok(!stub.calls.includes("/groups?with_rules=true"));
+      await fetcher.post(`/groups/${id}/rules?save=true`, {});
+      await new Promise((r) => setTimeout(r, 0));
+      assert.deepStrictEqual(
+        store.tracker.data[0].rules.map((r: any) => r.rule),
+        [`${id}.example.com`, "new.example"],
+      );
+    } finally {
+      store.destroy();
+      stub.restore();
+    }
+  });
+
+  /* catches: a reload answered after a Save putting the pre-Save groups back on screen */
+  it("a reload answered after a Save does not replace what the Save wrote", async () => {
+    const id = "5a5e0106";
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let reads = 0;
+    const stub = installFetchStub({
+      [`/groups/${id}/rules?save=true`]: { id: "dd00dd00" },
+      "/groups?with_rules=true": async () => {
+        if (++reads === 1) await gate;
+        return { groups: [makeGroup(id)] };
+      },
+      "/groups?save=true": { groups: [] },
+      "/system/netfilter": {},
+    });
+    const store = new GroupsStore();
+    try {
+      await loaded(store, id);
+      await fetcher.post(`/groups/${id}/rules?save=true`, {});
+      store.data[0].name = "renamed";
+      await withWindowStub(() => store.saveChanges());
+      release();
+      await new Promise((r) => setTimeout(r, 0));
+      assert.ok(stub.calls.includes("/system/netfilter"));
+      assert.strictEqual(store.tracker.data[0].name, "renamed");
+    } finally {
+      store.destroy();
+      stub.restore();
+    }
+  });
+
+  /* catches: a reload landing over edits made while its GET was in flight */
+  it("a reload does not replace edits made while it was loading", async () => {
+    const id = "5a5e0104";
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const stub = installFetchStub({
+      [`/groups/${id}/rules?save=true`]: { id: "cc00cc00" },
+      "/groups?with_rules=true": async () => {
+        await gate;
+        return { groups: [makeGroup(id)] };
+      },
+      "/system/netfilter": {},
+    });
+    const store = new GroupsStore();
+    try {
+      await loaded(store, id);
+      await fetcher.post(`/groups/${id}/rules?save=true`, {});
+      store.data[0].name = "typed meanwhile";
+      release();
+      await new Promise((r) => setTimeout(r, 0));
+      assert.ok(stub.calls.includes("/system/netfilter"));
+      assert.strictEqual(store.data[0].name, "typed meanwhile");
+      assert.ok(store.tracker.isDirty);
+    } finally {
+      store.destroy();
+      stub.restore();
+    }
+  });
+});
+
+describe("a Save whose answer gives new rules their own ids", () => {
+  /* catches: the baseline keeping client ids the daemon replaced, so a later delete or edit brings the old rule back */
+  it("a rule added, saved, then deleted and saved again stays deleted", async () => {
+    const id = "5a5e0201";
+    const group = { ...makeGroup(id), rules: [] as any[] };
+    let live: any[] = [structuredClone(group)];
+    const stub = installFetchStub({
+      "/groups?with_rules=true": () => ({ groups: structuredClone(live) }),
+      "/groups?save=true": () => {
+        const body = stub.requests.at(-1)!.body as any;
+        let n = 0;
+        live = body.groups.map((g: any) => ({
+          ...g,
+          rules: g.rules.map((r: any) =>
+            r.id.startsWith("d") ? r : { ...r, id: `d000000${n++}` },
+          ),
+        }));
+        return { groups: structuredClone(live) };
+      },
+    });
+    try {
+      const store = new GroupsStore();
+      seed(store, [group]);
+      store.tracker.data[0].rules.push({
+        id: "c1c1c1c1",
+        enable: true,
+        rule: "new.example",
+        type: "domain",
+      });
+      await withWindowStub(() => store.saveChanges());
+      assert.deepStrictEqual(
+        live[0].rules.map((r: any) => r.rule),
+        ["new.example"],
+      );
+      store.tracker.data[0].rules.splice(0, 1);
+      await withWindowStub(() => store.saveChanges());
+      assert.deepStrictEqual(live[0].rules, []);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+describe("a write elsewhere while only list rules are edited", () => {
+  /* catches: the reload guard looking at the tracker alone and reloading under pending list-rule edits */
+  it("does not reload the store", async () => {
+    const id = "5a5e0301";
+    const stub = installFetchStub({
+      [`/groups/${id}/list/rules?offset=0&limit=50`]: rulesPage(3),
+      [`/groups/${id}/rules?save=true`]: { id: "ee00ee00" },
+      "/groups?with_rules=true": { groups: [makeGroup(id, true)] },
+      "/system/netfilter": {},
+    });
+    const store = new GroupsStore();
+    try {
+      store.dataLoaded = true;
+      seed(store, [makeGroup(id, true)]);
+      store.open_state[id] = true;
+      await store.lists.loadRules(id, 0);
+      store.lists.pageState[id].rules[0].enable = false;
+      assert.ok(store.lists.hasPendingEdits);
+      assert.ok(!store.tracker.isDirty);
+      await fetcher.post(`/groups/${id}/rules?save=true`, {});
+      await new Promise((r) => setTimeout(r, 0));
+      assert.ok(!stub.calls.includes("/groups?with_rules=true"), stub.calls.join(", "));
+    } finally {
+      store.destroy();
       stub.restore();
     }
   });

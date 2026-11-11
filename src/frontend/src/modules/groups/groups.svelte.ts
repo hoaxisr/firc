@@ -18,7 +18,7 @@ import {
 } from "../../types";
 import { defaultGroup, defaultRule } from "../../utils/defaults";
 import { overlay, toast } from "../../utils/events";
-import { fetcher, HttpError } from "../../utils/fetcher";
+import { fetcher, HttpError, onWrite } from "../../utils/fetcher";
 import { counted } from "../../utils/plural";
 import { randomId } from "../../utils/random-id";
 import { type SortDirection } from "../../utils/rule-sorter";
@@ -196,6 +196,79 @@ type SearchHighlightSegment = {
 type GroupsStoreOptions = {
   onRenderComplete?: () => void;
 };
+
+const OUTSIDE_WRITE =
+  /^\/groups(\?|$|\/[0-9a-f]{8}(\?|$|\/rules))|^\/system\/autolist\/candidates\/[^/]+\/add/;
+
+const DAEMON_ONLY = ["live", "liveReason", "active", "interfaces"];
+
+function stripLive(group: any): Group {
+  const out = { ...group };
+  for (const key of DAEMON_ONLY) delete out[key];
+  return out;
+}
+
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a).filter((k) => (a as any)[k] !== undefined);
+  const kb = Object.keys(b).filter((k) => (b as any)[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => same((a as any)[k], (b as any)[k]));
+}
+
+function mergeFields<T extends object>(mine: T, base: T, theirs: T, skip: string[] = []): T {
+  const out: any = { ...mine };
+  const keys = new Set([...Object.keys(mine), ...Object.keys(base), ...Object.keys(theirs)]);
+  for (const key of keys) {
+    if (skip.includes(key)) continue;
+    if (same((mine as any)[key], (base as any)[key])) {
+      if ((theirs as any)[key] === undefined) delete out[key];
+      else out[key] = (theirs as any)[key];
+    }
+  }
+  return out;
+}
+
+function mergeById<T extends { id: string }>(
+  mine: T[],
+  base: T[],
+  theirs: T[],
+  both: (mine: T, base: T, theirs: T) => T,
+): T[] {
+  const was = new Map(base.map((x) => [x.id, x]));
+  const now = new Map(theirs.map((x) => [x.id, x]));
+  const kept = new Set(mine.map((x) => x.id));
+  const out: T[] = [];
+  for (const item of mine) {
+    const before = was.get(item.id);
+    const after = now.get(item.id);
+    if (!before) out.push(item);
+    else if (!after) {
+      if (!same(item, before)) out.push(item);
+    } else out.push(both(item, before, after));
+  }
+  for (const item of theirs) if (!was.has(item.id) && !kept.has(item.id)) out.push(item);
+  return out;
+}
+
+function bodyShape(group: any): Group {
+  const { list, resolver: _resolver, ...rest } = stripLive(group) as any;
+  return {
+    ...withoutStaleBlock(rest),
+    list: list ? { url: list.url, interval: list.interval } : null,
+  } as Group;
+}
+
+export function mergeOutside(current: Group[], base: Group[], daemon: Group[]): Group[] {
+  const [mine, was, now] = [current, base, daemon].map((side) => side.map(bodyShape));
+  return mergeById(mine, was, now, (mine, was, now) => ({
+    ...mergeFields(mine, was, now, ["rules"]),
+    rules: mergeById(mine.rules ?? [], was.rules ?? [], now.rules ?? [], (m, w, n) =>
+      mergeFields(m, w, n),
+    ),
+  }));
+}
 
 export class GroupsStore {
   onRenderComplete?: () => void;
@@ -591,9 +664,11 @@ export class GroupsStore {
   #searchIndexBuildToken = 0;
   #searchIndexBuilding = false;
   #dispose: (() => void) | null = null;
+  #offWrite: () => void;
 
   constructor(options: GroupsStoreOptions = {}) {
     this.onRenderComplete = options.onRenderComplete;
+    this.#offWrite = onWrite(this.#outsideWrite);
     this.#setupEffects();
   }
 
@@ -703,6 +778,7 @@ export class GroupsStore {
 
     this.lists.destroy();
     this.#stopLivePolling();
+    this.#offWrite();
 
     if (this.#dispose) {
       this.#dispose();
@@ -710,7 +786,8 @@ export class GroupsStore {
     }
   }
 
-  mount = async () => {
+  mount = async ({ ifClean = false } = {}) => {
+    const saves = this.#saves;
     if (!this.dataLoaded) this.finishedGroupsCount = 0;
     this.fetchError = false;
     try {
@@ -725,10 +802,8 @@ export class GroupsStore {
         .get<NetfilterState>("/system/netfilter", { quiet: true })
         .then((netfilter) => this.#takeNetfilter(netfilter, ticket))
         .catch((error) => console.error("Failed to read netfilter state:", error));
-      const fetched = records.map(
-        ({ live: _live, liveReason: _reason, active: _active, interfaces: _ifs, ...group }: any) =>
-          group,
-      );
+      const fetched = records.map(stripLive);
+      if (ifClean && (this.#hasEdits() || saves !== this.#saves)) return;
       this.tracker = new ChangeTracker(fetched);
       this.dataRevision = 0;
       this.resetListMetaBaseline(fetched);
@@ -1097,6 +1172,24 @@ export class GroupsStore {
   }
 
   #saving = false;
+  #saves = 0;
+
+  #hasEdits() {
+    return this.tracker.isDirty || this.lists.hasPendingEdits;
+  }
+
+  #outsideWrite = (_method: string, url: string) => {
+    if (this.#saving || !this.dataLoaded || this.#hasEdits()) return;
+    if (!OUTSIDE_WRITE.test(url)) return;
+    void this.mount({ ifClean: true });
+  };
+
+  async #daemonGroups(): Promise<Group[]> {
+    const answer = await fetcher.get<{ groups?: unknown }>("/groups?with_rules=true");
+    if (Array.isArray(answer?.groups)) return answer.groups as Group[];
+    toast.error(t("Request failed"));
+    throw new Error("the groups answer has no groups");
+  }
 
   async saveChanges() {
     if (this.invalidRules.size > 0) {
@@ -1106,14 +1199,27 @@ export class GroupsStore {
     if (!this.canSave) return;
     if (this.#saving) return;
     this.#saving = true;
+    this.#saves++;
     this.groupFieldError = null;
     overlay.show(t("saving changes..."));
 
-    const current = $state.snapshot(this.data) as Group[];
-    const bodyGroups = current.map(({ list, resolver, ...rest }) => ({
-      ...withoutStaleBlock(rest),
-      list: list ? { url: list.url, interval: list.interval } : null,
-    }));
+    let current = $state.snapshot(this.data) as Group[];
+    let bodyGroups: Group[];
+    try {
+      bodyGroups = mergeOutside(current, this.tracker.baseline, await this.#daemonGroups());
+    } catch (error) {
+      console.error(error);
+      overlay.hide();
+      this.#saving = false;
+      return;
+    }
+    const full = new Map(current.map((g) => [g.id, g]));
+    current = bodyGroups.map((g) => {
+      const was = full.get(g.id);
+      if (!was) return g;
+      const out: Group = g.list && was.list ? { ...g, list: { ...was.list, ...g.list } } : g;
+      return was.resolver ? { ...out, resolver: was.resolver } : out;
+    });
     const edits = current
       .map((group) => ({ id: group.id, rules: this.lists.ruleEdits(group.id) }))
       .filter((e) => e.rules.length > 0);
@@ -1153,7 +1259,9 @@ export class GroupsStore {
       }
 
       const answerById = new Map((answer.groups ?? []).map((g: any) => [g.id, g]));
-      const saved = current.map((group) => {
+      const saved = current.map((sent) => {
+        const rules = answerById.get(sent.id)?.rules;
+        const group = Array.isArray(rules) ? { ...sent, rules } : sent;
         const withResolver = answerById.get(group.id)?.resolver
           ? { ...group, resolver: answerById.get(group.id).resolver }
           : group;

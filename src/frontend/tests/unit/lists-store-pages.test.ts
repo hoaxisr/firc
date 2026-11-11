@@ -101,6 +101,8 @@ const eventStream = (...events: string[]) => ({ [SSE_BODY]: events.join("") });
 const syncDone = (record: Record<string, unknown>) =>
   eventStream(`event: done\ndata: ${JSON.stringify(record)}\n\n`);
 
+let seeded: unknown[] | null = null;
+
 function installFetchStub(handlers: Record<string, FetchHandler>) {
   const calls: string[] = [];
   const requests: { path: string; method?: string; body?: unknown }[] = [];
@@ -121,6 +123,9 @@ function installFetchStub(handlers: Record<string, FetchHandler>) {
     }
     requests.push({ path, method: init?.method, body });
 
+    if (path === "/groups?with_rules=true" && !(path in handlers) && seeded) {
+      return { ok: true, status: 200, json: async () => ({ groups: structuredClone(seeded) }) };
+    }
     if (!(path in handlers)) {
       throw new Error(`unstubbed fetch: ${path}`);
     }
@@ -155,6 +160,7 @@ function installFetchStub(handlers: Record<string, FetchHandler>) {
     calls,
     requests,
     restore: () => {
+      seeded = null;
       (globalThis as any).fetch = original;
     },
   };
@@ -203,6 +209,7 @@ async function withWindowStub<T>(
 
 function seed(store: InstanceType<typeof GroupsStore>, groups: ReturnType<typeof makeGroup>[]) {
   const cloned = structuredClone(groups);
+  seeded = structuredClone(groups);
   store.tracker.reset(cloned);
   store.resetListMetaBaseline(cloned);
 }

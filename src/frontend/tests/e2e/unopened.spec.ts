@@ -1056,3 +1056,108 @@ test("the addresses table counts attempts and the candidates table failures", as
   await expect(heads.nth(1)).toContainText("Attempts");
   await expect(heads.nth(1)).not.toContainText("Failures");
 });
+
+/* catches: a save with unsaved edits sending back a snapshot that drops a rule added from the Journal */
+test("a rule added from here survives a save of unsaved group edits", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  let live = structuredClone(GROUP);
+  const puts: { rules?: { rule: string }[] }[][] = [];
+  await page.route(/\/groups(\?.*)?$/, (route) => {
+    const req = route.request();
+    if (req.method() === "PUT") {
+      const body = req.postDataJSON().groups;
+      puts.push(body);
+      live = { ...live, ...body[0], rules: body[0].rules ?? live.rules };
+    }
+    return route.fulfill({ json: { groups: [live] } });
+  });
+  await page.route(/\/groups\/b10c4ed0\/rules(\?.*)?$/, (route) => {
+    const body = route.request().postDataJSON();
+    live = { ...live, rules: [...live.rules, { id: "ee00ee00", ...body }] };
+    return route.fulfill({ json: { id: "ee00ee00" } });
+  });
+  await page.goto("/");
+  const toggle = page.locator(".enable-group").first();
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await page.getByRole("tab", { name: "Journal" }).click();
+  await page.getByRole("tab", { name: /Not opening/ }).click();
+  const row = page.locator("[data-address='34.107.243.93']");
+  await row.getByRole("button", { name: "To group" }).click();
+  await page.getByRole("menuitem", { name: "Blocked" }).click();
+  await expect(page.getByText("34.107.243.93 added to «Blocked»")).toBeVisible();
+  await page.getByRole("tab", { name: "Groups" }).click();
+  await page.locator("#save-changes").click();
+  await expect.poll(() => puts.length).toBe(1);
+  expect(live.enable).toBe(false);
+  expect(live.rules.map((r) => r.rule)).toEqual(["rutracker.org", "34.107.243.93/32"]);
+});
+
+/* catches: a Save putting back the groups it loaded over what the daemon changed on its own */
+test("a save keeps what the daemon itself added and switched off meanwhile", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  let live: any = structuredClone(GROUP);
+  live.rules.push({ id: "cd34ab12", enable: true, rule: "kept.org", type: "namespace" });
+  const puts: any[] = [];
+  await page.route(/\/groups(\?.*)?$/, (route) => {
+    const req = route.request();
+    if (req.method() === "PUT") {
+      const body = req.postDataJSON().groups;
+      puts.push(body);
+      live = { ...live, ...body[0] };
+    }
+    return route.fulfill({ json: { groups: [live] } });
+  });
+  await page.goto("/");
+  const toggle = page.locator(".enable-group").first();
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  live = {
+    ...live,
+    rules: [
+      { ...live.rules[0], enable: false, autolist: "rutracker.org" },
+      live.rules[1],
+      { id: "ef56ef56", enable: true, rule: "auto.example", type: "namespace", autolist: "h" },
+    ],
+  };
+  await page.locator("#save-changes").click();
+  await expect.poll(() => puts.length).toBe(1);
+  expect(puts[0][0].enable).toBe(false);
+  expect(puts[0][0].rules.map((r: any) => [r.rule, r.enable, r.autolist])).toEqual([
+    ["rutracker.org", false, "rutracker.org"],
+    ["kept.org", true, undefined],
+    ["auto.example", true, "h"],
+  ]);
+});
+
+/* catches: a malformed groups answer before the Save taken as "no groups" and sent */
+test("a save sends nothing when the groups answer before it is malformed", async ({ page }) => {
+  const fake = a1();
+  await shell(page, fake);
+  let reads = 0;
+  let configSaves = 0;
+  const puts: unknown[] = [];
+  await page.route("**/system/config/save", (route) => {
+    configSaves++;
+    return route.fulfill({ json: {} });
+  });
+  await page.route(/\/groups(\?.*)?$/, (route) => {
+    const req = route.request();
+    if (req.method() === "PUT") puts.push(req.postDataJSON());
+    reads++;
+    return route.fulfill({ json: reads > 1 && req.method() === "GET" ? {} : { groups: [GROUP] } });
+  });
+  await page.goto("/");
+  const toggle = page.locator(".enable-group").first();
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  const before = reads;
+  await page.locator("#save-changes").click();
+  await expect.poll(() => reads).toBeGreaterThan(before);
+  await page.waitForTimeout(300);
+  expect(puts).toEqual([]);
+  expect(configSaves).toBe(0);
+  await expect(page.getByText("Request failed")).toBeVisible();
+});
