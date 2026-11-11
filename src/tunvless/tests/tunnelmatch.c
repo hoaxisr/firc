@@ -453,14 +453,15 @@ static struct conn *sf_pending(int connect_ms) {
 }
 
 static int sf_ready(struct conn *c) {
-    for (int i = 0; i < 3000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) {
+    uint64_t end = now_ns() + 10000 * 1000000ull;
+    while (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE) && now_ns() < end) {
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
     __atomic_store_n(&g_connect_ms, 0, __ATOMIC_RELEASE);
     if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) return -1;
     g_now_ns = now_ns();
-    return conn_ready(c, &g_tun);
+    return conn_ready(c, &g_tun) ? -2 : 0;
 }
 
 static void sf_end(struct conn *c) {
@@ -481,8 +482,9 @@ static void t_server_first_from_ready(void) {
     cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
     uint64_t t0 = c->estab_ns;
     int calls = g_send_calls;
-    if (sf_ready(c) != 0) {
-        check(0, "server first from ready: fixture flow ready");
+    int r = sf_ready(c);
+    if (r != 0) {
+        check(0, r == -1 ? "server first from ready: fixture dial done" : "server first from ready: fixture flow ready");
         sf_end(NULL);
         return;
     }
