@@ -305,3 +305,19 @@ test("a rule the recheck switched off is dimmed with its own badge", async ({ pa
   await expect(off.locator(".rule-row")).toHaveClass(/autolist-off/);
   await expect(rules.nth(0).locator(".rule-row")).not.toHaveClass(/autolist-off/);
 });
+
+/* catches: the interface picker reloading the groups without end while the saved group is gone */
+test("a saved group that no longer exists does not make the page ask for groups again and again", async ({
+  page,
+}) => {
+  let asked = 0;
+  page.on("request", (r) => {
+    if (r.method() === "GET" && /\/api\/v1\/groups(\?|$)/.test(r.url())) asked++;
+  });
+  await settings(page, { "app.autolist.group": "deadbeef" });
+  await expect(row(page, "app.autolist.checkInterface")).toBeVisible();
+  const settled = asked;
+  await page.waitForTimeout(1500);
+  expect(asked - settled).toBe(0);
+  expect(asked).toBeLessThan(10);
+});

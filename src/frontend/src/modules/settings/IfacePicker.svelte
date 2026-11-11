@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
 
   import Select from "../../components/ui/Select.svelte";
   import { fetchInterfaces, interfaces } from "../../data/interfaces.svelte";
@@ -32,7 +32,10 @@
   }
 
   $effect(() => {
-    if (groupId !== "" && !groups.some((g) => g.id === groupId)) void loadGroups();
+    const id = groupId;
+    untrack(() => {
+      if (id !== "" && !groups.some((g) => g.id === id)) void loadGroups();
+    });
   });
 
   const group = $derived(groups.find((g) => g.id === groupId));
