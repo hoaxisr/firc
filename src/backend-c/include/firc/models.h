@@ -262,6 +262,8 @@ typedef struct firc_config {
 
 firc_rule_t *firc_rule_new(void);
 void firc_rule_free(firc_rule_t *r);
+/* A copy of every field of r with strings of its own; *out is untouched on failure. */
+firc_err_t firc_rule_dup(const firc_rule_t *r, firc_rule_t **out);
 #define FIRC_RULE_COMMENT_MAX 256
 /* NULL when s (NULL is none) can be a rule's comment once trimmed of spaces; else why not. */
 const char *firc_rule_comment_why(const char *s);
@@ -271,6 +273,10 @@ firc_err_t firc_rule_set_comment(firc_rule_t *r, const char *s, const char **why
 firc_group_t *firc_group_new(void);
 void firc_group_free(firc_group_t *g);
 firc_err_t firc_group_add_rule(firc_group_t *g, firc_rule_t *r); /* takes ownership */
+/* Fills the zeroed out with g's rule pointers in order, the one at `at` replaced by put (dropped when put is
+ * NULL; at SIZE_MAX touches none), then append when not NULL. Shares the pointers; FIRC_ERR_NOMEM frees out's array only. */
+firc_err_t firc_group_rules_with(const firc_group_t *g, size_t at, firc_rule_t *put, firc_rule_t *append,
+                                 firc_group_t *out);
 /* FIRC_ERR_EXIST when two of g's rules share an id (the zero id included); FIRC_ERR_NOMEM. */
 firc_err_t firc_group_check_rule_ids(const firc_group_t *g);
 

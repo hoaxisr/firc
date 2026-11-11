@@ -713,10 +713,21 @@ bool firc_groups_maybe_save(firc_groups_ctx_t *ctx, firc_http_req_t *req, firc_h
     return false;
 }
 
-/* must follow every in-place edit through firc_ruleset_group_mut, or a new rule updates netfilter but never resolves */
-static void republish_dns_snapshot(firc_groups_ctx_t *ctx) {
-    firc_err_t err = firc_app_republish_dns_snapshot(ctx->app);
-    if (err != FIRC_OK) { FIRC_ERROR("failed to republish DNS-matching snapshot: %s", firc_err_str(err)); }
+static bool hand_rules_set(firc_groups_ctx_t *ctx, firc_ruleset_t *rs, firc_group_t *next, firc_http_req_t *req,
+                           firc_http_res_t *res) {
+    bool unsaved = false;
+    const char *path = firc_http_req_query_is_true(req, "save") ? ctx->config_path : NULL;
+    firc_err_t err = firc_app_set_hand_rules(ctx->app, rs, next, path, ctx->config_version, &unsaved);
+    if (err == FIRC_OK) { return true; }
+    if (!unsaved) {
+        firc_http_res_write_error(res, 500, firc_err_str(err));
+        return false;
+    }
+    FIRC_ERROR("failed to save config file: %s", firc_err_str(err));
+    char msg[160];
+    snprintf(msg, sizeof(msg), "applied, but groups.yaml was not saved: %s", firc_err_str(err));
+    firc_http_res_write_error(res, 500, msg);
+    return false;
 }
 
 bool firc_groups_resolve(firc_groups_ctx_t *ctx, firc_http_req_t *req, firc_http_res_t *res,
@@ -1006,7 +1017,7 @@ static void handle_put_rules(firc_http_req_t *req, firc_http_res_t *res, void *u
         return;
     }
     int n = cJSON_GetArraySize(rules_j);
-    firc_group_t built = {0}; /* built through firc_group_add_rule, as a later POST append assumes */
+    firc_group_t built = {0};
     for (int i = 0; i < n; i++) {
         const char *why = NULL;
         cJSON *rule_j = cJSON_GetArrayItem(rules_j, i);
@@ -1043,21 +1054,7 @@ static void handle_put_rules(firc_http_req_t *req, firc_http_res_t *res, void *u
     firc_id_set_free(&known.ids);
     cJSON_Delete(json);
 
-    for (size_t i = 0; i < group->n_rules; i++) { firc_rule_free(group->rules[i]); }
-    free(group->rules);
-    group->rules = built.rules;
-    group->n_rules = built.n_rules;
-    republish_dns_snapshot(ctx);
-
-    if (firc_ruleset_runtime_enabled(rs)) {
-        firc_err_t err = firc_app_sync_group(ctx->app, rs);
-        if (err != FIRC_OK) {
-            firc_http_res_write_error(res, 500, firc_err_str(err));
-            return;
-        }
-    }
-
-    if (!firc_groups_maybe_save(ctx, req, res)) { return; }
+    if (!hand_rules_set(ctx, rs, &built, req, res)) { return; }
     firc_http_res_write_json(res, 200, wrap_rules(group->rules, group->n_rules));
 }
 
@@ -1093,22 +1090,13 @@ static void handle_create_rule(firc_http_req_t *req, firc_http_res_t *res, void 
         firc_http_res_write_error(res, 500, firc_err_str(err));
         return;
     }
-    if (firc_group_add_rule(group, rule) != FIRC_OK) {
+    firc_group_t next = {0};
+    if (firc_group_rules_with(group, SIZE_MAX, NULL, rule, &next) != FIRC_OK) {
         firc_rule_free(rule);
         firc_http_res_write_error(res, 500, "out of memory");
         return;
     }
-    republish_dns_snapshot(ctx);
-
-    if (firc_ruleset_runtime_enabled(rs)) {
-        err = firc_app_sync_group(ctx->app, rs);
-        if (err != FIRC_OK) {
-            firc_http_res_write_error(res, 500, firc_err_str(err));
-            return;
-        }
-    }
-
-    if (!firc_groups_maybe_save(ctx, req, res)) { return; }
+    if (!hand_rules_set(ctx, rs, &next, req, res)) { return; }
     firc_http_res_write_json(res, 200, rule_to_json(rule));
 }
 
@@ -1163,13 +1151,9 @@ static void handle_put_rule(firc_http_req_t *req, firc_http_res_t *res, void *ud
     }
     if (err == FIRC_OK) { err = carry_marker(fresh, firc_ruleset_group_mut(rs)); }
     cJSON_Delete(json);
-    if (err == FIRC_OK) {
-        firc_ruleset_group_mut(rs)->rules[idx] = fresh;
-        firc_rule_free(rule);
-        rule = fresh;
-    } else {
-        firc_rule_free(fresh);
-    }
+    firc_group_t next = {0};
+    if (err == FIRC_OK) { err = firc_group_rules_with(firc_ruleset_group(rs), idx, fresh, NULL, &next); }
+    if (err != FIRC_OK) { firc_rule_free(fresh); }
     if (err == FIRC_ERR_INVAL) { /* unreachable while the pre-check above stands */
         firc_http_res_write_error(res, 400, why != NULL ? why : "the rule is unusable");
         return;
@@ -1178,18 +1162,8 @@ static void handle_put_rule(firc_http_req_t *req, firc_http_res_t *res, void *ud
         firc_http_res_write_error(res, 500, "out of memory");
         return;
     }
-    republish_dns_snapshot(ctx);
-
-    if (firc_ruleset_runtime_enabled(rs)) {
-        err = firc_app_sync_group(ctx->app, rs);
-        if (err != FIRC_OK) {
-            firc_http_res_write_error(res, 500, firc_err_str(err));
-            return;
-        }
-    }
-
-    if (!firc_groups_maybe_save(ctx, req, res)) { return; }
-    firc_http_res_write_json(res, 200, rule_to_json(rule));
+    if (!hand_rules_set(ctx, rs, &next, req, res)) { return; }
+    firc_http_res_write_json(res, 200, rule_to_json(fresh));
 }
 
 static void handle_delete_rule(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
@@ -1199,21 +1173,12 @@ static void handle_delete_rule(firc_http_req_t *req, firc_http_res_t *res, void 
     size_t idx;
     if (!resolve_rule(rs, req, res, &idx)) { return; }
 
-    firc_group_t *group = firc_ruleset_group_mut(rs);
-    firc_rule_free(group->rules[idx]);
-    for (size_t i = idx; i + 1 < group->n_rules; i++) { group->rules[i] = group->rules[i + 1]; }
-    group->n_rules--;
-    republish_dns_snapshot(ctx);
-
-    if (firc_ruleset_runtime_enabled(rs)) {
-        firc_err_t err = firc_app_sync_group(ctx->app, rs);
-        if (err != FIRC_OK) {
-            firc_http_res_write_error(res, 500, firc_err_str(err));
-            return;
-        }
+    firc_group_t next = {0};
+    if (firc_group_rules_with(firc_ruleset_group(rs), idx, NULL, NULL, &next) != FIRC_OK) {
+        firc_http_res_write_error(res, 500, "out of memory");
+        return;
     }
-
-    if (!firc_groups_maybe_save(ctx, req, res)) { return; }
+    if (!hand_rules_set(ctx, rs, &next, req, res)) { return; }
     firc_http_res_write(res, 200, NULL, NULL, 0);
 }
 

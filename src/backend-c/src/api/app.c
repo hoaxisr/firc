@@ -1428,6 +1428,95 @@ firc_err_t firc_app_sync_group(firc_app_t *app, firc_ruleset_t *rs) {
     return r;
 }
 
+static int rule_ptr_cmp(const void *a, const void *b) {
+    uintptr_t x = (uintptr_t) * (firc_rule_t *const *)a;
+    uintptr_t y = (uintptr_t) * (firc_rule_t *const *)b;
+    return x < y ? -1 : x > y;
+}
+
+static firc_rule_t **sorted_rules(firc_rule_t *const *v, size_t n) {
+    firc_rule_t **s = malloc((n > 0 ? n : 1) * sizeof(*s));
+    if (s == NULL) { return NULL; }
+    if (n > 0) {
+        memcpy(s, v, n * sizeof(*s));
+        qsort(s, n, sizeof(*s), rule_ptr_cmp);
+    }
+    return s;
+}
+
+static bool rule_among(const firc_rule_t *r, firc_rule_t *const *v, size_t n, firc_rule_t **sorted) {
+    if (sorted != NULL) { return bsearch(&r, sorted, n, sizeof(*sorted), rule_ptr_cmp) != NULL; }
+    for (size_t i = 0; i < n; i++) {
+        if (v[i] == r) { return true; }
+    }
+    return false;
+}
+
+static bool rules_listed_twice(firc_rule_t *const *v, size_t n) {
+    firc_rule_t **s = sorted_rules(v, n);
+    bool twice = false;
+    for (size_t i = 1; i < n; i++) {
+        if (s != NULL ? s[i] == s[i - 1] : rule_among(v[i], v, i, NULL)) {
+            twice = true;
+            break;
+        }
+    }
+    free(s);
+    return twice;
+}
+
+static void free_rules_not_in(firc_rule_t **loser, size_t n_loser, firc_rule_t *const *keep, size_t n_keep,
+                              bool may_repeat) {
+    firc_rule_t **sk = sorted_rules(keep, n_keep);
+    firc_rule_t **sl = may_repeat ? sorted_rules(loser, n_loser) : NULL;
+    firc_rule_t **walk = sl != NULL ? sl : loser;
+    for (size_t i = 0; i < n_loser; i++) {
+        if (may_repeat && (sl != NULL ? i > 0 && sl[i] == sl[i - 1] : rule_among(loser[i], loser, i, NULL))) {
+            continue;
+        }
+        if (!rule_among(walk[i], keep, n_keep, sk)) { firc_rule_free(walk[i]); }
+    }
+    free(sl);
+    free(sk);
+    free(loser);
+}
+
+firc_err_t firc_app_set_hand_rules(firc_app_t *app, firc_ruleset_t *rs, firc_group_t *next, const char *save_path,
+                                   const char *version, bool *unsaved) {
+    *unsaved = false;
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    if (rules_listed_twice(next->rules, next->n_rules)) {
+        free_rules_not_in(next->rules, next->n_rules, g->rules, g->n_rules, true);
+        return FIRC_ERR_INVAL;
+    }
+    firc_rule_t **old = g->rules;
+    size_t n_old = g->n_rules;
+    app_nf_enter(app);
+    g->rules = next->rules;
+    g->n_rules = next->n_rules;
+    firc_err_t err = firc_ruleset_runtime_enabled(rs) ? sync_group_ruleset_locked(app, rs) : FIRC_OK;
+    if (err != FIRC_OK) {
+        g->rules = old;
+        g->n_rules = n_old;
+        firc_err_t again = sync_group_ruleset_locked(app, rs);
+        if (again != FIRC_OK) {
+            FIRC_ERROR("group \"%s\": rules put back, group not synced: %s", g->name != NULL ? g->name : "",
+                       firc_err_str(again));
+        }
+    }
+    republish_or_log(app);
+    app_nf_leave(app);
+    if (err != FIRC_OK) {
+        free_rules_not_in(next->rules, next->n_rules, old, n_old, false);
+        return err;
+    }
+    free_rules_not_in(old, n_old, g->rules, g->n_rules, false);
+    if (save_path == NULL) { return FIRC_OK; }
+    err = firc_app_save_groups(app, save_path, version != NULL ? version : "");
+    if (err != FIRC_OK) { *unsaved = true; }
+    return err;
+}
+
 static bool id_among(firc_id_t id, firc_group_t *const *keep, size_t n_keep) {
     for (size_t i = 0; i < n_keep; i++) {
         if (keep[i] != NULL && firc_id_equal(keep[i]->id, id)) { return true; }
@@ -3283,27 +3372,30 @@ static void autolist_count_add(firc_app_t *app, int64_t now) {
     app->al_added_at = (app->al_added_at + 1) % AL_ADDS_PER_HOUR;
 }
 
-static void autolist_publish(firc_app_t *app, firc_ruleset_t *rs) {
-    firc_err_t err = firc_app_republish_dns_snapshot(app);
-    if (err != FIRC_OK) { FIRC_ERROR("autolist: the DNS rules were not refreshed: %s", firc_err_str(err)); }
-    if (rs != NULL && firc_ruleset_runtime_enabled(rs)) {
-        err = firc_app_sync_group(app, rs);
-        if (err != FIRC_OK) {
-            const firc_group_t *g = firc_ruleset_group(rs);
-            FIRC_ERROR("autolist: group \"%s\" not synced: %s", g->name != NULL ? g->name : "", firc_err_str(err));
-        }
+static firc_err_t autolist_set_rules(firc_app_t *app, firc_ruleset_t *rs, firc_group_t *next) {
+    bool unsaved = false;
+    firc_err_t err = firc_app_set_hand_rules(app, rs, next, app->config_path, app->config_version, &unsaved);
+    if (err == FIRC_OK) { return FIRC_OK; }
+    const firc_group_t *g = firc_ruleset_group(rs);
+    const char *name = g->name != NULL ? g->name : "";
+    if (unsaved) {
+        FIRC_ERROR("autolist: group \"%s\" changed, but groups.yaml not saved: %s", name, firc_err_str(err));
+        return FIRC_OK;
     }
-    if (app->config_path != NULL) {
-        err = firc_app_save_groups(app, app->config_path, app->config_version != NULL ? app->config_version : "");
-        if (err != FIRC_OK) { FIRC_ERROR("autolist: groups.yaml not saved: %s", firc_err_str(err)); }
+    FIRC_ERROR("autolist: group \"%s\" not synced, its rules put back: %s", name, firc_err_str(err));
+    return err;
+}
+
+static size_t autolist_rule_at(const firc_group_t *g, const char *domain) {
+    for (size_t i = 0; i < g->n_rules; i++) {
+        if (g->rules[i]->rule != NULL && strcmp(g->rules[i]->rule, domain) == 0) { return i; }
     }
+    return SIZE_MAX;
 }
 
 static firc_rule_t *autolist_rule_named(const firc_group_t *g, const char *domain) {
-    for (size_t i = 0; i < g->n_rules; i++) {
-        if (g->rules[i]->rule != NULL && strcmp(g->rules[i]->rule, domain) == 0) { return g->rules[i]; }
-    }
-    return NULL;
+    size_t at = autolist_rule_at(g, domain);
+    return at != SIZE_MAX ? g->rules[at] : NULL;
 }
 
 static firc_err_t autolist_add_rule(firc_app_t *app, const char *domain, const char *host, firc_al_why_t why) {
@@ -3314,19 +3406,28 @@ static firc_err_t autolist_add_rule(firc_app_t *app, const char *domain, const c
     const firc_al_cand_t *c = firc_al_cands_find(app->al_cands, domain);
     unsigned fails = c != NULL ? (unsigned)c->fails : 0;
     bool by_domain = c != NULL && c->by_domain;
-    firc_rule_t *have = autolist_rule_named(g, domain);
-    if (have != NULL) {
+    size_t at = autolist_rule_at(g, domain);
+    if (at != SIZE_MAX) {
+        const firc_rule_t *have = g->rules[at];
         if (have->autolist == NULL) { return FIRC_ERR_EXIST; }
         if (have->enable) { return FIRC_OK; }
-        firc_err_t set = firc_strset(&have->autolist, host);
+        firc_rule_t *on = NULL;
+        firc_group_t next = {0};
+        firc_err_t set = firc_rule_dup(have, &on);
+        if (set == FIRC_OK) { set = firc_strset(&on->autolist, host); }
+        if (set == FIRC_OK) {
+            on->enable = true;
+            on->autolist_by_domain = by_domain;
+            set = firc_group_rules_with(g, at, on, NULL, &next);
+        }
         if (set != FIRC_OK) {
+            firc_rule_free(on);
             FIRC_ERROR("autolist: %s not switched on again: %s", domain, firc_err_str(set));
             return set;
         }
-        have->enable = true;
-        have->autolist_by_domain = by_domain;
+        set = autolist_set_rules(app, rs, &next);
+        if (set != FIRC_OK) { return set; }
         app->al_switched_on++;
-        autolist_publish(app, rs);
         FIRC_INFO("autolist: %s switched on again in group \"%s\" for %s: %u failures, %s", domain, gname, host, fails,
                   autolist_why_text(why));
         return FIRC_OK;
@@ -3336,18 +3437,20 @@ static firc_err_t autolist_add_rule(firc_app_t *app, const char *domain, const c
     if (err == FIRC_OK) { err = firc_strset(&r->type, "namespace"); }
     if (err == FIRC_OK) { err = firc_strset(&r->rule, domain); }
     if (err == FIRC_OK) { err = firc_strset(&r->autolist, host); }
+    firc_group_t next = {0};
     if (err == FIRC_OK) {
         r->enable = true;
         r->autolist_by_domain = by_domain;
-        err = firc_group_add_rule(g, r);
+        err = firc_group_rules_with(g, SIZE_MAX, NULL, r, &next);
     }
     if (err != FIRC_OK) {
         firc_rule_free(r);
         FIRC_ERROR("autolist: %s not added: %s", domain, firc_err_str(err));
         return err;
     }
+    err = autolist_set_rules(app, rs, &next);
+    if (err != FIRC_OK) { return err; }
     autolist_count_add(app, autolist_now(app));
-    autolist_publish(app, rs);
     FIRC_INFO("autolist: %s added to group \"%s\" for %s: %u failures, %s", domain, gname, host, fails,
               autolist_why_text(why));
     return FIRC_OK;
@@ -3532,31 +3635,65 @@ static void autolist_rechecked(firc_app_t *app, const char *host, const firc_aut
     }
     for (size_t i = 0; i < app->n_rulesets; i++) {
         firc_ruleset_t *rs = app->rulesets[i];
-        firc_group_t *g = firc_ruleset_group_mut(rs);
-        bool changed = false;
-        for (size_t k = 0; k < g->n_rules; k++) {
+        const firc_group_t *g = firc_ruleset_group(rs);
+        bool any = false;
+        for (size_t k = 0; !any && k < g->n_rules; k++) {
+            const firc_rule_t *rule = g->rules[k];
+            any = rule->enable && rule->autolist != NULL && strcmp(rule->autolist, host) == 0;
+        }
+        if (!any) { continue; }
+        firc_group_t next = {0};
+        bool *off = calloc(g->n_rules, sizeof(*off));
+        size_t n_off = 0;
+        firc_err_t err = off == NULL ? FIRC_ERR_NOMEM : FIRC_OK;
+        for (size_t k = 0; err == FIRC_OK && k < g->n_rules; k++) {
             firc_rule_t *rule = g->rules[k];
-            if (!rule->enable || rule->autolist == NULL || strcmp(rule->autolist, host) != 0) { continue; }
-            firc_al_cand_t *c = firc_al_cands_find(app->al_cands, rule->rule);
-            if (r->short_body && rule->autolist_by_domain) {
+            firc_rule_t *put = rule;
+            bool mine = rule->enable && rule->autolist != NULL && strcmp(rule->autolist, host) == 0;
+            const firc_al_cand_t *c = mine ? firc_al_cands_find(app->al_cands, rule->rule) : NULL;
+            if (mine && r->short_body && rule->autolist_by_domain) {
                 FIRC_DEBUG("autolist: %s answered a short page through %s, which says nothing about the rest of %s",
                            host, via, rule->rule);
-                continue;
+                mine = false;
             }
-            if (r->short_body && c != NULL && c->why == FIRC_AL_WHY_FREEZE) {
+            if (mine && r->short_body && c != NULL && c->why == FIRC_AL_WHY_FREEZE) {
                 FIRC_DEBUG("autolist: %s answered a short page through %s, which says nothing about a freeze", host,
                            via);
-                continue;
+                mine = false;
             }
-            rule->enable = false;
+            if (mine) {
+                err = firc_rule_dup(rule, &put);
+                if (err != FIRC_OK) { break; }
+                put->enable = false;
+                off[k] = true;
+                n_off++;
+            }
+            err = firc_group_add_rule(&next, put);
+            if (err != FIRC_OK && put != rule) { firc_rule_free(put); }
+        }
+        if (err != FIRC_OK) {
+            for (size_t k = 0; k < next.n_rules; k++) {
+                if (next.rules[k] != g->rules[k]) { firc_rule_free(next.rules[k]); }
+            }
+            FIRC_ERROR("autolist: %s opens through %s again, but group \"%s\" was left as it is: %s", host, via,
+                       g->name != NULL ? g->name : "", firc_err_str(err));
+        }
+        if (err != FIRC_OK || n_off == 0 || autolist_set_rules(app, rs, &next) != FIRC_OK) {
+            if (err != FIRC_OK || n_off == 0) { free(next.rules); }
+            free(off);
+            continue;
+        }
+        for (size_t k = 0; k < g->n_rules; k++) {
+            if (!off[k]) { continue; }
+            const firc_rule_t *rule = g->rules[k];
+            firc_al_cand_t *c = firc_al_cands_find(app->al_cands, rule->rule);
             app->al_switched_off++;
-            changed = true;
             if (c != NULL) { c->state = FIRC_AL_OFF; }
             FIRC_INFO("autolist: %s opens through %s again, so %s is switched off in group \"%s\" until it is "
                       "blocked again",
                       host, via, rule->rule, g->name != NULL ? g->name : "");
         }
-        if (changed) { autolist_publish(app, rs); }
+        free(off);
     }
 }
 

@@ -332,6 +332,20 @@ $(BUILDDIR)/tests/test_nfrebuild: tests/unit/test_nfrebuild.c $(LIB_OBJS) $(TEST
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(NFREBUILD_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
+GROUPS_WRAP := -Wl,--wrap=firc_ruleset_sync
+
+$(BUILDDIR)/tests/test_groups: tests/unit/test_groups.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(GROUPS_WRAP) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
+AUTOLIST_APP_WRAP := -Wl,--wrap=firc_ruleset_runtime_enabled,--wrap=firc_ruleset_sync
+
+$(BUILDDIR)/tests/test_autolist_app: tests/unit/test_autolist_app.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(AUTOLIST_APP_WRAP) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
 UPDATE_WRAP := -Wl,--wrap=calloc
 
 $(BUILDDIR)/tests/test_update: tests/unit/test_update.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)

@@ -2680,6 +2680,234 @@ TEST move_up_asks_the_watcher_for_the_group_and_names_each_refusal(void) {
     PASS();
 }
 
+static int g_sync_calls;
+static int g_sync_fails;
+
+firc_err_t __real_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed);
+firc_err_t __wrap_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed);
+firc_err_t __wrap_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed) {
+    g_sync_calls++;
+    if (g_sync_fails > 0) {
+        g_sync_fails--;
+        if (chain_changed) { *chain_changed = false; }
+        return FIRC_ERR_NOMEM;
+    }
+    return __real_firc_ruleset_sync(rs, chain_changed);
+}
+
+static bool name_matched(harness_t *h, const char *domain) {
+    uint8_t name[FIRC_DNS_MAX_NAME + 1];
+    size_t name_len = wire_name(domain, name, sizeof(name));
+    uint8_t addr[4] = {93, 184, 216, 34};
+    firc_dns_rr_t *rr = calloc(1, sizeof(*rr));
+    memcpy(rr->name, name, name_len);
+    rr->name_len = name_len;
+    rr->rtype = FIRC_DNS_TYPE_A;
+    rr->rclass = 1;
+    rr->ttl = 60;
+    rr->rdata = malloc(4);
+    memcpy(rr->rdata, addr, 4);
+    rr->rdata_len = 4;
+    firc_dns_question_t q = {{0}, 0, 0, 0};
+    memcpy(q.name, name, name_len);
+    q.name_len = name_len;
+    q.qtype = FIRC_DNS_TYPE_A;
+    q.qclass = 1;
+    firc_dns_msg_t msg = {0};
+    msg.questions = &q;
+    msg.n_questions = 1;
+    msg.answers = rr;
+    msg.n_answers = 1;
+    (void)firc_dns_pipeline_handle_message(h->pipeline, &msg, 0, NULL, NULL);
+    bool faked = msg.n_answers == 1 && memcmp(msg.answers[0].rdata, addr, 4) != 0;
+    for (size_t i = 0; i < msg.n_answers; i++) { free(msg.answers[i].rdata); }
+    free(msg.answers);
+    return faked;
+}
+
+static firc_rule_t *made_rule(const char *type, const char *text) {
+    firc_rule_t *r = firc_rule_new();
+    if (r == NULL || firc_id_random(&r->id) != FIRC_OK || firc_strset(&r->type, type) != FIRC_OK ||
+        firc_strset(&r->rule, text) != FIRC_OK) {
+        abort();
+    }
+    r->enable = true;
+    return r;
+}
+
+static firc_ruleset_t *live_group_with(harness_t *h, const char *rules_json) {
+    char body[512];
+    snprintf(body, sizeof(body), "{\"name\":\"g\",\"interface\":\"lo\",\"rules\":%s}", rules_json);
+    cJSON *out = NULL;
+    if (do_request("POST", "/api/v1/groups", body, &out) != 200) { return NULL; }
+    cJSON_Delete(out);
+    firc_ruleset_t *rs = only_group(h);
+    return rs != NULL && firc_ruleset_runtime_enabled(rs) ? rs : NULL;
+}
+
+static bool prefixes_are(firc_ruleset_t *rs, const char *want) {
+    firc_nf_prefixes_t p = {0};
+    if (firc_ruleset_prefixes(rs, &p) != FIRC_OK) { return false; }
+    char got[256] = "";
+    for (size_t i = 0; i < p.n; i++) {
+        char a[INET6_ADDRSTRLEN];
+        inet_ntop(p.v[i].family == 4 ? AF_INET : AF_INET6, p.v[i].addr, a, sizeof(a));
+        size_t len = strlen(got);
+        snprintf(got + len, sizeof(got) - len, "%s%s/%u", len ? " " : "", a, p.v[i].cidr);
+    }
+    free(p.v);
+    return strcmp(got, want) == 0;
+}
+
+static bool file_exists(const char *path) { return access(path, F_OK) == 0; }
+
+/* catches: a failed sync leaving the new rules in the group, in the link or in DNS, or saving them */
+TEST a_failed_sync_puts_the_old_rules_back_everywhere(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    firc_ruleset_t *rs = live_group_with(h, "[{\"type\":\"subnet\",\"rule\":\"10.1.0.0/16\",\"enable\":true},"
+                                            "{\"type\":\"domain\",\"rule\":\"old.example\",\"enable\":true}]");
+    ASSERT(rs != NULL);
+    ASSERT(prefixes_are(rs, "10.1.0.0/16"));
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    firc_rule_t *old0 = g->rules[0], *old1 = g->rules[1];
+    firc_rule_t **old_array = g->rules;
+    firc_group_t next = {0};
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, old1));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, made_rule("subnet", "10.2.0.0/16")));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, made_rule("domain", "new.example")));
+    char dir[] = "/tmp/firc-hr-XXXXXX";
+    ASSERT(mkdtemp(dir) != NULL);
+    char conf[64], yaml[80];
+    snprintf(conf, sizeof(conf), "%s/firc.conf", dir);
+    snprintf(yaml, sizeof(yaml), "%s/groups.yaml", dir);
+    g_sync_calls = 0;
+    g_sync_fails = 1;
+    bool unsaved = true;
+    ASSERT_EQ(FIRC_ERR_NOMEM, firc_app_set_hand_rules(h->app, rs, &next, conf, "v", &unsaved));
+    ASSERT_EQ(2, g_sync_calls);
+    ASSERT_FALSE(unsaved);
+    ASSERT(g->rules == old_array && g->n_rules == 2 && g->rules[0] == old0 && g->rules[1] == old1);
+    ASSERT(prefixes_are(rs, "10.1.0.0/16"));
+    ASSERT(name_matched(h, "old.example"));
+    ASSERT_FALSE(name_matched(h, "new.example"));
+    ASSERT_FALSE(file_exists(yaml));
+    rmdir(dir);
+    harness_stop(h);
+    PASS();
+}
+
+/* catches: a good sync not taking the new rules everywhere, the old rules kept, or no save */
+TEST a_good_sync_takes_the_new_rules_and_saves(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    firc_ruleset_t *rs = live_group_with(h, "[{\"type\":\"subnet\",\"rule\":\"10.1.0.0/16\",\"enable\":true},"
+                                            "{\"type\":\"domain\",\"rule\":\"old.example\",\"enable\":true}]");
+    ASSERT(rs != NULL);
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    firc_rule_t *kept = g->rules[1];
+    firc_rule_t *added = made_rule("domain", "new.example");
+    firc_group_t next = {0};
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, kept));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, added));
+    char dir[] = "/tmp/firc-hr-XXXXXX";
+    ASSERT(mkdtemp(dir) != NULL);
+    char conf[64], yaml[80];
+    snprintf(conf, sizeof(conf), "%s/firc.conf", dir);
+    snprintf(yaml, sizeof(yaml), "%s/groups.yaml", dir);
+    g_sync_calls = 0;
+    bool unsaved = true;
+    ASSERT_EQ(FIRC_OK, firc_app_set_hand_rules(h->app, rs, &next, conf, "v", &unsaved));
+    ASSERT_EQ(1, g_sync_calls);
+    ASSERT_FALSE(unsaved);
+    ASSERT(g->n_rules == 2 && g->rules[0] == kept && g->rules[1] == added);
+    ASSERT(prefixes_are(rs, ""));
+    ASSERT(name_matched(h, "new.example"));
+    ASSERT(name_matched(h, "old.example"));
+    ASSERT(file_exists(yaml));
+    unlink(yaml);
+    rmdir(dir);
+    harness_stop(h);
+    PASS();
+}
+
+/* catches: a rule listed twice taken in, which frees it twice later */
+TEST a_rule_listed_twice_is_refused_with_nothing_changed(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    firc_ruleset_t *rs = live_group_with(h, "[{\"type\":\"domain\",\"rule\":\"old.example\",\"enable\":true}]");
+    ASSERT(rs != NULL);
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    firc_rule_t **old_array = g->rules;
+    firc_rule_t *twice = made_rule("domain", "twice.example");
+    firc_group_t next = {0};
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, g->rules[0]));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, twice));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&next, twice));
+    g_sync_calls = 0;
+    bool unsaved = true;
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_app_set_hand_rules(h->app, rs, &next, NULL, NULL, &unsaved));
+    ASSERT_EQ(0, g_sync_calls);
+    ASSERT_FALSE(unsaved);
+    ASSERT(g->rules == old_array && g->n_rules == 1);
+    ASSERT_FALSE(name_matched(h, "twice.example"));
+    harness_stop(h);
+    PASS();
+}
+
+/* catches: a rule route answering 200, or keeping its change, after a failed sync */
+TEST every_rule_route_rolls_back_on_a_failed_sync(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    firc_ruleset_t *rs = live_group_with(h, "[{\"type\":\"domain\",\"rule\":\"old.example\",\"enable\":true}]");
+    ASSERT(rs != NULL);
+    char id[FIRC_ID_STR_LEN], rid[FIRC_ID_STR_LEN];
+    firc_id_format(firc_ruleset_group(rs)->id, id);
+    firc_id_format(firc_ruleset_group(rs)->rules[0]->id, rid);
+    char rules[96], one[128];
+    snprintf(rules, sizeof(rules), "/api/v1/groups/%s/rules", id);
+    snprintf(one, sizeof(one), "%s/%s", rules, rid);
+    const char *rule = "{\"type\":\"domain\",\"rule\":\"new.example\",\"enable\":true}";
+    struct {
+        const char *method, *path, *body;
+    } calls[] = {
+        {"POST", rules, rule},
+        {"PUT", rules, "{\"rules\":[{\"type\":\"domain\",\"rule\":\"new.example\",\"enable\":true}]}"},
+        {"PUT", one, rule},
+        {"DELETE", one, NULL},
+    };
+    for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++) {
+        cJSON *out = NULL;
+        g_sync_fails = 2;
+        ASSERT_EQm(calls[i].method, 500, do_request(calls[i].method, calls[i].path, calls[i].body, &out));
+        cJSON_Delete(out);
+        g_sync_fails = 0;
+        ASSERT_EQ(200, do_request("GET", rules, NULL, &out));
+        cJSON *list = cJSON_GetObjectItemCaseSensitive(out, "rules");
+        ASSERT_EQm(calls[i].method, 1, cJSON_GetArraySize(list));
+        ASSERT_STR_EQ("old.example", jstr(cJSON_GetArrayItem(list, 0), "rule"));
+        cJSON_Delete(out);
+    }
+    harness_stop(h);
+    PASS();
+}
+
+/* catches: a rule write without ?save touching groups.yaml */
+TEST a_rule_write_without_save_leaves_the_file_alone(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    h->ctx.config_path = "/nonexistent-firc-dir/firc.conf";
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"g\",\"interface\":\"eth0\"}", &out));
+    char rules[96];
+    snprintf(rules, sizeof(rules), "/api/v1/groups/%s/rules", jstr(out, "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("POST", rules, "{\"type\":\"domain\",\"rule\":\"a.example\",\"enable\":true}", &out));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2740,6 +2968,11 @@ int main(int argc, char **argv) {
     RUN_TEST(put_rules_strict_id_validation);
     RUN_TEST(rules_put_then_posted_to_keep_every_rule);
     RUN_TEST(rule_created_via_http_is_dns_matchable);
+    RUN_TEST(a_failed_sync_puts_the_old_rules_back_everywhere);
+    RUN_TEST(a_good_sync_takes_the_new_rules_and_saves);
+    RUN_TEST(a_rule_listed_twice_is_refused_with_nothing_changed);
+    RUN_TEST(every_rule_route_rolls_back_on_a_failed_sync);
+    RUN_TEST(a_rule_write_without_save_leaves_the_file_alone);
     RUN_TEST(a_groups_resolve_round_trips_and_its_resolver_is_shown);
     RUN_TEST(a_disabled_groups_resolver_lists_no_servers);
     RUN_TEST(a_resolve_server_list_is_kept_verbatim_and_a_bad_one_refused);

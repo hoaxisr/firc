@@ -2593,7 +2593,7 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
-          description: Internal Server Error
+          description: 'Internal Server Error. A sync of the group that fails puts its old rules back and answers with the error: nothing changed. A save that fails answers "applied, but groups.yaml was not saved: <error>".'
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Create a rule'
@@ -2635,7 +2635,7 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
-          description: Internal Server Error
+          description: 'Internal Server Error. A sync of the group that fails puts its old rules back and answers with the error: nothing changed. A save that fails answers "applied, but groups.yaml was not saved: <error>".'
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Update the list of rules'
@@ -2669,7 +2669,7 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
-          description: Internal Server Error
+          description: 'Internal Server Error. A sync of the group that fails puts its old rules back and answers with the error: nothing changed. A save that fails answers "applied, but groups.yaml was not saved: <error>".'
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Delete a rule'
@@ -2747,7 +2747,7 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
-          description: Internal Server Error
+          description: 'Internal Server Error. A sync of the group that fails puts its old rules back and answers with the error: nothing changed. A save that fails answers "applied, but groups.yaml was not saved: <error>".'
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Update a rule'

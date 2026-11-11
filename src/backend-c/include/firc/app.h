@@ -182,6 +182,12 @@ void firc_app_netfilter_health(const firc_app_t *app, firc_nfcommit_health_t *ou
 /* re-syncs rs's chain after its rules changed, asking for a pass only if its subnet prefixes changed */
 firc_err_t firc_app_sync_group(firc_app_t *app, firc_ruleset_t *rs);
 
+/* Gives rs the hand rules in next (built with firc_group_add_rule, may share pointers with the current
+ * ones) and syncs it; a failed sync puts the old rules back and syncs again, saving nothing. Owns both
+ * arrays from the call on. Saves groups.yaml beside save_path on success; *unsaved: only the save failed. */
+firc_err_t firc_app_set_hand_rules(firc_app_t *app, firc_ruleset_t *rs, firc_group_t *next, const char *save_path,
+                                   const char *version, bool *unsaved);
+
 /* disables, frees and removes every group */
 void firc_app_clear_groups(firc_app_t *app);
 

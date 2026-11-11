@@ -229,6 +229,29 @@ static firc_err_t grow_array(void ***arr, size_t n)
     return FIRC_OK;
 }
 
+firc_err_t firc_rule_dup(const firc_rule_t *r, firc_rule_t **out)
+{
+    firc_rule_t *d = firc_rule_new();
+    if (d == NULL) {
+        return FIRC_ERR_NOMEM;
+    }
+    d->id = r->id;
+    d->enable = r->enable;
+    d->autolist_by_domain = r->autolist_by_domain;
+    firc_err_t err = firc_strset(&d->type, r->type);
+    if (err == FIRC_OK) { err = firc_strset(&d->rule, r->rule); }
+    if (err == FIRC_OK) { err = firc_strset(&d->proto, r->proto); }
+    if (err == FIRC_OK) { err = firc_strset(&d->ports, r->ports); }
+    if (err == FIRC_OK) { err = firc_strset(&d->comment, r->comment); }
+    if (err == FIRC_OK) { err = firc_strset(&d->autolist, r->autolist); }
+    if (err != FIRC_OK) {
+        firc_rule_free(d);
+        return err;
+    }
+    *out = d;
+    return FIRC_OK;
+}
+
 firc_err_t firc_group_add_rule(firc_group_t *g, firc_rule_t *r)
 {
     firc_err_t err = grow_array((void ***)&g->rules, g->n_rules);
@@ -237,6 +260,23 @@ firc_err_t firc_group_add_rule(firc_group_t *g, firc_rule_t *r)
     }
     g->rules[g->n_rules++] = r;
     return FIRC_OK;
+}
+
+firc_err_t firc_group_rules_with(const firc_group_t *g, size_t at, firc_rule_t *put, firc_rule_t *append,
+                                 firc_group_t *out)
+{
+    firc_err_t err = FIRC_OK;
+    for (size_t i = 0; err == FIRC_OK && i < g->n_rules; i++) {
+        firc_rule_t *r = i == at ? put : g->rules[i];
+        if (r != NULL) { err = firc_group_add_rule(out, r); }
+    }
+    if (err == FIRC_OK && append != NULL) { err = firc_group_add_rule(out, append); }
+    if (err != FIRC_OK) {
+        free(out->rules);
+        out->rules = NULL;
+        out->n_rules = 0;
+    }
+    return err;
 }
 
 firc_err_t firc_group_check_rule_ids(const firc_group_t *g)

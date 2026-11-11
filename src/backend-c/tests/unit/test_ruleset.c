@@ -1,5 +1,8 @@
 #include "greatest.h"
 
+#include <stdint.h>
+#include <stdlib.h>
+
 #include "firc/events.h"
 #include "firc/ruleset.h"
 #include "firc/keenetic_policy.h"
@@ -193,6 +196,72 @@ TEST a_list_prefix_carries_its_protocol_and_ports(void) {
     ASSERT_EQ(IPPROTO_UDP, p.e[0].proto);
     ASSERT_STR_EQ("50000:50099,19200:19400", p.e[0].ports);
     firc_config_clear(&cfg);
+    PASS();
+}
+
+/* catches: a rule lost, moved or added twice when a group's rules are rebuilt with one change */
+TEST a_rebuilt_rule_array_shares_the_rest_in_order(void) {
+    firc_group_t g = {0};
+    firc_rule_t *r[3];
+    for (int i = 0; i < 3; i++) {
+        r[i] = firc_rule_new();
+        ASSERT(r[i] != NULL);
+        ASSERT_EQ(FIRC_OK, firc_group_add_rule(&g, r[i]));
+    }
+    firc_rule_t *x = firc_rule_new();
+    ASSERT(x != NULL);
+    firc_group_t out = {0};
+    ASSERT_EQ(FIRC_OK, firc_group_rules_with(&g, SIZE_MAX, NULL, x, &out));
+    ASSERT(out.n_rules == 4 && out.rules[0] == r[0] && out.rules[2] == r[2] && out.rules[3] == x);
+    free(out.rules);
+    out = (firc_group_t){0};
+    ASSERT_EQ(FIRC_OK, firc_group_rules_with(&g, 1, x, NULL, &out));
+    ASSERT(out.n_rules == 3 && out.rules[0] == r[0] && out.rules[1] == x && out.rules[2] == r[2]);
+    free(out.rules);
+    out = (firc_group_t){0};
+    ASSERT_EQ(FIRC_OK, firc_group_rules_with(&g, 0, NULL, NULL, &out));
+    ASSERT(out.n_rules == 2 && out.rules[0] == r[1] && out.rules[1] == r[2]);
+    ASSERT(g.n_rules == 3 && g.rules[0] == r[0]);
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(&out, x));
+    ASSERT_EQ(3, (int)out.n_rules);
+    free(out.rules);
+    firc_rule_free(x);
+    for (int i = 0; i < 3; i++) { firc_rule_free(r[i]); }
+    free(g.rules);
+    PASS();
+}
+
+/* catches: a field left out of the copy, or a string shared with the original */
+TEST a_duplicated_rule_has_every_field_in_strings_of_its_own(void) {
+    firc_rule_t *r = firc_rule_new();
+    ASSERT(r != NULL);
+    r->id = (firc_id_t){{1, 2, 3, 4}};
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->type, "subnet"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->rule, "10.0.0.0/8"));
+    r->enable = true;
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->proto, "tcp"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->ports, "443"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->comment, "c"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->autolist, "a.example"));
+    r->autolist_by_domain = true;
+    firc_rule_t *d = NULL;
+    ASSERT_EQ(FIRC_OK, firc_rule_dup(r, &d));
+    ASSERT(firc_id_equal(r->id, d->id));
+    ASSERT(d->enable && d->autolist_by_domain);
+    const char *a[] = {r->type, r->rule, r->proto, r->ports, r->comment, r->autolist};
+    const char *b[] = {d->type, d->rule, d->proto, d->ports, d->comment, d->autolist};
+    for (size_t i = 0; i < 6; i++) {
+        ASSERT_STR_EQ(a[i], b[i]);
+        ASSERT(a[i] != b[i]);
+    }
+    firc_rule_free(r);
+    r = firc_rule_new();
+    ASSERT(r != NULL);
+    firc_rule_free(d);
+    ASSERT_EQ(FIRC_OK, firc_rule_dup(r, &d));
+    ASSERT(d->type == NULL && d->autolist == NULL && !d->enable && !d->autolist_by_domain);
+    firc_rule_free(r);
+    firc_rule_free(d);
     PASS();
 }
 
@@ -1037,5 +1106,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_ruleset_starts_its_list_on_the_entry_it_was_told);
     RUN_TEST(a_ruleset_started_blocked_writes_no_default);
     RUN_TEST(a_list_with_an_unusable_entry_routes_nothing);
+    RUN_TEST(a_duplicated_rule_has_every_field_in_strings_of_its_own);
+    RUN_TEST(a_rebuilt_rule_array_shares_the_rest_in_order);
     GREATEST_MAIN_END();
 }

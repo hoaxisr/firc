@@ -881,6 +881,40 @@ TEST a_flush_that_cannot_be_queued_closes_at_once(void) {
     PASS();
 }
 
+/* catches: a failed copy reported as OK, a half copy handed out, or *out written on failure */
+TEST a_rule_copy_that_ran_out_of_memory_hands_out_nothing(void) {
+    firc_rule_t *r = firc_rule_new();
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->type, "domain"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->rule, "a.example"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->proto, "tcp"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->ports, "443"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->comment, "c"));
+    ASSERT_EQ(FIRC_OK, firc_strset(&r->autolist, "a.example"));
+    long failed = 0;
+    for (long at = 0; at < 64; at++) {
+        firc_rule_t *sentinel = (firc_rule_t *)&failed;
+        firc_rule_t *d = sentinel;
+        arm(at);
+        firc_err_t err = firc_rule_dup(r, &d);
+        long seen = intercepted();
+        disarm();
+        ASSERTm("the allocator seam intercepted nothing -- the test proves nothing", seen > 0);
+        if (err == FIRC_OK) {
+            ASSERT_STR_EQ("a.example", d->autolist);
+            ASSERT_STR_EQ("443", d->ports);
+            firc_rule_free(d);
+            break;
+        }
+        ASSERT_EQ(FIRC_ERR_NOMEM, err);
+        ASSERT(d == sentinel);
+        failed++;
+    }
+    ASSERT_EQ_FMTm("a copy needs the rule and six strings", 7L, failed, "%ld");
+    firc_rule_free(r);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -888,6 +922,7 @@ int main(int argc, char **argv) {
     firc_sub_fetch_global_init();
     GREATEST_MAIN_BEGIN();
     RUN_TEST(an_allocation_failure_is_never_reported_as_a_bad_line);
+    RUN_TEST(a_rule_copy_that_ran_out_of_memory_hands_out_nothing);
     RUN_TEST(an_override_is_never_dropped_because_memory_ran_out);
     RUN_TEST(a_snapshot_never_outlives_the_list_it_borrows);
     RUN_TEST(a_replace_that_drops_a_list_never_leaves_a_snapshot_on_it);

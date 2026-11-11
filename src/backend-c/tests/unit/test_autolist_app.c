@@ -2548,6 +2548,80 @@ TEST an_owned_sni_on_a_hinted_answered_address_is_a_bypass_by_sni(void) {
     PASS();
 }
 
+static int g_force_live;
+static int g_sync_fails;
+
+bool __real_firc_ruleset_runtime_enabled(const firc_ruleset_t *rs);
+bool __wrap_firc_ruleset_runtime_enabled(const firc_ruleset_t *rs);
+bool __wrap_firc_ruleset_runtime_enabled(const firc_ruleset_t *rs) {
+    return __atomic_load_n(&g_force_live, __ATOMIC_ACQUIRE) || __real_firc_ruleset_runtime_enabled(rs);
+}
+
+firc_err_t __real_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed);
+firc_err_t __wrap_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed);
+firc_err_t __wrap_firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed) {
+    if (__atomic_load_n(&g_sync_fails, __ATOMIC_ACQUIRE) > 0) {
+        __atomic_sub_fetch(&g_sync_fails, 1, __ATOMIC_ACQ_REL);
+        if (chain_changed) { *chain_changed = false; }
+        return FIRC_ERR_NOMEM;
+    }
+    return __real_firc_ruleset_sync(rs, chain_changed);
+}
+
+static void fail_next_sync(void) {
+    __atomic_store_n(&g_sync_fails, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_force_live, 1, __ATOMIC_RELEASE);
+}
+
+static void syncs_back_to_normal(void) {
+    __atomic_store_n(&g_force_live, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_sync_fails, 0, __ATOMIC_RELEASE);
+}
+
+/* catches: an add whose sync failed keeping the rule, counting it, or marking the candidate added */
+TEST an_add_whose_sync_fails_leaves_no_rule_and_the_candidate_as_it_was(void) {
+    rig_t r;
+    ASSERT(rig_up(&r));
+    ASSERT(fail_twice(&r, "blocked.example.com", 50001));
+    cand_want_t want = {"example.com", "candidate"};
+    cJSON_Delete(wait_status(has_candidate, &want));
+    fail_next_sync();
+    ASSERT_EQ(500, request("POST", "/api/v1/system/autolist/candidates/example.com/add", g_buf, sizeof(g_buf)));
+    syncs_back_to_normal();
+    cJSON *st = wait_status(has_candidate, &want);
+    ASSERT_STR_EQ("candidate", str_of(candidate(st, "example.com"), "state"));
+    ASSERT_EQ(0, (int)num_of(st, "addedHour"));
+    cJSON_Delete(st);
+    rig_stop_loop(&r);
+    ASSERT_EQ(0u, rules_named(r.app, "example.com"));
+    rig_down(&r);
+    PASS();
+}
+
+/* catches: a switch-off whose sync failed leaving the rule off, counting it, or marking the candidate off */
+TEST a_switch_off_whose_sync_fails_leaves_the_rule_on(void) {
+    rig_t r;
+    setup_t su = {.mode = "add"};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(fail_twice(&r, "www.up.example", 50001));
+    cand_want_t want = {"up.example", "added"};
+    cJSON_Delete(wait_status(has_candidate, &want));
+    fail_next_sync();
+    ASSERT_EQ(200, request("POST", "/api/v1/system/autolist/check", g_buf, sizeof(g_buf)));
+    cJSON *st = wait_status(check_done, NULL);
+    ASSERT_EQm("the failure was injected", 0, __atomic_load_n(&g_sync_fails, __ATOMIC_ACQUIRE));
+    syncs_back_to_normal();
+    ASSERT_STR_EQ("open", str_of(result_of(st, "www.up.example"), "verdict"));
+    ASSERT_EQ(0, (int)num_of(st, "switchedOff"));
+    ASSERT_STR_EQ("added", str_of(candidate(st, "up.example"), "state"));
+    cJSON_Delete(st);
+    rig_stop_loop(&r);
+    ASSERT(rule_of(r.app, "up.example")->enable);
+    ASSERT_STR_EQ("www.up.example", rule_of(r.app, "up.example")->autolist);
+    rig_down(&r);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2566,6 +2640,8 @@ int main(int argc, char **argv) {
     RUN_TEST(covering_groups_stop_at_32_with_the_target_first);
     RUN_TEST(freeze_probe_makes_candidate);
     RUN_TEST(recheck_open_switches_off_keeps_marker);
+    RUN_TEST(an_add_whose_sync_fails_leaves_no_rule_and_the_candidate_as_it_was);
+    RUN_TEST(a_switch_off_whose_sync_fails_leaves_the_rule_on);
     RUN_TEST(recheck_short_keeps_freeze_rule);
     RUN_TEST(check_iface_in_group_is_refused);
     RUN_TEST(recheck_rotates_past_32_rules);
