@@ -161,7 +161,7 @@ describe("a group's live state", () => {
     assert.strictEqual(failing.error, "iptables-restore: line 56 failed");
     assert.strictEqual(failing.footer, true);
 
-    const bare = liveTooltip("not-written", { iface: "wg0", netfilter: { ok: true } }, t, clock);
+    const bare = liveTooltip("not-written", { iface: "wg0", netfilter: { ok: false } }, t, clock);
     assert.strictEqual(bare.title, "Rules are being rewritten");
     assert.ok(bare.lines[0].startsWith("The router is not accepting firc's rules"), bare.lines[0]);
     assert.ok(!bare.lines[0].includes("@"), "no time without since");
@@ -169,6 +169,18 @@ describe("a group's live state", () => {
 
     const unknown = liveTooltip("not-written", { iface: "wg0" }, t, clock);
     assert.ok(unknown.lines[0].startsWith("The router is not accepting firc's rules"));
+  });
+
+  // Catches a group whose subnet set failed told that the router refuses firc's rules.
+  it("blames the subnet list when the tables are written", () => {
+    const set = liveTooltip("not-written", { iface: "wg0", netfilter: { ok: true } }, t, clock);
+    assert.strictEqual(set.title, "The subnet list is not written");
+    assert.deepStrictEqual(set.lines, [
+      "The router has not accepted the group's subnet list, and the daemon keeps rewriting it by itself: after a second, then less often, up to once a minute.",
+      "Until it passes, the group's subnets route by the previous list. If there is none, the group is not in the router's rules: its subnets go direct and its sites do not open. If it lasts longer than a minute, open the Journal.",
+    ]);
+    assert.strictEqual(set.error, undefined);
+    assert.strictEqual(set.footer, true);
   });
 
   // Catches a first write after start read as a failure, or hiding its error when it also fails.

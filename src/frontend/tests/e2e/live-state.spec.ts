@@ -191,6 +191,25 @@ test.describe("A group's live state", () => {
     await expect(page.getByRole("tooltip")).toContainText("First write of the rules since start");
   });
 
+  // Catches a failed subnet set explained as the router refusing firc's rules.
+  test("a not-written group with the tables written names its subnet list", async ({ page }) => {
+    const daemon = await setup(page);
+    daemon.netfilter = { ok: true };
+    const tele2 = await statusOf(page, "Tele2");
+    await expect
+      .poll(
+        async () => {
+          await page.mouse.move(0, 0);
+          await tele2.hover();
+          return page.getByRole("tooltip").textContent();
+        },
+        { timeout: 8000 },
+      )
+      .toContain("The subnet list is not written");
+    await expect(page.getByRole("tooltip")).toContainText("route by the previous list");
+    await expect(page.getByRole("tooltip")).not.toContainText("Rules are being rewritten");
+  });
+
   // Catches stale green icons staying up while the daemon is silent, or not recovering.
   test("a daemon that stops answering greys every icon until it answers", async ({ page }) => {
     await page.clock.install();

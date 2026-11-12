@@ -211,6 +211,20 @@ export function liveTooltip(
           footer: true,
         };
       }
+      if (nf?.ok === true) {
+        return {
+          title: t("The subnet list is not written"),
+          lines: [
+            t(
+              "The router has not accepted the group's subnet list, and the daemon keeps rewriting it by itself: after a second, then less often, up to once a minute.",
+            ),
+            t(
+              "Until it passes, the group's subnets route by the previous list. If there is none, the group is not in the router's rules: its subnets go direct and its sites do not open. If it lasts longer than a minute, open the Journal.",
+            ),
+          ],
+          footer: true,
+        };
+      }
       const since = nf?.since;
       const first =
         since !== undefined
