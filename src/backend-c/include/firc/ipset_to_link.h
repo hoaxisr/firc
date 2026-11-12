@@ -101,11 +101,33 @@ typedef struct firc_nf_prefixes {
     size_t n;
 } firc_nf_prefixes_t;
 
+#define FIRC_SET_NAME_MAX 32
+
+typedef struct firc_nf_print {
+    size_t n;
+    uint64_t hash;
+} firc_nf_print_t;
+
 /* The prefixes of the subnets, proto and ports dropped; out is overwritten, FIRC_ERR_NOMEM leaves it empty. */
 firc_err_t firc_nf_prefixes_of(const firc_ipv4_subnet_t *v4, size_t n4, const firc_ipv6_subnet_t *v6, size_t n6,
                                firc_nf_prefixes_t *out);
 /* firc_nf_prefixes_of the subnets set_subnets last took. */
 firc_err_t firc_ipset_to_link_prefixes(const firc_ipset_to_link_t *l, firc_nf_prefixes_t *out);
+/* True for a rule with no protocol and a length of at least 1: what a hash:net member can say. */
+bool firc_subnet4_is_bare(const firc_ipv4_subnet_t *s);
+bool firc_subnet6_is_bare(const firc_ipv6_subnet_t *s);
+/* The print of the bare prefixes of family 4 or 6, taken when set_subnets stored them; n 0 when none. */
+firc_nf_print_t firc_ipset_to_link_bare_print(const firc_ipset_to_link_t *l, uint8_t family);
+/* Test seam: how many times firc_ipset_to_link_bare built a list. */
+size_t firc_ipset_to_link_bare_builds_for_test(void);
+/* The bare prefixes of one family (4 or 6), sorted and unique; out overwritten, free with firc_nf_prefixes_clear. */
+firc_err_t firc_ipset_to_link_bare(const firc_ipset_to_link_t *l, uint8_t family, firc_nf_prefixes_t *out);
+/* The count and an FNV-1a 64 over each member's cidr byte then its address bytes, in list order. */
+firc_nf_print_t firc_nf_prefixes_print(const firc_nf_prefixes_t *p);
+/* "<chain>S4" or "<chain>T6" (scratch); FIRC_ERR_INVAL if family is not 4 or 6 or the name does not fit cap. */
+firc_err_t firc_ipset_to_link_set_name_of(const char *chain, uint8_t family, bool scratch, char *out, size_t cap);
+/* The chain name the link was made with. */
+const char *firc_ipset_to_link_chain(const firc_ipset_to_link_t *l);
 /* Whether a prefix of `was` is covered by no prefix of `now` in its family. */
 bool firc_nf_prefixes_narrow(const firc_nf_prefixes_t *was, const firc_nf_prefixes_t *now);
 /* Prefixes of was not covered by now (same family rules as firc_nf_prefixes_narrow); out overwritten. */
@@ -131,7 +153,7 @@ const firc_nf_devices_t *firc_ipset_to_link_devices(const firc_ipset_to_link_t *
 /* Test seam: stages the rules as a rebuild would, without enable. */
 firc_err_t firc_ipset_to_link_stage_for_test(firc_ipset_to_link_t *l);
 
-/* One MARK and one CONNMARK per prefix of the engine's family. */
+/* For the engine's family: one MARK and CONNMARK on the set <chain>S4|S6 when a bare prefix exists, then one per other prefix. */
 firc_err_t firc_ipset_to_link_build_subnet_rules(firc_ipt_t *ipt, const char *chain_name,
                                                  uint32_t mark, const firc_ipv4_subnet_t *v4,
                                                  size_t n4, const firc_ipv6_subnet_t *v6,

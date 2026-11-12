@@ -24,6 +24,7 @@
 #include "firc/ptr.h"
 #include "firc/conntrack.h"
 #include "firc/rtnl.h"
+#include "firc/setnl.h"
 #include "firc/ruleset.h"
 #include "firc/settings.h"
 #include "firc/stale_marks.h"
@@ -45,6 +46,7 @@ typedef struct firc_app_deps {
     firc_ipt_t *ipt6;
     firc_rtnl_t *rtnl;
     firc_ct_t *ct; /* optional */
+    firc_setnl_t *sets; /* nullable; without it a group with bare prefixes is left out */
     firc_dns_pipeline_t *pipeline;
     firc_fakeip_t *pool; /* nullable; without it the group logs its table unprotected */
     firc_loop_t *loop; /* nullable; without it a completed pass reports synchronously */
@@ -173,6 +175,7 @@ firc_err_t firc_app_move_group(firc_app_t *app, firc_id_t id, size_t to, bool bl
 /* retries every group whose enable failed and is due, spaced 1s to 60s; true if one came up; no-op if not running */
 bool firc_app_retry_groups(firc_app_t *app, const char *iface);
 bool firc_app_retry_timer_for_test(const firc_app_t *app, uint64_t *delay_ms); /* test seam */
+bool firc_app_set_retry_armed_for_test(const firc_app_t *app); /* test seam */
 #define FIRC_APP_RETRY_MIN_MS 1000u
 #define FIRC_APP_RETRY_MAX_MS 60000u
 

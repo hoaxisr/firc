@@ -103,6 +103,7 @@ struct daemon {
     firc_fakeip_t *pool;
     firc_nl_watcher_t *watcher;
     firc_ct_t *ct;
+    firc_setnl_t *sets;
     firc_stable_fields_t fields;
     /* Debounced interface refresh; more than 8 distinct names falls back to refreshing every group. */
     char refresh_ifaces[8][IF_NAMESIZE];
@@ -353,6 +354,8 @@ static void daemon_teardown(struct daemon *d)
 
     firc_app_destroy(d->app);
     d->app = NULL;
+    firc_setnl_free(d->sets);
+    d->sets = NULL;
 
     /* Pool-reject routes stay on a clean stop: clients keep fake answers up to the TTL clamp; a restart adopts them. */
     /* Saved as exact only if the loop ran: a failed startup has nothing truer than the file. */
@@ -1002,6 +1005,26 @@ static firc_ipt_t *open_engine(firc_ipt_proto_t fam, bool purge, const char *pre
     return ipt;
 }
 
+static firc_setnl_t *open_sets(void)
+{
+    firc_setnl_t *s = NULL;
+    firc_err_t err = firc_setnl_new(&s);
+    if (err != FIRC_OK) {
+        FIRC_WARN("cannot open ip_set netlink (%s): groups with a subnet rule naming no protocol are left out", firc_err_str(err));
+        return NULL;
+    }
+    firc_setnl_caps_t caps;
+    err = firc_setnl_probe(s, &caps);
+    if (err == FIRC_ERR_NOSYS) {
+        FIRC_WARN("this kernel has no ip_set: groups with a subnet rule naming no protocol are left out");
+    } else if (err != FIRC_OK) {
+        FIRC_WARN("ip_set did not answer its probe (%s): groups with a subnet rule naming no protocol may be left out", firc_err_str(err));
+    } else if (!caps.has_type) {
+        FIRC_WARN("this kernel has no hash:net set: groups with a subnet rule naming no protocol are left out");
+    }
+    return s;
+}
+
 int main(int argc, char **argv)
 {
     /* init pipes stdout into logger: a dead reader must cost a dropped line, not the daemon. */
@@ -1184,13 +1207,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    d.sets = open_sets();
+
     if (purge) {
         d.rtnl = firc_rtnl_open();
         if (d.rtnl == NULL) { FIRC_WARN("purge: rtnetlink not available"); }
         firc_purge_paths_t paths = {.pool_file = FIRC_POOL_STATE_PATH, .fields_file = FIRC_FIELDS_STATE_PATH,
                                     .sock = FIRC_SOCK_PATH, .lock = FIRC_INSTANCE_LOCK_PATH, .run_dir = FIRC_APP_RUN_DIR};
         firc_purge_report_t report;
-        err = firc_purge(d.ipt4, d.ipt6, d.rtnl, cfg.app.netfilter.iptables.chain_prefix, &paths, &report);
+        err = firc_purge(d.ipt4, d.ipt6, d.rtnl, d.sets, cfg.app.netfilter.iptables.chain_prefix, &paths, &report);
         daemon_teardown(&d);
         firc_config_clear(&cfg);
         return err == FIRC_OK ? 0 : 1;
@@ -1243,6 +1268,7 @@ int main(int argc, char **argv)
         firc_config_clear(&cfg);
         return 1;
     }
+    (void)firc_purge_sets(d.sets, cfg.app.netfilter.iptables.chain_prefix, NULL);
     /* Without conntrack every flush is a no-op, not an error. */
     d.ct = firc_ct_open();
     if (d.ct == NULL) {
@@ -1492,6 +1518,7 @@ int main(int argc, char **argv)
         .ipt6 = d.ipt6,
         .rtnl = d.rtnl,
         .ct = d.ct,
+        .sets = d.sets,
         .pool = d.pool,
         .loop = d.loop,
         .proxy = d.proxy,

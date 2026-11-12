@@ -28,6 +28,9 @@ uint8_t *firc_test_xt_raw(const char *name, firc_ipt_proto_t fam, size_t *len);
 bool firc_test_xt_to_host(firc_ipt_proto_t fam, uint8_t *blob, uint32_t size);
 char *firc_test_xt_read_text(const char *name, firc_ipt_proto_t fam);
 char *firc_test_xt_print(firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info, const uint8_t *blob);
+typedef bool (*firc_test_xt_namer_fn)(void *ud, uint16_t index, char *out);
+char *firc_test_xt_print_named(firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info, const uint8_t *blob,
+                               firc_test_xt_namer_fn namer, void *namer_ud);
 void firc_test_xt_zero_kernel_fields(firc_ipt_proto_t fam, uint8_t *blob, uint32_t size);
 bool firc_test_xt_same(firc_ipt_proto_t fam, const firc_xt_info_t *ai, const uint8_t *a,
                        const firc_xt_info_t *bi, const uint8_t *b);

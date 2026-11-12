@@ -58,6 +58,7 @@ netns() {
         [ "$i" -lt 100 ] || fail "a namespace never appeared"
         sleep 0.05
     done
+    nsenter -t "$p" -n sysctl -qw net.ipv4.conf.all.arp_ignore=0 net.ipv4.conf.default.arp_ignore=0
     echo "$p"
 }
 in_ns() {

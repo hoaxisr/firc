@@ -264,6 +264,7 @@ TEST a_missing_revision_is_named_and_fails_only_its_rules(void) {
     firc_test_stage_t *s = firc_test_stage_new();
     firc_test_stage_fixture(s, "firmware-firc", FIRC_IPT_PROTO_IPV4);
     ASSERT_EQ_FMT(FIRC_ERR_IO, firc_xt_commit(xt, "nat", &s->stage, NULL), "%d");
+    ASSERT_EQ_FMT(0, firc_xt_refusal(xt), "%d");
     ASSERT_EQ_FMT((size_t)0, firc_fake_xt_replaces(f), "%zu");
     firc_test_stage_t *sweep = firc_test_stage_new();
     firc_test_stage_fixture(sweep, "sweep", FIRC_IPT_PROTO_IPV4);
@@ -514,6 +515,7 @@ TEST the_probe_asks_every_extension_after_an_unknown_errno(void) {
     firc_test_stage_t *s = firc_test_stage_new();
     firc_test_stage_fixture(s, "firmware-firc", FIRC_IPT_PROTO_IPV4);
     ASSERT_EQ_FMT(FIRC_ERR_IO, firc_xt_commit(xt, "nat", &s->stage, NULL), "%d");
+    ASSERT_EQ_FMT(0, firc_xt_refusal(xt), "%d");
     firc_test_stage_free(s);
     firc_xt_free(xt);
     firc_fake_xt_free(f);
@@ -1062,6 +1064,7 @@ TEST the_barrier_needs_connmark_revision_one(void) {
         firc_test_stage_t *st = firc_test_stage_new();
         firc_test_stage_rules_file(st, "f-firc", k_fams[i]);
         ASSERT_EQ_FMT(FIRC_ERR_IO, firc_xt_commit(xt, "filter", &st->stage, NULL), "%d");
+        ASSERT_EQ_FMT(0, firc_xt_refusal(xt), "%d");
         ASSERT_EQ_FMT((size_t)0, firc_fake_xt_replaces(f), "%zu");
         char *text = log_stop();
         ASSERT_EQ_FMTm(text, (size_t)1, count(text, "match connmark revision 1 (ENOENT): connmark rules cannot be written"), "%zu");
@@ -1133,6 +1136,332 @@ TEST the_fake_checks_protocols(void) {
     PASS();
 }
 
+static bool host_is_little(void) {
+    const uint16_t one = 1;
+    uint8_t first;
+    memcpy(&first, &one, 1);
+    return first == 1;
+}
+
+static void dst_payload(uint8_t index, uint8_t out[4]) {
+    out[0] = host_is_little() ? index : 0;
+    out[1] = host_is_little() ? 0 : index;
+    out[2] = 1;
+    out[3] = 0;
+}
+
+static firc_err_t commit_set_lines(firc_xt_t *xt, const char *chain, const char *const *lines, size_t n, bool as_block) {
+    firc_test_stage_t *s = firc_test_stage_new();
+    firc_xt_block_t b;
+    firc_xt_block_init(&b);
+    if (as_block) {
+        for (size_t i = 0; i < n; i++) {
+            firc_ipt_rule_t *r = firc_test_rule(lines[i]);
+            if (firc_xt_block_add_rule(&b, firc_xt_proto(xt), r) != FIRC_OK) { abort(); }
+            firc_ipt_rule_free(r);
+        }
+        firc_test_stage_block(s, chain, &b);
+    } else {
+        firc_test_stage_override(s, chain, lines, n);
+    }
+    firc_err_t err = firc_xt_commit(xt, "mangle", &s->stage, NULL);
+    firc_test_stage_free(s);
+    firc_xt_block_free(&b);
+    return err;
+}
+
+static uint32_t kernel_rule_at(firc_fake_xt_t *f, firc_ipt_proto_t fam, const char *chain, size_t i, uint8_t *out,
+                               size_t *n_rules, int32_t *index) {
+    firc_xt_info_t info;
+    uint8_t *blob = NULL;
+    uint32_t len = 0;
+    *n_rules = 0;
+    *index = -1;
+    if (!firc_fake_xt_blob(f, "mangle", &info, &blob)) { return 0; }
+    firc_xt_table_t t;
+    const char *why = NULL;
+    if (firc_xt_parse(fam, &info, blob, &t, &why) == FIRC_OK) {
+        firc_xt_chain_t *c = firc_xt_find_chain(&t, chain);
+        if (c != NULL) { *n_rules = c->n_rules; }
+        if (c != NULL && i < c->n_rules && c->rules[i].len <= 512) {
+            len = c->rules[i].len;
+            memcpy(out, c->rules[i].bytes, len);
+            *index = c->rules[i].old_index;
+        }
+        firc_xt_table_clear(&t);
+    }
+    free(blob);
+    return len;
+}
+
+static uint32_t kernel_rule(firc_fake_xt_t *f, firc_ipt_proto_t fam, const char *chain, size_t i, uint8_t *out,
+                            size_t *n_rules) {
+    int32_t index;
+    return kernel_rule_at(f, fam, chain, i, out, n_rules, &index);
+}
+
+TEST a_set_match_encodes_revision_1_dim_1_dst(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+    for (size_t f = 0; f < 2; f++) {
+        uint32_t eh = f == 0 ? 112u : 168u;
+        firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+        firc_fake_xt_set(k, "fircAS4", 7);
+        firc_xt_t *xt = firc_fake_xt_handle(k);
+        ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, true), "%d");
+        ASSERT_EQ_FMT((size_t)1, firc_fake_xt_replaces(k), "%zu");
+        uint8_t e[512];
+        size_t n = 0;
+        ASSERT_EQ_FMT(eh + 80u, kernel_rule(k, k_fams[f], "FIRC_s", 0, e, &n), "%u");
+        uint16_t size = 0, toff = 0;
+        memcpy(&size, e + eh, 2);
+        memcpy(&toff, e + (f == 0 ? 88 : 140), 2);
+        ASSERT_EQ_FMT(40u, (unsigned)size, "%u");
+        ASSERT_EQ_FMT(eh + 40u, (unsigned)toff, "%u");
+        ASSERT_STR_EQ("set", (const char *)e + eh + 2);
+        ASSERT_EQ_FMT(1u, (unsigned)e[eh + 31], "%u");
+        uint8_t want[8] = {0};
+        dst_payload(7, want);
+        ASSERT_MEM_EQ(want, e + eh + 32, 8);
+        firc_xt_free(xt);
+        firc_fake_xt_free(k);
+    }
+    PASS();
+}
+
+TEST a_missing_set_refuses_the_table_with_enoent(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+    for (size_t f = 0; f < 2; f++) {
+        for (int as_block = 0; as_block < 2; as_block++) {
+            firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+            firc_fake_xt_set(k, "fircOther", 3);
+            firc_xt_info_t bi, ai;
+            uint8_t *before = NULL, *after = NULL;
+            ASSERT(firc_fake_xt_blob(k, "mangle", &bi, &before));
+            firc_xt_t *xt = firc_fake_xt_handle(k);
+            ASSERT_EQ_FMT(FIRC_ERR_IO, commit_set_lines(xt, "FIRC_s", line, 1, as_block != 0), "%d");
+            ASSERT_EQ_FMT(ENOENT, firc_xt_refusal(xt), "%d");
+            ASSERT_EQ_FMT((size_t)0, firc_fake_xt_replaces(k), "%zu");
+            ASSERT(firc_fake_xt_blob(k, "mangle", &ai, &after));
+            ASSERT(firc_test_xt_same(k_fams[f], &bi, before, &ai, after));
+            free(before);
+            free(after);
+            firc_xt_free(xt);
+            firc_fake_xt_free(k);
+        }
+    }
+    PASS();
+}
+
+TEST a_kernel_without_the_set_match_refuses_with_enoent(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+    firc_fake_xt_t *k = firc_fake_xt_new(FIRC_IPT_PROTO_IPV4);
+    firc_fake_xt_set(k, "fircAS4", 7);
+    firc_fake_xt_lack(k, false, "set", 1);
+    firc_xt_t *xt = firc_fake_xt_handle(k);
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_probe(xt), "%d");
+    ASSERT_EQ_FMT(FIRC_ERR_IO, commit_set_lines(xt, "FIRC_s", line, 1, true), "%d");
+    ASSERT_EQ_FMT(ENOENT, firc_xt_refusal(xt), "%d");
+    ASSERT_EQ_FMT((size_t)0, firc_fake_xt_replaces(k), "%zu");
+    firc_xt_free(xt);
+    firc_fake_xt_free(k);
+    PASS();
+}
+
+TEST a_kernel_without_ipset_refuses_with_enoent(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+    static const struct { int asked, refusal; } cases[] = {{ENOPROTOOPT, ENOENT}, {EPERM, EPERM}};
+    for (size_t i = 0; i < 2; i++) {
+        firc_fake_xt_t *k = firc_fake_xt_new(FIRC_IPT_PROTO_IPV4);
+        firc_fake_xt_set(k, "fircAS4", 7);
+        firc_fake_xt_fail_sets(k, cases[i].asked);
+        firc_xt_t *xt = firc_fake_xt_handle(k);
+        ASSERT_EQ_FMT(FIRC_ERR_IO, commit_set_lines(xt, "FIRC_s", line, 1, true), "%d");
+        ASSERT_EQ_FMT(cases[i].refusal, firc_xt_refusal(xt), "%d");
+        ASSERT_EQ_FMT((size_t)0, firc_fake_xt_replaces(k), "%zu");
+        firc_xt_free(xt);
+        firc_fake_xt_free(k);
+    }
+    PASS();
+}
+
+TEST a_set_that_moved_index_rewrites_the_rule(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+    for (size_t f = 0; f < 2; f++) {
+        for (int as_block = 0; as_block < 2; as_block++) {
+            uint32_t eh = f == 0 ? 112u : 168u;
+            firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+            firc_fake_xt_set(k, "fircAS4", 7);
+            firc_xt_t *xt = firc_fake_xt_handle(k);
+            ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, as_block != 0), "%d");
+            firc_fake_xt_set(k, "fircAS4", 9);
+            firc_fake_xt_set_counters(k, "mangle", 100);
+            ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, as_block != 0), "%d");
+            ASSERT_EQ_FMT((size_t)2, firc_fake_xt_replaces(k), "%zu");
+            uint8_t e[512], want[4];
+            size_t n = 0;
+            int32_t at = -1;
+            ASSERT_EQ_FMT(eh + 80u, kernel_rule_at(k, k_fams[f], "FIRC_s", 0, e, &n, &at), "%u");
+            ASSERT_EQ_FMT((size_t)1, n, "%zu");
+            firc_xt_counter_t c;
+            ASSERT(at >= 0 && firc_fake_xt_counter(k, "mangle", (uint32_t)at, &c));
+            ASSERT_EQ_FMT(100u + (unsigned)at, (unsigned)c.pcnt, "%u");
+            dst_payload(9, want);
+            ASSERT_MEM_EQ(want, e + eh + 32, 4);
+            ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, as_block != 0), "%d");
+            ASSERT_EQ_FMT((size_t)2, firc_fake_xt_replaces(k), "%zu");
+            firc_xt_free(xt);
+            firc_fake_xt_free(k);
+        }
+    }
+    PASS();
+}
+
+TEST two_rules_on_one_set_ask_for_its_index_once(void) {
+    static const char *const lines[] = {
+        "-m set --match-set fircA dst -j RETURN",
+        "-m set --match-set fircB dst -j RETURN",
+        "-p tcp --dport 53 -m set --match-set fircA dst -j RETURN",
+    };
+    firc_fake_xt_t *k = firc_fake_xt_new(FIRC_IPT_PROTO_IPV4);
+    firc_fake_xt_set(k, "fircA", 7);
+    firc_fake_xt_set(k, "fircB", 8);
+    firc_xt_t *xt = firc_fake_xt_handle(k);
+    ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", lines, 3, true), "%d");
+    ASSERT_EQ_FMT((size_t)2, firc_fake_xt_set_asks(k), "%zu");
+    uint8_t e[512], want[4];
+    size_t n = 0;
+    ASSERT(kernel_rule(k, FIRC_IPT_PROTO_IPV4, "FIRC_s", 0, e, &n) > 0);
+    dst_payload(7, want);
+    ASSERT_MEM_EQ(want, e + 112 + 32, 4);
+    ASSERT(kernel_rule(k, FIRC_IPT_PROTO_IPV4, "FIRC_s", 1, e, &n) > 0);
+    dst_payload(8, want);
+    ASSERT_MEM_EQ(want, e + 112 + 32, 4);
+    ASSERT(kernel_rule(k, FIRC_IPT_PROTO_IPV4, "FIRC_s", 2, e, &n) > 0);
+    dst_payload(7, want);
+    ASSERT_MEM_EQ(want, e + 112 + 48 + 32, 4);
+    firc_xt_free(xt);
+    firc_fake_xt_free(k);
+    PASS();
+}
+
+static uint32_t foreign_set_entry(firc_ipt_proto_t fam, uint8_t rev, uint8_t index, uint8_t *out) {
+    uint32_t eh = fam == FIRC_IPT_PROTO_IPV4 ? 112u : 168u;
+    uint16_t msize = rev == 4 ? 80 : 40, tsize = 40;
+    uint16_t toff = (uint16_t)(eh + msize), next = (uint16_t)(toff + tsize);
+    memset(out, 0, next);
+    memcpy(out + (fam == FIRC_IPT_PROTO_IPV4 ? 88 : 140), &toff, 2);
+    memcpy(out + (fam == FIRC_IPT_PROTO_IPV4 ? 90 : 142), &next, 2);
+    memcpy(out + eh, &msize, 2);
+    memcpy(out + eh + 2, "set", 3);
+    out[eh + 31] = rev;
+    dst_payload(index, out + eh + 32);
+    memcpy(out + toff, &tsize, 2);
+    int32_t ret = -5;
+    memcpy(out + toff + 32, &ret, 4);
+    return next;
+}
+
+static firc_err_t commit_raw(firc_xt_t *xt, const char *chain, const uint8_t *bytes, uint32_t len) {
+    firc_xt_block_t fb;
+    firc_xt_block_init(&fb);
+    fb.fam = firc_xt_proto(xt);
+    fb.bytes = (uint8_t *)bytes;
+    fb.len = len;
+    fb.n = 1;
+    firc_test_stage_t *s = firc_test_stage_new();
+    firc_test_stage_block(s, chain, &fb);
+    firc_err_t err = firc_xt_commit(xt, "mangle", &s->stage, NULL);
+    firc_test_stage_free(s);
+    return err;
+}
+
+TEST a_foreign_set_match_of_revision_4_survives_a_commit(void) {
+    for (size_t f = 0; f < 2; f++) {
+        uint32_t eh = f == 0 ? 112u : 168u;
+        uint8_t foreign[512];
+        uint32_t len = foreign_set_entry(k_fams[f], 4, 5, foreign);
+        ASSERT_EQ_FMT(eh + 80u + 40u, len, "%u");
+        firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+        firc_fake_xt_set(k, "fwset", 5);
+        firc_fake_xt_set(k, "fircAS4", 7);
+        firc_xt_t *xt = firc_fake_xt_handle(k);
+        ASSERT_EQ_FMT(FIRC_OK, commit_raw(xt, "fw_set", foreign, len), "%d");
+        static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN"};
+        ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, true), "%d");
+        ASSERT_EQ_FMT((size_t)2, firc_fake_xt_replaces(k), "%zu");
+        uint8_t e[512];
+        size_t n = 0;
+        ASSERT_EQ_FMT(len, kernel_rule(k, k_fams[f], "fw_set", 0, e, &n), "%u");
+        ASSERT_MEM_EQ(foreign, e, len);
+        firc_xt_free(xt);
+        firc_fake_xt_free(k);
+    }
+    PASS();
+}
+
+TEST a_patch_carrying_a_set_match_is_refused(void) {
+    static const char *const lines[] = {"-m set --match-set fircA dst -j RETURN", "-m set --match-set fwset dst -j RETURN"};
+    const firc_ipt_option_t op[] = {FIRC_IPT_OP_APPEND};
+    const int num[] = {0};
+    for (size_t f = 0; f < 2; f++) {
+        for (size_t l = 0; l < 2; l++) {
+            firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+            firc_fake_xt_set(k, "fwset", 5);
+            firc_fake_xt_set(k, "fircA", 7);
+            firc_xt_t *xt = firc_fake_xt_handle(k);
+            uint8_t foreign[512];
+            uint32_t len = foreign_set_entry(k_fams[f], 1, 5, foreign);
+            ASSERT_EQ_FMT(FIRC_OK, commit_raw(xt, "PREROUTING", foreign, len), "%d");
+            size_t replaces = firc_fake_xt_replaces(k);
+            firc_xt_info_t bi, ai;
+            uint8_t *before = NULL, *after = NULL;
+            ASSERT(firc_fake_xt_blob(k, "mangle", &bi, &before));
+            firc_test_stage_t *s = firc_test_stage_new();
+            firc_test_stage_patch(s, "PREROUTING", 1, op, num, lines + l);
+            ASSERT_EQ_FMT(FIRC_ERR_INVAL, firc_xt_commit(xt, "mangle", &s->stage, NULL), "%d");
+            ASSERT_EQ_FMT(0, firc_xt_refusal(xt), "%d");
+            firc_test_stage_free(s);
+            ASSERT_EQ_FMT(replaces, firc_fake_xt_replaces(k), "%zu");
+            ASSERT(firc_fake_xt_blob(k, "mangle", &ai, &after));
+            ASSERT(firc_test_xt_same(k_fams[f], &bi, before, &ai, after));
+            uint8_t e[512];
+            size_t n = 0;
+            ASSERT_EQ_FMT(len, kernel_rule(k, k_fams[f], "PREROUTING", 0, e, &n), "%u");
+            ASSERT_EQ_FMT((size_t)1, n, "%zu");
+            ASSERT_MEM_EQ(foreign, e, len);
+            free(before);
+            free(after);
+            firc_xt_free(xt);
+            firc_fake_xt_free(k);
+        }
+    }
+    PASS();
+}
+
+TEST a_set_dropped_between_commits_refuses_the_next(void) {
+    static const char *const line[] = {"-m set --match-set fircAS4 dst -j RETURN", "-m mark --mark 1 -j RETURN"};
+    for (size_t f = 0; f < 2; f++) {
+        firc_fake_xt_t *k = firc_fake_xt_new(k_fams[f]);
+        firc_fake_xt_set(k, "fircAS4", 7);
+        firc_xt_t *xt = firc_fake_xt_handle(k);
+        ASSERT_EQ_FMT(FIRC_OK, commit_set_lines(xt, "FIRC_s", line, 1, true), "%d");
+        firc_fake_xt_set_drop(k, "fircAS4");
+        firc_xt_info_t bi, ai;
+        uint8_t *before = NULL, *after = NULL;
+        ASSERT(firc_fake_xt_blob(k, "mangle", &bi, &before));
+        ASSERT_EQ_FMT(FIRC_ERR_IO, commit_set_lines(xt, "FIRC_s", line, 2, true), "%d");
+        ASSERT_EQ_FMT(ENOENT, firc_xt_refusal(xt), "%d");
+        ASSERT_EQ_FMT((size_t)1, firc_fake_xt_replaces(k), "%zu");
+        ASSERT(firc_fake_xt_blob(k, "mangle", &ai, &after));
+        ASSERT(firc_test_xt_same(k_fams[f], &bi, before, &ai, after));
+        free(before);
+        free(after);
+        firc_xt_free(xt);
+        firc_fake_xt_free(k);
+    }
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -1180,5 +1509,14 @@ int main(int argc, char **argv) {
     RUN_TEST(the_read_hook_names_the_table);
     RUN_TEST(the_fake_knows_its_extensions);
     RUN_TEST(the_fake_checks_protocols);
+    RUN_TEST(a_set_match_encodes_revision_1_dim_1_dst);
+    RUN_TEST(a_missing_set_refuses_the_table_with_enoent);
+    RUN_TEST(a_kernel_without_the_set_match_refuses_with_enoent);
+    RUN_TEST(a_kernel_without_ipset_refuses_with_enoent);
+    RUN_TEST(a_set_that_moved_index_rewrites_the_rule);
+    RUN_TEST(two_rules_on_one_set_ask_for_its_index_once);
+    RUN_TEST(a_foreign_set_match_of_revision_4_survives_a_commit);
+    RUN_TEST(a_patch_carrying_a_set_match_is_refused);
+    RUN_TEST(a_set_dropped_between_commits_refuses_the_next);
     GREATEST_MAIN_END();
 }

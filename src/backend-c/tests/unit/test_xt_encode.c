@@ -7,11 +7,13 @@
 #include "xt_golden.h"
 #include "../../src/xtables/xt_internal.h"
 
+static char g_set[FIRC_XT_NAME_LEN];
+
 static const firc_ipt_proto_t k_fams[] = {FIRC_IPT_PROTO_IPV4, FIRC_IPT_PROTO_IPV6};
 
 static firc_err_t enc(firc_ipt_proto_t fam, const char *line, firc_xt_entry_t *e, uint32_t *exts) {
     firc_ipt_rule_t *r = firc_test_rule(line);
-    firc_err_t err = firc_xt_encode(fam, 0, r, e, exts);
+    firc_err_t err = firc_xt_encode(fam, 0, r, e, exts, g_set);
     firc_ipt_rule_free(r);
     return err;
 }
@@ -76,7 +78,7 @@ static enum greatest_test_res rules_encode_as_golden(const char *fixture, firc_i
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMTm(line, FIRC_OK, firc_xt_encode(fam, 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMTm(line, FIRC_OK, firc_xt_encode(fam, 0, r, &e, &exts, g_set), "%d");
         ASSERTm(line, firc_xt_entry_same(fam, &e, &c->rules[rules[i].idx]));
         ASSERT_EQ_FMTm(line, rules[i].exts, exts, "%u");
         firc_xt_entry_clear(&e);
@@ -102,7 +104,7 @@ static enum greatest_test_res refused(firc_ipt_proto_t fam, const char *line) {
     firc_xt_entry_t e;
     memset(&e, 0, sizeof(e));
     uint32_t exts = 0;
-    ASSERT_EQ_FMTm(line, FIRC_ERR_INVAL, firc_xt_encode(fam, 0, r, &e, &exts), "%d");
+    ASSERT_EQ_FMTm(line, FIRC_ERR_INVAL, firc_xt_encode(fam, 0, r, &e, &exts, g_set), "%d");
     ASSERTm(line, e.bytes == NULL);
     firc_ipt_rule_free(r);
     PASS();
@@ -203,7 +205,7 @@ TEST an_interface_at_the_length_limit_gets_a_full_mask(void) {
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts, g_set), "%d");
         ASSERT_MEM_EQ("abcdefghijklmno\0", e.bytes + at_name[f], 16);
         static const uint8_t full[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                                          0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -242,7 +244,7 @@ TEST a_mark_without_a_mask_matches_every_bit(void) {
     firc_xt_entry_t e;
     memset(&e, 0, sizeof(e));
     uint32_t exts = 0;
-    ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts, g_set), "%d");
     uint32_t mark, mask;
     memcpy(&mark, e.bytes + 112 + 32, 4);
     memcpy(&mask, e.bytes + 112 + 36, 4);
@@ -291,7 +293,7 @@ TEST a_rule_outside_the_vocabulary_is_refused(void) {
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMTm(v4[i], FIRC_ERR_INVAL, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMTm(v4[i], FIRC_ERR_INVAL, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts, g_set), "%d");
         ASSERTm(v4[i], e.bytes == NULL);
         firc_ipt_rule_free(r);
     }
@@ -302,7 +304,7 @@ TEST a_rule_outside_the_vocabulary_is_refused(void) {
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMTm(v6[i], FIRC_ERR_INVAL, firc_xt_encode(FIRC_IPT_PROTO_IPV6, 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMTm(v6[i], FIRC_ERR_INVAL, firc_xt_encode(FIRC_IPT_PROTO_IPV6, 0, r, &e, &exts, g_set), "%d");
         ASSERTm(v6[i], e.bytes == NULL);
         firc_ipt_rule_free(r);
     }
@@ -349,7 +351,7 @@ TEST the_probe_list_names_what_the_encoder_writes(void) {
             firc_xt_entry_t e;
             memset(&e, 0, sizeof(e));
             uint32_t exts = 0;
-            ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts), "%d");
+            ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts, g_set), "%d");
             uint32_t eh = f == 0 ? 112 : 168;
             uint16_t toff;
             memcpy(&toff, e.bytes + (f == 0 ? 88 : 140), 2);
@@ -375,7 +377,7 @@ TEST a_prefix_clears_the_host_bits(void) {
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], 0, r, &e, &exts, g_set), "%d");
         if (f == 0) {
             ASSERT_MEM_EQ(dst4, e.bytes + 4, 4);
             ASSERT_MEM_EQ(dmsk4, e.bytes + 12, 4);
@@ -401,7 +403,7 @@ TEST matches_follow_the_order_of_the_words(void) {
         firc_xt_entry_t e;
         memset(&e, 0, sizeof(e));
         uint32_t exts = 0;
-        ASSERT_EQ_FMTm(cases[i].line, FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts), "%d");
+        ASSERT_EQ_FMTm(cases[i].line, FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, r, &e, &exts, g_set), "%d");
         ASSERT_STR_EQm(cases[i].line, cases[i].first, (const char *)e.bytes + 112 + 2);
         ASSERT_STR_EQm(cases[i].line, cases[i].second, (const char *)e.bytes + 112 + 48 + 2);
         uint16_t toff;
@@ -584,7 +586,7 @@ TEST the_mac_match_takes_the_revision_it_is_given(void) {
             firc_ipt_rule_t *r = firc_test_rule("-m mac ! --mac-source 02:00:00:00:00:0a -j RETURN");
             firc_xt_entry_t e;
             uint32_t exts = 0;
-            ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], rev, r, &e, &exts), "%d");
+            ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(k_fams[f], rev, r, &e, &exts, g_set), "%d");
             uint32_t eh = firc_xt_ehdr(k_fams[f]);
             ASSERT_STR_EQ("mac", (const char *)e.bytes + eh + 2);
             ASSERT_EQ_FMT(rev, e.bytes[eh + 31], "%u");
@@ -594,7 +596,7 @@ TEST the_mac_match_takes_the_revision_it_is_given(void) {
             ASSERT_EQ_FMT(1u, firc_xt_rd32(e.bytes + eh + XT_MATCH_HDR_LEN + 8), "%u");
             ASSERT_EQ_FMT((uint32_t)FIRC_XT_EXT_MAC, exts, "%u");
             firc_xt_entry_clear(&e);
-            ASSERT_EQ_FMT(FIRC_ERR_INVAL, firc_xt_encode(k_fams[f], 2, r, &e, &exts), "%d");
+            ASSERT_EQ_FMT(FIRC_ERR_INVAL, firc_xt_encode(k_fams[f], 2, r, &e, &exts, g_set), "%d");
             ASSERT(e.bytes == NULL);
             firc_ipt_rule_free(r);
         }
@@ -828,7 +830,7 @@ TEST the_capture_values(void) {
     firc_xt_entry_clear(&e);
     const char *spaced[] = {"-m", "string", "--algo", "bm", "--hex-string", "a\\|b|16 03|", "-j", "RETURN"};
     firc_ipt_rule_t *sr = firc_ipt_rule_new(spaced, sizeof(spaced) / sizeof(spaced[0]));
-    ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, sr, &e, &exts), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_encode(FIRC_IPT_PROTO_IPV4, 0, sr, &e, &exts, g_set), "%d");
     firc_ipt_rule_free(sr);
     memcpy(&s, match_named(FIRC_IPT_PROTO_IPV4, &e, "string"), sizeof(s));
     ASSERT_EQ_FMT(5, (int)s.patlen, "%d");
@@ -896,7 +898,7 @@ static void tap_encode(void *ud, unsigned family, const char *const *args, size_
     s->family[s->n] = family;
     s->exts[s->n] = 0;
     s->err[s->n] = firc_xt_encode(family == FIRC_FAM_V6 ? FIRC_IPT_PROTO_IPV6 : FIRC_IPT_PROTO_IPV4, 0, r, &e,
-                                  &s->exts[s->n]);
+                                  &s->exts[s->n], g_set);
     firc_xt_entry_clear(&e);
     s->n++;
     firc_ipt_rule_free(r);
@@ -930,6 +932,102 @@ TEST the_captures_own_rules_encode_in_both_families(void) {
     PASS();
 }
 
+static firc_err_t block_line(firc_xt_block_t *b, firc_ipt_proto_t fam, const char *line) {
+    firc_ipt_rule_t *r = firc_test_rule(line);
+    firc_err_t err = firc_xt_block_add_rule(b, fam, r);
+    firc_ipt_rule_free(r);
+    return err;
+}
+
+TEST a_set_match_keeps_its_place_among_the_matches(void) {
+    for (size_t f = 0; f < 2; f++) {
+        firc_xt_block_t b;
+        firc_xt_block_init(&b);
+        ASSERT_EQ_FMT(FIRC_OK,
+                      block_line(&b, k_fams[f], "-m set --match-set fircAS4 dst -m conntrack --ctdir ORIGINAL -m mark --mark 1 -j RETURN"),
+                      "%d");
+        uint32_t eh = f == 0 ? 112u : 168u;
+        const uint8_t *e = b.bytes;
+        uint16_t size = 0, toff = 0;
+        memcpy(&size, e + eh, 2);
+        ASSERT_EQ_FMT(40u, (unsigned)size, "%u");
+        ASSERT_STR_EQ("set", (const char *)e + eh + 2);
+        ASSERT_EQ_FMT(1u, (unsigned)e[eh + 31], "%u");
+        ASSERT_STR_EQ("conntrack", (const char *)e + eh + 40 + 2);
+        memcpy(&size, e + eh + 40, 2);
+        ASSERT_EQ_FMT(200u, (unsigned)size, "%u");
+        ASSERT_STR_EQ("mark", (const char *)e + eh + 240 + 2);
+        memcpy(&toff, e + (f == 0 ? 88 : 140), 2);
+        ASSERT_EQ_FMT(eh + 288u, (unsigned)toff, "%u");
+        ASSERT_EQ_FMT((size_t)1, b.n_sets, "%zu");
+        ASSERT_EQ_FMT(0u, b.sets[0].entry, "%u");
+        ASSERT_EQ_FMT(eh + 32u, b.sets[0].at, "%u");
+        ASSERT_STR_EQ("fircAS4", b.sets[0].name);
+        static const uint8_t payload[4] = {0, 0, 1, 0};
+        ASSERT_MEM_EQ(payload, e + eh + 32, 4);
+        firc_xt_block_free(&b);
+    }
+    PASS();
+}
+
+TEST a_set_match_after_the_cheap_matches_stays_last(void) {
+    for (size_t f = 0; f < 2; f++) {
+        firc_xt_block_t b;
+        firc_xt_block_init(&b);
+        ASSERT_EQ_FMT(FIRC_OK,
+                      block_line(&b, k_fams[f],
+                                 "-m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -m set "
+                                 "--match-set fircAS4 dst -j RETURN"),
+                      "%d");
+        uint32_t eh = f == 0 ? 112u : 168u;
+        const uint8_t *e = b.bytes;
+        uint16_t size = 0, toff = 0;
+        ASSERT_STR_EQ("conntrack", (const char *)e + eh + 2);
+        memcpy(&size, e + eh, 2);
+        ASSERT_EQ_FMT(200u, (unsigned)size, "%u");
+        ASSERT_STR_EQ("mark", (const char *)e + eh + 200 + 2);
+        memcpy(&size, e + eh + 200, 2);
+        ASSERT_EQ_FMT(48u, (unsigned)size, "%u");
+        ASSERT_STR_EQ("set", (const char *)e + eh + 248 + 2);
+        memcpy(&size, e + eh + 248, 2);
+        ASSERT_EQ_FMT(40u, (unsigned)size, "%u");
+        memcpy(&toff, e + (f == 0 ? 88 : 140), 2);
+        ASSERT_EQ_FMT(eh + 288u, (unsigned)toff, "%u");
+        ASSERT_EQ_FMT((size_t)1, b.n_sets, "%zu");
+        ASSERT_EQ_FMT(eh + 280u, b.sets[0].at, "%u");
+        ASSERT_STR_EQ("fircAS4", b.sets[0].name);
+        static const uint8_t payload[4] = {0, 0, 1, 0};
+        ASSERT_MEM_EQ(payload, e + eh + 280, 4);
+        firc_xt_block_free(&b);
+    }
+    PASS();
+}
+
+TEST a_src_direction_is_refused(void) {
+    static const char *const bad[] = {
+        "-m set --match-set fircAS4 src -j RETURN",
+        "-m set --match-set fircAS4 dst,dst -j RETURN",
+        "-m set --match-set fircAS4 -j RETURN",
+        "-m set ! --match-set fircAS4 dst -j RETURN",
+        "-m set -j RETURN",
+        "-m set --match-set fircAS4 dst --match-set fircAS6 dst -j RETURN",
+        "-m set --match-set fircAS4 dst -m set --match-set fircAS6 dst -j RETURN",
+        "-m set --match-set abcdefghijabcdefghijabcdefghijab dst -j RETURN",
+    };
+    for (size_t f = 0; f < 2; f++) {
+        firc_xt_block_t b;
+        firc_xt_block_init(&b);
+        ASSERT_EQ_FMT(FIRC_OK, block_line(&b, k_fams[f], "-m set --match-set abcdefghijabcdefghijabcdefghija dst -j RETURN"), "%d");
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            ASSERT_EQ_FMTm(bad[i], FIRC_ERR_INVAL, block_line(&b, k_fams[f], bad[i]), "%d");
+        }
+        ASSERT_EQ_FMT((uint32_t)1, b.n, "%u");
+        ASSERT_EQ_FMT((size_t)1, b.n_sets, "%zu");
+        firc_xt_block_free(&b);
+    }
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -956,5 +1054,8 @@ int main(int argc, char **argv) {
     RUN_TEST(the_connmark_match_values);
     RUN_TEST(the_capture_values);
     RUN_TEST(the_captures_own_rules_encode_in_both_families);
+    RUN_TEST(a_set_match_keeps_its_place_among_the_matches);
+    RUN_TEST(a_set_match_after_the_cheap_matches_stays_last);
+    RUN_TEST(a_src_direction_is_refused);
     GREATEST_MAIN_END();
 }

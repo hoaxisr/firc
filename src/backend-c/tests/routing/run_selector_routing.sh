@@ -60,6 +60,7 @@ netns() { # an empty network namespace; prints the pid that holds it
         [ "$i" -lt 100 ] || fail "a namespace never appeared"
         sleep 0.05
     done
+    nsenter -t "$p" -n sysctl -qw net.ipv4.conf.all.arp_ignore=0 net.ipv4.conf.default.arp_ignore=0
     echo "$p"
 }
 in_ns() {
@@ -114,11 +115,18 @@ reset() { # no firc chain, and the firmware's own chain jumped first
         $IPT -t "$t" -F
         $IPT -t "$t" -X
     done
+    "$HELPER" unset FIRCSELS4 || fail "firc-routecheck unset FIRCSELS4"
     $IPT -t mangle -N FW
     $IPT -t mangle -A PREROUTING -j FW
 }
 firc() { # firc's chains for a selector, written by the real builder through x_tables, and the DNAT
-    "$HELPER" devchain 5 "$@" > "$T/devchain" || fail "firc-routecheck devchain $*"
+    rc=0
+    "$HELPER" devchain 5 "$@" > "$T/devchain" || rc=$?
+    if [ "$rc" = 77 ]; then
+        echo "SKIP: no ip_set in this kernel"
+        exit 77
+    fi
+    [ "$rc" = 0 ] || fail "firc-routecheck devchain $*"
     FAKE=$(sed -n 's/^# fake //p' "$T/devchain")
     [ -n "$FAKE" ] || fail "the builder issued no fake address"
     $IPT -t nat -A PREROUTING -d "$FAKE" -j DNAT --to-destination 9.9.9.9
@@ -198,4 +206,5 @@ firc subnet 9.9.9.9/32 deny mac:02:00:00:00:00:0b
 ask "subnet, deny by MAC: A, not denied, goes through the tunnel" "$CA" tunnel 9.9.9.9
 ask "subnet, deny by MAC: B, denied, goes through the WAN" "$CB" wan 9.9.9.9
 
+reset
 echo "PASS: selector routing"

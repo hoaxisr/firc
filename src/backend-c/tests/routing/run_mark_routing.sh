@@ -46,6 +46,7 @@ while [ "$(readlink /proc/$FAR/ns/net)" = "$(readlink /proc/self/ns/net)" ]; do
     [ "$i" -lt 100 ] || fail "the far namespace never appeared"
     sleep 0.05
 done
+nsenter -t "$FAR" -n sysctl -qw net.ipv4.conf.all.arp_ignore=0 net.ipv4.conf.default.arp_ignore=0
 ip link set tun0p netns "$FAR"
 far() { nsenter -t "$FAR" -n "$@"; }
 far ip link set lo up

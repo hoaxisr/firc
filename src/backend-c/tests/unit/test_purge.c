@@ -11,6 +11,7 @@
 
 #include "fake_iptables.h"
 #include "fake_rtnl.h"
+#include "fake_setnl.h"
 #include "firc/mark.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/purge.h"
@@ -128,7 +129,7 @@ TEST nothing_of_ours_is_left_and_nothing_of_anyone_elses_is_touched(void) {
     ASSERT(up(&f));
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep));
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep));
 
     static const char *jump[] = {"-j", "FIRC_POOLREJECT"};
     static const char *foreign[] = {"-i", "eth0", "-j", "ACCEPT"};
@@ -191,7 +192,7 @@ TEST a_raced_iptables_write_is_retried(void) {
     firc_fake_ipt_fail_at_commit(f.fake4, 1, FIRC_ERR_AGAIN);
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep));
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep));
     ASSERT(rep.iptables_ok);
     ASSERT_EQ_FMTm("the raced write was tried again", (size_t)2, firc_fake_ipt_writes(f.fake4), "%zu");
     ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake4, "filter", "FIRC_POOLREJECT"));
@@ -206,7 +207,7 @@ TEST a_route_the_kernel_will_not_delete_is_reported_not_hidden(void) {
     fake_rtnl_fail_next_of(f.kernel, RTM_DELROUTE, EPERM);
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep) != FIRC_OK);
+    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep) != FIRC_OK);
     ASSERT(rep.iptables_ok);
     ASSERT_EQ_FMTm("the rules went first, untouched by the refusal", (size_t)2, rep.rules_removed, "%zu");
     ASSERT_FALSEm("a route of ours is still there, and the report says so", rep.routes_ok);
@@ -223,7 +224,7 @@ TEST every_step_runs_whatever_the_earlier_ones_did(void) {
     for (int i = 0; i < 3; i++) { firc_fake_ipt_fail_next_write(f.fake4, FIRC_ERR_IO); }
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT_EQ(FIRC_ERR_IO, firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep));
+    ASSERT_EQ(FIRC_ERR_IO, firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep));
     ASSERT_FALSE(rep.iptables_ok);
     ASSERT_EQ_FMT((size_t)6, rep.routes_removed, "%zu");
     ASSERT_EQ_FMT((size_t)2, rep.rules_removed, "%zu");
@@ -240,7 +241,7 @@ TEST a_route_still_there_after_a_tolerated_delete_is_reported(void) {
     fake_rtnl_fail_next_of(f.kernel, RTM_DELROUTE, ESRCH);
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT_EQ_FMT(FIRC_ERR_STATE, firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep), "%d");
+    ASSERT_EQ_FMT(FIRC_ERR_STATE, firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep), "%d");
     ASSERT_FALSE(rep.routes_ok);
     ASSERT_EQ_FMTm("a delete the kernel found nothing for is not counted", (size_t)5, rep.routes_removed, "%zu");
     down(&f);
@@ -254,7 +255,7 @@ TEST a_rule_the_kernel_will_not_delete_fails_the_purge(void) {
     fake_rtnl_fail_next_of(f.kernel, RTM_DELRULE, EPERM);
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep) != FIRC_OK);
+    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep) != FIRC_OK);
     ASSERTm("the routes were still taken", rep.routes_ok);
     down(&f);
     PASS();
@@ -277,7 +278,7 @@ TEST a_file_that_cannot_be_removed_fails_the_purge(void) {
     p.sock = kept;
     unlink(f.sock);
     firc_purge_report_t rep;
-    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep) != FIRC_OK);
+    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep) != FIRC_OK);
     struct stat st;
     ASSERTm("the run dir itself went", stat(f.dir, &st) != 0);
     chmod(keep_dir, 0700);
@@ -293,7 +294,7 @@ TEST without_netlink_the_chains_still_go(void) {
     ASSERT(up(&f));
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT(firc_purge(f.ipt4, f.ipt6, NULL, "FIRC_", &p, &rep) != FIRC_OK);
+    ASSERT(firc_purge(f.ipt4, f.ipt6, NULL, NULL, "FIRC_", &p, &rep) != FIRC_OK);
     ASSERT(rep.iptables_ok);
     ASSERT_FALSE(rep.routes_ok);
     ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake6, "filter", "FIRC_POOLREJECT"));
@@ -318,7 +319,7 @@ TEST the_refused_table_dumps_go_with_the_purge(void) {
     }
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    (void)firc_purge(f.ipt4, f.ipt6, f.rtnl, "FIRC_", &p, &rep);
+    (void)firc_purge(f.ipt4, f.ipt6, f.rtnl, NULL, "FIRC_", &p, &rep);
     struct stat st;
     for (int i = 0; i < 6; i++) {
         ASSERT(stat(path[i], &st) != 0 && errno == ENOENT);
@@ -336,10 +337,91 @@ TEST without_an_ipv6_engine_the_ipv4_tables_still_go(void) {
     f.ipt6 = NULL;
     firc_purge_paths_t p = paths_of(&f);
     firc_purge_report_t rep;
-    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, NULL, f.rtnl, "FIRC_", &p, &rep));
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, NULL, f.rtnl, NULL, "FIRC_", &p, &rep));
     ASSERT(rep.iptables_ok);
     ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake4, "nat", "FIRC_old"));
     ASSERT_FALSE(firc_fake_ipt_chain_exists(f.fake4, "filter", "FIRC_POOLREJECT"));
+    down(&f);
+    PASS();
+}
+
+static fake_setnl_t *crash_sets(firc_setnl_t **sets) {
+    fake_setnl_t *k = fake_setnl_start(sets);
+    if (k == NULL) { return NULL; }
+    fake_setnl_plant(k, "FIRC_deadbeefS4", 4);
+    fake_setnl_plant(k, "FIRC_deadbeefT6", 6);
+    fake_setnl_plant(k, "_NDM_X", 4);
+    return k;
+}
+
+TEST the_sweep_helper_with_an_empty_keep_takes_every_set_of_ours(void) {
+    firc_setnl_t *sets = NULL;
+    fake_setnl_t *k = crash_sets(&sets);
+    ASSERT(k != NULL);
+    size_t destroyed = 0;
+    ASSERT_EQ(FIRC_OK, firc_purge_sets(sets, "FIRC_", &destroyed));
+    ASSERT_EQ_FMT((size_t)2, destroyed, "%zu");
+    ASSERT_FALSE(fake_setnl_has(k, "FIRC_deadbeefS4"));
+    ASSERT_FALSE(fake_setnl_has(k, "FIRC_deadbeefT6"));
+    ASSERT(fake_setnl_has(k, "_NDM_X"));
+    firc_setnl_free(sets);
+    fake_setnl_stop(k);
+    PASS();
+}
+
+TEST purge_destroys_the_sets_and_counts_them(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_setnl_t *sets = NULL;
+    fake_setnl_t *k = crash_sets(&sets);
+    ASSERT(k != NULL);
+    firc_purge_paths_t p = paths_of(&f);
+    firc_purge_report_t rep;
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, sets, "FIRC_", &p, &rep));
+    ASSERT_EQ_FMT((size_t)2, rep.sets, "%zu");
+    ASSERT_FALSE(fake_setnl_has(k, "FIRC_deadbeefS4"));
+    ASSERT_FALSE(fake_setnl_has(k, "FIRC_deadbeefT6"));
+    ASSERT(fake_setnl_has(k, "_NDM_X"));
+    firc_setnl_free(sets);
+    fake_setnl_stop(k);
+    down(&f);
+    PASS();
+}
+
+TEST purge_with_a_busy_set_exits_nonzero(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_setnl_t *sets = NULL;
+    fake_setnl_t *k = crash_sets(&sets);
+    ASSERT(k != NULL);
+    fake_setnl_reference(k, "FIRC_deadbeefS4", true);
+    firc_purge_paths_t p = paths_of(&f);
+    firc_purge_report_t rep;
+    ASSERT(firc_purge(f.ipt4, f.ipt6, f.rtnl, sets, "FIRC_", &p, &rep) != FIRC_OK);
+    ASSERT(rep.iptables_ok);
+    ASSERT(fake_setnl_has(k, "FIRC_deadbeefS4"));
+    ASSERT_FALSE(fake_setnl_has(k, "FIRC_deadbeefT6"));
+    firc_setnl_free(sets);
+    fake_setnl_stop(k);
+    down(&f);
+    PASS();
+}
+
+TEST a_kernel_without_ip_set_has_no_sets_to_sweep(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_setnl_t *sets = NULL;
+    fake_setnl_t *k = fake_setnl_start(&sets);
+    ASSERT(k != NULL);
+    fake_setnl_no_subsystem(k);
+    size_t destroyed = 7;
+    ASSERT_EQ(FIRC_OK, firc_purge_sets(sets, "FIRC_", &destroyed));
+    ASSERT_EQ_FMT((size_t)0, destroyed, "%zu");
+    firc_purge_paths_t p = paths_of(&f);
+    firc_purge_report_t rep;
+    ASSERT_EQ(FIRC_OK, firc_purge(f.ipt4, f.ipt6, f.rtnl, sets, "FIRC_", &p, &rep));
+    firc_setnl_free(sets);
+    fake_setnl_stop(k);
     down(&f);
     PASS();
 }
@@ -358,5 +440,9 @@ int main(int argc, char **argv) {
     RUN_TEST(without_netlink_the_chains_still_go);
     RUN_TEST(the_refused_table_dumps_go_with_the_purge);
     RUN_TEST(without_an_ipv6_engine_the_ipv4_tables_still_go);
+    RUN_TEST(the_sweep_helper_with_an_empty_keep_takes_every_set_of_ours);
+    RUN_TEST(purge_destroys_the_sets_and_counts_them);
+    RUN_TEST(purge_with_a_busy_set_exits_nonzero);
+    RUN_TEST(a_kernel_without_ip_set_has_no_sets_to_sweep);
     GREATEST_MAIN_END();
 }

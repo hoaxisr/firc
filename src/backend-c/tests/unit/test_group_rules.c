@@ -52,6 +52,7 @@ TEST the_mark_is_written_masked(void)
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_g1", "nwg0", mark, 1, NULL, NULL));
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "FIRC_g1S4", 1);
     const firc_ipv4_subnet_t p[] = {{.addr = {10, 0, 0, 0}, .cidr = 8}};
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_g1", mark, p, 1, NULL, 0));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -99,6 +100,7 @@ TEST a_blackhole_group_gets_no_masquerade(void)
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(3, &mark));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_bh", "blackhole", mark, 3, NULL, NULL));
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "FIRC_bhS4", 1);
     const firc_ipv4_subnet_t p[] = {{.addr = {10, 0, 0, 0}, .cidr = 8}};
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_bh", mark, p, 1, NULL, 0));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -122,6 +124,7 @@ TEST a_block_group_gets_no_masquerade(void)
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(3, &mark));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_bk", "block", mark, 3, NULL, NULL));
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "FIRC_bkS4", 1);
     const firc_ipv4_subnet_t p[] = {{.addr = {10, 0, 0, 0}, .cidr = 8}};
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_bk", mark, p, 1, NULL, 0));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -145,6 +148,7 @@ TEST the_connmark_rule_keenetic_needs_is_still_emitted(void)
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_g1", "nwg0", mark, 1, NULL, NULL));
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "FIRC_g1S4", 1);
     const firc_ipv4_subnet_t p[] = {{.addr = {10, 0, 0, 0}, .cidr = 8}};
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_g1", mark, p, 1, NULL, 0));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
@@ -293,8 +297,9 @@ TEST a_subnet_rule_is_a_static_mark_rule_in_the_groups_chain(void)
 
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
-    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {0, 0, 0, 0}, .cidr = 0}};
-    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP},
+                                     {.addr = {0, 0, 0, 0}, .cidr = 0}};
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32, .proto = IPPROTO_TCP}};
     for (int fam = 0; fam < 2; fam++) {
         firc_ipt_t *ipt = fam == 0 ? ipt4 : ipt6;
         ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_g1", "nwg0", mark, 1,
@@ -303,25 +308,25 @@ TEST a_subnet_rule_is_a_static_mark_rule_in_the_groups_chain(void)
         ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
     }
 
-    static const char *m1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
+    static const char *m1[] = {"-d", "10.1.0.0/16", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
                                "mark", "!", "--mark", "0x40000000/0x40000000", "-j", "MARK", "--set-xmark",
                                "0x40010000/0x40ff0000"};
-    static const char *c1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL",
+    static const char *c1[] = {"-d", "10.1.0.0/16", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL",
                                "-j", "CONNMARK", "--save-mark", "--nfmask", "0x40ff0000", "--ctmask", "0x40ff0000"};
     static const char *m0[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
                                "0x40000000/0x40000000", "-j", "MARK", "--set-xmark", "0x40010000/0x40ff0000"};
-    static const char *m6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
+    static const char *m6[] = {"-d", "2001:db8::/32", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
                                "mark", "!", "--mark", "0x40000000/0x40000000", "-j", "MARK", "--set-xmark",
                                "0x40010000/0x40ff0000"};
-    static const char *c6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL",
+    static const char *c6[] = {"-d", "2001:db8::/32", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL",
                                "-j", "CONNMARK", "--save-mark", "--nfmask", "0x40ff0000", "--ctmask", "0x40ff0000"};
-    ASSERT(has_rule(f4, "mangle", "FIRC_g1", m1, 15));
-    ASSERT(has_rule(f4, "mangle", "FIRC_g1", c1, 13));
+    ASSERT(has_rule(f4, "mangle", "FIRC_g1", m1, 17));
+    ASSERT(has_rule(f4, "mangle", "FIRC_g1", c1, 15));
     ASSERTm("a /0 is one rule with no destination at all", has_rule(f4, "mangle", "FIRC_g1", m0, 13));
     ASSERT_FALSEm("iptables-save would never echo this form back",
                   any_arg_equals(f4, "mangle", "FIRC_g1", "0.0.0.0/0"));
-    ASSERT(has_rule(f6, "mangle", "FIRC_g1", m6, 15));
-    ASSERT(has_rule(f6, "mangle", "FIRC_g1", c6, 13));
+    ASSERT(has_rule(f6, "mangle", "FIRC_g1", m6, 17));
+    ASSERT(has_rule(f6, "mangle", "FIRC_g1", c6, 15));
     ASSERT_FALSEm("v6 prefix in the v4 table", any_arg_equals(f4, "mangle", "FIRC_g1", "2001:db8::/32"));
     ASSERT_FALSEm("v4 prefix in the v6 table", any_arg_equals(f6, "mangle", "FIRC_g1", "10.1.0.0/16"));
     ASSERT_FALSEm("nothing of it in filter", any_arg_equals(f4, "filter", "FIRC_g1", "10.1.0.0/16"));
@@ -384,7 +389,8 @@ TEST a_rewrite_drops_a_removed_prefix_and_keeps_one_jump(void)
     firc_netfilter_register_base_chains(ipt, NULL);
     uint32_t mark = 0;
     ASSERT(firc_mark_for_field(1, &mark));
-    const firc_ipv4_subnet_t two[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 16}};
+    const firc_ipv4_subnet_t two[] = {{.addr = {10, 1, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP},
+                                      {.addr = {10, 2, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP}};
 
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_rules(ipt, "FIRC_g1", "nwg0", mark, 1, NULL, NULL));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt, "FIRC_g1", mark, two, 2, NULL, 0));
@@ -420,6 +426,8 @@ TEST prefixes_set_on_the_object_reach_both_engines(void)
     firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_xt(f6), "FIRC_");
     firc_netfilter_register_base_chains(NULL, ipt6);
 
+    firc_fake_xt_set(firc_fake_ipt_xt(f4), "FIRC_g1S4", 1);
+    firc_fake_xt_set(firc_fake_ipt_xt(f6), "FIRC_g1S6", 2);
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, ipt6, NULL, 100,
                                                      NULL, "g1", NULL, NULL);
     ASSERT(l != NULL);
@@ -430,14 +438,16 @@ TEST prefixes_set_on_the_object_reach_both_engines(void)
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
 
-    ASSERT(any_arg_equals(f4, "mangle", "FIRC_g1", "10.1.0.0/16"));
-    ASSERT(any_arg_equals(f6, "mangle", "FIRC_g1", "2001:db8::/32"));
+    ASSERT(any_arg_equals(f4, "mangle", "FIRC_g1", "FIRC_g1S4"));
+    ASSERT(any_arg_equals(f6, "mangle", "FIRC_g1", "FIRC_g1S6"));
+    ASSERT_FALSE(any_arg_equals(f4, "mangle", "FIRC_g1", "FIRC_g1S6"));
+    ASSERT_FALSE(any_arg_equals(f6, "mangle", "FIRC_g1", "FIRC_g1S4"));
 
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_subnets(l, NULL, 0, NULL, 0, NULL));
     ASSERT_EQ(FIRC_OK, firc_netfilter_register_base_chains(ipt4, ipt6));
     ASSERT_EQ(FIRC_OK, firc_ipset_to_link_stage_for_test(l));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
-    ASSERT_FALSE(any_arg_equals(f4, "mangle", "FIRC_g1", "10.1.0.0/16"));
+    ASSERT_FALSE(any_arg_equals(f4, "mangle", "FIRC_g1", "FIRC_g1S4"));
 
     firc_ipset_to_link_free(l);
     firc_ipt_free(ipt4);
@@ -587,6 +597,7 @@ static bool build_g1_subnets(built_t *b, firc_ipt_proto_t proto, const firc_nf_d
     b->f = firc_fake_ipt_new(proto);
     b->ipt = firc_ipt_new(firc_fake_ipt_as_xt(b->f), "FIRC_");
     if (b->snap == NULL || b->ipt == NULL) { return false; }
+    firc_fake_xt_set(firc_fake_ipt_xt(b->f), proto == FIRC_IPT_PROTO_IPV6 ? "FIRC_g1S6" : "FIRC_g1S4", 1);
     if (proto == FIRC_IPT_PROTO_IPV6) {
         firc_netfilter_register_base_chains(NULL, b->ipt);
     } else {
@@ -613,6 +624,120 @@ static void built_free(built_t *b)
 
 #define F5 "0x40050000/0x40ff0000"
 #define F5_CONNMARK "-m mark --mark " F5 " -j CONNMARK --save-mark --nfmask 0x40ff0000 --ctmask 0x40ff0000"
+
+static firc_ipt_t *set_engine(firc_ipt_proto_t proto, firc_fake_ipt_t **f, const char *set) {
+    *f = firc_fake_ipt_new(proto);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(*f), "firc");
+    if (set != NULL) { firc_fake_xt_set(firc_fake_ipt_xt(*f), set, 3); }
+    firc_ipt_register_chain_override(ipt, "mangle", "fircA");
+    firc_ipt_register_chain_override(ipt, "mangle", "fircAD");
+    return ipt;
+}
+
+#define A_GUARD "-m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000"
+#define A_MARK "-j MARK --set-xmark 0x40010000/0x40ff0000"
+#define A_SAVE "-m conntrack --ctdir ORIGINAL -j CONNMARK --save-mark --nfmask 0x40ff0000 --ctmask 0x40ff0000"
+#define A_SET_SAVE(set) \
+    "-m conntrack --ctdir ORIGINAL -m set --match-set " set " dst -j CONNMARK --save-mark --nfmask 0x40ff0000 --ctmask 0x40ff0000"
+
+TEST bare_prefixes_become_one_set_rule_pair_per_family(void) {
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(1, &mark));
+    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {192, 0, 2, 0}, .cidr = 24}};
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    firc_fake_ipt_t *f4, *f6;
+    firc_ipt_t *ipt4 = set_engine(FIRC_IPT_PROTO_IPV4, &f4, "fircAS4");
+    firc_ipt_t *ipt6 = set_engine(FIRC_IPT_PROTO_IPV6, &f6, "fircAS6");
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt4, "fircA", mark, v4, 2, v6, 1));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt6, "fircA", mark, v4, 2, v6, 1));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
+    static const char *const want4[] = {
+        A_GUARD " -m set --match-set fircAS4 dst " A_MARK,
+        A_SET_SAVE("fircAS4"),
+    };
+    static const char *const want6[] = {
+        A_GUARD " -m set --match-set fircAS6 dst " A_MARK,
+        A_SET_SAVE("fircAS6"),
+    };
+    ASSERT(rules_are(f4, "mangle", "fircA", want4, 2));
+    ASSERT(rules_are(f6, "mangle", "fircA", want6, 2));
+    firc_ipt_free(ipt4);
+    firc_ipt_free(ipt6);
+    PASS();
+}
+
+TEST a_selector_group_s_bare_prefixes_are_one_jump(void) {
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(1, &mark));
+    firc_nf_source_t allow[] = {mac_src()};
+    firc_nf_devices_t dev = {.active = true, .allow = allow, .n_allow = 1};
+    const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {192, 0, 2, 0}, .cidr = 24}};
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    firc_fake_ipt_t *f4, *f6;
+    firc_ipt_t *ipt4 = set_engine(FIRC_IPT_PROTO_IPV4, &f4, "fircAS4");
+    firc_ipt_t *ipt6 = set_engine(FIRC_IPT_PROTO_IPV6, &f6, "fircAS6");
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules_dev(ipt4, "fircA", mark, v4, 2, v6, 1, &dev));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules_dev(ipt6, "fircA", mark, v4, 2, v6, 1, &dev));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
+    static const char *const want4[] = {A_GUARD " -m set --match-set fircAS4 dst -j fircAD"};
+    static const char *const want6[] = {A_GUARD " -m set --match-set fircAS6 dst -j fircAD"};
+    ASSERT(rules_are(f4, "mangle", "fircA", want4, 1));
+    ASSERT(rules_are(f6, "mangle", "fircA", want6, 1));
+    firc_ipt_free(ipt4);
+    firc_ipt_free(ipt6);
+    PASS();
+}
+
+TEST a_protocol_rule_and_a_slash_zero_stay_rules(void) {
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(1, &mark));
+    const firc_ipv4_subnet_t v4[] = {
+        {.addr = {10, 9, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP, .ports = "443"},
+        {.addr = {0, 0, 0, 0}, .cidr = 0},
+        {.addr = {10, 1, 0, 0}, .cidr = 16},
+    };
+    firc_fake_ipt_t *f4;
+    firc_ipt_t *ipt4 = set_engine(FIRC_IPT_PROTO_IPV4, &f4, "fircAS4");
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt4, "fircA", mark, v4, 3, NULL, 0));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    static const char *const want[] = {
+        A_GUARD " -m set --match-set fircAS4 dst " A_MARK,
+        A_SET_SAVE("fircAS4"),
+        "-d 10.9.0.0/16 -p tcp " A_GUARD " -m tcp --dport 443 " A_MARK,
+        "-d 10.9.0.0/16 -p tcp -m conntrack --ctdir ORIGINAL -m tcp --dport 443 -j CONNMARK --save-mark --nfmask "
+        "0x40ff0000 --ctmask 0x40ff0000",
+        A_GUARD " " A_MARK,
+        A_SAVE,
+    };
+    ASSERT(rules_are(f4, "mangle", "fircA", want, 6));
+    firc_ipt_free(ipt4);
+    PASS();
+}
+
+TEST a_group_with_no_bare_prefix_names_no_set(void) {
+    uint32_t mark = 0;
+    ASSERT(firc_mark_for_field(1, &mark));
+    const firc_ipv4_subnet_t v4[] = {
+        {.addr = {10, 9, 0, 0}, .cidr = 16, .proto = IPPROTO_TCP, .ports = "443"},
+        {.addr = {0, 0, 0, 0}, .cidr = 0},
+    };
+    const firc_ipv4_subnet_t bare4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
+    firc_fake_ipt_t *f4, *f6;
+    firc_ipt_t *ipt4 = set_engine(FIRC_IPT_PROTO_IPV4, &f4, NULL);
+    firc_ipt_t *ipt6 = set_engine(FIRC_IPT_PROTO_IPV6, &f6, NULL);
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt4, "fircA", mark, v4, 2, NULL, 0));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_build_subnet_rules(ipt6, "fircA", mark, bare4, 1, NULL, 0));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
+    ASSERT_EQ_FMT((size_t)4, rule_count(f4, "mangle", "fircA"), "%zu");
+    ASSERT_FALSE(any_arg_equals(f4, "mangle", "fircA", "set"));
+    ASSERT_EQ_FMT((size_t)0, rule_count(f6, "mangle", "fircA"), "%zu");
+    firc_ipt_free(ipt4);
+    firc_ipt_free(ipt6);
+    PASS();
+}
 
 /* Catches: an inactive selector still writing the devices jump or chain. */
 TEST a_group_without_a_selector_marks_its_chunks_as_before(void)
@@ -666,17 +791,17 @@ TEST a_selector_group_s_subnet_rule_jumps_to_its_devices_chain(void)
     ASSERT(build_g1_subnets(&b4, FIRC_IPT_PROTO_IPV4, &dev, v4, 3, v6, 1));
     ASSERT(build_g1_subnets(&b6, FIRC_IPT_PROTO_IPV6, &dev, v4, 3, v6, 1));
 
-    static const char *j1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
-                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
+    static const char *j1[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
+                               "0x40000000/0x40000000", "-m", "set", "--match-set", "FIRC_g1S4", "dst", "-j", "FIRC_g1D"};
     static const char *j2[] = {"-d", "10.2.0.0/16", "-p", "tcp", "-m", "conntrack", "--ctdir", "ORIGINAL",
                                "-m", "mark", "!", "--mark", "0x40000000/0x40000000", "-m", "multiport",
                                "--dports", "443,1000:2000", "-j", "FIRC_g1D"};
     static const char *j0[] = {"-p", "udp", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!",
                                "--mark", "0x40000000/0x40000000", "-m", "udp", "--dport", "51820", "-j",
                                "FIRC_g1D"};
-    static const char *j6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
-                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
-    ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j1, 13));
+    static const char *j6[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
+                               "0x40000000/0x40000000", "-m", "set", "--match-set", "FIRC_g1S6", "dst", "-j", "FIRC_g1D"};
+    ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j1, 16));
     ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j2, 19));
     ASSERT(has_rule(b4.f, "mangle", "FIRC_g1", j0, 17));
     ASSERT_EQ_FMTm("the ctdir return, two chunk jumps, three subnet jumps", (size_t)6,
@@ -690,7 +815,7 @@ TEST a_selector_group_s_subnet_rule_jumps_to_its_devices_chain(void)
     };
     ASSERT(rules_are(b4.f, "mangle", "FIRC_g1D", want, 2));
 
-    ASSERT(has_rule(b6.f, "mangle", "FIRC_g1", j6, 13));
+    ASSERT(has_rule(b6.f, "mangle", "FIRC_g1", j6, 16));
     ASSERT_EQ_FMT((size_t)3, rule_count(b6.f, "mangle", "FIRC_g1"), "%zu");
     ASSERT_FALSE(any_arg_equals(b6.f, "mangle", "FIRC_g1", "10.1.0.0/16"));
     ASSERT_FALSE(any_arg_equals(b6.f, "mangle", "FIRC_g1", "--set-xmark"));
@@ -704,18 +829,19 @@ TEST a_selector_group_s_subnet_rule_jumps_to_its_devices_chain(void)
 TEST a_group_without_a_selector_keeps_its_subnet_mark_and_connmark(void)
 {
     const firc_ipv4_subnet_t v4[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
-    static const char *m1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m",
-                               "mark", "!", "--mark", "0x40000000/0x40000000", "-j", "MARK", "--set-xmark",
-                               "0x40050000/0x40ff0000"};
-    static const char *c1[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL",
-                               "-j", "CONNMARK", "--save-mark", "--nfmask", "0x40ff0000", "--ctmask", "0x40ff0000"};
+    static const char *m1[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
+                               "0x40000000/0x40000000", "-m", "set", "--match-set", "FIRC_g1S4", "dst", "-j", "MARK",
+                               "--set-xmark", "0x40050000/0x40ff0000"};
+    static const char *c1[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "set", "--match-set", "FIRC_g1S4",
+                               "dst", "-j", "CONNMARK", "--save-mark", "--nfmask", "0x40ff0000", "--ctmask",
+                               "0x40ff0000"};
     firc_nf_devices_t none = {0};
     const firc_nf_devices_t *cases[] = {&none, NULL};
     for (size_t i = 0; i < 2; i++) {
         built_t b;
         ASSERT(build_g1_subnets(&b, FIRC_IPT_PROTO_IPV4, cases[i], v4, 1, NULL, 0));
-        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", m1, 15));
-        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", c1, 13));
+        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", m1, 18));
+        ASSERT(has_rule(b.f, "mangle", "FIRC_g1", c1, 16));
         ASSERT_FALSE(any_arg_equals(b.f, "mangle", "FIRC_g1", "FIRC_g1D"));
         ASSERT_FALSE(firc_fake_ipt_chain_exists(b.f, "mangle", "FIRC_g1D"));
         built_free(&b);
@@ -851,6 +977,8 @@ TEST subnets_and_devices_set_on_the_object_jump_together(void)
     firc_fake_ipt_t *f6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
     firc_ipt_t *ipt6 = firc_ipt_new(firc_fake_ipt_as_xt(f6), "FIRC_");
     firc_netfilter_register_base_chains(NULL, ipt6);
+    firc_fake_xt_set(firc_fake_ipt_xt(f4), "FIRC_g1S4", 1);
+    firc_fake_xt_set(firc_fake_ipt_xt(f6), "FIRC_g1S6", 2);
     firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", ipt4, ipt6, NULL, 100, NULL, "g1", NULL, NULL);
     ASSERT(l != NULL);
     firc_nf_source_t allow[] = {mac_src()};
@@ -863,12 +991,12 @@ TEST subnets_and_devices_set_on_the_object_jump_together(void)
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt4));
     ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt6));
 
-    static const char *j4[] = {"-d", "10.1.0.0/16", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
-                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
-    static const char *j6[] = {"-d", "2001:db8::/32", "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark",
-                               "!", "--mark", "0x40000000/0x40000000", "-j", "FIRC_g1D"};
-    ASSERT(has_rule(f4, "mangle", "FIRC_g1", j4, 13));
-    ASSERT(has_rule(f6, "mangle", "FIRC_g1", j6, 13));
+    static const char *j4[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
+                               "0x40000000/0x40000000", "-m", "set", "--match-set", "FIRC_g1S4", "dst", "-j", "FIRC_g1D"};
+    static const char *j6[] = {"-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "mark", "!", "--mark",
+                               "0x40000000/0x40000000", "-m", "set", "--match-set", "FIRC_g1S6", "dst", "-j", "FIRC_g1D"};
+    ASSERT(has_rule(f4, "mangle", "FIRC_g1", j4, 16));
+    ASSERT(has_rule(f6, "mangle", "FIRC_g1", j6, 16));
     ASSERT(firc_fake_ipt_chain_exists(f4, "mangle", "FIRC_g1D"));
     ASSERT(firc_fake_ipt_chain_exists(f6, "mangle", "FIRC_g1D"));
 
@@ -1109,6 +1237,179 @@ TEST a_link_reports_the_prefixes_it_holds(void)
     PASS();
 }
 
+TEST bare_is_no_protocol_and_a_length(void)
+{
+    const firc_ipv4_subnet_t a = {.addr = {10, 1, 0, 0}, .cidr = 16};
+    const firc_ipv4_subnet_t b = {.addr = {0, 0, 0, 0}, .cidr = 0};
+    const firc_ipv4_subnet_t c = {.addr = {10, 9, 0, 0}, .cidr = 16, .proto = 6, .ports = "443"};
+    const firc_ipv6_subnet_t d = {.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32};
+    const firc_ipv6_subnet_t e = {.cidr = 0};
+    const firc_ipv6_subnet_t f = {.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32, .proto = 17};
+    ASSERT(firc_subnet4_is_bare(&a));
+    ASSERT_FALSE(firc_subnet4_is_bare(&b));
+    ASSERT_FALSE(firc_subnet4_is_bare(&c));
+    ASSERT(firc_subnet6_is_bare(&d));
+    ASSERT_FALSE(firc_subnet6_is_bare(&e));
+    ASSERT_FALSE(firc_subnet6_is_bare(&f));
+    PASS();
+}
+
+static firc_ipset_to_link_t *bare_link(const firc_ipv4_subnet_t *v4, size_t n4, const firc_ipv6_subnet_t *v6,
+                                       size_t n6)
+{
+    firc_ipset_to_link_t *l = firc_ipset_to_link_new("FIRC_g1", "nwg0", NULL, NULL, NULL, 100, NULL, "g1", NULL, NULL);
+    if (l != NULL && firc_ipset_to_link_set_subnets(l, v4, n4, v6, n6, NULL) != FIRC_OK) {
+        firc_ipset_to_link_free(l);
+        return NULL;
+    }
+    return l;
+}
+
+TEST bare_lists_are_sorted_unique_and_per_family(void)
+{
+    const firc_ipv4_subnet_t v4[] = {
+        {.addr = {10, 2, 0, 0}, .cidr = 16}, {.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 16},
+        {.addr = {0, 0, 0, 0}, .cidr = 0},   {.addr = {10, 9, 0, 0}, .cidr = 16, .proto = 6, .ports = "443"},
+        {.addr = {10, 1, 2, 3}, .cidr = 16},
+    };
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}, {.cidr = 0}};
+    firc_ipset_to_link_t *l = bare_link(v4, 6, v6, 2);
+    ASSERT(l != NULL);
+    firc_nf_prefixes_t b4 = {0}, b6 = {0};
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_bare(l, 4, &b4));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_bare(l, 6, &b6));
+    ASSERT_EQ_FMT((size_t)2, b4.n, "%zu");
+    ASSERT_EQ_FMT((size_t)1, b6.n, "%zu");
+    if (b4.n == 2) {
+        ASSERT_EQ_FMT(4, (int)b4.v[0].family, "%d");
+        ASSERT_EQ_FMT(1, (int)b4.v[0].addr[1], "%d");
+        ASSERT_EQ_FMT(0, (int)b4.v[0].addr[2], "%d");
+        ASSERT_EQ_FMT(0, (int)b4.v[0].addr[3], "%d");
+        ASSERT_EQ_FMT(2, (int)b4.v[1].addr[1], "%d");
+    }
+    if (b6.n == 1) {
+        ASSERT_EQ_FMT(6, (int)b6.v[0].family, "%d");
+        ASSERT_EQ_FMT(32, (int)b6.v[0].cidr, "%d");
+    }
+    firc_nf_prefixes_t bad = {0};
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_ipset_to_link_bare(l, 5, &bad));
+    ASSERT_EQ_FMT((size_t)0, bad.n, "%zu");
+    firc_nf_prefixes_clear(&b4);
+    firc_nf_prefixes_clear(&b6);
+    firc_ipset_to_link_free(l);
+    PASS();
+}
+
+static firc_nf_print_t print_of(const firc_ipv4_subnet_t *v4, size_t n4)
+{
+    firc_nf_print_t r = {0};
+    firc_ipset_to_link_t *l = bare_link(v4, n4, NULL, 0);
+    firc_nf_prefixes_t b = {0};
+    if (l != NULL && firc_ipset_to_link_bare(l, 4, &b) == FIRC_OK) { r = firc_nf_prefixes_print(&b); }
+    firc_nf_prefixes_clear(&b);
+    firc_ipset_to_link_free(l);
+    return r;
+}
+
+TEST a_print_is_the_same_for_the_same_set_in_any_input_order(void)
+{
+    const firc_ipv4_subnet_t fwd[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 16}};
+    const firc_ipv4_subnet_t rev[] = {{.addr = {10, 2, 0, 0}, .cidr = 16}, {.addr = {10, 1, 0, 0}, .cidr = 16}};
+    firc_nf_print_t a = print_of(fwd, 2), b = print_of(rev, 2);
+    ASSERT_EQ_FMT((size_t)2, a.n, "%zu");
+    ASSERT_EQ_FMT(a.n, b.n, "%zu");
+    ASSERT(a.hash == b.hash);
+    PASS();
+}
+
+TEST a_print_of_v6_prefixes_hashes_all_sixteen_bytes(void)
+{
+    const firc_ipv6_subnet_t a[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8, 0, 1}, .cidr = 48}};
+    const firc_ipv6_subnet_t b[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8, 0, 2}, .cidr = 48}};
+    firc_nf_print_t p[2] = {{0}, {0}};
+    const firc_ipv6_subnet_t *in[2] = {a, b};
+    for (int i = 0; i < 2; i++) {
+        firc_ipset_to_link_t *l = bare_link(NULL, 0, in[i], 1);
+        ASSERT(l != NULL);
+        firc_nf_prefixes_t bare = {0};
+        ASSERT_EQ(FIRC_OK, firc_ipset_to_link_bare(l, 6, &bare));
+        p[i] = firc_nf_prefixes_print(&bare);
+        firc_nf_prefixes_clear(&bare);
+        firc_ipset_to_link_free(l);
+    }
+    ASSERT_EQ_FMT(p[0].n, p[1].n, "%zu");
+    ASSERT_EQ_FMT((size_t)1, p[0].n, "%zu");
+    ASSERT(p[0].hash != p[1].hash);
+    PASS();
+}
+
+TEST a_print_differs_for_one_swapped_prefix_of_equal_count(void)
+{
+    const firc_ipv4_subnet_t one[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 16}};
+    const firc_ipv4_subnet_t addr[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 3, 0, 0}, .cidr = 16}};
+    const firc_ipv4_subnet_t len[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 24}};
+    firc_nf_print_t a = print_of(one, 2), b = print_of(addr, 2), c = print_of(len, 2);
+    ASSERT_EQ_FMT(a.n, b.n, "%zu");
+    ASSERT_EQ_FMT(a.n, c.n, "%zu");
+    ASSERT(a.hash != b.hash);
+    ASSERT(a.hash != c.hash);
+    PASS();
+}
+
+TEST the_print_of_one_prefix_is_this_number(void)
+{
+    const firc_ipv4_subnet_t one[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
+    firc_nf_print_t p = print_of(one, 1);
+    ASSERT_EQ_FMT((size_t)1, p.n, "%zu");
+    ASSERT(p.hash == 0x67364f2d9721332aULL);
+    firc_nf_prefixes_t none = {0};
+    firc_nf_print_t e = firc_nf_prefixes_print(&none);
+    ASSERT_EQ_FMT((size_t)0, e.n, "%zu");
+    ASSERT(e.hash == 0xcbf29ce484222325ULL);
+    PASS();
+}
+
+TEST set_names_are_chain_letter_family(void)
+{
+    char out[FIRC_SET_NAME_MAX];
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of("fircA", 4, false, out, sizeof(out)));
+    ASSERT_STR_EQ("fircAS4", out);
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of("fircA", 6, true, out, sizeof(out)));
+    ASSERT_STR_EQ("fircAT6", out);
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of("fircA", 6, false, out, sizeof(out)));
+    ASSERT_STR_EQ("fircAS6", out);
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of("fircA", 4, true, out, sizeof(out)));
+    ASSERT_STR_EQ("fircAT4", out);
+    PASS();
+}
+
+TEST a_chain_too_long_for_a_set_name_is_refused(void)
+{
+    char out[FIRC_SET_NAME_MAX];
+    char chain[31];
+    memset(chain, 'c', 30);
+    chain[30] = 0;
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_ipset_to_link_set_name_of(chain, 4, false, out, sizeof(out)));
+    char wide[64];
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_ipset_to_link_set_name_of(chain, 4, false, wide, sizeof(wide)));
+    chain[29] = 0;
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of(chain, 4, false, out, sizeof(out)));
+    ASSERT_EQ_FMT((size_t)(FIRC_SET_NAME_MAX - 1), strlen(out), "%zu");
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_name_of(chain, 4, false, wide, sizeof(wide)));
+    ASSERT_EQ_FMT((size_t)31, strlen(wide), "%zu");
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_ipset_to_link_set_name_of("fircA", 5, false, out, sizeof(out)));
+    PASS();
+}
+
+TEST a_link_names_its_chain(void)
+{
+    firc_ipset_to_link_t *l = bare_link(NULL, 0, NULL, 0);
+    ASSERT(l != NULL);
+    ASSERT_STR_EQ("FIRC_g1", firc_ipset_to_link_chain(l));
+    firc_ipset_to_link_free(l);
+    PASS();
+}
+
 /* Catches: push growing by one instead of doubling, or losing the duplicate check when it grows. */
 TEST push_doubles_its_room_and_keeps_the_duplicate_scan(void)
 {
@@ -1316,6 +1617,36 @@ TEST a_one_entry_group_keeps_its_single_egress_rule(void)
     PASS();
 }
 
+static bool print_is(firc_nf_print_t got, const firc_nf_prefix_t *want, size_t n)
+{
+    firc_nf_prefixes_t w = {.v = (firc_nf_prefix_t *)want, .n = n};
+    firc_nf_print_t p = firc_nf_prefixes_print(&w);
+    return got.n == p.n && got.hash == p.hash;
+}
+
+TEST a_link_prints_its_bare_prefixes_when_it_takes_them(void)
+{
+    const firc_ipv4_subnet_t v4[] = {
+        {.addr = {10, 2, 0, 0}, .cidr = 16}, {.addr = {10, 1, 0, 0}, .cidr = 16}, {.addr = {10, 2, 0, 0}, .cidr = 16},
+        {.addr = {10, 9, 0, 0}, .cidr = 16, .proto = 6, .ports = "443"}, {.addr = {0, 0, 0, 0}, .cidr = 0},
+    };
+    const firc_ipv6_subnet_t v6[] = {{.addr = {0x20, 0x01, 0x0d, 0xb8}, .cidr = 32}};
+    const firc_nf_prefix_t want4[] = {{.family = 4, .cidr = 16, .addr = {10, 1, 0, 0}},
+                                      {.family = 4, .cidr = 16, .addr = {10, 2, 0, 0}}};
+    const firc_nf_prefix_t want6[] = {{.family = 6, .cidr = 32, .addr = {0x20, 0x01, 0x0d, 0xb8}}};
+    firc_ipset_to_link_t *l = bare_link(v4, 5, v6, 1);
+    ASSERT(l != NULL);
+    ASSERT(print_is(firc_ipset_to_link_bare_print(l, 4), want4, 2));
+    ASSERT(print_is(firc_ipset_to_link_bare_print(l, 6), want6, 1));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_subnets(l, v4, 5, v6, 1, NULL));
+    ASSERT(print_is(firc_ipset_to_link_bare_print(l, 4), want4, 2));
+    ASSERT_EQ(FIRC_OK, firc_ipset_to_link_set_subnets(l, &v4[1], 1, NULL, 0, NULL));
+    ASSERT(print_is(firc_ipset_to_link_bare_print(l, 4), want4, 1));
+    ASSERT_EQ_FMT((size_t)0, firc_ipset_to_link_bare_print(l, 6).n, "%zu");
+    firc_ipset_to_link_free(l);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -1334,6 +1665,10 @@ int main(int argc, char **argv)
     RUN_TEST(the_v6_table_gets_the_same_rules_with_v6_chunks);
     RUN_TEST(a_subnet_rule_is_a_static_mark_rule_in_the_groups_chain);
     RUN_TEST(a_subnet_rule_with_a_protocol_marks_that_protocol_only);
+    RUN_TEST(bare_prefixes_become_one_set_rule_pair_per_family);
+    RUN_TEST(a_selector_group_s_bare_prefixes_are_one_jump);
+    RUN_TEST(a_protocol_rule_and_a_slash_zero_stay_rules);
+    RUN_TEST(a_group_with_no_bare_prefix_names_no_set);
     RUN_TEST(a_rewrite_drops_a_removed_prefix_and_keeps_one_jump);
     RUN_TEST(prefixes_set_on_the_object_reach_both_engines);
     RUN_TEST(the_chunk_rules_come_from_the_snapshot_the_object_is_given);
@@ -1355,6 +1690,16 @@ int main(int argc, char **argv)
     RUN_TEST(push_doubles_its_room_and_keeps_the_duplicate_scan);
     RUN_TEST(a_subnet_set_narrows_only_when_a_prefix_loses_all_cover);
     RUN_TEST(a_link_reports_the_prefixes_it_holds);
+    RUN_TEST(bare_is_no_protocol_and_a_length);
+    RUN_TEST(bare_lists_are_sorted_unique_and_per_family);
+    RUN_TEST(a_link_prints_its_bare_prefixes_when_it_takes_them);
+    RUN_TEST(a_print_is_the_same_for_the_same_set_in_any_input_order);
+    RUN_TEST(a_print_of_v6_prefixes_hashes_all_sixteen_bytes);
+    RUN_TEST(a_print_differs_for_one_swapped_prefix_of_equal_count);
+    RUN_TEST(the_print_of_one_prefix_is_this_number);
+    RUN_TEST(set_names_are_chain_letter_family);
+    RUN_TEST(a_chain_too_long_for_a_set_name_is_refused);
+    RUN_TEST(a_link_names_its_chain);
     RUN_TEST(a_list_group_accepts_and_masquerades_through_every_entry);
     RUN_TEST(the_egress_subchain_returns_only_listed_interfaces);
     RUN_TEST(a_one_entry_group_keeps_its_single_egress_rule);

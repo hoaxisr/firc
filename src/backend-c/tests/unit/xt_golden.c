@@ -306,6 +306,8 @@ typedef struct view {
     uint32_t n;
     pchain_t chains[512];
     size_t nc;
+    firc_test_xt_namer_fn namer;
+    void *namer_ud;
 } view_t;
 
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -448,7 +450,17 @@ static bool say_string(out_t *o, const uint8_t *p) {
     return true;
 }
 
-static bool say_match(out_t *o, bool v6, const char *name, uint8_t rev, const uint8_t *p) {
+static bool say_set(out_t *o, const view_t *v, const uint8_t *p) {
+    xt_set_info_t si;
+    memcpy(&si, p, sizeof(si));
+    char name[32];
+    if (v->namer == NULL || si.dim != 1 || si.flags != 0 || !v->namer(v->namer_ud, si.index, name)) { return false; }
+    say(o, " -m set --match-set %s dst", name);
+    return true;
+}
+
+static bool say_match(out_t *o, const view_t *v, bool v6, const char *name, uint8_t rev, const uint8_t *p) {
+    if (strcmp(name, "set") == 0 && rev == 1) { return say_set(o, v, p); }
     if (strcmp(name, "mark") == 0 && rev == 1) {
         xt_mark_mtinfo1_t mi;
         memcpy(&mi, p, sizeof(mi));
@@ -604,7 +616,7 @@ static bool say_rule(out_t *o, const view_t *v, uint32_t off) {
         if (ip.proto == 6) { say(o, " -p tcp"); } else if (ip.proto == 17) { say(o, " -p udp"); } else if (ip.proto != 0) { return false; }
     }
     for (uint32_t m = v->eh; m < toff; m += rd16(e + m)) {
-        if (!say_match(o, v6, (const char *)e + m + 2, e[m + 31], e + m + 32)) { return false; }
+        if (!say_match(o, v, v6, (const char *)e + m + 2, e[m + 31], e + m + 32)) { return false; }
     }
     const uint8_t *t = e + toff;
     const char *tname = (const char *)t + 2;
@@ -676,8 +688,15 @@ static int chain_cmp(const void *a, const void *b) {
 }
 
 char *firc_test_xt_print(firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info, const uint8_t *blob) {
+    return firc_test_xt_print_named(fam, table, info, blob, NULL, NULL);
+}
+
+char *firc_test_xt_print_named(firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info, const uint8_t *blob,
+                               firc_test_xt_namer_fn namer, void *namer_ud) {
     view_t *v = calloc(1, sizeof(*v));
     if (v == NULL) { return NULL; }
+    v->namer = namer;
+    v->namer_ud = namer_ud;
     bool v6 = fam == FIRC_IPT_PROTO_IPV6;
     v->fam = fam;
     v->blob = blob;

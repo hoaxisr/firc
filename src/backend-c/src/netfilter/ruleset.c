@@ -26,6 +26,7 @@ struct firc_ruleset {
     bool dev_narrowed;
     _Atomic int pass;
     _Atomic bool flush_owed;
+    _Atomic bool sets_stale;
     size_t start_active;
     bool start_blocked;
 };
@@ -44,6 +45,14 @@ void firc_ruleset_set_pass(firc_ruleset_t *rs, firc_ruleset_pass_t pass) {
 }
 
 void firc_ruleset_owe_flush(firc_ruleset_t *rs) { atomic_store_explicit(&rs->flush_owed, true, memory_order_relaxed); }
+
+bool firc_ruleset_sets_stale(const firc_ruleset_t *rs) {
+    return rs != NULL && atomic_load_explicit(&((firc_ruleset_t *)rs)->sets_stale, memory_order_relaxed);
+}
+
+void firc_ruleset_set_sets_stale(firc_ruleset_t *rs, bool stale) {
+    atomic_store_explicit(&rs->sets_stale, stale, memory_order_relaxed);
+}
 
 bool firc_ruleset_take_flush(firc_ruleset_t *rs) {
     return atomic_exchange_explicit(&rs->flush_owed, false, memory_order_relaxed);
@@ -561,6 +570,26 @@ firc_err_t firc_ruleset_prefixes(const firc_ruleset_t *rs, firc_nf_prefixes_t *o
         return FIRC_OK;
     }
     return firc_ipset_to_link_prefixes(rs->ipset_to_link, out);
+}
+
+firc_err_t firc_ruleset_bare(const firc_ruleset_t *rs, uint8_t family, firc_nf_prefixes_t *out) {
+    if (!firc_ruleset_routed(rs)) {
+        out->v = NULL;
+        out->n = 0;
+        return FIRC_OK;
+    }
+    return firc_ipset_to_link_bare(rs->ipset_to_link, family, out);
+}
+
+firc_nf_print_t firc_ruleset_bare_print(const firc_ruleset_t *rs, uint8_t family) {
+    return firc_ruleset_routed(rs) ? firc_ipset_to_link_bare_print(rs->ipset_to_link, family) : (firc_nf_print_t){0, 0};
+}
+
+bool firc_ruleset_has_bare(const firc_ruleset_t *rs, uint8_t family) { return firc_ruleset_bare_print(rs, family).n > 0; }
+
+firc_err_t firc_ruleset_set_name(const firc_ruleset_t *rs, uint8_t family, bool scratch, char *out, size_t cap) {
+    if (!firc_ruleset_routed(rs)) { return FIRC_ERR_STATE; }
+    return firc_ipset_to_link_set_name_of(firc_ipset_to_link_chain(rs->ipset_to_link), family, scratch, out, cap);
 }
 
 bool firc_ruleset_has_devices(const firc_ruleset_t *rs) {

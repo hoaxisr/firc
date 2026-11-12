@@ -36,6 +36,9 @@ struct firc_fake_xt {
     unsigned infos_since_race;
     fake_lack_t lacks[8];
     size_t n_lacks;
+    struct { char name[32]; uint16_t index; } sets[16];
+    size_t n_sets, set_asks;
+    int fail_sets;
     bool lock_held, firc_holds;
     size_t replaces, reads, revision_asks, reads_under_lock, writes_outside_lock;
     void (*on_read)(void *ud, const char *table);
@@ -206,6 +209,8 @@ static const kext_t k_exts[] = {
     {"string", false, 1, 0, 0, sizeof(xt_string_info_t), ALL_HOOKS, NULL},
     {"addrtype", false, 0, 4, 0, 12u, ALL_HOOKS, NULL},
     {"addrtype", false, 1, 0, 0, sizeof(xt_addrtype_info_v1_t), ALL_HOOKS, NULL},
+    {"set", false, 1, 0, 0, sizeof(xt_set_info_t), ALL_HOOKS, NULL},
+    {"set", false, 4, 0, 0, 48u, ALL_HOOKS, NULL},
 };
 
 static const kext_t *kext_find(bool v6, bool target, const char *name, uint8_t rev, int *miss) {
@@ -226,7 +231,23 @@ typedef struct kentry {
     uint16_t proto;
     uint32_t mask;
     const char *table;
+    const firc_fake_xt_t *f;
 } kentry_t;
+
+static bool lacked(const firc_fake_xt_t *f, const char *name, uint8_t rev) {
+    for (size_t i = 0; i < f->n_lacks; i++) {
+        const fake_lack_t *l = &f->lacks[i];
+        if (!l->any && !l->target && l->rev == rev && strncmp(l->name, name, XT_NAME_LEN) == 0) { return true; }
+    }
+    return false;
+}
+
+static bool set_known(const firc_fake_xt_t *f, uint16_t index) {
+    for (size_t i = 0; i < f->n_sets; i++) {
+        if (f->sets[i].index == index) { return true; }
+    }
+    return false;
+}
 
 static bool ip_proto_is(const kentry_t *e, uint16_t proto) { return e->proto == proto && !e->inv_proto; }
 
@@ -234,6 +255,9 @@ static int ext_check(const kentry_t *e, const uint8_t *x, bool target) {
     int miss = 0;
     const kext_t *k = kext_find(e->v6, target, (const char *)x + 2, x[31], &miss);
     if (k == NULL) { return miss == EPROTONOSUPPORT ? ENOENT : miss; }
+    if (!target && strcmp(k->name, "set") == 0 && (lacked(e->f, k->name, k->rev) || !set_known(e->f, g16(x + 32)))) {
+        return ENOENT;
+    }
     if ((uint32_t)g16(x) - 32u != XT_ALIGN8(k->size) || (k->table != NULL && strcmp(k->table, e->table) != 0) ||
         (e->mask & ~k->hooks) != 0 || (k->proto != 0 && !ip_proto_is(e, k->proto))) {
         return EINVAL;
@@ -255,7 +279,7 @@ static int ext_check(const kentry_t *e, const uint8_t *x, bool target) {
     return 0;
 }
 
-static int kernel_check(bool v6, const char *table, const firc_xt_info_t *in, const uint8_t *b) {
+static int kernel_check(const firc_fake_xt_t *f, bool v6, const char *table, const firc_xt_info_t *in, const uint8_t *b) {
     if (!kernel_accepts(v6, in, b)) { return EINVAL; }
     uint32_t at_flags = v6 ? 131u : 82u;
     uint8_t flag_mask = v6 ? 0x07u : 0x03u;
@@ -281,7 +305,7 @@ static int kernel_check(bool v6, const char *table, const firc_xt_info_t *in, co
     for (uint32_t i = 0; err == 0 && i < n; i++) {
         const uint8_t *e = b + offs[i];
         kentry_t ke = {v6, (e[at_flags + 1] & 0x40u) != 0, (e[at_flags] & XT_IP6T_F_PROTO) != 0, g16(e + (v6 ? 128u : 80u)),
-                       mask[i], table};
+                       mask[i], table, f};
         for (uint32_t m = v.eh; err == 0 && m < g16(e + v.at_t); m += g16(e + m)) { err = ext_check(&ke, e + m, false); }
         if (err == 0) { err = ext_check(&ke, target_at(&v, i), true); }
     }
@@ -406,7 +430,7 @@ static int op_replace(void *ud, firc_ipt_proto_t fam, const char *table, const f
             f->race = FIRC_FAKE_XT_RACE_NONE;
             t->blob[v6 ? 31 : 7] ^= 0x01u;
         }
-        int ke = kernel_check(v6, table, info, blob);
+        int ke = kernel_check(f, v6, table, info, blob);
         uint8_t *nb = malloc(info->size ? info->size : 1);
         firc_xt_counter_t *nc = calloc(info->num_entries ? info->num_entries : 1, sizeof(*nc));
         if (nb == NULL || nc == NULL) {
@@ -500,8 +524,23 @@ static void op_unlock(void *ud) {
 }
 static void op_destroy(void *ud) { (void)ud; }
 
+static int op_set_index(void *ud, const char *name, uint16_t *index) {
+    firc_fake_xt_t *f = ud;
+    pthread_mutex_lock(&f->mu);
+    f->set_asks++;
+    int err = f->fail_sets != 0 ? f->fail_sets : ENOENT;
+    for (size_t i = 0; i < f->n_sets && f->fail_sets == 0; i++) {
+        if (strcmp(f->sets[i].name, name) == 0) {
+            *index = f->sets[i].index;
+            err = 0;
+        }
+    }
+    pthread_mutex_unlock(&f->mu);
+    return err;
+}
+
 static const firc_xt_kernel_ops_t k_ops = {op_get_info, op_get_entries, op_replace, op_add_counters,
-                                           op_get_revision, op_lock, op_unlock, op_destroy};
+                                           op_get_revision, op_lock, op_unlock, op_destroy, op_set_index};
 
 bool firc_fake_xt_load(firc_fake_xt_t *f, const char *table, const firc_xt_info_t *info, const uint8_t *blob) {
     pthread_mutex_lock(&f->mu);
@@ -576,6 +615,9 @@ void firc_fake_xt_reset(firc_fake_xt_t *f) {
     f->race = FIRC_FAKE_XT_RACE_NONE;
     f->infos_since_race = 0;
     f->n_lacks = 0;
+    f->n_sets = 0;
+    f->set_asks = 0;
+    f->fail_sets = 0;
     f->lock_held = false;
     memset(f->fail_tables, 0, sizeof(f->fail_tables));
     free(f->order);
@@ -623,6 +665,7 @@ void firc_fake_xt_fail_next_replace(firc_fake_xt_t *f, int err) { FAKE_SET(fail_
 void firc_fake_xt_fail_next_counters(firc_fake_xt_t *f, int err) { FAKE_SET(fail_counters, err); }
 void firc_fake_xt_hold_lock(firc_fake_xt_t *f, bool held) { FAKE_SET(lock_held, held); }
 void firc_fake_xt_fail_revisions(firc_fake_xt_t *f, int err) { FAKE_SET(fail_revisions, err); }
+void firc_fake_xt_fail_sets(firc_fake_xt_t *f, int err) { FAKE_SET(fail_sets, err); }
 
 void firc_fake_xt_race_next(firc_fake_xt_t *f, firc_fake_xt_race_t how) {
     pthread_mutex_lock(&f->mu);
@@ -749,3 +792,48 @@ static char *copy_order(firc_fake_xt_t *f, const char *const *buf) {
 
 char *firc_fake_xt_write_order(firc_fake_xt_t *f) { return copy_order(f, (const char *const *)&f->order); }
 char *firc_fake_xt_read_order(firc_fake_xt_t *f) { return copy_order(f, (const char *const *)&f->rorder); }
+
+void firc_fake_xt_set(firc_fake_xt_t *k, const char *name, uint16_t index) {
+    pthread_mutex_lock(&k->mu);
+    size_t i = 0;
+    while (i < k->n_sets && strcmp(k->sets[i].name, name) != 0) { i++; }
+    if (i < 16) {
+        if (i == k->n_sets) { k->n_sets++; }
+        memset(k->sets[i].name, 0, sizeof(k->sets[i].name));
+        strncpy(k->sets[i].name, name, sizeof(k->sets[i].name) - 1);
+        k->sets[i].index = index;
+    }
+    pthread_mutex_unlock(&k->mu);
+}
+
+void firc_fake_xt_set_drop(firc_fake_xt_t *k, const char *name) {
+    pthread_mutex_lock(&k->mu);
+    for (size_t i = 0; i < k->n_sets; i++) {
+        if (strcmp(k->sets[i].name, name) == 0) {
+            k->sets[i] = k->sets[--k->n_sets];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&k->mu);
+}
+
+size_t firc_fake_xt_set_asks(firc_fake_xt_t *k) {
+    pthread_mutex_lock(&k->mu);
+    size_t n = k->set_asks;
+    pthread_mutex_unlock(&k->mu);
+    return n;
+}
+
+bool firc_fake_xt_namer(void *k, uint16_t index, char *out) {
+    firc_fake_xt_t *f = k;
+    pthread_mutex_lock(&f->mu);
+    bool found = false;
+    for (size_t i = 0; i < f->n_sets && !found; i++) {
+        if (f->sets[i].index == index) {
+            memcpy(out, f->sets[i].name, sizeof(f->sets[i].name));
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&f->mu);
+    return found;
+}

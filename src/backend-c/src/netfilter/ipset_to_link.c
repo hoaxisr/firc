@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include "firc/pool_reject.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,7 @@ struct firc_ipset_to_link {
     size_t n_sub4;
     firc_ipv6_subnet_t *sub6;
     size_t n_sub6;
+    firc_nf_print_t bare_print[2];
     firc_nf_devices_t dev;
     bool pool_rejected;
     uint32_t start_idx;
@@ -371,6 +373,9 @@ static firc_err_t build_iptables_rules(firc_ipset_to_link_t *l, firc_ipt_t *ipt)
                                                      l->sub6, l->n_sub6, &l->dev);
 }
 
+static firc_err_t bare_of(const firc_ipv4_subnet_t *sub4, size_t n_sub4, const firc_ipv6_subnet_t *sub6,
+                          size_t n_sub6, uint8_t family, firc_nf_prefixes_t *out);
+
 firc_err_t firc_ipset_to_link_set_subnets(firc_ipset_to_link_t *l, const firc_ipv4_subnet_t *v4,
                                           size_t n4, const firc_ipv6_subnet_t *v6, size_t n6,
                                           bool *changed) {
@@ -389,6 +394,19 @@ firc_err_t firc_ipset_to_link_set_subnets(firc_ipset_to_link_t *l, const firc_ip
     }
     if (n4) { memcpy(c4, v4, n4 * sizeof(*c4)); }
     if (n6) { memcpy(c6, v6, n6 * sizeof(*c6)); }
+    firc_nf_print_t prints[2];
+    for (size_t f = 0; f < 2; f++) {
+        firc_nf_prefixes_t bare = {NULL, 0};
+        if (bare_of(c4, n4, c6, n6, f == 0 ? 4 : 6, &bare) != FIRC_OK) {
+            free(c4);
+            free(c6);
+            return FIRC_ERR_NOMEM;
+        }
+        prints[f] = firc_nf_prefixes_print(&bare);
+        firc_nf_prefixes_clear(&bare);
+    }
+    l->bare_print[0] = prints[0];
+    l->bare_print[1] = prints[1];
     free(l->sub4);
     free(l->sub6);
     l->sub4 = c4;
@@ -439,6 +457,83 @@ firc_err_t firc_nf_prefixes_of(const firc_ipv4_subnet_t *v4, size_t n4, const fi
 
 firc_err_t firc_ipset_to_link_prefixes(const firc_ipset_to_link_t *l, firc_nf_prefixes_t *out) {
     return firc_nf_prefixes_of(l->sub4, l->n_sub4, l->sub6, l->n_sub6, out);
+}
+
+bool firc_subnet4_is_bare(const firc_ipv4_subnet_t *s) {
+    return s->proto == 0 && s->cidr != 0;
+}
+
+bool firc_subnet6_is_bare(const firc_ipv6_subnet_t *s) {
+    return s->proto == 0 && s->cidr != 0;
+}
+
+static _Atomic size_t g_bare_builds;
+
+size_t firc_ipset_to_link_bare_builds_for_test(void) { return g_bare_builds; }
+
+firc_nf_print_t firc_ipset_to_link_bare_print(const firc_ipset_to_link_t *l, uint8_t family) {
+    return family == 4 ? l->bare_print[0] : family == 6 ? l->bare_print[1] : (firc_nf_print_t){0, 0};
+}
+
+static firc_err_t bare_of(const firc_ipv4_subnet_t *sub4, size_t n_sub4, const firc_ipv6_subnet_t *sub6,
+                          size_t n_sub6, uint8_t family, firc_nf_prefixes_t *out) {
+    out->v = NULL;
+    out->n = 0;
+    if (family != 4 && family != 6) { return FIRC_ERR_INVAL; }
+    size_t k = 0;
+    if (family == 4) {
+        for (size_t i = 0; i < n_sub4; i++) { k += firc_subnet4_is_bare(&sub4[i]); }
+    } else {
+        for (size_t i = 0; i < n_sub6; i++) { k += firc_subnet6_is_bare(&sub6[i]); }
+    }
+    firc_nf_prefix_t *v = k ? calloc(k, sizeof(*v)) : NULL;
+    if (k && v == NULL) { return FIRC_ERR_NOMEM; }
+    firc_nf_prefixes_t bare = {.v = v, .n = 0};
+    if (family == 4) {
+        for (size_t i = 0; i < n_sub4; i++) {
+            if (!firc_subnet4_is_bare(&sub4[i])) { continue; }
+            put_prefix(&v[bare.n++], 4, sub4[i].addr, 4, sub4[i].cidr, 32);
+        }
+    } else {
+        for (size_t i = 0; i < n_sub6; i++) {
+            if (!firc_subnet6_is_bare(&sub6[i])) { continue; }
+            put_prefix(&v[bare.n++], 6, sub6[i].addr, 16, sub6[i].cidr, 128);
+        }
+    }
+    if (bare.n > 1) { qsort(v, bare.n, sizeof(*v), prefix_cmp); }
+    size_t u = 0;
+    for (size_t i = 0; i < bare.n; i++) {
+        if (u == 0 || prefix_cmp(&v[u - 1], &v[i]) != 0) { v[u++] = v[i]; }
+    }
+    out->v = v;
+    out->n = u;
+    return FIRC_OK;
+}
+
+firc_err_t firc_ipset_to_link_bare(const firc_ipset_to_link_t *l, uint8_t family, firc_nf_prefixes_t *out) {
+    g_bare_builds++;
+    return bare_of(l->sub4, l->n_sub4, l->sub6, l->n_sub6, family, out);
+}
+
+firc_nf_print_t firc_nf_prefixes_print(const firc_nf_prefixes_t *p) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < p->n; i++) {
+        size_t len = p->v[i].family == 6 ? 16 : 4;
+        h = (h ^ p->v[i].cidr) * 0x100000001b3ULL;
+        for (size_t j = 0; j < len; j++) { h = (h ^ p->v[i].addr[j]) * 0x100000001b3ULL; }
+    }
+    return (firc_nf_print_t){.n = p->n, .hash = h};
+}
+
+firc_err_t firc_ipset_to_link_set_name_of(const char *chain, uint8_t family, bool scratch, char *out, size_t cap) {
+    if (family != 4 && family != 6) { return FIRC_ERR_INVAL; }
+    size_t lim = cap < FIRC_SET_NAME_MAX ? cap : FIRC_SET_NAME_MAX;
+    int n = snprintf(out, cap, "%s%c%u", chain, scratch ? 'T' : 'S', (unsigned)family);
+    return n < 0 || (size_t)n >= lim ? FIRC_ERR_INVAL : FIRC_OK;
+}
+
+const char *firc_ipset_to_link_chain(const firc_ipset_to_link_t *l) {
+    return l->chain_name;
 }
 
 static bool prefix_covered(const firc_nf_prefix_t *w, const firc_nf_prefixes_t *now, const bool *present) {
@@ -643,16 +738,16 @@ static const char *proto_name(uint8_t proto) {
     return proto == IPPROTO_TCP ? "tcp" : proto == IPPROTO_UDP ? "udp" : NULL;
 }
 
-/* Real prefixes: original direction and not yet handled; no -d for /0. */
-static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const char *cidr,
-                                   unsigned prefix, uint8_t proto, const char *ports,
+/* Original direction and not yet handled. */
+static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const char *const *dst, size_t nd,
+                                   const char *const *set, size_t ns, uint8_t proto, const char *ports,
                                    const char *mark_str, const char *jump) {
     char handled[32];
     snprintf(handled, sizeof(handled), "0x%x/0x%x", FIRC_MARK_HANDLED, FIRC_MARK_HANDLED);
     const char *pn = proto_name(proto);
     const char *head[8];
     size_t nh = 0;
-    if (prefix != 0) { head[nh++] = "-d"; head[nh++] = cidr; }
+    for (size_t i = 0; i < nd; i++) { head[nh++] = dst[i]; }
     if (pn != NULL) { head[nh++] = "-p"; head[nh++] = pn; }
     const char *pm[4];
     size_t np = 0;
@@ -670,6 +765,7 @@ static firc_err_t emit_subnet_rule(firc_ipt_t *ipt, const char *chain, const cha
     for (size_t i = 0; i < 4; i++) { mk[nm++] = dir[i]; cm[nc++] = dir[i]; }
     const char *unm[] = {"-m", "mark", "!", "--mark", handled};
     for (size_t i = 0; i < 5; i++) { mk[nm++] = unm[i]; }
+    for (size_t i = 0; i < ns; i++) { mk[nm++] = set[i]; cm[nc++] = set[i]; }
     for (size_t i = 0; i < np; i++) { mk[nm++] = pm[i]; cm[nc++] = pm[i]; }
     if (jump != NULL) {
         mk[nm++] = "-j";
@@ -698,20 +794,37 @@ firc_err_t firc_ipset_to_link_build_subnet_rules_dev(firc_ipt_t *ipt, const char
     char mark_str[32];
     snprintf(mark_str, sizeof(mark_str), "0x%x/0x%x", mark, FIRC_MARK_WRITE_MASK);
     bool is6 = firc_ipt_proto(ipt) == FIRC_IPT_PROTO_IPV6;
+    size_t n = is6 ? n6 : n4;
+    bool any_bare = false;
+    for (size_t i = 0; i < n; i++) {
+        /* Ports without a protocol would mark every port. */
+        if ((is6 ? v6[i].proto : v4[i].proto) == 0 && (is6 ? v6[i].ports : v4[i].ports)[0] != '\0') {
+            return FIRC_ERR_INVAL;
+        }
+        any_bare = any_bare || (is6 ? firc_subnet6_is_bare(&v6[i]) : firc_subnet4_is_bare(&v4[i]));
+    }
+    const char *jump = with_dev ? dchain : NULL;
+    if (any_bare) {
+        char set[FIRC_SET_NAME_MAX];
+        firc_err_t err = firc_ipset_to_link_set_name_of(chain_name, is6 ? 6 : 4, false, set, sizeof(set));
+        if (err != FIRC_OK) { return err; }
+        const char *dst[] = {"-m", "set", "--match-set", set, "dst"};
+        err = emit_subnet_rule(ipt, chain_name, NULL, 0, dst, 5, 0, "", mark_str, jump);
+        if (err != FIRC_OK) { return err; }
+    }
     char addr[INET6_ADDRSTRLEN], cidr[64];
-    for (size_t i = 0; i < (is6 ? n6 : n4); i++) {
+    for (size_t i = 0; i < n; i++) {
+        if (is6 ? firc_subnet6_is_bare(&v6[i]) : firc_subnet4_is_bare(&v4[i])) { continue; }
         const void *raw = is6 ? (const void *)v6[i].addr : (const void *)v4[i].addr;
         unsigned prefix = is6 ? v6[i].cidr : v4[i].cidr;
         if (inet_ntop(is6 ? AF_INET6 : AF_INET, raw, addr, sizeof(addr)) == NULL) {
             return FIRC_ERR_INVAL;
         }
         snprintf(cidr, sizeof(cidr), "%s/%u", addr, prefix);
-        uint8_t proto = is6 ? v6[i].proto : v4[i].proto;
-        const char *ports = is6 ? v6[i].ports : v4[i].ports;
-        /* Ports without a protocol would mark every port. */
-        if (proto == 0 && ports[0] != '\0') { return FIRC_ERR_INVAL; }
-        firc_err_t err = emit_subnet_rule(ipt, chain_name, cidr, prefix, proto, ports, mark_str,
-                                          with_dev ? dchain : NULL);
+        const char *dst[] = {"-d", cidr};
+        firc_err_t err = emit_subnet_rule(ipt, chain_name, dst, prefix != 0 ? 2 : 0, NULL, 0,
+                                          is6 ? v6[i].proto : v4[i].proto, is6 ? v6[i].ports : v4[i].ports,
+                                          mark_str, jump);
         if (err != FIRC_OK) { return err; }
     }
     return FIRC_OK;

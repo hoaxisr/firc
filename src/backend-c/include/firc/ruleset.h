@@ -93,6 +93,9 @@ firc_ruleset_pass_t firc_ruleset_pass(const firc_ruleset_t *rs);
 void firc_ruleset_set_pass(firc_ruleset_t *rs, firc_ruleset_pass_t pass);
 void firc_ruleset_owe_flush(firc_ruleset_t *rs);
 bool firc_ruleset_take_flush(firc_ruleset_t *rs);
+/* Whether a set of the group failed to take its current prefixes; any thread. */
+bool firc_ruleset_sets_stale(const firc_ruleset_t *rs);
+void firc_ruleset_set_sets_stale(firc_ruleset_t *rs, bool stale);
 
 /* Hands the subnet prefixes and devices to the link; the next pass writes them. *chain_changed is set even on error. */
 firc_err_t firc_ruleset_sync(firc_ruleset_t *rs, bool *chain_changed);
@@ -112,6 +115,15 @@ bool firc_ruleset_devices_narrowed(const firc_ruleset_t *rs);
 const firc_nf_devices_t *firc_ruleset_devices(const firc_ruleset_t *rs);
 /* The prefixes the link holds, empty while not routed; out is overwritten. */
 firc_err_t firc_ruleset_prefixes(const firc_ruleset_t *rs, firc_nf_prefixes_t *out);
+
+/* The routed group's bare prefixes of family 4 or 6, sorted and unique; empty while not routed. */
+firc_err_t firc_ruleset_bare(const firc_ruleset_t *rs, uint8_t family, firc_nf_prefixes_t *out);
+/* The routed group's bare print of family (see firc_ipset_to_link_bare_print); n 0 while not routed. */
+firc_nf_print_t firc_ruleset_bare_print(const firc_ruleset_t *rs, uint8_t family);
+/* Whether the routed group holds a bare prefix of family; false while not routed. */
+bool firc_ruleset_has_bare(const firc_ruleset_t *rs, uint8_t family);
+/* The routed group's live or scratch set name for family; FIRC_ERR_STATE while not routed. */
+firc_err_t firc_ruleset_set_name(const firc_ruleset_t *rs, uint8_t family, bool scratch, char *out, size_t cap);
 
 /* Test seam: proto is 0, IPPROTO_TCP or IPPROTO_UDP; ports in iptables form, "" for all. */
 typedef void (*firc_ruleset_plan_fn)(int family, const uint8_t *addr, uint8_t cidr, uint8_t proto, const char *ports,

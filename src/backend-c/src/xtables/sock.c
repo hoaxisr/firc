@@ -151,8 +151,34 @@ static void real_destroy(void *ud) {
     free(k);
 }
 
+static int real_set_index(void *ud, const char *name, uint16_t *index) {
+    (void)ud;
+    int fd = socket(AF_INET, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_RAW);
+    if (fd < 0) { return errno; }
+    xt_ip_set_req_version_t v;
+    memset(&v, 0, sizeof(v));
+    v.op = XT_IP_SET_OP_VERSION;
+    socklen_t len = sizeof(v);
+    int err = getsockopt(fd, XT_SOL_IP, XT_SO_IP_SET, &v, &len) != 0 ? errno : 0;
+    xt_ip_set_req_get_set_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = XT_IP_SET_OP_GET_BYNAME;
+    g.version = v.version;
+    memcpy(g.set.name, name, strnlen(name, XT_IPSET_MAXNAMELEN - 1));
+    if (err == 0) {
+        len = sizeof(g);
+        err = getsockopt(fd, XT_SOL_IP, XT_SO_IP_SET, &g, &len) != 0 ? errno : 0;
+    }
+    close(fd);
+    if (err != 0) { return err; }
+    if (g.set.index == XT_IPSET_INVALID_ID) { return ENOENT; }
+    *index = g.set.index;
+    return 0;
+}
+
 static const firc_xt_kernel_ops_t k_real_ops = {real_get_info,     real_get_entries, real_replace, real_add_counters,
-                                                real_get_revision, real_lock,        real_unlock,  real_destroy};
+                                                real_get_revision, real_lock,        real_unlock,  real_destroy,
+                                                real_set_index};
 
 firc_xt_t *firc_xt_real_new(firc_ipt_proto_t fam) {
     real_kernel_t *k = calloc(1, sizeof(*k));

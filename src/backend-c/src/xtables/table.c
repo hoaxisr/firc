@@ -12,15 +12,21 @@ static uint32_t userspace(const uint8_t *ext, uint32_t size) {
     return keep < size ? keep : size;
 }
 
+static bool same_but(const uint8_t *a, const uint8_t *b, uint32_t from, uint32_t to, uint32_t skip) {
+    if (skip < from || skip >= to || to - skip < 2u) { return memcmp(a + from, b + from, to - from) == 0; }
+    return memcmp(a + from, b + from, skip - from) == 0 && memcmp(a + skip + 2u, b + skip + 2u, to - skip - 2u) == 0;
+}
+
 bool firc_xt_entry_same(firc_ipt_proto_t fam, const firc_xt_entry_t *a, const firc_xt_entry_t *b) {
     if (a->len != b->len || a->points_at != b->points_at || strcmp(a->jump, b->jump) != 0) { return false; }
+    uint32_t skip = a->set != 0 ? a->set_at : FIRC_XT_NONE;
     uint32_t eh = firc_xt_ehdr(fam), toff = firc_xt_rd16(a->bytes + firc_xt_at_toff(fam));
     if (toff != firc_xt_rd16(b->bytes + firc_xt_at_toff(fam)) || toff < eh || toff > a->len) { return false; }
     if (memcmp(a->bytes, b->bytes, eh) != 0) { return false; }
     for (uint32_t m = eh; m < toff;) {
         uint32_t ms = firc_xt_rd16(a->bytes + m);
         if (ms < XT_MATCH_HDR_LEN || ms > toff - m || ms != firc_xt_rd16(b->bytes + m)) { return false; }
-        if (memcmp(a->bytes + m, b->bytes + m, userspace(a->bytes + m, ms)) != 0) { return false; }
+        if (!same_but(a->bytes, b->bytes, m, m + userspace(a->bytes + m, ms), skip)) { return false; }
         m += ms;
     }
     if (!jumps(a)) { return memcmp(a->bytes + toff, b->bytes + toff, a->len - toff) == 0; }
@@ -51,14 +57,37 @@ static void cut_rule(firc_xt_chain_t *c, size_t at) {
     c->n_rules--;
 }
 
+uint16_t firc_xt_table_set(firc_xt_table_t *t, const char *name) {
+    for (size_t i = 0; i < t->n_sets; i++) {
+        if (strcmp(t->sets[i].name, name) == 0) { return (uint16_t)(i + 1); }
+    }
+    if (t->n_sets == UINT16_MAX) { return 0; }
+    if (t->n_sets == t->cap_sets) {
+        size_t cap = t->cap_sets ? t->cap_sets * 2 : 4;
+        firc_xt_tset_t *grown = realloc(t->sets, cap * sizeof(*grown));
+        if (grown == NULL) { return 0; }
+        t->sets = grown;
+        t->cap_sets = cap;
+    }
+    firc_xt_tset_t *s = &t->sets[t->n_sets++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    return (uint16_t)t->n_sets;
+}
+
 static firc_err_t encode_one(firc_xt_table_t *t, const char *chain, const firc_ipt_rule_t *r, firc_xt_entry_t *e,
                              uint32_t *exts, char *why, size_t why_len) {
-    firc_err_t err = firc_xt_encode(t->fam, t->mac_rev, r, e, exts);
+    char set[FIRC_XT_NAME_LEN];
+    firc_err_t err = firc_xt_encode(t->fam, t->mac_rev, r, e, exts, set);
     if (err == FIRC_ERR_INVAL) {
         char *words = firc_ipt_rule_string(r);
         snprintf(why, why_len, "the rule \"%s\" is outside what firc writes", words != NULL ? words : "");
         free(words);
         return err;
+    }
+    if (err == FIRC_OK && set[0] != '\0' && (e->set = firc_xt_table_set(t, set)) == 0) {
+        firc_xt_entry_clear(e);
+        return FIRC_ERR_NOMEM;
     }
     if (err != FIRC_OK || e->jump[0] == '\0') { return err; }
     const firc_xt_chain_t *to = firc_xt_find_chain(t, e->jump);
@@ -89,8 +118,11 @@ static firc_err_t replace_rules(firc_xt_table_t *t, const char *name, firc_xt_en
     }
     for (size_t i = 0; i < n && i < c->n_rules; i++) {
         if (firc_xt_entry_same(t->fam, &fresh[i], &c->rules[i])) {
+            uint16_t set = fresh[i].set, set_at = fresh[i].set_at;
             firc_xt_entry_clear(&fresh[i]);
             fresh[i] = c->rules[i];
+            fresh[i].set = set;
+            fresh[i].set_at = set_at;
             c->rules[i].owned = false;
         }
     }
@@ -139,7 +171,7 @@ static firc_err_t override_from_block(firc_xt_table_t *t, const firc_xt_stage_ch
     }
     firc_xt_entry_t *fresh = calloc(b->n ? b->n : 1, sizeof(*fresh));
     if (fresh == NULL) { return FIRC_ERR_NOMEM; }
-    size_t off = 0, jump = 0;
+    size_t off = 0, jump = 0, set = 0;
     uint32_t eh = firc_xt_ehdr(t->fam);
     uint32_t i = 0;
     for (; i < b->n; i++) {
@@ -153,9 +185,21 @@ static firc_err_t override_from_block(firc_xt_table_t *t, const firc_xt_stage_ch
             snprintf(e->jump, sizeof(e->jump), "%s", b->jumps[jump].chain);
             jump++;
         }
+        if (set < b->n_sets && b->sets[set].entry == i) {
+            if (b->sets[set].at < eh + XT_MATCH_HDR_LEN || b->sets[set].at + 2u > firc_xt_rd16(e->bytes + firc_xt_at_toff(t->fam))) {
+                break;
+            }
+            e->set_at = (uint16_t)b->sets[set].at;
+            e->set = firc_xt_table_set(t, b->sets[set].name);
+            if (e->set == 0) {
+                free(fresh);
+                return FIRC_ERR_NOMEM;
+            }
+            set++;
+        }
         off += e->len;
     }
-    if (i != b->n || off != b->len || jump != b->n_jumps) {
+    if (i != b->n || off != b->len || jump != b->n_jumps || set != b->n_sets) {
         free(fresh);
         snprintf(why, why_len, "the block for %s does not hold the entries it counts", sc->name);
         return FIRC_ERR_INVAL;
@@ -174,6 +218,11 @@ static firc_err_t do_patch(firc_xt_table_t *t, const firc_xt_stage_chain_t *sc, 
         firc_xt_entry_t e;
         err = encode_one(t, sc->name, op->rule, &e, exts, why, why_len);
         if (err != FIRC_OK) { return err; }
+        if (e.set != 0) {
+            snprintf(why, why_len, "a patch of %s carries a set match", c->name);
+            firc_xt_entry_clear(&e);
+            return FIRC_ERR_INVAL;
+        }
         size_t count = 0;
         for (size_t r = 0; r < c->n_rules; r++) { count += firc_xt_entry_same(t->fam, &c->rules[r], &e) ? 1u : 0u; }
         for (; count > 1; count--) {

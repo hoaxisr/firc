@@ -21,6 +21,7 @@
 #include "firc/pool_reject.h"
 #include "firc/ruleset.h"
 #include "firc/rulesnap.h"
+#include "firc/setnl.h"
 #include "firc/xtables.h"
 #include "../../src/xtables/xt_internal.h"
 #include "xt_golden.h"
@@ -209,6 +210,64 @@ static firc_fakeip_cfg_t routing_pool_cfg(void)
     return c;
 }
 
+static int open_sets(firc_setnl_t **out)
+{
+    firc_setnl_caps_t caps;
+    firc_err_t err = firc_setnl_new(out);
+    if (err == FIRC_OK) { err = firc_setnl_probe(*out, &caps); }
+    if (err == FIRC_OK && !caps.has_type) { err = FIRC_ERR_NOSYS; }
+    if (err == FIRC_OK) { return 0; }
+    firc_setnl_free(*out);
+    *out = NULL;
+    if (err == FIRC_ERR_NOSYS) { return 77; }
+    fprintf(stderr, "ip_set: %s\n", firc_err_str(err));
+    return 3;
+}
+
+static int stage_bare_set(const char *chain)
+{
+    firc_nf_prefix_t v[sizeof(g_sub) / sizeof(g_sub[0])];
+    size_t n = 0;
+    for (size_t i = 0; i < g_nsub; i++) {
+        if (!firc_subnet4_is_bare(&g_sub[i])) { continue; }
+        memset(&v[n], 0, sizeof(v[n]));
+        v[n].family = 4;
+        v[n].cidr = g_sub[i].cidr;
+        memcpy(v[n].addr, g_sub[i].addr, 4);
+        n++;
+    }
+    if (n == 0) { return 0; }
+    char live[FIRC_SET_NAME_MAX], scratch[FIRC_SET_NAME_MAX];
+    if (firc_ipset_to_link_set_name_of(chain, 4, false, live, sizeof(live)) != FIRC_OK ||
+        firc_ipset_to_link_set_name_of(chain, 4, true, scratch, sizeof(scratch)) != FIRC_OK) {
+        return 3;
+    }
+    firc_setnl_t *sets = NULL;
+    int rc = open_sets(&sets);
+    if (rc != 0) { return rc; }
+    firc_err_t err = firc_setnl_replace(sets, live, scratch, 4, v, n);
+    firc_setnl_free(sets);
+    if (err != FIRC_OK) {
+        fprintf(stderr, "ip_set %s: %s\n", live, firc_err_str(err));
+        return 3;
+    }
+    return 0;
+}
+
+static int do_unset(const char *name)
+{
+    firc_setnl_t *sets = NULL;
+    int rc = open_sets(&sets);
+    if (rc != 0) { return rc == 77 ? 0 : rc; }
+    firc_err_t err = firc_setnl_destroy(sets, name);
+    firc_setnl_free(sets);
+    if (err != FIRC_OK) {
+        fprintf(stderr, "unset %s: %s\n", name, firc_err_str(err));
+        return 3;
+    }
+    return 0;
+}
+
 static int do_devchain(int argc, char **argv)
 {
     char *end = NULL;
@@ -261,6 +320,11 @@ static int do_devchain(int argc, char **argv)
             return 64;
         }
     }
+    int staged = stage_bare_set("FIRCSEL");
+    if (staged != 0) {
+        firc_group_free(g);
+        return staged;
+    }
     firc_ruleset_lookup_t lk = {arg_mark, NULL, NULL, arg_nets, NULL, NULL};
     firc_nf_devices_t dev;
     if (firc_ruleset_render_devices(g, &lk, &dev) != FIRC_OK) { return 3; }
@@ -301,6 +365,119 @@ static int do_devchain(int argc, char **argv)
         return 3;
     }
     return 0;
+}
+
+#define SETS_CHAIN "FIRCNET"
+#define SETS_FIELD 5
+
+static const char *const sets_first4[] = {"10.77.0.0/16", "192.0.2.0/24"};
+static const char *const sets_then4[] = {"10.78.0.0/16"};
+static const char *const sets_v6[] = {"2001:db8::/32"};
+
+static int sets_fill(firc_setnl_t *s, uint8_t family, const char *const *cidrs, size_t n)
+{
+    firc_nf_prefix_t v[2];
+    if (n > sizeof(v) / sizeof(v[0])) { return 3; }
+    for (size_t i = 0; i < n; i++) {
+        firc_ip_t net;
+        uint8_t len = 0;
+        if (!firc_ip_parse_cidr(cidrs[i], &net, &len)) { return 3; }
+        memset(&v[i], 0, sizeof(v[i]));
+        v[i].family = family;
+        v[i].cidr = len;
+        memcpy(v[i].addr, net.b, family == 6 ? 16 : 4);
+    }
+    char live[FIRC_SET_NAME_MAX], scratch[FIRC_SET_NAME_MAX];
+    if (firc_ipset_to_link_set_name_of(SETS_CHAIN, family, false, live, sizeof(live)) != FIRC_OK ||
+        firc_ipset_to_link_set_name_of(SETS_CHAIN, family, true, scratch, sizeof(scratch)) != FIRC_OK) {
+        return 3;
+    }
+    firc_err_t err = firc_setnl_replace(s, live, scratch, family, v, n);
+    if (err != FIRC_OK) {
+        fprintf(stderr, "ip_set %s: %s\n", live, firc_err_str(err));
+        return 3;
+    }
+    return 0;
+}
+
+static int sets_commit(bool rules)
+{
+    firc_log_set_fd(STDERR_FILENO);
+    firc_ipv4_subnet_t sub4[2];
+    firc_ipv6_subnet_t sub6[1];
+    uint32_t mark = 0;
+    if (!firc_mark_for_field(SETS_FIELD, &mark) || !firc_rule_parse_subnet4(sets_first4[0], &sub4[0]) ||
+        !firc_rule_parse_subnet4(sets_first4[1], &sub4[1]) || !firc_rule_parse_subnet6(sets_v6[0], &sub6[0])) {
+        return 3;
+    }
+    for (int f = 0; f < 2; f++) {
+        bool v6 = f == 1;
+        firc_xt_t *xt = firc_xt_real_new(v6 ? FIRC_IPT_PROTO_IPV6 : FIRC_IPT_PROTO_IPV4);
+        if (xt == NULL) {
+            perror("x_tables raw socket");
+            return 3;
+        }
+        firc_ipt_t *ipt = firc_ipt_new(xt, "FIRC");
+        if (ipt == NULL) { return 3; }
+        firc_err_t err = firc_netfilter_register_base_chains(v6 ? NULL : ipt, v6 ? ipt : NULL);
+        if (err == FIRC_OK && rules) {
+            err = firc_ipset_to_link_build_rules(ipt, SETS_CHAIN, "tun0", mark, SETS_FIELD, NULL, NULL);
+        }
+        if (err == FIRC_OK && rules) {
+            err = firc_ipset_to_link_build_subnet_rules_dev(ipt, SETS_CHAIN, mark, sub4, 2, sub6, 1, NULL);
+        }
+        if (err == FIRC_OK) { err = firc_ipt_commit(ipt); }
+        firc_ipt_free(ipt);
+        if (err != FIRC_OK) {
+            fprintf(stderr, "sets: %s commit: %s\n", v6 ? "v6" : "v4", firc_err_str(err));
+            return 3;
+        }
+    }
+    return 0;
+}
+
+static void sets_count(const char *name, void *ud)
+{
+    if (strncmp(name, SETS_CHAIN, strlen(SETS_CHAIN)) == 0) {
+        printf("left %s\n", name);
+        (*(size_t *)ud)++;
+    }
+}
+
+static int do_sets(const char *op)
+{
+    firc_setnl_t *s = NULL;
+    int rc = open_sets(&s);
+    if (rc != 0) { return rc; }
+    if (strcmp(op, "write") == 0) {
+        rc = sets_fill(s, 4, sets_first4, 2);
+        if (rc == 0) { rc = sets_fill(s, 6, sets_v6, 1); }
+        if (rc == 0) { rc = sets_commit(true); }
+    } else if (strcmp(op, "swap") == 0) {
+        rc = sets_fill(s, 4, sets_then4, 1);
+    } else if (strcmp(op, "destroy") == 0) {
+        for (uint8_t family = 4; family <= 6; family = (uint8_t)(family + 2)) {
+            char live[FIRC_SET_NAME_MAX];
+            if (firc_ipset_to_link_set_name_of(SETS_CHAIN, family, false, live, sizeof(live)) != FIRC_OK) {
+                rc = 3;
+                break;
+            }
+            firc_err_t err = firc_setnl_destroy(s, live);
+            printf("destroy %s: %s\n", live, firc_err_str(err));
+            if (err != FIRC_ERR_AGAIN) { rc = 1; }
+        }
+    } else if (strcmp(op, "sweep") == 0) {
+        rc = sets_commit(false);
+        size_t destroyed = 0, left = 0;
+        firc_err_t err = rc == 0 ? firc_setnl_sweep(s, SETS_CHAIN, NULL, 0, &destroyed) : FIRC_ERR_IO;
+        if (err == FIRC_OK) { err = firc_setnl_names(s, sets_count, &left); }
+        printf("sweep: %s, destroyed %zu, left %zu\n", firc_err_str(err), destroyed, left);
+        if (rc == 0 && (err != FIRC_OK || destroyed != 2 || left != 0)) { rc = 1; }
+    } else {
+        rc = 64;
+    }
+    firc_setnl_free(s);
+    return rc;
 }
 
 static size_t shared_answer(uint8_t *b)
@@ -563,6 +740,13 @@ static int do_egress(const char *fam_text, const char *iface) {
     return 0;
 }
 
+static bool index_namer(void *ud, uint16_t index, char *out)
+{
+    (void)ud;
+    snprintf(out, 32, "#%u", (unsigned)index);
+    return true;
+}
+
 static int do_xtdump(const char *table, const char *fam_text) {
     bool v6 = strcmp(fam_text, "v6") == 0;
     if (!v6 && strcmp(fam_text, "v4") != 0) { return 64; }
@@ -589,7 +773,8 @@ static int do_xtdump(const char *table, const char *fam_text) {
     memcpy(info.underflow, g.underflow, sizeof(info.underflow));
     info.num_entries = g.num_entries;
     info.size = g.size;
-    char *text = firc_test_xt_print(v6 ? FIRC_IPT_PROTO_IPV6 : FIRC_IPT_PROTO_IPV4, table, &info, buf + XT_GET_ENTRIES_HDR_LEN);
+    char *text = firc_test_xt_print_named(v6 ? FIRC_IPT_PROTO_IPV6 : FIRC_IPT_PROTO_IPV4, table, &info,
+                                          buf + XT_GET_ENTRIES_HDR_LEN, index_namer, NULL);
     free(buf);
     if (text == NULL) { fprintf(stderr, "%s: the printer refused the table\n", table); return 5; }
     fputs(text, stdout);
@@ -689,11 +874,13 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && strcmp(argv[1], "ask") == 0) { return do_ask(argv[2], argv[3]); }
     if (argc >= 3 && strcmp(argv[1], "devchain") == 0) { return do_devchain(argc, argv); }
+    if (argc == 3 && strcmp(argv[1], "unset") == 0) { return do_unset(argv[2]); }
+    if (argc == 3 && strcmp(argv[1], "sets") == 0) { return do_sets(argv[2]); }
     if (argc == 4 && strcmp(argv[1], "shared") == 0) { return do_shared(argv[2], argv[3]); }
     if (argc == 4 && strcmp(argv[1], "xtparse") == 0) { return do_xtparse(argv[2], argv[3]); }
     if (argc == 4 && strcmp(argv[1], "xtnat") == 0) { return do_xtnat(argv[2], argv[3]); }
     if (argc == 4 && strcmp(argv[1], "xtdump") == 0) { return do_xtdump(argv[2], argv[3]); }
     fprintf(stderr, "usage: %s send <ipv4> <port> <mark-hex> [source port] | barrier v4|v6 | inject <src> <sport> <dst> <dport> <mark-hex> | egress v4|v6 <iface> | serve <ipv4> <port> [tag] | ask <ipv4> <port> | "
-                    "devchain <field> [...] | xtparse <file> v4|v6 | xtnat write|output|sweep|probe v4|v6 | xtdump <table> v4|v6\n", argv[0]);
+                    "devchain <field> [...] | unset <set> | sets write|swap|destroy|sweep | xtparse <file> v4|v6 | xtnat write|output|sweep|probe v4|v6 | xtdump <table> v4|v6\n", argv[0]);
     return 64;
 }

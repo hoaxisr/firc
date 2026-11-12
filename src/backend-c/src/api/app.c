@@ -43,6 +43,7 @@
 #include "firc/recall.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/nfcommit.h"
+#include "firc/purge.h"
 #include "firc/rulesnap.h"
 #include "firc/sub_fetch.h"
 #include "firc/sub_worker.h"
@@ -89,6 +90,27 @@ typedef struct nf_held {
     uint64_t ticket;
 } nf_held_t;
 
+typedef struct set_rec {
+    firc_id_t id;
+    uint8_t family;
+    bool live;
+    bool failed;
+    firc_err_t failed_err;
+    firc_nf_print_t print;
+    firc_nf_print_t failed_print;
+} set_rec_t;
+
+typedef struct set_job {
+    firc_id_t id;
+    uint8_t family;
+    char live[FIRC_SET_NAME_MAX];
+    char scratch[FIRC_SET_NAME_MAX];
+    firc_nf_prefixes_t list;
+    firc_nf_print_t print;
+    bool done;
+    firc_err_t err;
+} set_job_t;
+
 struct firc_app {
     firc_lograte_t said_snapshot;
     bool owed_full_sweep; /* a failed-to-report full pass asked for one more; cleared by the next landed report */
@@ -98,6 +120,19 @@ struct firc_app {
     firc_ipt_t *ipt6;
     firc_rtnl_t *rtnl;
     firc_ct_t *ct;
+    firc_setnl_t *sets;
+    set_rec_t *set_recs;
+    size_t n_set_recs;
+    size_t cap_set_recs;
+    char *sets_swept;
+    bool sweep_again;
+    bool sweep_said;
+    int set_retry_timer;
+    uint32_t set_retry_ms;
+    bool set_retry_due;
+    firc_id_t *set_left;
+    size_t n_set_left;
+    size_t cap_set_left;
     firc_fakeip_t *pool;                /* borrowed, nullable; loop thread only */
     firc_loop_t *loop;                  /* borrowed, nullable */
     firc_dnsproxy_t *proxy;             /* borrowed, nullable */
@@ -239,7 +274,7 @@ static void on_tap_deadline(firc_loop_t *loop, void *ud);
 static firc_err_t capture_end(firc_app_t *app, const char *token, const char *how);
 static void autolist_stop(firc_app_t *app);
 static void report_committed(firc_app_t *app, uint64_t gen, bool full, uint64_t ticket, firc_ktcp_image_t *image,
-                             const firc_xt_acl_t *skip, firc_ktcp_off_t off);
+                             const firc_xt_acl_t *skip, firc_ktcp_off_t off, bool sets_failed);
 static const firc_fakeip_snapshot_t *rules_snapshot(void *ud);
 static void pool_forget_group_id(firc_app_t *app, firc_id_t gid);
 static void firc_app_request_sync_missing_unlocked(firc_app_t *app); /* needed from inside app_nf_enter below */
@@ -1102,6 +1137,7 @@ firc_app_t *firc_app_create(const firc_app_deps_t *deps) {
     app->ipt6 = deps->ipt6;
     app->rtnl = deps->rtnl;
     app->ct = deps->ct;
+    app->sets = deps->sets;
     app->router = deps->router;
     app->resolvers = deps->resolvers;
     app->pool = deps->pool;
@@ -1184,12 +1220,15 @@ void firc_app_destroy(firc_app_t *app) {
     firc_app_stop_netfilter_committer(app); /* nothing below is safe while a rebuild can still read the registry */
     if (app->retry_timer != 0) { (void)firc_loop_del_timer(app->loop, app->retry_timer); }
     app->retry_timer = 0;
+    if (app->set_retry_timer != 0) { (void)firc_loop_del_timer(app->loop, app->set_retry_timer); }
+    app->set_retry_timer = 0;
     firc_app_stop_list_worker(app); /* before the config it reports about goes: a result it posts could reach a loop whose app no longer exists */
     (void)firc_app_capture_stop(app, NULL);
     autolist_stop(app);
     firc_ptr_free(app->al_ptr);
     app->al_ptr = NULL;
     firc_err_t stopped = write_stop_state(app); /* no pass will run again, so write directly; before the flushes, so a flushed flow meets no chain to re-mark it */
+    (void)firc_purge_sets(app->sets, app->cfg->app.netfilter.iptables.chain_prefix, NULL);
     for (size_t i = 0; stopped != FIRC_OK && i < app->n_held; i++) { firc_ipset_to_link_free(app->held[i].link); }
     if (stopped != FIRC_OK) { app->n_held = 0; }
     memset(&app->ktcp_sink, 0, sizeof(app->ktcp_sink));
@@ -1207,6 +1246,9 @@ void firc_app_destroy(firc_app_t *app) {
     free(app->flushes);
     free(app->waits);
     free(app->held);
+    free(app->set_recs);
+    free(app->sets_swept);
+    free(app->set_left);
     firc_fakeip_snapshot_free(app->pool_snap);
     app->pool_snap = NULL;
     for (size_t i = 0; i < app->n_retired; i++) { firc_fakeip_snapshot_free(app->retired[i]); }
@@ -1360,7 +1402,8 @@ bool firc_app_group_live(const firc_app_t *app, firc_id_t id, const char **reaso
         /* no false live: before the first pass, or after 5s of failures, the chain may not be in the kernel */
         firc_nfcommit_health_t h;
         firc_app_netfilter_health(app, &h);
-        if (h.failing || h.first_pending || firc_ruleset_pass(rs) == FIRC_RULESET_PASS_LEFT_OUT) {
+        if (h.failing || h.first_pending || firc_ruleset_pass(rs) == FIRC_RULESET_PASS_LEFT_OUT ||
+            firc_ruleset_sets_stale(rs)) {
             why = "not-written";
         }
     }
@@ -1373,6 +1416,8 @@ static bool retry_due(const firc_app_t *app, firc_ruleset_t *rs, const char *ifa
     if (!app->running || !retry_pending(rs) || now < firc_ruleset_retry(rs)->at_ms) { return false; }
     return iface == NULL || firc_group_has_iface(g, iface);
 }
+
+bool firc_app_set_retry_armed_for_test(const firc_app_t *app) { return app->set_retry_timer != 0; }
 
 bool firc_app_retry_timer_for_test(const firc_app_t *app, uint64_t *delay_ms) {
     if (delay_ms != NULL) { *delay_ms = app->retry_timer != 0 ? app->retry_timer_delay : 0; }
@@ -2965,6 +3010,317 @@ static firc_err_t stage_redir(firc_app_t *app, const firc_ruleset_t *skip, const
     return err;
 }
 
+static const uint8_t k_set_families[2] = {4, 6};
+
+static firc_ipt_t *set_engine(const firc_app_t *app, uint8_t family) { return family == 4 ? app->ipt4 : app->ipt6; }
+
+static set_rec_t *set_rec_find(const firc_app_t *app, firc_id_t id, uint8_t family) {
+    for (size_t i = 0; i < app->n_set_recs; i++) {
+        if (app->set_recs[i].family == family && firc_id_equal(app->set_recs[i].id, id)) { return &app->set_recs[i]; }
+    }
+    return NULL;
+}
+
+static set_rec_t *set_rec_get(firc_app_t *app, firc_id_t id, uint8_t family) {
+    set_rec_t *rec = set_rec_find(app, id, family);
+    if (rec != NULL) { return rec; }
+    if (app->n_set_recs == app->cap_set_recs) {
+        size_t cap = app->cap_set_recs ? app->cap_set_recs * 2 : 8;
+        set_rec_t *v = realloc(app->set_recs, cap * sizeof(*v));
+        if (v == NULL) { return NULL; }
+        app->set_recs = v;
+        app->cap_set_recs = cap;
+    }
+    rec = &app->set_recs[app->n_set_recs++];
+    memset(rec, 0, sizeof(*rec));
+    rec->id = id;
+    rec->family = family;
+    return rec;
+}
+
+static bool set_live(const firc_app_t *app, firc_id_t id, uint8_t family) {
+    const set_rec_t *rec = set_rec_find(app, id, family);
+    return rec != NULL && rec->live;
+}
+
+static bool set_missing(const firc_app_t *app, const firc_ruleset_t *rs) {
+    firc_id_t id = firc_ruleset_group(rs)->id;
+    for (size_t f = 0; f < 2; f++) {
+        uint8_t fam = k_set_families[f];
+        if (set_engine(app, fam) != NULL && firc_ruleset_has_bare(rs, fam) && !set_live(app, id, fam)) { return true; }
+    }
+    return false;
+}
+
+static void set_jobs_free(set_job_t *jobs, size_t n) {
+    for (size_t i = 0; i < n; i++) { firc_nf_prefixes_clear(&jobs[i].list); }
+    free(jobs);
+}
+
+static bool same_print(firc_nf_print_t a, firc_nf_print_t b) { return a.n == b.n && a.hash == b.hash; }
+
+static firc_err_t sets_collect(firc_app_t *app, set_job_t **out, size_t *n_out, bool *was_due) {
+    *out = NULL;
+    *n_out = 0;
+    *was_due = false;
+    if (app->sets == NULL || app->n_rulesets == 0) { return FIRC_OK; }
+    set_job_t *jobs = calloc(app->n_rulesets * 2, sizeof(*jobs));
+    if (jobs == NULL) { return FIRC_ERR_NOMEM; }
+    size_t n = 0;
+    firc_err_t err = FIRC_OK;
+    for (size_t i = 0; i < app->n_rulesets && err == FIRC_OK; i++) {
+        const firc_ruleset_t *rs = app->rulesets[i];
+        if (!firc_ruleset_routed(rs)) { continue; }
+        firc_id_t id = firc_ruleset_group(rs)->id;
+        for (size_t f = 0; f < 2 && err == FIRC_OK; f++) {
+            uint8_t fam = k_set_families[f];
+            if (set_engine(app, fam) == NULL) { continue; }
+            firc_nf_print_t print = firc_ruleset_bare_print(rs, fam);
+            if (print.n == 0) { continue; }
+            set_rec_t *rec = set_rec_find(app, id, fam);
+            if (rec != NULL && rec->live && same_print(rec->print, print)) {
+                rec->failed = false;
+                continue;
+            }
+            if (rec != NULL && rec->failed && !app->set_retry_due && same_print(rec->failed_print, print)) { continue; }
+            set_job_t *j = &jobs[n];
+            err = firc_ruleset_bare(rs, fam, &j->list);
+            if (err != FIRC_OK) { continue; }
+            j->print = print;
+            j->id = id;
+            j->family = fam;
+            j->err = firc_ruleset_set_name(rs, fam, false, j->live, sizeof(j->live));
+            if (j->err == FIRC_OK) { j->err = firc_ruleset_set_name(rs, fam, true, j->scratch, sizeof(j->scratch)); }
+            j->done = j->err != FIRC_OK;
+            n++;
+        }
+    }
+    if (err != FIRC_OK) {
+        set_jobs_free(jobs, app->n_rulesets * 2);
+        return err;
+    }
+    *was_due = app->set_retry_due;
+    app->set_retry_due = false;
+    *out = jobs;
+    *n_out = n;
+    return FIRC_OK;
+}
+
+static bool sets_write(firc_app_t *app, set_job_t *jobs, size_t n, firc_cancel_t *cancel) {
+    for (size_t i = 0; i < n; i++) {
+        if (firc_cancel_raised(cancel)) { return false; }
+        set_job_t *j = &jobs[i];
+        if (j->done) { continue; }
+        j->err = firc_setnl_replace(app->sets, j->live, j->scratch, j->family, j->list.v, j->list.n);
+        j->done = true;
+    }
+    return true;
+}
+
+static void sets_record(firc_app_t *app, const set_job_t *jobs, size_t n, bool was_due) {
+    for (size_t i = 0; i < n; i++) {
+        const set_job_t *j = &jobs[i];
+        if (!j->done && was_due) { app->set_retry_due = true; }
+        if (j->done && j->err != FIRC_ERR_NOSYS && j->err != FIRC_ERR_INVAL) { app->sweep_again = true; }
+        firc_ruleset_t *rs = j->done ? firc_app_find_group_by_id(app, j->id) : NULL;
+        set_rec_t *rec = rs != NULL ? set_rec_get(app, j->id, j->family) : NULL;
+        if (rec == NULL) { continue; }
+        if (j->err == FIRC_OK) {
+            if (rec->failed && rec->live) { firc_ruleset_owe_flush(rs); }
+            rec->failed = false;
+            rec->live = true;
+            rec->print = j->print;
+            if (firc_ruleset_pass(rs) == FIRC_RULESET_PASS_LEFT_OUT) {
+                firc_ruleset_set_pass(rs, FIRC_RULESET_PASS_ON_TRIAL);
+            }
+            continue;
+        }
+        if (!rec->failed) {
+            const firc_group_t *g = firc_ruleset_group(rs);
+            char id[FIRC_ID_STR_LEN];
+            firc_id_format(g->id, id);
+            FIRC_WARN("group \"%s\" (%s): its subnet set was not written: %s", g->name != NULL ? g->name : "", id,
+                      firc_err_str(j->err));
+        }
+        rec->failed = true;
+        rec->failed_err = j->err;
+        rec->failed_print = j->print;
+    }
+}
+
+static int set_name_cmp(const void *a, const void *b) { return strcmp(a, b); }
+
+static bool set_wanted(const firc_app_t *app, const set_rec_t *rec) {
+    const firc_ruleset_t *rs = firc_app_find_group_by_id(app, rec->id);
+    return rs != NULL && firc_ruleset_has_bare(rs, rec->family);
+}
+
+static void sets_mark_stale(firc_app_t *app) {
+    for (size_t i = 0; i < app->n_rulesets; i++) {
+        firc_ruleset_t *rs = app->rulesets[i];
+        firc_id_t id = firc_ruleset_group(rs)->id;
+        bool stale = false;
+        for (size_t f = 0; f < 2; f++) {
+            const set_rec_t *rec = set_rec_find(app, id, k_set_families[f]);
+            stale = stale || (rec != NULL && rec->failed && set_wanted(app, rec));
+        }
+        firc_ruleset_set_sets_stale(rs, stale);
+    }
+}
+
+typedef struct {
+    char (*names)[FIRC_SET_NAME_MAX];
+    bool *seen;
+    size_t n;
+} live_names_t;
+
+static void on_kernel_set(const char *name, void *ud) {
+    live_names_t *l = ud;
+    for (size_t i = 0; i < l->n; i++) {
+        if (strcmp(l->names[i], name) == 0) { l->seen[i] = true; }
+    }
+}
+
+static void sets_forget_gone(firc_app_t *app) {
+    if (app->sets == NULL || app->n_set_recs == 0) { return; }
+    live_names_t l = {calloc(app->n_set_recs, sizeof(*l.names)), calloc(app->n_set_recs, sizeof(*l.seen)),
+                      app->n_set_recs};
+    if (l.names != NULL && l.seen != NULL) {
+        for (size_t i = 0; i < l.n; i++) {
+            const set_rec_t *rec = &app->set_recs[i];
+            firc_ruleset_t *rs = firc_app_find_group_by_id(app, rec->id);
+            l.seen[i] = rs == NULL ||
+                        firc_ruleset_set_name(rs, rec->family, false, l.names[i], sizeof(l.names[i])) != FIRC_OK;
+        }
+        if (firc_setnl_names(app->sets, on_kernel_set, &l) == FIRC_OK) {
+            for (size_t i = 0; i < l.n; i++) {
+                if (!l.seen[i]) { app->set_recs[i].live = false; }
+            }
+        }
+    }
+    free(l.names);
+    free(l.seen);
+}
+
+static void sets_sweep(firc_app_t *app) {
+    if (app->sets == NULL) { return; }
+    size_t kept = 0;
+    for (size_t i = 0; i < app->n_set_recs; i++) {
+        if (set_wanted(app, &app->set_recs[i])) { app->set_recs[kept++] = app->set_recs[i]; }
+    }
+    app->n_set_recs = kept;
+    char(*names)[FIRC_SET_NAME_MAX] = kept != 0 ? calloc(kept, sizeof(*names)) : NULL;
+    const char **keep = kept != 0 ? calloc(kept, sizeof(*keep)) : NULL;
+    char *joined = calloc(kept * FIRC_SET_NAME_MAX + 1, 1);
+    if ((kept != 0 && (names == NULL || keep == NULL)) || joined == NULL) {
+        free(names);
+        free(keep);
+        free(joined);
+        return;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < kept; i++) {
+        const set_rec_t *rec = &app->set_recs[i];
+        if (rec->live &&
+            firc_ruleset_set_name(firc_app_find_group_by_id(app, rec->id), rec->family, false, names[n],
+                                  sizeof(names[n])) == FIRC_OK) {
+            n++;
+        }
+    }
+    if (n > 1) { qsort(names, n, sizeof(*names), set_name_cmp); }
+    size_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+        keep[i] = names[i];
+        size_t len = strlen(names[i]);
+        memcpy(joined + at, names[i], len);
+        joined[at + len] = '\n';
+        at += len + 1;
+    }
+    if (app->sweep_again || strcmp(joined, app->sets_swept != NULL ? app->sets_swept : "") != 0) {
+        firc_err_t err = firc_setnl_sweep(app->sets, app->cfg->app.netfilter.iptables.chain_prefix, keep, n, NULL);
+        if (err != FIRC_OK && err != FIRC_ERR_AGAIN && firc_setnl_probe(app->sets, NULL) == FIRC_ERR_NOSYS) {
+            err = FIRC_OK;
+        }
+        if (err == FIRC_OK || err == FIRC_ERR_AGAIN) {
+            free(app->sets_swept);
+            app->sets_swept = joined;
+            joined = NULL;
+            app->sweep_again = err == FIRC_ERR_AGAIN;
+            app->sweep_said = false;
+        } else if (!app->sweep_said) {
+            app->sweep_said = true;
+            FIRC_WARN("subnet sets no group names are left in the kernel: %s", firc_err_str(err));
+        }
+    }
+    free(names);
+    free(keep);
+    free(joined);
+}
+
+static bool sets_failing(const firc_app_t *app) {
+    for (size_t i = 0; i < app->n_set_recs; i++) {
+        if (app->set_recs[i].failed && app->set_recs[i].failed_err != FIRC_ERR_NOSYS) { return true; }
+    }
+    return false;
+}
+
+static void on_set_retry(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    firc_app_t *app = ud;
+    app->set_retry_timer = 0;
+    app_nf_enter(app);
+    app->set_retry_due = true;
+    app_request_more_locked(app);
+    app_nf_leave(app);
+}
+
+static void set_retry_arm(firc_app_t *app, bool failed) {
+    if (!failed) {
+        if (app->set_retry_timer != 0) { (void)firc_loop_del_timer(app->loop, app->set_retry_timer); }
+        app->set_retry_timer = 0;
+        app->set_retry_ms = 0;
+        return;
+    }
+    if (app->set_retry_timer != 0) { return; }
+    uint32_t next = app->set_retry_ms == 0 ? FIRC_APP_RETRY_MIN_MS : app->set_retry_ms * 2u;
+    app->set_retry_ms = next < FIRC_APP_RETRY_MAX_MS ? next : FIRC_APP_RETRY_MAX_MS;
+    int id = 0;
+    if (firc_loop_add_timer(app->loop, app->set_retry_ms, 0, on_set_retry, app, &id) != FIRC_OK) {
+        FIRC_WARN("could not arm the retry of a subnet set; the next pass writes it");
+        app_nf_enter(app);
+        app->set_retry_due = true;
+        app_nf_leave(app);
+        return;
+    }
+    app->set_retry_timer = id;
+}
+
+static firc_err_t leave_out_for_set(firc_app_t *app, firc_ruleset_t *rs) {
+    const firc_group_t *g = firc_ruleset_group(rs);
+    if (app->n_set_left == app->cap_set_left) {
+        size_t cap = app->cap_set_left ? app->cap_set_left * 2 : 8;
+        firc_id_t *v = realloc(app->set_left, cap * sizeof(*v));
+        if (v == NULL) { return FIRC_ERR_NOMEM; }
+        app->set_left = v;
+        app->cap_set_left = cap;
+    }
+    app->set_left[app->n_set_left++] = g->id;
+    firc_ruleset_set_pass(rs, FIRC_RULESET_PASS_LEFT_OUT);
+    char id[FIRC_ID_STR_LEN];
+    firc_id_format(g->id, id);
+    FIRC_WARN("group \"%s\" (%s) is left out of netfilter: its subnet set is not in the kernel",
+              g->name != NULL ? g->name : "", id);
+    return FIRC_OK;
+}
+
+static void owe_set_left(firc_app_t *app) {
+    for (size_t i = 0; i < app->n_set_left; i++) {
+        firc_ruleset_t *rs = firc_app_find_group_by_id(app, app->set_left[i]);
+        if (rs != NULL && firc_ruleset_pass(rs) == FIRC_RULESET_PASS_LEFT_OUT) { firc_ruleset_owe_flush(rs); }
+    }
+    app->n_set_left = 0;
+}
+
 static firc_err_t rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cancel, bool full,
                                            const firc_ruleset_t *skip, int *refusal) {
     *refusal = 0;
@@ -2980,8 +3336,14 @@ static firc_err_t rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cance
     if (err != FIRC_OK) { return err; }
 
     for (size_t i = 0; i < app->n_rulesets; i++) {
-        if (!staged_in_pass(app->rulesets[i], skip)) { continue; }
-        err = firc_ruleset_prepare_iptables(app->rulesets[i]);
+        firc_ruleset_t *rs = app->rulesets[i];
+        if (!staged_in_pass(rs, skip)) { continue; }
+        if (set_missing(app, rs)) {
+            err = leave_out_for_set(app, rs);
+            if (err != FIRC_OK) { return err; }
+            continue;
+        }
+        err = firc_ruleset_prepare_iptables(rs);
         if (err != FIRC_OK) { return err; }
     }
     err = firc_app_stage_pool_reject(app);
@@ -3042,7 +3404,8 @@ static bool refused_rule(firc_err_t err, int refusal) {
     return err == FIRC_ERR_IO && (refusal == EINVAL || refusal == ENOENT || refusal == ELOOP);
 }
 
-static firc_err_t rebuild_leaving_out(firc_app_t *app, firc_cancel_t *cancel, bool full) {
+static firc_err_t rebuild_leaving_out(firc_app_t *app, firc_cancel_t *cancel, bool full, bool *set_gone) {
+    *set_gone = false;
     int refusal = 0;
     app->redir_staged = false;
     firc_err_t err = rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
@@ -3086,7 +3449,11 @@ static firc_err_t rebuild_leaving_out(firc_app_t *app, firc_cancel_t *cancel, bo
         (void)rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
         if (refused) { app->pass_refused = false; }
     }
-    if (err != FIRC_OK) { return err; }
+    if (err != FIRC_OK) {
+        *set_gone = refused_rule(err, refusal) && refusal == ENOENT;
+        return err;
+    }
+    owe_set_left(app);
     app->pass_refused = false;
     for (size_t i = 0; i < app->n_rulesets; i++) {
         firc_ruleset_t *rs = app->rulesets[i];
@@ -4640,7 +5007,18 @@ firc_err_t firc_app_rebuild_netfilter_kind(firc_app_t *app, firc_cancel_t *cance
 
 static firc_err_t firc_app_rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cancel,
                                                     bool full) {
+    set_job_t *jobs = NULL;
+    size_t n_jobs = 0;
     if (app->nf_mu_ready) { pthread_mutex_lock(&app->nf_mu); }
+    bool was_due = false;
+    firc_err_t err = sets_collect(app, &jobs, &n_jobs, &was_due);
+    if (app->nf_mu_ready) { pthread_mutex_unlock(&app->nf_mu); }
+    bool sets_whole = sets_write(app, jobs, n_jobs, cancel);
+    if (app->nf_mu_ready) { pthread_mutex_lock(&app->nf_mu); }
+    sets_record(app, jobs, n_jobs, was_due);
+    sets_mark_stale(app);
+    set_jobs_free(jobs, n_jobs);
+    if (err == FIRC_OK && (!sets_whole || firc_cancel_raised(cancel))) { err = FIRC_ERR_CANCELED; }
     uint64_t ticket = app->nf_change; /* every mutation made before this pass took the lock */
 
     /* attached for exactly this pass: leaving it on would also abort a synchronous API commit on the loop thread */
@@ -4653,7 +5031,11 @@ static firc_err_t firc_app_rebuild_netfilter_locked(firc_app_t *app, firc_cancel
     struct timespec pass_t0, pass_t1;
     clock_gettime(CLOCK_MONOTONIC, &pass_t0);
     uint64_t gen = pass_snapshot_begin(app);
-    firc_err_t err = rebuild_leaving_out(app, cancel, full);
+    bool set_gone = false;
+    if (err == FIRC_OK) { err = rebuild_leaving_out(app, cancel, full, &set_gone); }
+    if (err == FIRC_OK) { sets_sweep(app); }
+    if (set_gone) { sets_forget_gone(app); }
+    bool sets_failed = sets_failing(app);
     pass_snapshot_end(app);
     clock_gettime(CLOCK_MONOTONIC, &pass_t1);
     firc_ipt_take_report(app->ipt4, report4, sizeof(report4));
@@ -4676,7 +5058,7 @@ static firc_err_t firc_app_rebuild_netfilter_locked(firc_app_t *app, firc_cancel
     if (app->ipt6) { firc_ipt_set_cancel(app->ipt6, NULL); }
 
     if (app->nf_mu_ready) { pthread_mutex_unlock(&app->nf_mu); }
-    if (err == FIRC_OK) { report_committed(app, gen, full, ticket, &image, &skip_list, off); }
+    if (err == FIRC_OK) { report_committed(app, gen, full, ticket, &image, &skip_list, off, sets_failed); }
     return err;
 }
 
@@ -4724,6 +5106,7 @@ typedef struct committed_report {
     firc_ktcp_image_t image;
     firc_xt_acl_t skip;
     firc_ktcp_off_t off;
+    bool sets_failed;
 } committed_report_t;
 
 static void push_image(firc_app_t *app, firc_ktcp_image_t *image) {
@@ -4759,11 +5142,12 @@ static void on_committed_posted(firc_loop_t *loop, void *ud) {
     pay_flushes(r->app, r->ticket); /* the flushes this pass carried */
     waits_due(r->app);
     firc_app_retry_groups(r->app, NULL); /* a group whose enable failed is tried again when due */
+    set_retry_arm(r->app, r->sets_failed);
     drop_report(r);
 }
 
 static void report_committed(firc_app_t *app, uint64_t gen, bool full, uint64_t ticket, firc_ktcp_image_t *image,
-                             const firc_xt_acl_t *skip, firc_ktcp_off_t off) {
+                             const firc_xt_acl_t *skip, firc_ktcp_off_t off, bool sets_failed) {
     if (app->loop == NULL) {
         /* no loop: the committer thread itself writes loop objects (pool, conntrack handle), all under nf_mu */
         if (app->nf_mu_ready) { pthread_mutex_lock(&app->nf_mu); }
@@ -4786,6 +5170,7 @@ static void report_committed(firc_app_t *app, uint64_t gen, bool full, uint64_t 
         memset(image, 0, sizeof(*image));
         r->skip = *skip;
         r->off = off;
+        r->sets_failed = sets_failed;
     }
     if (r == NULL ||
         firc_loop_post_with_drop(app->loop, on_committed_posted, r, drop_report) != FIRC_OK) {

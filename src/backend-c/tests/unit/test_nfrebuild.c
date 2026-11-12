@@ -14,6 +14,7 @@
 
 #include "fake_conntrack.h"
 #include "fake_rtnl.h"
+#include "fake_setnl.h"
 #include "fake_iptables.h"
 #include "fake_xtables.h"
 
@@ -1474,6 +1475,8 @@ typedef struct {
     firc_rtnl_t *rtnl;
     firc_app_t *app;
     firc_port_remap_t *remap;
+    fake_setnl_t *setk;
+    firc_setnl_t *sets;
     uint16_t ports[FIRC_KTCP_DEVICES];
 } tun_rig_t;
 
@@ -1492,7 +1495,10 @@ static bool tun_rig_build(tun_rig_t *r, bool target, const char *lack, uint8_t r
     r->kernel = fake_rtnl_start(&r->rtnl);
     if (r->kernel == NULL) { return false; }
     fake_rtnl_set_link_flags(r->kernel, 0x1 | 0x10);
-    firc_app_deps_t deps = {.cfg = &r->cfg, .ipt4 = r->ipt, .rtnl = r->rtnl, .pool = r->pool, .loop = loop};
+    r->setk = fake_setnl_start(&r->sets);
+    if (r->setk == NULL) { return false; }
+    firc_app_deps_t deps = {.cfg = &r->cfg, .ipt4 = r->ipt, .rtnl = r->rtnl, .sets = r->sets, .pool = r->pool,
+                            .loop = loop};
     r->app = firc_app_create(&deps);
     r->remap = firc_port_remap_new(r->cfg.app.netfilter.iptables.chain_prefix, 53, 3553, NULL, 0, r->ipt, NULL);
     if (r->app == NULL || firc_port_remap_enable(r->remap) != FIRC_OK) { return false; }
@@ -1509,6 +1515,8 @@ static bool tun_rig_up(tun_rig_t *r) { return tun_rig_build(r, false, NULL, 0, N
 
 static void tun_rig_down(tun_rig_t *r) {
     firc_app_destroy(r->app);
+    firc_setnl_free(r->sets);
+    fake_setnl_stop(r->setk);
     firc_port_remap_free(r->remap);
     firc_rtnl_close(r->rtnl);
     fake_rtnl_stop(r->kernel);

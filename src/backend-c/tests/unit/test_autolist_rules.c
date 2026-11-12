@@ -10,6 +10,8 @@
 #include "firc/netfilter_cleaner.h"
 #include "../../src/xtables/xt_internal.h"
 
+static char g_set[FIRC_XT_NAME_LEN];
+
 #define PREFIX "FIRC_"
 #define AL_CHAIN PREFIX FIRC_AUTOLIST_CHAIN_SUFFIX
 
@@ -297,7 +299,7 @@ TEST encoder_takes_every_autolist_rule(void) {
         ASSERT(r != NULL);
         firc_xt_entry_t e;
         uint32_t exts = 0;
-        firc_err_t err = firc_xt_encode(fam, 0, r, &e, &exts);
+        firc_err_t err = firc_xt_encode(fam, 0, r, &e, &exts, g_set);
         firc_ipt_rule_free(r);
         free(e.bytes);
         ASSERT_EQm(b.line[i], FIRC_OK, err);

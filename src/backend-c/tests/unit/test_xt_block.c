@@ -781,6 +781,115 @@ TEST a_kept_copy_stages_like_its_source(void) {
     PASS();
 }
 
+TEST keeping_part_of_a_block_keeps_its_set_names(void) {
+    static const char *const lines[] = {
+        "-m set --match-set fircA dst -j RETURN",
+        "-m mark --mark 1 -j RETURN",
+        "-m set --match-set fircB dst -j FIRC_x",
+        "-p tcp --dport 53 -m set --match-set fircC dst -j RETURN",
+    };
+    for (size_t f = 0; f < 2; f++) {
+        uint32_t eh = f == 0 ? 112u : 168u;
+        firc_xt_block_t k;
+        firc_xt_block_init(&k);
+        const bool keep[] = {false, true, true, true};
+        ASSERT_EQ_FMT(FIRC_OK, kept(k_fams[f], lines, keep, 4, &k), "%d");
+        ASSERT_EQ_FMT((size_t)2, k.n_sets, "%zu");
+        ASSERT_EQ_FMT(1u, k.sets[0].entry, "%u");
+        ASSERT_EQ_FMT(eh + 32u, k.sets[0].at, "%u");
+        ASSERT_STR_EQ("fircB", k.sets[0].name);
+        ASSERT_EQ_FMT(2u, k.sets[1].entry, "%u");
+        ASSERT_EQ_FMT(eh + 48u + 32u, k.sets[1].at, "%u");
+        ASSERT_STR_EQ("fircC", k.sets[1].name);
+        firc_xt_block_t want = lines_block(k_fams[f], lines + 1, 3);
+        ASSERT(firc_xt_block_equal(&want, &k));
+        static const char *const other[] = {
+            "-m mark --mark 1 -j RETURN",
+            "-m set --match-set fircD dst -j FIRC_x",
+            "-p tcp --dport 53 -m set --match-set fircC dst -j RETURN",
+        };
+        firc_xt_block_t renamed = lines_block(k_fams[f], other, 3);
+        ASSERT_FALSE(firc_xt_block_equal(&renamed, &k));
+        firc_xt_block_t bare = k;
+        bare.n_sets = 0;
+        ASSERT_FALSE(firc_xt_block_equal(&bare, &k));
+        ASSERT_FALSE(firc_xt_block_equal(&k, &bare));
+        firc_xt_block_t first;
+        firc_xt_block_init(&first);
+        const bool only_first[] = {true, false, false, false};
+        ASSERT_EQ_FMT(FIRC_OK, kept(k_fams[f], lines, only_first, 4, &first), "%d");
+        ASSERT_EQ_FMT((size_t)1, first.n_sets, "%zu");
+        ASSERT_EQ_FMT(0u, first.sets[0].entry, "%u");
+        ASSERT_STR_EQ("fircA", first.sets[0].name);
+        firc_xt_block_free(&k);
+        firc_xt_block_free(&want);
+        firc_xt_block_free(&renamed);
+        firc_xt_block_free(&first);
+    }
+    PASS();
+}
+
+TEST a_block_with_a_stray_set_is_refused(void) {
+    for (size_t f = 0; f < 2; f++) {
+        uint32_t eh = f == 0 ? 112u : 168u;
+        firc_xt_block_t b = lines_block(k_fams[f], (const char *const[]){"-m set --match-set fircA dst -j RETURN"}, 1);
+        const bool keep[] = {true};
+        ASSERT_EQ_FMT(FIRC_OK, merge_into_empty(k_fams[f], &b), "%d");
+        static const struct { uint32_t entry; uint32_t at_from_eh; } bad[] = {{1, 32}, {0, 8}, {0, 40}};
+        for (size_t i = 0; i < 3; i++) {
+            b.sets[0].entry = bad[i].entry;
+            b.sets[0].at = eh + bad[i].at_from_eh;
+            ASSERT_EQ_FMT(FIRC_ERR_INVAL, merge_into_empty(k_fams[f], &b), "%d");
+            firc_xt_block_t o;
+            firc_xt_block_init(&o);
+            ASSERT_EQ_FMT(FIRC_ERR_INVAL, firc_xt_block_keep(&b, k_fams[f], keep, &o), "%d");
+            firc_xt_block_free(&o);
+        }
+        firc_xt_block_free(&b);
+    }
+    PASS();
+}
+
+TEST an_unresolved_set_is_not_written_out(void) {
+    firc_xt_block_t b = lines_block(FIRC_IPT_PROTO_IPV4, (const char *const[]){"-m set --match-set fircA dst -j RETURN"}, 1);
+    firc_test_stage_t *s = firc_test_stage_new();
+    firc_test_stage_block(s, "FIRC_g1", &b);
+    firc_xt_info_t ei, ni;
+    uint8_t *empty = NULL, *out = NULL;
+    int32_t *oi = NULL;
+    ASSERT(firc_test_xt_read("empty", FIRC_IPT_PROTO_IPV4, &ei, &empty));
+    firc_xt_table_t t;
+    const char *why = NULL;
+    char w[256];
+    uint32_t exts = 0;
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_parse(FIRC_IPT_PROTO_IPV4, &ei, empty, &t, &why), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_merge(&t, &s->stage, &exts, w, sizeof(w)), "%d");
+    ASSERT_EQ_FMT((size_t)1, t.n_sets, "%zu");
+    ASSERT_EQ_FMT(FIRC_ERR_IO, firc_xt_serialise(&t, &out, &ni, &oi, w, sizeof(w)), "%d");
+    ASSERT(strstr(w, "fircA") != NULL);
+    t.sets[0].index = 0x0102;
+    t.sets[0].known = true;
+    ASSERT_EQ_FMT(FIRC_OK, firc_xt_serialise(&t, &out, &ni, &oi, w, sizeof(w)), "%d");
+    uint16_t at_index = 0;
+    size_t hits = 0;
+    for (uint32_t off = 0; off + 112u + 36u <= ni.size; off += firc_xt_rd16(out + off + 90)) {
+        if (strcmp((const char *)out + off + 112 + 2, "set") == 0) {
+            memcpy(&at_index, out + off + 112 + 32, 2);
+            hits++;
+        }
+    }
+    ASSERT_EQ_FMT((size_t)1, hits, "%zu");
+    ASSERT_EQ_FMT(0x0102u, (unsigned)at_index, "%u");
+    ASSERT_EQ_FMT(0u, (unsigned)firc_xt_rd16(b.bytes + 112 + 32), "%u");
+    free(out);
+    free(oi);
+    firc_xt_table_clear(&t);
+    free(empty);
+    firc_test_stage_free(s);
+    firc_xt_block_free(&b);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -809,5 +918,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_kept_copy_carries_its_jumps);
     RUN_TEST(a_dropped_jump_takes_its_chain_with_it);
     RUN_TEST(a_kept_copy_stages_like_its_source);
+    RUN_TEST(keeping_part_of_a_block_keeps_its_set_names);
+    RUN_TEST(a_block_with_a_stray_set_is_refused);
+    RUN_TEST(an_unresolved_set_is_not_written_out);
     GREATEST_MAIN_END();
 }

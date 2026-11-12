@@ -20,6 +20,8 @@ typedef struct firc_xt_entry {
     char jump[FIRC_XT_NAME_LEN];
     bool staged;
     bool owned;
+    uint16_t set;
+    uint16_t set_at;
 } firc_xt_entry_t;
 
 typedef struct firc_xt_chain {
@@ -31,6 +33,12 @@ typedef struct firc_xt_chain {
     firc_xt_entry_t tail;
 } firc_xt_chain_t;
 
+typedef struct firc_xt_tset {
+    char name[FIRC_XT_NAME_LEN];
+    uint16_t index;
+    bool known;
+} firc_xt_tset_t;
+
 typedef struct firc_xt_table {
     firc_ipt_proto_t fam;
     uint32_t valid_hooks;
@@ -39,6 +47,8 @@ typedef struct firc_xt_table {
     firc_xt_entry_t end;
     uint32_t n_read;
     uint8_t mac_rev;
+    firc_xt_tset_t *sets;
+    size_t n_sets, cap_sets;
 } firc_xt_table_t;
 
 static inline uint32_t firc_xt_ehdr(firc_ipt_proto_t fam) {
@@ -70,6 +80,7 @@ void firc_xt_entry_clear(firc_xt_entry_t *e);
 firc_xt_chain_t *firc_xt_find_chain(firc_xt_table_t *t, const char *name);
 firc_err_t firc_xt_add_user_chain(firc_xt_table_t *t, const char *name, firc_xt_chain_t **out);
 firc_err_t firc_xt_drop_chain(firc_xt_table_t *t, firc_xt_chain_t *c);
+uint16_t firc_xt_table_set(firc_xt_table_t *t, const char *name);
 
 typedef enum firc_xt_ext {
     FIRC_XT_EXT_DNAT = 1u << 0,
@@ -91,6 +102,7 @@ typedef enum firc_xt_ext {
     FIRC_XT_EXT_CONNMARK_MATCH = 1u << 16,
     FIRC_XT_EXT_REDIRECT = 1u << 17,
     FIRC_XT_EXT_ADDRTYPE = 1u << 18,
+    FIRC_XT_EXT_SET = 1u << 19,
 } firc_xt_ext_t;
 
 #define FIRC_XT_EXT_V4_ONLY (FIRC_XT_EXT_REDIRECT | FIRC_XT_EXT_ADDRTYPE)
@@ -107,7 +119,7 @@ extern const firc_xt_ext_desc_t firc_xt_exts[];
 extern const size_t firc_xt_n_exts;
 
 firc_err_t firc_xt_encode(firc_ipt_proto_t fam, uint8_t mac_rev, const firc_ipt_rule_t *rule, firc_xt_entry_t *out,
-                          uint32_t *exts);
+                          uint32_t *exts, char set[FIRC_XT_NAME_LEN]);
 
 bool firc_xt_entry_same(firc_ipt_proto_t fam, const firc_xt_entry_t *a, const firc_xt_entry_t *b);
 firc_err_t firc_xt_merge(firc_xt_table_t *t, const firc_xt_stage_t *stage, uint32_t *exts, char *why, size_t why_len);

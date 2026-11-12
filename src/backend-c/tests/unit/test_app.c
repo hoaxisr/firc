@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <linux/netfilter/ipset/ip_set.h>
 #include <linux/rtnetlink.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,8 @@
 #include "fake_iptables.h"
 #include "fake_nflog.h"
 #include "fake_rtnl.h"
+#include "fake_setnl.h"
+#include "setnl_xt_bridge.h"
 #include "firc/ruleset.h"
 
 #include "firc/app.h"
@@ -198,6 +201,9 @@ typedef struct {
     firc_rtnl_t *rtnl;
     fake_ct_t *ctk;
     firc_ct_t *ct;
+    fake_setnl_t *setk;
+    firc_setnl_t *sets;
+    setnl_xt_bridge_t bridge;
     firc_dns_pipeline_t *pipeline;
     firc_resolve_router_t *router;
     firc_app_t *app;
@@ -230,6 +236,8 @@ static unsigned test_iface_index(const char *name) {
 }
 
 static int64_t g_capture_seconds;
+static bool g_app_no_sets;
+static bool g_app_no_v6;
 
 static firc_dnsproxy_t *g_app_proxy;
 static firc_kn_resolvers_t *g_app_resolvers;
@@ -318,11 +326,17 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
     if (l->kernel == NULL) { return false; }
     l->ctk = fake_ct_start(&l->ct);
     if (l->ctk == NULL) { return false; }
+    if (!g_app_no_sets) {
+        l->setk = fake_setnl_start(&l->sets);
+        if (l->setk == NULL) { return false; }
+        bridge_attach(&l->bridge, l->setk, l->fake, l->fake6);
+    }
     firc_app_deps_t deps = {.cfg = &l->cfg,
                             .ipt4 = l->ipt,
-                            .ipt6 = l->ipt6,
+                            .ipt6 = g_app_no_v6 ? NULL : l->ipt6,
                             .rtnl = l->rtnl,
                             .ct = l->ct,
+                            .sets = l->sets,
                             .pipeline = l->pipeline,
                             .router = l->router,
                             .proxy = g_app_proxy,
@@ -363,10 +377,15 @@ static void locked_app_down_rest(locked_app_t *l) {
     g_app_proxy = NULL;
     g_app_resolvers = NULL;
     g_app_mono = NULL;
+    g_app_no_sets = false;
+    g_app_no_v6 = false;
     for (int w = 0; w < 2; w++) {
         fake_nflog_stop(g_tap_kernel[w]);
         g_tap_kernel[w] = NULL;
     }
+    bridge_detach(&l->bridge);
+    firc_setnl_free(l->sets);
+    fake_setnl_stop(l->setk);
     firc_ct_close(l->ct);
     fake_ct_stop(l->ctk);
     firc_port_remap_free(l->remap);
@@ -1420,9 +1439,14 @@ TEST a_domain_rule_edit_asks_for_no_pass_but_a_subnet_rule_does(void) {
 
 /* Whether the group's mangle chain marks traffic to `cidr`, read under the netfilter lock. */
 static bool chain_marks(locked_app_t *l, firc_id_t gid, const char *cidr) {
-    char id[FIRC_ID_STR_LEN], chain[64];
+    char id[FIRC_ID_STR_LEN], chain[64], set[96], match[128];
     firc_id_format(gid, id);
     snprintf(chain, sizeof(chain), "FIRC_%s", id);
+    snprintf(set, sizeof(set), "%sS4", chain);
+    snprintf(match, sizeof(match), "-m set --match-set %s dst", set);
+    unsigned a = 0, b = 0, c = 0, d = 0, len = 0;
+    if (sscanf(cidr, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &len) != 5) { return false; }
+    firc_nf_prefix_t p = {.family = 4, .cidr = (uint8_t)len, .addr = {(uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d}};
     firc_app_nf_enter(l->app);
     firc_ipt_rule_t *const *rules = NULL;
     size_t n = 0;
@@ -1430,12 +1454,12 @@ static bool chain_marks(locked_app_t *l, firc_id_t gid, const char *cidr) {
     if (firc_fake_ipt_get_rules(l->fake, "mangle", chain, &rules, &n)) {
         for (size_t i = 0; i < n && !found; i++) {
             char *text = firc_ipt_rule_string(rules[i]);
-            found = text != NULL && strstr(text, cidr) != NULL;
+            found = text != NULL && strstr(text, match) != NULL;
             free(text);
         }
     }
     firc_app_nf_leave(l->app);
-    return found;
+    return found && fake_setnl_contains(l->setk, set, &p);
 }
 
 static locked_app_t g_ll;
@@ -4668,6 +4692,18 @@ static firc_group_t *named_group(uint8_t tag, const char *name, const char *host
     return g;
 }
 
+static firc_rule_t *tcp_rule(const char *type, const char *text) {
+    firc_rule_t *r = edit_rule(type, text);
+    r->proto = strdup("tcp");
+    return r;
+}
+
+static firc_group_t *tcp_group(uint8_t tag, const char *name, const char *host, const char *type, const char *prefix) {
+    firc_group_t *g = named_group(tag, name, host, NULL, NULL);
+    firc_group_add_rule(g, tcp_rule(type, prefix));
+    return g;
+}
+
 static firc_id_t tag_id(uint8_t tag) { return (firc_id_t){{tag, tag, tag, tag}}; }
 
 static bool issue_unwritten(locked_app_t *l, const char *name, uint8_t tag, firc_ip_t *fake) {
@@ -4707,7 +4743,7 @@ static bool refused_group_fixture(locked_app_t *l, firc_ip_t *f1, firc_ip_t *f2,
     fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
     firc_app_set_running(l->app, true);
     return firc_app_add_group(l->app, named_group(1, "one", "a.example", NULL, NULL)) == FIRC_OK &&
-           firc_app_add_group(l->app, named_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.66.0.0/16")) ==
+           firc_app_add_group(l->app, tcp_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.66.0.0/16")) ==
                FIRC_OK &&
            firc_app_add_group(l->app, named_group(3, "three", "c.example", NULL, NULL)) == FIRC_OK &&
            issue_unwritten(l, "a.example", 1, f1) && issue_unwritten(l, "b.example", 2, f2) &&
@@ -4796,7 +4832,7 @@ TEST an_update_the_kernel_takes_brings_the_left_out_group_back(void) {
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
     ASSERT_STR_EQ("not-written", live_reason(&l, 2));
     ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(2),
-                                             named_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.67.0.0/16")));
+                                             tcp_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.67.0.0/16")));
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
     ASSERT(group_fully_in(&l, tag_id(2)));
     ASSERT(kernel_text_has(&l, l.fake, "10.67.0.0/16"));
@@ -4831,7 +4867,7 @@ static enum greatest_test_res refusal_fails_every_group(const char *second_prefi
     ASSERT(refused_group_fixture(&l, &f1, &f2, &f3));
     if (second_prefix != NULL) {
         firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, tag_id(1));
-        ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, second_prefix)));
+        ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), tcp_rule(FIRC_RULE_SUBNET, second_prefix)));
         ASSERT_EQ(FIRC_OK, firc_app_sync_group(l.app, rs));
     }
     firc_fake_ipt_refuse_rules_containing(l.fake, refuse);
@@ -4861,7 +4897,7 @@ TEST a_group_refused_in_ipv6_only_is_left_out_of_both_families(void) {
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     firc_app_set_running(l.app, true);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, named_group(1, "one", "a.example", NULL, NULL)));
-    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, named_group(2, "six", "b.example", FIRC_RULE_SUBNET6, "fd66::/64")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tcp_group(2, "six", "b.example", FIRC_RULE_SUBNET6, "fd66::/64")));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, named_group(3, "three", "c.example", NULL, NULL)));
     firc_fake_ipt_refuse_rules_containing(l.fake6, "fd66::/64");
     ASSERT_EQm("one refusal may be a lost race: that pass fails", FIRC_ERR_IO, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
@@ -5033,7 +5069,7 @@ TEST a_group_refused_in_nat_is_taken_out_of_mangle_too(void) {
     firc_fake_ipt_refuse_rules_containing(l.fake, masq);
 
     firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, tag_id(2));
-    ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, "10.66.0.0/16")));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), tcp_rule(FIRC_RULE_SUBNET, "10.66.0.0/16")));
     ASSERT_EQ(FIRC_OK, firc_app_sync_group(l.app, rs));
     ASSERT(issue_unwritten(&l, "d.example", 1, &f4));
     char *before = firc_fake_xt_write_order(firc_fake_ipt_xt(l.fake));
@@ -6217,14 +6253,15 @@ TEST a_subnet_rule_of_a_selector_group_jumps_to_its_devices_chain(void) {
     ASSERT_EQ(FIRC_OK, firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, "10.0.0.0/8")));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
     ASSERT(first_pass_done(&l));
-    char chain[64], dchain[64], jump[160];
+    char chain[64], dchain[64], jump[256];
     chain_of(&l, gid, chain, sizeof(chain));
     devices_chain_of(&l, gid, dchain, sizeof(dchain));
-    snprintf(jump, sizeof(jump), "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j %s",
-             dchain);
+    snprintf(jump, sizeof(jump),
+             "-m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -m set --match-set %sS4 dst -j %s",
+             chain, dchain);
     ASSERT(mangle_has(&l, chain, jump));
-    ASSERT_FALSE(mangle_has(&l, chain,
-                            "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK"));
+    ASSERT_FALSE(mangle_has(&l, chain, "-j MARK"));
+    ASSERT_FALSE(mangle_has(&l, chain, "-j CONNMARK"));
     locked_app_down(&l);
     PASS();
 }
@@ -6253,12 +6290,17 @@ TEST a_selector_emptied_returns_its_subnet_rule_to_a_mark(void) {
     ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, emptied));
     ASSERT(wait_written_after(&l, started));
     ASSERT_FALSE(mangle_chain_there(&l, dchain));
-    ASSERT(mangle_has(&l, chain,
-                      "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK "
-                      "--set-xmark"));
-    ASSERT(mangle_has(&l, chain,
-                      "-d 10.0.0.0/8 -m conntrack --ctdir ORIGINAL -j CONNMARK --save-mark --nfmask 0x40ff0000 "
-                      "--ctmask 0x40ff0000"));
+    char mk[192], cm[192];
+    snprintf(mk, sizeof(mk),
+             "-m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -m set --match-set %sS4 dst -j MARK "
+             "--set-xmark",
+             chain);
+    snprintf(cm, sizeof(cm),
+             "-m conntrack --ctdir ORIGINAL -m set --match-set %sS4 dst -j CONNMARK --save-mark --nfmask 0x40ff0000 "
+             "--ctmask 0x40ff0000",
+             chain);
+    ASSERT(mangle_has(&l, chain, mk));
+    ASSERT(mangle_has(&l, chain, cm));
     ASSERT_FALSE(mangle_has(&l, chain, dchain));
     locked_app_down(&l);
     PASS();
@@ -8220,7 +8262,7 @@ TEST a_left_out_tunnel_group_closes_its_chunks_and_subnets(void) {
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     firc_app_set_running(l.app, true);
     attach_close(&l, &rec);
-    firc_group_t *two = named_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.66.0.0/16");
+    firc_group_t *two = tcp_group(2, "refused-two", "b.example", FIRC_RULE_SUBNET, "10.66.0.0/16");
     free(two->iface);
     two->iface = strdup("tunvless3");
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, named_group(1, "one", "a.example", NULL, NULL)));
@@ -8949,6 +8991,1129 @@ TEST a_failed_list_group_is_retried_when_its_second_entry_comes_up(void) {
     PASS();
 }
 
+static void set_of(uint8_t tag, bool scratch, char *out, size_t cap) {
+    snprintf(out, cap, "FIRC_%02x%02x%02x%02x%c4", tag, tag, tag, tag, scratch ? 'T' : 'S');
+}
+
+static firc_nf_prefix_t pfx4(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t cidr) {
+    firc_nf_prefix_t p = {.family = 4, .cidr = cidr, .addr = {a, b, c, d}};
+    return p;
+}
+
+static firc_group_t *bare_group(uint8_t tag, const char *name, const char *const *subnets, size_t n) {
+    char host[32];
+    snprintf(host, sizeof(host), "t%u.example", (unsigned)tag);
+    firc_group_t *g = named_group(tag, name, host, NULL, NULL);
+    for (size_t i = 0; i < n; i++) { firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, subnets[i])); }
+    return g;
+}
+
+static bool sets_up(locked_app_t *l) {
+    if (!locked_app_up_no_committer(l)) { return false; }
+    fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
+    firc_app_set_running(l->app, true);
+    return true;
+}
+
+static firc_err_t sets_pass(locked_app_t *l) { return firc_app_rebuild_netfilter_kind(l->app, NULL, false); }
+
+static const char *const k_two_bare[] = {"10.1.0.0/16", "192.0.2.0/24"};
+
+static bool two_bare_up(locked_app_t *l) {
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    return sets_up(l) && firc_app_add_group(l->app, bare_group(1, "g", k_two_bare, 2)) == FIRC_OK &&
+           sets_pass(l) == FIRC_OK && fake_setnl_count(l->setk, s4) == 2;
+}
+
+TEST a_group_s_bare_prefixes_reach_the_kernel_as_a_set(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    firc_nf_prefix_t a = pfx4(10, 1, 0, 0, 16), b = pfx4(192, 0, 2, 0, 24);
+    ASSERT_EQ_FMT((size_t)2, fake_setnl_count(l.setk, s4), "%zu");
+    ASSERT(fake_setnl_contains(l.setk, s4, &a));
+    ASSERT(fake_setnl_contains(l.setk, s4, &b));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_pass_with_unchanged_prefixes_sends_no_set_message(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    size_t before = fake_setnl_messages(l.setk);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter(l.app, NULL));
+    ASSERT_EQ_FMT(before, fake_setnl_messages(l.setk), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_put_with_the_same_prefixes_sends_no_set_message(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    size_t before = fake_setnl_messages(l.setk);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT(before, fake_setnl_messages(l.setk), "%zu");
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_EQ_FMT((size_t)2, fake_setnl_count(l.setk, s4), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_put_swapping_one_prefix_for_another_rewrites_the_set(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    static const char *const swapped[] = {"10.1.0.0/16", "198.51.100.0/24"};
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", swapped, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    firc_nf_prefix_t gone = pfx4(192, 0, 2, 0, 24), came = pfx4(198, 51, 100, 0, 24);
+    ASSERT_EQ_FMT((size_t)2, fake_setnl_count(l.setk, s4), "%zu");
+    ASSERT(fake_setnl_contains(l.setk, s4, &came));
+    ASSERT_FALSE(fake_setnl_contains(l.setk, s4, &gone));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST an_added_prefix_is_in_the_set_before_the_tables_are_written(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", NULL, 0)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, tag_id(1));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, "10.3.0.0/16")));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_group(l.app, rs));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char t4[FIRC_SET_NAME_MAX];
+    set_of(1, true, t4, sizeof(t4));
+    uint64_t named = bridge_first_since(&l.bridge, t0, "rename", t4);
+    uint64_t written = bridge_first_since(&l.bridge, t0, "table", NULL);
+    ASSERT(named != 0 && written != 0);
+    ASSERT(named < written);
+    locked_app_down(&l);
+    PASS();
+}
+
+typedef struct {
+    fake_setnl_t *setk;
+    char name[FIRC_SET_NAME_MAX];
+    size_t at_probe;
+} set_probe_t;
+
+static void probe_set_count(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    set_probe_t *p = ud;
+    p->at_probe = fake_setnl_count(p->setk, p->name);
+}
+
+typedef struct {
+    bool (*done)(void *ud);
+    void *ud;
+    bool met;
+} loop_until_t;
+
+static void loop_until_tick(firc_loop_t *loop, void *ud) {
+    loop_until_t *u = ud;
+    if (!u->met && u->done(u->ud)) {
+        u->met = true;
+        firc_loop_stop(loop);
+    }
+}
+
+static bool run_loop_until(firc_loop_t *loop, bool (*done)(void *ud), void *ud, uint64_t max_ms) {
+    loop_until_t u = {.done = done, .ud = ud, .met = false};
+    int tick = 0, end = 0;
+    if (firc_loop_add_timer(loop, 20, 20, loop_until_tick, &u, &tick) != FIRC_OK ||
+        firc_loop_add_timer(loop, max_ms, 0, stop_the_loop, loop, &end) != FIRC_OK) {
+        return false;
+    }
+    (void)firc_loop_run(loop);
+    (void)firc_loop_del_timer(loop, tick);
+    (void)firc_loop_del_timer(loop, end);
+    return u.met;
+}
+
+static bool set_holds_three(void *ud) {
+    set_probe_t *p = ud;
+    return fake_setnl_count(p->setk, p->name) == 3;
+}
+
+static bool wait_set_count(fake_setnl_t *setk, const char *name, size_t want) {
+    for (int i = 0; i < 300; i++) {
+        if (fake_setnl_count(setk, name) == want) { return true; }
+        sleep_ms(10);
+    }
+    return false;
+}
+
+TEST a_failed_set_write_keeps_the_old_set_and_retries_by_itself(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT(wait_written_after(&l, started));
+    set_probe_t probe = {.setk = l.setk, .at_probe = 0};
+    set_of(1, false, probe.name, sizeof(probe.name));
+    ASSERT(wait_set_count(l.setk, probe.name, 2));
+
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    uint64_t mark = journal_mark();
+    firc_app_nf_enter(l.app);
+    started = firc_app_nf_passes_for_test(l.app);
+    firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, tag_id(1));
+    firc_err_t added = firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, "10.3.0.0/16"));
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ(FIRC_OK, added);
+    ASSERT_EQ(FIRC_OK, firc_app_sync_group(l.app, rs));
+    ASSERTm("the pass went on", wait_written_after(&l, started));
+    ASSERT_EQ_FMTm("the old set stays", (size_t)2, fake_setnl_count(l.setk, probe.name), "%zu");
+
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    int id = 0;
+    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 600, 0, probe_set_count, &probe, &id));
+    bool wrote = run_loop_until(loop, set_holds_three, &probe, 20000);
+    ASSERT_EQ_FMTm("nothing retried before the first second", (size_t)2, probe.at_probe, "%zu");
+    ASSERTm("the timer's pass wrote it", wrote);
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_WARN, "group \"g\" (01010101): its subnet set was not written: "),
+                  "%zu");
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_set_written_after_a_failure_owes_the_group_a_flush(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const both[] = {"10.1.0.0/16", "10.2.0.0/16"};
+    static const char *const kept[] = {"10.2.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", both, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", kept, 1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_EQ_FMTm("fixture: the old set still marks 10.1/16", (size_t)2, fake_setnl_count(l.setk, s4), "%zu");
+    static const uint8_t late[4] = {10, 1, 0, 9};
+    plant_flow(&l, 1, late, late);
+    firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, tag_id(1));
+    ASSERT_EQ(FIRC_OK, firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, "10.6.0.0/16")));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_group(l.app, rs));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT((size_t)2, fake_setnl_count(l.setk, s4), "%zu");
+    ASSERTm("the flow the old set marked went", fake_ct_deleted(l.ctk, late, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST two_groups_without_a_set_are_left_out_and_the_third_goes_live(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    fake_setnl_no_type(l.setk);
+    static const char *const one[] = {"10.1.0.0/16"};
+    static const char *const two[] = {"10.2.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "two", two, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(3, "three", NULL, 0)));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 2));
+    ASSERT_STR_EQ("live", live_reason(&l, 3));
+    ASSERT_EQ_FMT(0, group_in_kernel(&l, tag_id(1)), "%d");
+    ASSERT_EQ_FMT(0, group_in_kernel(&l, tag_id(2)), "%d");
+    ASSERT(group_fully_in(&l, tag_id(3)));
+    ASSERT(journal_says(mark, "group \"one\" (01010101) is left out of netfilter: its subnet set is not in the kernel"));
+    ASSERT(journal_says(mark, "group \"two\" (02020202) is left out of netfilter: its subnet set is not in the kernel"));
+    locked_app_down(&l);
+    PASS();
+}
+
+static bool set_has(locked_app_t *l, uint8_t tag, size_t n) {
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(tag, false, s4, sizeof(s4));
+    return fake_setnl_count(l->setk, s4) == n;
+}
+
+typedef struct {
+    firc_app_t *app;
+    bool seen;
+} retry_seen_t;
+
+static bool set_retry_fired(void *ud) {
+    retry_seen_t *r = ud;
+    bool armed = firc_app_set_retry_armed_for_test(r->app);
+    r->seen = r->seen || armed;
+    return r->seen && !armed;
+}
+
+TEST a_left_out_group_returns_when_its_set_is_written(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_ex(&l, loop, tap_fake_open, false));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    static const char *const one[] = {"10.1.0.0/16"};
+    fake_setnl_fail_next(l.setk, IPSET_CMD_CREATE, ENOMEM, false);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT_EQ_FMT(0, group_in_kernel(&l, tag_id(1)), "%d");
+    retry_seen_t r = {.app = l.app, .seen = false};
+    ASSERTm("the timer fired", run_loop_until(loop, set_retry_fired, &r, 20000));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT(set_has(&l, 1, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(group_fully_in(&l, tag_id(1)));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_group_without_a_client_is_left_out_only_if_it_has_bare_prefixes(void) {
+    g_app_no_sets = true;
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const one[] = {"10.1.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    firc_group_t *tcp = bare_group(2, "two", NULL, 0);
+    firc_rule_t *r = edit_rule(FIRC_RULE_SUBNET, "10.2.0.0/16");
+    r->proto = strdup("tcp");
+    firc_group_add_rule(tcp, r);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tcp));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(3, "three", NULL, 0)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_STR_EQ("live", live_reason(&l, 3));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST the_pass_names_the_set_it_wrote(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    char chain[64], s4[FIRC_SET_NAME_MAX], m[48], mk[256], cm[256];
+    chain_of(&l, tag_id(1), chain, sizeof(chain));
+    set_of(1, false, s4, sizeof(s4));
+    snprintf(m, sizeof(m), "0x%x/0x40ff0000", FIRC_MARK_HANDLED | field_of(&l, 1));
+    snprintf(mk, sizeof(mk),
+             "-m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -m set --match-set %s dst -j MARK "
+             "--set-xmark %s",
+             s4, m);
+    snprintf(cm, sizeof(cm),
+             "-m conntrack --ctdir ORIGINAL -m set --match-set %s dst -j CONNMARK --save-mark --nfmask 0x40ff0000 "
+             "--ctmask 0x40ff0000",
+             s4);
+    ASSERT(mangle_has(&l, chain, mk));
+    ASSERT(mangle_has(&l, chain, cm));
+    ASSERT_FALSE(mangle_has(&l, chain, "-d 10.1.0.0/16"));
+    ASSERT_FALSE(mangle_has(&l, chain, "-d 192.0.2.0/24"));
+    ASSERT(fake_setnl_has(l.setk, s4));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_of_protocol_rules_runs_without_a_client(void) {
+    g_app_no_sets = true;
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    firc_group_t *tcp = bare_group(2, "two", NULL, 0);
+    firc_rule_t *r = edit_rule(FIRC_RULE_SUBNET, "10.2.0.0/16");
+    r->proto = strdup("tcp");
+    firc_group_add_rule(tcp, r);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tcp));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char chain[64], mk[256];
+    chain_of(&l, tag_id(2), chain, sizeof(chain));
+    snprintf(mk, sizeof(mk),
+             "-d 10.2.0.0/16 -p tcp -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK "
+             "--set-xmark 0x%x/0x40ff0000",
+             FIRC_MARK_HANDLED | field_of(&l, 2));
+    ASSERT(mangle_has(&l, chain, mk));
+    ASSERT_FALSE(mangle_has(&l, chain, "--match-set"));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_losing_its_last_bare_prefix_drops_its_set_after_the_tables(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", NULL, 0)));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    uint64_t dropped = bridge_first_since(&l.bridge, t0, "destroy", s4);
+    uint64_t written = bridge_last_since(&l.bridge, t0, "table", NULL);
+    ASSERT(dropped != 0 && written != 0);
+    ASSERT(written < dropped);
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_deleted_group_s_set_is_swept(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_disabled_group_s_set_is_swept(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    firc_group_t *off = bare_group(1, "g", k_two_bare, 2);
+    off->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), off));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_busy_set_is_swept_by_the_next_pass(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    fake_setnl_reference(l.setk, s4, true);
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERTm("fixture: busy", fake_setnl_has(l.setk, s4));
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_WARN, ""), "%zu");
+    fake_setnl_reference(l.setk, s4, false);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_trial_search_writes_each_set_once(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[3] = 3603;
+    firc_app_set_ktcp_ports(l.app, ports);
+    static const char *const one[] = {"10.1.0.0/16"};
+    static const char *const two[] = {"10.2.0.0/16"};
+    firc_group_t *tun = bare_group(1, "one", one, 1);
+    free(tun->iface);
+    tun->iface = strdup("tunvless3");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tun));
+    firc_group_t *refused = bare_group(2, "two", two, 1);
+    firc_group_add_rule(refused, tcp_rule(FIRC_RULE_SUBNET, "10.66.0.0/16"));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, refused));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "10.66.0.0/16");
+    uint64_t refused_at = bridge_now(&l.bridge);
+    ASSERT_EQm("one refusal fails the pass", FIRC_ERR_IO, sets_pass(&l));
+    ASSERT_EQ_FMTm("a refusal that is not ENOENT asks no names", (size_t)0,
+                   bridge_count_since(&l.bridge, refused_at, "list", NULL), "%zu");
+
+    static const char *const one_more[] = {"10.1.0.0/16", "10.3.0.0/16"};
+    static const char *const two_more[] = {"10.2.0.0/16", "10.4.0.0/16"};
+    firc_group_t *tun_more = bare_group(1, "one", one_more, 2);
+    free(tun_more->iface);
+    tun_more->iface = strdup("tunvless3");
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), tun_more));
+    firc_group_t *refused_more = bare_group(2, "two", two_more, 2);
+    firc_group_add_rule(refused_more, tcp_rule(FIRC_RULE_SUBNET, "10.66.0.0/16"));
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(2), refused_more));
+    uint64_t t0 = bridge_now(&l.bridge);
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERTm("fixture: the search ran", journal_says(mark, "group \"two\" (02020202) is left out"));
+    ASSERT_EQ_FMT((size_t)2, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+typedef struct {
+    firc_app_t *app;
+    firc_ruleset_t *rs;
+    _Atomic bool done;
+} sync_call_t;
+
+static void *sync_in_thread(void *ud) {
+    sync_call_t *c = ud;
+    (void)firc_app_sync_group(c->app, c->rs);
+    atomic_store(&c->done, true);
+    return NULL;
+}
+
+static bool wait_flag(_Atomic bool *flag, int ms) {
+    for (int i = 0; i < ms / 10; i++) {
+        if (atomic_load(flag)) { return true; }
+        sleep_ms(10);
+    }
+    return atomic_load(flag);
+}
+
+static bool wait_adds(setnl_xt_bridge_t *b, int ms) {
+    for (int i = 0; i < ms / 10; i++) {
+        if (bridge_count_since(b, 0, "add", NULL) > 0) { return true; }
+        sleep_ms(10);
+    }
+    return false;
+}
+
+TEST a_mutating_call_returns_while_a_set_is_being_written(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT(wait_written_after(&l, 0));
+    fake_setnl_hold_adds(l.setk, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    bool adding = wait_adds(&l.bridge, 2000);
+    sync_call_t call = {.app = l.app, .rs = firc_app_find_group_by_id(l.app, tag_id(1))};
+    atomic_store(&call.done, false);
+    pthread_t th;
+    bool started = adding && pthread_create(&th, NULL, sync_in_thread, &call) == 0;
+    bool in_time = started && wait_flag(&call.done, 2000);
+    fake_setnl_hold_adds(l.setk, false);
+    if (started) { pthread_join(th, NULL); }
+    ASSERTm("fixture: a set write was held", adding);
+    ASSERT(started);
+    ASSERTm("the edit returned while the set was being written", in_time);
+    locked_app_down(&l);
+    PASS();
+}
+
+static void raise_on_add(const char *what, const char *name, void *ud) {
+    (void)name;
+    if (strcmp(what, "add") == 0) { firc_cancel_raise(ud); }
+}
+
+TEST a_cancel_stops_before_the_next_set_not_inside_one(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const two[] = {"10.2.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "two", two, 1)));
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    bridge_then(&l.bridge, raise_on_add, cancel);
+    firc_err_t err = firc_app_rebuild_netfilter_kind(l.app, cancel, false);
+    bridge_then(&l.bridge, NULL, NULL);
+    firc_cancel_free(cancel);
+    ASSERT_EQ(FIRC_ERR_CANCELED, err);
+    char s1[FIRC_SET_NAME_MAX], s2[FIRC_SET_NAME_MAX], t1[FIRC_SET_NAME_MAX], t2[FIRC_SET_NAME_MAX];
+    set_of(1, false, s1, sizeof(s1));
+    set_of(2, false, s2, sizeof(s2));
+    set_of(1, true, t1, sizeof(t1));
+    set_of(2, true, t2, sizeof(t2));
+    ASSERT_EQ_FMTm("the first set is whole", (size_t)2, fake_setnl_count(l.setk, s1), "%zu");
+    ASSERT_EQ_FMTm("the second never began", (size_t)0, bridge_count_since(&l.bridge, 0, "create", t2), "%zu");
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMTm("the first is not written again", (size_t)0, bridge_count_since(&l.bridge, t0, "create", t1), "%zu");
+    ASSERT_EQ_FMT((size_t)1, bridge_count_since(&l.bridge, t0, "create", t2), "%zu");
+    ASSERT_EQ_FMT((size_t)1, fake_setnl_count(l.setk, s2), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST the_stop_sweeps_the_sets(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    fake_setnl_plant(l.setk, "_NDM_X", 4);
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERTm("fixture", fake_setnl_has(l.setk, s4));
+    firc_app_destroy(l.app);
+    l.app = NULL;
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    ASSERT(fake_setnl_has(l.setk, "_NDM_X"));
+    locked_app_down_rest(&l);
+    PASS();
+}
+
+static firc_err_t add_subnet(locked_app_t *l, uint8_t tag, const char *prefix) {
+    firc_ruleset_t *rs = firc_app_find_group_by_id(l->app, tag_id(tag));
+    firc_err_t err = firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, prefix));
+    return err == FIRC_OK ? firc_app_sync_group(l->app, rs) : err;
+}
+
+typedef struct {
+    firc_app_t *app;
+    firc_cancel_t *cancel;
+    int what;
+    bool fired;
+} write_hook_t;
+
+static void mutate_on_add(const char *what, const char *name, void *ud) {
+    (void)name;
+    write_hook_t *h = ud;
+    if (strcmp(what, "add") != 0 || h->fired) { return; }
+    h->fired = true;
+    if (h->cancel != NULL) { firc_cancel_raise(h->cancel); }
+    if (h->what == 0) {
+        firc_ruleset_t *rs = firc_app_find_group_by_id(h->app, tag_id(2));
+        (void)firc_group_add_rule(firc_ruleset_group_mut(rs), edit_rule(FIRC_RULE_SUBNET, "10.2.0.0/16"));
+        (void)firc_app_sync_group(h->app, rs);
+    } else if (h->what == 1) {
+        (void)firc_app_remove_group_by_id(h->app, tag_id(1));
+    } else {
+        firc_group_t *off = bare_group(1, "g", k_two_bare, 2);
+        off->enable = false;
+        (void)firc_app_update_group(h->app, tag_id(1), off);
+    }
+}
+
+TEST an_edit_during_the_last_set_write_cancels_before_staging(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const one[] = {"10.1.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "two", NULL, 0)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.5.0.0/16"));
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    write_hook_t h = {.app = l.app, .cancel = cancel, .what = 0};
+    bridge_then(&l.bridge, mutate_on_add, &h);
+    firc_err_t err = firc_app_rebuild_netfilter_kind(l.app, cancel, false);
+    bridge_then(&l.bridge, NULL, NULL);
+    firc_cancel_free(cancel);
+    ASSERTm("fixture: the edit landed during the write", h.fired);
+    ASSERT_EQ(FIRC_ERR_CANCELED, err);
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_FALSEm("no flush owed", firc_ruleset_take_flush(firc_app_find_group_by_id(l.app, tag_id(2))));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT(set_has(&l, 2, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(group_fully_in(&l, tag_id(2)));
+    locked_app_down(&l);
+    PASS();
+}
+
+static enum greatest_test_res first_write_loses_its_group(int what, bool cancels) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    firc_cancel_t *cancel = cancels ? firc_cancel_new() : NULL;
+    ASSERT(!cancels || cancel != NULL);
+    write_hook_t h = {.app = l.app, .cancel = cancel, .what = what};
+    bridge_then(&l.bridge, mutate_on_add, &h);
+    firc_err_t err = firc_app_rebuild_netfilter_kind(l.app, cancel, false);
+    bridge_then(&l.bridge, NULL, NULL);
+    firc_cancel_free(cancel);
+    ASSERTm("fixture: the group went during the write", h.fired);
+    ASSERT_EQ(cancels ? FIRC_ERR_CANCELED : FIRC_OK, err);
+    if (cancels) { ASSERT_EQ(FIRC_OK, sets_pass(&l)); }
+    char s4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_deleted_during_its_first_set_write_leaves_no_set(void) { CHECK_CALL(first_write_loses_its_group(1, false)); PASS(); }
+
+TEST a_group_deleted_during_a_cancelled_write_leaves_no_set_after_the_rerun(void) {
+    CHECK_CALL(first_write_loses_its_group(1, true));
+    PASS();
+}
+
+TEST a_group_disabled_during_its_first_set_write_leaves_no_set(void) { CHECK_CALL(first_write_loses_its_group(2, false)); PASS(); }
+
+TEST a_failure_an_edit_undid_is_cleared_and_the_next_one_warns(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_ex(&l, loop, tap_fake_open, false));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    uint64_t mark = journal_mark();
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT(run_loop_for(loop, 100));
+    ASSERT_FALSEm("nothing left to retry", firc_app_set_retry_armed_for_test(l.app));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.4.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMTm("the new failure is said", (size_t)2,
+                   journal_count_at(mark, FIRC_LOG_WARN, "its subnet set was not written"), "%zu");
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_pass_with_nothing_to_write_builds_no_bare_list(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    size_t before = firc_ipset_to_link_bare_builds_for_test();
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter(l.app, NULL));
+    ASSERT_EQ_FMT(before, firc_ipset_to_link_bare_builds_for_test(), "%zu");
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMTm("one list for the one job", before + 1, firc_ipset_to_link_bare_builds_for_test(), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_failing_set_is_rewritten_only_when_the_timer_asks(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_ex(&l, loop, tap_fake_open, false));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter(l.app, NULL));
+    ASSERT_EQ_FMTm("no other pass rewrites it", (size_t)0, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    retry_seen_t r = {.app = l.app, .seen = false};
+    ASSERTm("the timer fired", run_loop_until(loop, set_retry_fired, &r, 20000));
+    uint64_t t1 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT((size_t)1, bridge_count_since(&l.bridge, t1, "create", NULL), "%zu");
+    ASSERT(set_has(&l, 1, 3));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_first_set_after_a_failure_owes_no_flush(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const one[] = {"10.1.0.0/16"};
+    fake_setnl_fail_next(l.setk, IPSET_CMD_CREATE, ENOMEM, false);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", one, 1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    static const uint8_t flow[4] = {10, 1, 0, 9};
+    plant_flow(&l, 1, flow, flow);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.5.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_FALSE(fake_ct_deleted(l.ctk, flow, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_left_out_group_s_flush_waits_for_a_written_pass(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", NULL, 0)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    static const char *const two[] = {"10.2.0.0/16"};
+    fake_setnl_fail_next(l.setk, IPSET_CMD_CREATE, ENOMEM, false);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "two", two, 1)));
+    firc_ip_t fake = {{0}, 0};
+    ASSERT(issue_unwritten(&l, "t1.example", 1, &fake));
+    firc_fake_ipt_fail_next_write(l.fake, FIRC_ERR_IO);
+    ASSERTm("fixture: the pass fails", sets_pass(&l) != FIRC_OK);
+    ASSERT_FALSEm("nothing owed while the old tables stand",
+                  firc_ruleset_take_flush(firc_app_find_group_by_id(l.app, tag_id(2))));
+    static const uint8_t flow[4] = {10, 2, 0, 9};
+    plant_flow(&l, 2, flow, flow);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 2));
+    ASSERTm("paid once a pass landed", fake_ct_deleted(l.ctk, flow, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+static enum greatest_test_res slash_zero_stays_in(bool client) {
+    g_app_no_sets = !client;
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const all[] = {"0.0.0.0/0"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", all, 1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    if (client) { ASSERT_EQ_FMT((size_t)0, fake_setnl_sets(l.setk), "%zu"); }
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_slash_zero_rule_needs_no_set(void) {
+    CHECK_CALL(slash_zero_stays_in(true));
+    CHECK_CALL(slash_zero_stays_in(false));
+    PASS();
+}
+
+TEST a_kernel_without_ip_set_costs_no_set_message_after_the_first_pass(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    fake_setnl_no_subsystem(l.setk);
+    static const char *const one[] = {"10.1.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    uint64_t mark = journal_mark();
+    size_t at_start = fake_setnl_messages(l.setk);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT(journal_says(mark, "group \"one\" (01010101) is left out of netfilter: its subnet set is not in the kernel"));
+    size_t before = fake_setnl_messages(l.setk);
+    ASSERT_EQ_FMTm("the write's one probe, no sweep", at_start + 1, before, "%zu");
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT(before, fake_setnl_messages(l.setk), "%zu");
+    ASSERT_FALSE(journal_says(mark, "subnet sets no group names"));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_sweep_on_a_kernel_that_lost_ip_set_is_done_and_silent(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    fake_setnl_no_subsystem(l.setk);
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    size_t before = fake_setnl_messages(l.setk);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT(before, fake_setnl_messages(l.setk), "%zu");
+    ASSERT_FALSE(journal_says(mark, "subnet sets no group names"));
+    locked_app_down(&l);
+    PASS();
+}
+
+static bool g_fail_set_retry_timer;
+
+typedef struct {
+    firc_app_t *app;
+    fake_setnl_t *refail;
+    size_t refail_until;
+    uint64_t asked[16];
+    size_t n;
+} set_retry_log_t;
+
+static set_retry_log_t g_set_retry_log;
+
+firc_err_t __real_firc_loop_add_timer(firc_loop_t *loop, uint64_t initial_ms, uint64_t interval_ms, firc_timer_cb cb,
+                                      void *ud, int *out_id);
+firc_err_t __wrap_firc_loop_add_timer(firc_loop_t *loop, uint64_t initial_ms, uint64_t interval_ms, firc_timer_cb cb,
+                                      void *ud, int *out_id);
+firc_err_t __wrap_firc_loop_add_timer(firc_loop_t *loop, uint64_t initial_ms, uint64_t interval_ms, firc_timer_cb cb,
+                                      void *ud, int *out_id) {
+    if (g_fail_set_retry_timer && initial_ms == FIRC_APP_RETRY_MIN_MS && interval_ms == 0) { return FIRC_ERR_SYS; }
+    set_retry_log_t *g = &g_set_retry_log;
+    if (g->app != NULL && ud == g->app && interval_ms == 0 && initial_ms >= FIRC_APP_RETRY_MIN_MS &&
+        initial_ms <= FIRC_APP_RETRY_MAX_MS) {
+        if (g->n < sizeof(g->asked) / sizeof(g->asked[0])) { g->asked[g->n++] = initial_ms; }
+        if (g->refail != NULL && g->n < g->refail_until) { fake_setnl_fail_add_at(g->refail, 1, ENOMEM); }
+        initial_ms = 1;
+    }
+    return __real_firc_loop_add_timer(loop, initial_ms, interval_ms, cb, ud, out_id);
+}
+
+static bool failing_set_on_a_loop(locked_app_t *l, firc_loop_t **loop) {
+    if (firc_loop_create(loop) != FIRC_OK || !locked_app_up_ex(l, *loop, tap_fake_open, false)) { return false; }
+    fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
+    firc_app_set_running(l->app, true);
+    if (firc_app_add_group(l->app, bare_group(1, "g", k_two_bare, 2)) != FIRC_OK || sets_pass(l) != FIRC_OK) {
+        return false;
+    }
+    fake_setnl_fail_add_at(l->setk, 1, ENOMEM);
+    return add_subnet(l, 1, "10.3.0.0/16") == FIRC_OK && sets_pass(l) == FIRC_OK && set_has(l, 1, 2);
+}
+
+TEST a_retry_that_could_not_be_armed_is_written_by_the_next_pass(void) {
+    firc_loop_t *loop = NULL;
+    locked_app_t l;
+    ASSERT(failing_set_on_a_loop(&l, &loop));
+    g_fail_set_retry_timer = true;
+    bool ran = run_loop_for(loop, 100);
+    g_fail_set_retry_timer = false;
+    ASSERT(ran);
+    ASSERT_FALSEm("fixture: no timer", firc_app_set_retry_armed_for_test(l.app));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT((size_t)1, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    ASSERT(set_has(&l, 1, 3));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_cancelled_retry_pass_leaves_the_retry_to_its_rerun(void) {
+    firc_loop_t *loop = NULL;
+    locked_app_t l;
+    ASSERT(failing_set_on_a_loop(&l, &loop));
+    retry_seen_t r = {.app = l.app, .seen = false};
+    ASSERTm("the timer fired", run_loop_until(loop, set_retry_fired, &r, 20000));
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    firc_cancel_raise(cancel);
+    uint64_t t0 = bridge_now(&l.bridge);
+    firc_err_t err = firc_app_rebuild_netfilter_kind(l.app, cancel, false);
+    firc_cancel_free(cancel);
+    ASSERT_EQ(FIRC_ERR_CANCELED, err);
+    ASSERT_EQ_FMTm("fixture: nothing written", (size_t)0, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT((size_t)1, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    ASSERT(set_has(&l, 1, 3));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_refused_first_set_sends_no_sweep(void) {
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    static const char *const one[] = {"10.1.0.0/16"};
+    fake_setnl_fail_next(l.setk, IPSET_CMD_CREATE, EINVAL, false);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMTm("fixture: the create was tried", (size_t)1, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    ASSERT_EQ_FMT((size_t)0, bridge_count_since(&l.bridge, t0, "list", NULL), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_whose_set_write_fails_is_not_written_until_the_retry_lands(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_ex(&l, loop, tap_fake_open, false));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT(chain_marks(&l, tag_id(1), "10.1.0.0/16"));
+    ASSERT(chain_marks(&l, tag_id(1), "192.0.2.0/24"));
+    ASSERT(set_has(&l, 1, 2));
+    retry_seen_t r = {.app = l.app, .seen = false};
+    ASSERTm("the timer fired", run_loop_until(loop, set_retry_fired, &r, 20000));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT(set_has(&l, 1, 3));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_failed_set_whose_content_returns_is_live_without_a_write(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", k_two_bare, 2)));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_EQ_FMT((size_t)0, bridge_count_since(&l.bridge, t0, "create", NULL), "%zu");
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_failed_set_whose_prefixes_all_went_is_live_after_one_pass(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, tag_id(1), bare_group(1, "g", NULL, 0)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+static bool group_live_with_set(locked_app_t *l, size_t n) {
+    for (int i = 0; i < 500; i++) {
+        if (set_has(l, 1, n) && strcmp(live_reason(l, 1), "live") == 0) { return true; }
+        sleep_ms(10);
+    }
+    return false;
+}
+
+TEST a_live_set_that_vanished_is_written_again(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    static const char *const kept[] = {"10.9.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "kept", kept, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(group_live_with_set(&l, 2));
+    ASSERT(wait_set_count(l.setk, "FIRC_02020202S4", 1));
+    char s4[FIRC_SET_NAME_MAX], t4[FIRC_SET_NAME_MAX];
+    set_of(1, false, s4, sizeof(s4));
+    set_of(1, true, t4, sizeof(t4));
+    firc_app_nf_enter(l.app);
+    firc_err_t dropped = firc_setnl_destroy(l.sets, s4);
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ(FIRC_OK, dropped);
+    ASSERTm("fixture: the set is gone", !fake_setnl_has(l.setk, s4));
+    uint64_t t0 = bridge_now(&l.bridge);
+    ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(l.app));
+    ASSERTm("the set came back and the group is live", group_live_with_set(&l, 2));
+    uint64_t rewritten = bridge_first_since(&l.bridge, t0, "create", t4);
+    ASSERT(rewritten != 0);
+    size_t lists = 0;
+    for (uint64_t at = t0; (at = bridge_first_since(&l.bridge, at, "list", NULL)) != 0 && at < rewritten;) { lists++; }
+    ASSERT_EQ_FMTm("one names dump found it", (size_t)1, lists, "%zu");
+    ASSERT_EQ_FMTm("the set still there is not written again", (size_t)0,
+                   bridge_count_since(&l.bridge, t0, "create", "FIRC_02020202T4"), "%zu");
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_family_without_an_engine_needs_no_set(void) {
+    g_app_no_v6 = true;
+    locked_app_t l;
+    ASSERT(sets_up(&l));
+    fake_setnl_plant(l.setk, "FIRC_01010101S6", 6);
+    firc_group_t *g = bare_group(1, "g", NULL, 0);
+    firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, "10.1.0.0/16"));
+    firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET6, "2001:db8::/32"));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(set_has(&l, 1, 1));
+    ASSERT_EQ_FMT((size_t)0, bridge_count_since(&l.bridge, 0, "create", "FIRC_01010101T6"), "%zu");
+    ASSERT_FALSEm("the sweep kept only S4", fake_setnl_has(l.setk, "FIRC_01010101S6"));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_pass_whose_tables_fail_after_a_set_write_does_not_sweep(void) {
+    locked_app_t l;
+    ASSERT(two_bare_up(&l));
+    static const char *const two[] = {"10.2.0.0/16"};
+    char s1[FIRC_SET_NAME_MAX];
+    set_of(1, false, s1, sizeof(s1));
+    fake_setnl_reference(l.setk, s1, true);
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERTm("fixture: busy", fake_setnl_has(l.setk, s1));
+    fake_setnl_reference(l.setk, s1, false);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(2, "two", two, 1)));
+    uint64_t t0 = bridge_now(&l.bridge);
+    firc_fake_ipt_fail_next_write(l.fake, FIRC_ERR_IO);
+    ASSERTm("fixture: the tables fail", sets_pass(&l) != FIRC_OK);
+    ASSERTm("fixture: the set was written", set_has(&l, 2, 1));
+    ASSERT_EQ_FMT((size_t)0, bridge_count_since(&l.bridge, t0, "list", NULL), "%zu");
+    ASSERT(fake_setnl_has(l.setk, s1));
+    ASSERT_EQ(FIRC_OK, sets_pass(&l));
+    ASSERT_FALSE(fake_setnl_has(l.setk, s1));
+    locked_app_down(&l);
+    PASS();
+}
+
+typedef struct {
+    locked_app_t *l;
+    bool edited;
+} spacing_t;
+
+static bool retry_spacing_done(void *ud) {
+    spacing_t *s = ud;
+    set_retry_log_t *g = &g_set_retry_log;
+    if (!s->edited && g->n == 8 && !firc_app_set_retry_armed_for_test(s->l->app) && set_has(s->l, 1, 3)) {
+        s->edited = true;
+        fake_setnl_fail_add_at(s->l->setk, 1, ENOMEM);
+        (void)add_subnet(s->l, 1, "10.4.0.0/16");
+    }
+    return s->edited && g->n == 9;
+}
+
+TEST the_set_retry_doubles_to_a_minute_and_starts_over_after_a_success(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "g", k_two_bare, 2)));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(wait_set_count(l.setk, "FIRC_01010101S4", 2));
+    memset(&g_set_retry_log, 0, sizeof(g_set_retry_log));
+    g_set_retry_log.refail = l.setk;
+    g_set_retry_log.refail_until = 8;
+    g_set_retry_log.app = l.app;
+    fake_setnl_fail_add_at(l.setk, 1, ENOMEM);
+    ASSERT_EQ(FIRC_OK, add_subnet(&l, 1, "10.3.0.0/16"));
+    spacing_t sp = {.l = &l, .edited = false};
+    bool done = run_loop_until(loop, retry_spacing_done, &sp, 10000);
+    set_retry_log_t got = g_set_retry_log;
+    memset(&g_set_retry_log, 0, sizeof(g_set_retry_log));
+    ASSERT(done);
+    static const uint64_t want[9] = {1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 1000};
+    for (size_t i = 0; i < 9; i++) { ASSERT_EQ_FMT(want[i], got.asked[i], "%" PRIu64); }
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_kernel_without_ip_set_arms_no_retry(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_setnl_no_subsystem(l.setk);
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    memset(&g_set_retry_log, 0, sizeof(g_set_retry_log));
+    g_set_retry_log.app = l.app;
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    static const char *const one[] = {"10.1.0.0/16"};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, bare_group(1, "one", one, 1)));
+    ASSERT(wait_written_after(&l, started));
+    uint64_t passes = firc_app_nf_passes_for_test(l.app);
+    bool ran = run_loop_for(loop, 300);
+    size_t arms = g_set_retry_log.n;
+    memset(&g_set_retry_log, 0, sizeof(g_set_retry_log));
+    ASSERT(ran);
+    ASSERT_EQ_FMT((size_t)0, arms, "%zu");
+    ASSERT_FALSE(firc_app_set_retry_armed_for_test(l.app));
+    ASSERT_EQ_FMT(passes, firc_app_nf_passes_for_test(l.app), "%" PRIu64);
+    ASSERT_STR_EQ("not-written", live_reason(&l, 1));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -9208,5 +10373,48 @@ int main(int argc, char **argv) {
     RUN_TEST(without_a_committer_a_move_off_a_redirected_tunnel_closes_at_once);
     RUN_TEST(a_live_check_setting_reaches_the_watcher);
     RUN_TEST(a_failed_list_group_is_retried_when_its_second_entry_comes_up);
+    RUN_TEST(a_group_s_bare_prefixes_reach_the_kernel_as_a_set);
+    RUN_TEST(a_pass_with_unchanged_prefixes_sends_no_set_message);
+    RUN_TEST(a_put_with_the_same_prefixes_sends_no_set_message);
+    RUN_TEST(a_put_swapping_one_prefix_for_another_rewrites_the_set);
+    RUN_TEST(an_added_prefix_is_in_the_set_before_the_tables_are_written);
+    RUN_TEST(a_failed_set_write_keeps_the_old_set_and_retries_by_itself);
+    RUN_TEST(a_set_written_after_a_failure_owes_the_group_a_flush);
+    RUN_TEST(two_groups_without_a_set_are_left_out_and_the_third_goes_live);
+    RUN_TEST(a_left_out_group_returns_when_its_set_is_written);
+    RUN_TEST(a_group_without_a_client_is_left_out_only_if_it_has_bare_prefixes);
+    RUN_TEST(the_pass_names_the_set_it_wrote);
+    RUN_TEST(a_group_of_protocol_rules_runs_without_a_client);
+    RUN_TEST(a_group_losing_its_last_bare_prefix_drops_its_set_after_the_tables);
+    RUN_TEST(a_deleted_group_s_set_is_swept);
+    RUN_TEST(a_disabled_group_s_set_is_swept);
+    RUN_TEST(a_busy_set_is_swept_by_the_next_pass);
+    RUN_TEST(a_trial_search_writes_each_set_once);
+    RUN_TEST(a_mutating_call_returns_while_a_set_is_being_written);
+    RUN_TEST(a_cancel_stops_before_the_next_set_not_inside_one);
+    RUN_TEST(the_stop_sweeps_the_sets);
+    RUN_TEST(an_edit_during_the_last_set_write_cancels_before_staging);
+    RUN_TEST(a_group_deleted_during_its_first_set_write_leaves_no_set);
+    RUN_TEST(a_group_disabled_during_its_first_set_write_leaves_no_set);
+    RUN_TEST(a_failure_an_edit_undid_is_cleared_and_the_next_one_warns);
+    RUN_TEST(a_pass_with_nothing_to_write_builds_no_bare_list);
+    RUN_TEST(a_failing_set_is_rewritten_only_when_the_timer_asks);
+    RUN_TEST(a_first_set_after_a_failure_owes_no_flush);
+    RUN_TEST(a_left_out_group_s_flush_waits_for_a_written_pass);
+    RUN_TEST(a_slash_zero_rule_needs_no_set);
+    RUN_TEST(a_group_deleted_during_a_cancelled_write_leaves_no_set_after_the_rerun);
+    RUN_TEST(a_kernel_without_ip_set_costs_no_set_message_after_the_first_pass);
+    RUN_TEST(a_sweep_on_a_kernel_that_lost_ip_set_is_done_and_silent);
+    RUN_TEST(a_retry_that_could_not_be_armed_is_written_by_the_next_pass);
+    RUN_TEST(a_cancelled_retry_pass_leaves_the_retry_to_its_rerun);
+    RUN_TEST(a_refused_first_set_sends_no_sweep);
+    RUN_TEST(a_group_whose_set_write_fails_is_not_written_until_the_retry_lands);
+    RUN_TEST(a_failed_set_whose_content_returns_is_live_without_a_write);
+    RUN_TEST(a_failed_set_whose_prefixes_all_went_is_live_after_one_pass);
+    RUN_TEST(a_live_set_that_vanished_is_written_again);
+    RUN_TEST(a_family_without_an_engine_needs_no_set);
+    RUN_TEST(a_pass_whose_tables_fail_after_a_set_write_does_not_sweep);
+    RUN_TEST(the_set_retry_doubles_to_a_minute_and_starts_over_after_a_success);
+    RUN_TEST(a_kernel_without_ip_set_arms_no_retry);
     GREATEST_MAIN_END();
 }

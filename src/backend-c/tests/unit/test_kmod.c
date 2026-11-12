@@ -68,11 +68,26 @@ TEST a_module_without_a_file_is_not_mentioned(void) {
     PASS();
 }
 
+TEST the_netfilter_loader_tries_the_set_modules_in_order(void) {
+    const char *files[] = {"xt_set.ko", "ip_set_hash_net.ko", "ip_set.ko"};
+    char log[8192];
+    size_t loaded = 99;
+    ASSERT(read_log_after_netfilter_load(files, 3, log, sizeof(log), &loaded));
+    ASSERT_EQ_FMT((size_t)0, loaded, "%zu");
+    const char *core = strstr(log, "kernel module ip_set would not load");
+    const char *hash = strstr(log, "kernel module ip_set_hash_net would not load");
+    const char *match = strstr(log, "kernel module xt_set would not load");
+    ASSERT(core != NULL && hash != NULL && match != NULL);
+    ASSERT(core < hash && hash < match);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(the_netfilter_loader_tries_multiport_and_addrtype);
     RUN_TEST(a_module_without_a_file_is_not_mentioned);
+    RUN_TEST(the_netfilter_loader_tries_the_set_modules_in_order);
     GREATEST_MAIN_END();
 }

@@ -716,7 +716,7 @@ dl=$(grep -nxF -- "$DNATJ" "$W/nat" | cut -d: -f1)
 # catches: the REDIR jump missing its local exclusion, or standing after the DNAT jump so DNAT binds the flow first
 check "the REDIR jump with addrtype ! LOCAL precedes the DNAT jump" yes \
     "$([ -n "$jl" ] && [ -n "$dl" ] && [ "$jl" -lt "$dl" ] && echo yes || echo "no (jump $jl, dnat $dl)")"
-M0=$(iptables-legacy-save -t mangle | sed -n 's|^-A FIRC_0000aa01 -d 10.81.0.0/24 .*--set-xmark \(0x40[0-9a-f]*\)/0x40ff0000$|\1|p')
+M0=$(iptables-legacy-save -t mangle | sed -n 's|^-A FIRC_0000aa01 .*-j MARK --set-xmark \(0x40[0-9a-f]*\)/0x40ff0000$|\1|p' | sort -u)
 # catches: a REDIRECT to the wrong port or under another group's mark
 check "one REDIRECT, G0's mark to 3600" "1 1" \
     "$(grep -c -- '-j REDIRECT' "$W/nat") $(grep -cxF -- "-A FIRC_REDIR -p tcp -m mark --mark $M0/0x40ff0000 -j REDIRECT --to-ports 3600" "$W/nat")"

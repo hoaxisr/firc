@@ -15,8 +15,24 @@ static bool unlink_quiet(const char *path, firc_err_t *first) {
     return false;
 }
 
-firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, const char *chain_prefix,
-                      const firc_purge_paths_t *paths, firc_purge_report_t *report) {
+firc_err_t firc_purge_sets(firc_setnl_t *sets, const char *chain_prefix, size_t *destroyed) {
+    size_t n = 0;
+    if (destroyed != NULL) { *destroyed = 0; }
+    if (sets == NULL || firc_setnl_probe(sets, NULL) == FIRC_ERR_NOSYS) { return FIRC_OK; }
+    firc_err_t err = firc_setnl_sweep(sets, chain_prefix, NULL, 0, &n);
+    if (destroyed != NULL) { *destroyed = n; }
+    if (err == FIRC_ERR_AGAIN) {
+        FIRC_WARN("%zu set(s) of ours removed; a %s* set in use by a rule was left in place", n, chain_prefix);
+    } else if (err != FIRC_OK) {
+        FIRC_WARN("the %s* sets were not removed: %s", chain_prefix, firc_err_str(err));
+    } else if (n > 0) {
+        FIRC_INFO("%zu set(s) of ours removed", n);
+    }
+    return err;
+}
+
+firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, firc_setnl_t *sets,
+                      const char *chain_prefix, const firc_purge_paths_t *paths, firc_purge_report_t *report) {
     firc_purge_report_t rep;
     memset(&rep, 0, sizeof(rep));
     firc_err_t first = FIRC_OK;
@@ -30,6 +46,9 @@ firc_err_t firc_purge(firc_ipt_t *ipt4, firc_ipt_t *ipt6, firc_rtnl_t *rtnl, con
     } else {
         FIRC_INFO("purge: every %s* chain removed, the FORWARD barrier included", chain_prefix);
     }
+
+    err = firc_purge_sets(sets, chain_prefix, &rep.sets);
+    if (err != FIRC_OK && first == FIRC_OK) { first = err; }
 
     if (rtnl != NULL) {
         err = firc_rtnl_clean_stale_rules(rtnl, &rep.rules_removed);

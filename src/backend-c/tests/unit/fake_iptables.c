@@ -46,7 +46,7 @@ static void append(char **buf, size_t *len, const char *text) {
 static int before_write(void *ud, firc_ipt_proto_t fam, const char *table, const firc_xt_info_t *info,
                         const uint8_t *blob) {
     firc_fake_ipt_t *f = ud;
-    char *text = firc_test_xt_print(fam, table, info, blob);
+    char *text = firc_test_xt_print_named(fam, table, info, blob, firc_fake_xt_namer, f->xt);
     pthread_mutex_lock(&f->mu);
     f->attempts++;
     int err = 0;
@@ -151,6 +151,9 @@ static int h_add_counters(void *ud, firc_ipt_proto_t fam, const char *t, const f
 static int h_get_revision(void *ud, firc_ipt_proto_t fam, bool target, const char *name, uint8_t rev) {
     return firc_fake_xt_ops()->get_revision(inner(ud), fam, target, name, rev);
 }
+static int h_set_index(void *ud, const char *name, uint16_t *index) {
+    return firc_fake_xt_ops()->set_index(inner(ud), name, index);
+}
 static int h_lock(void *ud, unsigned wait_ms) { return firc_fake_xt_ops()->lock(inner(ud), wait_ms); }
 static void h_unlock(void *ud) { firc_fake_xt_ops()->unlock(inner(ud)); }
 static void h_destroy(void *ud) {
@@ -162,7 +165,7 @@ static void h_destroy(void *ud) {
 }
 
 static const firc_xt_kernel_ops_t k_handle_ops = {h_get_info, h_get_entries, h_replace, h_add_counters,
-                                                  h_get_revision, h_lock, h_unlock, h_destroy};
+                                                  h_get_revision, h_lock, h_unlock, h_destroy, h_set_index};
 
 firc_xt_t *firc_fake_ipt_as_xt(firc_fake_ipt_t *f) {
     firc_xt_t *xt = firc_xt_new(f->proto, &k_handle_ops, f);
@@ -180,7 +183,7 @@ char *firc_fake_ipt_print(firc_fake_ipt_t *f, const char *table) {
     firc_xt_info_t info;
     uint8_t *blob = NULL;
     if (!firc_fake_xt_blob(f->xt, table, &info, &blob)) { return NULL; }
-    char *text = firc_test_xt_print(f->proto, table, &info, blob);
+    char *text = firc_test_xt_print_named(f->proto, table, &info, blob, firc_fake_xt_namer, f->xt);
     free(blob);
     return text;
 }

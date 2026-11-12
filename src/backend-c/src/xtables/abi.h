@@ -198,6 +198,29 @@ typedef struct firc_xt_nat_range {
 #define XT_ADDRTYPE_LOCAL 0x0004u
 #define XT_ADDRTYPE_INVERT_DEST 0x2u
 
+#define XT_SO_IP_SET 83
+#define XT_IP_SET_OP_VERSION 0x00000100u
+#define XT_IP_SET_OP_GET_BYNAME 0x00000006u
+#define XT_IPSET_MAXNAMELEN 32
+#define XT_IPSET_INVALID_ID 65535u
+
+typedef struct firc_xt_set_info {
+    uint16_t index;
+    uint8_t dim, flags;
+} xt_set_info_t;
+
+typedef struct firc_xt_ip_set_req_version {
+    uint32_t op, version;
+} xt_ip_set_req_version_t;
+
+typedef struct firc_xt_ip_set_req_get_set {
+    uint32_t op, version;
+    union {
+        char name[XT_IPSET_MAXNAMELEN];
+        uint16_t index;
+    } set;
+} xt_ip_set_req_get_set_t;
+
 typedef struct firc_xt_addrtype_info_v1 {
     uint16_t source, dest;
     uint32_t flags;
@@ -337,5 +360,9 @@ _Static_assert(offsetof(xt_string_info_t, patlen) == 148, "string patlen at 148"
 _Static_assert(offsetof(xt_string_info_t, config) == XT_STRING_USERSPACE, "string's userspace part is 152 bytes");
 _Static_assert(sizeof(xt_nflog_info_t) == 76, "xt_nflog_info is 76 bytes");
 _Static_assert(sizeof(xt_addrtype_info_v1_t) == 8, "xt_addrtype_info_v1 is 8 bytes");
+_Static_assert(sizeof(xt_set_info_t) == 4, "xt_set_info is 4 bytes");
+_Static_assert(sizeof(xt_ip_set_req_version_t) == 8, "ip_set_req_version is 8 bytes");
+_Static_assert(sizeof(xt_ip_set_req_get_set_t) == 40, "ip_set_req_get_set is 40 bytes");
+_Static_assert(offsetof(xt_ip_set_req_get_set_t, set) == 8, "ip_set_req_get_set.set at 8");
 
 #endif

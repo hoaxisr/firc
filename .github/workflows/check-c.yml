@@ -276,7 +276,7 @@ jobs:
             objs=$(make -s BUILD=$build $kn print-AUTOLIST_OBJS)
             test -n "$objs" || { echo "no autolist objects found: the check is empty"; exit 1; }
             nm --undefined-only $objs > "$RUNNER_TEMP/autolist.$build"
-            if grep -E ' (firc_nfcommit_|firc_ct_|firc_ipset_|firc_rtnl_)' "$RUNNER_TEMP/autolist.$build"; then
+            if grep -E ' (firc_nfcommit_|firc_ct_|firc_ipset_|firc_rtnl_|firc_setnl_)' "$RUNNER_TEMP/autolist.$build"; then
               echo "the automatic list calls a routing writer: its output must be configuration only"
               exit 1
             fi
@@ -297,6 +297,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo modprobe -a nf_conntrack nf_nat iptable_nat ip6table_nat xt_mac xt_mark xt_connmark xt_conntrack xt_nat xt_MASQUERADE iptable_filter iptable_mangle ip6table_filter ip6table_mangle xt_multiport xt_connbytes xt_length xt_limit xt_string xt_NFLOG ipt_REJECT ip6t_REJECT || true
           sudo modprobe nft_chain_nat || true # the nat chain type, when iptables is the nft backend
+          sudo modprobe -a ip_set ip_set_hash_net xt_set || true
           make CFLAGS_EXTRA=-Werror routing
 
       - name: fircd starts, reloads and stops its tunnels (user namespace)

@@ -122,6 +122,7 @@ NETFILTER_SRCS := \
     src/netfilter/cleaner.c \
     src/netfilter/purge.c \
     src/netfilter/conntrack.c \
+    src/netfilter/setnl.c \
     src/netfilter/stale_marks.c \
     src/netfilter/fields_file.c \
     src/netfilter/stable_fields.c \
@@ -257,7 +258,7 @@ PCRE2_LIB ?= -lpcre2-8
 CJSON_LIB ?= -lcjson
 DEP_LIBS := -lyaml $(PCRE2_LIB) -lmnl $(CJSON_LIB) -lm -lcurl -lz
 
-TEST_SUPPORT_SRCS := tests/unit/fake_iptables.c tests/unit/fake_rtnl.c tests/unit/fake_conntrack.c tests/unit/fake_nflog.c tests/unit/xt_golden.c tests/unit/fake_xtables.c
+TEST_SUPPORT_SRCS := tests/unit/fake_iptables.c tests/unit/fake_rtnl.c tests/unit/fake_conntrack.c tests/unit/fake_setnl.c tests/unit/fake_nflog.c tests/unit/xt_golden.c tests/unit/fake_xtables.c
 TEST_SUPPORT_OBJS := $(TEST_SUPPORT_SRCS:tests/unit/%.c=$(BUILDDIR)/tests/support/%.o)
 
 TEST_SRCS := $(filter-out $(TEST_SUPPORT_SRCS), $(wildcard tests/unit/*.c))
@@ -318,7 +319,7 @@ $(BUILDDIR)/tests/test_oom: tests/unit/test_oom.c $(LIB_OBJS) $(TEST_SUPPORT_OBJ
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(OOM_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
-APP_WRAP := -Wl,--wrap=firc_dnsproxy_close_group_pools,--wrap=firc_dnsproxy_forget_group,--wrap=if_nametoindex
+APP_WRAP := -Wl,--wrap=firc_dnsproxy_close_group_pools,--wrap=firc_dnsproxy_forget_group,--wrap=if_nametoindex,--wrap=firc_loop_add_timer
 
 $(BUILDDIR)/tests/test_app: tests/unit/test_app.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
 	@mkdir -p $(dir $@)
@@ -407,10 +408,14 @@ $(ROUTECHECK): tests/routing/routecheck.c $(LIB_OBJS) $(BUILDDIR)/tests/support/
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Itests/unit $(LDFLAGS) -o $@ $< $(LIB_OBJS) $(BUILDDIR)/tests/support/xt_golden.o $(LDLIBS) $(DEP_LIBS)
 
+ROUTING_NEEDS_IPSET = rc=0; FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh $(1) || rc=$$?; \
+	[ $$rc != 77 ] || echo "FAIL: $(1): this kernel has no ip_set, nothing was proven"; exit $$rc
+
 .PHONY: routing
 routing: $(ROUTECHECK)
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_mark_routing.sh
-	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_selector_routing.sh
+	$(call ROUTING_NEEDS_IPSET,tests/routing/run_selector_routing.sh)
+	$(call ROUTING_NEEDS_IPSET,tests/routing/run_subnet_set_routing.sh)
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_shared_name_routing.sh
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_barrier_routing.sh
 	FIRC_ROUTECHECK=$(abspath $(ROUTECHECK)) sh tests/routing/run_egress_routing.sh

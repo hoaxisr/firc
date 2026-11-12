@@ -218,6 +218,7 @@ static bool firc_marks_over(uint32_t field, uint32_t before, marks_t *out) {
     firc_fakeip_snapshot_t *snap = ok ? firc_fakeip_snapshot_take(pool) : NULL;
     firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
     firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(f), "FIRC_");
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "FIRC_g1S4", 1);
     uint32_t mark = 0;
     const firc_ipv4_subnet_t sub[] = {{.addr = {10, 1, 0, 0}, .cidr = 16}};
     ok = ok && snap != NULL && firc_netfilter_register_base_chains(ipt, NULL) == FIRC_OK &&
@@ -242,7 +243,7 @@ static bool firc_marks_over(uint32_t field, uint32_t before, marks_t *out) {
             }
             out->after[out->n++] = (before & ~m) ^ v;
             if (firc_test_rule_contains(r, "-d 198.18.")) { out->chunk = true; }
-            if (firc_test_rule_contains(r, "-d 10.1.0.0/16")) { out->subnet = true; }
+            if (firc_test_rule_contains(r, "--match-set FIRC_g1S4 dst")) { out->subnet = true; }
         }
     }
     firc_ipt_free(ipt);

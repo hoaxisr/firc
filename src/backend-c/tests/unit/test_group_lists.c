@@ -10,6 +10,8 @@
 #include "fake_iptables.h"
 #include "fake_conntrack.h"
 #include "fake_rtnl.h"
+#include "fake_setnl.h"
+#include "setnl_xt_bridge.h"
 
 #include "firc/app.h"
 #include "firc/dnspipeline.h"
@@ -809,6 +811,9 @@ typedef struct nf_fixture {
     fake_rtnl_t *kernel;
     firc_rtnl_t *rtnl;
     fake_ct_t *ctk;
+    fake_setnl_t *setk;
+    firc_setnl_t *sets;
+    setnl_xt_bridge_t bridge;
     firc_ct_t *ct;
     firc_port_remap_t *remap;
     firc_config_t cfg;
@@ -840,8 +845,11 @@ static bool nf_fixture_up_ex(nf_fixture_t *f, bool with_committer) {
     fake_rtnl_set_link_flags(f->kernel, 0x1 | 0x10);
     f->ctk = fake_ct_start(&f->ct);
     if (f->ctk == NULL) { return false; }
+    f->setk = fake_setnl_start(&f->sets);
+    if (f->setk == NULL) { return false; }
+    bridge_attach(&f->bridge, f->setk, f->fake, f->fake6);
     firc_app_deps_t deps = {.cfg = &f->cfg, .ipt4 = f->ipt, .ipt6 = f->ipt6, .rtnl = f->rtnl,
-                            .ct = f->ct, .pipeline = f->pipeline, .pool = f->pool};
+                            .ct = f->ct, .sets = f->sets, .pipeline = f->pipeline, .pool = f->pool};
     f->app = firc_app_create(&deps);
     if (f->app == NULL) { return false; }
     f->remap = firc_port_remap_new(f->cfg.app.netfilter.iptables.chain_prefix, 53, 3553, NULL, 0,
@@ -861,6 +869,9 @@ static bool nf_fixture_up_no_committer(nf_fixture_t *f) { return nf_fixture_up_e
 static void nf_fixture_down(nf_fixture_t *f) {
     g_nf_open = false;
     firc_app_destroy(f->app);
+    bridge_detach(&f->bridge);
+    firc_setnl_free(f->sets);
+    fake_setnl_stop(f->setk);
     firc_ct_close(f->ct);
     fake_ct_stop(f->ctk);
     firc_port_remap_free(f->remap);
@@ -890,6 +901,13 @@ static void nf_chain_name(const firc_config_t *cfg, firc_id_t id, char *out, siz
     char idbuf[FIRC_ID_STR_LEN];
     firc_id_format(id, idbuf);
     snprintf(out, cap, "%s%s", cfg->app.netfilter.iptables.chain_prefix, idbuf);
+}
+
+static bool nf_set_holds(nf_fixture_t *f, const char *chain, uint8_t a, uint8_t b, uint8_t len) {
+    char set[FIRC_SET_NAME_MAX];
+    snprintf(set, sizeof(set), "%sS4", chain);
+    firc_nf_prefix_t p = {.family = 4, .cidr = len, .addr = {a, b, 0, 0}};
+    return fake_setnl_contains(f->setk, set, &p);
 }
 
 static bool nf_any_arg_equals(firc_fake_ipt_t *f, const char *table, const char *chain,
@@ -949,10 +967,12 @@ TEST a_list_sync_resyncs_only_its_own_group(void) {
     char rule2_before[256];
     snprintf(rule2_before, sizeof(rule2_before), "%s", s2_before);
     free(s2_before);
-    ASSERTm("group 2 starts with its own subnet mark rule",
-            nf_any_arg_equals(g_nfx.fake, "mangle", chain2, "10.0.0.0/8"));
-    ASSERT_FALSEm("group 1 starts with no subnet of its own",
-                  nf_any_arg_equals(g_nfx.fake, "mangle", chain1, "10.9.0.0/16"));
+    char set1[96], set2[96];
+    snprintf(set1, sizeof(set1), "%sS4", chain1);
+    snprintf(set2, sizeof(set2), "%sS4", chain2);
+    ASSERTm("group 2 starts with its own subnet mark rule", nf_any_arg_equals(g_nfx.fake, "mangle", chain2, set2));
+    ASSERT(nf_set_holds(&g_nfx, chain2, 10, 0, 8));
+    ASSERT_FALSEm("group 1 starts with no subnet of its own", nf_any_arg_equals(g_nfx.fake, "mangle", chain1, set1));
 
     uint64_t before = firc_app_nf_passes_for_test(g_nfx.app);
 
@@ -969,8 +989,8 @@ TEST a_list_sync_resyncs_only_its_own_group(void) {
     ASSERT_EQ_FMTm("exactly one pass, not a rebuild's worth", (unsigned long long)(before + 1),
                    (unsigned long long)firc_app_nf_passes_for_test(g_nfx.app), "%llu");
 
-    ASSERTm("group 1's own chain now carries the new subnet",
-            nf_any_arg_equals(g_nfx.fake, "mangle", chain1, "10.9.0.0/16"));
+    ASSERTm("group 1's own chain now carries the new subnet", nf_any_arg_equals(g_nfx.fake, "mangle", chain1, set1));
+    ASSERT(nf_set_holds(&g_nfx, chain1, 10, 9, 16));
 
     size_t n2_after = 0;
     ASSERT(firc_fake_ipt_get_rules(g_nfx.fake, "mangle", chain2, &rules2, &n2_after));
@@ -1009,12 +1029,17 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     ASSERT(changed);
     firc_sub_event_free(ev1);
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(g_nfx.app, NULL, false));
-    ASSERTm("the good subnet landed in the chain",
-            nf_any_arg_equals(g_nfx.fake, "mangle", chain1, "10.1.0.0/16"));
+    char set1[96], whole[192];
+    snprintf(set1, sizeof(set1), "%sS4", chain1);
+    ASSERTm("the good subnet landed in the chain", nf_any_arg_equals(g_nfx.fake, "mangle", chain1, set1));
+    ASSERT(nf_set_holds(&g_nfx, chain1, 10, 1, 16));
 
-    firc_fake_ipt_refuse_rules_containing(g_nfx.fake, "10.9.0.0/16");
+    snprintf(whole, sizeof(whole), "-A %s -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK",
+             chain1);
+    firc_fake_ipt_refuse_rules_containing(g_nfx.fake, whole);
     firc_sub_event_t *ev2 = group_parsed_event(id_of(1), 0);
-    firc_sub_rules_push(&ev2->rules, "10.9.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
+    firc_sub_rules_push(&ev2->rules, "10.1.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
+    firc_sub_rules_push(&ev2->rules, "0.0.0.0/0", FIRC_RULE_SUBNET, true, test_random_id());
     changed = false;
     ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_nfx.app, ev2, 2000, &changed));
     ASSERT(changed);
@@ -1022,9 +1047,7 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     ASSERT_EQ(FIRC_ERR_IO, firc_app_rebuild_netfilter_kind(g_nfx.app, NULL, false));
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(g_nfx.app, NULL, false));
 
-    ASSERT_FALSEm("the refused prefix never reached the chain",
-                  nf_any_arg_equals(g_nfx.fake, "mangle", chain1, "10.9.0.0/16"));
-    ASSERT_FALSE(firc_fake_ipt_chain_exists(g_nfx.fake, "mangle", chain1));
+    ASSERT_FALSEm("the refused line never reached the chain", firc_fake_ipt_chain_exists(g_nfx.fake, "mangle", chain1));
     const char *reason = NULL;
     ASSERT_FALSE(firc_app_group_live(g_nfx.app, id_of(1), &reason));
     ASSERT_STR_EQ("not-written", reason);
@@ -1037,7 +1060,7 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     ASSERT(changed);
     firc_sub_event_free(ev3);
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(g_nfx.app, NULL, false));
-    ASSERT(nf_any_arg_equals(g_nfx.fake, "mangle", chain1, "10.1.0.0/16"));
+    ASSERT(nf_any_arg_equals(g_nfx.fake, "mangle", chain1, set1));
 
     nf_fixture_down(&g_nfx);
     PASS();

@@ -262,6 +262,16 @@ static firc_err_t commit_table(firc_xt_t *xt, const char *table, const firc_xt_s
                       gone->target ? "target" : "match", gone->name,
                       xt->fam == FIRC_IPT_PROTO_IPV6 ? gone->rev6 : gone->rev4);
     }
+    for (size_t i = 0; i < w->view.n_sets; i++) {
+        firc_xt_tset_t *s = &w->view.sets[i];
+        e = xt->ops->set_index(xt->ud, s->name, &s->index);
+        if (e != 0) {
+            xt->refusal = e == ENOENT || e == ENOPROTOOPT ? ENOENT : e;
+            return failed(xt, table, FIRC_ERR_IO, "x_tables %s %s: the set %s cannot be found in the kernel (%s)", fam,
+                          table, s->name, errname(e, eb, sizeof(eb)));
+        }
+        s->known = true;
+    }
     tm.merge = now_us();
     firc_xt_info_t ni;
     err = firc_xt_serialise_room(&w->view, FIRC_XT_HEADROOM, &w->written, &ni, &w->old_index, why, sizeof(why));

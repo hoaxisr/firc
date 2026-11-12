@@ -39,6 +39,7 @@ typedef struct firc_xt_kernel_ops {
     int (*lock)(void *ud, unsigned wait_ms);
     void (*unlock)(void *ud);
     void (*destroy)(void *ud);
+    int (*set_index)(void *ud, const char *name, uint16_t *index);
 } firc_xt_kernel_ops_t;
 
 typedef enum firc_xt_stage_kind {
@@ -51,7 +52,13 @@ typedef struct firc_xt_jump {
     char chain[FIRC_XT_NAME_LEN];
 } firc_xt_jump_t;
 
-/* One chain's rules for fam encoded back to back; a jump's verdict is 0 and the chain it names is in jumps.
+typedef struct firc_xt_setref {
+    uint32_t entry;
+    uint32_t at;
+    char name[FIRC_XT_NAME_LEN];
+} firc_xt_setref_t;
+
+/* One chain's rules for fam back to back; a jump's verdict is 0, its chain in jumps; a set match's index is 0, its set in sets.
  * mac_rev, set before the first rule, is the mac match revision written: firc_xt_mac_rev of the handle;
  * the first entry fixes it in first_mac_rev, and a later rule under another mac_rev is refused. */
 typedef struct firc_xt_block {
@@ -62,6 +69,8 @@ typedef struct firc_xt_block {
     uint32_t exts;
     firc_xt_jump_t *jumps;
     size_t n_jumps, cap_jumps;
+    firc_xt_setref_t *sets;
+    size_t n_sets, cap_sets;
     uint8_t mac_rev, first_mac_rev;
 } firc_xt_block_t;
 
@@ -86,7 +95,7 @@ typedef void (*firc_xt_role_fn)(void *ud, uint32_t index, firc_xt_role_t role, c
  * REWRITES when it is DNAT to an address, whatever its conditions. FIRC_ERR_INVAL, and no call, for an unsound block or another family.
  * MARKS mean something only for a mangle block, REWRITES only for a nat one. */
 firc_err_t firc_xt_block_roles(const firc_xt_block_t *b, firc_ipt_proto_t fam, firc_xt_role_fn fn, void *ud);
-/* Appends to out, which must be empty, the entries of in whose keep[index] is true, their jumps with them. */
+/* Appends to out, which must be empty, the entries of in whose keep[index] is true, their jumps and sets with them. */
 firc_err_t firc_xt_block_keep(const firc_xt_block_t *in, firc_ipt_proto_t fam, const bool *keep, firc_xt_block_t *out);
 
 typedef struct firc_xt_patch_op {

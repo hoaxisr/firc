@@ -52,6 +52,7 @@ _Static_assert(sizeof(xt_connmark_tginfo1_t) <= MAX_PAYLOAD, "CONNMARK fits an e
 _Static_assert(sizeof(xt_nflog_info_t) <= MAX_PAYLOAD, "NFLOG fits an ext_t");
 _Static_assert(sizeof(xt_addrtype_info_v1_t) <= MAX_PAYLOAD, "addrtype fits an ext_t");
 _Static_assert(sizeof(xt_nat_ipv4_compat_t) <= MAX_PAYLOAD, "REDIRECT fits an ext_t");
+_Static_assert(sizeof(xt_set_info_t) <= MAX_PAYLOAD, "set fits an ext_t");
 #define NOT_MINE (-1)
 #define BAD (-2)
 
@@ -81,6 +82,7 @@ typedef struct want {
     target_kind_t target;
     int32_t verdict;
     char jump[FIRC_XT_NAME_LEN];
+    char set[FIRC_XT_NAME_LEN];
     bool to_addr, to_port;
     uint8_t addr[16];
     uint16_t port;
@@ -308,6 +310,7 @@ static bool open_match(want_t *w, const char *name) {
     if (strcmp(name, "addrtype") == 0) {
         return !w->v6 && open_ext(w, FIRC_XT_EXT_ADDRTYPE, "addrtype", 1, sizeof(xt_addrtype_info_v1_t)) != NULL;
     }
+    if (strcmp(name, "set") == 0) { return open_ext(w, FIRC_XT_EXT_SET, "set", 1, sizeof(xt_set_info_t)) != NULL; }
     if (strcmp(name, "length") == 0) { return open_ext(w, FIRC_XT_EXT_LENGTH, "length", 0, sizeof(xt_length_info_t)) != NULL; }
     if (strcmp(name, "connbytes") == 0) {
         return open_ext(w, FIRC_XT_EXT_CONNBYTES, "connbytes", 0, sizeof(xt_connbytes_info_t)) != NULL;
@@ -701,7 +704,18 @@ static int addrtype_option(ext_t *x, const char *opt, char *const *a, size_t na,
     return 1;
 }
 
-static int match_option(const want_t *w, ext_t *x, const char *opt, char *const *a, size_t na, bool inv) {
+static int set_option(want_t *w, ext_t *x, const char *opt, char *const *a, size_t na) {
+    if (strcmp(opt, "--match-set") != 0) { return NOT_MINE; }
+    size_t len = na >= 1 ? strlen(a[0]) : 0;
+    if (na < 2 || x->seen != 0 || len == 0 || len >= sizeof(w->set) || strcmp(a[1], "dst") != 0) { return BAD; }
+    xt_set_info_t si = {0, 1, 0};
+    memcpy(x->p, &si, sizeof(si));
+    memcpy(w->set, a[0], len + 1);
+    x->seen = 1;
+    return 2;
+}
+
+static int match_option(want_t *w, ext_t *x, const char *opt, char *const *a, size_t na, bool inv) {
     if (x == NULL) { return NOT_MINE; }
     switch (x->bit) {
     case FIRC_XT_EXT_MARK:
@@ -716,6 +730,7 @@ static int match_option(const want_t *w, ext_t *x, const char *opt, char *const 
     case FIRC_XT_EXT_CONNBYTES: return connbytes_option(x, opt, a, na);
     case FIRC_XT_EXT_STRING: return string_option(x, opt, a, na);
     case FIRC_XT_EXT_ADDRTYPE: return addrtype_option(x, opt, a, na, inv);
+    case FIRC_XT_EXT_SET: return set_option(w, x, opt, a, na);
     default: return NOT_MINE;
     }
 }
@@ -1011,7 +1026,8 @@ static uint8_t *put_ext_of(const ext_t *x, uint8_t *at, uint32_t *exts) {
 }
 
 firc_err_t firc_xt_encode(firc_ipt_proto_t fam, uint8_t mac_rev, const firc_ipt_rule_t *rule, firc_xt_entry_t *out,
-                          uint32_t *exts) {
+                          uint32_t *exts, char set[FIRC_XT_NAME_LEN]) {
+    set[0] = '\0';
     memset(out, 0, sizeof(*out));
     out->old_index = -1;
     out->old_off = FIRC_XT_NONE;
@@ -1035,7 +1051,11 @@ firc_err_t firc_xt_encode(firc_ipt_proto_t fam, uint8_t mac_rev, const firc_ipt_
     firc_xt_wr16(e + firc_xt_at_toff(fam), (uint16_t)(eh + msize));
     firc_xt_wr16(e + firc_xt_at_next(fam), (uint16_t)len);
     uint8_t *m = e + eh;
-    for (size_t i = 0; i < w.nm; i++) { m = put_ext_of(&w.m[i], m, exts); }
+    for (size_t i = 0; i < w.nm; i++) {
+        if (w.m[i].bit == FIRC_XT_EXT_SET) { out->set_at = (uint16_t)((size_t)(m - e) + XT_MATCH_HDR_LEN); }
+        m = put_ext_of(&w.m[i], m, exts);
+    }
+    memcpy(set, w.set, sizeof(w.set));
     if (w.target == T_EXT) {
         put_ext_of(&w.t, m, exts);
     } else {
@@ -1053,6 +1073,7 @@ void firc_xt_block_free(firc_xt_block_t *b) {
     if (b == NULL) { return; }
     free(b->bytes);
     free(b->jumps);
+    free(b->sets);
     memset(b, 0, sizeof(*b));
 }
 
@@ -1083,6 +1104,21 @@ static firc_err_t block_jump(firc_xt_block_t *b, const char *chain) {
     return FIRC_OK;
 }
 
+static firc_err_t block_set(firc_xt_block_t *b, uint32_t at, const char *name) {
+    if (b->n_sets == b->cap_sets) {
+        size_t cap = b->cap_sets ? b->cap_sets * 2 : 8;
+        firc_xt_setref_t *grown = realloc(b->sets, cap * sizeof(*grown));
+        if (grown == NULL) { return FIRC_ERR_NOMEM; }
+        b->sets = grown;
+        b->cap_sets = cap;
+    }
+    firc_xt_setref_t *r = &b->sets[b->n_sets++];
+    r->entry = b->n;
+    r->at = at;
+    snprintf(r->name, sizeof(r->name), "%s", name);
+    return FIRC_OK;
+}
+
 static bool block_takes(const firc_xt_block_t *b, firc_ipt_proto_t fam) {
     return (fam == FIRC_IPT_PROTO_IPV4 || fam == FIRC_IPT_PROTO_IPV6) &&
            (b->n == 0 || (b->fam == fam && b->first_mac_rev == b->mac_rev));
@@ -1098,10 +1134,13 @@ firc_err_t firc_xt_block_add_rule(firc_xt_block_t *b, firc_ipt_proto_t fam, cons
     if (!block_takes(b, fam)) { return FIRC_ERR_INVAL; }
     firc_xt_entry_t e;
     uint32_t exts = 0;
-    firc_err_t err = firc_xt_encode(fam, b->mac_rev, rule, &e, &exts);
+    char set[FIRC_XT_NAME_LEN];
+    firc_err_t err = firc_xt_encode(fam, b->mac_rev, rule, &e, &exts, set);
     if (err != FIRC_OK) { return err; }
     uint8_t *at = block_room(b, e.len);
-    if (at == NULL || (e.jump[0] != '\0' && block_jump(b, e.jump) != FIRC_OK)) {
+    bool jumped = at != NULL && e.jump[0] != '\0';
+    if (at == NULL || (jumped && block_jump(b, e.jump) != FIRC_OK) || (set[0] != '\0' && block_set(b, e.set_at, set) != FIRC_OK)) {
+        if (jumped && b->n_jumps > 0 && b->jumps[b->n_jumps - 1].entry == b->n) { b->n_jumps--; }
         firc_xt_entry_clear(&e);
         return FIRC_ERR_NOMEM;
     }
@@ -1145,9 +1184,18 @@ firc_err_t firc_xt_block_add_dnat(firc_xt_block_t *b, firc_ipt_proto_t fam, cons
 }
 
 bool firc_xt_block_equal(const firc_xt_block_t *a, const firc_xt_block_t *b) {
-    if (a->n != b->n || a->len != b->len || a->n_jumps != b->n_jumps || (a->n > 0 && a->fam != b->fam)) { return false; }
+    if (a->n != b->n || a->len != b->len || a->n_jumps != b->n_jumps || a->n_sets != b->n_sets ||
+        (a->n > 0 && a->fam != b->fam)) {
+        return false;
+    }
     for (size_t i = 0; i < a->n_jumps; i++) {
         if (a->jumps[i].entry != b->jumps[i].entry || strcmp(a->jumps[i].chain, b->jumps[i].chain) != 0) { return false; }
+    }
+    for (size_t i = 0; i < a->n_sets; i++) {
+        if (a->sets[i].entry != b->sets[i].entry || a->sets[i].at != b->sets[i].at ||
+            strcmp(a->sets[i].name, b->sets[i].name) != 0) {
+            return false;
+        }
     }
     return a->len == 0 || memcmp(a->bytes, b->bytes, a->len) == 0;
 }
@@ -1155,15 +1203,19 @@ bool firc_xt_block_equal(const firc_xt_block_t *a, const firc_xt_block_t *b) {
 static bool block_sound(const firc_xt_block_t *b, firc_ipt_proto_t fam) {
     if (b->n > 0 && b->fam != fam) { return false; }
     uint32_t eh = firc_xt_ehdr(fam), i = 0;
-    size_t off = 0, jump = 0;
+    size_t off = 0, jump = 0, set = 0;
     for (; i < b->n && b->len - off >= eh; i++) {
         uint32_t len = firc_xt_rd16(b->bytes + off + firc_xt_at_next(fam));
         uint32_t toff = firc_xt_rd16(b->bytes + off + firc_xt_at_toff(fam));
         if (len > b->len - off || toff < eh || len < toff + XT_MATCH_HDR_LEN) { return false; }
         if (jump < b->n_jumps && b->jumps[jump].entry == i) { jump++; }
+        if (set < b->n_sets && b->sets[set].entry == i) {
+            if (b->sets[set].at < eh + XT_MATCH_HDR_LEN || b->sets[set].at + 2u > toff) { return false; }
+            set++;
+        }
         off += len;
     }
-    return i == b->n && off == b->len && jump == b->n_jumps;
+    return i == b->n && off == b->len && jump == b->n_jumps && set == b->n_sets;
 }
 
 static bool ip_only_dst(firc_ipt_proto_t fam, const uint8_t *e, uint8_t *addr, uint8_t *mask) {
@@ -1230,7 +1282,7 @@ firc_err_t firc_xt_block_roles(const firc_xt_block_t *b, firc_ipt_proto_t fam, f
 }
 
 firc_err_t firc_xt_block_keep(const firc_xt_block_t *in, firc_ipt_proto_t fam, const bool *keep, firc_xt_block_t *out) {
-    if (out->n != 0 || out->len != 0 || out->n_jumps != 0 || (fam != FIRC_IPT_PROTO_IPV4 && fam != FIRC_IPT_PROTO_IPV6) ||
+    if (out->n != 0 || out->len != 0 || out->n_jumps != 0 || out->n_sets != 0 || (fam != FIRC_IPT_PROTO_IPV4 && fam != FIRC_IPT_PROTO_IPV6) ||
         !block_sound(in, fam)) {
         return FIRC_ERR_INVAL;
     }
@@ -1238,13 +1290,15 @@ firc_err_t firc_xt_block_keep(const firc_xt_block_t *in, firc_ipt_proto_t fam, c
     out->mac_rev = in->mac_rev;
     out->first_mac_rev = in->first_mac_rev;
     out->exts = in->exts;
-    size_t off = 0, jump = 0;
+    size_t off = 0, jump = 0, set = 0;
     for (uint32_t i = 0; i < in->n; i++) {
         const uint8_t *e = in->bytes + off;
         uint32_t len = firc_xt_rd16(e + firc_xt_at_next(fam));
         bool jumps = jump < in->n_jumps && in->jumps[jump].entry == i;
+        bool names = set < in->n_sets && in->sets[set].entry == i;
         if (keep[i]) {
             if (jumps && block_jump(out, in->jumps[jump].chain) != FIRC_OK) { return FIRC_ERR_NOMEM; }
+            if (names && block_set(out, in->sets[set].at, in->sets[set].name) != FIRC_OK) { return FIRC_ERR_NOMEM; }
             uint8_t *at = block_room(out, len);
             if (at == NULL) { return FIRC_ERR_NOMEM; }
             memcpy(at, e, len);
@@ -1252,6 +1306,7 @@ firc_err_t firc_xt_block_keep(const firc_xt_block_t *in, firc_ipt_proto_t fam, c
             out->n++;
         }
         if (jumps) { jump++; }
+        if (names) { set++; }
         off += len;
     }
     return FIRC_OK;

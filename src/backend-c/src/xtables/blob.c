@@ -32,6 +32,10 @@ void firc_xt_table_clear(firc_xt_table_t *t) {
     t->n_chains = 0;
     t->cap_chains = 0;
     firc_xt_entry_clear(&t->end);
+    free(t->sets);
+    t->sets = NULL;
+    t->n_sets = 0;
+    t->cap_sets = 0;
 }
 
 firc_xt_chain_t *firc_xt_find_chain(firc_xt_table_t *t, const char *name) {
@@ -99,6 +103,8 @@ static void view_entry(firc_ipt_proto_t fam, uint8_t *blob, const uint32_t *offs
     out->points_at = FIRC_XT_NONE;
     out->jump[0] = '\0';
     out->staged = false;
+    out->set = 0;
+    out->set_at = 0;
 }
 
 static uint32_t first_off(const firc_xt_chain_t *c) { return c->n_rules > 0 ? c->rules[0].old_off : c->tail.old_off; }
@@ -323,8 +329,19 @@ firc_err_t firc_xt_serialise_room(const firc_xt_table_t *t, size_t room, uint8_t
     oi = malloc(n * sizeof(*oi));
     if (out == NULL || oi == NULL) { goto done; }
     size_t nm = 0;
+    err = FIRC_ERR_IO;
     for (size_t i = 0; i < n; i++) {
-        memcpy(out + slots[i].off, slots[i].e->bytes, slots[i].e->len);
+        const firc_xt_entry_t *e = slots[i].e;
+        memcpy(out + slots[i].off, e->bytes, e->len);
+        if (e->set != 0) {
+            const firc_xt_tset_t *s = e->set <= t->n_sets ? &t->sets[e->set - 1] : NULL;
+            if (s == NULL || !s->known) {
+                snprintf(why, why_len, "a rule in %s names the set %s, whose index is not known", slots[i].chain,
+                         s != NULL ? s->name : "?");
+                goto done;
+            }
+            firc_xt_wr16(out + slots[i].off + e->set_at, s->index);
+        }
         oi[i] = slots[i].e->old_index;
         if (slots[i].e->old_off != FIRC_XT_NONE) { mv[nm++] = (moved_t){slots[i].e->old_off, slots[i].off}; }
     }

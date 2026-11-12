@@ -37,5 +37,10 @@ size_t firc_fake_xt_revision_asks(firc_fake_xt_t *f);
 size_t firc_fake_xt_reads_under_lock(firc_fake_xt_t *f);
 size_t firc_fake_xt_writes_outside_lock(firc_fake_xt_t *f);
 const firc_xt_kernel_ops_t *firc_fake_xt_ops(void);
+void firc_fake_xt_set(firc_fake_xt_t *k, const char *name, uint16_t index);
+void firc_fake_xt_set_drop(firc_fake_xt_t *k, const char *name);
+size_t firc_fake_xt_set_asks(firc_fake_xt_t *k);
+void firc_fake_xt_fail_sets(firc_fake_xt_t *f, int err);
+bool firc_fake_xt_namer(void *k, uint16_t index, char *out);
 
 #endif

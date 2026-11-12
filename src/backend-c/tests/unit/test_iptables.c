@@ -461,6 +461,46 @@ TEST an_uncovered_rewrite_is_warned_about_once_per_run_of_refusals(void) {
     PASS();
 }
 
+TEST restaging_the_same_set_rule_writes_nothing(void) {
+    firc_fake_ipt_t *f;
+    firc_ipt_t *ipt = engine(&f);
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "fircA", 7);
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "fircB", 8);
+    (void)firc_ipt_register_chain_override(ipt, "mangle", "FIRC_s");
+    ASSERT_EQ_FMT(FIRC_OK, add(ipt, "mangle", "FIRC_s", "-m set --match-set fircA dst -j RETURN"), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_ipt_commit(ipt), "%d");
+    size_t reads = firc_fake_xt_reads(firc_fake_ipt_xt(f)), replaces = firc_fake_xt_replaces(firc_fake_ipt_xt(f));
+    (void)firc_ipt_register_chain_override(ipt, "mangle", "FIRC_s");
+    ASSERT_EQ_FMT(FIRC_OK, add(ipt, "mangle", "FIRC_s", "-m set --match-set fircA dst -j RETURN"), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_ipt_commit(ipt), "%d");
+    ASSERT_EQ_FMT(reads, firc_fake_xt_reads(firc_fake_ipt_xt(f)), "%zu");
+    ASSERT_EQ_FMT(replaces, firc_fake_xt_replaces(firc_fake_ipt_xt(f)), "%zu");
+    (void)firc_ipt_register_chain_override(ipt, "mangle", "FIRC_s");
+    ASSERT_EQ_FMT(FIRC_OK, add(ipt, "mangle", "FIRC_s", "-m set --match-set fircB dst -j RETURN"), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_ipt_commit(ipt), "%d");
+    ASSERT_EQ_FMT(replaces + 1, firc_fake_xt_replaces(firc_fake_ipt_xt(f)), "%zu");
+    ASSERT(has(f, "mangle", "-A FIRC_s -m set --match-set fircB dst -j RETURN"));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
+TEST the_printer_names_the_set(void) {
+    firc_fake_ipt_t *f;
+    firc_ipt_t *ipt = engine(&f);
+    firc_fake_xt_set(firc_fake_ipt_xt(f), "fircAS4", 7);
+    (void)firc_ipt_register_chain_override(ipt, "mangle", "FIRC_s");
+    ASSERT_EQ_FMT(FIRC_OK, add(ipt, "mangle", "FIRC_s", "-p tcp --dport 53 -m set --match-set fircAS4 dst -j RETURN"), "%d");
+    ASSERT_EQ_FMT(FIRC_OK, firc_ipt_commit(ipt), "%d");
+    ASSERT(has(f, "mangle", "-A FIRC_s -p tcp -m tcp --dport 53 -m set --match-set fircAS4 dst -j RETURN"));
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    ASSERT(firc_fake_ipt_get_rules(f, "mangle", "FIRC_s", &rules, &n));
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    ASSERT(firc_test_rule_contains(rules[0], "--match-set fircAS4 dst"));
+    firc_ipt_free(ipt);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -483,5 +523,7 @@ int main(int argc, char **argv) {
     RUN_TEST(registering_a_patch_again_keeps_what_it_staged);
     RUN_TEST(a_patch_refuses_an_address_rewrite);
     RUN_TEST(an_uncovered_rewrite_is_warned_about_once_per_run_of_refusals);
+    RUN_TEST(restaging_the_same_set_rule_writes_nothing);
+    RUN_TEST(the_printer_names_the_set);
     GREATEST_MAIN_END();
 }

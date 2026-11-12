@@ -75,6 +75,7 @@ size_t firc_kmod_load(const char *dir, const char *const *mods, size_t n, const 
 
 size_t firc_kmod_load_netfilter(const char *dir) {
     static const char *const mods[] = {"xt_multiport", "xt_addrtype", "xt_mac",    "xt_mark",
-                                       "xt_connmark",  "xt_conntrack", "xt_tcpudp"};
+                                       "xt_connmark",  "xt_conntrack", "xt_tcpudp", "ip_set",
+                                       "ip_set_hash_net", "xt_set"};
     return firc_kmod_load(dir, mods, sizeof(mods) / sizeof(mods[0]), "firc's rules");
 }
