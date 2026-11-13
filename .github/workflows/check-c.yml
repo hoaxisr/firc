@@ -540,7 +540,7 @@ jobs:
           tests="h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
                  rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch xhoptsmatch xmuxmatch tun6match vreqmatch \
                  scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch dialmatch probematch xconnmatch \
-                 fmaskmatch fmlinkmatch tscratchmatch"
+                 fmaskmatch fmlinkmatch tscratchmatch gorandmatch fmsdmatch"
           run=""
           for t in $tests; do
             case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac

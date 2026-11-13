@@ -50,10 +50,13 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            ua-golang ua-edge ua-firefox ua-safari ua-curl ua-empty
            fm-frag-hello-tls fm-frag-hello-reality fm-frag-range fm-frag-loop fm-frag-xhttp
            fm-hc-raw fm-hc-vision fm-hc-xhttp fm-hc-ws fm-hc-neg fm-filter-ok fm-filter-neg
-           fm-chain-hf fm-chain-fh fm-dl-same fm-dl-noinherit fm-dl-frag fm-refuse-sudoku fm-refuse-xmc
+           fm-chain-hf fm-chain-fh fm-dl-same fm-dl-noinherit fm-dl-frag fm-refuse-xmc
+           fm-sd-raw fm-sd-tls fm-sd-none fm-sd-vision fm-sd-xhttp fm-sd-xhttp-packet fm-sd-ws fm-sd-upg fm-sd-grpc
+           fm-sd-ascii fm-sd-custom fm-sd-ascii-table fm-sd-pad0 fm-sd-neg fm-sd-badcfg fm-chain-sf fm-chain-fs
+           fm-sd-dl-same fm-sd-dl-noinherit fm-sd-dl-own
            vis-up vis-up-tls vis-up-shapes vis-up-tls12 vis-up-ccm8 vis-plain-end vis-wait vis-reshape
-           fm-frag-vision-up fm-hc-vision-up"
-VCASES="vis-up vis-up-tls vis-up-shapes vis-up-tls12 vis-up-ccm8 vis-plain-end vis-wait vis-reshape fm-frag-vision-up fm-hc-vision-up"
+           fm-frag-vision-up fm-hc-vision-up fm-sd-vision-up"
+VCASES="vis-up vis-up-tls vis-up-shapes vis-up-tls12 vis-up-ccm8 vis-plain-end vis-wait vis-reshape fm-frag-vision-up fm-hc-vision-up fm-sd-vision-up"
 CASES="${CASES:-$ALL_CASES}"
 XRAY="${XRAY:-$(command -v xray 2>/dev/null || true)}"
 
@@ -143,7 +146,7 @@ is_v() { case " $VCASES " in *" $1 "*) return 0 ;; esac; return 1; }
 TPID=""; OPID=""; VPID=""; OWANT=""; NOLD=""; NNEW=""
 for m in $CASES; do if is_v "$m"; then NNEW=1; else NOLD=1; fi; done
 [ -z "$NOLD" ] || { bg_in "$NSS" "$W/target.log" python3 tests/grpc-target.py "$TARGET" 8080; TPID=$!; }
-case " $CASES " in *" vis-dl"*|*" fm-hc-vision "*) OWANT=1; bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0; OPID=$! ;; esac
+case " $CASES " in *" vis-dl"*|*" fm-hc-vision "*|*" fm-sd-vision "*) OWANT=1; bg_in "$NSS" "$W/origin.log" python3 tests/vision-origin.py "$TARGET" 8443 "$W/mask.pem" "$W/mask.key" 0; OPID=$! ;; esac
 if [ -n "$NNEW" ]; then
     printf '%s\n' 'openssl_conf = c' '[c]' 'ssl_conf = s' '[s]' 'system_default = d' '[d]' 'CipherString = DEFAULT@SECLEVEL=0' > "$W/ccm8.cnf"
     bg_in "$NSS" "$W/vorigin.log" python3 tests/vision-origin.py "$TARGET" 9443 "$W/mask.pem" "$W/mask.key" 0
@@ -208,6 +211,11 @@ HCJ='{"type":"header-custom","settings":{"clients":[[{"packet":"GET / HTTP/1.1\r
 HCX='{"type":"header-custom","settings":{"clients":[[{"packet":"GET /x HTTP/1.1\r\n\r\n","type":"str"}]],"servers":[[{"packet":"HTTP/1.1 200 OK\r\n\r\n","type":"str"}]]}}'
 HCH=474554202f20485454502f312e310d0a0d0a
 FR10='{"type":"fragment","settings":{"packets":"tlshello","length":10}}'
+FR100='{"type":"fragment","settings":{"packets":"1-1","length":100,"delay":10}}'
+sdj() { echo "{\"type\":\"sudoku\",\"settings\":{\"password\":\"$1\",\"paddingMin\":${3:-5},\"paddingMax\":${3:-20}${2:-}}}"; }
+SD=$(sdj p); SDQ=$(sdj q)
+sdm() { CFM="{\"tcp\":[$1]}"; SFM="{\"tcp\":[${2:-$1}]}"; }
+fmvis() { case "$MODE" in fm-hc-vision|fm-sd-vision) return 0 ;; esac; return 1; }
 fmtls() { SEC=tls; TUN_ARGS="--ca $W/mask.pem"; XALPN=${1:-http/1.1}; }
 fmraw() { NET='"network":"tcp"'; Q="type=tcp"; XCNET="$NET"; }
 fmfrag() { fmraw; CFM="{\"tcp\":[{\"type\":\"fragment\",\"settings\":$1}]}"; LPORT=18444; TAPLENS=1; }
@@ -217,7 +225,7 @@ case_cfg() {
     SLOG="${XLOG:-warning}"
     SEC=reality; TUN_ARGS=""; TUN_ENV=""; FP=chrome; SCERT=mask; SKEY=mask; EXPECT=ok; V6=""; NODE=v4; XMODE=""; XMUX=""; KEYLOG=""; LPORT=""; TAPCAP=1048576
     XCNET=""; FLOW=""; XALPN=h2; DL=""; DH="$S_IP2"; BP=/xp/
-    CFM=""; SFM=""; BFM=""; DPORT=""; TAPLENS=""; TAP2=""
+    CFM=""; SFM=""; BFM=""; DPORT=""; TAPLENS=""; TAP2=""; SDL=""; FMLOAD=""; DOKO=""; XCLOG=warning
     XP='{"path":"/xp/"}'
     case "$1" in
     grpc-gun|grpc-multi)
@@ -349,15 +357,37 @@ case_cfg() {
     vis-up-tls)              fmtls; fmraw; vcfg ;;
     fm-frag-vision-up)       fmfrag '{"packets":"1-3","length":"10-20"}'; vcfg ;;
     fm-hc-vision-up)         fmtls; fmraw; CFM="{\"tcp\":[$HCJ]}"; SFM=$CFM; vcfg ;;
-    fm-refuse-sudoku)        fmraw; CFM='{"tcp":[{"type":"sudoku","settings":{"password":"p"}}]}'; SFM=$CFM ;;
+    fm-sd-raw)               fmraw; sdm "$SD"; LPORT=18444; SDL=entropy; FMLOAD=1 ;;
+    fm-sd-tls)               fmtls; fmraw; sdm "$SD" ;;
+    fm-sd-none)              SEC=none; fmraw; sdm "$SD" ;;
+    fm-sd-vision)            fmraw; Q="type=tcp&flow=xtls-rprx-vision"; FLOW=xtls-rprx-vision; sdm "$SD" ;;
+    fm-sd-vision-up)         fmraw; sdm "$SD"; vcfg ;;
+    fm-sd-xhttp)             fmxh stream-up; sdm "$SD"; LPORT=18444; SDL=entropy ;;
+    fm-sd-xhttp-packet)      fmtls h2; fmxh packet-up; sdm "$SD"; LPORT=18444; SDL=entropy ;;
+    fm-sd-ws)                fmtls; NET='"network":"ws","wsSettings":{"path":"/ws"}'; Q="type=ws&path=%2Fws"; XCNET="$NET"; sdm "$SD" ;;
+    fm-sd-upg)               fmtls; NET='"network":"httpupgrade","httpupgradeSettings":{"path":"/hu"}'; Q="type=httpupgrade&path=%2Fhu"
+                             XCNET="$NET"; sdm "$SD" ;;
+    fm-sd-grpc)              fmtls h2; NET="\"network\":\"grpc\",\"grpcSettings\":{\"serviceName\":\"$SVC\",\"multiMode\":false}"
+                             Q="type=grpc&serviceName=$SVC&mode=gun"; XCNET="$NET"; sdm "$SD" ;;
+    fm-sd-ascii)             fmraw; sdm "$(sdj p ',"ascii":"prefer_ascii"')"; LPORT=18444; SDL=ascii ;;
+    fm-sd-custom)            fmraw; sdm "$(sdj p ',"customTables":["xpxvvpvv","vxpvxvvp"]')"; FMLOAD=1 ;;
+    fm-sd-ascii-table)       fmraw; sdm "$(sdj p ',"ascii":"ascii","customTable":"bad"')" ;;
+    fm-sd-pad0)              fmraw; sdm "$(sdj p "" 0)"; LPORT=18444 ;;
+    fm-sd-neg)               fmraw; sdm "$SDQ" "$SD"; EXPECT=fail ;;
+    fm-sd-badcfg)            fmraw; sdm "$(sdj p ',"ascii":"bogus"')" "$SD"; XCLOG=info ;;
+    fm-chain-sf)             fmraw; CFM="{\"tcp\":[$SD,$FR100]}"; SFM="{\"tcp\":[$SD]}"; LPORT=18444; TAPLENS=1 ;;
+    fm-chain-fs)             fmraw; CFM="{\"tcp\":[$FR10,$SD]}"; SFM="{\"tcp\":[$SD]}" ;;
+    fm-sd-dl-same)           fmtls h2; dl tls packet-up packet-up ""; sdm "$SD"; BFM=$CFM ;;
+    fm-sd-dl-noinherit)      fmtls h2; dl tls packet-up packet-up ""; sdm "$SD"; EXPECT=fail ;;
+    fm-sd-dl-own)            dl reality packet-up packet-up ""; BFM="{\"tcp\":[$SDQ]}"; LPORT=18444; DPORT=18444; TAP2=1; DOKO=1 ;;
     fm-refuse-xmc)           fmtls; fmraw; CFM='{"tcp":[{"type":"xmc","settings":{"password":"p","profiles":[{"username":"Steve_1","uuid":"00112233-4455-6677-8899-aabbccddeeff","texturesValue":"v","texturesSignature":"s"}]}}]}'; SFM=$CFM ;;
     *) echo "run-xray: unknown case $1"; exit 2 ;;
     esac
     [ -z "$DL" ] || dl_cfg
-    case "$1" in xhttp-*|xmux-*|h2-*|ua-*|v6-carry-xhttp|node6-xhttp|fm-*xhttp|fm-dl-*) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
+    case "$1" in xhttp-*|xmux-*|h2-*|ua-*|v6-carry-xhttp|node6-xhttp|fm-*xhttp|fm-*xhttp-packet|fm-dl-*|fm-sd-dl-*) NET="\"network\":\"xhttp\",\"xhttpSettings\":$XP" ;; esac
     case "$1" in
-    fm-*xhttp) XCNET="$NET" ;;
-    fm-dl-*)   XCNET="\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"$XM\",\"downloadSettings\":$XBLK}" ;;
+    fm-*xhttp|fm-*xhttp-packet) XCNET="$NET" ;;
+    fm-dl-*|fm-sd-dl-*) XCNET="\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"$XM\",\"downloadSettings\":$XBLK}" ;;
     esac
     [ -z "$SFM" ] || NET="$NET,\"finalmask\":$SFM"
     [ -z "$CFM" ] || { Q="$Q&fm=$(enc "$CFM")"; XCNET="$XCNET,\"finalmask\":$CFM"; }
@@ -497,7 +527,7 @@ xc_up() {
     XMJ=""; [ -z "$XMUX" ] || XMJ=",\"xmux\":$XMUX"
     XN=${XCNET:-"\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/xp/\",\"mode\":\"$XMODE\"$XMJ}"}
     cat > "$W/xc-$MODE.json" <<JSON
-{"log":{"loglevel":"warning"},
+{"log":{"loglevel":"$XCLOG"},
  "inbounds":[{"listen":"127.0.0.1","port":18080,"protocol":"dokodemo-door","settings":{"address":"$TARGET","port":${XC_TPORT:-8080},"network":"tcp"}}],
  "outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$S_IP","port":${LPORT:-$PORT},"users":[{"id":"$UUID","encryption":"none"$FJ}]}]},
    "streamSettings":{$XN,$CS}}]}
@@ -1110,6 +1140,31 @@ def check(n, b):
         return hello(b, int(a[2]), int(a[0]), int(a[1]))
     if mode == "uncut":
         return hello(b, int(a[0]), 1, 1 << 30, True)
+    if mode == "sdalpha":
+        if a[0] == "ascii":
+            good = set(range(0x20, 0x7f)) | {10}
+        else:
+            good = {x for x in range(256) if x & 0x90 == 0} | set(range(0x80, 0x88)) | set(range(0x10, 0x18))
+        rl = len(b) >= 5 and b[3] << 8 | b[4]
+        if rl and 0x14 <= b[0] <= 0x17 and b[1] == 3 and b[2] <= 4 and rl <= 16640 and (
+                b[0] != 22 or len(b) >= 9 and b[5] == 1 and (b[6] << 16 | b[7] << 8 | b[8]) == rl - 4):
+            return "starts with a TLS record header %s" % b[:5].hex()
+        bad = [i for i, x in enumerate(b) if x not in good]
+        if bad:
+            return "byte %d of %d is %02x, outside the %s alphabet" % (bad[0], len(b), b[bad[0]], a[0])
+        return "ok: %d B, every byte in the %s alphabet, starts %s" % (len(b), a[0], b[:3].hex())
+    if mode == "first":
+        e, m = int(a[0]), int(a[1])
+        sp = spans(n)
+        if not sp or sp[-1][1] < e:
+            return "skip: %d B" % (sp[-1][1] if sp else 0)
+        run = 0
+        for s in sp:
+            if s[1] - s[0] > m:
+                break
+            run = s[1]
+        return "%s: the first %d B in recvs of at most %d B (expected >= %d); first recvs %s" % (
+            "ok" if run >= e else "bad", run, m, e, [s[1] - s[0] for s in sp[:8]])
     r = recs(b, 0)
     if mode == "range":
         m = int(a[0]); h = 5 + r[0][2]
@@ -1221,7 +1276,8 @@ fm_drive() {
     h=$TARGET; p=8080; [ "$1" = x ] && { h=127.0.0.1; p=18080; }
     case "$MODE" in
     fm-frag-loop) fm_loop_drive "$h" "$p" ;;
-    fm-hc-vision) [ "$1" = t ] && p=8443; fm_vis "$h:$p" ;;
+    fm-hc-vision|fm-sd-vision) [ "$1" = t ] && p=8443; fm_vis "$h:$p" ;;
+    fm-sd-pad0) up200 ;;
     *) rec_drive plain "$h" "$p" first ;;
     esac
 }
@@ -1233,23 +1289,27 @@ fm_run() {
         O=fail
         for _ in 1 2 3; do out=$(probe); echo "run-xray: probe: $out"; ! is_ok "$out" || O=ok; done
     elif [ "$1" = t ]; then
-        if [ "$MODE" = fm-hc-vision ]; then TUN_TRACE=1 tun_up "$BIN" t || return 1; else tun_up "$BIN" t || return 1; fi
+        if fmvis; then TUN_TRACE=1 tun_up "$BIN" t || return 1; else tun_up "$BIN" t || return 1; fi
         ! fm_drive t || O=ok
     else
-        if [ "$MODE" = fm-hc-vision ]; then XC_TPORT=8443 xc_up || return 1; else xc_up || return 1; fi
+        if fmvis; then XC_TPORT=8443 xc_up || return 1; else xc_up || return 1; fi
         ! fm_drive x || O=ok
     fi
+    [ "$O" != ok ] || [ -z "$FMLOAD" ] || lrun "$1" --dur "$DUR" --down 2 --up 2 --rate 10 --report 10 ||
+        { echo "run-xray: FAIL — $1: the load failed"; O=fail; }
     sleep 0.5; tun_down; xc_down; sleep 0.5; tap_down; tap2_down
     eval "O_$1=\$O"
 }
 fm_warm() {
     fm_taps w || return 1
+    [ -z "${FMX:-}" ] || { tap_down; tap2_down; return 0; }
     for _ in $(seq 12); do out=$(probe); is_ok "$out" && break; sleep 1; done
     echo "run-xray: warm-up probe: $out"
     tap_down; tap2_down
 }
 fm_refuse() {
-    kind=${MODE#fm-refuse-}
+    kind=${MODE#fm-refuse-}; txt="link cannot be used: finalmask: $kind is not supported yet"; xo=ok
+    [ "$MODE" != fm-sd-badcfg ] || { kind=sudoku; txt="link cannot be used: finalmask: sudoku: invalid sudoku ascii mode: bogus"; xo=fail; }
     if [ -z "${FMX:-}" ]; then
         s0=$(nft_val dlcnt packets syn1)
         rm -f "$W/kin"; mkfifo "$W/kin"; : > "$W/kev"
@@ -1257,7 +1317,6 @@ fm_refuse() {
         SPID=$!; PIDS="$PIDS $SPID"
         exec 7> "$W/kin"
         cat "$W/sub.txt" >&7; echo >&7
-        txt="link cannot be used: finalmask: $kind is not supported yet"
         i=0; while [ $i -lt 25 ] && ! grep -qF "$txt" "$W/tun-$MODE-t.log"; do sleep 0.2; i=$((i + 1)); done
         out=$(probe); echo "run-xray: probe: $out"
         sleep 2; exec 7>&-; tun_down
@@ -1269,11 +1328,14 @@ fm_refuse() {
     xc_up || return 1
     O=fail; for _ in 1 2 3; do rec_drive plain 127.0.0.1 18080 first && { O=ok; break; }; sleep 1; done
     xc_down
-    same "Xray client with $kind" "$O" ok
+    same "Xray client with $kind" "$O" "$xo"
+    [ "$xo" = ok ] || if grep -F "invalid sudoku ascii mode: bogus" "$W/xc-$MODE.log" | head -1 | grep .; then
+        echo "run-xray: Xray's client failed at dial"
+    else echo "run-xray: FAIL — the Xray client log does not name the ascii mode"; XR=1; fi
 }
 fm_case() {
     XR=0; O_t=skip; O_x=skip; R2PID=""
-    case "$MODE" in fm-refuse-*) fm_refuse; return $XR ;; esac
+    case "$MODE" in fm-refuse-*|fm-sd-badcfg) fm_refuse; return $XR ;; esac
     [ "$EXPECT" = fail ] || fm_warm || return 1
     for c in t x; do
         [ "$c" = t ] && [ -n "${FMX:-}" ] && continue
@@ -1284,6 +1346,12 @@ fm_case() {
 $(dl_delta "$a" "$(dl_snap)")
 EOF
             want "$c: TCP connections to the download address $S_IP2" "$s2" gt 0
+        fi
+        if [ "$MODE" = fm-sd-neg ] && [ "$c" = t ]; then
+            read -r _ _ _ _ s1 _ <<EOF
+$(dl_delta "$a" "$(dl_snap)")
+EOF
+            want "t: TCP connections to $S_IP" "$s1" gt 0
         fi
     done
     echo "run-xray: outcome: tunvless $O_t, Xray client $O_x"
@@ -1309,10 +1377,20 @@ EOF
         fm-chain-hf)       fmpy head "$d" "$HCH" && fmpy uncut "$d" 18 ;;
         fm-chain-fh)       fmpy head "$d" "$HCH" && fmpy hello "$d" 10 10 18 ;;
         fm-dl-frag)        fmpy hello "$W/tap2-$MODE-$c" 10 10 0 && fmpy uncut "$d" 0 ;;
+        fm-sd-raw|fm-sd-xhttp|fm-sd-xhttp-packet|fm-sd-ascii) fmpy sdalpha "$d" "$SDL" ;;
+        fm-chain-sf)       fmpy first "$d" 4864 100 ;;
+        fm-sd-dl-own)      fmpy sdalpha "$W/tap2-$MODE-$c" entropy ;;
         *) echo "run-xray:   none" ;;
         esac || { echo "run-xray: FAIL — $c: the tap does not show the mask"; XR=1; }
     done
-    [ "$MODE" != fm-hc-vision ] || [ -n "${FMX:-}" ] ||
+    if [ "$MODE" = fm-sd-pad0 ] && [ -z "${FMX:-}" ]; then
+        nt=$(rec_conn "$W/tap-$MODE-t" largest) && nx=$(rec_conn "$W/tap-$MODE-x" largest) &&
+            bt=$(wc -c < "$W/tap-$MODE-t/$nt.c2s") && bx=$(wc -c < "$W/tap-$MODE-x/$nx.c2s") || { bt=0; bx=1; }
+        r=$(awk -v t="$bt" -v x="$bx" 'BEGIN { printf "%.3f", t / x }')
+        if awk -v r="$r" 'BEGIN { exit !(r >= 0.97 && r <= 1.03) }'; then echo "run-xray: c2s bytes tunvless $bt / Xray $bx = $r"
+        else echo "run-xray: FAIL — c2s bytes tunvless $bt / Xray $bx = $r, expected 0.97..1.03"; XR=1; fi
+    fi
+    ! fmvis || [ -n "${FMX:-}" ] ||
         want "tunvless switches to direct copy" "$(grep -c 'server switched to direct copy' "$W/tun-$MODE-t.log")" ge 1
     if grep -E "does not answer|answers again|did not open|refused the data" "$W"/tun-"$MODE"-*.log 2>/dev/null | head -3 | grep .; then
         echo "run-xray: FAIL — the pool declared the node dead, a flow did not open, or data was refused"; XR=1
@@ -1456,7 +1534,10 @@ vshape_check() {
     same "$(vcn) $G commands" "$(fld "$VF" 3)" "$k"
     same "$(vcn) $G contents" "$(fld "$VF" 1)" "$e"
     s=$(fsum "$VF")
-    vtail "$s"
+    if [ "$MODE" = fm-sd-vision-up ]; then
+        fmpy sdalpha "$W/tap-$MODE-$C-$G" entropy || { echo "run-xray: FAIL — $(vcn) $G: the tap does not show the mask"; XR=1; }
+        [ "$C" != t ] || want "tunvless traces the client switch" "$(grep -c 'client switched to direct copy' "$W/tun-$MODE-$G.log")" ge 1
+    else vtail "$s"; fi
     want "$(vcn) $G origin bytes after S" "$(($(wc -c < "$VOC") - s))" ge 1000000
     eval "SK_${C}_$G=\"\$(fld \"\$VF\" 3)\" SC_${C}_$G=\"\$(fld \"\$VF\" 1)\""
 }
@@ -1471,7 +1552,8 @@ vapp() { [ -n "$VCC" ] && python3 tests/vrecs.py "$VCC" --after-handshake || tru
 v_case() {
     XR=0
     tap_up w || return 1
-    warm=0; for _ in $(seq 12); do out=$(probe); is_ok "$out" && { warm=1; break; }; sleep 1; done
+    warm=0; [ -z "${FMX:-}" ] || warm=1
+    [ "$warm" -eq 1 ] || for _ in $(seq 12); do out=$(probe); is_ok "$out" && { warm=1; break; }; sleep 1; done
     tap_down
     [ "$warm" -eq 1 ] || { echo "run-xray: FAIL — the node did not answer the probe within a minute: $out"; return 1; }
     case "$MODE" in
@@ -1483,6 +1565,7 @@ v_case() {
     vis-up|vis-up-tls|vis-up-tls12) head -c "$([ "$MODE" = vis-up-tls12 ] && echo 1000000 || echo 3000000)" /dev/urandom > "$W/up-$MODE.bin" ;;
     esac
     for C in t x; do
+        [ "$C" = t ] && [ -n "${FMX:-}" ] && continue
         case "$MODE" in
         vis-up|vis-up-tls)
             VP=8443; vgo up dcurl "$W/up-$MODE.bin" 8443 --tlsv1.3 || return 1
@@ -1500,7 +1583,7 @@ v_case() {
             want "$(vcn) frames with command 2" "$(fld "$VF" 3 | tr ' ' '\n' | grep -c '^2$')" eq 0 ;;
         vis-up-shapes)
             for m in split joined nocss; do VP=8443; vgo "$m" dshape "$m" || return 1; vshape_check; done ;;
-        fm-frag-vision-up|fm-hc-vision-up)
+        fm-frag-vision-up|fm-hc-vision-up|fm-sd-vision-up)
             VP=8443; vgo split dshape split || return 1; vshape_check ;;
         vis-plain-end)
             VP=8080; VPROBE=1 vgo plain ddrive plain 8080 0 1000 10 50 || return 1
@@ -1554,8 +1637,9 @@ v_case() {
             done ;;
         esac
     done
+    [ -z "${FMX:-}" ] || return $XR
     case "$MODE" in
-    vis-up-shapes|fm-frag-vision-up|fm-hc-vision-up)
+    vis-up-shapes|fm-frag-vision-up|fm-hc-vision-up|fm-sd-vision-up)
         ms="split"; [ "$MODE" = vis-up-shapes ] && ms="split joined nocss"
         for m in $ms; do
             eval "a=\$SK_t_$m b=\$SK_x_$m c=\$SC_t_$m d=\$SC_x_$m"
@@ -1610,7 +1694,7 @@ for MODE in $CASES; do
             SKIPPED="$SKIPPED $MODE"; continue
         fi ;;
     esac
-    case "$MODE" in fm-refuse-*)
+    case "$MODE" in fm-refuse-*|fm-sd-badcfg)
         if [ -z "$DLNFT" ]; then
             echo "run-xray: case $MODE — SKIPPED (no nft counters in the server namespace; not passed)"
             SKIPPED="$SKIPPED $MODE"; continue
@@ -1634,6 +1718,7 @@ for MODE in $CASES; do
     *)        INB="{\"listen\":\"$S_IP\",$INB1}" ;;
     esac
     [ -z "$DL" ] || INB="{\"listen\":\"0.0.0.0\",$INB1}"
+    [ -z "$DOKO" ] || INB="{\"listen\":\"$S_IP\",$INB1},{\"listen\":\"$S_IP2\",\"port\":$PORT,\"protocol\":\"dokodemo-door\",\"settings\":{\"address\":\"$S_IP\",\"port\":$PORT,\"network\":\"tcp\"},\"streamSettings\":{\"network\":\"tcp\",\"finalmask\":$BFM}}"
     FR="{\"action\":\"allow\",\"ip\":[\"$TARGET/32\"]}"
     case "$V6" in
     carry|noroute)

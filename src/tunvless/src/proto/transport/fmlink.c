@@ -118,6 +118,7 @@ int fm_link_open(const char *fm, struct fm_link **out) {
             case FM_FILTER: continue;
             case FM_FRAGMENT: ops[k] = &fm_frag_ops; break;
             case FM_HEADER: ops[k] = &fm_hc_ops; break;
+            case FM_SUDOKU: ops[k] = &fm_sd_ops; break;
             default: goto out;
         }
         ms[k++] = &c->m[i];
@@ -206,10 +207,6 @@ static size_t splice_top(const struct fm_link *l) {
     size_t top = l->n;
     while (top && l->lay[top - 1].ops->splice) top--;
     return top;
-}
-
-int fm_splices(const struct fm_link *l) {
-    return !l || !splice_top(l);
 }
 
 void fm_sleep_ms(int64_t ms) {
@@ -407,10 +404,8 @@ static ssize_t read_up(struct fm_link *l, int fd, size_t top, unsigned char *d, 
         }
         if (got) return (ssize_t)got;
         if (l->eof) return 0;
-        if (!r || (flags & MSG_DONTWAIT)) {
-            errno = EAGAIN;
-            return -1;
-        }
+        errno = r && !(flags & MSG_DONTWAIT) ? EINTR : EAGAIN;
+        return -1;
     }
 }
 
@@ -440,6 +435,7 @@ int fm_lower_read_full(struct fm_layer *me, int fd, unsigned char *d, size_t n) 
         ssize_t r = read_up(me->l, fd, me->idx, d + got, n - got, 0);
         if (r == 0) return TR_ECLOSED;
         if (r < 0) {
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return TR_ECONNTIMEOUT;
             return errno == EPROTO ? TR_EMASK : TR_EIO;
         }
@@ -517,5 +513,12 @@ void fm_rand_bytes(unsigned char *b, size_t n, uint8_t from, uint8_t to) {
 
 size_t fm_room(const struct fm_link *l) {
     size_t m = l ? q_mem(l) : 0;
-    return m >= FM_Q_MAX ? 0 : FM_Q_MAX - m;
+    return m >= FM_Q_MAX ? 0 : (FM_Q_MAX - m) / fm_grow(l);
+}
+
+unsigned fm_grow(const struct fm_link *l) {
+    unsigned g = 1;
+    for (size_t i = 0; l && i < l->n; i++)
+        if (l->lay[i].ops->grow) g *= l->lay[i].ops->grow(l->lay[i].m);
+    return g;
 }

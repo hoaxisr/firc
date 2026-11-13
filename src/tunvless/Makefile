@@ -35,7 +35,8 @@ TRANSPORT_SRC := src/proto/transport/transport.c src/proto/transport/trdial.c \
                  src/proto/transport/trupgrade.c src/proto/transport/trws.c src/proto/transport/trpath.c \
                  src/proto/transport/trvenc.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c \
                  src/proto/transport/xconn.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
-                 src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c
+                 src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
+                 src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c
 TLS_SRC       := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
                  src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c \
                  src/proto/tls/roots.c
@@ -117,10 +118,11 @@ TW_FLAGS  = $(shell cat $(TW_LIB).cflags 2>/dev/null)
 
 SCRATCH_SRC := src/lib/tscratch.c
 
-FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/lib/osrand.c
+FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/lib/osrand.c \
+              src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c
 
-UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch tscratchmatch
-CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch
+UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch tscratchmatch gorandmatch
+CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch fmsdmatch
 
 test: unit-test crypto-test $(O)/tunvless
 	sh tests/tlssize.sh $(O)/tunvless
@@ -151,10 +153,11 @@ XHUP_SRC := src/proto/tls/h2.c src/proto/tls/h2wire.c src/proto/transport/transp
             src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/lib/osrand.c \
             src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
             src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/proto/transport/fmask.c \
+            src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c \
             $(SCRATCH_SRC)
-$(T)/xhupmatch: tests/xhupmatch.c tests/trvenc-stub.c src/proto/transport/trxhttp.c $(XHUP_SRC) $(HDR)
+$(T)/xhupmatch: tests/xhupmatch.c tests/trvenc-stub.c src/proto/transport/trxhttp.c $(XHUP_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -Wl,--wrap=calloc -o $@ tests/xhupmatch.c tests/trvenc-stub.c $(XHUP_SRC) -lpthread
+	$(CC) $(T_CFLAGS) -Wl,--wrap=calloc -Wl,--wrap=xconn_io -o $@ tests/xhupmatch.c tests/trvenc-stub.c $(XHUP_SRC) $(T_FMCRYPTO) -lpthread
 
 WS_SRC := src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/transport/trpath.c \
           src/proto/transport/transport.c src/proto/transport/trsec.c src/proto/transport/trdial.c \
@@ -162,23 +165,24 @@ WS_SRC := src/proto/transport/trws.c src/proto/transport/trupgrade.c src/proto/t
           src/proto/tls/h2wire.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/tls/roots.c src/lib/osrand.c \
           src/proto/transport/xconn.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/transport/trxmux.c src/proto/transport/xmux.c \
           src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/proto/transport/fmask.c \
+          src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c \
           $(SCRATCH_SRC)
-$(T)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) $(HDR)
+$(T)/wsmatch: tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) -lpthread
+	$(CC) $(T_CFLAGS) -o $@ tests/wsmatch.c tests/trvenc-stub.c $(WS_SRC) $(T_FMCRYPTO) -lpthread
 
 $(T)/xhoptsmatch: tests/xhoptsmatch.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/lib/osrand.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/xhoptsmatch.c src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/lib/osrand.c
 
 XMUX_SRC := $(XHUP_SRC) src/proto/transport/trxhttp.c
-$(T)/xmuxmatch: tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) $(HDR)
+$(T)/xmuxmatch: tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) -lpthread
+	$(CC) $(T_CFLAGS) -o $@ tests/xmuxmatch.c tests/trvenc-stub.c $(XMUX_SRC) $(T_FMCRYPTO) -lpthread
 
-$(T)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) $(HDR)
+$(T)/pqfallbackmatch: tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) -lpthread
+	$(CC) $(T_CFLAGS) -o $@ tests/pqfallbackmatch.c src/proto/transport/trsec.c $(FMLINK_SRC) $(T_FMCRYPTO) -lpthread
 
 $(T)/b3match: tests/b3match.c src/lib/blake3.h
 	@mkdir -p $(T)
@@ -222,9 +226,9 @@ $(T)/fmaskmatch: tests/fmaskmatch.c src/proto/transport/fmask.c $(HDR)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/fmaskmatch.c src/proto/transport/fmask.c
 
-$(T)/fmlinkmatch: tests/fmlinkmatch.c $(FMLINK_SRC) $(HDR)
+$(T)/fmlinkmatch: tests/fmlinkmatch.c tests/sdpeer.h $(FMLINK_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -o $@ tests/fmlinkmatch.c $(filter-out src/proto/transport/fmlink.c,$(FMLINK_SRC)) -lpthread
+	$(CC) $(T_CFLAGS) -o $@ tests/fmlinkmatch.c $(filter-out src/proto/transport/fmlink.c src/lib/osrand.c,$(FMLINK_SRC)) $(T_CRYPTO)
 
 $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 	@mkdir -p $(T)
@@ -232,9 +236,9 @@ $(T)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c $(HDR)
 
 # grpcmatch includes trgrpc.c (its framing functions are static) and links the rest for real.
 GRPC_TEST_SRC := $(filter-out src/proto/transport/trgrpc.c,$(XHUP_SRC)) src/proto/transport/trxhttp.c
-$(T)/grpcmatch: tests/grpcmatch.c tests/trvenc-stub.c src/proto/transport/trgrpc.c $(GRPC_TEST_SRC) $(HDR)
+$(T)/grpcmatch: tests/grpcmatch.c tests/trvenc-stub.c src/proto/transport/trgrpc.c $(GRPC_TEST_SRC) $(T)/scrypto.o $(HDR)
 	@mkdir -p $(T)
-	$(CC) $(T_CFLAGS) -Wl,--wrap=calloc -o $@ tests/grpcmatch.c tests/trvenc-stub.c $(GRPC_TEST_SRC) -lpthread
+	$(CC) $(T_CFLAGS) -Wl,--wrap=calloc -o $@ tests/grpcmatch.c tests/trvenc-stub.c $(GRPC_TEST_SRC) $(T_FMCRYPTO) -lpthread
 
 $(T)/ctlmatch: tests/ctlmatch.c src/control.c src/control.h
 	@mkdir -p $(T)
@@ -255,6 +259,10 @@ $(T)/ratelogmatch: tests/ratelogmatch.c src/lib/ratelog.h
 $(T)/tstackmatch: tests/tstackmatch.c src/lib/tstack.h
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/tstackmatch.c -lpthread
+
+$(T)/gorandmatch: tests/gorandmatch.c src/lib/gorand.c src/lib/gorand.h tests/unit.h
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/gorandmatch.c src/lib/gorand.c
 
 $(T)/tscratchmatch: tests/tscratchmatch.c src/lib/tscratch.c src/lib/tscratch.h tests/unit.h
 	@mkdir -p $(T)
@@ -307,6 +315,8 @@ $(T)/certgen.o: tests/certgen.c tests/certgen.h $(TW_LIB)
 
 T_CRYPTO = $(T)/scrypto.o src/lib/osrand.c $(TW_LIB) -lpthread
 
+T_FMCRYPTO = -Wl,--wrap=sc_wipe $(T)/scrypto.o $(TW_LIB)
+
 $(T)/certzip.o: src/lib/certzip.c src/lib/certzip.h $(CERTZIP_LIBS)
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) $(CERTZIP_FLAGS) -c $< -o $@
@@ -323,9 +333,14 @@ CLIENT_SRC := src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/v
               src/proto/transport/xhopts.c src/proto/transport/xhreq.c src/proto/transport/xconn.c \
               src/proto/transport/trxmux.c src/proto/transport/xmux.c \
               src/proto/transport/fmlink.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c \
+              src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c \
               src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c src/proto/tls/h2.c \
               src/proto/tls/h2wire.c src/proto/tls/h2mux.c src/proto/tls/hpack.c src/proto/tls/ech.c \
               $(SCRATCH_SRC)
+
+FMSD_SRC := src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/proto/transport/fmask.c src/lib/gorand.c
+$(T)/fmsdmatch: tests/fmsdmatch.c tests/sdpeer.h $(FMSD_SRC) src/proto/transport/fmsd.h src/lib/gorand.h $(T)/scrypto.o $(HDR)
+	$(CC) $(T_CFLAGS) -Wl,--wrap=go_rand_seed -o $@ tests/fmsdmatch.c $(FMSD_SRC) $(T_CRYPTO)
 
 $(T)/scryptomatch: tests/scryptomatch.c tests/scrypto-pki.h tests/scrypto-pq.h $(T)/scrypto.o
 	$(CC) $(T_CFLAGS) -o $@ tests/scryptomatch.c $(T_CRYPTO)
@@ -338,13 +353,13 @@ $(T)/echmatch: tests/echmatch.c src/proto/tls/ech.c src/proto/tls/reality.c $(T)
 
 # vlessmatch includes trdial.c, roots.c and trsec.c (it reaches their static seams).
 VLM_SRC := $(filter-out src/proto/transport/trsec.c src/proto/tls/certverify.c,$(CLIENT_SRC))
-$(T)/vlessmatch: tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c \
+$(T)/vlessmatch: tests/vlessmatch.c tests/fmrelay.h tests/sdpeer.h $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c \
                  $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=time -Wl,--wrap=__time64 -o $@ tests/vlessmatch.c $(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
-$(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c tests/fmrelay.h $(CLIENT_SRC) src/proto/transport/trdial.c \
+$(T)/xconnmatch: tests/xconnmatch.c tests/vlessmatch.c tests/fmrelay.h tests/sdpeer.h $(CLIENT_SRC) src/proto/transport/trdial.c \
                  src/proto/tls/roots.c $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
-	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=time -Wl,--wrap=__time64 -o $@ tests/xconnmatch.c \
+	$(CC) $(T_CFLAGS) -DSTEER_HAVE_X509WRITE -Wl,--wrap=sc_wipe -Wl,--wrap=send -Wl,--wrap=fm_grow -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=time -Wl,--wrap=__time64 -o $@ tests/xconnmatch.c \
 		$(VLM_SRC) $(T)/certgen.o $(T_CERTZIP) $(T_CRYPTO)
 
 $(T)/probematch: tests/probematch.c $(CLIENT_SRC) src/proto/transport/trdial.c src/proto/tls/roots.c $(T)/scrypto.o $(T)/certzip.o $(HDR)

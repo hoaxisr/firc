@@ -52,6 +52,7 @@ int tr_link_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     }
     if (l->plain || l->rx_direct) {
         ssize_t r = tr_lk_recv(l, d, cap, 0);
+        if (r < 0 && errno == EINTR) return 0;
         if (r <= 0) return tr_lk_err(l, r);
         *got = (size_t)r;
         return 0;
@@ -260,7 +261,7 @@ void transport_tx_direct(struct transport *t) {
 }
 
 int transport_can_tx_direct(const struct transport *t) {
-    return !t->enc && t->fr == &tr_tcp && !t->link.plain && fm_splices(t->link.tls.fm);
+    return !t->enc && t->fr == &tr_tcp && !t->link.plain;
 }
 
 void transport_moved(struct transport *t) {

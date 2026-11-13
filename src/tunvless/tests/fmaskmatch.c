@@ -449,10 +449,168 @@ static void t_servers_measurable(void) {
              hc("{\"servers\":[[{\"transform\":{\"op\":\"be32\",\"args\":[{\"reuse\":\"q\"}]}}]]}"));
 }
 
+static const char *sd_of(const char *settings) {
+    static char out[512];
+    size_t k;
+    snprintf(jb, sizeof jb, "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":%s}]}", settings);
+    if (parse(jb)) {
+        snprintf(out, sizeof out, "!%s", why);
+        return out;
+    }
+    if (cfg.n != 1 || cfg.m[0].kind != FM_SUDOKU) return "(not one sudoku)";
+    const struct fm_sd *s = &cfg.m[0].u.sd;
+    k = (size_t)snprintf(out, sizeof out, "ascii=%u pat=", (unsigned)s->ascii);
+    for (size_t i = 0; i < s->n_pat && k < sizeof out; i++)
+        k += (size_t)snprintf(out + k, sizeof out - k, "%s\"%s\"", i ? "," : "", s->pat[i]);
+    if (k < sizeof out) k += (size_t)snprintf(out + k, sizeof out - k, " pad=%u/%u pw=", s->pmin, s->pmax);
+    for (size_t i = 0; i < s->pw_n && k < sizeof out; i++)
+        k += (size_t)snprintf(out + k, sizeof out - k, "%s%02x", i ? " " : "", s->pw[i]);
+    return out;
+}
+
+#define SD_ENT "ascii=0 pat=\"\" pad=0/0 pw="
+#define SD_ASC "ascii=1 pat=\"\" pad=0/0 pw="
+#define SD_T(t) "ascii=0 pat=\"" t "\" pad=0/0 pw="
+#define SD_PAD(a, b) "ascii=0 pat=\"\" pad=" a "/" b " pw="
+
+static void t_sd_defaults(void) {
+    /* catches: absent settings refused, or no entropy pattern */
+    ok_parse("sd defaults: no settings", "{\"tcp\":[{\"type\":\"sudoku\"}]}");
+    check("sd defaults: kind", FM_SUDOKU, cfg.n == 1 ? (long)cfg.m[0].kind : -1);
+    check_str("sd defaults: settings null", SD_ENT, sd_of("null"));
+    check_str("sd defaults: settings {}", SD_ENT, sd_of("{}"));
+    check_str("sd defaults: settings array", "!sudoku: invalid settings", sd_of("[]"));
+}
+
+static void t_sd_ascii_mode(void) {
+    /* catches: ASCII-only trimming, a case-sensitive mode, or the trimmed value in the text */
+    check_str("sd mode: empty", SD_ENT, sd_of("{\"ascii\":\"\"}"));
+    check_str("sd mode: entropy", SD_ENT, sd_of("{\"ascii\":\"entropy\"}"));
+    check_str("sd mode: prefer_entropy", SD_ENT, sd_of("{\"ascii\":\"prefer_entropy\"}"));
+    check_str("sd mode: spaced Prefer_Entropy", SD_ENT, sd_of("{\"ascii\":\" Prefer_Entropy \"}"));
+    check_str("sd mode: ascii", SD_ASC, sd_of("{\"ascii\":\"ascii\"}"));
+    check_str("sd mode: prefer_ascii", SD_ASC, sd_of("{\"ascii\":\"prefer_ascii\"}"));
+    check_str("sd mode: dotted capital I", SD_ASC, sd_of("{\"ascii\":\"ASC\\u0130\\u0130\"}"));
+    check_str("sd mode: ideographic space", SD_ASC, sd_of("{\"ascii\":\" ascii\\u3000\"}"));
+    check_str("sd mode: next line", SD_ASC, sd_of("{\"ascii\":\"ascii\\u0085\"}"));
+    check_str("sd mode: leading space", SD_ASC, sd_of("{\"ascii\":\" ascii\"}"));
+    check_str("sd mode: long s", "!sudoku: invalid sudoku ascii mode: a\xc5\xbf" "cii",
+              sd_of("{\"ascii\":\"a\\u017fcii\"}"));
+    check_str("sd mode: zero width space", "!sudoku: invalid sudoku ascii mode: entropy\xe2\x80\x8b",
+              sd_of("{\"ascii\":\"entropy\\u200b\"}"));
+    check_str("sd mode: raw value", "!sudoku: invalid sudoku ascii mode:  xx ", sd_of("{\"ascii\":\" xx \"}"));
+    check_str("sd mode: xx", "!sudoku: invalid sudoku ascii mode: xx", sd_of("{\"ascii\":\"xx\"}"));
+    check_str("sd mode: number", "!sudoku: invalid ascii", sd_of("{\"ascii\":1}"));
+}
+
+static void t_sd_custom_table(void) {
+    /* catches: length counted in runes, the checks reordered, or inner tabs removed */
+    check_str("sd table: spaced", SD_T("xpxvvpvv"), sd_of("{\"customTable\":\"xp xv vp vv\"}"));
+    check_str("sd table: upper", SD_T("xpxvvpvv"), sd_of("{\"customTable\":\"XPXVVPVV\"}"));
+    check_str("sd table: unicode trim", SD_T("xpxvvpvv"), sd_of("{\"customTable\":\" xpxvvpvv\\u3000\"}"));
+    check_str("sd table: e acute", "!sudoku: customTable must be 8 chars, got 9",
+              sd_of("{\"customTable\":\"xpxvvpv\\u00e9\"}"));
+    check_str("sd table: trailing tab", "!sudoku: customTable must be 8 chars, got 7",
+              sd_of("{\"customTable\":\"xpxvvpv\\t\"}"));
+    check_str("sd table: zero width space", "!sudoku: customTable must be 8 chars, got 10",
+              sd_of("{\"customTable\":\"xpxvvpv\\u200b\"}"));
+    check_str("sd table: A", "!sudoku: customTable has invalid char 'a'", sd_of("{\"customTable\":\"xpxvvpvA\"}"));
+    check_str("sd table: inner tab", "!sudoku: customTable has invalid char '\\t'",
+              sd_of("{\"customTable\":\"xpx\\tvpvv\"}"));
+    check_str("sd table: NUL", "!sudoku: customTable has invalid char '\\x00'",
+              sd_of("{\"customTable\":\"xpxvvpv\\u0000\"}"));
+    check_str("sd table: quote", "!sudoku: customTable has invalid char '\\''", sd_of("{\"customTable\":\"xpxvv'vv\"}"));
+    check_str("sd table: dotted capital I", "!sudoku: customTable has invalid char 'i'",
+              sd_of("{\"customTable\":\"xpxvvpv\\u0130\"}"));
+    check_str("sd table: e acute in 8 bytes", "!sudoku: customTable has invalid char '\xc3\xa9'",
+              sd_of("{\"customTable\":\"xpxvvp\\u00e9\"}"));
+    check_str("sd table: counts", "!sudoku: customTable must contain exactly 2 x, 2 p and 4 v",
+              sd_of("{\"customTable\":\"xxxvvpvv\"}"));
+    check_str("sd table: blank", SD_ENT, sd_of("{\"customTable\":\"  \"}"));
+    check_str("sd table: number", "!sudoku: invalid customTable", sd_of("{\"customTable\":1}"));
+}
+
+static void t_sd_tables_list(void) {
+    /* catches: ascii mode validating tables, de-dup before normalizing, or the legacy list ignored */
+    check_str("sd tables: listed, de-duplicated", "ascii=0 pat=\"xpxvvpvv\",\"\",\"vxpvxvvp\" pad=0/0 pw=",
+              sd_of("{\"customTables\":[\"xpxvvpvv\",\" XPXVVPVV \",\"\",\"vxpvxvvp\"]}"));
+    check_str("sd tables: later duplicate", "ascii=0 pat=\"xpxvvpvv\",\"vxpvxvvp\" pad=0/0 pw=",
+              sd_of("{\"customTables\":[\"xpxvvpvv\",\"vxpvxvvp\",\"xpxvvpvv\"]}"));
+    check_str("sd tables: customTable ignored", SD_T("xpxvvpvv"),
+              sd_of("{\"customTable\":\"bad\",\"customTables\":[\"xpxvvpvv\"]}"));
+    check_str("sd tables: empty takes legacy", SD_T("vxpvxvvp"),
+              sd_of("{\"customTables\":[],\"custom_tables\":[\"vxpvxvvp\"]}"));
+    check_str("sd tables: ascii mode skips them", SD_ASC,
+              sd_of("{\"ascii\":\"ascii\",\"customTables\":[\"bad\"],\"customTable\":\"bad\"}"));
+    check_str("sd tables: bad", "!sudoku: customTable must be 8 chars, got 3", sd_of("{\"customTables\":[\"bad\"]}"));
+    check_str("sd tables: a string", "!sudoku: invalid customTables", sd_of("{\"customTables\":\"x\"}"));
+    check_str("sd tables: a number inside", "!sudoku: invalid customTables", sd_of("{\"customTables\":[5]}"));
+    check_str("sd tables: null entry", "ascii=0 pat=\"\",\"xpxvvpvv\" pad=0/0 pw=",
+              sd_of("{\"customTables\":[null,\"xpxvvpvv\"]}"));
+    check_str("sd tables: null after a list", SD_ENT, sd_of("{\"customTables\":[\"a\"],\"customTables\":null}"));
+    check_str("sd tables: folded key", SD_T("vxpvxvvp"), sd_of("{\"customtables\":[\"vxpvxvvp\"]}"));
+}
+
+static void t_sd_legacy(void) {
+    /* catches: legacy used after trimming, read when camel is non-zero, or not read when camel is 0 */
+    check_str("sd legacy: custom_table alone", SD_T("vxpvxvvp"), sd_of("{\"custom_table\":\"vxpvxvvp\"}"));
+    check_str("sd legacy: blank customTable wins", SD_ENT,
+              sd_of("{\"customTable\":\"  \",\"custom_table\":\"vxpvxvvp\"}"));
+    check_str("sd legacy: string null keeps the earlier", "!sudoku: customTable must be 8 chars, got 1",
+              sd_of("{\"customTable\":\"a\",\"customTable\":null}"));
+    check_str("sd legacy: padding_min/max", SD_PAD("40", "50"), sd_of("{\"padding_min\":40,\"padding_max\":50}"));
+    check_str("sd legacy: paddingMin wins", SD_PAD("10", "10"), sd_of("{\"paddingMin\":10,\"padding_min\":40}"));
+    check_str("sd legacy: paddingMin 0", SD_PAD("40", "40"), sd_of("{\"paddingMin\":0,\"padding_min\":40}"));
+    check_str("sd legacy: bad padding_min", "!sudoku: invalid padding_min", sd_of("{\"padding_min\":-1}"));
+}
+
+static void t_sd_padding(void) {
+    static const char *const bad[] = {"-1", "1.0", "1e2", "4294967296", "\"5\"", "-0", "true"};
+    char what[64], js[64];
+    /* catches: pmax not raised to pmin, no clamp, or a double parse */
+    check_str("sd pad: 150/20", SD_PAD("100", "100"), sd_of("{\"paddingMin\":150,\"paddingMax\":20}"));
+    check_str("sd pad: 30/10", SD_PAD("30", "30"), sd_of("{\"paddingMin\":30,\"paddingMax\":10}"));
+    check_str("sd pad: max only", SD_PAD("0", "7"), sd_of("{\"paddingMax\":7}"));
+    check_str("sd pad: uint32 max", SD_PAD("100", "100"), sd_of("{\"paddingMin\":4294967295}"));
+    check_str("sd pad: null keeps the earlier", SD_PAD("5", "5"), sd_of("{\"paddingMin\":5,\"paddingMin\":null}"));
+    check_str("sd pad: folded key", SD_PAD("3", "3"), sd_of("{\"PaddingMIN\":3}"));
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        snprintf(what, sizeof what, "sd pad: %s refused", bad[i]);
+        snprintf(js, sizeof js, "{\"paddingMin\":%s}", bad[i]);
+        check_str(what, "!sudoku: invalid paddingMin", sd_of(js));
+    }
+    check_str("sd pad: bad max", "!sudoku: invalid paddingMax", sd_of("{\"paddingMax\":101.5}"));
+}
+
+static void t_sd_password(void) {
+    /* catches: NUL mapped to 0x01, or case-sensitive keys */
+    check_str("sd pw: NUL kept", "ascii=0 pat=\"\" pad=0/0 pw=61 00 62", sd_of("{\"password\":\"a\\u0000b\"}"));
+    check_str("sd pw: last key wins", "ascii=0 pat=\"\" pad=0/0 pw=79", sd_of("{\"PASSWORD\":\"z\",\"password\":\"y\"}"));
+    check_str("sd pw: last key wins, upper", "ascii=0 pat=\"\" pad=0/0 pw=7a",
+              sd_of("{\"password\":\"y\",\"PASSWORD\":\"z\"}"));
+    check_str("sd pw: null keeps the earlier", "ascii=0 pat=\"\" pad=0/0 pw=61",
+              sd_of("{\"password\":\"a\",\"password\":null}"));
+    check_str("sd pw: number", "!sudoku: invalid password", sd_of("{\"password\":5}"));
+}
+
+static void t_sd_one_per_chain(void) {
+    /* catches: stacked sudoku accepted (Vision's room closes for good), or the check counted across main and block */
+    bad_parse("sd chain: two apart",
+              "{\"tcp\":[{\"type\":\"sudoku\"},{\"type\":\"fragment\",\"settings\":{\"length\":1}},{\"type\":\"sudoku\"}]}",
+              "sudoku: more than one sudoku mask is not supported");
+    bad_parse("sd chain: two adjacent", "{\"tcp\":[{\"type\":\"sudoku\"},{\"type\":\"Sudoku\"}]}",
+              "sudoku: more than one sudoku mask is not supported");
+    ok_parse("sd chain: one with a fragment",
+             "{\"tcp\":[{\"type\":\"sudoku\"},{\"type\":\"fragment\",\"settings\":{\"length\":1}}]}");
+    check("sd chain: one with a fragment, n", 2, (long)cfg.n);
+    ok_parse("sd chain: no count kept across parses", "{\"tcp\":[{\"type\":\"sudoku\"}]}");
+}
+
 static void t_types(void) {
     /* catches: a case-sensitive type lookup refusing what Xray accepts, a refused type silently skipped, or udp masks validated */
-    bad_parse("type sudoku", "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{}}]}", "sudoku is not supported yet");
-    bad_parse("type SUDOKU", "{\"tcp\":[{\"type\":\"SUDOKU\"}]}", "sudoku is not supported yet");
+    ok_parse("type sudoku", "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{}}]}");
+    ok_parse("type SUDOKU", "{\"tcp\":[{\"type\":\"SUDOKU\"}]}");
+    check("type SUDOKU: kind", FM_SUDOKU, cfg.n == 1 ? (long)cfg.m[0].kind : -1);
     bad_parse("type xmc", "{\"tcp\":[{\"type\":\"xmc\",\"settings\":{\"password\":\"p\"}}]}", "xmc is not supported yet");
     bad_parse("type Xmc", "{\"tcp\":[{\"type\":\"Xmc\"}]}", "xmc is not supported yet");
     ok_parse("type Fragment", "{\"tcp\":[{\"type\":\"Fragment\",\"settings\":{\"length\":1}}]}");
@@ -483,8 +641,8 @@ static void t_types(void) {
     ok_parse("quicParams not read", "{\"quicParams\":{\"x\":1},\"tcp\":[]}");
     bad_parse("first error wins", "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{}},{\"type\":\"sudoku\"}]}",
               "fragment: last lengths entry min can't be 0");
-    bad_parse("refused type before a later bad one", "{\"tcp\":[{\"type\":\"sudoku\"},{\"type\":\"frag\"}]}",
-              "sudoku is not supported yet");
+    bad_parse("refused type before a later bad one", "{\"tcp\":[{\"type\":\"xmc\"},{\"type\":\"frag\"}]}",
+              "xmc is not supported yet");
     bad_parse("refused type after a good one", "{\"tcp\":[{\"type\":\"filter\"},{\"type\":\"xmc\"}]}",
               "xmc is not supported yet");
     check("validate only: ok", 0, fm_parse("{\"tcp\":[{\"type\":\"filter\"}]}", 27, NULL, why, sizeof why));
@@ -525,6 +683,14 @@ int main(void) {
     t_item_kinds();
     t_transform();
     t_servers_measurable();
+    t_sd_defaults();
+    t_sd_ascii_mode();
+    t_sd_custom_table();
+    t_sd_tables_list();
+    t_sd_legacy();
+    t_sd_padding();
+    t_sd_password();
+    t_sd_one_per_chain();
     t_types();
     t_filter();
     t_order_kept();

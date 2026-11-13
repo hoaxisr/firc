@@ -36,6 +36,7 @@ struct fm_ops {
     int  (*pending)(const struct fm_layer *me);
     void (*free)(void *st);
     const char *(*why)(const struct fm_layer *me);
+    unsigned (*grow)(const struct fm_mask *m);
 };
 
 struct fm_layer {
@@ -46,7 +47,7 @@ struct fm_layer {
     size_t idx;
 };
 
-extern const struct fm_ops fm_frag_ops, fm_hc_ops;
+extern const struct fm_ops fm_frag_ops, fm_hc_ops, fm_sd_ops;
 
 const struct fm_cfg *fm_cfg_get(const char *json);
 int     fm_link_open(const char *fm, struct fm_link **out);
@@ -55,13 +56,13 @@ void    fm_link_free(struct fm_link *l);
 int     fm_link_hs(struct fm_link *l, int fd, int timeout_ms);
 int     fm_shape(struct fm_link *l, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg);
 ssize_t fm_send(struct fm_link *l, int fd, const void *d, size_t n, int direct);
-int     fm_splices(const struct fm_link *l);
 ssize_t fm_recv(struct fm_link *l, int fd, void *d, size_t cap, int flags, int direct);
 int     fm_pending_any(const struct fm_link *l);
 static inline int fm_pending(const struct fm_link *l) { return l && fm_pending_any(l); }
 void    fm_set_loop(struct fm_link *l, int on);
 int     fm_kick(struct fm_link *l, int fd, uint64_t now_ms, int *next_ms);
 size_t  fm_room(const struct fm_link *l);
+unsigned fm_grow(const struct fm_link *l);
 const char *fm_last_why(void);
 int64_t fm_rand_between(int64_t from, int64_t to);
 void    fm_rand_bytes(unsigned char *b, size_t n, uint8_t from, uint8_t to);

@@ -74,6 +74,7 @@
 
 #include "scrypto.h"
 #include "reality.h"
+#include "vision.h"
 #if defined(STEER_HAVE_X509WRITE)
 # include "certgen.h"
 #endif
@@ -687,9 +688,8 @@ static int rec_open(struct dir *d, int fd, unsigned char *out, size_t cap, size_
     }
 }
 
-static int rec_seal(struct dir *d, int fd, const unsigned char *msg, size_t n) {
-    static __thread unsigned char out[5 + 4096 + 17];
-    if (n + 17 > 4096 + 17) return -1;
+static size_t rec_wrap(struct dir *d, const unsigned char *msg, size_t n, unsigned char *out) {
+    if (n + 17 > 4096 + 17) return 0;
     size_t total = n + 1 + 16;
     out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
     out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
@@ -697,9 +697,15 @@ static int rec_seal(struct dir *d, int fd, const unsigned char *msg, size_t n) {
     out[5 + n] = 0x17;
     unsigned char nonce[12];
     dir_nonce(d, nonce);
-    if (sc_aead_seal(&d->g, nonce, out, 5, out + 5, n + 1, out + 5 + n + 1)) return -1;
+    if (sc_aead_seal(&d->g, nonce, out, 5, out + 5, n + 1, out + 5 + n + 1)) return 0;
     d->seq++;
-    return wr_all(fd, out, 5 + total);
+    return 5 + total;
+}
+
+static int rec_seal(struct dir *d, int fd, const unsigned char *msg, size_t n) {
+    static __thread unsigned char out[5 + 4096 + 17];
+    size_t k = rec_wrap(d, msg, n, out);
+    return k ? wr_all(fd, out, k) : -1;
 }
 
 /* The client's Finished (RFC 8446 §4.4.4), checked as a real server checks it: a record under the
@@ -1678,7 +1684,8 @@ static unsigned char g_fmx_up[3000], g_fmx_down[1000], g_fmx_in[4096];
 static int fm_read_n(struct transport *c, unsigned char *out, size_t want) {
     static unsigned char buf[VLESS_MIN_RECV_CAP];
     size_t have = 0;
-    for (int i = 0; i < 100 && have < want; i++) {
+    uint64_t dl = fmr_ms() + 10000;
+    while (have < want && fmr_ms() < dl) {
         if (!transport_has_data(c)) {
             struct pollfd p = { .fd = transport_fd(c), .events = POLLIN, .revents = 0 };
             if (poll(&p, 1, 3000) <= 0) return -110;
@@ -1693,9 +1700,25 @@ static int fm_read_n(struct transport *c, unsigned char *out, size_t want) {
     return have == want ? 0 : -112;
 }
 
-enum { FM_RECORDS, FM_DIRECT_RAW, FM_DIRECT_MASKED, FM_TX_DIRECT };
+enum { FM_RECORDS, FM_DIRECT_RAW, FM_DIRECT_MASKED, FM_TX_DIRECT, FM_DIRECT_REC };
 
 static unsigned char g_fmx_raw[3000];
+static unsigned char g_fmx_wire[5 + 100 + 17 + sizeof g_fmx_down];
+
+static int fm_rec_raw(struct transport *c, struct dir *sd, int fd) {
+    size_t n = rec_wrap(sd, g_fmx_up, 100, g_fmx_wire);
+    if (!n) return -130;
+    memcpy(g_fmx_wire + n, g_fmx_down, sizeof g_fmx_down);
+    n += sizeof g_fmx_down;
+    if (wr_all(fd, g_fmx_wire, n)) return -131;
+    for (int i = 0; i < 3000 && fm_inq(transport_fd(c)) < (int)(n * 8 / 6); i++) usleep(1000);
+    unsigned char got[100];
+    int rc = fm_read_n(c, got, sizeof got);
+    if (!rc && memcmp(got, g_fmx_up, sizeof got)) rc = -132;
+    if (!rc && !tls13_buffered(&c->link.tls)) rc = -133;
+    if (!rc) transport_direct(c);
+    return rc;
+}
 
 static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
     int sv[2];
@@ -1758,7 +1781,9 @@ static int fm_data(const struct plan *pl, struct vless_node *n, int how) {
         struct pollfd pf = { .fd = s.fd, .events = POLLIN, .revents = 0 };
         if (!rc && poll(&pf, 1, 200) != 0) rc = -123;
     }
-    if (!rc && how != FM_RECORDS && how != FM_TX_DIRECT) {
+    if (!rc && how == FM_DIRECT_REC) {
+        rc = fm_rec_raw(&c, sd, s.fd);
+    } else if (!rc && how != FM_RECORDS && how != FM_TX_DIRECT) {
         if (how == FM_DIRECT_RAW) fmrelay_off(&g_relay, 1);
         transport_direct(&c);
         if (wr_all(s.fd, g_fmx_down, sizeof g_fmx_down)) rc = -106;
@@ -1981,7 +2006,7 @@ static void t_tx_direct(void) {
     check("tx direct, splice layer: raw bytes past it", 0, fm_data(&ok, &rn, FM_TX_DIRECT));
     check("tx direct, splice layer: may switch", 1, can_tx(&ok, &rn, 0));
     fm_use(&FMT_X55_NOSPLICE, 1);
-    check("tx direct, non-splice layer: may not switch", 0, can_tx(&ok, &rn, 0));
+    check("tx direct, non-splice layer: may switch", 1, can_tx(&ok, &rn, 0));
     fm_use(NULL, 0);
     static const struct { const char *what; const struct transport_ops *fr; int plain; int want; } k[] = {
         { "tx direct, raw tcp: may switch", &tr_tcp, 0, 1 },
@@ -2177,6 +2202,557 @@ static void t_fm_mask_error(void) {
     check("mask error: nothing left on the heap", 0, LEAK_CHECK());
 }
 
+#define SD_NODE "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+
+enum { SDK_TCP, SDK_VISION, SDK_WS, SDK_WS_ED, SDK_HU, SDK_N };
+
+static const char *const g_sdk_name[SDK_N] = { "none tcp", "vision direct", "plain ws", "plain ws ed", "plain httpupgrade" };
+
+struct sdup { struct srv *s; int go, rc; const unsigned char *d; size_t n; };
+
+static void *sd_upg_half(void *a) {
+    struct sdup *u = a;
+    struct srv *s = u->s;
+    u->rc = -1;
+    size_t rn = 0;
+    while (!strstr(s->req, "\r\n\r\n")) {
+        ssize_t r = read(s->fd, s->req + rn, sizeof s->req - 1 - rn);
+        if (r <= 0) return NULL;
+        rn += (size_t)r;
+        s->req[rn] = '\0';
+    }
+    char resp[512];
+    int k = upg_answer(s, resp, sizeof resp);
+    if (k < 0 || wr_all(s->fd, (const unsigned char *)resp, (size_t)k)) return NULL;
+    uint64_t dl = fmr_ms() + 10000;
+    while (!__atomic_load_n(&u->go, __ATOMIC_SEQ_CST) && fmr_ms() < dl) poll(NULL, 0, 1);
+    if (!__atomic_load_n(&u->go, __ATOMIC_SEQ_CST) || !u->d) return NULL;
+    unsigned char h[4] = { 0x82, (unsigned char)u->n, 0, 0 };
+    size_t hn = 2;
+    if (u->n >= 126) {
+        h[1] = 126;
+        h[2] = (unsigned char)(u->n >> 8);
+        h[3] = (unsigned char)u->n;
+        hn = 4;
+    }
+    if (s->plan->upg == 1 && wr_all(s->fd, h, hn)) return NULL;
+    if (wr_all(s->fd, u->d, u->n)) return NULL;
+    u->rc = 0;
+    return NULL;
+}
+
+static int sd_read(struct transport *c, unsigned char *out, size_t want) {
+    static unsigned char buf[VLESS_MIN_RECV_CAP];
+    size_t have = 0;
+    uint64_t dl = fmr_ms() + 15000;
+    while (have < want && fmr_ms() < dl) {
+        if (!transport_has_data(c)) {
+            struct pollfd p = { .fd = transport_fd(c), .events = POLLIN, .revents = 0 };
+            if (poll(&p, 1, 100) <= 0) continue;
+        }
+        size_t got = 0;
+        int rc = transport_read(c, buf, sizeof buf, &got);
+        if (rc) return rc;
+        if (have + got > want) return -111;
+        memcpy(out + have, buf, got);
+        have += got;
+    }
+    return have == want ? 0 : -112;
+}
+
+struct sdres { int rc, zrc; size_t zgot; uint64_t zms; long zinq; };
+
+static void sd_zero(struct transport *c, struct sdres *o) {
+    static unsigned char buf[VLESS_MIN_RECV_CAP];
+    uint64_t dl = fmr_ms() + 3000;
+    while (!__atomic_load_n(&g_relay.sd_padded, __ATOMIC_SEQ_CST) && fmr_ms() < dl) poll(NULL, 0, 1);
+    if (!__atomic_load_n(&g_relay.sd_padded, __ATOMIC_SEQ_CST)) {
+        o->rc = -130;
+        return;
+    }
+    uint64_t t0 = fmr_ms();
+    o->zgot = 99;
+    o->zrc = transport_read(c, buf, sizeof buf, &o->zgot);
+    o->zms = fmr_ms() - t0;
+    int q = -1;
+    o->zinq = ioctl(transport_fd(c), FIONREAD, &q) ? -1 : q;
+}
+
+static unsigned char g_sd_down[2048];
+
+static void sd_case(int kind, int mode, struct sdres *o) {
+    memset(o, 0, sizeof *o);
+    o->zrc = -1;
+    static const char *const ty[SDK_N] = { "tcp", "tcp", "ws", "ws", "httpupgrade" };
+    static const char *const pa[SDK_N] = { "", "", "/w?ed=0", "/w?ed=2048", "/w" };
+    const int upg = kind >= SDK_WS;
+    const int first_pad = mode == FMR_SD_PAD && kind == SDK_WS_ED;
+    struct plan pl = { .name = "sd", .reality_ok = 1, .upg = kind == SDK_HU ? 2 : upg, .ed_first = kind == SDK_WS_ED };
+    struct vless_node n;
+    upg_node(&n, kind == SDK_VISION ? "reality" : "none", ty[kind], pa[kind]);
+    n.fm = SD_NODE;
+    const struct fm_cfg *cf = fm_cfg_get(SD_NODE);
+    g_fmr_sd = cf && cf->n == 1 ? sd_tables(&cf->m[0].u.sd) : NULL;
+    g_fmr_mode = first_pad ? FMR_SD_PAD : FMR_SD_PLAIN;
+    if (!g_fmr_sd) {
+        o->rc = -99;
+        return;
+    }
+    for (size_t i = 0; i < sizeof g_sd_down; i++) g_sd_down[i] = (unsigned char)(i * 37 + (i >> 8) + 5);
+    const size_t dn = mode == FMR_SD_DRIP ? sizeof g_sd_down : 5;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) {
+        o->rc = -100;
+        return;
+    }
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = &pl;
+    struct sdup u = { &s, 0, 0, g_sd_down, dn };
+    pthread_t th;
+    int th_on = 0;
+    if (kind == SDK_VISION) th_on = !pthread_create(&th, NULL, server_half, &s);
+    else if (upg) th_on = !pthread_create(&th, NULL, sd_upg_half, &u);
+    fm_use(NULL, 1);
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(&n, &c, 3);
+    g_tcp_dial = NULL;
+    const int up = rc == 0;
+    if (kind == SDK_VISION && th_on) {
+        pthread_join(th, NULL);
+        th_on = 0;
+        if (!rc && s.rc) rc = -101;
+    }
+    unsigned char got[5];
+    if (!rc && kind == SDK_WS_ED) rc = transport_write(&c, (const unsigned char *)"hello", 5);
+    if (!rc && first_pad) {
+        sd_zero(&c, o);
+        rc = o->rc;
+    }
+    if (g_relay.on) fmrelay_go(&g_relay);
+    if (!rc && upg) rc = sd_read(&c, got, 5);
+    if (!rc && upg && memcmp(got, "FIRST", 5)) rc = -102;
+    if (!rc && kind == SDK_VISION) transport_direct(&c);
+    if (!rc && mode != FMR_SD_PLAIN && !first_pad) fmrelay_sd(&g_relay, mode);
+    if (!rc && upg) __atomic_store_n(&u.go, 1, __ATOMIC_SEQ_CST);
+    else if (!rc && wr_all(s.fd, g_sd_down, dn)) rc = -103;
+    if (!rc && mode == FMR_SD_PAD && !first_pad) {
+        sd_zero(&c, o);
+        rc = o->rc;
+    }
+    if (g_relay.on) fmrelay_go(&g_relay);
+    static unsigned char in[sizeof g_sd_down];
+    if (!rc) rc = sd_read(&c, in, dn);
+    if (!rc && memcmp(in, g_sd_down, dn)) rc = -104;
+    if (up) transport_close(&c);
+    __atomic_store_n(&u.go, 1, __ATOMIC_SEQ_CST);
+    if (th_on) pthread_join(th, NULL);
+    if (!rc && upg && u.rc) rc = -105;
+    close(s.fd);
+    fmrelay_join(&g_relay);
+    fm_use(NULL, 0);
+    g_fmr_sd = NULL;
+    g_fmr_mode = FMR_SD_PLAIN;
+    o->rc = rc;
+}
+
+static void t_fm_sd_pad_silent(void) {
+    /* catches: a data-phase read site mapping a zero-yield EINTR to TR_EIO */
+    int fd0 = fd_count();
+    for (int k = 0; k < SDK_N; k++) {
+        struct sdres o;
+        char what[128];
+        sd_case(k, FMR_SD_PAD, &o);
+        snprintf(what, sizeof what, "sd pad silent %s: the read after the pad, rc 0", g_sdk_name[k]);
+        check(what, 0, o.zrc);
+        snprintf(what, sizeof what, "sd pad silent %s: got 0", g_sdk_name[k]);
+        check(what, 0, (long)o.zgot);
+        snprintf(what, sizeof what, "sd pad silent %s: within 100 ms", g_sdk_name[k]);
+        check(what, 1, o.zms < 100);
+        snprintf(what, sizeof what, "sd pad silent %s: the pad was read", g_sdk_name[k]);
+        check(what, 0, o.zinq);
+        snprintf(what, sizeof what, "sd pad silent %s: the next bytes decode", g_sdk_name[k]);
+        check(what, 0, o.rc);
+    }
+    check("sd pad silent: descriptor count restored", fd0, fd_count());
+    check("sd pad silent: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+static void t_fm_sd_drip(void) {
+    /* catches: a zero-yield read in the data phase cutting the flow or losing a byte */
+    int fd0 = fd_count();
+    for (int k = 0; k < SDK_N; k++) {
+        struct sdres o;
+        char what[128];
+        sd_case(k, FMR_SD_DRIP, &o);
+        snprintf(what, sizeof what, "sd drip %s: 2 KiB down intact", g_sdk_name[k]);
+        check(what, 0, o.rc);
+    }
+    check("sd drip: descriptor count restored", fd0, fd_count());
+    check("sd drip: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+#if defined(STEER_HAVE_X509WRITE)
+static void t_fm_sd(void) {
+    /* catches: a handshake, record, raw, upgrade or ws read or write bypassing the mask */
+    struct plan ok = { .name = "sd", .reality_ok = 1 };
+    struct plan tok = { .name = "sd tls", .chain = LEAF_OK };
+    int fd0 = fd_count();
+    g_fmr_sd = fmr_sd_of(SD_NODE);
+    check("sd: the relay's tables", 1, g_fmr_sd != NULL);
+    fm_use(NULL, 1);
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    check("sd: the relay alone breaks a reality link", 1, fm_data(&ok, &rn, FM_RECORDS) != 0);
+    rn.fm = SD_NODE;
+    check("sd reality tcp: data both ways", 0, fm_data(&ok, &rn, FM_RECORDS));
+    check("sd reality tcp: the relay carried it", 1, g_relay.n[0] > 4 * 3000 && g_relay.n[1] > 1000);
+    struct vless_node tn;
+    node_tls(&tn, "tcp");
+    tn.fm = SD_NODE;
+    check("sd tls tcp: data both ways", 0, fm_data(&tok, &tn, FM_RECORDS));
+    check("sd tls tcp: the relay carried it", 1, g_relay.n[0] > 4 * 3000 && g_relay.n[1] > 1000);
+    struct vless_node pn;
+    upg_node(&pn, "none", "tcp", "");
+    pn.fm = SD_NODE;
+    check("sd none tcp: data both ways", 0, fm_data(&ok, &pn, FM_RECORDS));
+    check("sd none tcp: four hints a byte up, the bytes down", 1, g_relay.n[0] == 4 * 3000 && g_relay.n[1] == 1000);
+    static const char *ty[] = { "ws", "httpupgrade", "ws" };
+    static const char *pa[] = { "/w?ed=0", "/w?ed=2048", "/w?ed=2048" };
+    static const char *nm[] = { "ws", "httpupgrade", "ws ed" };
+    for (int sec = 0; sec < 2; sec++)
+        for (int u = 0; u < 3; u++) {
+            struct plan up = { .name = "sd upg", .reality_ok = 1, .upg = u == 1 ? 2 : 1, .ed_first = u == 2 };
+            struct vless_node n;
+            upg_node(&n, sec ? "none" : "reality", ty[u], pa[u]);
+            n.fm = SD_NODE;
+            static struct srv s;
+            char what[96];
+            int rc = fm_upg(&up, &n, &s);
+            snprintf(what, sizeof what, "sd %s %s: FIRST read, hello sent", sec ? "none" : "reality", nm[u]);
+            check(what, 0, rc);
+            snprintf(what, sizeof what, "sd %s %s: the server read hello", sec ? "none" : "reality", nm[u]);
+            check(what, 1, s.got_hello);
+            size_t rq = strnlen(s.req, sizeof s.req);
+            snprintf(what, sizeof what, "sd %s %s: the request is at least its bare lines", sec ? "none" : "reality", nm[u]);
+            check(what, 1, rq >= 38);
+            snprintf(what, sizeof what, "sd %s %s: the relay carried it, four hints a byte", sec ? "none" : "reality", nm[u]);
+            check(what, 1, g_relay.n[0] >= 4 * (long)(rq + 5) && g_relay.n[1] > 0);
+        }
+    g_fmr_mode = FMR_SD_DRIP;
+    check("sd reality tcp, drip through the handshake: data both ways", 0, fm_data(&ok, &rn, FM_RECORDS));
+    check("sd reality tcp, drip: the relay carried it", 1, g_relay.n[0] > 4 * 3000 && g_relay.n[1] > 1000);
+    g_fmr_mode = FMR_SD_PLAIN;
+    g_fmr_sd = NULL;
+    fm_use(NULL, 0);
+    check("sd: descriptor count restored", fd0, fd_count());
+    check("sd: nothing left on the heap", 0, LEAK_CHECK());
+}
+#endif
+
+static void t_fm_sd_direct_rx(void) {
+    /* catches: direct reads skipping a non-splice layer, or the record buffer's raw start dropped */
+    struct plan ok = { .name = "sd direct", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    rn.fm = SD_NODE;
+    int fd0 = fd_count();
+    g_fmr_sd = fmr_sd_of(SD_NODE);
+    check("sd direct: the relay's tables", 1, g_fmr_sd != NULL);
+    fm_use(NULL, 1);
+    check("sd direct: the raw downlink decoded", 0, fm_data(&ok, &rn, FM_DIRECT_MASKED));
+    check("sd direct: the relay carried it", 1, g_relay.n[0] > 4 * 3000 && g_relay.n[1] > 1000);
+    check("sd direct: the buffered raw start decoded first", 0, fm_data(&ok, &rn, FM_DIRECT_REC));
+    check("sd direct, buffered: the relay carried it", 1, g_relay.n[0] > 4 * 3000 && g_relay.n[1] > 1000 + 100);
+    g_fmr_sd = NULL;
+    fm_use(NULL, 0);
+    check("sd direct: descriptor count restored", fd0, fd_count());
+    check("sd direct: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+static void t_sd_can_tx(void) {
+    /* catches: a mask condition left on the switch */
+    static const char frsd[] = "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"1-100\",\"length\":10}},"
+                               "{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\"}}]}";
+    static const char sdhc[] = "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\"}},"
+                               "{\"type\":\"header-custom\",\"settings\":{\"clients\":[[{\"packet\":[1]}]]}}]}";
+    static const struct { const char *what; const char *fm; const struct transport_ops *fr; int enc; int want; } k[] = {
+        { "sd can tx, sudoku: may switch", SD_NODE, &tr_tcp, 0, 1 },
+        { "sd can tx, fragment and sudoku: may switch", frsd, &tr_tcp, 0, 1 },
+        { "sd can tx, sudoku and header-custom: may switch", sdhc, &tr_tcp, 0, 1 },
+        { "sd can tx, sudoku under encryption: may not switch", SD_NODE, &tr_tcp, 1, 0 },
+        { "sd can tx, sudoku on ws: may not switch", SD_NODE, &tr_ws, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        static struct transport t;
+        memset(&t, 0, sizeof t);
+        t.fr = k[i].fr;
+        if (k[i].enc) t.enc = (struct venc *)&t;
+        int rc = fm_link_open(k[i].fm, &t.link.tls.fm);
+        check(k[i].what, k[i].want, rc ? -1 : transport_can_tx_direct(&t));
+        fm_link_free(t.link.tls.fm);
+    }
+    check("sd can tx: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+#define SD_FRAG "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"1-100\",\"lengths\":[2000,500],\"delays\":[0,1000]}}," \
+                "{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+
+static const unsigned char g_sdt_uuid[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+struct sdt { int cmd[2], frames, sw, raw, next; long wire; };
+
+static size_t sdt_sh(unsigned char *o) {
+    size_t i = 0;
+    static const unsigned char h[11] = { 0x16, 0x03, 0x03, 0x00, 0x7a, 0x02, 0x00, 0x00, 0x76, 0x03, 0x03 };
+    memcpy(o, h, sizeof h);
+    i += sizeof h;
+    memset(o + i, 0x11, 32);
+    i += 32;
+    o[i++] = 0x20;
+    memset(o + i, 0x22, 32);
+    i += 32;
+    static const unsigned char t[19] = { 0x13, 0x01, 0x00, 0x00, 0x2e, 0x00, 0x2b, 0x00, 0x02, 0x03,
+                                         0x04, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 };
+    memcpy(o + i, t, sizeof t);
+    i += sizeof t;
+    memset(o + i, 0x33, 32);
+    return i + 32;
+}
+
+static int sdt_frames(struct dir *cd, int fd, struct sdt *o) {
+    static unsigned char b[1 << 14];
+    size_t have = 0, at = 16;
+    while (o->frames < 2) {
+        size_t k = 0;
+        unsigned char inner = 0;
+        if (rec_open(cd, fd, b + have, sizeof b - have, &k, &inner) || inner != 0x17) return -140;
+        have += k;
+        while (o->frames < 2 && at + 5 <= have) {
+            size_t len = (size_t)b[at + 1] << 8 | b[at + 2], pad = (size_t)b[at + 3] << 8 | b[at + 4];
+            if (at + 5 + len + pad > have) break;
+            o->cmd[o->frames++] = b[at];
+            at += 5 + len + pad;
+        }
+    }
+    return have == at && !memcmp(b, g_sdt_uuid, 16) ? 0 : -141;
+}
+
+static int sdt_send(struct transport *c, struct vision *v, const unsigned char *d, size_t n) {
+    static unsigned char out[4096];
+    size_t on = 0;
+    if (vision_wrap(v, d, n, transport_can_tx_direct(c), out, sizeof out, &on)) return -150;
+    return transport_write(c, out, on);
+}
+
+static void sdt_run(const char *fm, int loop, struct sdt *o) {
+    struct plan ok = { .name = "sd tx", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    rn.fm = fm;
+    memset(o, 0, sizeof *o);
+    o->cmd[0] = o->cmd[1] = -1;
+    o->raw = -1;
+    o->next = -2;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return;
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = sv[1];
+    s.plan = &ok;
+    pthread_t th;
+    if (pthread_create(&th, NULL, server_half, &s)) {
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    fm_use(NULL, 1);
+    g_give_fd = sv[0];
+    g_tcp_dial = fake_dial;
+    struct transport c;
+    int rc = vless_connect(&rn, &c, 3);
+    g_tcp_dial = NULL;
+    pthread_join(th, NULL);
+    const int up = rc == 0;
+    struct dir *cd = calloc(1, sizeof *cd), *sd = calloc(1, sizeof *sd);
+    if (!rc && (!cd || !sd || s.rc || fm_app_keys(&s, cd, sd))) rc = -102;
+    struct vision v;
+    vision_init(&v, g_sdt_uuid);
+    static const unsigned char ch[10] = { 0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00 };
+    unsigned char sh[160], app[37] = { 0x17, 0x03, 0x03, 0x00, 0x20 };
+    memset(app + 5, 0x44, 32);
+    if (!rc) rc = sdt_send(&c, &v, ch, sizeof ch);
+    vision_filter(&v, sh, sdt_sh(sh));
+    if (!rc) rc = sdt_send(&c, &v, app, sizeof app);
+    if (!rc) rc = sdt_frames(cd, s.fd, o);
+    o->sw = v.tx_switch;
+    if (!rc && v.tx_switch) transport_tx_direct(&c);
+    if (!rc && loop) {
+        transport_set_loop(&c);
+        if (tr_link_nonblock(&c.link)) rc = -103;
+    }
+    for (size_t i = 0; i < sizeof g_fmx_raw; i++) g_fmx_raw[i] = (unsigned char)(i * 7 + 1);
+    long before = __atomic_load_n(&g_relay.n[0], __ATOMIC_SEQ_CST);
+    if (!rc) rc = transport_write(&c, g_fmx_raw, sizeof g_fmx_raw);
+    for (int i = 0, nx = 0; !rc && loop && nx >= 0 && nx < 500 && i < 1000; i++) {
+        if (i) poll(NULL, 0, 1);
+        if (transport_due(&c, tr_mono_ms(), &nx)) rc = -104;
+        if (nx > o->next) o->next = nx;
+    }
+    size_t got = 0;
+    while (!rc && got < sizeof g_fmx_raw) {
+        ssize_t r = read(s.fd, g_fmx_in + got, sizeof g_fmx_raw - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    struct pollfd pf = { .fd = s.fd, .events = POLLIN, .revents = 0 };
+    if (!rc) o->raw = got == sizeof g_fmx_raw && !memcmp(g_fmx_in, g_fmx_raw, got) && poll(&pf, 1, 200) == 0;
+    o->wire = __atomic_load_n(&g_relay.n[0], __ATOMIC_SEQ_CST) - before;
+    if (up) transport_close(&c);
+    fm_dirs_free(cd, sd);
+    close(s.fd);
+    fmrelay_join(&g_relay);
+    fm_use(NULL, 0);
+}
+
+static void t_fm_sd_direct_tx(void) {
+    /* catches: raw writes entering through TLS or past sudoku */
+    int fd0 = fd_count();
+    g_fmr_sd = fmr_sd_of(SD_NODE);
+    check("sd direct tx: the relay's tables", 1, g_fmr_sd != NULL);
+    struct sdt o;
+    sdt_run(SD_NODE, 0, &o);
+    check("sd direct tx: the handshake frame continues", VISION_CMD_CONTINUE, o.cmd[0]);
+    check("sd direct tx: the frame after the inner handshake says direct", VISION_CMD_DIRECT, o.cmd[1]);
+    check("sd direct tx: the writer switches", 1, o.sw);
+    check("sd direct tx: the raw uplink decodes to the inner stream", 1, o.raw);
+    check("sd direct tx: four hints a raw byte", 4L * (long)sizeof g_fmx_raw, o.wire);
+    sdt_run(SD_FRAG, 1, &o);
+    check("sd direct tx, fragment above: direct", VISION_CMD_DIRECT, o.cmd[1]);
+    check("sd direct tx, fragment above: the raw uplink decodes", 1, o.raw);
+    check("sd direct tx, fragment above: four hints a raw byte", 4L * (long)sizeof g_fmx_raw, o.wire);
+    check("sd direct tx, fragment above: no gap after a raw write", 1, o.next >= -1 && o.next <= 1);
+    g_fmr_sd = NULL;
+    check("sd direct tx: descriptor count restored", fd0, fd_count());
+    check("sd direct tx: nothing left on the heap", 0, LEAK_CHECK());
+}
+
+#define SD_NODE100 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":100,\"paddingMax\":100}}]}"
+
+static unsigned char g_sdv_up[1 << 18];
+
+struct sdv { struct dir *cd; int fd; size_t got; int same; };
+
+static void *sdv_read(void *a) {
+    struct sdv *v = a;
+    static unsigned char rec[1 << 15];
+    v->same = 1;
+    while (v->got < sizeof g_sdv_up) {
+        size_t k = 0;
+        unsigned char inner = 0;
+        if (rec_open(v->cd, v->fd, rec, sizeof rec, &k, &inner) || inner != 0x17) break;
+        if (v->got + k > sizeof g_sdv_up || memcmp(rec, g_sdv_up + v->got, k)) v->same = 0;
+        v->got += k;
+    }
+    return NULL;
+}
+
+static int sdv_wait(struct transport *c, int next) {
+    struct pollfd p = { .fd = transport_fd(c), .events = POLLOUT, .revents = 0 };
+    return poll(&p, 1, next >= 0 && next < 10 ? next : 10);
+}
+
+static void t_fm_sd_vision_full(void) {
+    /* catches: a mask room that never reopens past Vision's reserve */
+    struct plan ok = { .name = "sd vision", .reality_ok = 1 };
+    struct vless_node rn;
+    upg_node(&rn, "reality", "tcp", "");
+    rn.fm = SD_NODE100;
+    int fd0 = fd_count();
+    g_fmr_sd = fmr_sd_of(SD_NODE100);
+    check("sd vision: the relay's tables", 1, g_fmr_sd != NULL);
+    g_fmr_slow = 1;
+    fm_use(NULL, 1);
+    for (size_t i = 0; i < sizeof g_sdv_up; i++) g_sdv_up[i] = (unsigned char)(i * 131 + (i >> 10));
+    int sv[2];
+    int rc = !g_fmr_sd ? -99 : socketpair(AF_UNIX, SOCK_STREAM, 0, sv) ? -100 : 0;
+    struct timeval tv = { .tv_sec = 3 };
+    static struct srv s;
+    memset(&s, 0, sizeof s);
+    s.fd = rc ? -1 : sv[1];
+    s.plan = &ok;
+    pthread_t th;
+    if (!rc) setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (!rc && pthread_create(&th, NULL, server_half, &s)) rc = -101;
+    struct transport c;
+    int up = 0;
+    if (!rc) {
+        g_give_fd = sv[0];
+        g_tcp_dial = fake_dial;
+        rc = vless_connect(&rn, &c, 3);
+        g_tcp_dial = NULL;
+        pthread_join(th, NULL);
+        up = rc == 0;
+    }
+    struct dir *cd = calloc(1, sizeof *cd), *sd = calloc(1, sizeof *sd);
+    if (!rc && (!cd || !sd || s.rc || fm_app_keys(&s, cd, sd))) rc = -102;
+    if (!rc) {
+        transport_set_loop(&c);
+        if (tr_link_nonblock(&c.link)) rc = -103;
+    }
+    struct sdv v = { cd, s.fd, 0, 0 };
+    pthread_t rt;
+    int rt_on = !rc && !pthread_create(&rt, NULL, sdv_read, &v);
+    if (!rc && !rt_on) rc = -104;
+    size_t off = 0;
+    long stalls = 0;
+    int next = 0;
+    uint64_t dl = fmr_ms() + 60000;
+    while (!rc && off < sizeof g_sdv_up && fmr_ms() < dl) {
+        if (transport_due(&c, fmr_ms(), &next)) {
+            rc = -105;
+            break;
+        }
+        long room = transport_mask_room(&c) - 2048;
+        if (room <= 0) {
+            stalls++;
+            sdv_wait(&c, next);
+            continue;
+        }
+        size_t k = sizeof g_sdv_up - off;
+        if (k > (size_t)room) k = (size_t)room;
+        rc = transport_write(&c, g_sdv_up + off, k);
+        off += k;
+    }
+    if (!rc && off < sizeof g_sdv_up) rc = -107;
+    while (!rc && fmr_ms() < dl) {
+        if (transport_due(&c, fmr_ms(), &next)) rc = -106;
+        else if (next < 0) break;
+        else sdv_wait(&c, next);
+    }
+    if (rt_on) pthread_join(rt, NULL);
+    check("sd vision: 256 KiB up written", 0, rc);
+    check("sd vision: the room closed and reopened", 1, stalls > 0 && off == sizeof g_sdv_up);
+    check("sd vision: the server got 256 KiB, the bytes sent", 1, v.got == sizeof g_sdv_up && v.same);
+    if (up) transport_close(&c);
+    fm_dirs_free(cd, sd);
+    if (s.fd >= 0) close(s.fd);
+    fmrelay_join(&g_relay);
+    check("sd vision: the relay carried it padded", 1, g_relay.n[0] >= 9L * (long)sizeof g_sdv_up);
+    g_fmr_slow = 0;
+    g_fmr_sd = NULL;
+    fm_use(NULL, 0);
+    check("sd vision: descriptor count restored", fd0, fd_count());
+    check("sd vision: nothing left on the heap", 0, LEAK_CHECK());
+}
+
 int main(void) {
     /* The server half writes to a socket the client has already closed: on a failed check the
      * client closes without reading to the end. Without this the test would die of SIGPIPE
@@ -2362,6 +2938,12 @@ int main(void) {
     t_fm_free_paths();
     t_fm_pending_ready();
     t_fm_mask_error();
+    t_fm_sd_pad_silent();
+    t_fm_sd_drip();
+    t_fm_sd_direct_rx();
+    t_sd_can_tx();
+    t_fm_sd_direct_tx();
+    t_fm_sd_vision_full();
 
     {
         struct plan ok = { .name = "two links", .reality_ok = 1, .hold = 1 };
@@ -2690,6 +3272,7 @@ int main(void) {
             int rc = run_case(&up, &tn, NULL, 0, NULL);
             check("tls + ws: server chose h2, refused with TR_ENOH1", TR_ENOH1, rc);
         }
+        t_fm_sd();
         cc_tests();
         g_cert_roots = NULL;
         chain_free();

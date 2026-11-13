@@ -872,6 +872,202 @@ out:
     return rc;
 }
 
+struct sd_str { unsigned char *s; size_t n; };
+struct sd_list { size_t n; struct sd_str *v; };
+
+static int get_bstr(struct ctx *c, size_t node, struct sd_str *d, const char *field) {
+    size_t n;
+    unsigned char *s;
+    if (ty(c, node) == FJ_NULL) return 0;
+    if (ty(c, node) != FJ_STR) return fail(c, "invalid %s", field);
+    if (!(s = fj_unq(c, node, &n))) return oom(c);
+    free(d->s);
+    d->s = s;
+    d->n = n;
+    return 0;
+}
+
+static void list_free(struct sd_list *l) {
+    for (size_t i = 0; i < l->n; i++) free(l->v[i].s);
+    free(l->v);
+    l->v = NULL;
+    l->n = 0;
+}
+
+static int get_list(struct ctx *c, size_t node, struct sd_list *l, const char *field) {
+    size_t k = 0;
+    if (ty(c, node) != FJ_NULL && ty(c, node) != FJ_ARR) return fail(c, "invalid %s", field);
+    list_free(l);
+    if (ty(c, node) == FJ_NULL) return 0;
+    FJ_EACH(c, node, m) k++;
+    if (!k) return 0;
+    if (!(l->v = calloc(k, sizeof *l->v))) return oom(c);
+    FJ_EACH(c, node, m) {
+        struct sd_str *e = &l->v[l->n++];
+        if (get_bstr(c, m, e, field)) return -1;
+    }
+    return 0;
+}
+
+static int get_u32(struct ctx *c, size_t node, uint32_t *v, const char *field) {
+    uint64_t u;
+    if (ty(c, node) == FJ_NULL) return 0;
+    if (num_u64(c, node, &u) || u > UINT32_MAX) return fail(c, "invalid %s", field);
+    *v = (uint32_t)u;
+    return 0;
+}
+
+static uint32_t rune_at(const unsigned char *s, size_t n, size_t *len) {
+    size_t l = utf8_len(s, n);
+    *len = l ? l : 1;
+    if (!l) return 0xfffd;
+    if (l == 1) return s[0];
+    if (l == 2) return (uint32_t)(s[0] & 0x1f) << 6 | (uint32_t)(s[1] & 0x3f);
+    if (l == 3) return (uint32_t)(s[0] & 0x0f) << 12 | (uint32_t)(s[1] & 0x3f) << 6 | (uint32_t)(s[2] & 0x3f);
+    return (uint32_t)(s[0] & 0x07) << 18 | (uint32_t)(s[1] & 0x3f) << 12 | (uint32_t)(s[2] & 0x3f) << 6 |
+           (uint32_t)(s[3] & 0x3f);
+}
+
+static int go_space(uint32_t r) {
+    return (r >= 9 && r <= 13) || r == ' ' || r == 0x85 || r == 0xa0 || r == 0x1680 || (r >= 0x2000 && r <= 0x200a) ||
+           r == 0x2028 || r == 0x2029 || r == 0x202f || r == 0x205f || r == 0x3000;
+}
+
+static void go_trim(const unsigned char *s, size_t n, size_t *a, size_t *b) {
+    size_t l;
+    *a = 0;
+    *b = n;
+    while (*a < *b && go_space(rune_at(s + *a, *b - *a, &l))) *a += l;
+    while (*b > *a) {
+        size_t st = *b - 1;
+        while (st > *a && (s[st] & 0xc0) == 0x80) st--;
+        if (!go_space(rune_at(s + st, *b - st, &l)) || st + l != *b) break;
+        *b = st;
+    }
+}
+
+static size_t go_lower(const unsigned char *s, size_t n, unsigned char *o, int nospace) {
+    size_t w = 0, l;
+    for (size_t i = 0; i < n; i += l) {
+        uint32_t r = rune_at(s + i, n - i, &l);
+        if (r >= 'A' && r <= 'Z') o[w++] = (unsigned char)(r + 32);
+        else if (r == 0x130) o[w++] = 'i';
+        else if (r == 0x212a) o[w++] = 'k';
+        else if (!nospace || r != ' ') { memcpy(o + w, s + i, l); w += l; }
+    }
+    return w;
+}
+
+static int sd_mode(struct ctx *c, const struct sd_str *a, uint8_t *ascii) {
+    static const char *const word[] = {"", "entropy", "prefer_entropy", "ascii", "prefer_ascii"};
+    unsigned char m[48];
+    size_t x, y, w;
+    if (!a->n) { *ascii = 0; return 0; }
+    go_trim(a->s, a->n, &x, &y);
+    if (y - x <= sizeof m) {
+        w = go_lower(a->s + x, y - x, m, 0);
+        for (size_t i = 0; i < sizeof word / sizeof *word; i++)
+            if (w == strlen(word[i]) && !memcmp(m, word[i], w)) { *ascii = i >= 3; return 0; }
+    }
+    return fail(c, "invalid sudoku ascii mode: %.*s", (int)a->n, a->s ? (const char *)a->s : "");
+}
+
+static void go_quote(const unsigned char *s, size_t l, char *q, size_t qn) {
+    static const char esc[] = "\a\b\f\n\r\t\v", let[] = "abfnrtv";
+    const char *e = s[0] ? memchr(esc, s[0], sizeof esc - 1) : NULL;
+    if (l > 1) snprintf(q, qn, "%.*s", (int)l, (const char *)s);
+    else if (e) snprintf(q, qn, "\\%c", let[e - esc]);
+    else if (s[0] == '\'' || s[0] == '\\') snprintf(q, qn, "\\%c", s[0]);
+    else if (s[0] < 0x20 || s[0] == 0x7f) snprintf(q, qn, "\\x%02x", s[0]);
+    else snprintf(q, qn, "%c", s[0]);
+}
+
+static int sd_pat(struct ctx *c, const struct sd_str *raw, char out[9]) {
+    size_t x, y, w, l, nx = 0, np = 0, nv = 0;
+    unsigned char *b;
+    char q[8];
+    out[0] = '\0';
+    go_trim(raw->s, raw->n, &x, &y);
+    if (x == y) return 0;
+    if (!(b = malloc(y - x))) return oom(c);
+    w = go_lower(raw->s + x, y - x, b, 1);
+    if (w != 8) { free(b); return fail(c, "customTable must be 8 chars, got %zu", w); }
+    for (size_t i = 0; i < w; i += l) {
+        uint32_t r = rune_at(b + i, w - i, &l);
+        if (r == 'x') nx++;
+        else if (r == 'p') np++;
+        else if (r == 'v') nv++;
+        else {
+            go_quote(b + i, l, q, sizeof q);
+            free(b);
+            return fail(c, "customTable has invalid char '%s'", q);
+        }
+    }
+    memcpy(out, b, 8);
+    out[8] = '\0';
+    free(b);
+    if (nx != 2 || np != 2 || nv != 4) return fail(c, "customTable must contain exactly 2 x, 2 p and 4 v");
+    return 0;
+}
+
+static int build_sd(struct ctx *c, size_t node, struct fm_sd *d) {
+    static const char *const pk[4] = {"PADDINGMIN", "PADDING_MIN", "PADDINGMAX", "PADDING_MAX"};
+    static const char *const pf[4] = {"paddingMin", "padding_min", "paddingMax", "padding_max"};
+    struct sd_str pw = {NULL, 0}, ascii = {NULL, 0}, ct = {NULL, 0}, lct = {NULL, 0};
+    struct sd_list cts = {0, NULL}, lcts = {0, NULL};
+    const struct sd_list *tabs;
+    uint32_t pad[4] = {0, 0, 0, 0};
+    size_t nraw;
+    char k[24];
+    int rc = -1;
+    if (node && ty(c, node) != FJ_NULL) {
+        if (ty(c, node) != FJ_OBJ) return fail(c, "invalid settings");
+        FJ_EACH(c, node, m) {
+            int bad = 0;
+            key_fold(c, c->j.v[m].key, k, sizeof k);
+            if (!strcmp(k, "PASSWORD")) bad = get_bstr(c, m, &pw, "password");
+            else if (!strcmp(k, "ASCII")) bad = get_bstr(c, m, &ascii, "ascii");
+            else if (!strcmp(k, "CUSTOMTABLE")) bad = get_bstr(c, m, &ct, "customTable");
+            else if (!strcmp(k, "CUSTOM_TABLE")) bad = get_bstr(c, m, &lct, "custom_table");
+            else if (!strcmp(k, "CUSTOMTABLES")) bad = get_list(c, m, &cts, "customTables");
+            else if (!strcmp(k, "CUSTOM_TABLES")) bad = get_list(c, m, &lcts, "custom_tables");
+            else
+                for (int i = 0; i < 4; i++)
+                    if (!strcmp(k, pk[i])) bad = get_u32(c, m, &pad[i], pf[i]);
+            if (bad) goto out;
+        }
+    }
+    if (sd_mode(c, &ascii, &d->ascii)) goto out;
+    tabs = cts.n ? &cts : &lcts;
+    nraw = d->ascii ? 0 : tabs->n ? tabs->n : 1;
+    if (!(d->pat = calloc(nraw ? nraw : 1, sizeof *d->pat))) { oom(c); goto out; }
+    for (size_t i = 0; i < nraw; i++) {
+        char p[9];
+        size_t j = 0;
+        if (sd_pat(c, tabs->n ? &tabs->v[i] : ct.n ? &ct : &lct, p)) goto out;
+        while (j < d->n_pat && strcmp(d->pat[j], p)) j++;
+        if (j == d->n_pat) memcpy(d->pat[d->n_pat++], p, sizeof p);
+    }
+    if (!d->n_pat) d->n_pat = 1;
+    d->pmin = pad[0] ? pad[0] : pad[1];
+    d->pmax = pad[2] ? pad[2] : pad[3];
+    if (d->pmin > 100) d->pmin = 100;
+    if (d->pmax > 100) d->pmax = 100;
+    if (d->pmax < d->pmin) d->pmax = d->pmin;
+    d->pw = pw.s;
+    d->pw_n = pw.n;
+    pw.s = NULL;
+    rc = 0;
+out:
+    free(pw.s);
+    free(ascii.s);
+    free(ct.s);
+    free(lct.s);
+    list_free(&cts);
+    list_free(&lcts);
+    return rc;
+}
+
 static void mask_free(struct fm_mask *m) {
     if (m->kind == FM_FRAGMENT) {
         free(m->u.frag.len);
@@ -880,6 +1076,9 @@ static void mask_free(struct fm_mask *m) {
         seqs_free(m->u.hc.cl, m->u.hc.n_cl);
         seqs_free(m->u.hc.sv, m->u.hc.n_sv);
         seqs_free(m->u.hc.er, m->u.hc.n_er);
+    } else if (m->kind == FM_SUDOKU) {
+        free(m->u.sd.pw);
+        free(m->u.sd.pat);
     }
 }
 
@@ -905,7 +1104,7 @@ static int type_is(const char *t, const char *want) {
 static int build_mask(struct ctx *c, const char *type, size_t settings, struct fm_mask *m) {
     const char *t = type ? type : "";
     memset(m, 0, sizeof *m);
-    if (type_is(t, "sudoku")) return fail(c, "sudoku is not supported yet");
+    if (type_is(t, "sudoku")) { m->kind = FM_SUDOKU; c->mask = "sudoku"; return build_sd(c, settings, &m->u.sd); }
     if (type_is(t, "xmc")) return fail(c, "xmc is not supported yet");
     if (type_is(t, "filter")) { m->kind = FM_FILTER; return 0; }
     if (type_is(t, "fragment")) { m->kind = FM_FRAGMENT; c->mask = "fragment"; return build_frag(c, settings, &m->u.frag); }
@@ -917,7 +1116,7 @@ struct raw_mask { char *type; size_t settings; };
 
 static int build_cfg(struct ctx *c, size_t root, struct fm_cfg *cfg) {
     struct raw_mask *rm = NULL;
-    size_t tcp = 0, n = 0;
+    size_t tcp = 0, n = 0, sd = 0;
     char k[24];
     int rc = -1;
     if (ty(c, root) == FJ_NULL) return 0;
@@ -946,6 +1145,10 @@ static int build_cfg(struct ctx *c, size_t root, struct fm_cfg *cfg) {
     for (size_t i = 0; i < n; i++) {
         c->mask = NULL;
         cfg->n++;
+        if (rm[i].type && type_is(rm[i].type, "sudoku") && sd++) {
+            fail(c, "sudoku: more than one sudoku mask is not supported");
+            goto out;
+        }
         if (build_mask(c, rm[i].type, rm[i].settings, &cfg->m[i])) goto out;
     }
     rc = 0;
