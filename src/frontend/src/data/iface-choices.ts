@@ -6,7 +6,13 @@ export type IfaceItem = Interfaces["interfaces"][number];
 export const BLACKHOLE = "blackhole";
 export const BLOCK = "block";
 export const isSink = (id: string) => id === BLACKHOLE || id === BLOCK;
-export const TUNVLESS_DEVICE = /^tunvless([0-9]|[1-9][0-9])$/;
+export const DEVICE_PREFIXES = ["tunvless", "opkgtun"] as const;
+export const TUNVLESS_DEVICE = /^(tunvless|opkgtun)([0-9]|[1-9][0-9])$/;
+
+export function splitDevice(device: string): { prefix: string; num: string } {
+  const prefix = DEVICE_PREFIXES.find((p) => device.startsWith(p)) ?? DEVICE_PREFIXES[0];
+  return { prefix, num: device.startsWith(prefix) ? device.slice(prefix.length) : device };
+}
 const REST_ORDER: Record<string, number> = { wan: 0, lan: 1 };
 
 export function ifaceTitle(i: IfaceItem): { title: string; sub: string | undefined } {

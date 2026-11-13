@@ -3,6 +3,7 @@
   import { slide } from "svelte/transition";
 
   import Button from "../../../components/ui/Button.svelte";
+  import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { locale, t } from "../../../data/locale.svelte";
@@ -32,6 +33,7 @@
     RSS,
     Unplug,
   } from "../../../components/ui/icons";
+  import { DEVICE_PREFIXES, splitDevice } from "../../../data/iface-choices";
   import { counted } from "../../../utils/plural";
   import { usageAlert } from "../sub-usage";
   import { descriptionProblem, formatRate } from "../tunnel-editor";
@@ -64,6 +66,8 @@
   const Icon = $derived(look ? ICONS[look.icon] : CircleHelp);
   const refusal = $derived(store.refusalFor(tunnel.id));
   const saved = $derived(store.isSaved(tunnel.id));
+  const device = $derived(splitDevice(tunnel.device));
+  const prefixOptions = DEVICE_PREFIXES.map((p) => ({ value: p, label: p, mono: true }));
   const up = $derived(live?.status === "up");
   const usable = $derived((live?.nodes ?? []).filter((n) => n.state !== "skipped").length);
   const subscriptions = $derived(tunnel.sources.filter((s) => s.kind === "subscription"));
@@ -144,7 +148,17 @@
       </Tooltip>
       <div class="meta">
         <div class="title-row">
-          <span class="title">{tunnel.device || tunnel.id}</span>
+          {#if saved}
+            <span class="title">{tunnel.device || tunnel.id}</span>
+          {:else}
+            <Select
+              ariaLabel={t("Device prefix")}
+              options={prefixOptions}
+              selected={device.prefix}
+              onValueChange={(v: string) => (tunnel.device = v + device.num)}
+            />
+            <span class="title">{device.num}</span>
+          {/if}
           <input
             type="text"
             class="description"

@@ -1,3 +1,4 @@
+import { splitDevice } from "../../data/iface-choices";
 import type { Tunnel, TunnelSource } from "../../types";
 import { HttpError } from "../../utils/fetcher";
 import { randomId } from "../../utils/random-id";
@@ -56,8 +57,8 @@ export function normalizeTunnel(raw: Partial<Tunnel>): Tunnel {
 }
 
 export function freeDevice(tunnels: { device: string }[]): string {
-  const used = new Set(tunnels.map((t) => t.device));
-  for (let n = 0; n < 100; n++) if (!used.has(`tunvless${n}`)) return `tunvless${n}`;
+  const used = new Set(tunnels.map((t) => splitDevice(t.device).num));
+  for (let n = 0; n < 100; n++) if (!used.has(String(n))) return `tunvless${n}`;
   return "";
 }
 

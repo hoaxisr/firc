@@ -936,8 +936,12 @@ const tunnelRefusal = (tunnels: any[]) => {
     }
     if (ids.has(tn.id)) return { error: "id is used twice", field: "id", tunnel: tn.id };
     ids.add(tn.id);
-    if (!/^tunvless([0-9]|[1-9][0-9])$/.test(tn.device ?? "")) {
-      return { error: "device must be tunvless0..tunvless99", field: "device", tunnel: tn.id };
+    if (!/^(tunvless|opkgtun)([0-9]|[1-9][0-9])$/.test(tn.device ?? "")) {
+      return {
+        error: "must be tunvless<N> or opkgtun<N>, N 0..99",
+        field: "device",
+        tunnel: tn.id,
+      };
     }
     const description = String(tn.description ?? "");
     if (

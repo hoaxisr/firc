@@ -2,6 +2,7 @@ import {
   ifaceTitle,
   isSink,
   moreText,
+  splitDevice,
   TUNVLESS_DEVICE,
   type IfaceItem,
 } from "../../data/iface-choices";
@@ -197,8 +198,10 @@ export function deviceProblem(
   selfId: string,
   t: T = (key) => key,
 ): string | null {
-  if (!TUNVLESS_DEVICE.test(device)) return t("Device must be tunvless0 to tunvless99");
-  if (tunnels.some((tn) => tn.id !== selfId && tn.device === device)) {
+  if (!TUNVLESS_DEVICE.test(device))
+    return t("Device must be tunvless0 to tunvless99 or opkgtun0 to opkgtun99");
+  const num = splitDevice(device).num;
+  if (tunnels.some((tn) => tn.id !== selfId && splitDevice(tn.device).num === num)) {
     return t("Another tunnel uses this device");
   }
   return null;

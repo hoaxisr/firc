@@ -1883,7 +1883,7 @@ definitions:
         example: PRAW-1
         type: string
       device:
-        description: 'tunvless<N>, N 0..99, unique'
+        description: 'tunvless<N> or opkgtun<N>, N 0..99, N unique across both prefixes'
         example: tunvless0
         type: string
       enable:

@@ -655,7 +655,7 @@ static firc_err_t parse_uplink(ctx_t *c, node_t *v, size_t ti, firc_tunnel_t *t)
     if (strcmp(buf, "auto") == 0) {
         t->uplink = FIRC_UPLINK_AUTO;
     } else if (strncmp(buf, "iface:", 6) == 0 && firc_is_interface_name(buf + 6)) {
-        if (strncmp(buf + 6, "tunvless", 8) == 0) {
+        if (firc_tunvless_prefixed(buf + 6)) {
             return fail(c, "use tunnel:<id> to chain tunnels", "tunnels[%zu].uplink", ti);
         }
         t->uplink = FIRC_UPLINK_IFACE;
@@ -730,7 +730,7 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
             have_id = true;
         } else if (strcmp(key, "device") == 0) {
             if (!copy_str(v, t->device, sizeof t->device)) {
-                return fail(c, "must start with tunvless", "tunnels[%zu].device", ti);
+                return fail(c, "must start with tunvless or opkgtun", "tunnels[%zu].device", ti);
             }
         } else if (strcmp(key, "description") == 0) {
             if (!copy_str(v, t->description, sizeof t->description) || firc_text_has_control(t->description)) {
@@ -790,7 +790,7 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
 
 static bool device_ok(const char *d, bool *prefix)
 {
-    *prefix = strncmp(d, "tunvless", 8) == 0;
+    *prefix = firc_tunvless_prefixed(d);
     return firc_tunvless_index(d) >= 0;
 }
 
@@ -864,11 +864,11 @@ static firc_err_t validate(ctx_t *c, const firc_tunnels_t *ts)
         }
         bool prefix;
         if (!device_ok(t->device, &prefix) || !firc_is_interface_name(t->device)) {
-            return fail(c, prefix ? "must be tunvless<N>, N 0..99" : "must start with tunvless",
+            return fail(c, prefix ? "must be tunvless<N> or opkgtun<N>, N 0..99" : "must start with tunvless or opkgtun",
                         "tunnels[%zu].device", i);
         }
         for (size_t j = 0; j < i; j++) {
-            if (strcmp(ts->t[j].device, t->device) == 0) {
+            if (firc_tunvless_index(ts->t[j].device) == firc_tunvless_index(t->device)) {
                 return fail(c, "device used twice", "tunnels[%zu].device", i);
             }
         }
