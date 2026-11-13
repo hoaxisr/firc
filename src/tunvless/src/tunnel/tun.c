@@ -418,6 +418,7 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
          * the whole connection. */
         k->wscale = 0;
         k->ws_seen = 0;
+        k->mss = 0;
         if ((k->tcp_flags & TCP_SYN) && doff > 20) {
             size_t o = ihl + 20, end = ihl + doff;
             while (o < end && o < n) {
@@ -430,8 +431,9 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
                 if (kind == 3 && olen == 3) {
                     k->wscale = p[o + 2] > 14 ? 14 : p[o + 2];
                     k->ws_seen = 1;
-                    break;
                 }
+                if (kind == 2 && olen == 4)
+                    k->mss = (uint16_t)((p[o + 2] << 8) | p[o + 3]);
                 o += olen;
             }
         }
@@ -490,12 +492,14 @@ static uint16_t csum_fin(uint32_t acc) {
 void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
                    uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                    uint32_t seq, uint32_t ack, unsigned char flags,
-                   size_t data_n, uint16_t window) {
+                   size_t data_n, uint16_t window, uint16_t id) {
     size_t total = TUN_HDR_LEN + data_n;
     memset(out, 0, TUN_HDR_LEN);
     out[0] = 0x45;
     out[2] = (unsigned char)(total >> 8);
     out[3] = (unsigned char)total;
+    out[4] = (unsigned char)(id >> 8);
+    out[5] = (unsigned char)id;
     out[8] = 64;
     out[9] = 6;
     memcpy(out + 12, &src, 4);
@@ -544,7 +548,7 @@ static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
 }
 
 int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
-                   const unsigned char *data, size_t data_n) {
+                   const unsigned char *data, size_t data_n, unsigned mss) {
     struct iovec iov[3];
     int n = 0;
     struct vnet_hdr vh;
@@ -577,9 +581,9 @@ int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
         vh.hdr_len = TUN_HDR_LEN;
         /* Ask for splitting only when there is something to split: a GSO mark on a segment of
          * one MSS means nothing. */
-        if (data_n > TUN_MSS) {
+        if (tun_pieces(data_n, mss) > 1) {
             vh.gso_type = VNET_GSO_TCPV4;
-            vh.gso_size = TUN_MSS;
+            vh.gso_size = (uint16_t)mss;
         }
         iov[n].iov_base = &vh;
         iov[n].iov_len = sizeof(vh);
@@ -1053,7 +1057,7 @@ size_t tcp6_build(unsigned char *out, size_t cap, const unsigned char src[16],
 }
 
 int tun_write_data6(const struct tun_dev *d, unsigned char hdr[TUN6_HDR_LEN],
-                    const unsigned char *data, size_t data_n) {
+                    const unsigned char *data, size_t data_n, unsigned mss) {
     struct iovec iov[3];
     int n = 0;
     struct vnet_hdr vh;
@@ -1071,9 +1075,9 @@ int tun_write_data6(const struct tun_dev *d, unsigned char hdr[TUN6_HDR_LEN],
         vh.csum_start = 40;
         vh.csum_offset = 16;
         vh.hdr_len = TUN6_HDR_LEN;
-        if (data_n > TUN6_MSS) {
+        if (tun_pieces(data_n, mss) > 1) {
             vh.gso_type = VNET_GSO_TCPV6;
-            vh.gso_size = TUN6_MSS;
+            vh.gso_size = (uint16_t)mss;
         }
         iov[n].iov_base = &vh;
         iov[n].iov_len = sizeof(vh);

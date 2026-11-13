@@ -260,7 +260,7 @@ TEST a_missing_revision_is_named_and_fails_only_its_rules(void) {
     firc_xt_t *xt = firc_fake_xt_handle(f);
     log_start(FIRC_LOG_INFO);
     ASSERT_EQ_FMT(FIRC_ERR_NOSYS, firc_xt_probe(xt), "%d");
-    ASSERT_EQ_FMT((size_t)14, firc_fake_xt_revision_asks(f), "%zu");
+    ASSERT_EQ_FMT((size_t)15, firc_fake_xt_revision_asks(f), "%zu");
     firc_test_stage_t *s = firc_test_stage_new();
     firc_test_stage_fixture(s, "firmware-firc", FIRC_IPT_PROTO_IPV4);
     ASSERT_EQ_FMT(FIRC_ERR_IO, firc_xt_commit(xt, "nat", &s->stage, NULL), "%d");
@@ -547,7 +547,7 @@ TEST a_revision_the_kernel_does_not_support_is_missing(void) {
     ASSERT_EQ_FMTm(text, (size_t)1,
                    count(text, "x_tables: no ipv6 target DNAT revision 1 (EPROTONOSUPPORT): DNAT rules cannot be written"),
                    "%zu");
-    ASSERT_EQ_FMTm(text, (size_t)14, count(text, "x_tables: no ipv6 "), "%zu");
+    ASSERT_EQ_FMTm(text, (size_t)15, count(text, "x_tables: no ipv6 "), "%zu");
     free(text);
     firc_xt_free(xt);
     firc_fake_xt_free(f);

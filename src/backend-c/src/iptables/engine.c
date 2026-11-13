@@ -42,6 +42,7 @@ struct firc_ipt {
     firc_logrep_t said_inval;
     firc_logrep_t said_uncovered;
     int refusal;
+    const char *refused_table;
     char report[512];
     size_t report_len;
 };
@@ -566,6 +567,7 @@ bool firc_ipt_tables_moved(firc_ipt_t *ipt) {
 static firc_err_t commit_kind(firc_ipt_t *ipt, bool full) {
     if (ipt == NULL) { return FIRC_ERR_INVAL; }
     ipt->refusal = 0;
+    ipt->refused_table = NULL;
     if (firc_cancel_raised(ipt->cancel)) {
         firc_ipt_discard(ipt);
         return FIRC_ERR_CANCELED;
@@ -603,6 +605,7 @@ static firc_err_t commit_kind(firc_ipt_t *ipt, bool full) {
         report_add(ipt, steps[s].part ? "nat (first part)" : k_tables[t], ms_since(&t0), err);
         if (err != FIRC_OK) {
             ipt->refusal = firc_xt_refusal(ipt->xt);
+            ipt->refused_table = k_tables[t];
             break;
         }
         regs_clear(&ipt->written[t]);
@@ -628,6 +631,7 @@ static firc_err_t commit_kind(firc_ipt_t *ipt, bool full) {
 firc_err_t firc_ipt_commit(firc_ipt_t *ipt) { return commit_kind(ipt, false); }
 firc_err_t firc_ipt_commit_full(firc_ipt_t *ipt) { return commit_kind(ipt, true); }
 int firc_ipt_refusal(const firc_ipt_t *ipt) { return ipt != NULL ? ipt->refusal : 0; }
+const char *firc_ipt_refused_table(const firc_ipt_t *ipt) { return ipt != NULL ? ipt->refused_table : NULL; }
 
 firc_err_t firc_ipt_probe_chain(firc_ipt_t *ipt, const char *table, const char *chain, firc_ipt_rule_t *const *rules,
                                 size_t n) {

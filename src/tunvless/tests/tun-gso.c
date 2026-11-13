@@ -86,19 +86,23 @@ int main(void) {
      * 16 KB in one packet WITHOUT offload is wrong: the kernel accepts it and cuts it into IP
      * fragments, not TCP segments (11 fragments, only the first with a TCP header). */
     size_t seg = in.gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
-    for (size_t sent = 0; sent < sizeof(payload); ) {
+    uint16_t hid[PAYLOAD_N / TUN_MSS + 1];
+    uint16_t next_id = 1000;
+    for (size_t sent = 0, w = 0; sent < sizeof(payload); w++) {
         size_t chunk = sizeof(payload) - sent > seg ? seg : sizeof(payload) - sent;
         unsigned char hdr[TUN_HDR_LEN];
+        hid[w] = next_id;
+        next_id = (uint16_t)(next_id + (chunk + TUN_MSS - 1) / TUN_MSS);
         tcp_hdr_build(hdr, src, dst, 12345, 9999, (uint32_t)(1000 + sent), 2000,
-                      TCP_ACK | TCP_PSH, chunk, 65535);
-        if (tun_write_data(&in, hdr, payload + sent, chunk) != 0) {
+                      TCP_ACK | TCP_PSH, chunk, 65535, hid[w]);
+        if (tun_write_data(&in, hdr, payload + sent, chunk, TUN_MSS) != 0) {
             fprintf(stderr, "write failed: %s\n", strerror(errno));
             return 2;
         }
         sent += chunk;
     }
 
-    size_t got = 0, segs = 0, bad_ip = 0, bad_tcp = 0, bad_data = 0;
+    size_t got = 0, segs = 0, bad_ip = 0, bad_tcp = 0, bad_data = 0, bad_id = 0;
     size_t per_queue[QUEUES] = {0};
     for (int idle = 0; idle < 200 && got < sizeof(payload); ) {
         unsigned char pkt[65536];
@@ -139,12 +143,18 @@ int main(void) {
         size_t off = seq - 1000;
         if (off + dn > sizeof(payload) ||
             memcmp(pkt + ihl + doff, payload + off, dn) != 0) bad_data++;
+        /* catches: kernel pieces not numbered up from the written header's id */
+        uint16_t id = (uint16_t)((pkt[4] << 8) | pkt[5]);
+        size_t w = off / seg;
+        if (w >= sizeof(hid) / sizeof(*hid) ||
+            id != (uint16_t)(hid[w] + (off - w * seg) / TUN_MSS)) bad_id++;
         got += dn;
         segs++;
     }
 
     printf("segments %zu, bytes %zu of %zu; bad IP sums %zu, bad TCP sums %zu, data "
-           "mismatches %zu\n", segs, got, sizeof(payload), bad_ip, bad_tcp, bad_data);
+           "mismatches %zu, bad ids %zu; split by %s\n", segs, got, sizeof(payload), bad_ip,
+           bad_tcp, bad_data, bad_id, !in.gso ? "nobody" : out.rx_gso ? "tunvless" : "the kernel");
 
     /* The whole flow must be in ONE queue. Spread over several, the connection would be served
      * by different threads, each with its own table: two independent states of one TCP
@@ -158,7 +168,7 @@ int main(void) {
     if (nq > 1 && used != 1) { printf("FAIL: the flow spread over %d queues\n", used); spread = 1; }
     if (nq == 1) printf("  (kernel without IFF_MULTI_QUEUE: queue affinity not checked)\n");
 
-    int ok = got == sizeof(payload) && !bad_ip && !bad_tcp && !bad_data && !spread;
+    int ok = got == sizeof(payload) && !bad_ip && !bad_tcp && !bad_data && !bad_id && !spread;
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

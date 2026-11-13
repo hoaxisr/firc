@@ -36,6 +36,7 @@ struct flow_key {
      * option in a SYN-ACK only in answer to a SYN that has it, and the window is scaled only when
      * both sides sent it. A client without it sees our window as plain 16 bits. */
     uint8_t ws_seen;
+    uint16_t mss;
     /* The packet is the FIRST fragment of an incomplete datagram (MF set). ip_parse rejects later
      * fragments outright: they carry no header. This matters for UDP, where an incomplete datagram
      * would silently reach the server truncated (stack.c reassembles UDP fragments before
@@ -49,7 +50,8 @@ struct flow_key {
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-/* The MSS we advertise to the client in the SYN-ACK: device MTU minus the IP and TCP headers.
+/* The MSS we advertise to the client in the SYN-ACK, and the largest segment we send an IPv4
+ * client: device MTU minus the IP and TCP headers.
  *
  * It must be advertised: without the option the client has to assume 536 bytes (RFC 1122), and a
  * megabyte then takes 1860 packets instead of 690, each a full parse, send and ACK cycle on one
@@ -89,11 +91,11 @@ struct flow_key {
 struct tun_dev {
     int fd;
     /* gso: the device carries a virtio header on every read and write (IFF_VNET_HDR). One write
-     * then hands the kernel up to 16 KB as ONE segment marked "split by 1460", and the kernel
-     * splits it inside its stack and completes the checksums (on many LAN cards in hardware).
-     * Without it the same 16 KB take twelve writes and twelve passes over the data for the TCP
-     * checksum. sing-box and wireguard-go work the same way: most of the speed difference comes
-     * from the cost of handing packets to the client, not from crypto. */
+     * then hands the kernel up to 16 KB as ONE segment marked "split by the client's MSS", and
+     * the kernel splits it inside its stack and completes the checksums (on many LAN cards in
+     * hardware). Without it the same 16 KB take a write and a pass over the data for the TCP
+     * checksum per segment. sing-box and wireguard-go work the same way: most of the speed
+     * difference comes from the cost of handing packets to the client, not from crypto. */
     int gso;
     /* gro: whether we coalesce adjacent segments into one write (tun_gro_push). Separate from gso:
      * gso says the device accepts the split mark, gro says we use it to coalesce. STEER_TUN_NOGRO
@@ -151,7 +153,7 @@ ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap);
 void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
                    uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                    uint32_t seq, uint32_t ack, unsigned char flags,
-                   size_t data_n, uint16_t window);
+                   size_t data_n, uint16_t window, uint16_t id);
 
 /* Hand the client a header with its data. The data is NOT copied.
  *
@@ -159,7 +161,11 @@ void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
  * drains in microseconds, while a dropped segment would wait for a retransmit timeout. Returns 0
  * or -1. */
 int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
-                   const unsigned char *data, size_t data_n);
+                   const unsigned char *data, size_t data_n, unsigned mss);
+
+static inline size_t tun_pieces(size_t data_n, unsigned mss) {
+    return data_n > mss ? (data_n + mss - 1) / mss : 1;
+}
 
 /* A control packet (tcp_build, icmp_unreach_build) with its checksums already set. Not retried:
  * the client's own retransmit recovers a lost SYN-ACK or ACK. */
@@ -253,7 +259,7 @@ size_t tcp6_build(unsigned char *out, size_t cap, const unsigned char src[16],
                   uint32_t ack, uint8_t flags, uint16_t win, const unsigned char *opt,
                   size_t opt_n, const unsigned char *data, size_t data_n);
 int tun_write_data6(const struct tun_dev *d, unsigned char hdr[TUN6_HDR_LEN],
-                    const unsigned char *data, size_t data_n);
+                    const unsigned char *data, size_t data_n, unsigned mss);
 int udp6_write_to_client(const struct tun_dev *d, const unsigned char src[16],
                          const unsigned char dst[16], uint16_t sport, uint16_t dport,
                          const unsigned char *data, size_t n);

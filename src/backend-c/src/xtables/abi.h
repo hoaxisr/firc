@@ -299,6 +299,12 @@ typedef struct firc_xt_nflog_info {
     char prefix[64];
 } xt_nflog_info_t;
 
+#define XT_TCPMSS_CLAMP_PMTU 0xffff
+
+typedef struct firc_xt_tcpmss_info {
+    uint16_t mss;
+} xt_tcpmss_info_t;
+
 _Static_assert(sizeof(xt_ipt_ip_t) == 84, "ipt_ip is 84 bytes");
 _Static_assert(offsetof(xt_ipt_ip_t, proto) == 80, "ipt_ip.proto at 80");
 _Static_assert(sizeof(xt_ipt_entry_t) == 112, "ipt_entry is 112 bytes");

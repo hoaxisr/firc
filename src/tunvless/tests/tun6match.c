@@ -245,7 +245,7 @@ static void test_data6(void) {
     check("hdr_build data offset", 5, hdr[52] >> 4);
     check("hdr_build window", 777, be16(hdr + 54));
     check("hdr_build checksum left empty", 0, be16(hdr + 56));
-    check("write_data6 plain", 0, tun_write_data6(&g_dev, hdr, data, 1000));
+    check("write_data6 plain", 0, tun_write_data6(&g_dev, hdr, data, 1000, TUN6_MSS));
     check("plain one datagram", 1, drain(raw, sizeof raw, &pn));
     check("plain length", 1060, (long)pn);
     check("plain payload length", 1020, be16(raw + 4));
@@ -254,13 +254,13 @@ static void test_data6(void) {
 
     setup(0);
     tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
-    check("plain odd write", 0, tun_write_data6(&g_dev, hdr, data, 1001));
+    check("plain odd write", 0, tun_write_data6(&g_dev, hdr, data, 1001, TUN6_MSS));
     drain(raw, sizeof raw, &pn);
     check("plain odd tcp checksum", want_csum(A, B, 6, raw + 40, 1021, 16), be16(raw + 56));
 
     setup(1);
     tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
-    check("write_data6 gso", 0, tun_write_data6(&g_dev, hdr, data, 3000));
+    check("write_data6 gso", 0, tun_write_data6(&g_dev, hdr, data, 3000, TUN6_MSS));
     check("gso one datagram", 1, drain(raw, sizeof raw, &pn));
     check("gso length", 10 + 60 + 3000, (long)pn);
     uint16_t h[4];
@@ -279,17 +279,150 @@ static void test_data6(void) {
 
     setup(1);
     tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
-    check("write_data6 gso small", 0, tun_write_data6(&g_dev, hdr, data, 1440));
+    check("write_data6 gso small", 0, tun_write_data6(&g_dev, hdr, data, 1440, TUN6_MSS));
     drain(raw, sizeof raw, &pn);
     check("small segment is not marked gso", 0, raw[1]);
     check("small segment still needs csum", 1, raw[0]);
+
+    setup(1);
+    tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
+    check("write_data6 gso mss 1200", 0, tun_write_data6(&g_dev, hdr, data, 3000, 1200));
+    drain(raw, sizeof raw, &pn);
+    memcpy(h, raw + 2, 8);
+    /* catches: the v6 split taken from the constant, not the given MSS */
+    check("v6 gso_size is the given mss", 1200, h[1]);
+    check("v6 gso type tcpv6 at mss 1200", 4, raw[1]);
+
+    setup(1);
+    tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
+    check("write_data6 one mss of 1200", 0, tun_write_data6(&g_dev, hdr, data, 1200, 1200));
+    drain(raw, sizeof raw, &pn);
+    /* catches: a write of exactly one given MSS marked for splitting */
+    check("v6 one segment of the given mss is not marked gso", 0, raw[1]);
+
+    setup(1);
+    tcp6_hdr_build(hdr, A, B, 443, 40000, 1, 2, TCP_ACK, 9);
+    check("write_data6 1300 at mss 1200", 0, tun_write_data6(&g_dev, hdr, data, 1300, 1200));
+    drain(raw, sizeof raw, &pn);
+    /* catches: the split test still made against 1440 */
+    check("v6 1300 bytes at mss 1200 are marked gso", 4, raw[1]);
+}
+
+static void test_data4_mss(void) {
+    unsigned char hdr[TUN_HDR_LEN], data[3000], raw[4096];
+    size_t pn = 0;
+    uint16_t h[4];
+    memset(data, 'm', sizeof data);
+    setup(1);
+    tcp_hdr_build(hdr, 0x0100000au, 0x0200000au, 443, 40000, 1, 2, TCP_ACK, 3000, 9, 1);
+    check("write_data gso mss 1200", 0, tun_write_data(&g_dev, hdr, data, 3000, 1200));
+    check("v4 gso one datagram", 1, drain(raw, sizeof raw, &pn));
+    memcpy(h, raw + 2, 8);
+    /* catches: the v4 split taken from the constant, not the given MSS */
+    check("v4 gso_size is the given mss", 1200, h[1]);
+    check("v4 gso type tcpv4", 1, raw[1]);
+
+    setup(1);
+    tcp_hdr_build(hdr, 0x0100000au, 0x0200000au, 443, 40000, 1, 2, TCP_ACK, 1200, 9, 1);
+    check("write_data one mss of 1200", 0, tun_write_data(&g_dev, hdr, data, 1200, 1200));
+    drain(raw, sizeof raw, &pn);
+    /* catches: a write of exactly one given MSS marked for splitting */
+    check("v4 one segment of the given mss is not marked gso", 0, raw[1]);
+
+    setup(1);
+    tcp_hdr_build(hdr, 0x0100000au, 0x0200000au, 443, 40000, 1, 2, TCP_ACK, 1300, 9, 1);
+    check("write_data 1300 at mss 1200", 0, tun_write_data(&g_dev, hdr, data, 1300, 1200));
+    drain(raw, sizeof raw, &pn);
+    /* catches: the split test still made against 1460 */
+    check("v4 1300 bytes at mss 1200 are marked gso", 1, raw[1]);
+}
+
+static void test_pieces(void) {
+    /* catches: a piece count off by one at an exact multiple, or a split asked of one MSS */
+    check("pieces 1 byte", 1, (long)tun_pieces(1, 1200));
+    check("pieces one mss", 1, (long)tun_pieces(1200, 1200));
+    check("pieces one mss and a byte", 2, (long)tun_pieces(1201, 1200));
+    check("pieces 14600 at 1460", 10, (long)tun_pieces(14600, 1460));
+    check("pieces 16384 at 1200", 14, (long)tun_pieces(16384, 1200));
+    check("pieces 0 bytes", 1, (long)tun_pieces(0, 1200));
+}
+
+static void test_tcp_hdr_id(void) {
+    unsigned char h[TUN_HDR_LEN];
+    tcp_hdr_build(h, 0x0100000au, 0x0200000au, 443, 40000, 1, 2, TCP_ACK, 100, 9, 0xBEEF);
+    /* catches: the id left at 0, written in host order, or put in after the header checksum */
+    check("v4 header id", 0xBEEF, be16(h + 4));
+    check("v4 header checksum covers the id", 0xFFFF, fold(words(h, 20, 0)));
+    check("v4 total length", 140, be16(h + 2));
+}
+
+static void syn_opts_case(const char *name, int v6, const unsigned char *o, size_t n,
+                          unsigned want_mss, unsigned want_ws, unsigned want_seen) {
+    size_t hl = v6 ? 40 : 20, total = hl + 20 + n;
+    unsigned char *p = calloc(1, total);
+    struct flow_key k;
+    size_t off = 0;
+    char w[80];
+    if (v6) {
+        p[0] = 0x60; p[4] = (unsigned char)((20 + n) >> 8); p[5] = (unsigned char)(20 + n);
+        p[6] = 6; p[7] = 64;
+        memcpy(p + 8, A, 16); memcpy(p + 24, B, 16);
+    } else {
+        p[0] = 0x45; p[2] = (unsigned char)(total >> 8); p[3] = (unsigned char)total;
+        p[8] = 64; p[9] = 6;
+        p[12] = 10; p[15] = 1; p[16] = 10; p[19] = 2;
+    }
+    p[hl] = 0x9C; p[hl + 1] = 0x40; p[hl + 2] = 0x01; p[hl + 3] = 0xBB;
+    p[hl + 12] = (unsigned char)(((20 + n) / 4) << 4);
+    p[hl + 13] = TCP_SYN;
+    memcpy(p + hl + 20, o, n);
+    memset(&k, 0xAA, sizeof k);
+    snprintf(w, sizeof w, "%s parses", name);
+    check(w, 0, ip_parse(p, total, &k, &off));
+    snprintf(w, sizeof w, "%s mss", name);
+    check(w, (long)want_mss, k.mss);
+    snprintf(w, sizeof w, "%s wscale", name);
+    check(w, (long)want_ws, k.wscale);
+    snprintf(w, sizeof w, "%s ws_seen", name);
+    check(w, (long)want_seen, k.ws_seen);
+    free(p);
+}
+
+static void test_syn_mss_read(void) {
+    static const unsigned char mss_first[8] = {2, 4, 0x05, 0x14, 1, 3, 3, 7};
+    static const unsigned char ws_first[8] = {1, 3, 3, 7, 2, 4, 0x05, 0x14};
+    static const unsigned char no_mss[8] = {1, 3, 3, 7, 1, 1, 1, 0};
+    static const unsigned char bad_len[8] = {1, 3, 3, 7, 1, 2, 3, 5};
+    static const unsigned char zero_mss[4] = {2, 4, 0, 0};
+    for (int v6 = 0; v6 < 2; v6++) {
+        const char *t = v6 ? "v6" : "v4";
+        char name[40];
+        /* catches: the parse stopping at the first known option, or the MSS bytes read little-endian (0x1405 = 5125) */
+        snprintf(name, sizeof name, "%s mss then scale", t);
+        syn_opts_case(name, v6, mss_first, 8, 1300, 7, 1);
+        snprintf(name, sizeof name, "%s scale then mss", t);
+        syn_opts_case(name, v6, ws_first, 8, 1300, 7, 1);
+        /* catches: a stale or defaulted MSS reported when the option is absent */
+        snprintf(name, sizeof name, "%s no mss option", t);
+        syn_opts_case(name, v6, no_mss, 8, 0, 7, 1);
+        /* catches: a kind 2 of length 3 accepted, which reads one byte past the option and the buffer */
+        snprintf(name, sizeof name, "%s kind 2 length 3 last", t);
+        syn_opts_case(name, v6, bad_len, 8, 0, 7, 1);
+        /* catches: an MSS option of 0 reported as present */
+        snprintf(name, sizeof name, "%s mss zero", t);
+        syn_opts_case(name, v6, zero_mss, 4, 0, 0, 0);
+    }
 }
 
 int main(void) {
     test_parse();
+    test_syn_mss_read();
     test_v4_still();
+    test_tcp_hdr_id();
     test_tcp6_build();
     test_udp6();
     test_data6();
+    test_data4_mss();
+    test_pieces();
     return unit_done("tun6match");
 }

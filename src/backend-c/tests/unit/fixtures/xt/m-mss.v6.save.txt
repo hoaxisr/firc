@@ -1,0 +1,17 @@
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:FIRC_MSS - [0:0]
+:_NDM_HOTSPOT_PRERT - [0:0]
+:_NDM_QOS - [0:0]
+-A PREROUTING -j _NDM_HOTSPOT_PRERT
+-A FORWARD -j FIRC_MSS
+-A FORWARD -j _NDM_QOS
+-A FIRC_MSS -o tunvless1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A FIRC_MSS -o tunvless3 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A _NDM_HOTSPOT_PRERT -i br0 -m mark --mark 0x0/0xfffffff -j MARK --set-xmark 0xffffaaa/0xffffffff
+-A _NDM_QOS -o ppp0 -j RETURN
+COMMIT

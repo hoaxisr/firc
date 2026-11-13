@@ -19,7 +19,7 @@ const firc_test_xt_fixture_t firc_test_xt_all[] = {
     {"empty", "nat"}, {"firmware", "nat"}, {"firmware-firc", "nat"}, {"firmware-firc-remove", "nat"},
     {"sweep", "nat"}, {"dedupe-seed", "nat"}, {"dedupe", "nat"}, {"kept-seed", "nat"}, {"dnat2000-mark", "nat"},
     {"tiny", "nat"}, {"dnat-mark", "nat"}, {"redir-mark", "nat"}, {"f-empty", "filter"}, {"f-firmware", "filter"}, {"f-firc", "filter"},
-    {"f-egress", "filter"}, {"f-egress-list", "filter"}, {"m-empty", "mangle"}, {"m-firmware", "mangle"}, {"m-firc", "mangle"}, {"m-tap", "mangle"}, {"m-firc2", "mangle"},
+    {"f-egress", "filter"}, {"f-egress-list", "filter"}, {"m-empty", "mangle"}, {"m-firmware", "mangle"}, {"m-firc", "mangle"}, {"m-tap", "mangle"}, {"m-firc2", "mangle"}, {"m-mss", "mangle"},
 };
 const size_t firc_test_xt_n_all = sizeof(firc_test_xt_all) / sizeof(firc_test_xt_all[0]);
 
@@ -143,6 +143,11 @@ static bool host_payload(firc_ipt_proto_t fam, const char *name, uint8_t rev, ui
         host16(p + 6);
         host16(p + 8);
         host16(p + 10);
+        return true;
+    }
+    if (target && strcmp(name, "TCPMSS") == 0 && rev == 0) {
+        if (room < sizeof(xt_tcpmss_info_t)) { return false; }
+        host16(p);
         return true;
     }
     if (!target && strcmp(name, "conntrack") == 0 && rev == 3) {
@@ -571,6 +576,9 @@ static bool say_target(out_t *o, bool v6, const char *tname, uint8_t rev, const 
         if (lo == 0 || lo > hi) { return false; }
         say(o, " -j REDIRECT --to-ports %u", lo);
         if (hi != lo) { say(o, "-%u", hi); }
+    } else if (strcmp(tname, "TCPMSS") == 0 && rev == 0) {
+        if (rd16(p) != XT_TCPMSS_CLAMP_PMTU) { return false; }
+        say(o, " -j TCPMSS --clamp-mss-to-pmtu");
     } else if (strcmp(tname, "NFLOG") == 0 && rev == 0) {
         xt_nflog_info_t n;
         memcpy(&n, p, sizeof(n));

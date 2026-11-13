@@ -238,6 +238,17 @@ static unsigned test_iface_index(const char *name) {
 static int64_t g_capture_seconds;
 static bool g_app_no_sets;
 static bool g_app_no_v6;
+static const char *g_app_lack_target;
+static bool g_app_lack_v6_only;
+
+static firc_xt_t *app_xt(firc_fake_ipt_t *f, bool v6) {
+    firc_xt_t *xt = firc_fake_ipt_as_xt(f);
+    if (g_app_lack_target != NULL && xt != NULL && (v6 || !g_app_lack_v6_only)) {
+        firc_fake_xt_lack(firc_fake_ipt_xt(f), true, g_app_lack_target, 0);
+        (void)firc_xt_probe(xt);
+    }
+    return xt;
+}
 
 static firc_dnsproxy_t *g_app_proxy;
 static firc_kn_resolvers_t *g_app_resolvers;
@@ -318,9 +329,11 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
     l->router = firc_resolve_router_new(l->pipeline);
     if (l->router == NULL) { return false; }
     l->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    l->ipt = firc_ipt_new(firc_fake_ipt_as_xt(l->fake), "FIRC_");
+    l->ipt = firc_ipt_new(app_xt(l->fake, false), "FIRC_");
     l->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_xt(l->fake6), "FIRC_");
+    l->ipt6 = firc_ipt_new(app_xt(l->fake6, true), "FIRC_");
+    g_app_lack_target = NULL;
+    g_app_lack_v6_only = false;
     firc_netfilter_register_base_chains(l->ipt, l->ipt6);
     l->kernel = fake_rtnl_start(&l->rtnl);
     if (l->kernel == NULL) { return false; }
@@ -347,6 +360,12 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
                             .iface_index = test_iface_index,
                             .capture_seconds = g_capture_seconds,
                             .mono_ms = g_app_mono};
+    g_capture_seconds = 0;
+    g_app_proxy = NULL;
+    g_app_resolvers = NULL;
+    g_app_mono = NULL;
+    g_app_no_sets = false;
+    g_app_no_v6 = false;
     l->app = firc_app_create(&deps);
     l->remap = firc_port_remap_new(l->cfg.app.netfilter.iptables.chain_prefix, 53, 3553, NULL, 0,
                                   l->ipt, NULL);
@@ -379,6 +398,8 @@ static void locked_app_down_rest(locked_app_t *l) {
     g_app_mono = NULL;
     g_app_no_sets = false;
     g_app_no_v6 = false;
+    g_app_lack_target = NULL;
+    g_app_lack_v6_only = false;
     for (int w = 0; w < 2; w++) {
         fake_nflog_stop(g_tap_kernel[w]);
         g_tap_kernel[w] = NULL;
@@ -7554,6 +7575,306 @@ TEST an_unchanged_port_table_interrupts_no_pass(void) {
     PASS();
 }
 
+static const char *const k_mss_jump[] = {"-j", "FIRC_MSS"};
+static const char *const k_clamp_tunvless1[] = {"-o", "tunvless1", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST",
+                                                "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
+static const char *const k_clamp_tunvless2[] = {"-o", "tunvless2", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST",
+                                                "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
+
+static bool mss_parts_are(const firc_ipt_rule_t *rule, const char *const *want, size_t n) {
+    if (rule->n_parts != n) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(rule->parts[i], want[i]) != 0) { return false; }
+    }
+    return true;
+}
+
+static bool clamps_are(locked_app_t *l, firc_fake_ipt_t *fake, const char *const *const *want, size_t n_want) {
+    firc_app_nf_enter(l->app);
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    bool ok = firc_fake_ipt_get_rules(fake, "mangle", "FIRC_MSS", &rules, &n) && n == n_want;
+    for (size_t i = 0; ok && i < n; i++) { ok = mss_parts_are(rules[i], want[i], 12); }
+    firc_ipt_rule_t *const *fwd = NULL;
+    size_t n_fwd = 0;
+    ok = ok && firc_fake_ipt_get_rules(fake, "mangle", "FORWARD", &fwd, &n_fwd) && n_fwd > 0 &&
+         mss_parts_are(fwd[0], k_mss_jump, 2);
+    firc_app_nf_leave(l->app);
+    return ok;
+}
+
+static bool no_clamp(locked_app_t *l, firc_fake_ipt_t *fake) {
+    firc_app_nf_enter(l->app);
+    bool chain = firc_fake_ipt_chain_exists(fake, "mangle", "FIRC_MSS");
+    char *text = firc_fake_ipt_print(fake, "mangle");
+    bool jump = text == NULL || strstr(text, "FIRC_MSS") != NULL;
+    free(text);
+    firc_app_nf_leave(l->app);
+    return !chain && !jump;
+}
+
+static unsigned mss_links(const char *name) {
+    if (strcmp(name, "nwg0") == 0) { return 11; }
+    if (strncmp(name, "tunvless", 8) == 0) { return 12; }
+    return if_nametoindex(name);
+}
+
+static bool mss_up(locked_app_t *l) {
+    if (!locked_app_up_no_committer(l)) { return false; }
+    fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
+    firc_rtnl_set_nametoindex_for_test(mss_links);
+    firc_app_set_running(l->app, true);
+    return true;
+}
+
+static void mss_down(locked_app_t *l) {
+    locked_app_down(l);
+    firc_rtnl_set_nametoindex_for_test(NULL);
+}
+
+static firc_group_t *listed_tunnel_group(uint8_t tag, const char *host, const char *const *names, size_t n) {
+    firc_group_t *g = activation_group(tag, host, NULL, NULL);
+    firc_group_set_ifaces(g, names, n);
+    return g;
+}
+
+/* Catches: the active entry only, a duplicate per group, a non-tunvless interface or a disabled group clamped. */
+TEST the_clamp_covers_every_tunvless_entry_once(void) {
+    static const char *const listed[] = {"nwg0", "tunvless2"};
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(2, "b.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(3, "c.example", listed, 2)));
+    firc_group_t *off = tunnel_group(4, "d.example", "tunvless4");
+    off->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, off));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(clamps_are(&l, l.fake6, want, 2));
+    for (size_t to = 0; to < 2; to++) {
+        ASSERT_EQ(FIRC_OK, firc_app_move_group(l.app, tag_id(3), 1 - to, false));
+        ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+        ASSERT(clamps_are(&l, l.fake, want, 2));
+        ASSERT(clamps_are(&l, l.fake6, want, 2));
+    }
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a clamp or an empty chain staged for a group that names no tunvless device. */
+TEST a_group_on_no_tunvless_stages_no_clamp(void) {
+    static const char *const plain[] = {"nwg0"};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(1, "a.example", plain, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a stale chain kept across passes. */
+TEST the_clamp_leaves_with_the_last_tunvless_group(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a missing target failing the whole pass, or staged anyway and refused. */
+TEST a_kernel_without_tcpmss_writes_the_pass_without_the_clamp(void) {
+    g_app_lack_target = "TCPMSS";
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(pass_landed(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_ERROR, "the kernel refused the TCP MSS clamp"), "%zu");
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: the chain staged only on a config change, so a firmware rewrite of mangle loses it for good. */
+TEST a_rewrite_of_mangle_brings_the_clamp_back(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT(first_pass_done(&l));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    firc_app_nf_enter(l.app);
+    firc_fake_ipt_reset(l.fake);
+    firc_fake_ipt_reset(l.fake6);
+    firc_app_nf_leave(l.app);
+    ASSERT(no_clamp(&l, l.fake));
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(l.app));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the TCPMSS gate read from one family for both, so a v6 kernel without it fails the pass or loses the v4 clamp. */
+TEST a_v6_kernel_without_tcpmss_keeps_the_v4_clamp(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    g_app_lack_target = "TCPMSS";
+    g_app_lack_v6_only = true;
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_ERROR, "the kernel refused the TCP MSS clamp"), "%zu");
+    mss_down(&l);
+    PASS();
+}
+
+static bool two_redirected_tunnels_up(locked_app_t *l) {
+    if (!mss_up(l)) { return false; }
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[1] = 3601;
+    ports[2] = 3602;
+    firc_app_set_ktcp_ports(l->app, ports);
+    return firc_app_add_group(l->app, tunnel_group(1, "a.example", "tunvless1")) == FIRC_OK &&
+           firc_app_add_group(l->app, tunnel_group(2, "b.example", "tunvless2")) == FIRC_OK;
+}
+
+/* Catches: a refused clamp leaving groups out, or the retry dropping REDIR with MSS. */
+TEST a_refused_mss_chain_costs_only_itself(void) {
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the kernel TCP redirect"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a refused clamp sent to the group search when no REDIR was staged, leaving groups out. */
+TEST a_refused_clamp_without_redir_leaves_no_group_out(void) {
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(2, "b.example", "tunvless2")));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a v6 refusal of the clamp also dropping the v4 clamp or REDIR. */
+TEST a_refused_v6_clamp_keeps_the_v4_clamp_and_redir(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the kernel TCP redirect"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a ladder that drops MSS whenever anything is refused. */
+TEST a_refused_redir_keeps_the_clamp(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j REDIRECT");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(clamps_are(&l, l.fake6, want, 2));
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the TCP MSS clamp"));
+    mss_down(&l);
+    PASS();
+}
+
+/* catches: one pass refusing the clamp and REDIR keeping either, or saying either twice. */
+TEST a_refused_clamp_and_redir_in_one_pass_drop_both(void) {
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_also_containing(l.fake, "-j REDIRECT");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the kernel TCP redirect; TCP stays on the TUN"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    mss_down(&l);
+    PASS();
+}
+
 typedef struct {
     int calls;
     uint8_t dev;
@@ -10224,6 +10545,17 @@ int main(int argc, char **argv) {
     RUN_TEST(an_undelivered_report_frees_its_image);
     RUN_TEST(an_unchanged_port_table_interrupts_no_pass);
     RUN_TEST(a_refused_redirect_takes_the_cross_flag_down);
+    RUN_TEST(the_clamp_covers_every_tunvless_entry_once);
+    RUN_TEST(a_group_on_no_tunvless_stages_no_clamp);
+    RUN_TEST(the_clamp_leaves_with_the_last_tunvless_group);
+    RUN_TEST(a_kernel_without_tcpmss_writes_the_pass_without_the_clamp);
+    RUN_TEST(a_rewrite_of_mangle_brings_the_clamp_back);
+    RUN_TEST(a_refused_mss_chain_costs_only_itself);
+    RUN_TEST(a_refused_clamp_without_redir_leaves_no_group_out);
+    RUN_TEST(a_refused_redir_keeps_the_clamp);
+    RUN_TEST(a_refused_clamp_and_redir_in_one_pass_drop_both);
+    RUN_TEST(a_refused_v6_clamp_keeps_the_v4_clamp_and_redir);
+    RUN_TEST(a_v6_kernel_without_tcpmss_keeps_the_v4_clamp);
     RUN_TEST(removing_a_tunnel_group_closes_its_chunks_and_subnets);
     RUN_TEST(a_narrowed_selector_closes_chunks_and_subnets);
     RUN_TEST(a_narrowing_edit_closes_each_prefix_once);

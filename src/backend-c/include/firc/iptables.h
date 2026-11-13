@@ -70,6 +70,8 @@ firc_err_t firc_ipt_commit(firc_ipt_t *ipt);
 /* The same without the skip, and with every jump of ours in a built-in chain put back at its staged place. */
 firc_err_t firc_ipt_commit_full(firc_ipt_t *ipt);
 int firc_ipt_refusal(const firc_ipt_t *ipt);
+/* The table the last commit failed to write, "filter", "mangle" or "nat"; NULL when it wrote all or never ran. */
+const char *firc_ipt_refused_table(const firc_ipt_t *ipt);
 /* Whether a table firc wrote no longer has the shape firc left. Reads the kernel; NULL-safe. */
 bool firc_ipt_tables_moved(firc_ipt_t *ipt);
 

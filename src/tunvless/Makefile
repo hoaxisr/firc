@@ -398,6 +398,7 @@ e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/run-udp.sh
 	TUNVLESS=$(O)/tunvless sh tests/run-tunnel-fin.sh
 	TUNVLESS=$(O)/tunvless sh tests/rcvwnd.sh
+	TUNVLESS=$(O)/tunvless sh tests/tun-mss.sh
 	TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
 	SIGPIPE_CHAIN=1 TUNVLESS=$(O)/tunvless sh tests/sigpipe.sh
 	TUNVLESS=$(O)/tunvless sh tests/chain-cache.sh
@@ -406,6 +407,7 @@ e2e: $(O)/tunvless
 	TUNVLESS=$(O)/tunvless sh tests/refill.sh
 	TUNVLESS=$(O)/tunvless sh tests/control.sh
 	TUNVLESS=$(O)/tunvless sh tests/tlsrss.sh
+	sh tests/run-tun-gso.sh
 
 clean:
 	rm -rf $(O)

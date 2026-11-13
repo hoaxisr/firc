@@ -24,6 +24,7 @@
 #include "firc/logrep.h"
 #include "firc/match.h"
 #include "firc/dnat.h"
+#include "firc/mss.h"
 #include "firc/redir.h"
 #include "firc/pool_reject.h"
 #include "firc/ifacename.h"
@@ -259,6 +260,8 @@ struct firc_app {
     firc_app_ktcp_sink_t ktcp_sink;
     bool ktcp_lack_said, ktcp_cap_said, redir_refused_said;
     bool redir_off, redir_staged;
+    bool mss_off[2], mss_staged[2], mss_refused_said, refused_v6;
+    const char *refused_table;
     firc_ip_t reject_base[2]; /* the pool prefixes, for the FORWARD barrier */
     uint8_t reject_len[2];
     bool reject_has[2];
@@ -3321,9 +3324,39 @@ static void owe_set_left(firc_app_t *app) {
     app->n_set_left = 0;
 }
 
+static firc_err_t stage_mss(firc_app_t *app, const firc_ruleset_t *skip, const char *prefix) {
+    app->mss_staged[0] = app->mss_staged[1] = false;
+    bool used[FIRC_KTCP_DEVICES] = {false};
+    for (size_t i = 0; i < app->n_rulesets; i++) {
+        const firc_ruleset_t *rs = app->rulesets[i];
+        if (!staged_in_pass(rs, skip)) { continue; }
+        const firc_group_t *g = firc_ruleset_group(rs);
+        for (size_t k = 0; k < firc_group_n_ifaces(g); k++) {
+            int dev = firc_tunvless_index(firc_group_iface_at(g, k));
+            if (dev >= 0) { used[dev] = true; }
+        }
+    }
+    uint8_t devs[FIRC_KTCP_DEVICES];
+    size_t n = 0;
+    for (size_t d = 0; d < FIRC_KTCP_DEVICES; d++) {
+        if (used[d]) { devs[n++] = (uint8_t)d; }
+    }
+    if (n == 0) { return FIRC_OK; }
+    firc_ipt_t *const ipts[] = {app->ipt4, app->ipt6};
+    for (size_t f = 0; f < 2; f++) {
+        if (ipts[f] == NULL || app->mss_off[f] || !firc_ipt_has(ipts[f], "TCPMSS")) { continue; }
+        firc_err_t err = firc_mss_build_rules(ipts[f], prefix, devs, n);
+        if (err != FIRC_OK) { return err; }
+        app->mss_staged[f] = true;
+    }
+    return FIRC_OK;
+}
+
 static firc_err_t rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cancel, bool full,
                                            const firc_ruleset_t *skip, int *refusal) {
     *refusal = 0;
+    app->refused_table = NULL;
+    app->refused_v6 = false;
     firc_err_t err = firc_netfilter_register_base_chains(app->ipt4, app->ipt6);
     if (err != FIRC_OK) { return err; }
 
@@ -3372,17 +3405,22 @@ static firc_err_t rebuild_netfilter_locked(firc_app_t *app, firc_cancel_t *cance
     if (err != FIRC_OK) { return err; }
     err = stage_redir(app, skip, prefix, full);
     if (err != FIRC_OK) { return err; }
+    err = stage_mss(app, skip, prefix);
+    if (err != FIRC_OK) { return err; }
 
     if (firc_cancel_raised(cancel)) { return FIRC_ERR_CANCELED; }
 
     if (app->ipt4) {
         err = full ? firc_ipt_commit_full(app->ipt4) : firc_ipt_commit(app->ipt4);
         *refusal = firc_ipt_refusal(app->ipt4);
+        app->refused_table = firc_ipt_refused_table(app->ipt4);
         if (err != FIRC_OK) { return err; }
     }
     if (app->ipt6) {
         err = full ? firc_ipt_commit_full(app->ipt6) : firc_ipt_commit(app->ipt6);
         *refusal = firc_ipt_refusal(app->ipt6);
+        app->refused_table = firc_ipt_refused_table(app->ipt6);
+        app->refused_v6 = true;
         if (err != FIRC_OK) { return err; }
     }
     return FIRC_OK;
@@ -3409,25 +3447,38 @@ static firc_err_t rebuild_leaving_out(firc_app_t *app, firc_cancel_t *cancel, bo
     int refusal = 0;
     app->redir_staged = false;
     firc_err_t err = rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
-    if (refused_rule(err, refusal) && app->redir_staged) {
+    bool tried = false;
+    while (refused_rule(err, refusal) && app->refused_table != NULL) {
+        int f = app->refused_v6 ? 1 : 0;
+        if (strcmp(app->refused_table, "mangle") == 0 && app->mss_staged[f] && !app->mss_off[f]) {
+            app->mss_off[f] = true;
+        } else if (strcmp(app->refused_table, "nat") == 0 && !app->refused_v6 && app->redir_staged &&
+                   !app->redir_off) {
+            app->redir_off = true;
+        } else {
+            break;
+        }
+        tried = true;
         firc_ipt_discard(app->ipt4);
         firc_ipt_discard(app->ipt6);
-        app->redir_off = true;
-        int bare = 0;
-        firc_err_t without = rebuild_netfilter_locked(app, cancel, full, NULL, &bare);
-        app->redir_off = false;
-        if (without == FIRC_OK) {
-            if (!app->redir_refused_said) {
-                app->redir_refused_said = true;
-                FIRC_ERROR("the kernel refused the kernel TCP redirect; TCP stays on the TUN");
-            }
-            err = without;
-            refusal = bare;
-        } else {
-            firc_ipt_discard(app->ipt4);
-            firc_ipt_discard(app->ipt6);
-            err = rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
+        err = rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
+    }
+    bool mss_dropped = app->mss_off[0] || app->mss_off[1], redir_dropped = app->redir_off;
+    app->mss_off[0] = app->mss_off[1] = false;
+    app->redir_off = false;
+    if (tried && err == FIRC_OK) {
+        if (mss_dropped && !app->mss_refused_said) {
+            app->mss_refused_said = true;
+            FIRC_ERROR("the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS");
         }
+        if (redir_dropped && !app->redir_refused_said) {
+            app->redir_refused_said = true;
+            FIRC_ERROR("the kernel refused the kernel TCP redirect; TCP stays on the TUN");
+        }
+    } else if (tried) {
+        firc_ipt_discard(app->ipt4);
+        firc_ipt_discard(app->ipt6);
+        err = rebuild_netfilter_locked(app, cancel, full, NULL, &refusal);
     }
     bool refused = refused_rule(err, refusal);
     bool search = refused && app->pass_refused;

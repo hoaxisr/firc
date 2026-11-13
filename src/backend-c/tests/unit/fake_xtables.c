@@ -191,6 +191,8 @@ static const kext_t k_exts[] = {
     {"MARK", true, 2, 0, 0, sizeof(xt_mark_tginfo2_t), ALL_HOOKS, NULL},
     {"CONNMARK", true, 1, 0, 0, sizeof(xt_connmark_tginfo1_t), ALL_HOOKS, NULL},
     {"NFLOG", true, 0, 0, 0, sizeof(xt_nflog_info_t), ALL_HOOKS, NULL},
+    {"TCPMSS", true, 0, 4, 6, sizeof(xt_tcpmss_info_t), HOOK_FWD | HOOK_OUT | HOOK_POST, NULL},
+    {"TCPMSS", true, 0, 6, 6, sizeof(xt_tcpmss_info_t), HOOK_FWD | HOOK_OUT | HOOK_POST, NULL},
     {"mark", false, 1, 0, 0, sizeof(xt_mark_mtinfo1_t), ALL_HOOKS, NULL},
     {"connmark", false, 1, 0, 0, sizeof(xt_connmark_mtinfo1_t), ALL_HOOKS, NULL},
     {"tcp", false, 0, 4, 6, sizeof(xt_tcp_t), ALL_HOOKS, NULL},

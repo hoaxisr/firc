@@ -156,6 +156,7 @@ struct conn {
      * retransmit per ACK advance, as in TCP. */
     uint8_t fast_done;
     uint8_t client_wscale;    /* from the SYN options: window = client_win << wscale */
+    uint16_t mss;
     /* The client's SYN had the window scale option, so OUR window is scaled too: the window
      * field to it is the window >> g_rcv_shift (rcv_win_field). Without it, 16 bits as they are. */
     uint8_t ws_on;
@@ -798,6 +799,7 @@ static __thread struct {
     /* The client's window as we computed it, and the most in flight: without both, "window
      * waits" cannot be told from "misread the window". */
     uint32_t win_min, win_max, inflight_max;
+    uint16_t mss_min, mss_max;
     uint8_t wscale_seen;
 } g_st;
 
@@ -816,7 +818,8 @@ static void stats_dump(uint64_t window_ns) {
             "(%.1f KB each) | client writes %.0f/s (%.0f us each) | window waits %.0f/s | "
             "read limit hit %.0f/s | connections %u | retransmits %.0f/s (%.0f KB/s) | "
             "datagrams dropped %.0f/s | ACKs held %.0f/s | "
-            "client window %u..%u (scale %u), in flight up to %u | RTO floor %u ms | "
+            "client window %u..%u (scale %u), in flight up to %u | client MSS %u..%u | "
+            "RTO floor %u ms | "
             "server read %.0f%% | TUN parse %.0f%% | TUN read %.0f%%\n",
             g_worker,
             (double)g_st.rec_bytes / s / 1048576.0,
@@ -832,12 +835,15 @@ static void stats_dump(uint64_t window_ns) {
             (double)g_st.rtx_sends / s, (double)g_st.rtx_bytes / s / 1024.0,
             (double)g_st.udp_drops / s, (double)g_st.acks_held / s,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
-            g_st.wscale_seen, g_st.inflight_max, rto_floor(),
+            g_st.wscale_seen, g_st.inflight_max,
+            g_st.mss_min == 0xFFFF ? 0u : (unsigned)g_st.mss_min, (unsigned)g_st.mss_max,
+            rto_floor(),
             100.0 * (double)g_st.recv_ns / (double)window_ns,
             100.0 * (double)g_st.pkt_ns / (double)window_ns,
             100.0 * (double)g_st.tun_read_ns / (double)window_ns);
     memset(&g_st, 0, sizeof(g_st));
     g_st.win_min = 0xFFFFFFFFu;
+    g_st.mss_min = 0xFFFF;
 }
 
 /* Per-packet trace (STEER_TUN_TRACE): too noisy for normal work, essential when a connection
@@ -1400,9 +1406,26 @@ static void ctl_reply(const struct tun_dev *tun, const struct flow_key *k, uint3
     if (l) tun_write_ctl(tun, pkt, l);
 }
 
+/* IP ID for TCP data and datagrams to the client. It matters only for fragmentation: the client
+ * uses it to reassemble the fragments of one packet. Per thread: a shared counter would fight over
+ * a cache line for a number only the reassembler cares about. */
+static __thread uint16_t g_ip_id;
+
+#define TUN_MSS_FLOOR 64
+#define TUN_MSS_DEFAULT 536
+#define TUN6_MSS_DEFAULT 1220
+
+static uint16_t conn_mss(const struct flow_key *k) {
+    unsigned top = k->v6 ? TUN6_MSS : TUN_MSS;
+    unsigned m = k->mss ? k->mss : (k->v6 ? TUN6_MSS_DEFAULT : TUN_MSS_DEFAULT);
+    if (m > top) m = top;
+    if (m < TUN_MSS_FLOOR) m = TUN_MSS_FLOOR;
+    return (uint16_t)m;
+}
+
 static size_t seg_max(const struct conn *c, const struct tun_dev *tun) {
     if (tun->gso) return TUN_GSO_MAX;
-    return c->key.v6 ? TUN6_MSS : TUN_MSS;
+    return c->mss;
 }
 
 static int seg_write(const struct tun_dev *tun, const struct conn *c, uint32_t seq,
@@ -1411,11 +1434,13 @@ static int seg_write(const struct tun_dev *tun, const struct conn *c, uint32_t s
     if (c->key.v6) {
         tcp6_hdr_build(hdr, c->key.dst.b, c->key.src.b, c->key.dport, c->key.sport, seq,
                        c->client_seq, TCP_ACK | TCP_PSH, rcv_win_field(c));
-        return tun_write_data6(tun, hdr, p, n);
+        return tun_write_data6(tun, hdr, p, n, c->mss);
     }
+    uint16_t id = (uint16_t)(g_ip_id + 1);
+    g_ip_id = (uint16_t)(g_ip_id + tun_pieces(n, c->mss));
     tcp_hdr_build(hdr, c->key.dst.v4, c->key.src.v4, c->key.dport, c->key.sport, seq,
-                  c->client_seq, TCP_ACK | TCP_PSH, n, rcv_win_field(c));
-    return tun_write_data(tun, hdr, p, n);
+                  c->client_seq, TCP_ACK | TCP_PSH, n, rcv_win_field(c), id);
+    return tun_write_data(tun, hdr, p, n, c->mss);
 }
 
 /* A free slot; if there is none, evict the longest idle connection and take its slot.
@@ -1669,11 +1694,6 @@ static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
 }
 
 /* ---- UDP -------------------------------------------------------------------- */
-/* IP ID for datagrams to the client. It matters only for fragmentation: the client uses it to
- * reassemble the fragments of one datagram. Per thread: a shared counter would fight over a cache
- * line for a number only the reassembler cares about. */
-static __thread uint16_t g_ip_id;
-
 /* A datagram to the server: the dialer's framing and the data in ONE piece.
  *
  * One piece because h2_write sends all or nothing: a datagram split across two calls could go out
@@ -1760,8 +1780,8 @@ static int emit_ib_dgram(void *arg, const unsigned char *p, size_t n) {
  * it lies after decryption.
  *
  * The piece size depends on offload (GSO): with it a whole record goes in one write and the
- * kernel segments it by MSS; without it we cut 1460-byte segments ourselves and pay a write and a
- * checksum pass per segment. */
+ * kernel segments it by the client's MSS; without it we cut segments of that MSS ourselves and pay
+ * a write and a checksum pass per segment. */
 static int emit_to_client(struct conn *c, const struct tun_dev *tun,
                           const unsigned char *p, size_t n) {
     /* Copy for retransmission BEFORE sending. Room was checked in advance
@@ -1810,7 +1830,7 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
  * shows it and the retransmission goes on.
  *
  * The segment size is the one used for sending: with offload a whole 16 KB piece may have been
- * lost, and resending it in 1460-byte pieces would stretch recovery over ten timeouts. */
+ * lost, and resending it one MSS at a time would stretch recovery over ten timeouts. */
 static void rtx_resend(struct conn *c, const struct tun_dev *tun, const char *why) {
     const unsigned char *body = NULL;
     uint32_t n = rtx_peek(&c->rtx, (uint32_t)seg_max(c, tun), &body);
@@ -2370,6 +2390,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         c->client_ack = 2;
         c->client_win = k.window ? k.window : 8192;
         c->client_wscale = k.wscale;
+        c->mss = conn_mss(&k);
         c->ws_on = k.ws_seen;
         c->rto_ms = rto_floor();
         c->last = g_now_s;
@@ -3897,6 +3918,8 @@ static int loop_turn(struct loop *L, int max_ms) {
             if (room > g_st.win_max) g_st.win_max = room;
             if (infl > g_st.inflight_max) g_st.inflight_max = infl;
             g_st.wscale_seen = c->client_wscale;
+            if (c->mss && c->mss < g_st.mss_min) g_st.mss_min = c->mss;
+            if (c->mss > g_st.mss_max) g_st.mss_max = c->mss;
         }
 
         /* Do not ask the server for more while the client has not taken what it got. This is
@@ -4149,12 +4172,21 @@ static int loop_turn(struct loop *L, int max_ms) {
     return 0;
 }
 
+/* Upper limit for STEER_TUN_THREADS. More threads than cores would only add context switches:
+ * the loop is almost always either waiting in epoll or computing. */
+#define MAX_WORKERS 4
+
+static void worker_init(int id) {
+    g_worker = id;
+    g_st.win_min = 0xFFFFFFFFu;
+    g_st.mss_min = 0xFFFF;
+    g_ip_id = (uint16_t)(id * (65536 / MAX_WORKERS));
+}
+
 static void *worker_loop(void *arg) {
     struct worker *w = arg;
     int tun_fd = w->tun.fd;
-    g_worker = w->id;
-
-    g_st.win_min = 0xFFFFFFFFu;
+    worker_init(w->id);
     /* The thread's tables are in the heap (see "loop thread tables" at g_conns), so allocating
      * them can fail. The failure is handled like the epoll one below: the thread does not start,
      * and its queue is left to the others. */
@@ -4199,10 +4231,6 @@ static void *worker_loop(void *arg) {
     close(tun_fd);
     return NULL;
 }
-
-/* Upper limit for STEER_TUN_THREADS. More threads than cores would only add context switches:
- * the loop is almost always either waiting in epoll or computing. */
-#define MAX_WORKERS 4
 
 /* How many loop threads to start, and why ONE by default. A thread per core looks like an
  * obvious win, but it assumes both halves of a TCP connection land in the same device queue,
@@ -4295,7 +4323,7 @@ int stack_run(const struct tun_cfg *tc, const struct dialer *d, stack_ready_fn r
      * threads) must be known before measuring, not after. */
     fprintf(stderr, LOG_I "write offload on %s %s; threads %d of %d requested\n",
             dev, queues[0].gso ? "enabled (segments up to 16 KB, checksums by the kernel)"
-                               : "UNAVAILABLE — 1460-byte segments, checksums computed here",
+                               : "UNAVAILABLE — segments of the client's MSS, checksums computed here",
             n, want);
     fprintf(stderr, LOG_I "spare sessions to the node: %d (STEER_TUN_SPARES)\n", g_spare_want);
     if (n < want)

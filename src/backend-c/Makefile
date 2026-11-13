@@ -131,6 +131,7 @@ NETFILTER_SRCS := \
     src/netfilter/pool_reject.c \
     src/netfilter/dnat.c \
     src/netfilter/redir.c \
+    src/netfilter/mss.c \
     src/netfilter/checkroute.c \
     src/netlink/rtnl.c \
     src/netlink/watcher.c
