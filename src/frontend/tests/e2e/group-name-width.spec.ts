@@ -55,3 +55,11 @@ test("on a phone a long name is cut inside its row", async ({ page }) => {
   expect(f[2].cut).toBe(true);
   for (const x of f) expect(x.field).toBeLessThanOrEqual(x.row + 0.5);
 });
+
+// Catches a name field that takes the browser's own input padding, so iOS Safari's wider one cuts "Telegram" to "Telegr…".
+test("a browser's own input padding does not cut a group name", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await open(page);
+  await page.addStyleTag({ content: "input { padding: 0.2em 0.5em; }" });
+  expect((await fit(page)).map((f) => f.cut)).toEqual([false, false, false]);
+});

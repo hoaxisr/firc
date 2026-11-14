@@ -770,6 +770,7 @@
   .group-name {
     & {
       border: none;
+      padding: 1px 2px;
       background-color: transparent;
       font-size: 1.3rem;
       font-weight: 600;
