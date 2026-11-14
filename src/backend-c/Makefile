@@ -159,6 +159,7 @@ TUNNELS_SRCS := \
     src/tunnels/inbound_check.c \
     src/tunnels/tunproto.c \
     src/tunnels/ktcp.c \
+    src/tunnels/tunaddr.c \
     src/tunnels/tunsup.c \
     src/tunnels/tunnet.c \
     src/tunnels/tunrun.c \
@@ -319,6 +320,11 @@ $(BUILDDIR)/tests/test_oom: tests/unit/test_oom.c $(LIB_OBJS) $(TEST_SUPPORT_OBJ
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(OOM_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
+$(BUILDDIR)/tests/test_tunaddr: tests/unit/test_tunaddr.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(BUILDDIR)/tunvless/src/tunnel/ifcfg.o
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit -I$(TUNVLESS_DIR)/src/tunnel $(LDFLAGS) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(BUILDDIR)/tunvless/src/tunnel/ifcfg.o $(LDLIBS) $(DEP_LIBS)
 
 APP_WRAP := -Wl,--wrap=firc_dnsproxy_close_group_pools,--wrap=firc_dnsproxy_forget_group,--wrap=if_nametoindex,--wrap=firc_loop_add_timer
 

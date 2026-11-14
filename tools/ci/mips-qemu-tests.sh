@@ -63,6 +63,9 @@ skip_test() {
     test_app)
         echo "a_cached_answer_for_a_committed_address_is_not_held answers through the DNS proxy, whose reply qemu-user fails with ENODEV as in test_dnsproxy"
         ;;
+    test_tunaddr)
+        echo "the_system_read_finds_each_family_on_lo needs unshare(CLONE_NEWUSER), which qemu-user refuses with EINVAL: its own threads make the guest multithreaded"
+        ;;
     esac
 }
 

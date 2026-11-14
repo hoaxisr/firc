@@ -2,6 +2,7 @@
 
 #include "firc/tunsup.h"
 
+#include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 
 #include "firc/log.h"
 #include "firc/logrep.h"
+#include "firc/tunaddr.h"
 
 extern char **environ;
 
@@ -59,6 +61,8 @@ typedef struct slot {
     bool terminating;
     bool gone;
     bool warned_bad;
+    bool warned_holder;
+    bool warned_unread;
     bool warned_drop_out;
     bool warned_drop_err;
     bool deferred;
@@ -879,7 +883,33 @@ static void spawn(slot_t *sl)
         set_status(sl, FIRC_TUN_ST_STARTING);
         return;
     }
-    char addr[32];
+    char addr[20];
+    uint8_t addr6[16];
+    firc_tun_addr(device_index(t->device), addr, addr6);
+    char holder[16];
+    int held = firc_tun_addr_holder(device_index(t->device), t->device, holder);
+    char shown[INET6_ADDRSTRLEN];
+    if (held == AF_INET6) {
+        inet_ntop(AF_INET6, addr6, shown, sizeof shown);
+    } else {
+        snprintf(shown, sizeof shown, "%.*s", (int)strcspn(addr, "/"), addr);
+    }
+    if (held > 0) {
+        if (!sl->warned_holder) {
+            sl->warned_holder = true;
+            firc_log_from(FIRC_LOG_ERROR, t->device, "%s is already on %s", shown, holder);
+        }
+        sl->st.n_active = 0;
+        set_status(sl, FIRC_TUN_ST_BAD_CONFIG);
+        return;
+    }
+    sl->warned_holder = false;
+    if (held < 0 && !sl->warned_unread) {
+        sl->warned_unread = true;
+        firc_log_from(FIRC_LOG_WARN, t->device, "cannot read the interface addresses, %s not checked", shown);
+    } else if (held == 0) {
+        sl->warned_unread = false;
+    }
     char active[16];
     char interval[16];
     char silence[16];
@@ -887,7 +917,6 @@ static void spawn(slot_t *sl)
     char mark[16];
     char tcp_port[8];
     char tcp_pool[24];
-    snprintf(addr, sizeof addr, "198.51.100.%d/32", 1 + device_index(t->device));
     snprintf(tcp_port, sizeof tcp_port, "%u", (unsigned)firc_tunnel_tcp_port(t));
     snprintf(tcp_pool, sizeof tcp_pool, "%u.%u.%u.%u/%u", s->tcp_pool[0], s->tcp_pool[1], s->tcp_pool[2],
              s->tcp_pool[3], s->tcp_pool_len);

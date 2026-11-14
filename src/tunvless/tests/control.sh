@@ -233,6 +233,14 @@ wait_ev() {
     done
     return 1
 }
+wait_more() {
+    i=0
+    while [ $i -lt $(($3 * 5)) ]; do
+        [ "$(grep -cF "$1" "$W/ev2")" -gt "$2" ] && return 0
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
 fetch() { HX wget -q --tries=1 -O "$W/dl-$1" -T 20 "http://203.0.113.7/$1" && wc -c < "$W/dl-$1" || echo 0; }
 sleep 1
 mkfifo "$W/in"
@@ -244,6 +252,8 @@ check "swap: first active A" '{"type":"active","nodes":["A"],"index":[0],"v6":[f
 IFX=$(HX cat /sys/class/net/tvs0/ifindex 2>/dev/null)
 case "$IFX" in ''|*[!0-9]*) IFX_OK=no ;; *) IFX_OK=yes ;; esac
 check "swap: the device has an ifindex" yes "$IFX_OK"
+# catches: a default --addr outside the range fircd keeps clear of the firmware
+check "swap: without -a the device holds 203.0.113.1/32" 203.0.113.1/32 "$(HX ip -4 -o addr show dev tvs0 | awk '{print $4}')"
 : > "$W/req-A"
 ( fetch long > "$W/long.size" ) & LONG=$!
 wait_in "$W/req-A" ' 203.0.113.7:80'
@@ -259,8 +269,10 @@ check "swap: the same device" "$IFX" "$(HX cat /sys/class/net/tvs0/ifindex 2>/de
 sizes=""
 for i in 1 2 3 4; do sizes="$sizes $(fetch s$i)"; done
 check "swap: new connections go to B" " 2097152 2097152 2097152 2097152" "$sizes"
+A6='"nodes":["A"],"index":[0],"v6":[true]'
+A6N=$(grep -cF "$A6" "$W/ev2")
 { echo nodes; lnk A; lnk C; echo; } >&8
-wait_ev '"nodes":["A"],"index":[0],"v6":[true]' 10
+wait_more "$A6" "$A6N" 10
 check "swap: two commands acknowledged" 2 "$(grep -c '"type":"nodes"' "$W/ev2")"
 check "swap: A comes back under its first index" '{"type":"active","nodes":["A"],"index":[0],"v6":[true]}' "$(grep '"active"' "$W/ev2" | tail -1)"
 check "swap: new connections go to A again" 1048576 "$(fetch a1)"

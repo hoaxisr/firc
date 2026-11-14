@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -19,6 +20,7 @@
 #include "firc/events.h"
 #include "firc/log.h"
 #include "firc/loop.h"
+#include "firc/tunaddr.h"
 #include "firc/tunsup.h"
 
 #define FAKE "tests/unit/fixtures/fake_tunvless.sh"
@@ -383,6 +385,7 @@ static void teardown(void *ud)
 {
     (void)ud;
     alarm(0);
+    firc_tun_addr_set_ifaddrs_for_test(NULL, 0);
     if (g_open != NULL) {
         rec_close(g_open);
     }
@@ -507,7 +510,7 @@ TEST argv_full_and_no_link(void)
     run_ms(&r, 700);
     char buf[512];
     read_file(g_argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--control\n-d\ntunvless3\n-a\n198.51.100.4/32\n-A\n2\n--by\nlatency\n--interval\n45\n"
+    ASSERT_STR_EQ("--control\n-d\ntunvless3\n-a\n203.0.113.4/32\n-A\n2\n--by\nlatency\n--interval\n45\n"
                   "--silence\n12\n-t\n7\n-m\n0x1a\n--insecure\n--ca\n/opt/etc/ca.pem\n--fp\nfirefox\n",
                   buf);
     ASSERT(strstr(buf, "vless://") == NULL);
@@ -539,7 +542,7 @@ TEST argv_with_every_option_set(void)
     run_ms(&r, 700);
     char buf[512];
     read_file(g_argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--control\n-d\ntunvless3\n-a\n198.51.100.4/32\n-A\n2\n--by\nlatency\n--interval\n30\n"
+    ASSERT_STR_EQ("--control\n-d\ntunvless3\n-a\n203.0.113.4/32\n-A\n2\n--by\nlatency\n--interval\n30\n"
                   "--silence\n10\n-t\n5\n-m\n0x1a\n--insecure\n--ca\n/opt/etc/ca.pem\n--fp\nchrome\n"
                   "--tcp-port\n3603\n--tcp-pool\n198.18.0.0/15\n",
                   buf);
@@ -564,7 +567,7 @@ TEST argv_minimal_without_options(void)
     run_ms(&r, 700);
     char buf[512];
     read_file(g_argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--control\n-d\ntunvless0\n-a\n198.51.100.1/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
+    ASSERT_STR_EQ("--control\n-d\ntunvless0\n-a\n203.0.113.1/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
                   "--silence\n10\n-t\n5\n",
                   buf);
     rec_close(&r);
@@ -591,7 +594,7 @@ TEST a_kernel_tcp_tunnel_is_spawned_with_its_port_and_pool(void)
     run_ms(&r, 700);
     char buf[512];
     read_file(g_argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--control\n-d\ntunvless7\n-a\n198.51.100.8/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
+    ASSERT_STR_EQ("--control\n-d\ntunvless7\n-a\n203.0.113.8/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
                   "--silence\n10\n-t\n5\n--tcp-port\n3607\n--tcp-pool\n198.18.0.0/15\n",
                   buf);
     rec_close(&r);
@@ -616,7 +619,7 @@ TEST a_kernel_tcp_tunnel_without_a_pool_gets_only_its_port(void)
     run_ms(&r, 700);
     char buf[512];
     read_file(g_argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--control\n-d\ntunvless0\n-a\n198.51.100.1/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
+    ASSERT_STR_EQ("--control\n-d\ntunvless0\n-a\n203.0.113.1/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
                   "--silence\n10\n-t\n5\n--tcp-port\n3600\n",
                   buf);
     rec_close(&r);
@@ -2240,6 +2243,158 @@ TEST a_restarted_child_s_inbounds_mismatch_is_warned_again(void)
     PASS();
 }
 
+static firc_tun_ifaddr_t ifa4(const char *name, uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+{
+    firc_tun_ifaddr_t e;
+    memset(&e, 0, sizeof e);
+    snprintf(e.name, sizeof e.name, "%s", name);
+    e.family = AF_INET;
+    e.addr[0] = a;
+    e.addr[1] = b;
+    e.addr[2] = c;
+    e.addr[3] = d;
+    return e;
+}
+
+TEST an_address_held_elsewhere_stops_the_spawn(void)
+{
+    /* catches: a child spawned onto an address another interface holds, or the refusal said on every apply */
+    env_setup("ok");
+    log_to_file();
+    firc_tun_ifaddr_t held[] = {ifa4("ezcfg0", 203, 0, 113, 4)};
+    firc_tun_addr_set_ifaddrs_for_test(held, 1);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 3, links, 1);
+    tun_init(&t2, "a", 3, links, 1);
+    t2.active = 2;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    run_ms(&r, 300);
+    char buf[256];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(0, count_starts(buf, "tunvless3"));
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, state_of(r.s, "a").status);
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "ERR tunvless3: 203.0.113.4 is already on ezcfg0\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_restart_request_rechecks_bad_config(void)
+{
+    /* catches: a re-check on restart that nothing performs, or the refusal never said again after a start */
+    env_setup("ok");
+    log_to_file();
+    firc_tun_ifaddr_t held[] = {ifa4("ezcfg0", 203, 0, 113, 4)};
+    firc_tun_ifaddr_t freed[] = {ifa4("br0", 192, 168, 1, 1)};
+    firc_tun_addr_set_ifaddrs_for_test(held, 1);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 3, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 200);
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, state_of(r.s, "a").status);
+    firc_tun_addr_set_ifaddrs_for_test(freed, 1);
+    firc_loop_add_timer(r.loop, 10, 0, restart_cb, &r, NULL);
+    run_ms(&r, 700);
+    ASSERT_EQ(FIRC_OK, r.cmd_rc2);
+    char buf[256];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(1, count_starts(buf, "tunvless3"));
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    firc_tun_addr_set_ifaddrs_for_test(held, 1);
+    firc_loop_add_timer(r.loop, 10, 0, restart_cb, &r, NULL);
+    run_ms(&r, 700);
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(1, count_starts(buf, "tunvless3"));
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, state_of(r.s, "a").status);
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(2, count_of(log, "ERR tunvless3: 203.0.113.4 is already on ezcfg0\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_v6_holder_is_named_by_its_v6(void)
+{
+    /* catches: an address held only in IPv6 named by the IPv4 the holder does not have */
+    env_setup("ok");
+    log_to_file();
+    firc_tun_ifaddr_t held[1];
+    memset(held, 0, sizeof held);
+    snprintf(held[0].name, sizeof held[0].name, "br0");
+    held[0].family = AF_INET6;
+    static const uint8_t v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xcb, 0x00, 0x71, 0x04};
+    memcpy(held[0].addr, v6, 16);
+    firc_tun_addr_set_ifaddrs_for_test(held, 1);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 3, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, state_of(r.s, "a").status);
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "ERR tunvless3: 2001:db8::cb00:7104 is already on br0\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_unreadable_address_list_warns_once_and_starts(void)
+{
+    /* catches: a skipped check said nowhere or on every spawn, or a tunnel kept down when the list cannot be read */
+    env_setup("ok");
+    log_to_file();
+    firc_tun_addr_fail_ifaddrs_for_test(true);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 3, links, 1);
+    tun_init(&t2, "a", 3, links, 1);
+    t2.active = 2;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 700);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    run_ms(&r, 1200);
+    char buf[256];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(2, count_starts(buf, "tunvless3"));
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "WRN tunvless3: cannot read the interface addresses, 203.0.113.4 not checked\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
 TEST an_inbounds_ack_count_mismatch_stops_trusting_node_numbers(void)
 {
     /* catches: node numbers still mapped to list positions after tunvless refused an inbound line */
@@ -2504,5 +2659,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_null_inbounds_text_is_the_empty_command);
     RUN_TEST(an_inbound_link_takes_a_node_number);
     RUN_TEST(a_full_node_index_from_inbounds_is_warned_once);
+    RUN_TEST(an_address_held_elsewhere_stops_the_spawn);
+    RUN_TEST(a_restart_request_rechecks_bad_config);
+    RUN_TEST(a_v6_holder_is_named_by_its_v6);
+    RUN_TEST(an_unreadable_address_list_warns_once_and_starts);
     GREATEST_MAIN_END();
 }
