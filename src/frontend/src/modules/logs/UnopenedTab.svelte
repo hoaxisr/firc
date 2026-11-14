@@ -362,13 +362,13 @@
                   onclick={() => void probe(c)}
                   disabled={c.state === "checking" || locked || !data.running}>{t("Check")}</Button
                 >
-                <Button
-                  aria-label={t("Dismiss for a day")}
-                  title={t("Dismiss for a day")}
-                  onclick={() => void dismiss(c)}
-                  inactive={locked}><X size={14} aria-hidden="true" /></Button
-                >
               {/if}
+              <Button
+                aria-label={t("Dismiss for a day")}
+                title={t("Dismiss for a day")}
+                onclick={() => void dismiss(c)}
+                inactive={locked}><X size={14} aria-hidden="true" /></Button
+              >
             </span>
           </div>
         {/each}

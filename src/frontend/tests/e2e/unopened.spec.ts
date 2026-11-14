@@ -532,6 +532,22 @@ test("in add mode Remove deletes the rule and then dismisses the candidate", asy
   expect(dismiss).toBeGreaterThan(del);
 });
 
+test("hiding an added row dismisses it and leaves its rule in the group", async ({ page }) => {
+  const fake = a1();
+  fake.candidates = [candidate("rutracker.org", "rutracker.org", "no-answer", { state: "added" })];
+  await shell(page, fake);
+  await open(page);
+
+  await page
+    .locator(".row", { hasText: "rutracker.org" })
+    .getByRole("button", { name: "Dismiss for a day" })
+    .click();
+
+  await expect(page.locator("[data-domain]", { hasText: "rutracker.org" })).toHaveCount(0);
+  expect(fake.calls).toContain("POST /api/v1/system/autolist/candidates/rutracker.org/dismiss");
+  expect(fake.calls.filter((c) => c.startsWith("DELETE "))).toEqual([]);
+});
+
 test("To the rule opens the groups tab searching for the domain", async ({ page }) => {
   const fake = a1();
   fake.mode = "add";
