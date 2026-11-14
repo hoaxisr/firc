@@ -229,7 +229,7 @@ BODY {"error":"must be a list","field":"tunnels","tunnel":null}
 STEP 48 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"device":"eth0","enable":false,"id":"t1"}]}
 STATUS 400
-BODY {"error":"must start with tunvless","field":"device","tunnel":"t1"}
+BODY {"error":"must start with tunvless or opkgtun","field":"device","tunnel":"t1"}
 ---
 STEP 49 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"description":"PRAW-1","device":"tunvless0","exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","order":["0000000b:NL-2"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]},{"device":"tunvless1","enable":false,"id":"t2","sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}

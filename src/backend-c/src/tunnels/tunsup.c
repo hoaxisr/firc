@@ -19,6 +19,7 @@
 
 #include "firc/log.h"
 #include "firc/logrep.h"
+#include "firc/tunvless_name.h"
 
 extern char **environ;
 
@@ -748,21 +749,7 @@ static char *node_list(const firc_tunnel_t *t, size_t *len)
 
 static int device_index(const char *device)
 {
-    if (strncmp(device, "tunvless", 8) != 0) {
-        return -1;
-    }
-    const char *p = device + 8;
-    if (*p < '0' || *p > '9' || (p[0] == '0' && p[1] != 0)) {
-        return -1;
-    }
-    int n = 0;
-    for (; *p != 0; p++) {
-        if (*p < '0' || *p > '9' || n > 25) {
-            return -1;
-        }
-        n = n * 10 + (*p - '0');
-    }
-    return n <= 253 ? n : -1;
+    return firc_tunvless_index(device);
 }
 
 static int set_nonblock(int fd)

@@ -395,6 +395,16 @@ describe("device names", () => {
     assert.strictEqual(deviceProblem("tunvless0", set, "t0"), null);
     assert.strictEqual(deviceProblem("tunvless99", set, "t0"), null);
   });
+
+  // Catches opkgtun refused, or tunvless1 and opkgtun1 accepted together (they share one device number).
+  it("accepts opkgtun and counts a number once across both prefixes", () => {
+    const set = [tn("t0", "tunvless0"), tn("t1", "tunvless1")];
+    assert.strictEqual(deviceProblem("opkgtun5", set, "t0"), null);
+    assert.strictEqual(deviceProblem("opkgtun99", set, "t0"), null);
+    assert.strictEqual(deviceProblem("opkgtun1", set, "t0") !== null, true);
+    assert.strictEqual(deviceProblem("opkgtun100", set, "t0") !== null, true);
+    assert.strictEqual(deviceProblem("opkgtun01", set, "t0") !== null, true);
+  });
 });
 
 describe("the description field", () => {

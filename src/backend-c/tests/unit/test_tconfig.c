@@ -227,6 +227,16 @@ TEST a_device_used_twice_is_refused(void) {
     PASS();
 }
 
+/* catches: tunvless0 and opkgtun0 both accepted, sharing one device number */
+TEST an_opkgtun_device_shares_the_tunvless_numbers(void) {
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "tunvless0", "auto", "1", "site", LINK);
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "b1", "opkgtun0", "auto", "1", "site", LINK);
+    ASSERT(refused(doc, "tunnels[1].device", "used twice"));
+    ASSERT(refused_one("a1", "opkgtun100", "auto", "1", "site", LINK, "tunnels[0].device", "N 0..99"));
+    PASS();
+}
+
 /* catches: a tunnel device that could collide with a Keenetic interface */
 TEST a_device_outside_tunvless_is_refused(void) {
     ASSERT(refused_one("a1", "br0", "auto", "1", "site", LINK, "tunnels[0].device", "must start with tunvless"));
@@ -1215,6 +1225,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_saved_file_is_mode_0600);
     RUN_TEST(a_link_with_yaml_syntax_survives_save_and_load);
     RUN_TEST(a_device_used_twice_is_refused);
+    RUN_TEST(an_opkgtun_device_shares_the_tunvless_numbers);
     RUN_TEST(a_device_outside_tunvless_is_refused);
     RUN_TEST(a_tunvless_suffix_that_is_not_a_small_number_is_refused);
     RUN_TEST(an_uplink_through_itself_is_refused);

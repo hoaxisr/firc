@@ -26,10 +26,27 @@ TEST only_a_canonical_tunvless_device_has_a_number(void) {
     PASS();
 }
 
+/* Catches: opkgtun<N> refused, or numbered differently from tunvless<N>. */
+TEST opkgtun_is_numbered_like_tunvless(void) {
+    ASSERT_EQ(0, firc_tunvless_index("opkgtun0"));
+    ASSERT_EQ(42, firc_tunvless_index("opkgtun42"));
+    ASSERT_EQ(99, firc_tunvless_index("opkgtun99"));
+    ASSERT_EQ(-1, firc_tunvless_index("opkgtun100"));
+    ASSERT_EQ(-1, firc_tunvless_index("opkgtun01"));
+    ASSERT_EQ(-1, firc_tunvless_index("opkgtun"));
+    ASSERT_EQ(-1, firc_tunvless_index("opkgtunx"));
+    ASSERT(firc_tunvless_prefixed("opkgtun7"));
+    ASSERT(firc_tunvless_prefixed("tunvless7"));
+    ASSERT(!firc_tunvless_prefixed("br0"));
+    ASSERT(!firc_tunvless_prefixed(NULL));
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(only_a_canonical_tunvless_device_has_a_number);
+    RUN_TEST(opkgtun_is_numbered_like_tunvless);
     GREATEST_MAIN_END();
 }

@@ -147,9 +147,9 @@
     <Collapsible.Root bind:open={more}>
       <Collapsible.Trigger class="more">
         {#if more}<GroupCollapse size={15} />{:else}<ChevronRight size={15} />{/if}
-        {t(
-          "More: connect timeout, certificate check, TCP through the kernel, own CA, device name",
-        )}{helloNote ? `, ${helloNote}` : ""}
+        {t("More: connect timeout, certificate check, TCP through the kernel, own CA")}{helloNote
+          ? `, ${helloNote}`
+          : ""}
       </Collapsible.Trigger>
       <Collapsible.Content forceMount>
         {#snippet child({ props, open })}
