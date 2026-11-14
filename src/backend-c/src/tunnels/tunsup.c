@@ -32,6 +32,11 @@ extern char **environ;
 #define TERM_GRACE_S 5
 #define ACK_S 10
 #define INDEX_MAX 4096
+#define RECOVERY_FLOOR_S 600
+#define NUDGE_FLOOR_S 30
+#define NUDGE_FLOOR_MAX_S 300
+#define NUDGE_SHORT_S 5
+#define NUDGE_SETTLE_S 2
 
 static const char k_inb_verb[] = "inbounds\n";
 static const char k_wake_verb[] = "wake\n";
@@ -81,6 +86,15 @@ typedef struct slot {
     size_t n_want;
     size_t *map_want;
     size_t n_map_want;
+    bool starved;
+    int64_t recovered_ms;
+    int64_t nudged_ms;
+    int nudge_s;
+    int64_t pause_end_ms;
+    int64_t held_ms;
+    bool nudging;
+    bool demand;
+    bool owed;
 } slot_t;
 
 struct firc_tunsup {
@@ -98,6 +112,8 @@ struct firc_tunsup {
     uint64_t seq;
     uint8_t tcp_pool[4];
     uint8_t tcp_pool_len;
+    int settle_timer;
+    int owed_timer;
 };
 
 static void spawn(slot_t *sl);
@@ -295,10 +311,20 @@ static void reaped(slot_t *sl, pid_t pid)
     }
 }
 
+static void let_go(slot_t *sl)
+{
+    if (sl->held_ms != 0 && now_ms() - sl->held_ms >= (int64_t)NUDGE_FLOOR_S * sl->s->second_ms) {
+        sl->nudge_s = 0;
+    }
+    sl->held_ms = 0;
+}
+
 static void exit_one(slot_t *sl, int code)
 {
     firc_tunsup_t *s = sl->s;
     pid_t pid = sl->pid;
+    let_go(sl);
+    sl->owed = false;
     release_io(sl);
     sl->pid = 0;
     sl->run_dev[0] = 0;
@@ -481,9 +507,14 @@ static void took_map(slot_t *sl, firc_tev_t *ev)
     ev->drift = ev->count < 0 || (size_t)ev->count != want;
 }
 
+static bool known_index(const slot_t *sl, int index)
+{
+    return !sl->drift && index >= 0 && (size_t)index < sl->n_ix;
+}
+
 static int pos_of(const slot_t *sl, int index)
 {
-    if (sl->drift || index < 0 || (size_t)index >= sl->n_ix) {
+    if (!known_index(sl, index)) {
         return -1;
     }
     for (size_t i = 0; i < sl->cfg.n_src; i++) {
@@ -495,6 +526,64 @@ static int pos_of(const slot_t *sl, int index)
 }
 
 static void restart_child(slot_t *sl);
+
+static void active_positions(const slot_t *sl, firc_tev_t *ev)
+{
+    size_t n = ev->n_active < 8 ? ev->n_active : 8;
+    size_t left = 0;
+    for (size_t j = 0; j < n; j++) {
+        ev->active_pos[j] = -1;
+        left += known_index(sl, ev->active_index[j]) ? 1 : 0;
+    }
+    for (size_t i = 0; i < sl->cfg.n_src && left > 0; i++) {
+        if (sl->cfg.src[i].kind != FIRC_TUN_SRC_LINK) {
+            continue;
+        }
+        uint64_t h = link_hash(sl->cfg.src[i].link);
+        for (size_t j = 0; j < n; j++) {
+            if (ev->active_pos[j] < 0 && known_index(sl, ev->active_index[j]) && sl->ix[ev->active_index[j]] == h) {
+                ev->active_pos[j] = (int)i;
+                left--;
+            }
+        }
+    }
+}
+
+static bool complete_head(const slot_t *sl, const firc_tev_t *ev, bool part)
+{
+    size_t want = (size_t)sl->cfg.active < 8 ? (size_t)sl->cfg.active : 8;
+    size_t head[8];
+    uint64_t hash[8];
+    size_t n = 0;
+    for (size_t i = 0; i < sl->cfg.n_src && n < want; i++) {
+        if (sl->cfg.src[i].kind != FIRC_TUN_SRC_LINK) {
+            continue;
+        }
+        const char *link = sl->cfg.src[i].link;
+        uint64_t h = link_hash(link);
+        bool seen = false;
+        for (size_t k = 0; k < n && !seen; k++) {
+            seen = hash[k] == h && strcmp(sl->cfg.src[head[k]].link, link) == 0;
+        }
+        if (!seen) {
+            head[n] = i;
+            hash[n++] = h;
+        }
+    }
+    if (ev->n_active > n || (!part && ev->n_active < n)) {
+        return false;
+    }
+    for (size_t j = 0; j < ev->n_active && j < 8; j++) {
+        bool in = false;
+        for (size_t k = 0; k < n && !in; k++) {
+            in = ev->active_pos[j] == (int)head[k];
+        }
+        if (!in) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void ack_cb(firc_loop_t *loop, void *ud)
 {
@@ -522,6 +611,10 @@ static void on_out_line(const char *line, size_t len, void *ud)
     slot_t *sl = ud;
     firc_tev_t ev;
     firc_tun_event_parse(line, len, &ev);
+    if (sl->terminating && (ev.kind == FIRC_TEV_READY || ev.kind == FIRC_TEV_ACTIVE || ev.kind == FIRC_TEV_NO_NODE ||
+                            ev.kind == FIRC_TEV_NODE_UP || ev.kind == FIRC_TEV_NODE_DOWN)) {
+        return;
+    }
     switch (ev.kind) {
     case FIRC_TEV_READY:
         if (ev.dev[0] == 0) {
@@ -567,14 +660,35 @@ static void on_out_line(const char *line, size_t len, void *ud)
         }
         return;
     case FIRC_TEV_ACTIVE:
-        for (size_t i = 0; i < ev.n_active && i < 8; i++) {
-            ev.active_pos[i] = pos_of(sl, ev.active_index[i]);
+        active_positions(sl, &ev);
+        if (ev.n_active > 0 && sl->starved) {
+            int64_t now = now_ms();
+            if (!complete_head(sl, &ev, sl->demand) &&
+                (sl->recovered_ms == 0 || now - sl->recovered_ms >= (int64_t)RECOVERY_FLOOR_S * sl->s->second_ms)) {
+                firc_log_from(FIRC_LOG_INFO, sl->cfg.device, "nodes answer again, starting over from the first");
+                sl->recovered_ms = now;
+                restart_child(sl);
+                return;
+            }
+            sl->starved = false;
+        }
+        if (ev.n_active > 0) {
+            sl->owed = false;
+        }
+        if (ev.n_active == 0) {
+            let_go(sl);
+        } else if (sl->held_ms == 0) {
+            sl->held_ms = now_ms();
         }
         memcpy(sl->st.active, ev.active, sizeof sl->st.active);
         sl->st.n_active = ev.n_active;
         put_status(sl, ev.n_active > 0 ? FIRC_TUN_ST_UP : FIRC_TUN_ST_NO_NODE);
         break;
     case FIRC_TEV_NO_NODE:
+        let_go(sl);
+        sl->starved = true;
+        sl->demand = false;
+        sl->pause_end_ms = now_ms() + (int64_t)ev.retry_s * sl->s->second_ms;
         sl->st.n_active = 0;
         put_status(sl, FIRC_TUN_ST_NO_NODE);
         break;
@@ -975,6 +1089,12 @@ static void spawn(slot_t *sl)
     sl->started_ms = 0;
     sl->n_ix = 0;
     sl->drift = false;
+    sl->starved = sl->nudging;
+    sl->demand = sl->nudging;
+    sl->nudging = false;
+    sl->owed = false;
+    sl->held_ms = 0;
+    sl->pause_end_ms = 0;
     (void)index_add(sl);
     sl->in_buf = node_list(t, &sl->in_len);
     sl->in_off = 0;
@@ -1024,6 +1144,7 @@ static void terminate(slot_t *sl)
 {
     kill(sl->pid, SIGTERM);
     drop_timer(sl->s, &sl->ack_timer);
+    sl->owed = false;
     if (sl->terminating && sl->kill_timer != 0) {
         return;
     }
@@ -1135,6 +1256,7 @@ static void reconfigure(slot_t *sl, const firc_tunnel_t *t, uint32_t mark)
     snprintf(sl->st.device, sizeof sl->st.device, "%s", t->device);
     sl->next_backoff_s = BACKOFF_BASE_S;
     sl->deferred = false;
+    sl->nudging = false;
     drop_timer(sl->s, &sl->restart_timer);
     if (sl->pid > 0) {
         terminate(sl);
@@ -1148,6 +1270,7 @@ static void reconfigure(slot_t *sl, const firc_tunnel_t *t, uint32_t mark)
 static void restart_child(slot_t *sl)
 {
     firc_tunsup_t *s = sl->s;
+    sl->nudging = false;
     sl->start_seq = ++s->seq;
     sl->next_backoff_s = BACKOFF_BASE_S;
     drop_timer(s, &sl->restart_timer);
@@ -1333,6 +1456,8 @@ static bool reap_now(slot_t *sl)
 void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms)
 {
     assert(pthread_equal(s->loop_thread, pthread_self()));
+    drop_timer(s, &s->settle_timer);
+    drop_timer(s, &s->owed_timer);
     for (size_t i = 0; i < s->n; i++) {
         slot_t *sl = s->v[i];
         release_io(sl);
@@ -1368,6 +1493,8 @@ void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms)
             sl->st.last_exit = r == sl->pid ? exit_code(status) : -1;
             sl->pid = 0;
         }
+        let_go(sl);
+        sl->owed = false;
         sl->terminating = false;
         sl->deferred = false;
         sl->run_dev[0] = 0;
@@ -1445,6 +1572,93 @@ firc_err_t firc_tunsup_restart(firc_tunsup_t *s, const char *id)
     }
     restart_child(sl);
     return FIRC_OK;
+}
+
+static void settle_cb(firc_loop_t *loop, void *ud);
+static void owed_cb(firc_loop_t *loop, void *ud);
+
+static void arm_at(firc_tunsup_t *s, int *timer, int64_t at, firc_timer_cb fn)
+{
+    drop_timer(s, timer);
+    int64_t left = at - now_ms();
+    if (firc_loop_add_timer(s->loop, left > 1 ? (uint64_t)left : 1, 0, fn, s, timer) != FIRC_OK) {
+        *timer = 0;
+    }
+}
+
+static size_t pass(firc_tunsup_t *s, bool event)
+{
+    if (!pthread_equal(s->loop_thread, pthread_self()) || s->stopped) {
+        return 0;
+    }
+    size_t n = 0;
+    int64_t now = now_ms();
+    int64_t defer = 0;
+    for (size_t i = 0; i < s->n; i++) {
+        slot_t *sl = s->v[i];
+        if (sl->pid <= 0 || sl->terminating || !sl->starved ||
+            sl->pause_end_ms - now <= (int64_t)NUDGE_SHORT_S * s->second_ms) {
+            sl->owed = false;
+            continue;
+        }
+        if (!event && !sl->owed) {
+            continue;
+        }
+        int floor_s = sl->nudge_s > 0 ? sl->nudge_s : NUDGE_FLOOR_S;
+        int64_t end = sl->nudged_ms + (int64_t)floor_s * s->second_ms;
+        if (sl->nudged_ms != 0 && now < end) {
+            sl->owed = true;
+            defer = defer == 0 || end < defer ? end : defer;
+            continue;
+        }
+        if (sl->nudge_s == 0) {
+            sl->nudge_s = NUDGE_FLOOR_S;
+        } else {
+            sl->nudge_s = sl->nudge_s * 2 > NUDGE_FLOOR_MAX_S ? NUDGE_FLOOR_MAX_S : sl->nudge_s * 2;
+        }
+        firc_log_from(FIRC_LOG_INFO, sl->cfg.device, "the network changed, starting over");
+        sl->nudged_ms = now;
+        restart_child(sl);
+        sl->nudging = true;
+        n++;
+    }
+    if (defer == 0) {
+        drop_timer(s, &s->owed_timer);
+    } else {
+        arm_at(s, &s->owed_timer, defer, owed_cb);
+    }
+    return n;
+}
+
+size_t firc_tunsup_restart_starved(firc_tunsup_t *s)
+{
+    assert(pthread_equal(s->loop_thread, pthread_self()));
+    return pass(s, true);
+}
+
+static void settle_cb(firc_loop_t *loop, void *ud)
+{
+    (void)loop;
+    firc_tunsup_t *s = ud;
+    s->settle_timer = 0;
+    (void)pass(s, true);
+}
+
+static void owed_cb(firc_loop_t *loop, void *ud)
+{
+    (void)loop;
+    firc_tunsup_t *s = ud;
+    s->owed_timer = 0;
+    (void)pass(s, false);
+}
+
+void firc_tunsup_net_changed(firc_tunsup_t *s)
+{
+    assert(pthread_equal(s->loop_thread, pthread_self()));
+    if (!pthread_equal(s->loop_thread, pthread_self()) || s->stopped) {
+        return;
+    }
+    arm_at(s, &s->settle_timer, now_ms() + (int64_t)NUDGE_SETTLE_S * s->second_ms, settle_cb);
 }
 
 uint64_t firc_tunsup_start_seq(const firc_tunsup_t *s)

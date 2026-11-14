@@ -35,7 +35,7 @@ static char g_log[128];
 static char g_fds[128];
 static char g_path[1024];
 
-typedef struct {
+typedef struct rec {
     firc_tunsup_t *s;
     firc_loop_t *loop;
     int backoffs[64];
@@ -70,6 +70,18 @@ typedef struct {
     int map_expect[8];
     bool map_drift[8];
     int n_map;
+    char up_hist[16][64];
+    int n_up_hist;
+    const char *up_on;
+    int n_ready;
+    int n_nn;
+    int n_nup;
+    uint64_t seq_seen[2];
+    int64_t at[2][8];
+    int n_at[2];
+    int want_k;
+    int want_at;
+    bool (*cond)(const struct rec *r);
 } rec_t;
 
 static rec_t *g_open;
@@ -111,6 +123,11 @@ static void env_setup(const char *mode)
     unsetenv("FAKE_CLOSED");
     unsetenv("FAKE_TCPPORT");
     unsetenv("FAKE_STDIN_DIR");
+    for (int i = 1; i <= 8; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "FAKE_RUN_%d", i);
+        unsetenv(name);
+    }
 }
 
 static void env_teardown(void)
@@ -234,8 +251,18 @@ static void tun_init(firc_tunnel_t *t, const char *id, int n, char **links, size
 static void on_event(const firc_tun_state_t *st, const firc_tev_t *ev, void *ud)
 {
     rec_t *r = ud;
+    if (st->status == FIRC_TUN_ST_UP && r->n_up_hist < 16) {
+        char *h = r->up_hist[r->n_up_hist++];
+        h[0] = 0;
+        for (size_t i = 0; i < st->n_active && i < 8; i++) {
+            snprintf(h + strlen(h), 64 - strlen(h), "%s%s", i > 0 ? "," : "", st->active[i]);
+        }
+    }
     if (ev != NULL) {
         r->n_ev++;
+        r->n_ready += ev->kind == FIRC_TEV_READY ? 1 : 0;
+        r->n_nn += ev->kind == FIRC_TEV_NO_NODE ? 1 : 0;
+        r->n_nup += ev->kind == FIRC_TEV_NODE_UP ? 1 : 0;
         if (ev->kind == FIRC_TEV_NODE_DOWN && r->n_down < 16) {
             r->down_pos[r->n_down++] = ev->pos;
         }
@@ -2597,6 +2624,1210 @@ TEST a_command_before_ready_is_refused(void)
     PASS();
 }
 
+#define EV_NN "{\"type\":\"no_node\",\"retry\":5}"
+#define EV_NN6 "{\"type\":\"no_node\",\"retry\":6}"
+#define EV_NN60 "{\"type\":\"no_node\",\"retry\":60}"
+#define EV_NN600 "{\"type\":\"no_node\",\"retry\":600}"
+#define EV_RD "{\"type\":\"ready\",\"dev\":\"tunvless0\"}"
+#define EV_A "{\"type\":\"active\",\"nodes\":[\"A\"],\"index\":[0]}"
+#define EV_B "{\"type\":\"active\",\"nodes\":[\"B\"],\"index\":[1]}"
+#define EV_C "{\"type\":\"active\",\"nodes\":[\"C\"],\"index\":[2]}"
+#define EV_AB "{\"type\":\"active\",\"nodes\":[\"A\",\"B\"],\"index\":[0,1]}"
+#define EV_NONE "{\"type\":\"active\",\"nodes\":[],\"index\":[]}"
+
+static char *g_abc[] = {"vless://u@h0:1#A", "vless://u@h1:1#B", "vless://u@h2:1#C"};
+static firc_tunnel_t g_abc_t;
+static firc_tunnels_t g_abc_set;
+
+static firc_err_t links_open(rec_t *r, char **links, size_t n, int active, int second_ms)
+{
+    tun_init(&g_abc_t, "a", 0, links, n);
+    g_abc_t.active = active;
+    g_abc_set.t = &g_abc_t;
+    g_abc_set.n = 1;
+    rec_open(r);
+    firc_tunsup_set_second_ms_for_test(r->s, second_ms);
+    return firc_tunsup_apply(r->s, &g_abc_set, NULL);
+}
+
+static firc_err_t abc_open(rec_t *r, int active, int second_ms)
+{
+    return links_open(r, g_abc, 3, active, second_ms);
+}
+
+static int starts_now(void)
+{
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    return count_starts(buf, "tunvless0");
+}
+
+static bool up_held(const rec_t *r, const char *list)
+{
+    for (int i = 0; i < r->n_up_hist; i++) {
+        if (strcmp(r->up_hist[i], list) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST a_starved_child_that_found_a_later_node_is_restarted_once(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_C, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starts(&r, 2, 3000);
+    run_ms(&r, 400);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(1, st.n_active);
+    ASSERT_STR_EQ("A", st.active[0]);
+    ASSERT(up_held(&r, "A"));
+    ASSERT_FALSE(up_held(&r, "C"));
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "INF tunvless0: nodes answer again, starting over from the first\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_failover_without_no_node_is_not_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_RD "\n" EV_A "\n" EV_NONE "\n" EV_B, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_ms(&r, 800);
+    ASSERT_EQ(1, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(1, st.n_active);
+    ASSERT_STR_EQ("B", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_starved_child_back_on_the_head_is_not_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_RD "\n" EV_A "\n" EV_NN "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_ms(&r, 800);
+    ASSERT_EQ(1, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("A", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_starved_child_with_half_the_head_is_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_A, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_AB, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 2, 1000));
+    run_until_starts(&r, 2, 3000);
+    run_ms(&r, 400);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(2, st.n_active);
+    ASSERT_STR_EQ("A", st.active[0]);
+    ASSERT_STR_EQ("B", st.active[1]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_starved_child_on_the_second_node_is_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_B, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starts(&r, 2, 3000);
+    run_ms(&r, 400);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("A", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static void until_up_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    firc_tun_state_t st = state_of(r->s, "a");
+    if (starts_now() >= r->want_starts && st.status == FIRC_TUN_ST_UP &&
+        (r->up_on == NULL || (st.n_active > 0 && strcmp(st.active[0], r->up_on) == 0))) {
+        firc_loop_stop(loop);
+    }
+}
+
+static void run_until_up_on_start(rec_t *r, int n, uint64_t deadline_ms)
+{
+    r->want_starts = n;
+    int id = 0;
+    firc_loop_add_timer(r->loop, 5, 5, until_up_cb, r, &id);
+    run_ms(r, deadline_ms);
+    firc_loop_del_timer(r->loop, id);
+}
+
+TEST a_second_recovery_inside_the_floor_is_not_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_C, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 5));
+    run_until_up_on_start(&r, 2, 3000);
+    run_ms(&r, 100);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("C", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_recovery_after_the_floor_is_restarted_again(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_C, 1);
+    setenv("FAKE_RUN_2", EV_NN "\n" EV_RD "\n" EV_C "\nsleep 2.3\n" EV_NN "\n" EV_B, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 2));
+    run_until_up_on_start(&r, 3, 10000);
+    run_ms(&r, 100);
+    ASSERT_EQ(3, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("A", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_no_node_from_a_run_that_ended_does_not_restart_the_next(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\nexit 1", 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_B, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 50));
+    run_until_starts(&r, 2, 3000);
+    run_ms(&r, 500);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("B", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_recovery_swallowed_by_the_floor_clears_the_starving(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_C, 1);
+    setenv("FAKE_RUN_2", EV_NN "\n" EV_RD "\n" EV_C "\nsleep 2.3\n" EV_NONE "\n" EV_B, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 2));
+    r.up_on = "B";
+    run_until_up_on_start(&r, 2, 10000);
+    run_ms(&r, 100);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("B", st.active[0]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_tunnel_with_fewer_links_than_slots_is_not_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, links_open(&r, g_abc, 1, 2, 1000));
+    run_until_up_on_start(&r, 1, 3000);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST duplicate_links_do_not_hide_the_head(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n" EV_AB, 1);
+    static char *aab[] = {"vless://u@h0:1#A", "vless://u@h0:1#A", "vless://u@h1:1#B"};
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, links_open(&r, aab, 3, 2, 1000));
+    run_until_up_on_start(&r, 1, 3000);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(2, st.n_active);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_unnumbered_node_is_not_the_head(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN "\n" EV_RD "\n{\"type\":\"active\",\"nodes\":[\"A\"]}", 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_up_on_start(&r, 2, 3000);
+    run_ms(&r, 300);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static void until_starved_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    if (starts_now() >= r->want_starts && state_of(r->s, "a").status == FIRC_TUN_ST_NO_NODE) {
+        firc_loop_stop(loop);
+    }
+}
+
+static void run_until_starved_on_start(rec_t *r, int n, uint64_t deadline_ms)
+{
+    r->want_starts = n;
+    int id = 0;
+    firc_loop_add_timer(r->loop, 5, 5, until_starved_cb, r, &id);
+    run_ms(r, deadline_ms);
+    firc_loop_del_timer(r->loop, id);
+}
+
+TEST a_starved_child_is_restarted_on_demand(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_RUN_1", EV_NN60, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    run_until_starts(&r, 2, 3000);
+    run_ms(&r, 300);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "INF tunvless0: the network changed, starting over\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_child_with_a_node_is_not_restarted_on_demand(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_up_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_child_that_has_not_starved_is_not_restarted_on_demand(void)
+{
+    env_setup("runs");
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starts(&r, 1, 3000);
+    run_ms(&r, 100);
+    ASSERT_EQ(1, starts_now());
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_starved_child_that_lost_its_node_again_is_restarted_on_demand(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_RD "\n" EV_A "\n" EV_NN60, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    run_until_starts(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_active_that_arrives_while_terminating_does_not_restart_again(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_STUBBORN_DEV", "tunvless0", 1);
+    setenv("FAKE_RUN_1",
+           EV_NN60 "\nsleep 1\n" EV_RD "\n{\"type\":\"active\",\"nodes\":[\"B\",\"C\"],\"index\":[1,2]}\n" EV_NN60
+                   "\n{\"type\":\"node_up\",\"node\":\"B\",\"index\":1}\n{\"type\":\"node_down\",\"node\":\"C\","
+                   "\"why\":\"x\",\"index\":2}",
+           1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 400));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    r.up_on = "A";
+    run_until_up_on_start(&r, 2, 6000);
+    ASSERT_EQ(2, starts_now());
+    ASSERT_EQ(1, r.n_ready);
+    ASSERT_EQ(1, r.n_nn);
+    ASSERT_EQ(0, r.n_nup);
+    ASSERT_EQ(0, r.n_down);
+    ASSERT(r.n_up_hist > 0);
+    for (int i = 0; i < r.n_up_hist; i++) {
+        ASSERT_STR_EQ("A", r.up_hist[i]);
+    }
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "INF tunvless0: the network changed, starting over\n"));
+    ASSERT_EQ(0, count_of(log, "nodes answer again"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_starved_child_in_backoff_is_not_restarted_on_demand(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN60 "\nexit 1", 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_B, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 300));
+    run_until_backoffs(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_BACKOFF, state_of(r.s, "a").status);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    run_until_starts(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static void run_to(rec_t *r, int64_t since, int64_t ms)
+{
+    int64_t left = since + ms - now_ms();
+    if (left > 0) {
+        run_ms(r, (uint64_t)left);
+    }
+}
+
+TEST a_burst_of_network_changes_restarts_once_after_it_settles(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN60, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 750));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    firc_tunsup_net_changed(r.s);
+    run_ms(&r, 300);
+    firc_tunsup_net_changed(r.s);
+    run_ms(&r, 300);
+    firc_tunsup_net_changed(r.s);
+    int64_t last = now_ms();
+    run_ms(&r, 300);
+    int quiet_starts = starts_now();
+    if (now_ms() - last >= 1400) {
+        SKIPm("the look after the burst came too late");
+    }
+    ASSERT_EQ(1, quiet_starts);
+    run_until_starts(&r, 2, 4000);
+    ASSERT_EQ(2, starts_now());
+    ASSERT(now_ms() - last >= 1480);
+    run_ms(&r, 600);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_child_about_to_look_again_is_left_alone(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 2000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 200);
+    ASSERT_EQ(1, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN6, 1);
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 2000));
+    run_until_starved_on_start(&r, 1, 3000);
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, st.status);
+    size_t n = firc_tunsup_restart_starved(r.s);
+    if (now_ms() - st.since_ms >= 1800) {
+        SKIPm("the demand came too long after no_node");
+    }
+    ASSERT_EQ(1, n);
+    run_until_starts(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static int64_t start_gap(rec_t *r, int n, int64_t since, uint64_t deadline_ms)
+{
+    run_until_starts(r, n, deadline_ms);
+    return now_ms() - since;
+}
+
+static const char *const g_ab_ids[2] = {"a", "b"};
+
+static void watch_sync(rec_t *r)
+{
+    for (int k = 0; k < 2; k++) {
+        r->seq_seen[k] = firc_tunsup_started(r->s, g_ab_ids[k]);
+        r->n_at[k] = 0;
+    }
+}
+
+static void seq_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    int64_t now = now_ms();
+    for (int k = 0; k < 2; k++) {
+        uint64_t q = firc_tunsup_started(r->s, g_ab_ids[k]);
+        if (q != r->seq_seen[k] && r->n_at[k] < 8) {
+            r->at[k][r->n_at[k]++] = now;
+        }
+        r->seq_seen[k] = q;
+    }
+    if (r->want_k >= 0 && r->n_at[r->want_k] >= r->want_at) {
+        firc_loop_stop(loop);
+    }
+}
+
+static void watch_restarts(rec_t *r)
+{
+    watch_sync(r);
+    r->want_k = -1;
+    int id = 0;
+    firc_loop_add_timer(r->loop, 2, 2, seq_cb, r, &id);
+}
+
+static int64_t run_until_restart(rec_t *r, int k, int n, uint64_t deadline_ms)
+{
+    r->want_k = k;
+    r->want_at = n;
+    if (r->n_at[k] < n) {
+        run_ms(r, deadline_ms);
+    }
+    r->want_k = -1;
+    return r->n_at[k] >= n ? r->at[k][n - 1] : -1;
+}
+
+static void cond_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    if (r->cond(r)) {
+        firc_loop_stop(loop);
+    }
+}
+
+static void run_until_cond(rec_t *r, bool (*cond)(const rec_t *r), uint64_t deadline_ms)
+{
+    r->cond = cond;
+    int id = 0;
+    firc_loop_add_timer(r->loop, 5, 5, cond_cb, r, &id);
+    if (!cond(r)) {
+        run_ms(r, deadline_ms);
+    }
+    firc_loop_del_timer(r->loop, id);
+}
+
+TEST the_floor_doubles_while_the_tunnel_stays_starved(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 40));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    watch_restarts(&r);
+    run_until_starved_on_start(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    ASSERT(now_ms() - b < 25 * 40);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    int64_t at = run_until_restart(&r, 0, 1, 60 * 40);
+    ASSERT(at > 0);
+    ASSERT(at - b >= 29 * 40 && at - b <= 45 * 40);
+    b = at;
+    run_until_starved_on_start(&r, 3, 3000);
+    run_to(&r, b, 31 * 40);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    at = run_until_restart(&r, 0, 2, 90 * 40);
+    ASSERT(at > 0);
+    ASSERT(at - b >= 59 * 40 && at - b <= 75 * 40);
+    run_until_starts(&r, 4, 3000);
+    ASSERT_EQ(4, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST the_floor_stops_at_three_hundred(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 4));
+    static const int64_t gap[] = {0, 40, 70, 130, 250};
+    int64_t b = 0;
+    for (int k = 0; k < 5; k++) {
+        run_until_starved_on_start(&r, k + 1, 3000);
+        ASSERT_EQ(k + 1, starts_now());
+        run_to(&r, b, gap[k] * 4);
+        ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+        b = now_ms();
+    }
+    run_until_starved_on_start(&r, 6, 3000);
+    ASSERT_EQ(6, starts_now());
+    run_to(&r, b, 240 * 4);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    int64_t late = start_gap(&r, 7, b, 3000);
+    ASSERT_EQ(7, starts_now());
+    ASSERT(late >= 299 * 4 && late <= 400 * 4);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static void until_starved_after_a_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    if (starts_now() >= r->want_starts && up_held(r, "A") && state_of(r->s, "a").status == FIRC_TUN_ST_NO_NODE) {
+        firc_loop_stop(loop);
+    }
+}
+
+TEST after_a_node_the_floor_starts_from_thirty_again(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_A "\nsleep 2\n" EV_NN600, 1);
+    setenv("FAKE_RUN_4", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 50));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    run_until_starved_on_start(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    run_to(&r, b, 31 * 50);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    b = now_ms();
+    r.want_starts = 3;
+    int id = 0;
+    firc_loop_add_timer(r.loop, 5, 5, until_starved_after_a_cb, &r, &id);
+    run_ms(&r, 6000);
+    firc_loop_del_timer(r.loop, id);
+    ASSERT_EQ(3, starts_now());
+    ASSERT(up_held(&r, "A"));
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    ASSERT(now_ms() - b < 55 * 50);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    b = now_ms();
+    run_until_starved_on_start(&r, 4, 3000);
+    ASSERT_EQ(4, starts_now());
+    run_to(&r, b, 15 * 50);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    int64_t gap = start_gap(&r, 5, b, 60 * 50);
+    ASSERT_EQ(5, starts_now());
+    ASSERT(gap >= 29 * 50 && gap <= 45 * 50);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_stopped_supervisor_drops_the_settle(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN60, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 100));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    firc_tunsup_net_changed(r.s);
+    firc_tunsup_stop(r.s, 1000);
+    firc_tunsup_free(r.s);
+    r.s = NULL;
+    run_ms(&r, 600);
+    ASSERT_EQ(1, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static void until_both_cb(firc_loop_t *loop, void *ud)
+{
+    rec_t *r = ud;
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    if (count_starts(buf, "tunvless0") >= r->want_starts && count_starts(buf, "tunvless1") >= r->want_starts &&
+        state_of(r->s, "a").status == FIRC_TUN_ST_NO_NODE && state_of(r->s, "b").status == FIRC_TUN_ST_NO_NODE) {
+        firc_loop_stop(loop);
+    }
+}
+
+static void run_until_both_starved(rec_t *r, int n, uint64_t deadline_ms)
+{
+    r->want_starts = n;
+    int id = 0;
+    firc_loop_add_timer(r->loop, 5, 5, until_both_cb, r, &id);
+    run_ms(r, deadline_ms);
+    firc_loop_del_timer(r->loop, id);
+}
+
+TEST two_starved_tunnels_are_both_restarted(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN60, 1);
+    firc_tunnel_t t[2];
+    tun_init(&t[0], "a", 0, g_abc, 3);
+    tun_init(&t[1], "b", 1, g_abc, 3);
+    firc_tunnels_t set = {.t = t, .n = 2};
+    static rec_t r;
+    rec_open(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_until_both_starved(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "b").status);
+    ASSERT_EQ(2, firc_tunsup_restart_starved(r.s));
+    run_until_both_starved(&r, 2, 3000);
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(2, count_starts(buf, "tunvless0"));
+    ASSERT_EQ(2, count_starts(buf, "tunvless1"));
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_retired_starved_tunnel_is_not_restarted(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_STUBBORN_DEV", "tunvless0", 1);
+    setenv("FAKE_RUN_1", EV_NN60, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(r.s, "a").status);
+    firc_tunnels_t none = {.t = NULL, .n = 0};
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &none, NULL));
+    run_ms(&r, 100);
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(0, kill(nth_pid(buf, "tunvless0", 0), 0));
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_now());
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(0, count_of(log, "the network changed"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_node_held_for_a_moment_does_not_reset_the_floor(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_RD "\n" EV_A "\n" EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 50));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    watch_restarts(&r);
+    run_until_starved_on_start(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    ASSERT(up_held(&r, "A"));
+    run_to(&r, b, 15 * 50);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    int64_t at = run_until_restart(&r, 0, 1, 60 * 50);
+    ASSERT(at > 0);
+    ASSERT(at - b >= 29 * 50 && at - b <= 45 * 50);
+    b = at;
+    run_until_starved_on_start(&r, 3, 3000);
+    ASSERT(up_held(&r, "A"));
+    run_to(&r, b, 31 * 50);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    at = run_until_restart(&r, 0, 2, 90 * 50);
+    ASSERT(at > 0);
+    ASSERT(at - b >= 59 * 50 && at - b <= 75 * 50);
+    run_until_starts(&r, 4, 3000);
+    ASSERT_EQ(4, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_change_refused_by_the_floor_is_served_when_it_ends(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 30));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    watch_restarts(&r);
+    run_until_starved_on_start(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    run_to(&r, b, 10 * 30);
+    firc_tunsup_net_changed(r.s);
+    run_to(&r, b, 20 * 30);
+    ASSERT_EQ(0, r.n_at[0]);
+    ASSERT_EQ(2, starts_now());
+    int64_t at = run_until_restart(&r, 0, 1, 50 * 30);
+    ASSERT(at > 0);
+    ASSERT(at - b >= 29 * 30);
+    ASSERT(at - b <= 55 * 30);
+    run_to(&r, b, 100 * 30);
+    ASSERT_EQ(1, r.n_at[0]);
+    ASSERT_EQ(3, starts_now());
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(2, count_of(log, "INF tunvless0: the network changed, starting over\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static int b_starts(void)
+{
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    return count_starts(buf, "tunvless1");
+}
+
+static bool a_up_twice(const rec_t *r)
+{
+    return starts_now() >= 2 && state_of(r->s, "a").status == FIRC_TUN_ST_UP;
+}
+
+static bool b_starved_once(const rec_t *r)
+{
+    return b_starts() >= 1 && state_of(r->s, "b").status == FIRC_TUN_ST_NO_NODE;
+}
+
+static bool b_up_once(const rec_t *r)
+{
+    return b_starts() >= 1 && state_of(r->s, "b").status == FIRC_TUN_ST_UP;
+}
+
+static bool b_starved(const rec_t *r)
+{
+    return state_of(r->s, "b").status == FIRC_TUN_ST_NO_NODE;
+}
+
+static bool both_starved_again(const rec_t *r)
+{
+    return b_starts() >= 2 && state_of(r->s, "a").status == FIRC_TUN_ST_NO_NODE &&
+           state_of(r->s, "b").status == FIRC_TUN_ST_NO_NODE;
+}
+
+static firc_tunnel_t g_ab_t[2];
+
+static firc_err_t ab_open(rec_t *r, int second_ms)
+{
+    tun_init(&g_ab_t[0], "a", 0, g_abc, 3);
+    tun_init(&g_ab_t[1], "b", 1, g_abc, 3);
+    firc_tunnels_t one = {.t = g_ab_t, .n = 1};
+    rec_open(r);
+    firc_tunsup_set_second_ms_for_test(r->s, second_ms);
+    return firc_tunsup_apply(r->s, &one, NULL);
+}
+
+static firc_err_t ab_add_b(rec_t *r)
+{
+    firc_tunnels_t two = {.t = g_ab_t, .n = 2};
+    return firc_tunsup_apply(r->s, &two, NULL);
+}
+
+TEST one_change_does_not_keep_two_dead_tunnels_restarting(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A "\nsleep 1\n" EV_NN600, 1);
+    setenv("FAKE_RUN_3", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, ab_open(&r, 80));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t t0 = now_ms();
+    watch_restarts(&r);
+    run_until_cond(&r, a_up_twice, 3000);
+    ASSERT(a_up_twice(&r));
+    ASSERT_EQ(FIRC_OK, ab_add_b(&r));
+    run_until_cond(&r, b_starved_once, 3000);
+    ASSERT(b_starved_once(&r));
+    run_to(&r, t0, 6 * 80);
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t t1 = now_ms();
+    watch_sync(&r);
+    run_until_cond(&r, both_starved_again, 3000);
+    ASSERT(both_starved_again(&r));
+    run_to(&r, t0, 16 * 80);
+    ASSERT(now_ms() - t0 <= 24 * 80);
+    firc_tunsup_net_changed(r.s);
+    int64_t ra = run_until_restart(&r, 0, 1, 60 * 80);
+    int64_t rb = run_until_restart(&r, 1, 1, 60 * 80);
+    ASSERT(ra > 0 && rb > 0);
+    ASSERT(ra - t0 >= 29 * 80 && ra - t0 <= 40 * 80);
+    ASSERT(rb - t1 >= 29 * 80 && rb - t1 <= 40 * 80);
+    run_to(&r, rb, 70 * 80);
+    ASSERT_EQ(1, r.n_at[0]);
+    ASSERT_EQ(1, r.n_at[1]);
+    ASSERT_EQ(3, starts_now());
+    ASSERT_EQ(3, b_starts());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_tunnel_that_starved_after_the_change_is_not_served_by_it(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_NN600, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_A "\nsleep 0.6\n" EV_NN600, 1);
+    setenv("FAKE_RUN_4", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, ab_open(&r, 40));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t t0 = now_ms();
+    run_until_starved_on_start(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    ASSERT_EQ(FIRC_OK, ab_add_b(&r));
+    watch_restarts(&r);
+    run_until_cond(&r, b_up_once, 3000);
+    ASSERT(b_up_once(&r));
+    run_to(&r, t0, 8 * 40);
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "b").status);
+    firc_tunsup_net_changed(r.s);
+    run_until_cond(&r, b_starved, 3000);
+    ASSERT(b_starved(&r));
+    ASSERT(now_ms() - t0 <= 27 * 40);
+    int64_t ra = run_until_restart(&r, 0, 1, 40 * 40);
+    ASSERT(ra > 0);
+    ASSERT(ra - t0 >= 29 * 40 && ra - t0 <= 45 * 40);
+    run_ms(&r, 8 * 40);
+    ASSERT_EQ(1, r.n_at[0]);
+    ASSERT_EQ(0, r.n_at[1]);
+    ASSERT_EQ(1, b_starts());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+static bool nn_reached(const rec_t *r)
+{
+    return r->n_nn >= r->want_starts;
+}
+
+static void run_until_nn(rec_t *r, int n, uint64_t deadline_ms)
+{
+    r->want_starts = n;
+    run_until_cond(r, nn_reached, deadline_ms);
+}
+
+static enum greatest_test_res floor_after_a_hold(const char *run2, const char *run3, size_t want)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", run2, 1);
+    setenv("FAKE_RUN_3", run3, 1);
+    setenv("FAKE_RUN_4", EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 20));
+    run_until_nn(&r, 1, 3000);
+    ASSERT_EQ(1, r.n_nn);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    run_until_nn(&r, 2, 4000);
+    ASSERT_EQ(2, r.n_nn);
+    ASSERT(up_held(&r, "A"));
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    run_until_nn(&r, 3, 3000);
+    ASSERT_EQ(3, r.n_nn);
+    run_to(&r, b, 31 * 20);
+    ASSERT_EQ(want, firc_tunsup_restart_starved(r.s));
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_node_after_the_change_cancels_what_it_owed(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_NN600 "\nsleep 0.6\n" EV_RD "\n" EV_A "\nsleep 0.2\n" EV_NN600, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 40));
+    run_until_nn(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t t0 = now_ms();
+    watch_restarts(&r);
+    run_until_nn(&r, 2, 3000);
+    ASSERT_EQ(2, r.n_nn);
+    run_to(&r, t0, 8 * 40);
+    firc_tunsup_net_changed(r.s);
+    run_until_nn(&r, 3, 3000);
+    ASSERT_EQ(3, r.n_nn);
+    ASSERT(up_held(&r, "A"));
+    ASSERT(now_ms() - t0 <= 27 * 40);
+    run_to(&r, t0, 40 * 40);
+    ASSERT_EQ(0, r.n_at[0]);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_hold_counts_from_the_first_node_of_the_run(void)
+{
+    CHECK_CALL(floor_after_a_hold(EV_RD "\n" EV_A "\nsleep 0.4\n" EV_AB "\nsleep 0.4\n" EV_NN600, EV_NN600, 1));
+    PASS();
+}
+
+TEST a_short_hold_ended_by_an_exit_does_not_reset_the_floor(void)
+{
+    CHECK_CALL(floor_after_a_hold(EV_RD "\n" EV_A "\nsleep 0.1\nexit 1", "sleep 0.8\n" EV_NN600, 0));
+    PASS();
+}
+
+TEST a_long_hold_ended_by_an_exit_resets_the_floor(void)
+{
+    CHECK_CALL(floor_after_a_hold(EV_RD "\n" EV_A "\nsleep 0.8\nexit 1", EV_NN600, 1));
+    PASS();
+}
+
+TEST an_empty_active_ends_the_hold(void)
+{
+    CHECK_CALL(floor_after_a_hold(EV_RD "\n" EV_A "\nsleep 0.1\n" EV_NONE "\nsleep 0.8\n" EV_NN600, EV_NN600, 0));
+    PASS();
+}
+
+TEST a_run_started_on_demand_still_expects_the_head(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_C, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    r.up_on = "A";
+    run_until_up_on_start(&r, 3, 6000);
+    run_ms(&r, 300);
+    ASSERT_EQ(3, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_STR_EQ("A", st.active[0]);
+    ASSERT_FALSE(up_held(&r, "C"));
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(1, count_of(log, "INF tunvless0: nodes answer again, starting over from the first\n"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_run_started_on_demand_that_takes_the_head_stays(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    r.up_on = "A";
+    run_until_up_on_start(&r, 2, 3000);
+    run_ms(&r, 300);
+    ASSERT_EQ(2, starts_now());
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_run_started_on_demand_with_part_of_the_head_stays(void)
+{
+    env_setup("runs");
+    log_to_file();
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_RD "\n" EV_A "\nsleep 0.2\n" EV_AB, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_AB, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 2, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    r.up_on = "A";
+    run_until_up_on_start(&r, 2, 3000);
+    run_ms(&r, 800);
+    ASSERT_EQ(2, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(2, st.n_active);
+    ASSERT_STR_EQ("A", st.active[0]);
+    ASSERT_STR_EQ("B", st.active[1]);
+    rec_close(&r);
+    log_done();
+    char log[4096];
+    read_file(g_log, log, sizeof log);
+    ASSERT_EQ(0, count_of(log, "nodes answer again"));
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_run_started_on_demand_that_starves_itself_needs_the_whole_head(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_NN600 "\n" EV_RD "\n" EV_A, 1);
+    setenv("FAKE_RUN_3", EV_RD "\n" EV_AB, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 2, 1000));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    run_until_starts(&r, 3, 3000);
+    run_ms(&r, 800);
+    ASSERT_EQ(3, starts_now());
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_UP, st.status);
+    ASSERT_EQ(2, st.n_active);
+    ASSERT_STR_EQ("B", st.active[1]);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_run_started_on_demand_waits_for_its_own_no_node(void)
+{
+    env_setup("runs");
+    setenv("FAKE_RUN_1", EV_NN600, 1);
+    setenv("FAKE_RUN_2", EV_RD, 1);
+    static rec_t r;
+    ASSERT_EQ(FIRC_OK, abc_open(&r, 1, 40));
+    run_until_starved_on_start(&r, 1, 3000);
+    ASSERT_EQ(1, firc_tunsup_restart_starved(r.s));
+    int64_t b = now_ms();
+    run_until_starts(&r, 2, 3000);
+    ASSERT_EQ(2, starts_now());
+    run_to(&r, b, 31 * 40);
+    ASSERT_EQ(0, firc_tunsup_restart_starved(r.s));
+    run_ms(&r, 300);
+    ASSERT_EQ(2, starts_now());
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2659,6 +3890,46 @@ int main(int argc, char **argv)
     RUN_TEST(a_null_inbounds_text_is_the_empty_command);
     RUN_TEST(an_inbound_link_takes_a_node_number);
     RUN_TEST(a_full_node_index_from_inbounds_is_warned_once);
+    RUN_TEST(a_starved_child_that_found_a_later_node_is_restarted_once);
+    RUN_TEST(a_failover_without_no_node_is_not_restarted);
+    RUN_TEST(a_starved_child_back_on_the_head_is_not_restarted);
+    RUN_TEST(a_starved_child_with_half_the_head_is_restarted);
+    RUN_TEST(a_starved_child_on_the_second_node_is_restarted);
+    RUN_TEST(a_second_recovery_inside_the_floor_is_not_restarted);
+    RUN_TEST(a_recovery_after_the_floor_is_restarted_again);
+    RUN_TEST(a_no_node_from_a_run_that_ended_does_not_restart_the_next);
+    RUN_TEST(a_recovery_swallowed_by_the_floor_clears_the_starving);
+    RUN_TEST(a_tunnel_with_fewer_links_than_slots_is_not_restarted);
+    RUN_TEST(duplicate_links_do_not_hide_the_head);
+    RUN_TEST(an_unnumbered_node_is_not_the_head);
+    RUN_TEST(a_starved_child_is_restarted_on_demand);
+    RUN_TEST(a_child_with_a_node_is_not_restarted_on_demand);
+    RUN_TEST(a_child_that_has_not_starved_is_not_restarted_on_demand);
+    RUN_TEST(a_starved_child_that_lost_its_node_again_is_restarted_on_demand);
+    RUN_TEST(an_active_that_arrives_while_terminating_does_not_restart_again);
+    RUN_TEST(a_starved_child_in_backoff_is_not_restarted_on_demand);
+    RUN_TEST(a_burst_of_network_changes_restarts_once_after_it_settles);
+    RUN_TEST(a_child_about_to_look_again_is_left_alone);
+    RUN_TEST(the_floor_doubles_while_the_tunnel_stays_starved);
+    RUN_TEST(the_floor_stops_at_three_hundred);
+    RUN_TEST(after_a_node_the_floor_starts_from_thirty_again);
+    RUN_TEST(a_stopped_supervisor_drops_the_settle);
+    RUN_TEST(two_starved_tunnels_are_both_restarted);
+    RUN_TEST(a_retired_starved_tunnel_is_not_restarted);
+    RUN_TEST(a_node_held_for_a_moment_does_not_reset_the_floor);
+    RUN_TEST(a_change_refused_by_the_floor_is_served_when_it_ends);
+    RUN_TEST(one_change_does_not_keep_two_dead_tunnels_restarting);
+    RUN_TEST(a_tunnel_that_starved_after_the_change_is_not_served_by_it);
+    RUN_TEST(a_node_after_the_change_cancels_what_it_owed);
+    RUN_TEST(a_hold_counts_from_the_first_node_of_the_run);
+    RUN_TEST(a_short_hold_ended_by_an_exit_does_not_reset_the_floor);
+    RUN_TEST(a_long_hold_ended_by_an_exit_resets_the_floor);
+    RUN_TEST(an_empty_active_ends_the_hold);
+    RUN_TEST(a_run_started_on_demand_still_expects_the_head);
+    RUN_TEST(a_run_started_on_demand_that_takes_the_head_stays);
+    RUN_TEST(a_run_started_on_demand_with_part_of_the_head_stays);
+    RUN_TEST(a_run_started_on_demand_that_starves_itself_needs_the_whole_head);
+    RUN_TEST(a_run_started_on_demand_waits_for_its_own_no_node);
     RUN_TEST(an_address_held_elsewhere_stops_the_spawn);
     RUN_TEST(a_restart_request_rechecks_bad_config);
     RUN_TEST(a_v6_holder_is_named_by_its_v6);

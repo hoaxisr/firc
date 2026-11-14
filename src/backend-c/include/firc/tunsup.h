@@ -91,6 +91,15 @@ bool firc_tunsup_holds(const firc_tunsup_t *s, const char *id, uint32_t mark);
 /* Restarts the child of tunnel id even when nothing changed; FIRC_ERR_NOENT unknown, FIRC_ERR_STATE disabled. */
 firc_err_t firc_tunsup_restart(firc_tunsup_t *s, const char *id);
 
+/* Restarts every live child that reported no_node in this run and has more than 5 s of its pause left, 30 s after
+   its last such restart at the soonest, doubling to 300 s, from 30 s again once a node was held 30 s; a child held
+   back by that floor alone is restarted once when it ends, unless it got a node or restarted meanwhile; returns how
+   many it restarted. */
+size_t firc_tunsup_restart_starved(firc_tunsup_t *s);
+
+/* The network changed: runs firc_tunsup_restart_starved 2 s after the last of a burst of calls. */
+void firc_tunsup_net_changed(firc_tunsup_t *s);
+
 /* A counter raised each time a child is (re)started or sent new nodes; started() and updated() are its
    value at id's last start and last node update, 0 never. */
 uint64_t firc_tunsup_start_seq(const firc_tunsup_t *s);

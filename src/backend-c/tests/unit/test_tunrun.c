@@ -3199,6 +3199,72 @@ TEST pruning_alone_does_not_restart_the_tunnel(void)
     PASS();
 }
 
+TEST an_event_on_another_interface_restarts_a_starved_tunnel(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, "eth0");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 1000));
+    ASSERT_EQ(2, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_with_no_name_is_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, NULL);
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 1000));
+    ASSERT_EQ(2, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_a_tunnel_s_own_device_is_not_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, "tunvless0");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_another_tunnel_s_device_is_not_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS "  - id: b\n    device: tunvless1\n    sources:\n"
+                            "      - id: 0000000c\n        link: \"vless://" U "@c.example:443?security=none#C\"\n");
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "b", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    ASSERT_EQ(1, starts_of(&f, "tunvless1"));
+    firc_tunrun_net_event(f.run, "tunvless1");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 6000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless1"));
+    fx_down(&f);
+    PASS();
+}
+
 SUITE(tunrun)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -3296,6 +3362,10 @@ SUITE(tunrun)
     RUN_TEST(a_refresh_drops_keys_its_body_no_longer_gives_and_writes_the_file);
     RUN_TEST(a_refresh_leaves_a_hand_edited_file_alone);
     RUN_TEST(pruning_alone_does_not_restart_the_tunnel);
+    RUN_TEST(an_event_on_another_interface_restarts_a_starved_tunnel);
+    RUN_TEST(an_event_with_no_name_is_a_network_change);
+    RUN_TEST(an_event_on_a_tunnel_s_own_device_is_not_a_network_change);
+    RUN_TEST(an_event_on_another_tunnel_s_device_is_not_a_network_change);
 }
 
 GREATEST_MAIN_DEFS();

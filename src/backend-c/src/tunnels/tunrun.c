@@ -1483,6 +1483,14 @@ void firc_tunrun_refresh_uplinks(firc_tunrun_t *t, const char *ifname)
     }
 }
 
+void firc_tunrun_net_event(firc_tunrun_t *t, const char *iface)
+{
+    if (t == NULL || t->stopped || firc_tunvless_index(iface) >= 0) {
+        return;
+    }
+    firc_tunsup_net_changed(t->sup);
+}
+
 void firc_tunrun_stop(firc_tunrun_t *t, int grace_ms)
 {
     if (t == NULL || t->stopped) {

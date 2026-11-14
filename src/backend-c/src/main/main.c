@@ -784,6 +784,7 @@ static void on_iface_event(void *ud, const char *iface)
 {
     struct daemon *d = ud;
     if (d->ifwatch != NULL) { firc_ifwatch_nudge(d->ifwatch, iface); }
+    firc_tunrun_net_event(d->tunrun, iface);
 }
 
 static void resync(struct daemon *d, const char *iface_name)
@@ -859,6 +860,7 @@ static void on_addr_change(const char *iface_name, void *ud)
 {
     struct daemon *d = ud;
     FIRC_DEBUG("interface addressing changed: %s", iface_name);
+    firc_tunrun_net_event(d->tunrun, iface_name);
     schedule_refresh(d, iface_name);
 }
 
@@ -866,6 +868,7 @@ static void on_watcher_lost(void *ud)
 {
     struct daemon *d = ud;
     FIRC_DEBUG("netlink watcher missed events; re-reading every interface");
+    firc_tunrun_net_event(d->tunrun, NULL);
     schedule_refresh(d, NULL);
 }
 
@@ -927,6 +930,7 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
         }
     }
     firc_tunrun_refresh_uplinks(d->tunrun, iface_name);
+    firc_tunrun_net_event(d->tunrun, iface_name);
     /* An interface coming up is the likeliest reason a failed group's retry now holds. */
     (void)firc_app_retry_groups(d->app, iface_name);
     firc_app_republish_resolve_routes(d->app);

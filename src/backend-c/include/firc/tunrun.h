@@ -99,6 +99,10 @@ bool firc_tunrun_mark_of(const firc_tunrun_t *t, const char *id, uint32_t *mark,
 /* Rewrites the default route of every tunnel leaving through ifname, of every tunnel with an uplink when NULL. */
 void firc_tunrun_refresh_uplinks(firc_tunrun_t *t, const char *ifname);
 
+/* A network event on iface (NULL: cause unknown) restarts, once events settle, every starved tunnel (see
+   firc_tunsup_net_changed); nothing for one of firc's own tunnel devices, nothing once stopped. */
+void firc_tunrun_net_event(firc_tunrun_t *t, const char *iface);
+
 /* Stops every child (SIGKILL after grace_ms), then removes every uplink. */
 void firc_tunrun_stop(firc_tunrun_t *t, int grace_ms);
 
