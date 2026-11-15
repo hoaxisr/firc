@@ -143,6 +143,8 @@
     font-family: Monaco, monospace;
     font-size: 0.8rem;
     word-break: break-all;
+    resize: vertical;
+    max-height: 50vh;
   }
   .row {
     display: flex;
