@@ -1,8 +1,10 @@
+import { splitDevice } from "../../data/iface-choices";
 import type { Tunnel, TunnelSource } from "../../types";
 import { HttpError } from "../../utils/fetcher";
 import { randomId } from "../../utils/random-id";
 
 export const MAX_TUNNELS = 8 as const;
+export const OPKGTUN_MAX = 16 as const;
 
 export type TunnelFieldError = { tunnel: string; field: string; error: string };
 
@@ -55,9 +57,19 @@ export function normalizeTunnel(raw: Partial<Tunnel>): Tunnel {
   };
 }
 
-export function freeDevice(tunnels: { device: string }[]): string {
-  const used = new Set(tunnels.map((t) => t.device));
-  for (let n = 0; n < 100; n++) if (!used.has(`tunvless${n}`)) return `tunvless${n}`;
+export function freeDevice(
+  tunnels: readonly { device: string }[],
+  prefix: string = "tunvless",
+  ifaces: readonly { id: string }[] = [],
+): string {
+  const used = new Set(tunnels.map((t) => splitDevice(t.device).num));
+  const listed = new Set(ifaces.map((i) => i.id));
+  const max = prefix === "opkgtun" ? OPKGTUN_MAX : 99;
+  for (let n = 0; n <= max; n++) {
+    if (used.has(String(n))) continue;
+    if (prefix === "opkgtun" && listed.has(`opkgtun${n}`)) continue;
+    return `${prefix}${n}`;
+  }
   return "";
 }
 

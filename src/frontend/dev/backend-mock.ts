@@ -19,6 +19,7 @@ const INTERFACES: Interfaces = {
     { id: "wg0", name: "WireGuard Interface", role: "tunnel" },
     { id: "opkgtun10", name: "sing-box", role: "tunnel" },
     { id: "tunvless0", role: "tunnel" },
+    { id: "opkgtun2", role: "tunnel" },
     { id: "ppp0", name: "Broadband connection", ndmsName: "PPPoE0", role: "wan" },
     { id: "eth3", ndmsName: "GigabitEthernet1", role: "wan" },
     { id: "br0", name: "Home network", ndmsName: "Bridge0", role: "lan" },
@@ -911,10 +912,40 @@ let TUNNELS: any[] = [
       { port: 1081, listen: "br0", node: "0000000a:A", user: "bob", password: "s3cret" },
     ],
   },
+  {
+    id: "router",
+    device: "opkgtun2",
+    description: "NL",
+    enable: true,
+    active: 1,
+    by: "connection",
+    interval: 60,
+    silence: 20,
+    filter: "",
+    order: [],
+    exclude: [],
+    sources: [{ id: "0000000e", kind: "link", link: TUNNEL_LINK }],
+    uplink: { kind: "auto", ref: "" },
+    advanced: { ca: "", insecure: false, timeout: 8, kernelTcp: false, fingerprint: "" },
+    inbounds: [],
+  },
 ];
 
 const TUNNEL_STATUS_CYCLE = ["up", "up", "up", "no_node", "backoff", "starting"];
 let TUNNEL_TICK = 0;
+const ROUTER_WRITTEN: Record<string, number> = {};
+
+const tunnelRouter = (tn: any) => {
+  const m = /^opkgtun(\d+)$/.exec(tn.device ?? "");
+  if (!m) return null;
+  const age = TUNNEL_TICK - (ROUTER_WRITTEN[tn.id] ?? -100);
+  return {
+    name: `OpkgTun${m[1]}`,
+    state: age < 3 ? "pending" : "ready",
+    saved: age >= 8,
+    error: "",
+  };
+};
 
 const derivedId = (text: string) => {
   let h = 0x811c9dc5;
@@ -936,8 +967,14 @@ const tunnelRefusal = (tunnels: any[]) => {
     }
     if (ids.has(tn.id)) return { error: "id is used twice", field: "id", tunnel: tn.id };
     ids.add(tn.id);
-    if (!/^tunvless([0-9]|[1-9][0-9])$/.test(tn.device ?? "")) {
-      return { error: "device must be tunvless0..tunvless99", field: "device", tunnel: tn.id };
+    if (!/^(tunvless([0-9]|[1-9][0-9])|opkgtun([0-9]|1[0-6]))$/.test(tn.device ?? "")) {
+      return {
+        error: String(tn.device ?? "").startsWith("opkgtun")
+          ? "opkgtun<N> needs N 0..16, the router's limit for OpkgTun"
+          : "tunvless<N> needs N 0..99",
+        field: "device",
+        tunnel: tn.id,
+      };
     }
     const description = String(tn.description ?? "");
     if (
@@ -990,7 +1027,8 @@ const tunnelStatus = (tn: any) =>
     : TUNNEL_STATUS_CYCLE[Math.floor(TUNNEL_TICK / 3) % TUNNEL_STATUS_CYCLE.length];
 
 const tunnelState = (tn: any) => {
-  const status = tunnelStatus(tn);
+  const router = tunnelRouter(tn);
+  const status = router?.state === "pending" && tn.enable ? "router" : tunnelStatus(tn);
   const nodes: any[] = tunnelNodes(tn).map((row: any, k: number) => ({
     key: row.key,
     name: row.name,
@@ -1015,6 +1053,8 @@ const tunnelState = (tn: any) => {
     tcpPort: 0,
     tcpSkipped: [],
     tcpOff: "",
+    why: status === "router" ? "waiting for the router" : "",
+    ...(router ? { router } : {}),
     active: nodes.filter((n: any) => n.state === "active").map((n: any) => n.name),
     groups: [],
     nodes,
@@ -1070,6 +1110,12 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
       tn.advanced,
     ]);
   const before = new Map(TUNNELS.map((tn: any) => [tn.id, tn]));
+  for (const tn of tunnels) {
+    const old = before.get(tn.id);
+    if (!old || old.device !== tn.device || old.description !== (tn.description ?? "")) {
+      ROUTER_WRITTEN[tn.id] = TUNNEL_TICK;
+    }
+  }
   TUNNELS = tunnels.map((tn: any) => ({
     ...tn,
     description: tn.description ?? "",

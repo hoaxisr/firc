@@ -841,6 +841,9 @@ TEST a_flush_that_cannot_be_queued_closes_at_once(void) {
         oom_close_t seen_close = {0, 0};
         firc_app_ktcp_sink_t sink = {.pushed = NULL, .close = oom_close, .ud = &seen_close};
         firc_app_set_ktcp_sink(app, &sink);
+        static const uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+        static const char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP] = {[3] = "tunvless3"};
+        firc_app_set_tunnels(app, ports, names);
         firc_group_t *g = firc_group_new();
         g->id = (firc_id_t){{1, 1, 1, 1}};
         g->name = strdup("t");

@@ -165,6 +165,10 @@ def run_tunnel_sequence(t, conn):
     }
     t.step("PUT", "/api/v1/tunnels", json.dumps(tunnels))
     wait_tunnel_ready(conn, "t1")
+    with_opkg = json.loads(json.dumps(tunnels))
+    with_opkg["tunnels"].append({"id": "t3", "device": "opkgtun2", "enable": False,
+                                 "sources": [{"id": "0000000d", "kind": "link", "link": TUN_LINK}]})
+    t.step("PUT", "/api/v1/tunnels", json.dumps(with_opkg))
     t.step("GET", "/api/v1/tunnels")
     t.step("GET", "/api/v1/tunnels/state")
     draft = dict(tunnels["tunnels"][0], filter="^(NL|DE)-", exclude=[], order=["0000000b:DE-1"])

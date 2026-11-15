@@ -32,6 +32,7 @@ case "$ACTION" in
     rm -rf /opt/var/lib/firc/update
     rm -f /opt/var/lib/firc/hwid
     rm -f /opt/var/lib/firc/rci-token
+    rm -f /opt/var/lib/firc/opkgtun
     rmdir /opt/var/lib/firc 2>/dev/null
     ;;
   upgrade) ;;

@@ -15,9 +15,9 @@ static const char *const k_foreign[] = {"-o", "ppp0", "-j", "ACCEPT"};
 static const char *const k_jump[] = {"-j", "FIRC_MSS"};
 static const char *const k_clamp1[] = {"-o", "tunvless1", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
                                        "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
-static const char *const k_clamp3[] = {"-o", "tunvless3", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+static const char *const k_clamp3[] = {"-o", "opkgtun3", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
                                        "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
-static const uint8_t k_devs[] = {1, 3};
+static const char *const k_devs[] = {"tunvless1", "opkgtun3"};
 
 static bool rig_up(rig_t *r, firc_ipt_proto_t fam) {
     r->fake = firc_fake_ipt_new(fam);
@@ -30,7 +30,7 @@ static bool rig_up(rig_t *r, firc_ipt_proto_t fam) {
 
 static void rig_down(rig_t *r) { firc_ipt_free(r->ipt); }
 
-static firc_err_t write_devs(rig_t *r, const uint8_t *devs, size_t n) {
+static firc_err_t write_devs(rig_t *r, const char *const *devs, size_t n) {
     bool v6 = firc_ipt_proto(r->ipt) == FIRC_IPT_PROTO_IPV6;
     firc_err_t err = v6 ? firc_netfilter_register_base_chains(NULL, r->ipt) : firc_netfilter_register_base_chains(r->ipt, NULL);
     if (err == FIRC_OK) { err = firc_mss_build_rules(r->ipt, "FIRC_", devs, n); }
@@ -77,7 +77,7 @@ static enum greatest_test_res one_clamp_per_device_in(firc_ipt_proto_t fam) {
     PASS();
 }
 
-/* Catches: a device's clamp lost, reordered or on the wrong -o, or the jump not at FORWARD 1 (PREROUTING is refused). */
+/* Catches: a device's clamp lost, reordered or on the wrong -o (a tunvless<N> format for opkgtun3), or the jump not at FORWARD 1. */
 TEST v4_holds_one_clamp_per_device_jumped_from_forward(void) { return one_clamp_per_device_in(FIRC_IPT_PROTO_IPV4); }
 
 /* Catches: the IPv6 engine refused or given another rule than IPv4's. */

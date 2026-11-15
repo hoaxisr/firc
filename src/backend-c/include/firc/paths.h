@@ -43,6 +43,9 @@
 #ifndef FIRC_RCI_TOKEN_PATH
 #define FIRC_RCI_TOKEN_PATH "/opt/var/lib/firc/rci-token"
 #endif
+#ifndef FIRC_OPKGTUN_INTENT_PATH
+#define FIRC_OPKGTUN_INTENT_PATH "/opt/var/lib/firc/opkgtun"
+#endif
 #ifndef FIRC_NDMC_BIN
 #define FIRC_NDMC_BIN "/bin/ndmc"
 #endif
@@ -90,6 +93,9 @@
 #endif
 #ifndef FIRC_RCI_TOKEN_PATH
 #define FIRC_RCI_TOKEN_PATH "/var/lib/firc/rci-token"
+#endif
+#ifndef FIRC_OPKGTUN_INTENT_PATH
+#define FIRC_OPKGTUN_INTENT_PATH "/var/lib/firc/opkgtun"
 #endif
 #ifndef FIRC_NDMC_BIN
 #define FIRC_NDMC_BIN "ndmc"

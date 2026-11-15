@@ -87,4 +87,59 @@ describe("a tunnel's status look", () => {
     assert.strictEqual(r["Restart in {n} s"], "перезапуск через {n} с");
     assert.strictEqual(r["Configuration error"], "ошибка конфигурации");
   });
+
+  // Catches an OpkgTun record in work shown as an error, or a refused one shown as still waiting.
+  it("shows the router status as waiting, or as an error once the record failed", () => {
+    const wait = tunnelLook({ status: "router", backoffS: 0 }, t);
+    assert.strictEqual(wait.icon, "LoaderCircle");
+    assert.strictEqual(wait.color, "var(--text-2)");
+    assert.strictEqual(wait.label, "Waiting for the router");
+    const pending = { name: "OpkgTun2", state: "pending" as const, saved: false, error: "" };
+    assert.strictEqual(
+      tunnelLook({ status: "router", backoffS: 0, router: pending }, t).label,
+      "Waiting for the router",
+    );
+    const look = (state: "failed" | "foreign") =>
+      tunnelLook({ status: "router", backoffS: 0, router: { ...pending, state, error: "no" } }, t);
+    for (const state of ["failed", "foreign"] as const) {
+      assert.strictEqual(look(state).icon, "CircleX", state);
+      assert.strictEqual(look(state).color, "var(--red)", state);
+    }
+    assert.strictEqual(look("failed").label, "Router refused the interface");
+    assert.strictEqual(look("foreign").label, "The interface belongs to something else");
+  });
+
+  // Catches the Russian router labels missing, so the card shows English.
+  it("has Russian words for the router", () => {
+    const r = ru as Record<string, string>;
+    for (const key of [
+      "Waiting for the router",
+      "Router refused the interface",
+      "The interface belongs to something else",
+      "not saved in the router",
+      "The router's interface for this tunnel",
+      "Device number",
+      "The router already has this interface",
+      "On save, firc writes {name} to the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
+      "The tunnel goes away once you save. firc then removes {name} from the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
+    ]) {
+      assert.ok(r[key], key);
+    }
+  });
+
+  // Catches the save warnings reading as firc's unsaved changes rather than the router's own.
+  it("says the unsaved changes are the router's own", () => {
+    const r = ru as Record<string, string>;
+    for (const key of Object.keys(r).filter((k) =>
+      k.includes("changes made in the router itself"),
+    )) {
+      assert.ok(key.includes("{name}"), key);
+      assert.ok(r[key].includes("в самом роутере"), key);
+      assert.ok(r[key].includes("{name}"), key);
+    }
+    assert.strictEqual(
+      Object.keys(r).filter((k) => k.includes("changes made in the router itself")).length,
+      2,
+    );
+  });
 });

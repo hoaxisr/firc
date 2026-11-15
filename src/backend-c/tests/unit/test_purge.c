@@ -12,6 +12,7 @@
 #include "fake_iptables.h"
 #include "fake_rtnl.h"
 #include "fake_setnl.h"
+#include "firc/events.h"
 #include "firc/mark.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/purge.h"
@@ -426,6 +427,310 @@ TEST a_kernel_without_ip_set_has_no_sets_to_sweep(void) {
     PASS();
 }
 
+#define OPKG_FX "tests/unit/fixtures/opkgtun/"
+#define SAVE_OK                                                                                     \
+    "[{\"system\":{\"configuration\":{\"save\":{\"status\":[{\"status\":\"message\",\"code\":\"0\"," \
+    "\"ident\":\"Core::ConfigurationSaver\",\"message\":\"saving (http/rci).\"}]}}}}]"
+#define SAVE_REFUSED                                                                              \
+    "[{\"system\":{\"configuration\":{\"save\":{\"status\":[{\"status\":\"error\",\"code\":\"1\"," \
+    "\"ident\":\"Core::ConfigurationSaver\",\"message\":\"flash busy\"}]}}}}]"
+#define DELETE_REFUSED                                                                        \
+    "[{\"interface\":{\"status\":[{\"status\":\"error\",\"code\":\"1\",\"ident\":\"Network\"," \
+    "\"message\":\"RCI refused\"}]}}]"
+
+typedef struct {
+    char log[1024];
+    char *list;
+    bool save_fails;
+    bool delete_fails;
+    const char *refuse;
+    int64_t now;
+    int sleeps;
+    firc_err_t lock_rc;
+    char dir[64];
+    char intent[128];
+} pio_t;
+
+static pio_t g_p;
+
+static void plog(const char *line) {
+    size_t off = strlen(g_p.log);
+    snprintf(g_p.log + off, sizeof g_p.log - off, "%s ", line);
+}
+
+static char *slurp_fx(const char *name) {
+    char path[256];
+    snprintf(path, sizeof path, OPKG_FX "%s", name);
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) { return NULL; }
+    char *buf = calloc(1, 65536);
+    size_t n = fread(buf, 1, 65535, fp);
+    buf[n] = 0;
+    fclose(fp);
+    return buf;
+}
+
+static firc_err_t p_get(void *ud, const char *path, char **body) {
+    (void)ud;
+    *body = NULL;
+    if (strcmp(path, FIRC_OPKGTUN_LIST_PATH) != 0) {
+        plog("NS");
+        *body = strdup("[]");
+        return FIRC_OK;
+    }
+    plog("L");
+    if (g_p.list == NULL) { return FIRC_ERR_UPSTREAM; }
+    *body = strdup(g_p.list);
+    return FIRC_OK;
+}
+
+static firc_err_t p_post(void *ud, const char *body, long timeout_s, char **out) {
+    (void)ud;
+    (void)timeout_s;
+    if (strstr(body, "\"save\"") != NULL) {
+        plog("SAVE");
+        *out = strdup(g_p.save_fails ? SAVE_REFUSED : SAVE_OK);
+        return FIRC_OK;
+    }
+    plog(strstr(body, "\"no\":true") != NULL ? "DELETE" : "POST");
+    bool refused = g_p.delete_fails || (g_p.refuse != NULL && strstr(body, g_p.refuse) != NULL);
+    *out = refused ? strdup(DELETE_REFUSED) : slurp_fx("delete-ok.json");
+    return FIRC_OK;
+}
+
+static bool p_dev(void *ud, const char *dev) {
+    (void)ud;
+    (void)dev;
+    return false;
+}
+
+static firc_err_t p_unpersist(void *ud, const char *dev) {
+    (void)ud;
+    (void)dev;
+    return FIRC_OK;
+}
+
+static bool p_holder(void *ud, int n, const char *own, char out[16]) {
+    (void)ud;
+    (void)n;
+    (void)own;
+    (void)out;
+    return false;
+}
+
+static int64_t p_now(void *ud) {
+    (void)ud;
+    return g_p.now;
+}
+
+static bool p_sleep(void *ud, int ms) {
+    (void)ud;
+    g_p.sleeps++;
+    g_p.now += ms;
+    return true;
+}
+
+static firc_err_t p_lock(const char *path, int *fd) {
+    (void)path;
+    plog("LOCK");
+    *fd = g_p.lock_rc == FIRC_OK ? 99 : -1;
+    return g_p.lock_rc;
+}
+
+static firc_err_t p_revoke(void *ud) {
+    (void)ud;
+    plog("REVOKE");
+    return FIRC_OK;
+}
+
+static atomic_bool g_pstop;
+
+static firc_opkgtun_io_t pio_up(const char *list_fx, bool dirty) {
+    free(g_p.list);
+    memset(&g_p, 0, sizeof g_p);
+    g_p.now = 1000;
+    g_p.list = list_fx != NULL ? slurp_fx(list_fx) : NULL;
+    snprintf(g_p.dir, sizeof g_p.dir, "/tmp/firc_purge_opkg_XXXXXX");
+    if (mkdtemp(g_p.dir) == NULL) { abort(); }
+    snprintf(g_p.intent, sizeof g_p.intent, "%s/opkgtun", g_p.dir);
+    if (dirty) {
+        FILE *fp = fopen(g_p.intent, "w");
+        fputs("dirty\n", fp);
+        fclose(fp);
+    }
+    firc_event_reset_for_test();
+    atomic_store(&g_pstop, false);
+    firc_opkgtun_io_t io = {p_get, p_post, p_dev, p_unpersist, p_holder, p_now, p_sleep, g_p.intent, &g_pstop, NULL};
+    return io;
+}
+
+static void pio_down(void) {
+    unlink(g_p.intent);
+    char tmp[160];
+    snprintf(tmp, sizeof tmp, "%s/opkgtun.tmp", g_p.dir);
+    unlink(tmp);
+    rmdir(g_p.dir);
+    free(g_p.list);
+    g_p.list = NULL;
+}
+
+static int warns_with(const char *text) {
+    static firc_event_t ev[256];
+    uint64_t next = 0, dropped = 0;
+    size_t n = firc_event_read(0, ev, 256, &next, &dropped);
+    int k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (ev[i].kind == FIRC_EVENT_LOG && ev[i].u.log.level == FIRC_LOG_WARN && strstr(ev[i].u.log.text, text) != NULL) {
+            k++;
+        }
+    }
+    return k;
+}
+
+static const firc_purge_lock_t k_lock = {p_lock, "/run/x.lock"};
+
+TEST a_purge_beside_a_running_daemon_touches_no_record(void) {
+    /* catches: the router step or the revoke placed before the lock, so a purge beside a live daemon deletes its records */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    g_p.lock_rc = FIRC_ERR_EXIST;
+    int fd = 7;
+    ASSERT_EQ(1, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK ", g_p.log);
+    ASSERT_EQ(-1, fd);
+    pio_down();
+    PASS();
+}
+
+TEST the_purge_runs_lock_sweep_save_revoke(void) {
+    /* catches: a purge that revokes before its sweep, saves before its removal, or skips the save after one */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    g_p.lock_rc = FIRC_OK;
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(99, fd);
+    pio_down();
+    PASS();
+}
+
+TEST a_purge_with_no_record_of_ours_saves_nothing(void) {
+    /* catches: an unconditional save, which would write the user's unsaved router changes */
+    firc_opkgtun_io_t io = pio_up("rc-list-without.json", false);
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L REVOKE ", g_p.log);
+    pio_down();
+    PASS();
+}
+
+TEST a_purge_with_dirty_and_nothing_to_remove_saves(void) {
+    /* catches: a dirty intent file ignored, which leaves an earlier unsaved change of ours for a reboot to undo */
+    firc_opkgtun_io_t io = pio_up("rc-list-without.json", true);
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L SAVE REVOKE ", g_p.log);
+    pio_down();
+    PASS();
+}
+
+TEST an_unlocked_purge_sweeps_nothing_and_revokes(void) {
+    /* catches: an unlocked purge that sweeps beside a daemon it cannot see, or one that skips the revoke */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", true);
+    g_p.lock_rc = FIRC_ERR_IO;
+    int fd = 7;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK REVOKE ", g_p.log);
+    ASSERT_EQ(-1, fd);
+    ASSERT_EQ(1, warns_with("could not take the instance lock"));
+    ASSERT_EQ(1, warns_with("delete OpkgTun<N> in the router"));
+    pio_down();
+    PASS();
+}
+
+TEST a_dead_rci_purge_is_one_pass(void) {
+    /* catches: a retry or a backoff inside the purge's sweep, which holds prerm while RCI is down */
+    firc_opkgtun_io_t io = pio_up(NULL, true);
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L REVOKE ", g_p.log);
+    ASSERT_EQ(0, g_p.sleeps);
+    ASSERT_EQ(1, warns_with("may remain"));
+    pio_down();
+    PASS();
+}
+
+TEST the_router_step_removes_records_then_revokes(void) {
+    /* catches: the router step revoking the token before the RCI calls that need it */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    (void)firc_purge_router(&io, p_revoke, NULL);
+    ASSERT_STR_EQ("L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(0, warns_with("OpkgTun"));
+    pio_down();
+    PASS();
+}
+
+TEST a_failed_router_step_keeps_the_exit_status(void) {
+    /* catches: a router-step failure that fails --purge, so prerm retries for it, or that skips the revoke */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    g_p.delete_fails = true;
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT(strstr(g_p.log, "DELETE") != NULL);
+    ASSERT(strstr(g_p.log, "REVOKE ") != NULL);
+    ASSERT_EQ(1, warns_with("firc's OpkgTun records may remain; delete OpkgTun<N> in the router"));
+    pio_down();
+    PASS();
+}
+
+TEST a_refused_removal_with_nothing_unsaved_saves_nothing(void) {
+    /* catches: dirty kept after a delete NDM refused whole, so the purge saves changes that are not its own */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    g_p.delete_fails = true;
+    (void)firc_purge_router(&io, p_revoke, NULL);
+    ASSERT_STR_EQ("L NS DELETE L REVOKE ", g_p.log);
+    pio_down();
+    PASS();
+}
+
+TEST a_failed_save_after_removal_says_they_come_back(void) {
+    /* catches: a removal whose save failed reported as done, though a reboot brings the records back */
+    firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
+    g_p.save_fails = true;
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(1, warns_with("they come back after a reboot"));
+    ASSERT_EQ(0, warns_with("may remain"));
+    pio_down();
+    PASS();
+}
+
+TEST a_partial_removal_whose_save_failed_says_both(void) {
+    /* catches: a purge that removed some records, kept others and could not save, naming only those that remain */
+    firc_opkgtun_io_t io = pio_up(NULL, false);
+    g_p.list = strdup("{\"OpkgTun2\":{\"description\":\"firc:a\",\"up\":true},"
+                      "\"OpkgTun9\":{\"description\":\"firc:b\",\"up\":true}}");
+    g_p.refuse = "OpkgTun9";
+    g_p.save_fails = true;
+    (void)firc_purge_router(&io, p_revoke, NULL);
+    ASSERT_STR_EQ("L NS DELETE NS DELETE L SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(1, warns_with("may remain"));
+    ASSERT_EQ(1, warns_with("they come back after a reboot"));
+    pio_down();
+    PASS();
+}
+
+TEST a_failed_save_of_an_earlier_run_s_removal_warns(void) {
+    /* catches: a dirty file from an earlier run whose save fails now, so records deleted unsaved come back silently */
+    firc_opkgtun_io_t io = pio_up("rc-list-without.json", true);
+    g_p.save_fails = true;
+    (void)firc_purge_router(&io, p_revoke, NULL);
+    ASSERT_STR_EQ("L SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(1, warns_with("they come back after a reboot"));
+    pio_down();
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -444,5 +749,17 @@ int main(int argc, char **argv) {
     RUN_TEST(purge_destroys_the_sets_and_counts_them);
     RUN_TEST(purge_with_a_busy_set_exits_nonzero);
     RUN_TEST(a_kernel_without_ip_set_has_no_sets_to_sweep);
+    RUN_TEST(a_purge_beside_a_running_daemon_touches_no_record);
+    RUN_TEST(the_purge_runs_lock_sweep_save_revoke);
+    RUN_TEST(a_purge_with_no_record_of_ours_saves_nothing);
+    RUN_TEST(a_purge_with_dirty_and_nothing_to_remove_saves);
+    RUN_TEST(an_unlocked_purge_sweeps_nothing_and_revokes);
+    RUN_TEST(a_dead_rci_purge_is_one_pass);
+    RUN_TEST(the_router_step_removes_records_then_revokes);
+    RUN_TEST(a_failed_router_step_keeps_the_exit_status);
+    RUN_TEST(a_refused_removal_with_nothing_unsaved_saves_nothing);
+    RUN_TEST(a_failed_save_after_removal_says_they_come_back);
+    RUN_TEST(a_partial_removal_whose_save_failed_says_both);
+    RUN_TEST(a_failed_save_of_an_earlier_run_s_removal_warns);
     GREATEST_MAIN_END();
 }

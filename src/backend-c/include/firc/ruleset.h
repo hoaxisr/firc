@@ -37,6 +37,8 @@ typedef struct firc_ruleset_deps {
     const char *chain_prefix;
     uint32_t start_idx;
     const firc_ruleset_lookup_t *lookup;
+    firc_tunnel_dev_fn tunnel_dev;
+    void *tunnel_ud;
 } firc_ruleset_deps_t;
 
 /* group borrowed (must outlive the ruleset); deps copied. Mutated on the loop thread only. */

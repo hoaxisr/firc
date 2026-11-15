@@ -30,6 +30,8 @@ const LIST: Item[] = [
   { id: "tunvless0", name: "VLESS", role: "tunnel" },
 ];
 
+const TUNNELS = [{ device: "tunvless0" }];
+
 const ids = (xs: { id: string }[]) => xs.map((x) => x.id);
 
 describe("interface choices", () => {
@@ -87,15 +89,19 @@ describe("interface choices", () => {
 
   // Catches the segments missing on an empty query, a search blind to names, or the blackhole or a tunnel offered as a LAN.
   it("LAN choices are the segments, or every match of a search", () => {
-    assert.deepStrictEqual(ids(lanChoices(LIST, "")), ["br0", "br1"]);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "ETH2")), ["eth2.1"]);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "pppoe")), ["ppp0"]);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "home")), ["br0"]);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "vless")), []);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "black")), []);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "", TUNNELS)), ["br0", "br1"]);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "ETH2", TUNNELS)), ["eth2.1"]);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "pppoe", TUNNELS)), ["ppp0"]);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "home", TUNNELS)), ["br0"]);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "vless", TUNNELS)), []);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "black", TUNNELS)), []);
     assert.deepStrictEqual(
       ids(
-        lanChoices([{ id: "tunvless99" }, { id: "tunvless100" }, { id: "tunvless01" }], "tunvless"),
+        lanChoices(
+          [{ id: "tunvless99" }, { id: "tunvless100" }, { id: "tunvless01" }],
+          "tunvless",
+          [{ device: "tunvless99" }],
+        ),
       ),
       ["tunvless100", "tunvless01"],
     );
@@ -118,7 +124,7 @@ describe("interface choices", () => {
     assert.strictEqual(ids(c.rest).includes("block"), false);
     assert.strictEqual(ids(c.head).includes("block"), false);
     assert.strictEqual(groupChoices(LIST, ["block"]).expanded, false);
-    assert.deepStrictEqual(ids(lanChoices(LIST, "block")), []);
+    assert.deepStrictEqual(ids(lanChoices(LIST, "block", TUNNELS)), []);
     const self = {
       id: "t0",
       device: "tunvless0",

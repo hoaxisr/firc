@@ -1,0 +1,8 @@
+{
+  "GigabitEthernet0": {
+    "up": true
+  },
+  "Wireguard0": {
+    "description": "Wireguard VPN Server"
+  }
+}

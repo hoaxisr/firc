@@ -21,6 +21,7 @@
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/tunaddr.h"
+#include "firc/tunvless_name.h"
 
 extern char **environ;
 
@@ -86,6 +87,8 @@ typedef struct slot {
     size_t n_want;
     size_t *map_want;
     size_t n_map_want;
+    bool gated;
+    uint32_t gate_gen;
     bool starved;
     int64_t recovered_ms;
     int64_t nudged_ms;
@@ -104,12 +107,15 @@ struct firc_tunsup {
     void *ud;
     firc_tun_reap_fn on_reap;
     void *reap_ud;
+    firc_tun_gate_fn gate;
+    void *gate_ud;
     pthread_t loop_thread;
     slot_t **v;
     size_t n;
     int second_ms;
     bool stopped;
     uint64_t seq;
+    uint32_t gate_seq;
     uint8_t tcp_pool[4];
     uint8_t tcp_pool_len;
     int settle_timer;
@@ -118,6 +124,13 @@ struct firc_tunsup {
 
 static void spawn(slot_t *sl);
 static bool device_busy(const slot_t *sl);
+
+static void ungate(slot_t *sl)
+{
+    sl->gate_gen = ++sl->s->gate_seq;
+    sl->gated = false;
+    sl->st.why[0] = 0;
+}
 
 static int64_t now_ms(void)
 {
@@ -304,10 +317,10 @@ static void schedule_backoff(slot_t *sl)
     set_status(sl, FIRC_TUN_ST_BACKOFF);
 }
 
-static void reaped(slot_t *sl, pid_t pid)
+static void reaped(slot_t *sl, const char *dev, pid_t pid)
 {
     if (sl->s->on_reap != NULL) {
-        sl->s->on_reap(sl->cfg.id, pid, sl->s->reap_ud);
+        sl->s->on_reap(sl->cfg.id, dev, pid, sl->s->reap_ud);
     }
 }
 
@@ -323,6 +336,8 @@ static void exit_one(slot_t *sl, int code)
 {
     firc_tunsup_t *s = sl->s;
     pid_t pid = sl->pid;
+    char dev[sizeof sl->run_dev];
+    memcpy(dev, sl->run_dev, sizeof dev);
     let_go(sl);
     sl->owed = false;
     release_io(sl);
@@ -330,7 +345,7 @@ static void exit_one(slot_t *sl, int code)
     sl->run_dev[0] = 0;
     sl->st.last_exit = code;
     sl->st.n_active = 0;
-    reaped(sl, pid);
+    reaped(sl, dev, pid);
     if (sl->gone) {
         slot_remove(s, sl);
         return;
@@ -864,25 +879,6 @@ static char *node_list(const firc_tunnel_t *t, size_t *len)
     return buf;
 }
 
-static int device_index(const char *device)
-{
-    if (strncmp(device, "tunvless", 8) != 0) {
-        return -1;
-    }
-    const char *p = device + 8;
-    if (*p < '0' || *p > '9' || (p[0] == '0' && p[1] != 0)) {
-        return -1;
-    }
-    int n = 0;
-    for (; *p != 0; p++) {
-        if (*p < '0' || *p > '9' || n > 25) {
-            return -1;
-        }
-        n = n * 10 + (*p - '0');
-    }
-    return n <= 253 ? n : -1;
-}
-
 static int set_nonblock(int fd)
 {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -979,29 +975,42 @@ static bool device_busy(const slot_t *sl)
     const firc_tunsup_t *s = sl->s;
     for (size_t i = 0; i < s->n; i++) {
         const slot_t *o = s->v[i];
-        if (o != sl && o->pid > 0 && strcmp(o->run_dev, sl->cfg.device) == 0) {
+        if (o != sl && o->pid > 0 && firc_tundev_name_index(o->run_dev) == firc_tunnel_index(&sl->cfg)) {
             return true;
         }
     }
     return false;
 }
 
-static void spawn(slot_t *sl)
+static void spawn_past(slot_t *sl, bool open)
 {
     firc_tunsup_t *s = sl->s;
     const firc_tunnel_t *t = &sl->cfg;
     sl->deferred = device_busy(sl);
     if (sl->deferred) {
         firc_log_from(FIRC_LOG_INFO, t->device, "waiting for the previous holder of the device to exit");
+        sl->st.why[0] = 0;
         sl->st.n_active = 0;
         set_status(sl, FIRC_TUN_ST_STARTING);
         return;
     }
+    if (!open && s->gate != NULL) {
+        uint32_t gen = ++s->gate_seq;
+        sl->gate_gen = gen;
+        if (s->gate(t->id, t->device, firc_tunnel_index(t), gen, s->gate_ud) == FIRC_TUN_GATE_WAIT) {
+            sl->gated = true;
+            snprintf(sl->st.why, sizeof sl->st.why, "waiting for the router");
+            sl->st.n_active = 0;
+            set_status(sl, FIRC_TUN_ST_STARTING);
+            return;
+        }
+    }
+    ungate(sl);
     char addr[20];
     uint8_t addr6[16];
-    firc_tun_addr(device_index(t->device), addr, addr6);
+    firc_tun_addr(firc_tunnel_index(t), addr, addr6);
     char holder[16];
-    int held = firc_tun_addr_holder(device_index(t->device), t->device, holder);
+    int held = firc_tun_addr_holder(firc_tunnel_index(t), t->device, holder);
     char shown[INET6_ADDRSTRLEN];
     if (held == AF_INET6) {
         inet_ntop(AF_INET6, addr6, shown, sizeof shown);
@@ -1126,6 +1135,11 @@ static void spawn(slot_t *sl)
         return;
     }
     set_status(sl, FIRC_TUN_ST_STARTING);
+}
+
+static void spawn(slot_t *sl)
+{
+    spawn_past(sl, false);
 }
 
 static void terminate(slot_t *sl);
@@ -1256,6 +1270,7 @@ static void reconfigure(slot_t *sl, const firc_tunnel_t *t, uint32_t mark)
     snprintf(sl->st.device, sizeof sl->st.device, "%s", t->device);
     sl->next_backoff_s = BACKOFF_BASE_S;
     sl->deferred = false;
+    ungate(sl);
     sl->nudging = false;
     drop_timer(sl->s, &sl->restart_timer);
     if (sl->pid > 0) {
@@ -1341,7 +1356,7 @@ firc_err_t firc_tunsup_apply(firc_tunsup_t *s, const firc_tunnels_t *want, const
         return FIRC_ERR_STATE;
     }
     for (size_t i = 0; i < want->n; i++) {
-        if (device_index(want->t[i].device) < 0) {
+        if (firc_tunnel_index(&want->t[i]) < 0) {
             return FIRC_ERR_INVAL;
         }
     }
@@ -1462,6 +1477,7 @@ void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms)
         slot_t *sl = s->v[i];
         release_io(sl);
         drop_timer(s, &sl->restart_timer);
+        ungate(sl);
         sl->stop_pid = sl->pid;
         if (sl->pid > 0) {
             kill(sl->pid, SIGTERM);
@@ -1497,6 +1513,8 @@ void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms)
         sl->owed = false;
         sl->terminating = false;
         sl->deferred = false;
+        char dev[sizeof sl->run_dev];
+        memcpy(dev, sl->run_dev, sizeof dev);
         sl->run_dev[0] = 0;
         sl->st.n_active = 0;
         put_status(sl, FIRC_TUN_ST_OFF);
@@ -1504,7 +1522,7 @@ void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms)
         if (sl->stop_pid > 0) {
             pid_t pid = sl->stop_pid;
             sl->stop_pid = 0;
-            reaped(sl, pid);
+            reaped(sl, dev, pid);
         }
     }
     for (size_t i = 0; i < s->n;) {
@@ -1535,6 +1553,32 @@ void firc_tunsup_set_on_reap(firc_tunsup_t *s, firc_tun_reap_fn fn, void *ud)
 {
     s->on_reap = fn;
     s->reap_ud = ud;
+}
+
+void firc_tunsup_set_gate(firc_tunsup_t *s, firc_tun_gate_fn fn, void *ud)
+{
+    s->gate = fn;
+    s->gate_ud = ud;
+}
+
+void firc_tunsup_gate_open(firc_tunsup_t *s, const char *id, uint32_t gen)
+{
+    slot_t *sl = find_slot(s, id);
+    if (sl == NULL || !sl->gated || sl->gate_gen != gen) {
+        return;
+    }
+    sl->gated = false;
+    spawn_past(sl, true);
+}
+
+bool firc_tunsup_holds_device(const firc_tunsup_t *s, const char *device)
+{
+    for (size_t i = 0; i < s->n; i++) {
+        if (s->v[i]->pid > 0 && strcmp(s->v[i]->run_dev, device) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void firc_tunsup_set_uplink_ok(firc_tunsup_t *s, const char *id, bool ok)

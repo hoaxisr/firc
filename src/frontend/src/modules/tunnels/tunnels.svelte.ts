@@ -1,4 +1,4 @@
-import { fetchInterfaces } from "../../data/interfaces.svelte";
+import { fetchInterfaces, interfaces } from "../../data/interfaces.svelte";
 import { t } from "../../data/locale.svelte";
 import { settings } from "../settings/settings.svelte";
 
@@ -15,7 +15,7 @@ import type {
 import { overlay, toast } from "../../utils/events";
 import { fetcher, HttpError } from "../../utils/fetcher";
 import { inboundRefusal } from "./inbounds";
-import { restartingDevices } from "./tunnel-editor";
+import { deviceProblem, restartingDevices } from "./tunnel-editor";
 import {
   defaultTunnel,
   fieldRefusal,
@@ -72,7 +72,18 @@ export class TunnelsStore {
   }
 
   get canSave() {
-    return this.dirty && !this.saving;
+    return this.dirty && !this.saving && !this.data.some((tn) => this.deviceProblemOf(tn) !== null);
+  }
+
+  deviceProblemOf(tunnel: Tunnel, tr: (key: string) => string = (key) => key): string | null {
+    if (this.isSaved(tunnel.id)) return null;
+    return deviceProblem(
+      tunnel.device,
+      $state.snapshot(this.data) as Tunnel[],
+      tunnel.id,
+      tr,
+      interfaces.list,
+    );
   }
 
   #adopt(tunnels: Tunnel[]) {
@@ -101,6 +112,17 @@ export class TunnelsStore {
 
   isSaved(id: string): boolean {
     return (JSON.parse(this.#baseline) as Tunnel[]).some((tn) => tn.id === id);
+  }
+
+  savedOf(id: string): Tunnel | undefined {
+    return (JSON.parse(this.#baseline) as Tunnel[]).find((tn) => tn.id === id);
+  }
+
+  othersOf(id: string): Tunnel[] {
+    return [
+      ...(JSON.parse(this.#baseline) as Tunnel[]),
+      ...($state.snapshot(this.data) as Tunnel[]),
+    ].filter((tn) => tn.id !== id);
   }
 
   get canAdd() {

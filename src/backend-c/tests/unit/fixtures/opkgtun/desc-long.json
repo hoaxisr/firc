@@ -1,0 +1,16 @@
+[
+  {
+    "interface": {
+      "description": {
+        "status": [
+          {
+            "status": "error",
+            "code": "72155141",
+            "ident": "Network::Interface::Base",
+            "message": "\"OpkgTun9\": description length exceeds 256 bytes."
+          }
+        ]
+      }
+    }
+  }
+]

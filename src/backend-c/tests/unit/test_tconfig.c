@@ -227,6 +227,17 @@ TEST a_device_used_twice_is_refused(void) {
     PASS();
 }
 
+/* catches: tunvless0 and opkgtun0 both accepted, sharing one device number */
+TEST an_opkgtun_device_shares_the_tunvless_numbers(void) {
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "tunvless0", "auto", "1", "site", LINK);
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "b1", "opkgtun0", "auto", "1", "site", LINK);
+    ASSERT(refused(doc, "tunnels[1].device", "used twice"));
+    ASSERT(refused_one("a1", "opkgtun100", "auto", "1", "site", LINK, "tunnels[0].device",
+                       "opkgtun<N> needs N 0..16, the router's limit for OpkgTun"));
+    PASS();
+}
+
 /* catches: a tunnel device that could collide with a Keenetic interface */
 TEST a_device_outside_tunvless_is_refused(void) {
     ASSERT(refused_one("a1", "br0", "auto", "1", "site", LINK, "tunnels[0].device", "must start with tunvless"));
@@ -1179,6 +1190,15 @@ TEST the_tcp_port_is_3600_plus_the_device_number(void) {
     PASS();
 }
 
+/* catches: +8, the tunvless stem's length, which gives 3552 and 3602 */
+TEST an_opkg_tunnel_s_kernel_tcp_port_is_3600_plus_n(void) {
+    ASSERT_EQ(3603, port_of("opkgtun3", true, true));
+    ASSERT_EQ(3612, port_of("opkgtun12", true, true));
+    ASSERT_EQ(3616, port_of("opkgtun16", true, true));
+    ASSERT_EQ(3642, port_of("tunvless42", true, true));
+    PASS();
+}
+
 /* catches: a link with whitespace splitting into two stdin lines */
 TEST a_link_with_whitespace_is_refused(void) {
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"vless://u@h:443#a b\"\n",
@@ -1186,9 +1206,49 @@ TEST a_link_with_whitespace_is_refused(void) {
     PASS();
 }
 
-/* catches: an iface uplink onto a tunnel device bypassing the cycle check */
-TEST an_iface_uplink_on_a_tunvless_device_is_refused(void) {
-    ASSERT(refused_one("a1", "tunvless0", "iface:tunvless1", "1", "site", LINK, "tunnels[0].uplink", "tunnel:<id>"));
+static int loads(const char *doc)
+{
+    firc_tunnels_t t = {0};
+    firc_tun_err_t e = {0};
+    int ok = firc_tunnels_load_buffer(&t, doc, strlen(doc), &e) == FIRC_OK;
+    if (!ok) {
+        fprintf(stderr, "refused where=\"%s\" why=\"%s\"\n", e.where, e.why);
+    }
+    firc_tunnels_free(&t);
+    return ok;
+}
+
+/* catches: an uplink refused for its stem, so another program's opkgtun cannot carry a tunnel */
+TEST an_uplink_through_a_foreign_opkgtun_is_allowed(void) {
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "tunvless0", "iface:opkgtun10", "1", "site", LINK);
+    ASSERT(loads(doc));
+    PASS();
+}
+
+/* catches: an iface uplink onto another tunnel's device bypassing the cycle check */
+TEST an_uplink_through_a_configured_device_is_refused(void) {
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "tunvless0", "iface:opkgtun3", "1", "site", LINK);
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "b1", "opkgtun3", "auto", "1", "site", LINK);
+    ASSERT(refused(doc, "tunnels[0].uplink", "use tunnel:<id> to chain tunnels"));
+    char back[2048] = "tunnels:\n";
+    tun_text(back + strlen(back), sizeof back - strlen(back), "a1", "tunvless0", "auto", "1", "site", LINK);
+    tun_text(back + strlen(back), sizeof back - strlen(back), "b1", "opkgtun3", "iface:tunvless0", "1", "site", LINK);
+    ASSERT(refused(back, "tunnels[1].uplink", "use tunnel:<id> to chain tunnels"));
+    PASS();
+}
+
+/* catches: the PR's single 0..99 bound for both stems, or the opkgtun bound put on tunvless */
+TEST an_opkg_device_above_16_is_refused(void) {
+    ASSERT(refused_one("a1", "opkgtun17", "auto", "1", "site", LINK, "tunnels[0].device",
+                       "opkgtun<N> needs N 0..16, the router's limit for OpkgTun"));
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "opkgtun16", "auto", "1", "site", LINK);
+    ASSERT(loads(doc));
+    char tv[2048] = "tunnels:\n";
+    tun_text(tv + strlen(tv), sizeof tv - strlen(tv), "a1", "tunvless17", "auto", "1", "site", LINK);
+    ASSERT(loads(tv));
     PASS();
 }
 
@@ -1215,6 +1275,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_saved_file_is_mode_0600);
     RUN_TEST(a_link_with_yaml_syntax_survives_save_and_load);
     RUN_TEST(a_device_used_twice_is_refused);
+    RUN_TEST(an_opkgtun_device_shares_the_tunvless_numbers);
     RUN_TEST(a_device_outside_tunvless_is_refused);
     RUN_TEST(a_tunvless_suffix_that_is_not_a_small_number_is_refused);
     RUN_TEST(an_uplink_through_itself_is_refused);
@@ -1267,7 +1328,9 @@ int main(int argc, char **argv) {
     RUN_TEST(an_id_with_odd_characters_is_refused);
     RUN_TEST(an_enable_that_is_not_a_bool_is_refused);
     RUN_TEST(a_link_with_whitespace_is_refused);
-    RUN_TEST(an_iface_uplink_on_a_tunvless_device_is_refused);
+    RUN_TEST(an_uplink_through_a_foreign_opkgtun_is_allowed);
+    RUN_TEST(an_uplink_through_a_configured_device_is_refused);
+    RUN_TEST(an_opkg_device_above_16_is_refused);
     RUN_TEST(an_enabled_tunnel_without_sources_is_refused);
     RUN_TEST(kernel_tcp_loads_saves_and_refuses_a_non_bool);
     RUN_TEST(kernel_tcp_is_argv_affecting);
@@ -1275,6 +1338,7 @@ int main(int argc, char **argv) {
     RUN_TEST(fingerprint_safari_is_refused);
     RUN_TEST(a_fingerprint_change_restarts);
     RUN_TEST(the_tcp_port_is_3600_plus_the_device_number);
+    RUN_TEST(an_opkg_tunnel_s_kernel_tcp_port_is_3600_plus_n);
     RUN_TEST(inbounds_load_and_save_back);
     RUN_TEST(no_inbounds_are_not_written);
     RUN_TEST(inbound_port_out_of_range);

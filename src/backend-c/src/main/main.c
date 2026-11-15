@@ -49,6 +49,7 @@
 #include "firc/loop.h"
 #include "firc/netfilter_cleaner.h"
 #include "firc/netlink_watcher.h"
+#include "firc/opkgtun.h"
 #include "firc/settings.h"
 
 /* Folds a reconnect's burst into one pass; short enough that a gateway change lands before a held answer expires. */
@@ -114,6 +115,8 @@ struct daemon {
     firc_port_remap_t *port_remap;
     firc_app_t *app;
     firc_tunrun_t *tunrun;
+    firc_opkgtun_t *opkg;
+    firc_opkgtun_rci_t opkg_rci;
     firc_tunsubs_t *tunsubs;
     firc_update_t *update;
     int update_timer;
@@ -198,9 +201,10 @@ static bool tunnel_down(void *ud, const char *iface)
     return firc_tunrun_device_down(ud, iface);
 }
 
-static void ktcp_ports(const uint16_t ports[FIRC_KTCP_DEVICES], void *ud)
+static void ktcp_tunnels(const uint16_t ports[FIRC_KTCP_DEVICES],
+                         const char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP], void *ud)
 {
-    firc_app_set_ktcp_ports(ud, ports);
+    firc_app_set_tunnels(ud, ports, names);
 }
 
 static const firc_ktcp_image_t *ktcp_image(void *ud)
@@ -251,11 +255,7 @@ static bool iw_link_up(void *ud, const char *name) {
 
 static bool iw_tunnel_known(void *ud, const char *dev) {
     struct daemon *d = ud;
-    const firc_tunnels_t *c = d->tunrun != NULL ? firc_tunrun_config(d->tunrun) : NULL;
-    for (size_t i = 0; c != NULL && i < c->n; i++) {
-        if (strcmp(c->t[i].device, dev) == 0) { return true; }
-    }
-    return false;
+    return d->tunrun != NULL && firc_tunnels_by_device(firc_tunrun_config(d->tunrun), dev) != NULL;
 }
 
 static bool iw_tunnel_down(void *ud, const char *dev) {
@@ -319,6 +319,9 @@ static void daemon_teardown(struct daemon *d)
     d->rid_retry = NULL;
     firc_tunsubs_free(d->tunsubs);
     d->tunsubs = NULL;
+    if (d->tunrun != NULL) { firc_tunrun_set_router(d->tunrun, NULL); }
+    firc_opkgtun_stop(d->opkg);
+    d->opkg = NULL;
     firc_tunrun_stop(d->tunrun, 5000);
     firc_tunrun_free(d->tunrun);
     d->tunrun = NULL;
@@ -536,11 +539,12 @@ static firc_err_t rci_identity_get(void *ud, const char *path, char **body)
     (void)ud;
     long timeout_s = strcmp(path, "/rci/show/defaults") == 0 ? FIRC_KN_RCI_SERIAL_TIMEOUT_SECONDS
                                                               : FIRC_KN_RCI_TIMEOUT_SECONDS;
-    return firc_kn_rci_get_timeout(FIRC_KN_RCI_BASE_URL, path, timeout_s, body);
+    return firc_kn_rci_get_timeout(FIRC_KN_RCI_BASE_URL, path, timeout_s, NULL, body);
 }
 
-static void revoke_rci_token(void)
+static firc_err_t revoke_rci_token(void *ud)
 {
+    (void)ud;
     char *body = NULL;
     char release[64] = "";
     if (firc_kn_rci_get(FIRC_KN_RCI_BASE_URL, "/rci/show/version", &body) == FIRC_OK) {
@@ -555,6 +559,7 @@ static void revoke_rci_token(void)
         FIRC_WARN("purge: firc's RCI token may be left on the router (%s); a new install deletes it",
                   firc_err_str(err));
     }
+    return err;
 }
 
 static void on_identity_tick(firc_loop_t *loop, void *ud)
@@ -602,6 +607,29 @@ static bool load_tunnels(firc_tunnels_t *out, const char *keeping)
         FIRC_ERROR("%s: %s; %s", path, firc_err_str(err), keeping);
     }
     return false;
+}
+
+static void opkg_want(const firc_opkgtun_want_t *w, size_t n, void *ud)
+{
+    firc_opkgtun_want(((struct daemon *)ud)->opkg, w, n);
+}
+
+static size_t opkg_seen(firc_opkgtun_seen_t *out, size_t cap, uint32_t *swept, void *ud)
+{
+    struct daemon *d = ud;
+    size_t n = firc_opkgtun_seen(d->opkg, out, cap);
+    *swept = firc_opkgtun_swept(d->opkg);
+    return n;
+}
+
+static void opkg_sweep(void *ud)
+{
+    firc_opkgtun_sweep_now(((struct daemon *)ud)->opkg);
+}
+
+static void opkg_pass(void *ud)
+{
+    (void)firc_app_force_commit_iptables(((struct daemon *)ud)->app);
 }
 
 static void reload_tunnels(struct daemon *d)
@@ -915,7 +943,10 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
     FIRC_DEBUG("interface %s: %s", up ? "up" : "down", iface_name);
     if (d->ifwatch != NULL) { firc_ifwatch_link(d->ifwatch, iface_name, up); }
     firc_app_refresh_remap(d->app, iface_name);
-    if (!up) { return; }
+    if (!up) {
+        firc_tunrun_link_down(d->tunrun, iface_name);
+        return;
+    }
     for (size_t i = 0; i < firc_app_user_group_count(d->app); i++) {
         firc_ruleset_t *rs = firc_app_user_group_at(d->app, i);
         const firc_group_t *g = firc_ruleset_group(rs);
@@ -1072,7 +1103,6 @@ int main(int argc, char **argv)
     firc_sub_fetch_global_init();
 #ifdef FIRC_ENTWARE_KN
     firc_kn_token_setup(FIRC_RCI_TOKEN_PATH, FIRC_NDMC_BIN);
-    if (purge) { revoke_rci_token(); }
 #endif
 
     firc_config_t cfg;
@@ -1143,8 +1173,23 @@ int main(int argc, char **argv)
         /* Wider than 0700 from an older build: tighten it. */
         FIRC_WARN("cannot make %s private: %s", FIRC_APP_RUN_DIR, strerror(errno));
     }
-    /* Lock before touching the kernel or the pool file. */
-    err = firc_instance_lock(FIRC_INSTANCE_LOCK_PATH, &d.lock_fd);
+    if (purge) {
+        const firc_purge_lock_t lock = {firc_instance_lock, FIRC_INSTANCE_LOCK_PATH};
+#ifdef FIRC_ENTWARE_KN
+        firc_opkgtun_io_t io;
+        firc_opkgtun_rci_io(&d.opkg_rci, FIRC_KN_RCI_BASE_URL, FIRC_OPKGTUN_INTENT_PATH, &io);
+        int held = firc_purge_begin(&lock, &io, revoke_rci_token, NULL, &d.lock_fd);
+#else
+        int held = firc_purge_begin(&lock, NULL, NULL, NULL, &d.lock_fd);
+#endif
+        if (held != 0) {
+            firc_config_clear(&cfg);
+            return 1;
+        }
+        err = FIRC_OK;
+    } else {
+        err = firc_instance_lock(FIRC_INSTANCE_LOCK_PATH, &d.lock_fd);
+    }
     if (err == FIRC_ERR_EXIST) {
         FIRC_ERROR("another fircd holds %s: is the service already running?", FIRC_INSTANCE_LOCK_PATH);
         firc_config_clear(&cfg);
@@ -1557,9 +1602,12 @@ int main(int argc, char **argv)
         firc_config_clear(&cfg);
         return 1;
     }
+    firc_tunnels_t tunnels = {0};
+    bool tunnels_ok = load_tunnels(&tunnels, "starting with no tunnels");
     /* No group stops the daemon: one that fails is logged and left out. */
-    err = firc_app_start_groups(d.app);
+    err = firc_app_start_groups(d.app, tunnels_ok ? &tunnels : NULL);
     if (err != FIRC_OK) {
+        firc_tunnels_free(&tunnels);
         daemon_teardown(&d);
         firc_config_clear(&cfg);
         return 1;
@@ -1577,6 +1625,7 @@ int main(int argc, char **argv)
         d.tunrun = firc_tunrun_new(d.loop, d.rtnl, cfg.app.netfilter.start_mark_table_index, tunvless_bin, &lan);
         if (d.tunrun == NULL) {
             FIRC_ERROR("failed to create the tunnel supervisor");
+            firc_tunnels_free(&tunnels);
             daemon_teardown(&d);
             firc_config_clear(&cfg);
             return 1;
@@ -1598,16 +1647,23 @@ int main(int argc, char **argv)
         if (firc_fakeip_pool_prefix(d.pool, FIRC_FAM_V4, &pool4, &pool4_len)) {
             firc_tunrun_set_tcp_pool(d.tunrun, pool4.b, pool4_len);
         }
-        const firc_tunrun_ktcp_t hooks = {ktcp_ports, ktcp_image, ktcp_real_of, d.app, ktcp_closed, ktcp_ready};
+        const firc_tunrun_ktcp_t hooks = {ktcp_tunnels, ktcp_image, ktcp_real_of, d.app, ktcp_closed, ktcp_ready};
         firc_tunrun_set_ktcp(d.tunrun, &hooks);
         firc_tunrun_set_ktcp_usable(d.tunrun, d.ipt4 != NULL && firc_ipt_has(d.ipt4, "REDIRECT") &&
                                                       firc_ipt_has(d.ipt4, "addrtype"));
         const firc_app_ktcp_sink_t sink = {ktcp_pushed, ktcp_close, d.tunrun};
         firc_app_set_ktcp_sink(d.app, &sink);
-        firc_tunnels_t tunnels = {0};
-        if (load_tunnels(&tunnels, "starting with no tunnels")) {
-            (void)firc_tunrun_apply(d.tunrun, &tunnels);
+        firc_opkgtun_io_t io;
+        firc_opkgtun_rci_io(&d.opkg_rci, FIRC_KN_RCI_BASE_URL, FIRC_OPKGTUN_INTENT_PATH, &io);
+        d.opkg = firc_opkgtun_start(&io);
+        if (d.opkg == NULL) {
+            FIRC_ERROR("tunnels: the router's OpkgTun records cannot be kept; opkgtun tunnels will not start");
+        } else {
+            const firc_tunrun_router_t router = {opkg_want, opkg_seen, opkg_sweep, opkg_pass,
+                                                 firc_opkgtun_fd(d.opkg), &d};
+            firc_tunrun_set_router(d.tunrun, &router);
         }
+        (void)firc_tunrun_start(d.tunrun, tunnels_ok ? &tunnels : NULL);
         firc_tunnels_free(&tunnels);
     }
 

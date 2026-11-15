@@ -19,7 +19,8 @@ typedef enum {
     FIRC_TUN_ST_BACKOFF,
     FIRC_TUN_ST_BAD_CONFIG,
     FIRC_TUN_ST_WAITING,
-    FIRC_TUN_ST_UPLINK_DOWN
+    FIRC_TUN_ST_UPLINK_DOWN,
+    FIRC_TUN_ST_ROUTER
 } firc_tun_status_t;
 
 typedef struct {
@@ -39,6 +40,7 @@ typedef struct {
     uint16_t tcp_port;
     char id[16];
     char device[16];
+    char why[160];
     char active[8][128];
     firc_tun_ib_state_t ib[FIRC_TUN_MAX_INBOUNDS];
     size_t n_ib;
@@ -63,10 +65,25 @@ void firc_tunsup_stop(firc_tunsup_t *s, int grace_ms);
 
 void firc_tunsup_free(firc_tunsup_t *s);
 
-typedef void (*firc_tun_reap_fn)(const char *id, pid_t pid, void *ud);
+typedef void (*firc_tun_reap_fn)(const char *id, const char *device, pid_t pid, void *ud);
 
-/* fn runs once child pid of tunnel id has been reaped, removed tunnels included, before any respawn. */
+/* fn runs once child pid of tunnel id, which ran on device, has been reaped, removed tunnels included, before any
+   respawn. */
 void firc_tunsup_set_on_reap(firc_tunsup_t *s, firc_tun_reap_fn fn, void *ud);
+
+typedef enum { FIRC_TUN_GATE_GO, FIRC_TUN_GATE_WAIT } firc_tun_gate_t;
+
+/* Asked before every spawn of tunnel id on device (index n); WAIT holds the spawn until firc_tunsup_gate_open(gen). */
+typedef firc_tun_gate_t (*firc_tun_gate_fn)(const char *id, const char *device, int n, uint32_t gen, void *ud);
+
+/* Every spawn asks fn first; gens come from one counter across the supervisor, so no two waits share one. */
+void firc_tunsup_set_gate(firc_tunsup_t *s, firc_tun_gate_fn fn, void *ud);
+
+/* Spawns tunnel id held by the gate under gen, past the gate this once; nothing when the slot changed since. */
+void firc_tunsup_gate_open(firc_tunsup_t *s, const char *id, uint32_t gen);
+
+/* True while a child that runs on device is not reaped, retired tunnels included. */
+bool firc_tunsup_holds_device(const firc_tunsup_t *s, const char *device);
 
 /* Sets the pool base and prefix length passed as --tcp-pool to kernel-TCP tunnels; len 0 passes none. */
 void firc_tunsup_set_tcp_pool(firc_tunsup_t *s, const uint8_t base[4], uint8_t len);

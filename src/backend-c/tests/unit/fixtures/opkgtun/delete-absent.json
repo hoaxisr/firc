@@ -1,0 +1,14 @@
+[
+  {
+    "interface": {
+      "status": [
+        {
+          "status": "error",
+          "code": "6553611",
+          "ident": "Network::Interface::Repository",
+          "message": "unable to find interface \"OpkgTun9\"."
+        }
+      ]
+    }
+  }
+]

@@ -124,10 +124,18 @@ static void reset_stubs(void *ud) {
     g_before_loop = NULL;
 }
 
+static firc_tunnels_t *one_tunnel(const char *device) {
+    static firc_tunnel_t t;
+    static firc_tunnels_t ts = {.t = &t, .n = 1};
+    memset(&t, 0, sizeof t);
+    snprintf(t.device, sizeof t.device, "%s", device);
+    return &ts;
+}
+
 static firc_err_t list_with_aliases(firc_iface_info_t **out, size_t *n) {
     firc_kn_aliases_t aliases = {0};
     firc_err_t err = firc_kn_get_iface_aliases(&aliases);
-    if (err == FIRC_OK) { err = firc_app_list_interfaces(&aliases, out, n); }
+    if (err == FIRC_OK) { err = firc_app_list_interfaces(&aliases, one_tunnel("tunvless0"), out, n); }
     firc_kn_aliases_free(&aliases);
     return err;
 }
@@ -966,29 +974,48 @@ TEST hosts_mark_running_reads_the_running_settings(void) {
 
 /* Catches: a tunvless device, a point-to-point link, an inet one, a br segment or the rest given another role, or the order of the rules changed. */
 TEST each_interface_gets_its_role(void) {
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("nwg1", IFF_POINTOPOINT, false));
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("opkgtun10", IFF_POINTOPOINT | IFF_UP, false));
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless0", 0, false));
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless12", 0, true));
-    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("ppp0", IFF_POINTOPOINT, true));
-    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("eth3", 0, true));
-    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("br9", 0, true));
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("ppp0", IFF_POINTOPOINT, false));
-    ASSERT_EQ(FIRC_IFACE_LAN, firc_iface_role_for_test("br0", 0, false));
-    ASSERT_EQ(FIRC_IFACE_LAN, firc_iface_role_for_test("br12", IFF_UP, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("eth2.1", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("br", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("bridge0", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("br0.5", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvlessx", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless01", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless100", 0, false));
-    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless99", 0, false));
-    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("radio0", 0, false));
+    firc_tunnel_t t[3];
+    memset(t, 0, sizeof t);
+    snprintf(t[0].device, sizeof t[0].device, "tunvless0");
+    snprintf(t[1].device, sizeof t[1].device, "tunvless12");
+    snprintf(t[2].device, sizeof t[2].device, "tunvless99");
+    const firc_tunnels_t cfg = {.t = t, .n = 3};
+    const firc_tunnels_t *ts = &cfg;
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("nwg1", IFF_POINTOPOINT, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("opkgtun10", IFF_POINTOPOINT | IFF_UP, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless0", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless12", 0, true, ts));
+    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("ppp0", IFF_POINTOPOINT, true, ts));
+    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("eth3", 0, true, ts));
+    ASSERT_EQ(FIRC_IFACE_WAN, firc_iface_role_for_test("br9", 0, true, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("ppp0", IFF_POINTOPOINT, false, ts));
+    ASSERT_EQ(FIRC_IFACE_LAN, firc_iface_role_for_test("br0", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_LAN, firc_iface_role_for_test("br12", IFF_UP, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("eth2.1", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("br", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("bridge0", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("br0.5", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvlessx", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless01", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless100", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless99", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("radio0", 0, false, ts));
     ASSERT_STR_EQ("tunnel", firc_iface_role_name(FIRC_IFACE_TUNNEL));
     ASSERT_STR_EQ("wan", firc_iface_role_name(FIRC_IFACE_WAN));
     ASSERT_STR_EQ("lan", firc_iface_role_name(FIRC_IFACE_LAN));
     ASSERT_STR_EQ("other", firc_iface_role_name(FIRC_IFACE_OTHER));
+    PASS();
+}
+
+/* Catches: a device's role taken from its tunvless or opkgtun name instead of tunnels.yaml. */
+TEST iface_role_by_configuration(void) {
+    const firc_tunnels_t *ts = one_tunnel("tunvless10");
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("opkgtun10", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("opkgtun10", IFF_POINTOPOINT, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("tunvless10", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless3", 0, false, ts));
+    ASSERT_EQ(FIRC_IFACE_TUNNEL, firc_iface_role_for_test("opkgtun10", 0, false, one_tunnel("opkgtun10")));
+    ASSERT_EQ(FIRC_IFACE_OTHER, firc_iface_role_for_test("tunvless10", 0, false, NULL));
     PASS();
 }
 
@@ -2232,6 +2259,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_netfilter_route_says_whether_the_committer_is_failing);
     RUN_TEST(the_netfilter_route_says_the_first_write_is_pending);
     RUN_TEST(each_interface_gets_its_role);
+    RUN_TEST(iface_role_by_configuration);
     RUN_TEST(ifnet4_find_names_the_segment);
     RUN_TEST(ifnet4_link_first_prefers_lan_nets);
     RUN_TEST(hosts_mark_flags_devices_outside_link);

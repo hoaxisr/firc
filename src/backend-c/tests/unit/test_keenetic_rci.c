@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -456,7 +457,7 @@ TEST a_call_with_its_own_timeout_outlasts_a_slow_answer(void)
     char *body = NULL;
     ASSERT_EQ(FIRC_ERR_TIMEOUT, firc_kn_rci_get(base, "/rci/show/defaults", &body));
     ASSERT_EQ(NULL, body);
-    firc_err_t err = firc_kn_rci_get_timeout(base, "/rci/show/defaults", 10, &body);
+    firc_err_t err = firc_kn_rci_get_timeout(base, "/rci/show/defaults", 10, NULL, &body);
     pthread_join(th, NULL);
     close(s.fd);
     ASSERT_EQ(FIRC_OK, err);
@@ -490,6 +491,87 @@ TEST a_failed_call_names_the_curl_code(void)
     PASS();
 }
 
+/* catches: a write POST held to the 2 s of every other call, so a slow router answer reads as a lost one */
+TEST a_post_with_its_own_timeout_outlasts_a_slow_answer(void)
+{
+    slow_rci_server_t s = {.delay_ms = 2600};
+    ASSERT(slow_rci_listen(&s));
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, slow_rci_serve, &s));
+    char base[64];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", s.port);
+    char *body = NULL;
+    ASSERT_EQ(FIRC_ERR_TIMEOUT, firc_kn_rci_post(base, "/rci/", "[]", &body));
+    ASSERT_EQ(NULL, body);
+    firc_err_t err = firc_kn_rci_post_timeout(base, "/rci/", "[]", 10, NULL, &body);
+    pthread_join(th, NULL);
+    close(s.fd);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_STR_EQ("{\"serial\":\"S987654321\"}", body);
+    free(body);
+    PASS();
+}
+
+typedef struct {
+    int fd;
+    atomic_bool quit;
+} mute_server_t;
+
+static void *mute_serve(void *ud)
+{
+    mute_server_t *s = ud;
+    int c = accept(s->fd, NULL, NULL);
+    while (!atomic_load(&s->quit)) {
+        struct timespec ts = {0, 10 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    if (c >= 0) { close(c); }
+    return NULL;
+}
+
+static void *raise_later(void *ud)
+{
+    struct timespec ts = {0, 200 * 1000000L};
+    nanosleep(&ts, NULL);
+    atomic_store((atomic_bool *)ud, true);
+    return NULL;
+}
+
+static long ms_since(const struct timespec *a)
+{
+    struct timespec b;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    return (long)((b.tv_sec - a->tv_sec) * 1000 + (b.tv_nsec - a->tv_nsec) / 1000000);
+}
+
+/* catches: no abort in the transfer, so a stop waits out the call's own timeout */
+TEST an_abort_flag_ends_a_transfer(void)
+{
+    slow_rci_server_t l = {0};
+    ASSERT(slow_rci_listen(&l));
+    mute_server_t s = {.fd = l.fd};
+    pthread_t th, rt;
+    ASSERT_EQ(0, pthread_create(&th, NULL, mute_serve, &s));
+    atomic_bool stop = false;
+    ASSERT_EQ(0, pthread_create(&rt, NULL, raise_later, &stop));
+    char base[64];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", l.port);
+    char *body = NULL;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_err_t err = firc_kn_rci_post_timeout(base, "/rci/", "[]", 10, &stop, &body);
+    long took = ms_since(&t0);
+    atomic_store(&s.quit, true);
+    pthread_join(th, NULL);
+    pthread_join(rt, NULL);
+    close(l.fd);
+    ASSERT_EQ(FIRC_ERR_CANCELED, err);
+    ASSERT_EQ(NULL, body);
+    ASSERT(took >= 150);
+    ASSERT(took < 1700);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -515,5 +597,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_label_after_an_unlabelled_external_entry_is_found);
     RUN_TEST(a_call_with_its_own_timeout_outlasts_a_slow_answer);
     RUN_TEST(a_failed_call_names_the_curl_code);
+    RUN_TEST(a_post_with_its_own_timeout_outlasts_a_slow_answer);
+    RUN_TEST(an_abort_flag_ends_a_transfer);
     GREATEST_MAIN_END();
 }

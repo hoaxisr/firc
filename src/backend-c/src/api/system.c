@@ -824,7 +824,7 @@ typedef struct ifaces_read {
 static char *interfaces_body(const firc_system_ctx_t *ctx, const firc_kn_aliases_t *aliases, int *status) {
     firc_iface_info_t *ifaces = NULL;
     size_t n = 0;
-    firc_err_t err = firc_app_list_interfaces(aliases, &ifaces, &n);
+    firc_err_t err = firc_app_list_interfaces(aliases, ctx->tunnels, &ifaces, &n);
     cJSON *out;
     if (err != FIRC_OK) {
         *status = 500;

@@ -1,8 +1,9 @@
 import {
   ifaceTitle,
   isSink,
+  isTunnelDevice,
   moreText,
-  TUNVLESS_DEVICE,
+  splitDevice,
   type IfaceItem,
 } from "../../data/iface-choices";
 import type { Tunnel, TunnelProbeRow, TunnelUplink } from "../../types";
@@ -123,10 +124,7 @@ export function uplinkOptions(
   t: T,
   more: { opened?: boolean | null; onToggle?: () => void; locale?: string } = {},
 ): UplinkOption[] {
-  const devices = new Set(tunnels.map((tn) => tn.device));
-  const usable = ifaces.filter(
-    (i) => !isSink(i.id) && !TUNVLESS_DEVICE.test(i.id) && !devices.has(i.id),
-  );
+  const usable = ifaces.filter((i) => !isSink(i.id) && !isTunnelDevice(i.id, tunnels));
   const head = usable.filter((i) => i.role === "wan" || i.role === "tunnel");
   const rest = usable.filter((i) => i.role !== "wan" && i.role !== "tunnel");
   const expanded =
@@ -191,17 +189,33 @@ export function restartingDevices(before: Tunnel[], after: Tunnel[]): string[] {
   return out;
 }
 
+const DEVICE_NAME = /^(tunvless([0-9]|[1-9][0-9])|opkgtun([0-9]|1[0-6]))$/;
+
 export function deviceProblem(
   device: string,
   tunnels: Tunnel[],
   selfId: string,
   t: T = (key) => key,
+  ifaces: readonly { id: string }[] = [],
 ): string | null {
-  if (!TUNVLESS_DEVICE.test(device)) return t("Device must be tunvless0 to tunvless99");
-  if (tunnels.some((tn) => tn.id !== selfId && tn.device === device)) {
+  if (!DEVICE_NAME.test(device))
+    return t("Device must be tunvless0 to tunvless99 or opkgtun0 to opkgtun16");
+  const num = splitDevice(device).num;
+  if (tunnels.some((tn) => tn.id !== selfId && splitDevice(tn.device).num === num)) {
     return t("Another tunnel uses this device");
   }
+  if (device.startsWith("opkgtun") && ifaces.some((i) => i.id === device)) {
+    return t("The router already has this interface");
+  }
   return null;
+}
+
+export function routerWrite(saved: Tunnel | undefined, draft: Tunnel): string | null {
+  if (!draft.device.startsWith("opkgtun")) return null;
+  if (saved && saved.device === draft.device && saved.description === draft.description) {
+    return null;
+  }
+  return `OpkgTun${splitDevice(draft.device).num}`;
 }
 
 export const DESCRIPTION_MAX_BYTES = 63 as const;

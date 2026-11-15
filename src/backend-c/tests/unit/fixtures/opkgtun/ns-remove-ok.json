@@ -1,0 +1,16 @@
+[
+  {
+    "ip": {
+      "name-server": {
+        "status": [
+          {
+            "status": "message",
+            "code": "9895956",
+            "ident": "Dns::InterfaceSpecific",
+            "message": "\"OpkgTun9\": name server 192.0.2.53 deleted, domain (default)."
+          }
+        ]
+      }
+    }
+  }
+]

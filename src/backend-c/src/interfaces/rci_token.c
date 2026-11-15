@@ -22,6 +22,7 @@
 
 #define NDMC_OUT_MAX (64 * 1024)
 #define MAX_IDS 32
+#define STOP_SLICE_MS 100
 
 static struct {
     pthread_mutex_t mu;
@@ -189,13 +190,18 @@ static long ms_left(const struct timespec *start)
            ((now.tv_sec - start->tv_sec) * 1000L + (now.tv_nsec - start->tv_nsec) / 1000000L);
 }
 
-static bool reap(pid_t pid, const struct timespec *start, int *status)
+static bool stopped(const atomic_bool *stop)
+{
+    return stop != NULL && atomic_load(stop);
+}
+
+static bool reap(pid_t pid, const struct timespec *start, const atomic_bool *stop, int *status)
 {
     for (;;) {
         pid_t r = waitpid(pid, status, WNOHANG);
         if (r == pid) { return true; }
         if (r < 0 && errno != EINTR) { return false; }
-        if (ms_left(start) <= 0) {
+        if (ms_left(start) <= 0 || stopped(stop)) {
             kill(pid, SIGKILL);
             while (waitpid(pid, status, 0) < 0 && errno == EINTR) {}
             return false;
@@ -205,7 +211,7 @@ static bool reap(pid_t pid, const struct timespec *start, int *status)
     }
 }
 
-static firc_err_t ndmc_run(const char *ndmc, const char *cmd, char **out)
+static firc_err_t ndmc_run(const char *ndmc, const char *cmd, const atomic_bool *stop, char **out)
 {
     *out = NULL;
     char *buf = malloc(NDMC_OUT_MAX + 1);
@@ -239,8 +245,10 @@ static firc_err_t ndmc_run(const char *ndmc, const char *cmd, char **out)
     struct pollfd p[2] = {{.fd = pfd[0], .events = POLLIN}, {.fd = efd[0], .events = POLLIN}};
     while (p[0].fd >= 0 || p[1].fd >= 0) {
         long left = ms_left(&start);
-        if (left <= 0) { break; }
+        if (left <= 0 || stopped(stop)) { break; }
+        if (stop != NULL && left > STOP_SLICE_MS) { left = STOP_SLICE_MS; }
         int pr = poll(p, 2, (int)left);
+        if (pr == 0 && stop != NULL) { continue; }
         if (pr < 0 && errno == EINTR) { continue; }
         if (pr <= 0) { break; }
         if (p[0].revents != 0) {
@@ -259,8 +267,9 @@ static firc_err_t ndmc_run(const char *ndmc, const char *cmd, char **out)
     buf[len] = '\0';
     ebuf[elen] = '\0';
     int status = 0;
-    if (!reap(pid, &start, &status)) {
+    if (!reap(pid, &start, stop, &status)) {
         free(buf);
+        if (stopped(stop)) { return FIRC_ERR_CANCELED; }
         FIRC_WARN("rci token: ndmc \"%s\" gave no answer in %d ms", cmd, FIRC_KN_NDMC_TIMEOUT_MS);
         return FIRC_ERR_TIMEOUT;
     }
@@ -286,10 +295,10 @@ static firc_err_t ndmc_run(const char *ndmc, const char *cmd, char **out)
     return FIRC_OK;
 }
 
-static firc_err_t delete_ours(const char *ndmc, const char *keep)
+static firc_err_t delete_ours(const char *ndmc, const char *keep, const atomic_bool *stop)
 {
     char *out = NULL;
-    firc_err_t err = ndmc_run(ndmc, "show authentication token", &out);
+    firc_err_t err = ndmc_run(ndmc, "show authentication token", stop, &out);
     if (err != FIRC_OK) { return err; }
     char ids[MAX_IDS][16];
     size_t n = firc_kn_token_ids(out, FIRC_KN_TOKEN_USER_DATA, ids, MAX_IDS);
@@ -298,7 +307,7 @@ static firc_err_t delete_ours(const char *ndmc, const char *keep)
         if (keep != NULL && strcmp(ids[i], keep) == 0) { continue; }
         char cmd[64];
         snprintf(cmd, sizeof cmd, "authentication token delete %.15s", ids[i]);
-        err = ndmc_run(ndmc, cmd, &out);
+        err = ndmc_run(ndmc, cmd, stop, &out);
         free(out);
         if (err != FIRC_OK) { return err; }
     }
@@ -335,24 +344,26 @@ static bool store(const char *tok)
     return err == FIRC_OK;
 }
 
-static void issue(void)
+static bool issue(const atomic_bool *stop)
 {
     g.token[0] = '\0';
     g.last_issue = time(NULL);
     g.issued = true;
     char *out = NULL;
-    if (ndmc_run(g.ndmc, "authentication token generate " FIRC_KN_TOKEN_USER_DATA, &out) != FIRC_OK) { return; }
+    firc_err_t err = ndmc_run(g.ndmc, "authentication token generate " FIRC_KN_TOKEN_USER_DATA, stop, &out);
+    if (err != FIRC_OK) { return err != FIRC_ERR_CANCELED; }
     char id[16], tok[FIRC_KN_TOKEN_MAX];
     bool ok = firc_kn_token_parse_generated(out, id, sizeof id, tok, sizeof tok);
     free(out);
     if (!ok) { FIRC_WARN("rci token: ndmc issued a token firc cannot read; firc's tokens are deleted"); }
     if (!ok || !store(tok)) {
-        (void)delete_ours(g.ndmc, NULL);
-        return;
+        (void)delete_ours(g.ndmc, NULL, stop);
+        return !stopped(stop);
     }
-    if (id[0] != '\0') { (void)delete_ours(g.ndmc, id); }
+    if (id[0] != '\0') { (void)delete_ours(g.ndmc, id, stop); }
     snprintf(g.token, sizeof g.token, "%s", tok);
     FIRC_INFO("rci token: issued");
+    return true;
 }
 
 static bool pause_over(void)
@@ -391,32 +402,57 @@ static void load(void)
     snprintf(g.token, sizeof g.token, "%s", trim(buf));
 }
 
-void firc_kn_token_current(char out[FIRC_KN_TOKEN_MAX])
+static bool lock(const atomic_bool *stop)
 {
-    pthread_mutex_lock(&g.mu);
+    if (stop == NULL) {
+        pthread_mutex_lock(&g.mu);
+        return true;
+    }
+    while (!stopped(stop)) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += STOP_SLICE_MS * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_sec++;
+            until.tv_nsec -= 1000000000L;
+        }
+        int rc = pthread_mutex_timedlock(&g.mu, &until);
+        if (rc == 0 && !stopped(stop)) { return true; }
+        if (rc == 0) { pthread_mutex_unlock(&g.mu); }
+    }
+    return false;
+}
+
+bool firc_kn_token_current(char out[FIRC_KN_TOKEN_MAX], const atomic_bool *stop)
+{
     out[0] = '\0';
+    if (!lock(stop)) { return false; }
+    bool ok = true;
     if (g.on) {
         if (!g.loaded) { load(); }
-        if (g.token[0] == '\0' && pause_over()) { issue(); }
+        if (g.token[0] == '\0' && pause_over()) { ok = issue(stop); }
         snprintf(out, FIRC_KN_TOKEN_MAX, "%s", g.token);
     }
     pthread_mutex_unlock(&g.mu);
+    return ok;
 }
 
-void firc_kn_token_refused(const char *stale, char out[FIRC_KN_TOKEN_MAX])
+bool firc_kn_token_refused(const char *stale, char out[FIRC_KN_TOKEN_MAX], const atomic_bool *stop)
 {
-    pthread_mutex_lock(&g.mu);
     out[0] = '\0';
+    if (!lock(stop)) { return false; }
+    bool ok = true;
     g.on = g.path[0] != '\0';
     if (g.on) {
         if (!g.loaded) { load(); }
         if (strcmp(g.token, stale) == 0) {
             g.token[0] = '\0';
-            if (pause_over()) { issue(); }
+            if (pause_over()) { ok = issue(stop); }
         }
         snprintf(out, FIRC_KN_TOKEN_MAX, "%s", g.token);
     }
     pthread_mutex_unlock(&g.mu);
+    return ok;
 }
 
 static bool release_old(const char *release)
@@ -429,7 +465,7 @@ firc_err_t firc_kn_token_revoke(const char *path, const char *ndmc, const char *
 {
     bool had_file = access(path, F_OK) == 0;
     if (!had_file && release_old(release)) { return FIRC_OK; }
-    firc_err_t err = delete_ours(ndmc, NULL);
+    firc_err_t err = delete_ours(ndmc, NULL, NULL);
     if (err != FIRC_OK && err != FIRC_ERR_NOSYS) { return err; }
     if (had_file && unlink(path) != 0 && errno != ENOENT) { return FIRC_ERR_IO; }
     return FIRC_OK;

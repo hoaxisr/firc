@@ -5,7 +5,7 @@
   import { t } from "../../../data/locale.svelte";
   import type { TunnelsStore } from "../tunnels.svelte";
 
-  import { deviceProblem, skippedLabels } from "../tunnel-editor";
+  import { skippedLabels } from "../tunnel-editor";
   import type { ClientTunnel } from "../tunnels-data";
 
   let { store, tunnel = $bindable() }: { store: TunnelsStore; tunnel: ClientTunnel } = $props();
@@ -15,7 +15,6 @@
       tunnel.advanced.timeout < 1 ||
       tunnel.advanced.timeout > 600,
   );
-  const deviceBad = $derived(deviceProblem(tunnel.device, store.data, tunnel.id, t));
   const tcpPort = $derived(store.stateOf(tunnel.id)?.tcpPort ?? 0);
   const tcpSkipped = $derived(
     skippedLabels(store.stateOf(tunnel.id)?.tcpSkipped ?? [], interfaces.list),
@@ -146,24 +145,6 @@
       aria-label={t("Own CA")}
       placeholder="/opt/etc/ssl/ca.pem"
       bind:value={tunnel.advanced.ca}
-    />
-  </div>
-</div>
-<div class="row">
-  <div class="label">
-    <div class="name">{t("Device name")}</div>
-    <div class="hint" class:bad={Boolean(deviceBad)}>
-      {deviceBad ?? t("The interface groups choose; tunvless0 to tunvless99")}
-    </div>
-  </div>
-  <div class="controls">
-    <input
-      type="text"
-      class="wide"
-      aria-label={t("Device name")}
-      class:invalid={Boolean(deviceBad)}
-      aria-invalid={Boolean(deviceBad)}
-      bind:value={tunnel.device}
     />
   </div>
 </div>

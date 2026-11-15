@@ -229,97 +229,102 @@ BODY {"error":"must be a list","field":"tunnels","tunnel":null}
 STEP 48 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"device":"eth0","enable":false,"id":"t1"}]}
 STATUS 400
-BODY {"error":"must start with tunvless","field":"device","tunnel":"t1"}
+BODY {"error":"must start with tunvless or opkgtun","field":"device","tunnel":"t1"}
 ---
 STEP 49 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"description":"PRAW-1","device":"tunvless0","exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","order":["0000000b:NL-2"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]},{"device":"tunvless1","enable":false,"id":"t2","sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}
 STATUS 200
 BODY {"restarted":["tunvless0"],"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}],"updated":[]}
 ---
-STEP 50 GET /api/v1/tunnels
+STEP 50 PUT /api/v1/tunnels
+REQBODY {"tunnels":[{"description":"PRAW-1","device":"tunvless0","exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","order":["0000000b:NL-2"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]},{"device":"tunvless1","enable":false,"id":"t2","sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}},{"device":"opkgtun2","enable":false,"id":"t3","sources":[{"id":"0000000d","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}]}]}
 STATUS 200
-BODY {"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}
+BODY {"restarted":[],"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"opkgtun2","enable":false,"exclude":[],"filter":"","id":"t3","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000d","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"auto","ref":""}}],"updated":[]}
 ---
-STEP 51 GET /api/v1/tunnels/state
+STEP 51 GET /api/v1/tunnels
 STATUS 200
-BODY {"tunnels":[{"active":["A"],"backoffS":"<LIVE>","device":"tunvless0","groups":[],"id":"t1","inbounds":[],"lastExit":"<LIVE>","nodes":[{"key":"0000000b:NL-2","name":"NL-2","since":"<LIVE>","skipReason":"","source":"Stub","state":"reserve"},{"key":"0000000a:A","name":"A","since":"<LIVE>","skipReason":"","source":"link","state":"active"},{"key":"0000000b:NL-1","name":"NL-1","since":"<LIVE>","skipReason":"","source":"Stub","state":"excluded"}],"rxBps":"<LIVE>","since":"<LIVE>","status":"up","subscriptions":[{"error":"","fetching":false,"lastOk":"<LIVE>","lastTry":"<LIVE>","name":"Stub","nodes":3,"usage":null}],"tcpOff":"","tcpPort":0,"tcpSkipped":[],"txBps":"<LIVE>","uplinkOk":true},{"active":[],"backoffS":"<LIVE>","device":"tunvless1","groups":[],"id":"t2","inbounds":[],"lastExit":"<LIVE>","nodes":[{"key":"0000000c:A","name":"A","since":"<LIVE>","skipReason":"","source":"link","state":"reserve"}],"rxBps":"<LIVE>","since":"<LIVE>","status":"off","subscriptions":[],"tcpOff":"","tcpPort":0,"tcpSkipped":[],"txBps":"<LIVE>","uplinkOk":true}]}
+BODY {"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"opkgtun2","enable":false,"exclude":[],"filter":"","id":"t3","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000d","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"auto","ref":""}}]}
 ---
-STEP 52 POST /api/v1/tunnels/preview
+STEP 52 GET /api/v1/tunnels/state
+STATUS 200
+BODY {"tunnels":[{"active":["A"],"backoffS":"<LIVE>","device":"tunvless0","groups":[],"id":"t1","inbounds":[],"lastExit":"<LIVE>","nodes":[{"key":"0000000b:NL-2","name":"NL-2","since":"<LIVE>","skipReason":"","source":"Stub","state":"reserve"},{"key":"0000000a:A","name":"A","since":"<LIVE>","skipReason":"","source":"link","state":"active"},{"key":"0000000b:NL-1","name":"NL-1","since":"<LIVE>","skipReason":"","source":"Stub","state":"excluded"}],"rxBps":"<LIVE>","since":"<LIVE>","status":"up","subscriptions":[{"error":"","fetching":false,"lastOk":"<LIVE>","lastTry":"<LIVE>","name":"Stub","nodes":3,"usage":null}],"tcpOff":"","tcpPort":0,"tcpSkipped":[],"txBps":"<LIVE>","uplinkOk":true,"why":""},{"active":[],"backoffS":"<LIVE>","device":"tunvless1","groups":[],"id":"t2","inbounds":[],"lastExit":"<LIVE>","nodes":[{"key":"0000000c:A","name":"A","since":"<LIVE>","skipReason":"","source":"link","state":"reserve"}],"rxBps":"<LIVE>","since":"<LIVE>","status":"off","subscriptions":[],"tcpOff":"","tcpPort":0,"tcpSkipped":[],"txBps":"<LIVE>","uplinkOk":true,"why":""},{"active":[],"backoffS":"<LIVE>","device":"opkgtun2","groups":[],"id":"t3","inbounds":[],"lastExit":"<LIVE>","nodes":[{"key":"0000000d:A","name":"A","since":"<LIVE>","skipReason":"","source":"link","state":"reserve"}],"router":{"error":"this build cannot reach the router","name":"OpkgTun2","saved":true,"state":"failed"},"rxBps":"<LIVE>","since":"<LIVE>","status":"off","subscriptions":[],"tcpOff":"","tcpPort":0,"tcpSkipped":[],"txBps":"<LIVE>","uplinkOk":true,"why":""}]}
+---
+STEP 53 POST /api/v1/tunnels/preview
 REQBODY {"tunnel":{"description":"PRAW-1","device":"tunvless0","exclude":[],"filter":"^(NL|DE)-","id":"t1","order":["0000000b:DE-1"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]}}
 STATUS 200
 BODY {"matched":4,"nodes":[{"excluded":false,"isNew":false,"key":"0000000b:DE-1","name":"DE-1","overCap":false,"skipReason":"","source":"Stub"},{"excluded":false,"isNew":true,"key":"0000000a:A","name":"A","overCap":false,"skipReason":"","source":"link"},{"excluded":false,"isNew":true,"key":"0000000b:NL-1","name":"NL-1","overCap":false,"skipReason":"","source":"Stub"},{"excluded":false,"isNew":true,"key":"0000000b:NL-2","name":"NL-2","overCap":false,"skipReason":"","source":"Stub"}],"subscriptions":[{"cached":true,"name":"Stub"}],"total":4}
 ---
-STEP 53 POST /api/v1/tunnels/preview
+STEP 54 POST /api/v1/tunnels/preview
 REQBODY {"tunnel":{"description":"PRAW-1","device":"tunvless0","exclude":[],"filter":"(","id":"t1","order":["0000000b:DE-1"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]}}
 STATUS 400
 BODY {"error":"a POSIX extended regular expression under 1024 bytes","field":"filter","tunnel":"t1"}
 ---
-STEP 54 POST /api/v1/tunnels/probe
+STEP 55 POST /api/v1/tunnels/probe
 REQBODY {"id":"t1"}
 STATUS 200
 BODY {"nodes":[{"firstByteMs":20,"handshakeMs":10,"key":"0000000b:NL-2","ok":true,"why":""},{"firstByteMs":21,"handshakeMs":11,"key":"0000000a:A","ok":true,"why":""},{"firstByteMs":22,"handshakeMs":12,"key":"0000000b:NL-1","ok":true,"why":""}]}
 ---
-STEP 55 POST /api/v1/tunnels/probe
+STEP 56 POST /api/v1/tunnels/probe
 REQBODY {"id":"zz"}
 STATUS 404
 BODY {"error":"<ERR>"}
 ---
-STEP 56 POST /api/v1/tunnels/t1/refresh
+STEP 57 POST /api/v1/tunnels/t1/refresh
 STATUS 202
 BODY {"queued":true}
 ---
-STEP 57 POST /api/v1/tunnels/t2/refresh
+STEP 58 POST /api/v1/tunnels/t2/refresh
 STATUS 202
 BODY {"queued":false}
 ---
-STEP 58 POST /api/v1/tunnels/zz/refresh
+STEP 59 POST /api/v1/tunnels/zz/refresh
 STATUS 404
 BODY {"error":"<ERR>"}
 ---
-STEP 59 POST /api/v1/tunnels/t2/restart
+STEP 60 POST /api/v1/tunnels/t2/restart
 STATUS 409
 BODY {"error":"<ERR>"}
 ---
-STEP 60 POST /api/v1/tunnels/zz/restart
+STEP 61 POST /api/v1/tunnels/zz/restart
 STATUS 404
 BODY {"error":"<ERR>"}
 ---
-STEP 61 POST /api/v1/tunnels/t1/restart
+STEP 62 POST /api/v1/tunnels/t1/restart
 STATUS 202
 BODY {"queued":true}
 ---
-STEP 62 PUT /api/v1/tunnels
+STEP 63 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"description":"PRAW-1","device":"tunvless0","exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[{"listen":"lo","node":"0000000a:A","password":"p","port":18096,"user":"u"},{"listen":"lo","node":"0000000b:NL-2","port":18097}],"order":["0000000b:NL-2"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]},{"device":"tunvless1","enable":false,"id":"t2","sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}
 STATUS 200
 BODY {"restarted":[],"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[{"listen":"lo","node":"0000000a:A","password":"p","port":18096,"user":"u"},{"listen":"lo","node":"0000000b:NL-2","password":"","port":18097,"user":""}],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}],"updated":[]}
 ---
-STEP 63 GET /api/v1/tunnels
+STEP 64 GET /api/v1/tunnels
 STATUS 200
 BODY {"tunnels":[{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"PRAW-1","device":"tunvless0","enable":true,"exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[{"listen":"lo","node":"0000000a:A","password":"p","port":18096,"user":"u"},{"listen":"lo","node":"0000000b:NL-2","password":"","port":18097,"user":""}],"interval":60,"order":["0000000b:NL-2"],"silence":20,"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}],"uplink":{"kind":"auto","ref":""}},{"active":1,"advanced":{"ca":"","fingerprint":"","insecure":false,"kernelTcp":false,"timeout":8},"by":"connection","description":"","device":"tunvless1","enable":false,"exclude":[],"filter":"","id":"t2","inbounds":[],"interval":60,"order":[],"silence":20,"sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}
 ---
-STEP 64 GET /api/v1/tunnels/state
+STEP 65 GET /api/v1/tunnels/state
 STATUS 200
 BODY {"t1":[{"port":"int","rxBps":"int","state":"str","txBps":"int","why":"str"},{"port":"int","rxBps":"int","state":"str","txBps":"int","why":"str"}],"t2":[]}
 ---
-STEP 65 PUT /api/v1/tunnels
+STEP 66 PUT /api/v1/tunnels
 REQBODY {"tunnels":[{"description":"PRAW-1","device":"tunvless0","exclude":["0000000b:NL-1"],"filter":"^(A|NL-.*)$","id":"t1","inbounds":[{"listen":"lo","node":"0000000a:A","password":"p","port":18096,"user":"u"},{"listen":"eth9","node":"0000000b:NL-2","port":18097}],"order":["0000000b:NL-2"],"sources":[{"id":"0000000a","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"},{"headers":{"X-Device-OS":""},"id":"0000000b","interval":3600,"kind":"subscription","name":"Stub","url":"http://127.0.0.1:18099/tunnels-sub.txt?token=fake"}]},{"device":"tunvless1","enable":false,"id":"t2","sources":[{"id":"0000000c","kind":"link","link":"vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A"}],"uplink":{"kind":"tunnel","ref":"t1"}}]}
 STATUS 400
 BODY {"error":"eth9 is not a LAN interface of the running app.link (a saved change needs a restart)","field":"inbounds[1].listen","tunnel":"t1"}
 ---
-STEP 66 PUT /api/v1/tunnels
+STEP 67 PUT /api/v1/tunnels
 REQBODY {"tunnels":[]}
 STATUS 200
 BODY {"restarted":[],"tunnels":[],"updated":[]}
 ---
-STEP 67 GET /api/v1/tunnels/state
+STEP 68 GET /api/v1/tunnels/state
 STATUS 200
 BODY {"tunnels":[]}
 ---
-STEP 68 GET /api/v1/tunnels/headers
+STEP 69 GET /api/v1/tunnels/headers
 STATUS 200
 BODY {"headers":[{"name":"User-Agent","value":"firc/unattached"},{"name":"X-HWID","value":"0123456789abcdef"},{"name":"X-Device-OS","value":"KeeneticOS"}]}
 ---
-STEP 69 GET /api/v1/auth
+STEP 70 GET /api/v1/auth
 STATUS 200
 BODY {"enabled":true}
 ---

@@ -1,0 +1,16 @@
+[
+  {
+    "interface": {
+      "up": {
+        "status": [
+          {
+            "status": "message",
+            "code": "72155286",
+            "ident": "Network::Interface::Base",
+            "message": "\"OpkgTun9\": interface is up."
+          }
+        ]
+      }
+    }
+  }
+]

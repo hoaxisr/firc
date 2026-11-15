@@ -37,6 +37,7 @@ void firc_tunwatch_see(firc_tunwatch_t *w, const char *device, firc_tun_status_t
     const char *what = st == FIRC_TUN_ST_BAD_CONFIG    ? "its configuration has been refused"
                        : st == FIRC_TUN_ST_UPLINK_DOWN ? "its uplink has been down"
                        : st == FIRC_TUN_ST_WAITING     ? "it has had no nodes to use"
+                       : st == FIRC_TUN_ST_ROUTER      ? "its router interface has not been ready"
                                                        : "no node has worked";
     firc_log_from(FIRC_LOG_ERROR, device, "%s for %lld min; groups on it fail closed", what, minutes(down));
     w->alarmed = true;

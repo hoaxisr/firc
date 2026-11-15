@@ -12,6 +12,8 @@ const {
   backupText,
   sharedChain,
 } = await import("../../src/modules/groups/iface-list");
+const { lanChoices } = await import("../../src/data/iface-choices");
+const { uplinkOptions } = await import("../../src/modules/tunnels/tunnel-editor");
 
 describe("a group's interface list", () => {
   it("reads a string as one entry and a list as itself", () => {
@@ -161,5 +163,29 @@ describe("sharedChain", () => {
   // Catches an empty selection read as a chain.
   it("is null for no groups", () => {
     assert.strictEqual(sharedChain([]), null);
+  });
+});
+
+describe("a tunnel's device is known by configuration", () => {
+  const tunnels = [{ id: "t1", device: "tunvless1", uplink: { kind: "auto", ref: "" } }] as any;
+  const ifaces = [{ id: "tunvless1" }, { id: "opkgtun0" }, { id: "br0" }];
+  // Catches a LAN choice refused by its opkgtun or tunvless name instead of the tunnels list.
+  it("offers another program's opkgtun as a LAN and hides the configured tunnel", () => {
+    assert.deepStrictEqual(
+      lanChoices(ifaces, "opk", tunnels).map((i) => i.id),
+      ["opkgtun0"],
+    );
+    assert.deepStrictEqual(
+      lanChoices(ifaces, "tunvless", tunnels).map((i) => i.id),
+      [],
+    );
+  });
+  // Catches an uplink refused by its stem, or a configured tunnel's device offered as an interface.
+  it("offers another program's opkgtun as an uplink and not a configured tunnel", () => {
+    const values = uplinkOptions(tunnels[0], tunnels, ifaces, (k: string) => k, {
+      opened: true,
+    }).map((o) => o.value);
+    assert.strictEqual(values.includes("iface:opkgtun0"), true);
+    assert.strictEqual(values.includes("iface:tunvless1"), false);
   });
 });

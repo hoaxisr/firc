@@ -77,6 +77,10 @@ firc_ipset_to_link_t *firc_ipset_to_link_new(const char *chain_name, const char 
                                              void *snap_ud);
 void firc_ipset_to_link_free(firc_ipset_to_link_t *l);
 
+typedef bool (*firc_tunnel_dev_fn)(void *ud, const char *iface);
+/* fn says whether iface is a configured tunnel's device, whose absence is said at INFO; NULL: none is. */
+void firc_ipset_to_link_set_tunnel_dev(firc_ipset_to_link_t *l, firc_tunnel_dev_fn fn, void *ud);
+
 /* Drops flows whose mark has group_value plus the handled bit; no-op for NULL ct or zero value. */
 void firc_ipset_to_link_flush_mark(firc_ct_t *ct, uint32_t group_value, const char *who);
 

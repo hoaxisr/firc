@@ -1376,6 +1376,41 @@ TEST device_swap_waits_for_the_old_holder(void)
     PASS();
 }
 
+TEST a_swap_across_stems_waits_for_the_old_child(void)
+{
+    /* catches: device_busy comparing names, so opkgtun1 starts while tunvless1's child still holds address N 1 */
+    env_setup("ok");
+    setenv("FAKE_STUBBORN_DEV", "tunvless1", 1);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 1, links, 1);
+    tun_init(&t2, "b", 1, links, 1);
+    snprintf(t2.device, sizeof t2.device, "opkgtun1");
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    firc_tunsup_set_second_ms_for_test(r.s, 100);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    r.next = &set2;
+    firc_loop_add_timer(r.loop, 400, 0, apply_cb, &r, NULL);
+    firc_loop_add_timer(r.loop, 750, 0, snap_cb, &r, NULL);
+    run_ms(&r, 1800);
+    ASSERT_EQ(FIRC_OK, r.apply_rc);
+    ASSERT_EQ(1, count_starts(r.snap_starts, "tunvless1"));
+    ASSERT_EQ(0, count_starts(r.snap_starts, "opkgtun1"));
+    char buf[512];
+    read_file(g_starts, buf, sizeof buf);
+    ASSERT_EQ(1, count_starts(buf, "opkgtun1"));
+    firc_tun_state_t b = state_of(r.s, "b");
+    ASSERT_STR_EQ("opkgtun1", b.device);
+    ASSERT_EQ(FIRC_TUN_ST_UP, b.status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
 static void apply_again_cb(firc_loop_t *loop, void *ud)
 {
     (void)loop;
@@ -1418,6 +1453,7 @@ TEST repeated_apply_keeps_the_kill_deadline(void)
 
 typedef struct {
     char id[8][16];
+    char dev[8][16];
     pid_t pid[8];
     int n;
     int alive;
@@ -1425,11 +1461,12 @@ typedef struct {
 
 static reaps_t g_reaps;
 
-static void on_reap_rec(const char *id, pid_t pid, void *ud)
+static void on_reap_rec(const char *id, const char *device, pid_t pid, void *ud)
 {
     (void)ud;
     if (g_reaps.n < 8) {
         snprintf(g_reaps.id[g_reaps.n], 16, "%s", id);
+        snprintf(g_reaps.dev[g_reaps.n], 16, "%s", device);
         g_reaps.pid[g_reaps.n] = pid;
         g_reaps.n++;
     }
@@ -1463,6 +1500,7 @@ TEST reap_hook_names_each_child_once_reaped(void)
     ASSERT(pa > 0 && pb > 0);
     ASSERT_EQ(1, g_reaps.n);
     ASSERT_STR_EQ("a", g_reaps.id[0]);
+    ASSERT_STR_EQ("tunvless0", g_reaps.dev[0]);
     ASSERT_EQ(pa, g_reaps.pid[0]);
     ASSERT_FALSE(firc_tunsup_holds(r.s, "a", 0));
     ASSERT(firc_tunsup_holds(r.s, "b", 0));
@@ -1470,6 +1508,7 @@ TEST reap_hook_names_each_child_once_reaped(void)
     firc_tunsup_stop(r.s, 1000);
     ASSERT_EQ(2, g_reaps.n);
     ASSERT_STR_EQ("b", g_reaps.id[1]);
+    ASSERT_STR_EQ("tunvless1", g_reaps.dev[1]);
     ASSERT_EQ(pb, g_reaps.pid[1]);
     ASSERT_EQ(0, g_reaps.alive);
     rec_close(&r);
@@ -2618,6 +2657,412 @@ TEST a_command_before_ready_is_refused(void)
     char buf[512];
     read_file(g_stdin, buf, sizeof buf);
     ASSERT_STR_EQ("vless://u@h1:1#x\n\n", buf);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+typedef struct {
+    firc_tun_gate_t answer;
+    int calls;
+    uint32_t gen;
+    char id[16];
+    char device[16];
+    int n;
+} gate_rec_t;
+
+static gate_rec_t g_gate;
+
+static firc_tun_gate_t gate_rec(const char *id, const char *device, int n, uint32_t gen, void *ud)
+{
+    (void)ud;
+    g_gate.calls++;
+    g_gate.gen = gen;
+    g_gate.n = n;
+    snprintf(g_gate.id, sizeof g_gate.id, "%s", id);
+    snprintf(g_gate.device, sizeof g_gate.device, "%s", device);
+    return g_gate.answer;
+}
+
+static void gate_up(rec_t *r)
+{
+    memset(&g_gate, 0, sizeof g_gate);
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    firc_tunsup_set_gate(r->s, gate_rec, NULL);
+}
+
+static int starts_of(const char *dev)
+{
+    char buf[1024];
+    read_file(g_starts, buf, sizeof buf);
+    return count_starts(buf, dev);
+}
+
+TEST the_gate_holds_a_first_spawn(void)
+{
+    /* catches: firc_tunsup_apply spawning a new tunnel without asking the gate */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 3, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(0, starts_of("tunvless3"));
+    ASSERT_EQ(1, g_gate.calls);
+    ASSERT_STR_EQ("a", g_gate.id);
+    ASSERT_STR_EQ("tunvless3", g_gate.device);
+    ASSERT_EQ(3, g_gate.n);
+    firc_tun_state_t st = state_of(r.s, "a");
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, st.status);
+    ASSERT_STR_EQ("waiting for the router", st.why);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST the_gate_holds_a_backoff_restart(void)
+{
+    /* catches: restart_cb spawning after a backoff without asking the gate */
+    env_setup("crash");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 0, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    firc_tunsup_set_second_ms_for_test(r.s, 100);
+    gate_up(&r);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_until_backoffs(&r, 1, 2000);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    run_ms(&r, 800);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(r.s, "a").status);
+    rec_close(&r);
+    env_teardown();
+    PASS();
+}
+
+TEST the_gate_holds_a_reconfigure_restart(void)
+{
+    /* catches: exit_one respawning a reconfigured tunnel without asking the gate */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 0, links, 1);
+    tun_init(&t2, "a", 0, links, 1);
+    t2.active = 2;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    run_ms(&r, 600);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST the_gate_holds_a_deferred_holder_s_successor(void)
+{
+    /* catches: handle_exit starting the slot that waited for the device's old child without asking the gate */
+    env_setup("ok");
+    setenv("FAKE_STUBBORN_DEV", "tunvless1", 1);
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t a, b;
+    tun_init(&a, "a", 1, links, 1);
+    tun_init(&b, "b", 1, links, 1);
+    firc_tunnels_t set = {.t = &a, .n = 1};
+    firc_tunnels_t set2 = {.t = &b, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    firc_tunsup_set_second_ms_for_test(r.s, 100);
+    gate_up(&r);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless1"));
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    ASSERT_EQ(1, g_gate.calls);
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    run_ms(&r, 1200);
+    ASSERT_EQ(1, starts_of("tunvless1"));
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT_STR_EQ("b", g_gate.id);
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(r.s, "b").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST the_gate_holds_an_edit_of_a_tunnel_without_a_child(void)
+{
+    /* catches: reconfigure spawning a tunnel in backoff whose argv changed without asking the gate */
+    env_setup("crash");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 0, links, 1);
+    tun_init(&t2, "a", 0, links, 1);
+    t2.active = 2;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_until_backoffs(&r, 1, 2000);
+    ASSERT_EQ(FIRC_TUN_ST_BACKOFF, state_of(r.s, "a").status);
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(r.s, "a").status);
+    rec_close(&r);
+    env_teardown();
+    PASS();
+}
+
+TEST the_gate_holds_a_restart_request_without_a_child(void)
+{
+    /* catches: restart_child spawning a bad_config tunnel without asking the gate */
+    env_setup("badconf");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 0, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    run_ms(&r, 400);
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, state_of(r.s, "a").status);
+    g_gate.answer = FIRC_TUN_GATE_WAIT;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_restart(r.s, "a"));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(r.s, "a").status);
+    rec_close(&r);
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_after_a_disable_spawns_nothing(void)
+{
+    /* catches: a disable that leaves the slot waiting, so a late open starts a disabled tunnel */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, off;
+    tun_init(&t, "a", 0, links, 1);
+    tun_init(&off, "a", 0, links, 1);
+    off.enable = false;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set_off = {.t = &off, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    uint32_t gen = g_gate.gen;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set_off, NULL));
+    firc_tunsup_gate_open(r.s, "a", gen);
+    run_ms(&r, 300);
+    ASSERT_EQ(0, starts_of("tunvless0"));
+    ASSERT_EQ(FIRC_TUN_ST_OFF, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_after_an_edit_spawns_nothing(void)
+{
+    /* catches: gate_open ignoring the generation, so the open of an edited tunnel's old wait starts it */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 0, links, 1);
+    tun_init(&t2, "a", 0, links, 1);
+    t2.active = 2;
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    uint32_t old = g_gate.gen;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    uint32_t now = g_gate.gen;
+    ASSERT_EQ(2, g_gate.calls);
+    ASSERT(now != old);
+    firc_tunsup_gate_open(r.s, "a", old);
+    run_ms(&r, 300);
+    ASSERT_EQ(0, starts_of("tunvless0"));
+    firc_tunsup_gate_open(r.s, "a", now);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    ASSERT_STR_EQ("", state_of(r.s, "a").why);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_after_a_stop_spawns_nothing(void)
+{
+    /* catches: an open after the supervisor stopped starting a child nothing will reap */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 0, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    uint32_t gen = g_gate.gen;
+    firc_tunsup_stop(r.s, 1000);
+    firc_tunsup_gate_open(r.s, "a", gen);
+    run_ms(&r, 300);
+    ASSERT_EQ(0, starts_of("tunvless0"));
+    ASSERT(no_children());
+    rec_close(&r);
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_after_a_restart_already_spawned_spawns_nothing(void)
+{
+    /* catches: a stale open starting a second child beside the one a restart already started */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 0, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    uint32_t gen = g_gate.gen;
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_restart(r.s, "a"));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_STR_EQ("", state_of(r.s, "a").why);
+    firc_tunsup_gate_open(r.s, "a", gen);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_bypasses_the_gate_once(void)
+{
+    /* catches: an open that asks the gate again and so loops back into the wait */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t;
+    tun_init(&t, "a", 0, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    ASSERT_EQ(1, g_gate.calls);
+    firc_tunsup_gate_open(r.s, "a", g_gate.gen);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless0"));
+    ASSERT_EQ(1, g_gate.calls);
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(r.s, "a").status);
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST an_open_for_a_retired_slot_spawns_nothing_in_its_successor(void)
+{
+    /* catches: a gate generation per slot, so a removed tunnel's stale open starts the slot that replaced it */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t t, t2;
+    tun_init(&t, "a", 3, links, 1);
+    tun_init(&t2, "a", 5, links, 1);
+    firc_tunnels_t set = {.t = &t, .n = 1};
+    firc_tunnels_t none = {.t = NULL, .n = 0};
+    firc_tunnels_t set2 = {.t = &t2, .n = 1};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set, NULL));
+    uint32_t old = g_gate.gen;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &none, NULL));
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &set2, NULL));
+    ASSERT_EQ(2, g_gate.calls);
+    firc_tunsup_gate_open(r.s, "a", old);
+    run_ms(&r, 300);
+    ASSERT_EQ(0, starts_of("tunvless5"));
+    firc_tunsup_gate_open(r.s, "a", g_gate.gen);
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless5"));
+    rec_close(&r);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
+TEST a_deferred_open_drops_the_router_wait(void)
+{
+    /* catches: an opened slot deferred behind another device holder still saying it waits for the router */
+    env_setup("ok");
+    char *links[] = {"vless://u@h:443#x"};
+    firc_tunnel_t two[2];
+    tun_init(&two[0], "b", 1, links, 1);
+    tun_init(&two[1], "a", 1, links, 1);
+    firc_tunnels_t only_b = {.t = &two[0], .n = 1};
+    firc_tunnels_t both = {.t = two, .n = 2};
+    static rec_t r;
+    rec_open(&r);
+    gate_up(&r);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &only_b, NULL));
+    uint32_t gen = g_gate.gen;
+    ASSERT_STR_EQ("waiting for the router", state_of(r.s, "b").why);
+    g_gate.answer = FIRC_TUN_GATE_GO;
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(r.s, &both, NULL));
+    run_ms(&r, 300);
+    ASSERT_EQ(1, starts_of("tunvless1"));
+    firc_tunsup_gate_open(r.s, "b", gen);
+    run_ms(&r, 200);
+    ASSERT_EQ(1, starts_of("tunvless1"));
+    firc_tun_state_t st = state_of(r.s, "b");
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, st.status);
+    ASSERT_STR_EQ("", st.why);
     rec_close(&r);
     ASSERT(no_children());
     env_teardown();
@@ -3862,6 +4307,7 @@ int main(int argc, char **argv)
     RUN_TEST(empty_dev_or_node_ignored_once_logged);
     RUN_TEST(oversize_lines_warned_per_stream);
     RUN_TEST(device_swap_waits_for_the_old_holder);
+    RUN_TEST(a_swap_across_stems_waits_for_the_old_child);
     RUN_TEST(repeated_apply_keeps_the_kill_deadline);
     RUN_TEST(a_node_change_goes_down_the_open_stdin_without_a_restart);
     RUN_TEST(an_unanswered_node_list_restarts_the_child);
@@ -3934,5 +4380,18 @@ int main(int argc, char **argv)
     RUN_TEST(a_restart_request_rechecks_bad_config);
     RUN_TEST(a_v6_holder_is_named_by_its_v6);
     RUN_TEST(an_unreadable_address_list_warns_once_and_starts);
+    RUN_TEST(the_gate_holds_a_first_spawn);
+    RUN_TEST(the_gate_holds_a_backoff_restart);
+    RUN_TEST(the_gate_holds_a_reconfigure_restart);
+    RUN_TEST(the_gate_holds_a_deferred_holder_s_successor);
+    RUN_TEST(the_gate_holds_an_edit_of_a_tunnel_without_a_child);
+    RUN_TEST(the_gate_holds_a_restart_request_without_a_child);
+    RUN_TEST(an_open_after_a_disable_spawns_nothing);
+    RUN_TEST(an_open_after_an_edit_spawns_nothing);
+    RUN_TEST(an_open_after_a_stop_spawns_nothing);
+    RUN_TEST(an_open_after_a_restart_already_spawned_spawns_nothing);
+    RUN_TEST(an_open_bypasses_the_gate_once);
+    RUN_TEST(an_open_for_a_retired_slot_spawns_nothing_in_its_successor);
+    RUN_TEST(a_deferred_open_drops_the_router_wait);
     GREATEST_MAIN_END();
 }
