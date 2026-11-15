@@ -37,7 +37,7 @@ ALL_CASES="grpc-gun grpc-multi xhttp-auto xhttp-stream-one xhttp-stream-up xhttp
            xhttp-no-sse xhttp-post-max
            xhttp-sess-header xhttp-sess-cookie xhttp-sess-query xhttp-seq-header xhttp-seq-cookie-key
            xhttp-old-names xhttp-data-header xhttp-data-cookie xhttp-data-cookie-small
-           xhttp-obfs-header xhttp-obfs-cookie xhttp-obfs-query xhttp-obfs-qih xhttp-tokenish
+           xhttp-obfs-header xhttp-obfs-cookie xhttp-obfs-query xhttp-obfs-qih xhttp-tokenish xhttp-tokenish-query
            xhttp-method-put xhttp-method-get xhttp-table xhttp-headers xhttp-no-grpc xhttp-max-hdr
            xhttp-neg-obfs xhttp-neg-sess xhttp-neg-data xhttp-reality-firefox xhttp-tls-p384 xhttp-tls-p384-neg xhttp-tls-p384-cache
            v6-carry-tcp v6-carry-xhttp v6-second v6-none v6-noroute
@@ -279,6 +279,7 @@ case_cfg() {
     xhttp-obfs-query)        xh packet-up '"xPaddingObfsMode":true,"xPaddingPlacement":"query","xPaddingKey":"pq"' ;;
     xhttp-obfs-qih)          xh packet-up '"xPaddingObfsMode":true,"xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Ref"' ;;
     xhttp-tokenish)          xh packet-up '"xPaddingObfsMode":true,"xPaddingPlacement":"header","xPaddingMethod":"tokenish","xPaddingBytes":"50-60"' ;;
+    xhttp-tokenish-query)    xh packet-up '"xPaddingObfsMode":true,"xPaddingPlacement":"query","xPaddingMethod":"tokenish","xPaddingBytes":"100-1000"' ;;
     xhttp-method-put)        xh stream-one '"uplinkHTTPMethod":"PUT"' ;;
     xhttp-method-get)        xh packet-up '"uplinkHTTPMethod":"GET"' ;;
     xhttp-table)             xh packet-up '"sessionIDTable":"Base62","sessionIDLength":12' ;;

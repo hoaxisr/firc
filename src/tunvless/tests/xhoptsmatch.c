@@ -410,20 +410,20 @@ static void t_min_posts_interval_values(void) {
 
 static void t_query_padding_overflows_path(void) {
     struct xh_opts o;
-    check("query pad 1368: parse", 0, parse("xPaddingObfsMode=true\nxPaddingPlacement=query\n", "", 1368, &o));
-    check("query pad 1368: query", XHP_QUERY, o.pad_place);
-    check("query pad 1369: refused", -1, parse("xPaddingObfsMode=true\nxPaddingPlacement=query\n", "", 1369, &o));
-    check_why("query pad 1369: reason", "xhttp: padding too long for the path");
-    check("query pad without obfs: parse", 0, parse("xPaddingPlacement=query\n", "", 4000, &o));
-    check("header pad 4000: parse", 0, parse("xPaddingObfsMode=true\nxPaddingPlacement=header\n", "", 4000, &o));
-    check("tokenish query pad 1368: refused", -1,
-          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 1368, &o));
-    check("tokenish query pad 900: parse", 0,
-          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 900, &o));
-    check("tokenish query pad 974: parse", 0,
-          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 974, &o));
-    check("tokenish query pad 975: refused", -1,
-          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 975, &o));
+    check("query pad 7512: parse", 0, parse("xPaddingObfsMode=true\nxPaddingPlacement=query\n", "", 7512, &o));
+    check("query pad 7512: query", XHP_QUERY, o.pad_place);
+    check("query pad 7513: refused", -1, parse("xPaddingObfsMode=true\nxPaddingPlacement=query\n", "", 7513, &o));
+    check_why("query pad 7513: reason", "xhttp: padding too long for the path");
+    check("query pad without obfs: parse", 0, parse("xPaddingPlacement=query\n", "", 9000, &o));
+    check("header pad 9000: parse", 0, parse("xPaddingObfsMode=true\nxPaddingPlacement=header\n", "", 9000, &o));
+    check("tokenish query pad 7512: refused", -1,
+          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 7512, &o));
+    check("tokenish query pad 1000: parse", 0,
+          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 1000, &o));
+    check("tokenish query pad 5889: parse", 0,
+          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 5889, &o));
+    check("tokenish query pad 5890: refused", -1,
+          parse("xPaddingObfsMode=true\nxPaddingPlacement=query\nxPaddingMethod=tokenish\n", "", 5890, &o));
 }
 
 static void t_xmux_parse(void) {

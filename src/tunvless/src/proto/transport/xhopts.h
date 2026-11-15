@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define XH_PATH_MAX 2048
+#define XH_PATH_MAX 8192
 
 enum xh_place { XHP_PATH, XHP_QUERY, XHP_HEADER, XHP_COOKIE, XHP_BODY, XHP_AUTO, XHP_QUERY_IN_HEADER };
 
