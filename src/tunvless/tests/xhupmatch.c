@@ -23,10 +23,11 @@
 #include <arpa/inet.h>
 #include "reality.h"
 #include "hpackread.h"
+#include "fmrelay.h"
 
 /* ---- TLS and Reality stubs: the test link is plain, they are never reached --------- */
 
-void sc_wipe(void *p, size_t n) { memset(p, 0, n); }
+void __wrap_sc_wipe(void *p, size_t n) { memset(p, 0, n); }
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len)
     { (void)cfg; (void)st; (void)out; (void)out_n; *out_len = 0; return -1; }
@@ -1496,6 +1497,88 @@ static uint32_t hdr_sid(const unsigned char *d, size_t n, int k) {
     return 0;
 }
 
+#define SD_DP "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+#define SD_DQ "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"q\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+
+static int relay_lo(struct fmrelay *r, const char *fm, uint16_t to, uint16_t *port) {
+    int l = listen_lo(port);
+    if (l < 0) return -1;
+    g_fmr_sd = fmr_sd_of(fm);
+    int rc = g_fmr_sd ? fmrelay_listen(r, l, to) : -1;
+    g_fmr_sd = NULL;
+    if (rc) close(l);
+    return rc;
+}
+
+struct dlr { int get, post, hello, carried; };
+
+static void dl_own(const char *dfm, struct dlr *o) {
+    memset(o, 0, sizeof *o);
+    uint16_t pa = 0, pb = 0, ra = 0, rb = 0;
+    int la = listen_lo(&pa), lb = listen_lo(&pb);
+    struct fmrelay rp, rq;
+    memset(&rp, 0, sizeof rp);
+    memset(&rq, 0, sizeof rq);
+    int ok = la >= 0 && lb >= 0 && !relay_lo(&rp, SD_DP, pa, &ra) && !relay_lo(&rq, SD_DQ, pb, &rb);
+    check(ok, "dl own mask: listeners and relays");
+    struct tr_node n = xnode("packet-up", NULL, NULL), d = dnode();
+    n.host = d.host = "127.0.0.1";
+    n.port = ra;
+    d.port = rb;
+    n.fm = SD_DP;
+    d.fm = dfm;
+    n.dl = &d;
+    struct transport c;
+    int rc = ok ? transport_open(&c, &n, 2) : -1;
+    int fb = rc ? -1 : accept_wait(lb), fa = rc ? -1 : accept_wait(la);
+    static unsigned char bb[1 << 16], ab[1 << 16];
+    size_t bn = fb < 0 ? 0 : read_wait(fb, bb, sizeof bb, 1000);
+    int hb = hr_nth_headers(bb, bn, 0, &g_hb);
+    const char *m = hb ? NULL : fval(&g_hb, ":method");
+    o->get = rc == 0 && bn > 24 && !memcmp(bb, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) && m && !strcmp(m, "GET");
+    uint32_t sid = o->get ? hdr_sid(bb, bn, 0) : 0;
+    unsigned char f[14] = { 0, 0, 5, 0x00, 0, (unsigned char)(sid >> 24), (unsigned char)(sid >> 16),
+                            (unsigned char)(sid >> 8), (unsigned char)sid, 'h', 'e', 'l', 'l', 'o' };
+    if (fb >= 0 && sid) {
+        srv_headers_fd(fb, sid, 0x88, 0);
+        if (write(fb, f, sizeof f) != (ssize_t)sizeof f) { perror("write"); exit(2); }
+    }
+    int wr = rc ? -1 : transport_write(&c, piece, sizeof piece);
+    size_t an = fa < 0 ? 0 : read_wait(fa, ab, sizeof ab, 1000);
+    int ha = hr_nth_headers(ab, an, 0, &g_hb);
+    m = ha ? NULL : fval(&g_hb, ":method");
+    o->post = wr == 0 && an > 24 && !memcmp(ab, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) && m && !strcmp(m, "POST");
+    unsigned char out[TRANSPORT_MIN_READ_CAP];
+    size_t got = 0, have = 0;
+    for (int i = 0; !rc && sid && i < 50 && have < 5; i++) {
+        struct pollfd p = { .fd = transport_fd(&c), .events = POLLIN, .revents = 0 };
+        if (!transport_has_data(&c) && poll(&p, 1, 100) <= 0) continue;
+        if (transport_read(&c, out + have, sizeof out - have, &got)) break;
+        have += got;
+    }
+    o->hello = have == 5 && !memcmp(out, "hello", 5);
+    if (!rc) transport_close(&c);
+    if (fa >= 0) close(fa);
+    if (fb >= 0) close(fb);
+    fmrelay_join(&rp);
+    fmrelay_join(&rq);
+    o->carried = rp.n[0] >= 4 * (long)an && rq.n[0] >= 4 * (long)bn && rq.n[1] >= (long)sizeof f;
+    if (la >= 0) close(la);
+    if (lb >= 0) close(lb);
+}
+
+static void t_dl_own_mask(void) {
+    /* catches: the download link using the main node's mask */
+    struct dlr o;
+    dl_own(SD_DQ, &o);
+    check(o.get, "dl own mask: the download peer decodes the preface and the GET");
+    check(o.post, "dl own mask: the main peer decodes the upload");
+    check(o.hello, "dl own mask: the download peer's data decoded");
+    check(o.carried, "dl own mask: each relay carried its link");
+    dl_own(SD_DP, &o);
+    check(!o.get && !o.hello, "dl own mask: the main node's mask on the download link fails there");
+}
+
 static int quiet(int ls) {
     struct pollfd p = { .fd = ls, .events = POLLIN, .revents = 0 };
     return poll(&p, 1, 200) == 0;
@@ -1767,6 +1850,54 @@ static void t_direct_keeps_the_flow(void) {
     xclose(fds);
 }
 
+#define SD_X100 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":100,\"paddingMax\":100}}]}"
+
+static int g_io_n;
+int __real_xconn_io(struct xconn *x, uint32_t ev, uint64_t now_ms);
+int __wrap_xconn_io(struct xconn *x, uint32_t ev, uint64_t now_ms) {
+    g_io_n++;
+    return __real_xconn_io(x, ev, now_ms);
+}
+
+static void conn_init_sd(struct transport *c, enum xhttp_mode xh, int fd, const char *fm) {
+    struct tr_node n;
+    memset(&n, 0, sizeof n);
+    n.host = "127.0.0.1";
+    n.type = "xhttp";
+    n.security = "none";
+    n.sni = "";
+    struct xconn *x = xconn_new(&n, 0, 0);
+    if (!x || fm_link_open(fm, &x->link.tls.fm) || !x->link.tls.fm) { perror("sudoku link"); exit(2); }
+    x->link.fd = fd;
+    x->link.plain = 1;
+    if (xconn_start(x)) { perror("xconn_start"); exit(2); }
+    memset(c, 0, sizeof(*c));
+    c->link.fd = -1;
+    c->fr = &tr_xhttp;
+    c->xh.mode = xh;
+    c->xh.wait_ms = 1000;
+    c->xh.priv[0] = x;
+    snprintf(c->xh.main_side.authority, sizeof(c->xh.main_side.authority), "stand.example");
+    xh_opts_parse(NULL, "", 0, &c->xh.main_side.opts, NULL, 0);
+    snprintf(c->xh.main_side.base_path, sizeof(c->xh.main_side.base_path), "/xh/");
+    snprintf(c->xh.sid, sizeof(c->xh.sid), "0f1e2d3c");
+}
+
+static void t_sd_up_room_low(void) {
+    /* catches: UP_ROOM_LOW compared undivided */
+    int fd;
+    if (new_pair(&fd) != 0) { check(0, "socket pair created"); return; }
+    struct transport c;
+    conn_init_sd(&c, XH_STREAM_UP, fd, SD_X100);
+    int ro = up_open(&c, c.xh.priv[0]);
+    srv_drain();
+    g_io_n = 0;
+    long r = transport_room(&c);
+    check(ro == 0 && r == 29127, "sd up room: an empty queue at g = 9 has 29,127");
+    check(g_io_n == 0, "sd up room: a room above 65,536 / 9 pulls nothing");
+    transport_close(&c);
+}
+
 int main(void) {
     t_whole_writes();
     t_post_reset_fails_flow();
@@ -1785,6 +1916,7 @@ int main(void) {
     t_mode_table();
     t_dl_opts_as_packet_up();
     t_dl_link_to_download_node();
+    t_dl_own_mask();
     t_dl_only_xhttp();
     t_seq_cookie_after_session();
     t_tokenish_without_obfs_is_repeat_x();
@@ -1828,6 +1960,7 @@ int main(void) {
     t_packet_up_rst();
     t_stream_up(0x8C, 1, "stream-up: 400 to the upload fails the write, naming 400");
     t_stream_up(0x88, 0, "stream-up: 200 to the upload is read and is not a refusal");
+    t_sd_up_room_low();
     printf(g_fail ? "\nxhupmatch: FAILED\n" : "\nall checks passed\n");
     return g_fail;
 }

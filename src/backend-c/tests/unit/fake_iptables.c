@@ -25,6 +25,7 @@ struct firc_fake_ipt {
     size_t writes;
     size_t attempts;
     char *refuse;
+    char *refuse_also;
     char *log;
     size_t log_len;
     char *reads;
@@ -56,6 +57,8 @@ static int before_write(void *ud, firc_ipt_proto_t fam, const char *table, const
     } else if (f->fail_at != 0 && --f->fail_at == 0) {
         err = f->fail_at_err;
     } else if (f->refuse != NULL && f->refuse[0] != '\0' && text != NULL && strstr(text, f->refuse) != NULL) {
+        err = EINVAL;
+    } else if (f->refuse_also != NULL && text != NULL && strstr(text, f->refuse_also) != NULL) {
         err = EINVAL;
     }
     pthread_mutex_unlock(&f->mu);
@@ -108,6 +111,7 @@ static void fake_free(firc_fake_ipt_t *f) {
     firc_fake_xt_free(f->xt);
     views_clear(f);
     free(f->refuse);
+    free(f->refuse_also);
     free(f->log);
     free(f->reads);
     pthread_mutex_destroy(&f->mu);
@@ -251,6 +255,8 @@ void firc_fake_ipt_reset(firc_fake_ipt_t *f) {
     f->writes = 0;
     free(f->refuse);
     f->refuse = NULL;
+    free(f->refuse_also);
+    f->refuse_also = NULL;
     free(f->log);
     f->log = NULL;
     f->log_len = 0;
@@ -294,6 +300,13 @@ void firc_fake_ipt_refuse_rules_containing(firc_fake_ipt_t *f, const char *subst
     pthread_mutex_lock(&f->mu);
     free(f->refuse);
     f->refuse = substr != NULL ? strdup(substr) : NULL;
+    pthread_mutex_unlock(&f->mu);
+}
+
+void firc_fake_ipt_refuse_also_containing(firc_fake_ipt_t *f, const char *substr) {
+    pthread_mutex_lock(&f->mu);
+    free(f->refuse_also);
+    f->refuse_also = substr != NULL ? strdup(substr) : NULL;
     pthread_mutex_unlock(&f->mu);
 }
 

@@ -10,6 +10,7 @@
 #include "firc/ktcp.h"
 #include "firc/log.h"
 #include "firc/loop.h"
+#include "firc/opkgtun.h"
 #include "firc/rtnl.h"
 #include "firc/tunnels.h"
 #include "firc/tunnodes.h"
@@ -44,6 +45,30 @@ void firc_tunrun_refresh_inbounds(firc_tunrun_t *t);
 /* Takes want over (left empty); writes uplinks, then starts, restarts and stops tunvless to match.
    An uplink a child no longer needs is removed only once that child has been reaped. */
 firc_err_t firc_tunrun_apply(firc_tunrun_t *t, firc_tunnels_t *want);
+
+typedef struct firc_tunrun_router {
+    void (*want)(const firc_opkgtun_want_t *w, size_t n, void *ud);
+    size_t (*seen)(firc_opkgtun_seen_t *out, size_t cap, uint32_t *swept, void *ud);
+    void (*sweep)(void *ud);
+    void (*pass)(void *ud);
+    int fd;
+    void *ud;
+} firc_tunrun_router_t;
+
+/* Takes a copy of r: the opkgtun<N> records are wanted through it, its fd is watched for their states, and every
+   spawn asks first; NULL detaches. */
+void firc_tunrun_set_router(firc_tunrun_t *t, const firc_tunrun_router_t *r);
+
+/* The first apply; want is NULL when tunnels.yaml did not load. The router sweeps firc's records no tunnel wants
+   only after a good load and a good apply. */
+firc_err_t firc_tunrun_start(firc_tunrun_t *t, firc_tunnels_t *want);
+
+/* device went down: a ready opkgtun<N> record is checked again. */
+void firc_tunrun_link_down(firc_tunrun_t *t, const char *device);
+
+/* The OpkgTun record of tunnel id as last seen, PENDING before any; false when id is not configured or its device
+   is not opkgtun<N>. */
+bool firc_tunrun_router_of(const firc_tunrun_t *t, const char *id, firc_opkgtun_seen_t *out);
 
 /* Takes subscription bodies from subs from the next apply on; NULL detaches. */
 void firc_tunrun_set_subs(firc_tunrun_t *t, firc_tunsubs_t *subs);
@@ -99,13 +124,18 @@ bool firc_tunrun_mark_of(const firc_tunrun_t *t, const char *id, uint32_t *mark,
 /* Rewrites the default route of every tunnel leaving through ifname, of every tunnel with an uplink when NULL. */
 void firc_tunrun_refresh_uplinks(firc_tunrun_t *t, const char *ifname);
 
+/* A network event on iface (NULL: cause unknown) restarts, once events settle, every starved tunnel (see
+   firc_tunsup_net_changed); nothing for one of firc's own tunnel devices, nothing once stopped. */
+void firc_tunrun_net_event(firc_tunrun_t *t, const char *iface);
+
 /* Stops every child (SIGKILL after grace_ms), then removes every uplink. */
 void firc_tunrun_stop(firc_tunrun_t *t, int grace_ms);
 
 void firc_tunrun_free(firc_tunrun_t *t);
 
 typedef struct firc_tunrun_ktcp {
-    void (*ports)(const uint16_t ports[FIRC_KTCP_DEVICES], void *ud);
+    void (*tunnels)(const uint16_t ports[FIRC_KTCP_DEVICES], const char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP],
+                    void *ud);
     const firc_ktcp_image_t *(*image)(void *ud);
     bool (*real_of)(uint8_t dev, const uint8_t fake[4], firc_ip_t *real, void *ud);
     void *ud;
@@ -113,7 +143,8 @@ typedef struct firc_tunrun_ktcp {
     void (*ready)(uint8_t dev, void *ud);
 } firc_tunrun_ktcp_t;
 
-/* Takes a copy of k and calls its ports() with the port table at once and on every change; NULL detaches. */
+/* Takes a copy of k and calls its tunnels() with the ports and the configured devices, by N, at once and on every
+   change; NULL detaches. */
 void firc_tunrun_set_ktcp(firc_tunrun_t *t, const firc_tunrun_ktcp_t *k);
 
 /* Sends each ready tunvless with a port the lines of its device that changed from prev to next (both sorted). */

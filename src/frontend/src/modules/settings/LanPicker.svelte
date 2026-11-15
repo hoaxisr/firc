@@ -1,6 +1,7 @@
 <script lang="ts">
   import { interfaces } from "../../data/interfaces.svelte";
   import { t } from "../../data/locale.svelte";
+  import { loadTunnelDevices, tunnelDevices } from "../../data/tunnel-devices.svelte";
 
   import { Check, SelectOpen, X } from "../../components/ui/icons";
   import { ifaceTitle, lanChoices } from "../../data/iface-choices";
@@ -22,7 +23,7 @@
   let search: HTMLInputElement | undefined = $state();
   let addButton: HTMLButtonElement | undefined = $state();
   const listId = `lan-${randomId()}`;
-  const offered = $derived(lanChoices(interfaces.list, query));
+  const offered = $derived(lanChoices(interfaces.list, query, tunnelDevices.list));
   const titleOf = (id: string) =>
     ifaceTitle(interfaces.list.find((i) => i.id === id) ?? { id }).title;
 
@@ -45,7 +46,10 @@
     open = next;
     query = "";
     active = -1;
-    if (next) queueMicrotask(() => search?.focus());
+    if (next) {
+      void loadTunnelDevices();
+      queueMicrotask(() => search?.focus());
+    }
   }
 
   function onKey(e: KeyboardEvent) {

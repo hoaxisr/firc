@@ -6,13 +6,14 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-BIN="${TMPDIR:-/tmp}/tun-gso"
+D="$(mktemp -d)"
+BIN="$D/tun-gso"
 cc -O2 -Wall -Wextra -Isrc/tunnel -o "$BIN" tests/tun-gso.c src/tunnel/tun.c
 
 NS=tunvless-tungso
 ip netns delete "$NS" 2>/dev/null || true
 ip netns add "$NS"
-trap 'ip netns delete "$NS" 2>/dev/null || true' EXIT
+trap 'ip netns delete "$NS" 2>/dev/null || true; rm -rf "$D"' EXIT
 ip netns exec "$NS" ip link set lo up
 
 # Both paths, not only the fast one: without offload tunvless computes the checksums itself, in
@@ -21,3 +22,5 @@ echo "-- with offload"
 ip netns exec "$NS" "$BIN"
 echo "-- without offload (STEER_TUN_NOGSO)"
 ip netns exec "$NS" env STEER_TUN_NOGSO=1 "$BIN"
+echo "-- the kernel splits (STEER_TUN_NORXGSO)"
+ip netns exec "$NS" env STEER_TUN_NORXGSO=1 "$BIN"

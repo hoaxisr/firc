@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -313,6 +314,12 @@ static void hx_stop(hx_t *h)
     }
 }
 
+static struct {
+    int p[2];
+    bool open;
+    uint32_t recheck;
+} g_rt;
+
 static char g_wake_dir[64];
 
 static void teardown(void *ud)
@@ -330,6 +337,11 @@ static void teardown(void *ud)
         g_wake_dir[0] = 0;
     }
     setenv("FAKE_MODE", "ok", 1);
+    if (g_rt.open) {
+        close(g_rt.p[0]);
+        close(g_rt.p[1]);
+        g_rt.open = false;
+    }
 }
 
 static int connect_api(void)
@@ -1940,6 +1952,98 @@ static int ib_rate_poll(const char *field, double *out, int64_t *start, int64_t 
     return st;
 }
 
+static void rt_want(const firc_opkgtun_want_t *w, size_t n, void *ud)
+{
+    (void)ud;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(w[i].name, "OpkgTun2") == 0) {
+            g_rt.recheck = w[i].recheck;
+        }
+    }
+    if (write(g_rt.p[1], "x", 1) != 1) {
+    }
+}
+
+static size_t rt_seen(firc_opkgtun_seen_t *out, size_t cap, uint32_t *swept, void *ud)
+{
+    (void)ud;
+    char buf[64];
+    while (read(g_rt.p[0], buf, sizeof buf) > 0) {
+    }
+    *swept = 0;
+    if (cap < 1) {
+        return 0;
+    }
+    memset(out, 0, sizeof *out);
+    snprintf(out->name, sizeof out->name, "OpkgTun2");
+    out->state = FIRC_OPKG_FAILED;
+    out->saved = true;
+    out->rechecked = g_rt.recheck;
+    snprintf(out->error, sizeof out->error, "NDM said no");
+    return 1;
+}
+
+static void rt_none(void *ud)
+{
+    (void)ud;
+}
+
+static void rt_attach(hx_t *h)
+{
+    const firc_tunrun_router_t r = {rt_want, rt_seen, rt_none, rt_none, g_rt.p[0], NULL};
+    firc_tunrun_set_router(h->run, &r);
+}
+
+static void rt_detach(hx_t *h)
+{
+    firc_tunrun_set_router(h->run, NULL);
+}
+
+/* catches: a router object on a tunvless tunnel, saved taken from ready, or NDM's error and the why not shown */
+TEST router_only_for_opkg(void)
+{
+    memset(&g_rt, 0, sizeof g_rt);
+    ASSERT_EQ(0, pipe(g_rt.p));
+    fcntl(g_rt.p[0], F_SETFL, O_NONBLOCK);
+    g_rt.open = true;
+    ASSERT(hx_start(NULL, 0) != NULL);
+    on_loop(g_hx, rt_attach);
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("PUT", "/api/v1/tunnels",
+                            "{\"tunnels\":[{\"id\":\"v\",\"device\":\"tunvless1\",\"enable\":false,\"sources\":[{\"id\":"
+                            "\"0000000a\",\"kind\":\"link\",\"link\":\"" LINK_A "\"}]},{\"id\":\"o\",\"device\":"
+                            "\"opkgtun2\",\"sources\":[{\"id\":\"0000000a\",\"kind\":\"link\",\"link\":\"" LINK_A
+                            "\"}]}]}",
+                            &ans));
+    cJSON_Delete(ans);
+    ans = NULL;
+    bool seen = false;
+    for (int i = 0; i < 100 && !seen; i++) {
+        cJSON_Delete(ans);
+        ans = NULL;
+        ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/state", NULL, &ans));
+        const cJSON *o = tunnel_named(ans, "o");
+        seen = o != NULL && cJSON_IsObject(at(o, "router")) && cJSON_IsString(at(at(o, "router"), "state")) &&
+               strcmp(at(at(o, "router"), "state")->valuestring, "failed") == 0 &&
+               strcmp(at(o, "why")->valuestring, "NDM said no") == 0;
+        if (!seen) {
+            sleep_ms(30);
+        }
+    }
+    ASSERT(seen);
+    const cJSON *v = tunnel_named(ans, "v");
+    const cJSON *o = tunnel_named(ans, "o");
+    ASSERT(v != NULL && o != NULL);
+    ASSERT(cJSON_GetObjectItemCaseSensitive(v, "router") == NULL);
+    ASSERT_STR_EQ("", at(v, "why")->valuestring);
+    ASSERT_STR_EQ("router", at(o, "status")->valuestring);
+    ASSERT(same_json(at(o, "router"),
+                     "{\"name\":\"OpkgTun2\",\"state\":\"failed\",\"saved\":true,\"error\":\"NDM said no\"}"));
+    cJSON_Delete(ans);
+    on_loop(g_hx, rt_detach);
+    PASS();
+}
+
 /* catches: inbound rates taken from the tunnel's device counters, or not the byte difference over the poll gap */
 TEST inbound_rates_are_the_byte_difference_over_the_time_between_polls(void)
 {
@@ -2025,6 +2129,7 @@ SUITE(tunnels_api)
     RUN_TEST(put_inbound_of_a_disabled_tunnel_is_not_probed);
     RUN_TEST(state_has_inbounds);
     RUN_TEST(inbound_rates_are_the_byte_difference_over_the_time_between_polls);
+    RUN_TEST(router_only_for_opkg);
 }
 
 GREATEST_MAIN_DEFS();

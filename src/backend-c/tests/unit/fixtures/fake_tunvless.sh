@@ -83,6 +83,27 @@ pins)
     printf '{"type":"ready","dev":"%s"}\n' "$3"
     [ "$(wc -l < "$FAKE_STARTS_OUT")" = 1 ] && printf '{"type":"pins_full"}\n'
     answer ;;
+runs)
+    k=$(($(wc -l < "$FAKE_STARTS_OUT")))
+    ev=
+    while [ "$k" -gt 0 ] && [ -z "$ev" ]; do
+        eval "ev=\${FAKE_RUN_$k:-}"
+        k=$((k - 1))
+    done
+    while IFS= read -r l; do
+        case "$l" in
+        'sleep '*)
+            [ "$3" = "${FAKE_STUBBORN_DEV:-}" ] || trap 'kill $! 2>/dev/null; trap - TERM; kill -TERM $$' TERM
+            sleep "${l#sleep }" &
+            wait $!
+            [ "$3" = "${FAKE_STUBBORN_DEV:-}" ] || trap - TERM ;;
+        'exit '*) exit "${l#exit }" ;;
+        *) printf '%s\n' "$l" ;;
+        esac
+    done <<EOF
+$ev
+EOF
+    answer ;;
 crash) printf '{"type":"ready","dev":"%s"}\n' "$3"; exit 1 ;;
 late) sleep "${FAKE_SLEEP:-1}" </dev/null >/dev/null 2>&1; exit 1 ;;
 badconf) echo 'tunvless[warn]: bad option' >&2; exit 2 ;;

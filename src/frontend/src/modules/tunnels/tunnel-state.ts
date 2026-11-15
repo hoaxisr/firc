@@ -1,4 +1,4 @@
-import type { TunnelStatus } from "../../types";
+import type { TunnelRouter, TunnelStatus } from "../../types";
 
 export type TunnelIcon =
   | "CircleCheck"
@@ -19,12 +19,13 @@ export const TUNNEL_STATUSES: readonly TunnelStatus[] = [
   "bad_config",
   "waiting",
   "uplink_down",
+  "router",
 ];
 
 export type TunnelLook = { icon: TunnelIcon; color: string; label: string };
 
 export function tunnelLook(
-  state: { status: string; backoffS: number },
+  state: { status: string; backoffS: number; router?: TunnelRouter },
   t: (key: string) => string,
 ): TunnelLook {
   const n = Math.max(0, Math.floor(state.backoffS || 0));
@@ -56,6 +57,16 @@ export function tunnelLook(
       return { icon: "CircleX", color: "var(--red)", label: t("Configuration error") };
     case "off":
       return { icon: "PowerOff", color: "var(--text-2)", label: t("Off") };
+    case "router":
+      if (state.router?.state === "foreign")
+        return {
+          icon: "CircleX",
+          color: "var(--red)",
+          label: t("The interface belongs to something else"),
+        };
+      return state.router?.state === "failed"
+        ? { icon: "CircleX", color: "var(--red)", label: t("Router refused the interface") }
+        : { icon: "LoaderCircle", color: "var(--text-2)", label: t("Waiting for the router") };
     default:
       return { icon: "CircleHelp", color: "var(--text-2)", label: state.status };
   }

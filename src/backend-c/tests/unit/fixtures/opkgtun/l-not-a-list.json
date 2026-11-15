@@ -1,0 +1,10 @@
+{
+  "status": [
+    {
+      "status": "error",
+      "code": "6553609",
+      "ident": "Network::Interface::Base",
+      "message": "unable to find NoSuch0 in \"Network::Interface::Base\"."
+    }
+  ]
+}

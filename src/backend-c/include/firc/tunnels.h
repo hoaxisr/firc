@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "firc/err.h"
+#include "firc/ktcp.h"
 #include "firc/subhdr.h"
 
 #define FIRC_TUN_MAX 8
@@ -99,6 +100,15 @@ void firc_tunnels_free(firc_tunnels_t *t);
 
 /* True when tunvless for a would be started with the same options as for b; sources not compared. */
 bool firc_tunnel_same_argv(const firc_tunnel_t *a, const firc_tunnel_t *b);
+
+/* N of t's device, as firc_tundev_name_index reads it; -1 for a device that is not one. */
+int firc_tunnel_index(const firc_tunnel_t *t);
+
+/* Fills names[N] with the device of ts's tunnel N and "" for every N no tunnel has; NULL ts names none. */
+void firc_tunnels_names(const firc_tunnels_t *ts, char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP]);
+
+/* The tunnel of ts whose device is exactly dev; NULL when none is, or ts or dev is NULL. */
+const firc_tunnel_t *firc_tunnels_by_device(const firc_tunnels_t *ts, const char *dev);
 
 /* FIRC_TUNNEL_TCP_PORT_BASE plus the device number of t when t is enabled with kernelTcp, else 0. */
 uint16_t firc_tunnel_tcp_port(const firc_tunnel_t *t);

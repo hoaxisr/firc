@@ -24,6 +24,7 @@
 #include "firc/loop.h"
 #include "firc/mark.h"
 #include "firc/rtnl.h"
+#include "firc/tunaddr.h"
 #include "firc/tunnet.h"
 #include "firc/tunrun.h"
 #include "firc/tunsubs.h"
@@ -172,11 +173,14 @@ static void fx_down(fx_t *f)
 }
 
 static void kx_reset(void);
+static void fr_close(void);
 
 static void teardown(void *ud)
 {
     (void)ud;
     kx_reset();
+    fr_close();
+    firc_tun_addr_set_ifaddrs_for_test(NULL, 0);
     g_watch_pid = 0;
     g_watch_pid2 = 0;
     unsetenv("FAKE_STUBBORN_DEV");
@@ -1783,6 +1787,7 @@ TEST a_removed_tunnel_is_not_down_while_its_child_ends(void)
 
 typedef struct {
     uint16_t ports[FIRC_KTCP_DEVICES];
+    char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP];
     int n_ports;
     const firc_ktcp_image_t *cur;
     firc_ktcp_image_t im[3];
@@ -1802,10 +1807,12 @@ static void kx_reset(void)
     memset(&g_kx, 0, sizeof g_kx);
 }
 
-static void kx_ports(const uint16_t ports[FIRC_KTCP_DEVICES], void *ud)
+static void kx_ports(const uint16_t ports[FIRC_KTCP_DEVICES], const char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP],
+                     void *ud)
 {
     (void)ud;
     memcpy(g_kx.ports, ports, sizeof g_kx.ports);
+    memcpy(g_kx.names, names, sizeof g_kx.names);
     g_kx.n_ports++;
 }
 
@@ -2357,6 +2364,31 @@ TEST bytes_accumulate_across_events_and_a_child_restart(void)
     ASSERT_EQ(2000u, (unsigned)rx);
     ASSERT_EQ(40u, (unsigned)tx);
     ASSERT_EQ(0, journal_from("tunvless0", "bytes"));
+    unsetenv("FAKE_AFTER");
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: counters keyed by the digits of a name, so another program's opkgtun3 reads tunnel 3's, or names not published */
+TEST byte_counters_follow_the_tunnel_not_the_name(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    ktcp_env(&f);
+    setenv("FAKE_AFTER", "{\"type\":\"bytes\",\"rx\":1000,\"tx\":20}", 1);
+    kx_attach(&f);
+    apply_yaml(&f, "tunnels:\n" KT_TUN("a", "3", KT_ON));
+    uint64_t rx = 0, tx = 0;
+    for (int i = 0; i < 300 && rx < 1000; i++) {
+        run_ms(&f, 10);
+        (void)firc_tunrun_ktcp_bytes(f.run, "tunvless3", &rx, &tx);
+    }
+    ASSERT_EQ(1000u, (unsigned)rx);
+    ASSERT_EQ(20u, (unsigned)tx);
+    ASSERT_FALSE(firc_tunrun_ktcp_bytes(f.run, "opkgtun3", &rx, &tx));
+    ASSERT_EQ(0u, (unsigned)rx);
+    ASSERT_STR_EQ("tunvless3", g_kx.names[3]);
+    ASSERT_STR_EQ("", g_kx.names[0]);
     unsetenv("FAKE_AFTER");
     fx_down(&f);
     PASS();
@@ -3199,6 +3231,72 @@ TEST pruning_alone_does_not_restart_the_tunnel(void)
     PASS();
 }
 
+TEST an_event_on_another_interface_restarts_a_starved_tunnel(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, "eth0");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 1000));
+    ASSERT_EQ(2, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_with_no_name_is_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, NULL);
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 1000));
+    ASSERT_EQ(2, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_a_tunnel_s_own_device_is_not_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    firc_tunrun_net_event(f.run, "tunvless0");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_another_tunnel_s_device_is_not_a_network_change(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_LINKS "  - id: b\n    device: tunvless1\n    sources:\n"
+                            "      - id: 0000000c\n        link: \"vless://" U "@c.example:443?security=none#C\"\n");
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "b", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless0"));
+    ASSERT_EQ(1, starts_of(&f, "tunvless1"));
+    firc_tunrun_net_event(f.run, "tunvless1");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 6000));
+    ASSERT_EQ(1, starts_of(&f, "tunvless1"));
+    fx_down(&f);
+    PASS();
+}
+
 SUITE(tunrun)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -3261,6 +3359,7 @@ SUITE(tunrun)
     RUN_TEST(a_miss_from_a_child_without_a_port_is_ignored);
     RUN_TEST(close_goes_to_the_live_child_only);
     RUN_TEST(bytes_accumulate_across_events_and_a_child_restart);
+    RUN_TEST(byte_counters_follow_the_tunnel_not_the_name);
     RUN_TEST(attaching_the_hooks_publishes_the_ports_held);
     RUN_TEST(the_pool_set_on_the_runner_reaches_the_child);
     RUN_TEST(inbounds_go_out_after_ready);
@@ -3296,6 +3395,760 @@ SUITE(tunrun)
     RUN_TEST(a_refresh_drops_keys_its_body_no_longer_gives_and_writes_the_file);
     RUN_TEST(a_refresh_leaves_a_hand_edited_file_alone);
     RUN_TEST(pruning_alone_does_not_restart_the_tunnel);
+    RUN_TEST(an_event_on_another_interface_restarts_a_starved_tunnel);
+    RUN_TEST(an_event_with_no_name_is_a_network_change);
+    RUN_TEST(an_event_on_a_tunnel_s_own_device_is_not_a_network_change);
+    RUN_TEST(an_event_on_another_tunnel_s_device_is_not_a_network_change);
+}
+
+typedef enum { FR_MANUAL, FR_READY, FR_PRESENT_ONLY, FR_REFUSE_REMOVAL } fr_mode_t;
+
+typedef struct {
+    bool open;
+    int p[2];
+    fr_mode_t mode;
+    firc_opkgtun_want_t last[32];
+    size_t n_last;
+    int wants;
+    int sweeps;
+    int passes;
+    uint32_t sweep_removes;
+    firc_opkgtun_seen_t seen[32];
+    size_t n_seen;
+    uint32_t swept;
+    char log[8192];
+    pid_t watch;
+    int absent_while_alive;
+} fr_t;
+
+static fr_t g_fr;
+
+static void fr_signal(void)
+{
+    char b = 1;
+    ssize_t w = write(g_fr.p[1], &b, 1);
+    (void)w;
+}
+
+static void fr_seen_of(const firc_opkgtun_want_t *w, firc_opkgtun_seen_t *s)
+{
+    memset(s, 0, sizeof *s);
+    snprintf(s->name, sizeof s->name, "%s", w->name);
+    s->removing = !w->present;
+    s->rechecked = w->recheck;
+    s->state = FIRC_OPKG_PENDING;
+    if (g_fr.mode == FR_READY || (w->present && g_fr.mode != FR_MANUAL)) {
+        s->state = FIRC_OPKG_READY;
+    } else if (!w->present && g_fr.mode == FR_REFUSE_REMOVAL) {
+        s->state = FIRC_OPKG_FAILED;
+        snprintf(s->error, sizeof s->error, "RCI refused");
+    }
+}
+
+static void fr_want(const firc_opkgtun_want_t *w, size_t n, void *ud)
+{
+    (void)ud;
+    g_fr.wants++;
+    g_fr.n_last = n;
+    memcpy(g_fr.last, w, n * sizeof *w);
+    size_t off = strlen(g_fr.log);
+    off += (size_t)snprintf(g_fr.log + off, sizeof g_fr.log - off, "W");
+    for (size_t i = 0; i < n; i++) {
+        off += (size_t)snprintf(g_fr.log + off, sizeof g_fr.log - off, " %c%s/%u", w[i].present ? '+' : '-',
+                                w[i].name, (unsigned)w[i].recheck);
+        if (!w[i].present && g_fr.watch > 0 && kill(g_fr.watch, 0) == 0) {
+            g_fr.absent_while_alive++;
+        }
+    }
+    snprintf(g_fr.log + off, sizeof g_fr.log - off, ";");
+    if (g_fr.mode == FR_MANUAL) {
+        return;
+    }
+    g_fr.n_seen = n;
+    for (size_t i = 0; i < n; i++) {
+        fr_seen_of(&w[i], &g_fr.seen[i]);
+    }
+    fr_signal();
+}
+
+static size_t fr_seen(firc_opkgtun_seen_t *out, size_t cap, uint32_t *swept, void *ud)
+{
+    (void)ud;
+    char buf[64];
+    while (read(g_fr.p[0], buf, sizeof buf) > 0) {
+    }
+    size_t n = g_fr.n_seen < cap ? g_fr.n_seen : cap;
+    memcpy(out, g_fr.seen, n * sizeof *out);
+    *swept = g_fr.swept;
+    g_fr.swept = 0;
+    return n;
+}
+
+static void fr_sweep(void *ud)
+{
+    (void)ud;
+    g_fr.sweeps++;
+}
+
+static void fr_pass(void *ud)
+{
+    (void)ud;
+    g_fr.passes++;
+}
+
+static void fr_attach(fx_t *f, fr_mode_t mode)
+{
+    memset(&g_fr, 0, sizeof g_fr);
+    if (pipe(g_fr.p) != 0) {
+        abort();
+    }
+    fcntl(g_fr.p[0], F_SETFL, O_NONBLOCK);
+    g_fr.open = true;
+    g_fr.mode = mode;
+    const firc_tunrun_router_t r = {fr_want, fr_seen, fr_sweep, fr_pass, g_fr.p[0], NULL};
+    firc_tunrun_set_router(f->run, &r);
+}
+
+static void fr_close(void)
+{
+    if (g_fr.open) {
+        close(g_fr.p[0]);
+        close(g_fr.p[1]);
+        g_fr.open = false;
+    }
+}
+
+static void fr_answer(const char *name, firc_opkg_state_t state, bool removing, uint32_t rechecked, const char *error,
+                      bool saved)
+{
+    firc_opkgtun_seen_t *s = NULL;
+    for (size_t i = 0; i < g_fr.n_seen && s == NULL; i++) {
+        if (strcmp(g_fr.seen[i].name, name) == 0) {
+            s = &g_fr.seen[i];
+        }
+    }
+    if (s == NULL) {
+        s = &g_fr.seen[g_fr.n_seen++];
+    }
+    memset(s, 0, sizeof *s);
+    snprintf(s->name, sizeof s->name, "%s", name);
+    s->state = state;
+    s->removing = removing;
+    s->rechecked = rechecked;
+    s->saved = saved;
+    snprintf(s->error, sizeof s->error, "%s", error);
+    fr_signal();
+}
+
+static const firc_opkgtun_want_t *fr_last(const char *name)
+{
+    for (size_t i = 0; i < g_fr.n_last; i++) {
+        if (strcmp(g_fr.last[i].name, name) == 0) {
+            return &g_fr.last[i];
+        }
+    }
+    return NULL;
+}
+
+static firc_tun_state_t state_of(fx_t *f, const char *id)
+{
+    firc_tun_state_t st[8];
+    firc_tun_state_t none;
+    memset(&none, 0, sizeof none);
+    size_t n = firc_tunrun_states(f->run, st, 8);
+    for (size_t i = 0; i < n && i < 8; i++) {
+        if (strcmp(st[i].id, id) == 0) {
+            return st[i];
+        }
+    }
+    return none;
+}
+
+typedef struct {
+    const char *id;
+    const char *dev;
+    bool off;
+} ospec_t;
+
+static void otunnels(firc_tunnels_t *out, const ospec_t *o, size_t n)
+{
+    spec_t sp[4];
+    for (size_t i = 0; i < n && i < 4; i++) {
+        sp[i] = (spec_t){o[i].id, 0, FIRC_UPLINK_AUTO, NULL, o[i].off};
+    }
+    tunnels_of(out, sp, n);
+    for (size_t i = 0; i < n; i++) {
+        snprintf(out->t[i].device, sizeof out->t[i].device, "%s", o[i].dev);
+    }
+}
+
+static void oapply(fx_t *f, const ospec_t *o, size_t n)
+{
+    firc_tunnels_t t;
+    otunnels(&t, o, n);
+    (void)firc_tunrun_apply(f->run, &t);
+    firc_tunnels_free(&t);
+}
+
+static const ospec_t k_t1_opkg3[] = {{"t1", "opkgtun3", false}};
+static const ospec_t k_t1_tun3[] = {{"t1", "tunvless3", false}};
+
+TEST no_spawn_before_ready(void)
+{
+    /* catches: an opkgtun tunnel spawned before its record is ready, or opened by a seen from an older check */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 300);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun3"));
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present);
+    ASSERT_EQ(1u, w->recheck);
+    ASSERT_STR_EQ("opkgtun3", w->device);
+    ASSERT_EQ(3, w->n);
+    ASSERT_STR_EQ("firc:t1", w->mark);
+    ASSERT_STR_EQ("firc:t1", w->desc);
+    ASSERT_EQ(FIRC_TUN_ST_ROUTER, state_of(&f, "t1").status);
+    ASSERT_STR_EQ("waiting for the router", state_of(&f, "t1").why);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 0, "", false);
+    run_ms(&f, 300);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun3"));
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", false);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 2000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_failed_record_keeps_the_tunnel_down(void)
+{
+    /* catches: a failed record that lets the tunnel start, or hides NDM's reason behind a generic one */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 200);
+    fr_answer("OpkgTun3", FIRC_OPKG_FAILED, false, 1, "index 17 is too large", false);
+    run_ms(&f, 400);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun3"));
+    firc_tun_state_t st = state_of(&f, "t1");
+    ASSERT_EQ(FIRC_TUN_ST_ROUTER, st.status);
+    ASSERT_STR_EQ("index 17 is too large", st.why);
+    ASSERT(firc_tunrun_device_down(f.run, "opkgtun3"));
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_disabled_tunnel_keeps_its_record(void)
+{
+    /* catches: a disable taken as a removal, which would delete the record the user only switched off */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    const ospec_t off[] = {{"t1", "opkgtun3", true}};
+    oapply(&f, off, 1);
+    run_ms(&f, 500);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") == NULL);
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present);
+    ASSERT_EQ(FIRC_TUN_ST_OFF, state_of(&f, "t1").status);
+    fx_down(&f);
+    PASS();
+}
+
+TEST release_waits_for_the_reap(void)
+{
+    /* catches: a removal sent while tunvless still holds the device, which leaves NDM a broken device */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    g_fr.watch = last_pid(&f, "opkgtun3");
+    ASSERT(g_fr.watch > 0);
+    apply(&f, NULL, 0);
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present);
+    run_ms(&f, 800);
+    w = fr_last("OpkgTun3");
+    ASSERT(w == NULL || !w->present);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    ASSERT_EQ(0, g_fr.absent_while_alive);
+    ASSERT_EQ(0u, g_fr.n_last);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_swap_to_tunvless_waits_for_the_removal(void)
+{
+    /* catches: tunvless3 started while OpkgTun3, which holds its address, is still being removed */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_PRESENT_ONLY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    oapply(&f, k_t1_tun3, 1);
+    run_ms(&f, 800);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    ASSERT_EQ(0, starts_of(&f, "tunvless3"));
+    firc_tun_state_t st = state_of(&f, "t1");
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, st.status);
+    ASSERT_STR_EQ("waiting for OpkgTun3 to be removed", st.why);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, true, 0, "", false);
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless3", 1, 2000));
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 2000));
+    run_ms(&f, 100);
+    ASSERT_EQ(0u, g_fr.n_last);
+    fx_down(&f);
+    PASS();
+}
+
+TEST no_release_while_another_tunnel_names_it(void)
+{
+    /* catches: a record removed because its first tunnel left it, while the next tunnel already names it */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    const ospec_t moved[] = {{"t1", "tunvless5", false}, {"t2", "opkgtun3", false}};
+    oapply(&f, moved, 2);
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun3", 2, 3000));
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") == NULL);
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present);
+    ASSERT_STR_EQ("firc:t2", w->mark);
+    fx_down(&f);
+    PASS();
+}
+
+TEST each_spawn_runs_a_full_present_sequence(void)
+{
+    /* catches: a spawn that trusts the record seen at the last start instead of checking it again */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    ASSERT_EQ(1u, fr_last("OpkgTun3")->recheck);
+    ASSERT_EQ(FIRC_OK, firc_tunrun_restart(f.run, "t1"));
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun3", 2, 3000));
+    ASSERT_EQ(2u, fr_last("OpkgTun3")->recheck);
+    ASSERT(strstr(g_fr.log, "+OpkgTun3/1;") != NULL);
+    ASSERT(strstr(g_fr.log, "+OpkgTun3/2;") != NULL);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_link_down_of_a_ready_device_asks_for_a_converge(void)
+{
+    /* catches: a ready record taken down in NDM left down, or a recheck asked for a record still in work */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    run_ms(&f, 100);
+    int before = g_fr.wants;
+    firc_tunrun_link_down(f.run, "tunvless3");
+    firc_tunrun_link_down(f.run, "opkgtun4");
+    ASSERT_EQ(before, g_fr.wants);
+    firc_tunrun_link_down(f.run, "opkgtun3");
+    ASSERT_EQ(before + 1, g_fr.wants);
+    ASSERT_EQ(2u, fr_last("OpkgTun3")->recheck);
+    g_fr.mode = FR_MANUAL;
+    firc_tunrun_link_down(f.run, "opkgtun3");
+    ASSERT_EQ(3u, fr_last("OpkgTun3")->recheck);
+    g_fr.n_seen = 0;
+    fr_answer("OpkgTun3", FIRC_OPKG_PENDING, false, 3, "", true);
+    run_ms(&f, 100);
+    firc_tunrun_link_down(f.run, "opkgtun3");
+    ASSERT_EQ(3u, fr_last("OpkgTun3")->recheck);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun3"));
+    fx_down(&f);
+    PASS();
+}
+
+TEST the_starting_window_covers_pending(void)
+{
+    /* catches: a tunnel waiting for its record reported down at once, or a failed record kept in the window */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    int64_t since = -1;
+    ASSERT(firc_tunrun_device_starting(f.run, "opkgtun3", &since));
+    ASSERT_EQ(state_of(&f, "t1").since_ms, since);
+    ASSERT(since > 0);
+    fr_answer("OpkgTun3", FIRC_OPKG_FAILED, false, 1, "RCI refused", false);
+    run_ms(&f, 100);
+    ASSERT_FALSE(firc_tunrun_device_starting(f.run, "opkgtun3", &since));
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_start_with_our_old_record_brings_up_the_tunvless_tunnel(void)
+{
+    /* catches: a permanent bad_config when the sweep removes our old OpkgTun3 that held tunvless3's address */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    firc_tun_ifaddr_t held = {.name = "opkgtun3", .family = AF_INET, .addr = {203, 0, 113, 4}};
+    firc_tun_addr_set_ifaddrs_for_test(&held, 1);
+    firc_tunnels_t want;
+    otunnels(&want, k_t1_tun3, 1);
+    ASSERT_EQ(FIRC_OK, firc_tunrun_start(f.run, &want));
+    firc_tunnels_free(&want);
+    ASSERT_EQ(1, g_fr.sweeps);
+    run_ms(&f, 300);
+    ASSERT_EQ(FIRC_TUN_ST_BAD_CONFIG, status_of(&f, "t1"));
+    ASSERT_EQ(0, starts_of(&f, "tunvless3"));
+    firc_tun_ifaddr_t none = {.name = "lo", .family = AF_INET, .addr = {127, 0, 0, 1}};
+    firc_tun_addr_set_ifaddrs_for_test(&none, 1);
+    g_fr.swept = 1u << 3;
+    fr_signal();
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless3", 1, 2000));
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 2000));
+    run_ms(&f, 300);
+    ASSERT_EQ(1, starts_of(&f, "tunvless3"));
+    ASSERT(g_fr.passes >= 1);
+    fx_down(&f);
+    PASS();
+}
+
+TEST wants_are_recorded_before_the_apply(void)
+{
+    /* catches: wants recorded after firc_tunsup_apply, so the re-entrant spawn of tunvless3 misses the removal */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    setenv("FAKE_MODE", "crash", 1);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(FIRC_TUN_ST_BACKOFF, run_until_status(&f, "t1", FIRC_TUN_ST_BACKOFF, 3000));
+    g_fr.mode = FR_MANUAL;
+    setenv("FAKE_MODE", "ok", 1);
+    oapply(&f, k_t1_tun3, 1);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    ASSERT_EQ(0, starts_of(&f, "tunvless3"));
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, state_of(&f, "t1").status);
+    ASSERT_STR_EQ("waiting for OpkgTun3 to be removed", state_of(&f, "t1").why);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_failing_removal_says_why_the_tunnel_waits(void)
+{
+    /* catches: a refused removal that holds tunvless3 down without saying why */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_REFUSE_REMOVAL);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    oapply(&f, k_t1_tun3, 1);
+    run_ms(&f, 800);
+    ASSERT_EQ(0, starts_of(&f, "tunvless3"));
+    firc_tun_state_t st = state_of(&f, "t1");
+    ASSERT_EQ(FIRC_TUN_ST_STARTING, st.status);
+    ASSERT_STR_EQ("waiting for OpkgTun3 to be removed: RCI refused", st.why);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_created_record_asks_for_a_pass(void)
+{
+    /* catches: no committer pass after NDM rewrote its tables for a create or a removal, or one per republished state */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", false);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    ASSERT_EQ(1, g_fr.passes);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", true);
+    run_ms(&f, 200);
+    ASSERT_EQ(1, g_fr.passes);
+    apply(&f, NULL, 0);
+    run_ms(&f, 500);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, true, 0, "", false);
+    run_ms(&f, 200);
+    ASSERT_EQ(2, g_fr.passes);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_failed_load_sweeps_nothing(void)
+{
+    /* catches: a sweep after a tunnels.yaml that did not load, which would delete every record of ours */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    ASSERT(firc_tunrun_start(f.run, NULL) != FIRC_OK);
+    ASSERT_EQ(0, g_fr.sweeps);
+    firc_tunnels_t want;
+    otunnels(&want, k_t1_tun3, 1);
+    ASSERT_EQ(FIRC_OK, firc_tunrun_start(f.run, &want));
+    firc_tunnels_free(&want);
+    ASSERT_EQ(1, g_fr.sweeps);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_failed_apply_sweeps_nothing(void)
+{
+    /* catches: a sweep after an apply that failed, which keeps no tunnel's record */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    firc_tunnels_t want;
+    otunnels(&want, k_t1_tun3, 1);
+    snprintf(want.t[0].device, sizeof want.t[0].device, "tunvlessx");
+    ASSERT(firc_tunrun_start(f.run, &want) != FIRC_OK);
+    firc_tunnels_free(&want);
+    ASSERT_EQ(0, g_fr.sweeps);
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_absent_file_loads_empty(void)
+{
+    /* catches: an absent tunnels.yaml taken as a failed load, which would leave our old records in the router */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    char path[128];
+    snprintf(path, sizeof path, "%s/none.yaml", f.dir);
+    firc_tunnels_t want = {0};
+    firc_tun_err_t e = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_file(&want, path, &e));
+    ASSERT_EQ(0u, want.n);
+    ASSERT_EQ(FIRC_OK, firc_tunrun_start(f.run, &want));
+    firc_tunnels_free(&want);
+    ASSERT_EQ(1, g_fr.sweeps);
+    ASSERT_EQ(0u, g_fr.n_last);
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_up_only_restore_asks_for_a_pass(void)
+{
+    /* catches: a record brought up again on a recheck, or made ready twice before the loop read it, with no pass */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", true);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    ASSERT_EQ(1, g_fr.passes);
+    firc_tunrun_link_down(f.run, "opkgtun3");
+    ASSERT_EQ(2u, fr_last("OpkgTun3")->recheck);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 2, "", true);
+    run_ms(&f, 200);
+    ASSERT_EQ(2, g_fr.passes);
+    firc_tunrun_link_down(f.run, "opkgtun3");
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 3, "", false);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 3, "", true);
+    run_ms(&f, 200);
+    ASSERT_EQ(3, g_fr.passes);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_stale_wait_does_not_open_a_tunnel_moved_to_another_record(void)
+{
+    /* catches: OpkgTun3's removal opening t1 after t1 was deleted and re-added on opkgtun5 before OpkgTun5 is ready */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    apply(&f, NULL, 0);
+    run_ms(&f, 100);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    const ospec_t five[] = {{"t1", "opkgtun5", false}};
+    oapply(&f, five, 1);
+    run_ms(&f, 100);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, true, 0, "", false);
+    run_ms(&f, 400);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun5"));
+    ASSERT_EQ(FIRC_TUN_ST_ROUTER, state_of(&f, "t1").status);
+    fr_answer("OpkgTun5", FIRC_OPKG_READY, false, 1, "", false);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun5", 1, 2000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_sweep_removal_of_a_named_record_is_not_a_completed_removal(void)
+{
+    /* catches: a swept bit for a record a new want named during the sweep, opening its tunnel and forgetting the record */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    g_fr.swept = 1u << 3;
+    fr_signal();
+    run_ms(&f, 400);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun3"));
+    apply(&f, NULL, 0);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_renamed_record_answers_no_earlier_state(void)
+{
+    /* catches: a record swept and named again answering the state of its previous cycle */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", true);
+    run_ms(&f, 200);
+    firc_opkgtun_seen_t s;
+    ASSERT(firc_tunrun_router_of(f.run, "t1", &s));
+    ASSERT_EQ(FIRC_OPKG_READY, s.state);
+    apply(&f, NULL, 0);
+    run_ms(&f, 100);
+    g_fr.swept = 1u << 3;
+    fr_signal();
+    run_ms(&f, 200);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT(firc_tunrun_router_of(f.run, "t1", &s));
+    ASSERT_EQ(FIRC_OPKG_PENDING, s.state);
+    fx_down(&f);
+    PASS();
+}
+
+#define AB_OPKG0                                                                         \
+    "tunnels:\n  - id: a\n    device: opkgtun0\n    sources:\n"                          \
+    "      - id: 0000000a\n        link: \"vless://" U "@a.example:443?security=none#A\"\n" \
+    "      - id: 0000000b\n        link: \"vless://" U "@b.example:443?security=none#B\"\n"
+
+static void starve(fx_t *f, const char *yaml)
+{
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(f, yaml);
+    (void)run_until_status(f, "a", FIRC_TUN_ST_NO_NODE, 3000);
+}
+
+TEST an_event_on_an_opkg_tunnel_s_own_device_is_not_a_network_change(void)
+{
+    /* catches: a configured opkgtun device left out of the filter, so a restart's own link events restart it again */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    starve(&f, AB_OPKG0);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(&f, "a").status);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun0"));
+    firc_tunrun_net_event(f.run, "opkgtun0");
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_a_foreign_opkgtun_is_a_network_change(void)
+{
+    /* catches: any opkgtun<N> name taken as firc's own, so another program's OpkgTun10 coming up is ignored */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    starve(&f, AB_OPKG0);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(&f, "a").status);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun0"));
+    firc_tunrun_net_event(f.run, "opkgtun10");
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST an_event_on_an_opkgtun_being_removed_is_not_a_network_change(void)
+{
+    /* catches: the teardown of a record firc removes, or one its sweep removed, taken as a network change */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    oapply(&f, k_t1_opkg3, 1);
+    run_ms(&f, 100);
+    starve(&f, AB_LINKS);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, state_of(&f, "a").status);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") != NULL);
+    firc_tunrun_net_event(f.run, "opkgtun3");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 4000));
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, true, 0, "", true);
+    run_ms(&f, 100);
+    firc_tunrun_net_event(f.run, "opkgtun3");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 4000));
+    g_fr.swept = 1u << 5;
+    fr_signal();
+    run_ms(&f, 100);
+    firc_tunrun_net_event(f.run, "opkgtun5");
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 2, 4000));
+    firc_tunrun_net_event(f.run, "opkgtun6");
+    ASSERT_EQ(2, run_until_starts(&f, "tunvless0", 2, 6000));
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_nudged_opkg_tunnel_waits_for_its_record_again(void)
+{
+    /* catches: a network restart of an opkg tunnel that skips the record's recheck, or one that never comes back */
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_MANUAL);
+    setenv("FAKE_MODE", "nodes", 1);
+    setenv("FAKE_EVENTS", "{\"type\":\"no_node\",\"retry\":60}", 1);
+    apply_yaml(&f, AB_OPKG0);
+    run_ms(&f, 100);
+    ASSERT_EQ(1u, fr_last("OpkgTun0")->recheck);
+    fr_answer("OpkgTun0", FIRC_OPKG_READY, false, 1, "", true);
+    ASSERT_EQ(FIRC_TUN_ST_NO_NODE, run_until_status(&f, "a", FIRC_TUN_ST_NO_NODE, 3000));
+    ASSERT_EQ(1, starts_of(&f, "opkgtun0"));
+    firc_tunrun_net_event(f.run, "eth0");
+    run_ms(&f, 4000);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun0"));
+    ASSERT_EQ(2u, fr_last("OpkgTun0")->recheck);
+    ASSERT_EQ(FIRC_TUN_ST_ROUTER, state_of(&f, "a").status);
+    fr_answer("OpkgTun0", FIRC_OPKG_READY, false, 2, "", true);
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun0", 2, 2000));
+    fx_down(&f);
+    PASS();
+}
+
+SUITE(opkg)
+{
+    GREATEST_SET_TEARDOWN_CB(teardown, NULL);
+    RUN_TEST(no_spawn_before_ready);
+    RUN_TEST(a_failed_record_keeps_the_tunnel_down);
+    RUN_TEST(a_disabled_tunnel_keeps_its_record);
+    RUN_TEST(release_waits_for_the_reap);
+    RUN_TEST(a_swap_to_tunvless_waits_for_the_removal);
+    RUN_TEST(no_release_while_another_tunnel_names_it);
+    RUN_TEST(each_spawn_runs_a_full_present_sequence);
+    RUN_TEST(a_link_down_of_a_ready_device_asks_for_a_converge);
+    RUN_TEST(the_starting_window_covers_pending);
+    RUN_TEST(a_start_with_our_old_record_brings_up_the_tunvless_tunnel);
+    RUN_TEST(wants_are_recorded_before_the_apply);
+    RUN_TEST(a_failing_removal_says_why_the_tunnel_waits);
+    RUN_TEST(a_created_record_asks_for_a_pass);
+    RUN_TEST(an_up_only_restore_asks_for_a_pass);
+    RUN_TEST(a_stale_wait_does_not_open_a_tunnel_moved_to_another_record);
+    RUN_TEST(a_sweep_removal_of_a_named_record_is_not_a_completed_removal);
+    RUN_TEST(a_renamed_record_answers_no_earlier_state);
+    RUN_TEST(an_event_on_an_opkg_tunnel_s_own_device_is_not_a_network_change);
+    RUN_TEST(an_event_on_a_foreign_opkgtun_is_a_network_change);
+    RUN_TEST(an_event_on_an_opkgtun_being_removed_is_not_a_network_change);
+    RUN_TEST(a_nudged_opkg_tunnel_waits_for_its_record_again);
+    RUN_TEST(a_failed_load_sweeps_nothing);
+    RUN_TEST(a_failed_apply_sweeps_nothing);
+    RUN_TEST(an_absent_file_loads_empty);
 }
 
 GREATEST_MAIN_DEFS();
@@ -3306,6 +4159,7 @@ int main(int argc, char **argv)
     GREATEST_MAIN_BEGIN();
     firc_sub_fetch_global_init();
     RUN_SUITE(tunrun);
+    RUN_SUITE(opkg);
     firc_sub_fetch_global_cleanup();
     GREATEST_MAIN_END();
 }

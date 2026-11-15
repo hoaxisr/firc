@@ -62,6 +62,14 @@ static const rule_case_t k_redir_rules[] = {
      FIRC_XT_EXT_MARK | FIRC_XT_EXT_ADDRTYPE},
 };
 
+static const rule_case_t k_mss_rules[] = {
+    {"FIRC_MSS", 0, "-o tunvless1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+     "-o tunvless1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu", FIRC_XT_EXT_TCP | FIRC_XT_EXT_TCPMSS},
+    {"FIRC_MSS", 1, "-o tunvless3 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
+     "-o tunvless3 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu", FIRC_XT_EXT_TCP | FIRC_XT_EXT_TCPMSS},
+    {"FORWARD", 0, "-j FIRC_MSS", "-j FIRC_MSS", 0},
+};
+
 static enum greatest_test_res rules_encode_as_golden(const char *fixture, firc_ipt_proto_t fam, const rule_case_t *rules,
                                                      size_t n) {
     firc_xt_info_t info;
@@ -99,6 +107,14 @@ TEST every_builder_rule_encodes_as_iptables_restore_wrote_it(void) {
     PASS();
 }
 
+/* Catches: the TCPMSS clamp encoded unlike iptables-restore 1.4.21 wrote it (revision, size or payload). */
+TEST the_mss_clamp_encodes_as_iptables_restore_wrote_it(void) {
+    for (size_t f = 0; f < 2; f++) {
+        CHECK_CALL(rules_encode_as_golden("m-mss", k_fams[f], k_mss_rules, sizeof(k_mss_rules) / sizeof(k_mss_rules[0])));
+    }
+    PASS();
+}
+
 static enum greatest_test_res refused(firc_ipt_proto_t fam, const char *line) {
     firc_ipt_rule_t *r = firc_test_rule(line);
     firc_xt_entry_t e;
@@ -107,6 +123,37 @@ static enum greatest_test_res refused(firc_ipt_proto_t fam, const char *line) {
     ASSERT_EQ_FMTm(line, FIRC_ERR_INVAL, firc_xt_encode(fam, 0, r, &e, &exts, g_set), "%d");
     ASSERTm(line, e.bytes == NULL);
     firc_ipt_rule_free(r);
+    PASS();
+}
+
+/* Catches: the clamp's payload or revision wrong, or a clamp the kernel's SYN check refuses reaching the router. */
+TEST the_mss_clamp_needs_a_syn_match(void) {
+    for (size_t f = 0; f < 2; f++) {
+        firc_xt_entry_t e;
+        memset(&e, 0, sizeof(e));
+        uint32_t exts = 0;
+        ASSERT_EQ_FMT(FIRC_OK, enc(k_fams[f], "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu", &e, &exts), "%d");
+        uint32_t eh = f == 0 ? 112 : 168;
+        uint16_t toff;
+        memcpy(&toff, e.bytes + (f == 0 ? 88 : 140), 2);
+        const uint8_t *t = e.bytes + toff;
+        uint16_t tsize, mss;
+        memcpy(&tsize, t, 2);
+        memcpy(&mss, t + 32, 2);
+        ASSERT_EQ_FMT((uint16_t)40, tsize, "%u");
+        ASSERT_EQ_FMT((uint32_t)(toff + 40), e.len, "%u");
+        ASSERT_EQ_FMT((uint32_t)(eh + 32 + 16), (uint32_t)toff, "%u");
+        ASSERT_STR_EQ("TCPMSS", (const char *)t + 2);
+        ASSERT_EQ_FMT(0u, t[31], "%u");
+        ASSERT_EQ_FMT((uint16_t)0xffff, mss, "%u");
+        firc_xt_entry_clear(&e);
+        CHECK_CALL(refused(k_fams[f], "-p tcp -j TCPMSS --clamp-mss-to-pmtu"));
+        CHECK_CALL(refused(k_fams[f], "-p tcp --dport 80 -j TCPMSS --clamp-mss-to-pmtu"));
+        CHECK_CALL(refused(k_fams[f], "-p tcp --tcp-flags SYN,RST RST -j TCPMSS --clamp-mss-to-pmtu"));
+        CHECK_CALL(refused(k_fams[f], "-p tcp --tcp-flags SYN SYN -j TCPMSS"));
+        CHECK_CALL(refused(k_fams[f], "-p tcp --tcp-flags SYN SYN -j TCPMSS --set-mss"));
+        CHECK_CALL(refused(k_fams[f], "-p tcp --tcp-flags SYN SYN -j TCPMSS --clamp-mss-to-pmtu --clamp-mss-to-pmtu"));
+    }
     PASS();
 }
 
@@ -334,6 +381,8 @@ TEST the_probe_list_names_what_the_encoder_writes(void) {
         {FIRC_XT_EXT_CONNMARK_MATCH, "-m connmark --mark 1 -j RETURN", "-m connmark --mark 1 -j RETURN"},
         {FIRC_XT_EXT_REDIRECT, "-p tcp -j REDIRECT --to-ports 1", NULL},
         {FIRC_XT_EXT_ADDRTYPE, "-m addrtype --dst-type LOCAL -j RETURN", NULL},
+        {FIRC_XT_EXT_TCPMSS, "-p tcp --tcp-flags SYN SYN -j TCPMSS --clamp-mss-to-pmtu",
+         "-p tcp --tcp-flags SYN SYN -j TCPMSS --clamp-mss-to-pmtu"},
     };
     const uint32_t capture = FIRC_XT_EXT_LIMIT | FIRC_XT_EXT_LENGTH | FIRC_XT_EXT_CONNBYTES | FIRC_XT_EXT_STRING |
                              FIRC_XT_EXT_NFLOG;
@@ -1033,6 +1082,8 @@ GREATEST_MAIN_DEFS();
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(every_builder_rule_encodes_as_iptables_restore_wrote_it);
+    RUN_TEST(the_mss_clamp_encodes_as_iptables_restore_wrote_it);
+    RUN_TEST(the_mss_clamp_needs_a_syn_match);
     RUN_TEST(redirect_needs_a_protocol_and_a_valid_range);
     RUN_TEST(addrtype_takes_only_the_local_destination);
     RUN_TEST(an_interface_at_the_length_limit_gets_a_full_mask);

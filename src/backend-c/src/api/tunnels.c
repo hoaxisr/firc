@@ -826,6 +826,8 @@ static const char *status_name(firc_tun_status_t s)
         return "waiting";
     case FIRC_TUN_ST_UPLINK_DOWN:
         return "uplink_down";
+    case FIRC_TUN_ST_ROUTER:
+        return "router";
     case FIRC_TUN_ST_OFF:
     default:
         return "off";
@@ -1049,6 +1051,39 @@ static cJSON *inbounds_state_json(firc_tunnels_ctx_t *ctx, const firc_tunnel_t *
     return a;
 }
 
+static const char *opkg_state_name(firc_opkg_state_t s)
+{
+    switch (s) {
+    case FIRC_OPKG_READY:
+        return "ready";
+    case FIRC_OPKG_FAILED:
+        return "failed";
+    case FIRC_OPKG_FOREIGN:
+        return "foreign";
+    case FIRC_OPKG_PENDING:
+        break;
+    }
+    return "pending";
+}
+
+static bool put_router(cJSON *o, firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t)
+{
+    firc_opkgtun_seen_t r;
+    if (!firc_tunrun_router_of(ctx->run, t->id, &r)) {
+        return true;
+    }
+    cJSON *x = cJSON_CreateObject();
+    bool ok = x != NULL && cJSON_AddStringToObject(x, "name", r.name) != NULL &&
+              cJSON_AddStringToObject(x, "state", opkg_state_name(r.state)) != NULL &&
+              cJSON_AddBoolToObject(x, "saved", r.saved) != NULL &&
+              cJSON_AddStringToObject(x, "error", r.error) != NULL;
+    if (!ok) {
+        cJSON_Delete(x);
+        return false;
+    }
+    return put_item(o, "router", x);
+}
+
 static cJSON *tunnel_state_json(firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t, const firc_tun_state_t *st)
 {
     cJSON *o = cJSON_CreateObject();
@@ -1088,7 +1123,8 @@ static cJSON *tunnel_state_json(firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t,
     rates_of(ctx, t->device, &rx, &tx);
     ok = ok && cJSON_AddStringToObject(o, "id", t->id) != NULL &&
          cJSON_AddStringToObject(o, "device", t->device) != NULL &&
-         cJSON_AddStringToObject(o, "status", status_name(st->status)) != NULL;
+         cJSON_AddStringToObject(o, "status", status_name(st->status)) != NULL &&
+         cJSON_AddStringToObject(o, "why", st->why) != NULL && put_router(o, ctx, t);
     if (ok) {
         ok = put_item(o, "active", active);
         active = NULL;

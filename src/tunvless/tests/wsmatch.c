@@ -47,7 +47,7 @@
 
 /* ---- TLS and Reality stubs: the test link is plain, they are never reached --------- */
 
-void sc_wipe(void *p, size_t n) { memset(p, 0, n); }
+void __wrap_sc_wipe(void *p, size_t n) { memset(p, 0, n); }
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len)
     { (void)cfg; (void)st; (void)out; (void)out_n; *out_len = 0; return -1; }

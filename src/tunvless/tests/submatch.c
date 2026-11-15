@@ -1182,7 +1182,7 @@ static void t_xmux_all(void) {
 
 #define FM_FRAG "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"packets\":\"tlshello\",\"length\":\"10-20\"}}]}"
 #define FM_FRAG_WS "{ \"tcp\" : [ { \"type\" : \"fragment\" ,\n \"settings\" : { \"packets\" : \"tlshello\" , \"length\" : \"10-20\" } } ] }"
-#define FM_SUDOKU "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{}}]}"
+#define FM_SUDOKU "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"ascii\":\"bogus\"}}]}"
 #define FM_XMC "{\"tcp\":[{\"type\":\"xmc\",\"settings\":{}}]}"
 #define FM_FILTER "{\"tcp\":[{\"type\":\"filter\",\"settings\":{\"allowedSourceIPs\":[\"10.0.0.1\"]}}]}"
 #define FM_HC "{\"tcp\":[{\"type\":\"header-custom\",\"settings\":{\"clients\":[[{\"packet\":\"GET / HTTP/1.1\\r\\n\\r\\n\",\"type\":\"str\"}]]}}]}"
@@ -1243,7 +1243,7 @@ static void t_fm_link(void) {
     check("fm link: spaced compacted", FM_FRAG, fm_of(&n));
     check_n("fm link: spaced interned once", 1, n.fm == first);
     check_n("fm link: sudoku skipped", 1, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct(FM_SUDOKU)));
-    check("fm link: sudoku reason", "finalmask: sudoku is not supported yet", n.skip_reason);
+    check("fm link: sudoku reason", "finalmask: sudoku: invalid sudoku ascii mode: bogus", n.skip_reason);
     check_n("fm link: %7B skipped", 1, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%%7B"));
     check("fm link: %7B reason", "finalmask: does not parse", n.skip_reason);
     check_n("fm link: empty tcp usable", 0, fm_link(&n, "type=tcp&security=tls&sni=h.example&fm=%s", fm_pct("{\"tcp\":[]}")));
@@ -1273,13 +1273,13 @@ static void t_fm_xray_json(void) {
     check("fm xray: before network, carried", FM_FRAG, fm_of(&g_dl_last));
     check("fm xray: string value", "finalmask: invalid finalmask",
           fm_xray("\"network\":\"tcp\",\"finalmask\":\"x\""));
-    check("fm xray: finalMask key", "finalmask: sudoku is not supported yet",
+    check("fm xray: finalMask key", "finalmask: sudoku: invalid sudoku ascii mode: bogus",
           fm_xray("\"network\":\"tcp\",\"finalMask\":" FM_SUDOKU));
-    check("fm xray: FINALMASK key", "finalmask: sudoku is not supported yet",
+    check("fm xray: FINALMASK key", "finalmask: sudoku: invalid sudoku ascii mode: bogus",
           fm_xray("\"network\":\"tcp\",\"FINALMASK\":" FM_SUDOKU));
     check("fm xray: FinalMask key carried", "(usable)", fm_xray("\"network\":\"tcp\",\"FinalMask\":" FM_FRAG));
     check("fm xray: FinalMask key, mask", FM_FRAG, fm_of(&g_dl_last));
-    check("fm xray: block finalMask key", "downloadSettings: finalmask: sudoku is not supported yet",
+    check("fm xray: block finalMask key", "downloadSettings: finalmask: sudoku: invalid sudoku ascii mode: bogus",
           fm_xray("\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/x\",\"downloadSettings\":{\"address\":"
                   "\"d.example\",\"port\":443,\"network\":\"xhttp\",\"finalMask\":" FM_SUDOKU "}}"));
 }
@@ -1320,7 +1320,7 @@ static void t_fm_dl(void) {
                 check(name, FM_FRAG, fm_of(d[1]));
             } else {
                 snprintf(name, sizeof name, "fm dl %s: sudoku refused", pn[path]);
-                check(name, "downloadSettings: finalmask: sudoku is not supported yet", why[2]);
+                check(name, "downloadSettings: finalmask: sudoku: invalid sudoku ascii mode: bogus", why[2]);
             }
         }
     }
@@ -1369,9 +1369,9 @@ static void fm_own_case(const char *what, const char *main, const char *block, c
 
 static void t_fm_reason_own_node(void) {
     /* catches: a shared reason buffer overwritten by the other node */
-    fm_own_case("both bad", FM_SUDOKU, FM_XMC, "finalmask: sudoku is not supported yet",
+    fm_own_case("both bad", FM_SUDOKU, FM_XMC, "finalmask: sudoku: invalid sudoku ascii mode: bogus",
                 "finalmask: xmc is not supported yet");
-    fm_own_case("main bad", FM_SUDOKU, FM_FRAG, "finalmask: sudoku is not supported yet", "");
+    fm_own_case("main bad", FM_SUDOKU, FM_FRAG, "finalmask: sudoku: invalid sudoku ascii mode: bogus", "");
     fm_own_case("block bad", FM_FRAG, FM_XMC, "downloadSettings: finalmask: xmc is not supported yet",
                 "finalmask: xmc is not supported yet");
 }
@@ -1407,6 +1407,26 @@ static void t_fm_full(void) {
     sl_intern_reset();
 }
 
+static void t_fm_sudoku_per_list(void) {
+    static const char sd[] = "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\"}}]}";
+    static const char two[] = "{\"tcp\":[{\"type\":\"sudoku\"},{\"type\":\"sudoku\"}]}";
+    struct vless_node n;
+    static char q[16384], blk[1024];
+    /* catches: stacked sudoku accepted (Vision's room closes for good), or the check counted across main and block */
+    snprintf(blk, sizeof blk, "{\"downloadSettings\":" DL_FM("%s") "}", sd);
+    snprintf(q, sizeof q, FM_MAIN_Q "&fm=%s&extra=%s", fm_pct(sd), fm_pct(blk));
+    check("fm sudoku link: main and block usable", "(usable)", fm_link(&n, "%s", q) ? n.skip_reason : "(usable)");
+    check("fm sudoku link: main carried", sd, fm_of(&n));
+    check("fm sudoku link: block carried", sd, fm_of(dl_of(&n)));
+    snprintf(q, sizeof q, "\"network\":\"xhttp\",\"finalmask\":%s,\"xhttpSettings\":{\"path\":\"/x\","
+             "\"downloadSettings\":" DL_FM("%s") "}", sd, sd);
+    check("fm sudoku xray: main and block usable", "(usable)", fm_xray(q));
+    check("fm sudoku xray: main carried", sd, fm_of(&g_dl_last));
+    check("fm sudoku xray: block carried", sd, fm_of(dl_of(&g_dl_last)));
+    snprintf(q, sizeof q, "\"network\":\"tcp\",\"finalmask\":%s", two);
+    check("fm sudoku xray: two in one list", "finalmask: sudoku: more than one sudoku mask is not supported", fm_xray(q));
+}
+
 static void t_fm_all(void) {
     t_fm_full();
     t_fm_link();
@@ -1414,6 +1434,7 @@ static void t_fm_all(void) {
     t_fm_dl();
     t_fm_reason_own_node();
     t_fm_clash_singbox();
+    t_fm_sudoku_per_list();
 }
 
 int main(void) {

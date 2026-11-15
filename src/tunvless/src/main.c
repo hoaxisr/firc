@@ -114,7 +114,7 @@ static void usage(FILE *f) {
 "\n"
 "The device:\n"
 "  -d, --dev NAME         device name (default tunvless0)\n"
-"  -a, --addr CIDR        device address (default 198.51.100.1/32)\n"
+"  -a, --addr CIDR        device address (default 203.0.113.1/32)\n"
 "  -r, --route CIDR       route CIDR into the device once it is up; repeatable;\n"
 "                         \"default\" means 0.0.0.0/1 and 128.0.0.0/1\n"
 "  -T, --table N          routing table for --route (default main)\n"
@@ -238,7 +238,7 @@ static int parse_args(int argc, char **argv) {
         { "help",     no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
-    const char *addr = "198.51.100.1/32";
+    const char *addr = "203.0.113.1/32";
     uint32_t v;
     int c;
     while ((c = getopt_long(argc, argv, "n:lpd:a:r:T:m:b:t:A:Vh", opts, NULL)) != -1) {

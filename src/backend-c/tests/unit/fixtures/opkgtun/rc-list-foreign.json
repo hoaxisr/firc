@@ -1,0 +1,36 @@
+{
+  "GigabitEthernet0": {
+    "up": true
+  },
+  "OpkgTun9": {
+    "description": "hand",
+    "security-level": {
+      "public": true
+    },
+    "ip": {
+      "address": {
+        "address": "203.0.113.250",
+        "mask": "255.255.255.255"
+      },
+      "mtu": "1500",
+      "name-servers": true
+    },
+    "ipv6": {
+      "address": [
+        {
+          "auto": false
+        }
+      ],
+      "prefix": [
+        {
+          "auto": false
+        }
+      ],
+      "name-servers": true
+    },
+    "up": true
+  },
+  "Wireguard0": {
+    "description": "Wireguard VPN Server"
+  }
+}

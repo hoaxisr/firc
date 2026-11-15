@@ -49,7 +49,7 @@ void tr_link_close(struct tr_link *l) {
 
 static const void *g_st_at;
 static int g_build_rc, g_st_wipes, g_other_wipes;
-void sc_wipe(void *p, size_t n) {
+void __wrap_sc_wipe(void *p, size_t n) {
     memset(p, 0, n);
     if (p == g_st_at && n == sizeof(struct reality_state)) g_st_wipes++;
     else if (n >= sizeof(struct ech_state)) g_other_wipes++;

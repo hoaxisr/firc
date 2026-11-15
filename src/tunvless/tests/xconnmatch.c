@@ -14,6 +14,7 @@
 
 #include "xconn.h"
 #include "trxmux.h"
+#include "sdpeer.h"
 
 ssize_t __real_send(int fd, const void *b, size_t n, int fl);
 static long g_send_ok, g_send_again;
@@ -3636,17 +3637,25 @@ static size_t fm_get_body(struct xconn *x, const struct xs *g, unsigned char *ou
     return have;
 }
 
-static void x55_plain(int shared) {
-    const char *nm = shared ? "x55 xconn plain shared" : "x55 xconn plain private";
+static void x55_plain(int shared, const char *sd) {
+    const char *nm = sd ? shared ? "sd xconn plain shared" : "sd xconn plain private"
+                        : shared ? "x55 xconn plain shared" : "x55 xconn plain private";
     char what[96];
     int fd0 = fd_count();
     int l = listen_lo(0);
     uint16_t sp = g_port;
     int rl = listen_lo(0);
     struct fmrelay r;
+    g_fmr_sd = sd ? fmr_sd_of(sd) : NULL;
+    if (sd) {
+        snprintf(what, sizeof what, "%s: the relay's tables", nm);
+        check(what, 1, g_fmr_sd != NULL);
+    }
     fmrelay_listen(&r, rl, sp);
+    g_fmr_sd = NULL;
     struct tr_node n = plain_node(g_port);
-    fm_use(&FMT_X55, 0);
+    n.fm = sd;
+    fm_use(sd ? NULL : &FMT_X55, 0);
     struct xconn *x = xconn_new(&n, 0, shared);
     int rc = xconn_dial(x, 3);
     fm_use(NULL, 0);
@@ -3694,70 +3703,113 @@ static void x55_plain(int shared) {
     xconn_free(x);
     close(pfd);
     fmrelay_join(&r);
+    snprintf(what, sizeof what, "%s: the relay carried it", nm);
+    check(what, 1, r.n[0] >= (sd ? 4 : 1) * (70 + 40000) && r.n[1] > 0);
     snprintf(what, sizeof what, "%s: descriptors back", nm);
     check(what, fd0, fd_count());
 }
 
 /* catches: xconn.c:717/762/809 on the bare fd */
 static void t_fm_x55_xconn_plain(void) {
-    x55_plain(0);
-    x55_plain(1);
+    x55_plain(0, NULL);
+    x55_plain(1, NULL);
 }
 
-/* catches: xconn.c:809 or the TLS read of a shared xconn link on the bare fd */
-static void t_fm_x55_xconn_tls(void) {
+static void t_fm_sd_xconn_plain(void) {
+    /* catches: a private or shared xconn's reads, writes or shaping bypassing the mask */
+    x55_plain(0, SD_NODE);
+    x55_plain(1, SD_NODE);
+}
+
+static void x55_tls(int shared, const char *sd) {
+    const char *nm = sd ? shared ? "sd xconn tls shared" : "sd xconn tls private" : "x55 xconn tls";
+    char what[96];
     int fd0 = fd_count();
     struct tp p;
-    check("x55 xconn tls: peer starts", 0, tp_start(&p, "h2"));
+    snprintf(what, sizeof what, "%s: peer starts", nm);
+    check(what, 0, tp_start(&p, "h2"));
     uint16_t sp = g_port;
     int rl = listen_lo(0);
     struct fmrelay r;
+    g_fmr_sd = sd ? fmr_sd_of(sd) : NULL;
+    if (sd) {
+        snprintf(what, sizeof what, "%s: the relay's tables", nm);
+        check(what, 1, g_fmr_sd != NULL);
+    }
     fmrelay_listen(&r, rl, sp);
+    g_fmr_sd = NULL;
     struct tr_node n = tls_node(g_port);
-    fm_use(&FMT_X55, 0);
-    struct xconn *x = xconn_new(&n, 0, 1);
+    n.fm = sd;
+    fm_use(sd ? NULL : &FMT_X55, 0);
+    struct xconn *x = xconn_new(&n, 0, shared);
     int rc = xconn_dial(x, 3);
     fm_use(NULL, 0);
-    check("x55 xconn tls: dial", 0, rc);
+    snprintf(what, sizeof what, "%s: dial", nm);
+    check(what, 0, rc);
     int keys = tp_finish(&p);
-    check("x55 xconn tls: peer keys", 0, keys);
+    snprintf(what, sizeof what, "%s: peer keys", nm);
+    check(what, 0, keys);
     if (rc || keys) {
         xconn_free(x);
         tp_free(&p);
         fmrelay_join(&r);
         return;
     }
-    xconn_adopt(x, 0);
+    if (shared) xconn_adopt(x, 0);
     size_t rn = 0;
     unsigned char inner = 0;
-    check("x55 xconn tls: preface record opens", 0, rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &rn, &inner));
-    check("x55 xconn tls: Go's preface", 1, rn == 70 && !memcmp(g_rec, PREFACE70, 70));
+    snprintf(what, sizeof what, "%s: preface record opens", nm);
+    check(what, 0, rec_open(p.cd, p.s.fd, g_rec, sizeof g_rec, &rn, &inner));
+    snprintf(what, sizeof what, "%s: Go's preface", nm);
+    check(what, 1, rn == 70 && !memcmp(g_rec, PREFACE70, 70));
     struct xs g, u;
-    check("x55 xconn tls: GET opened", 0, xs_open(x, &RQ_GET, 1, &g));
+    snprintf(what, sizeof what, "%s: GET opened", nm);
+    check(what, 0, xs_open(x, &RQ_GET, 1, &g));
     xconn_flush(x);
     struct fv f[8];
     int k = next_rec(&p, f, 8, &rn);
-    check("x55 xconn tls: GET HEADERS at the peer", 1, k == 1 && f[0].type == FR_HEADERS);
+    snprintf(what, sizeof what, "%s: GET HEADERS at the peer", nm);
+    check(what, 1, k == 1 && f[0].type == FR_HEADERS);
     unsigned char msg[64];
     size_t m = frame(msg, 1, FR_HEADERS, FLAG_END_HEADERS, g.sid, ST200);
     m += frame(msg + m, 3, FR_DATA, FLAG_END_STREAM, g.sid, "abc");
-    check("x55 xconn tls: peer answers", 0, tp_seal(p.sd, p.s.fd, msg, m));
+    snprintf(what, sizeof what, "%s: peer answers", nm);
+    check(what, 0, tp_seal(p.sd, p.s.fd, msg, m));
     unsigned char body[8];
     size_t got = fm_get_body(x, &g, body, sizeof body);
-    check("x55 xconn tls: GET body read", 1, got == 3 && !memcmp(body, "abc", 3));
-    check("x55 xconn tls: POST opened", 0, xs_open(x, &RQ_POST, 2, &u));
-    check("x55 xconn tls: 40000 B sent", 0, xs_send(&u, g_big, 40000, 1));
+    snprintf(what, sizeof what, "%s: GET body read", nm);
+    check(what, 1, got == 3 && !memcmp(body, "abc", 3));
+    snprintf(what, sizeof what, "%s: POST opened", nm);
+    check(what, 0, xs_open(x, &RQ_POST, 2, &u));
+    snprintf(what, sizeof what, "%s: 40000 B sent", nm);
+    check(what, 0, xs_send(&u, g_big, 40000, 1));
     for (int i = 0; i < 50 && xconn_wants_out(x); i++) {
         xconn_flush(x);
         usleep(2000);
     }
     int same = 0;
-    check("x55 xconn tls: the peer got 40000 B of POST body", 40000, (long)fm_peer_post(-1, &p, u.sid, 40000, &same));
-    check("x55 xconn tls: the body is the bytes sent", 1, same);
+    snprintf(what, sizeof what, "%s: the peer got 40000 B of POST body", nm);
+    check(what, 40000, (long)fm_peer_post(-1, &p, u.sid, 40000, &same));
+    snprintf(what, sizeof what, "%s: the body is the bytes sent", nm);
+    check(what, 1, same);
     xconn_free(x);
     tp_free(&p);
     fmrelay_join(&r);
-    check("x55 xconn tls: descriptors back", fd0, fd_count());
+    snprintf(what, sizeof what, "%s: the relay carried it", nm);
+    check(what, 1, r.n[0] >= (sd ? 4 : 1) * 40000 && r.n[1] > 0);
+    snprintf(what, sizeof what, "%s: descriptors back", nm);
+    check(what, fd0, fd_count());
+}
+
+/* catches: xconn.c:809 or the TLS read of a shared xconn link on the bare fd */
+static void t_fm_x55_xconn_tls(void) {
+    x55_tls(1, NULL);
+}
+
+static void t_fm_sd_xconn_tls(void) {
+    /* catches: a private or shared xconn's TLS reads, writes or seal-time shaping bypassing the mask */
+    x55_tls(0, SD_NODE);
+    x55_tls(1, SD_NODE);
 }
 
 /* catches: CCS and Finished written separately (tls13.c:759, :774), which makes Xray's packets:"1-3" count differ */
@@ -4437,6 +4489,445 @@ static void t_xconn_read_pass_no_scratch(void) {
     close_plain(&p);
 }
 
+#define SD_C0 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+#define SD_C100 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":100,\"paddingMax\":100}}]}"
+
+#define SD_REC_OVER 22L
+#define SD_PIECE_COST (sizeof(void *) == 8 ? 64L : 56L)
+
+static long g_grow_calls;
+unsigned __real_fm_grow(const struct fm_link *l);
+unsigned __wrap_fm_grow(const struct fm_link *l) {
+    g_grow_calls++;
+    return __real_fm_grow(l);
+}
+
+struct sdp { int fd; struct tdec dec; struct tpk pk; unsigned char *pt; size_t n, cap; };
+
+static int sdp_init(struct sdp *q, int fd, const char *fm) {
+    memset(q, 0, sizeof *q);
+    q->fd = fd;
+    const struct fm_cfg *c = fm_cfg_get(fm);
+    const struct sd_set *s = c && c->n == 1 ? sd_tables(&c->m[0].u.sd) : NULL;
+    q->pk = (struct tpk){ s, 0, 30, 0x9e3779b97f4a7c15u };
+    q->cap = 8u << 20;
+    q->pt = malloc(q->cap);
+    return !s || !q->pt || tdec_init(&q->dec, s) ? -1 : 0;
+}
+
+static void sdp_free(struct sdp *q) {
+    tdec_free(&q->dec);
+    free(q->pt);
+    q->pt = NULL;
+}
+
+static size_t sdp_pull(struct sdp *q, int wait_ms) {
+    static unsigned char raw[1 << 16];
+    size_t got = 0;
+    for (;;) {
+        struct pollfd p = { .fd = q->fd, .events = POLLIN };
+        if (poll(&p, 1, got ? 0 : wait_ms) <= 0) break;
+        ssize_t r = recv(q->fd, raw, sizeof raw, MSG_DONTWAIT);
+        if (r <= 0 || q->n + (size_t)r > q->cap) break;
+        got += (size_t)r;
+        q->n += tdec_run(&q->dec, raw, (size_t)r, q->pt + q->n);
+    }
+    return got;
+}
+
+static void sdp_frame(struct sdp *q, unsigned type, unsigned flags, uint32_t sid, const void *body, uint32_t len) {
+    unsigned char f[9 + 64], w[2 * sizeof f + 8];
+    size_t n = frame(f, len, type, flags, sid, body);
+    wr_all(q->fd, w, tpk_pack(&q->pk, f, n, w));
+}
+
+static void sdp_open_windows(struct sdp *q) {
+    unsigned char s[6] = { 0, 4, 0x7f, 0xff, 0xff, 0xff };
+    unsigned char u[4] = { 0x7f, 0xff, 0x00, 0x00 };
+    sdp_frame(q, FR_SETTINGS, 0, 0, s, 6);
+    sdp_frame(q, FR_WINDOW_UPDATE, 0, 0, u, 4);
+}
+
+struct sdsum { size_t bytes[8]; int end[8], frames, bad; };
+
+static void sdp_sum(const struct sdp *q, const uint32_t *sid, int ns, struct sdsum *o) {
+    static struct fv f[65536];
+    memset(o, 0, sizeof *o);
+    int k = parse(q->pt, q->n, f, 65536);
+    for (int j = 0; j < k; j++) {
+        if (f[j].type != FR_DATA) continue;
+        for (int i = 0; i < ns; i++) {
+            if (f[j].sid != sid[i]) continue;
+            if (o->bytes[i] + f[j].len > sizeof g_big || memcmp(f[j].p, g_big + o->bytes[i], f[j].len)) o->bad = 1;
+            o->bytes[i] += f[j].len;
+            if (f[j].flags & FLAG_END_STREAM) o->end[i] = 1;
+            o->frames++;
+        }
+    }
+}
+
+static int open_sd(struct pl *p, struct sdp *q, int shared, const char *fm, uint64_t now) {
+    p->x = NULL;
+    p->pfd = -1;
+    q->pt = NULL;
+    int l = listen_lo(4096);
+    if (l < 0) return -1;
+    struct tr_node n = plain_node(g_port);
+    n.fm = fm;
+    p->x = xconn_new(&n, 0, shared);
+    int rc = p->x ? xconn_dial(p->x, 3) : -1;
+    p->pfd = rc ? -1 : accept(l, NULL, NULL);
+    close(l);
+    if (rc || p->pfd < 0 || sdp_init(q, p->pfd, fm)) return -1;
+    sdp_pull(q, 30);
+    return shared ? xconn_adopt(p->x, now) : 0;
+}
+
+static void sd_close(struct pl *p, struct sdp *q) {
+    close_plain(p);
+    sdp_free(q);
+}
+
+static long sd_queue(const struct xconn *x) {
+    return x->shared ? (long)xc_queued() + (long)(xc_pend_limit() - xc_pend_free()) : (long)x->q_pay;
+}
+
+static void window_once(int shared, const char *fm, long g, long pad, int ns) {
+    char nm[64], what[160];
+    snprintf(nm, sizeof nm, "sd window %s g=%ld x%d", shared ? "shared" : "private", g, ns);
+    struct pl p;
+    struct sdp q;
+    int ok = open_sd(&p, &q, shared, fm, 0) == 0;
+    snprintf(what, sizeof what, "%s: dial", nm);
+    check(what, 1, ok);
+    if (!ok) {
+        sd_close(&p, &q);
+        return;
+    }
+    small_sndbuf(p.x);
+    sdp_open_windows(&q);
+    io_in(p.x, 0);
+    xconn_flush(p.x);
+    sdp_pull(&q, 10);
+    struct xs s[20];
+    for (int i = 0; i < ns; i++) xs_open(p.x, &RQ_POST, (uint16_t)(1 + i), &s[i]);
+    xconn_flush(p.x);
+    sdp_pull(&q, 10);
+    for (int i = 0; i < 400 && !p.x->out.head; i++) {
+        xs_send(&s[0], g_big, 4096, 0);
+        xconn_flush(p.x);
+    }
+    for (int i = 0; i < ns; i++) xs_send(&s[i], g_big, 1, 0);
+    xconn_flush(p.x);
+    snprintf(what, sizeof what, "%s: the socket is full", nm);
+    check(what, 1, p.x->out.head != NULL && sd_queue(p.x) < XC_OUT_HIGH / 2);
+    long q0 = sd_queue(p.x), r[20], each = (XC_OUT_HIGH - q0) / g / ns, sum = 0;
+    int same = 1;
+    for (int i = 0; i < ns; i++) {
+        r[i] = xs_room(&s[i]);
+        same &= r[i] == each;
+        sum += r[i];
+    }
+    snprintf(what, sizeof what, "%s: each room is (H - q) / g / %d", nm, ns);
+    check(what, 1, same);
+    int rc = 0;
+    long sends = 0;
+    for (int i = 0; i < ns; i++)
+        for (long off = 0; off < r[i]; off += XC_MSS) {
+            long k = r[i] - off < XC_MSS ? r[i] - off : XC_MSS;
+            rc |= xs_send(&s[i], g_big, (size_t)k, 0);
+            xconn_flush(p.x);
+            sends++;
+        }
+    snprintf(what, sizeof what, "%s: %ld B in %ld sends, no TR_EIO", nm, sum, sends);
+    check(what, 1, rc == 0 && p.x->state == XC_LIVE);
+    long bound = XC_OUT_HIGH + sends * (g * (9 + SD_REC_OVER) + pad + SD_PIECE_COST);
+    snprintf(what, sizeof what, "%s: queue %ld, wire %ld <= %ld", nm, (long)p.x->q_pay, (long)p.x->out.n, bound);
+    check(what, 1, (long)p.x->q_pay <= bound && (long)p.x->out.n <= bound);
+    int zero = 1;
+    for (int i = 0; i < ns; i++) zero &= xs_room(&s[i]) == 0;
+    snprintf(what, sizeof what, "%s: then no room", nm);
+    check(what, 1, zero);
+    sd_close(&p, &q);
+}
+
+static void t_sd_xconn_window_once(void) {
+    /* catches: q_free not divided by the growth, or the XC_MSS floor kept */
+    window_once(0, SD_C0, 4, 0, 1);
+    window_once(0, SD_C100, 9, 1, 1);
+    window_once(1, SD_C0, 4, 0, 1);
+    window_once(1, SD_C100, 9, 1, 1);
+    window_once(1, SD_C100, 9, 1, 20);
+}
+
+static int sd_fill_pend(struct pl *p, struct sdp *q, struct xs *s, size_t *sent, int ns) {
+    uint64_t end = mono_us() + 5000000;
+    while (mono_us() < end) {
+        int any = 0;
+        for (int i = 0; i < ns; i++) {
+            long r = xs_room(&s[i]);
+            if (r < 1024) continue;
+            if (xs_send(&s[i], g_big + sent[i], (size_t)r, 0)) return -1;
+            sent[i] += (size_t)r;
+            any = 1;
+        }
+        xconn_flush(p->x);
+        sdp_pull(q, 2);
+        if (!any && !xc_queued() && !p->x->out.head) break;
+    }
+    for (int i = 0; i < ns; i++)
+        if (xs_send(&s[i], NULL, 0, 1)) return -1;
+    return 0;
+}
+
+static void t_sd_pend_flush_gate(void) {
+    /* catches: pend_flush sending past the queue, a re-flush that waits for an inbound frame, one xconn's pend left when another drains, or a kick walking on every flush */
+    struct pl p;
+    struct sdp q;
+    int ok = open_sd(&p, &q, 1, SD_C100, 0) == 0;
+    check("sd pend gate: dial", 1, ok);
+    if (!ok) {
+        sd_close(&p, &q);
+        return;
+    }
+    small_sndbuf(p.x);
+    struct xs s[5];
+    uint32_t sid[5];
+    size_t sent[5] = { 0 };
+    for (int i = 0; i < 4; i++) {
+        xs_open(p.x, &RQ_POST, (uint16_t)(1 + i), &s[i]);
+        sid[i] = s[i].sid;
+    }
+    xconn_flush(p.x);
+    sdp_pull(&q, 10);
+    check("sd pend gate: four uploads fill their pend", 0, sd_fill_pend(&p, &q, s, sent, 4));
+    long pend = (long)(xc_pend_limit() - xc_pend_free());
+    check("sd pend gate: over 1 MiB / 9 held, the queue empty", 1,
+          pend > 4 * XC_OUT_HIGH / 9 && !xc_queued() && !p.x->out.head);
+    g_grow_calls = 0;
+    for (int i = 0; i < 1000; i++) xconn_flush(p.x);
+    check("sd pend gate: 1,000 flushes with nothing completing run no pend flush", 0, g_grow_calls);
+    struct sdsum a;
+    sdp_sum(&q, sid, 4, &a);
+    int f0 = a.frames;
+    sdp_open_windows(&q);
+    int rc = io_in(p.x, 0);
+    long qmax = (long)p.x->q_pay, wmax = (long)p.x->out.n;
+    for (int i = 0; i < 20; i++) {
+        rc |= xconn_flush(p.x);
+        if ((long)p.x->q_pay > qmax) qmax = (long)p.x->q_pay;
+        if ((long)p.x->out.n > wmax) wmax = (long)p.x->out.n;
+    }
+    check("sd pend gate: the window opens, no TR_EIO", 1, rc == 0 && p.x->state == XC_LIVE);
+    check("sd pend gate: the queue under the 1 MiB cap", 1, qmax < 4 * XC_OUT_HIGH && wmax < 4 * XC_OUT_HIGH);
+    uint64_t t0 = mono_us();
+    int done = 0;
+    while (!done && mono_us() < t0 + 1000000) {
+        sdp_pull(&q, 2);
+        xconn_io(p.x, EPOLLOUT, 0);
+        if ((long)p.x->q_pay > qmax) qmax = (long)p.x->q_pay;
+        if ((long)p.x->out.n > wmax) wmax = (long)p.x->out.n;
+        sdp_sum(&q, sid, 4, &a);
+        done = !a.bad;
+        for (int i = 0; i < 4; i++) done &= a.bytes[i] == sent[i] && a.end[i];
+    }
+    check("sd pend gate: every byte and end of stream in 1 s, no frame from the peer", 1, done);
+    long bound = XC_OUT_HIGH + (long)(a.frames - f0) * (9 * (9 + SD_REC_OVER) + 1 + SD_PIECE_COST);
+    char what[128];
+    snprintf(what, sizeof what, "sd pend gate: queue %ld, wire %ld <= %ld", qmax, wmax, bound);
+    check(what, 1, qmax <= bound && wmax <= bound);
+    xs_open(p.x, &RQ_POST, 5, &s[4]);
+    sid[4] = s[4].sid;
+    long kicks = 0;
+    size_t more = 0;
+    for (int i = 0; i < 64; i++) {
+        long r = xs_room(&s[4]);
+        if (r > 16384) r = 16384;
+        if (r > 0 && !xs_send(&s[4], g_big + more, (size_t)r, 0)) more += (size_t)r;
+        long b = g_grow_calls;
+        xconn_flush(p.x);
+        kicks += g_grow_calls - b;
+        sdp_pull(&q, 2);
+    }
+    sdp_sum(&q, sid + 4, 1, &a);
+    check("sd pend gate: chunks complete with nothing held", 1,
+          a.bytes[0] > 0 && !a.bad && xc_pend_free() == xc_pend_limit());
+    check("sd pend gate: and no pend flush runs", 0, kicks);
+    sd_close(&p, &q);
+
+    struct pl A, B;
+    struct sdp qb;
+    ok = open_plain(&A, 1, 0, 4096, 0) == 0 && open_sd(&B, &qb, 1, SD_C100, 0) == 0;
+    check("sd pend gate two: dial", 1, ok);
+    if (!ok) {
+        close_plain(&A);
+        sd_close(&B, &qb);
+        return;
+    }
+    small_sndbuf(A.x);
+    small_sndbuf(B.x);
+    fill_windows(&A);
+    struct xs sb[2], sa;
+    uint32_t bsid[2];
+    size_t bsent[2] = { 0 };
+    for (int i = 0; i < 2; i++) {
+        xs_open(B.x, &RQ_POST, (uint16_t)(11 + i), &sb[i]);
+        bsid[i] = sb[i].sid;
+    }
+    xconn_flush(B.x);
+    sdp_pull(&qb, 10);
+    check("sd pend gate two: the second xconn fills its pend", 0, sd_fill_pend(&B, &qb, sb, bsent, 2));
+    xs_open(A.x, &RQ_POST, 10, &sa);
+    for (int i = 0; i < 40 && xc_queued() < XC_OUT_HIGH + 65536; i++) {
+        xs_send(&sa, g_big, 65536, 0);
+        xconn_flush(A.x);
+    }
+    check("sd pend gate two: the first fills the thread's queue", 1, xc_queued() >= XC_OUT_HIGH);
+    sdp_open_windows(&qb);
+    io_in(B.x, 0);
+    xconn_io(B.x, EPOLLOUT, 0);
+    sdp_pull(&qb, 5);
+    check("sd pend gate two: the second holds its pend, its queue empty", 1,
+          B.x->pend_n > 0 && !xconn_wants_out(B.x) && xc_queued() >= XC_OUT_HIGH);
+    struct sdsum b;
+    uint64_t t1 = mono_us();
+    done = 0;
+    while (!done && mono_us() < t1 + 1000000) {
+        peer_drain(A.pfd, g_pb, sizeof g_pb, 1);
+        xconn_io(A.x, EPOLLOUT, 0);
+        sdp_pull(&qb, 1);
+        if (xconn_wants_out(B.x)) xconn_io(B.x, EPOLLOUT, 0);
+        sdp_sum(&qb, bsid, 2, &b);
+        done = !b.bad && b.bytes[0] == bsent[0] && b.bytes[1] == bsent[1] && b.end[0] && b.end[1];
+    }
+    check("sd pend gate two: the second's pend arrives in 1 s, no frame from either peer", 1, done);
+    close_plain(&A);
+    sd_close(&B, &qb);
+}
+
+static void pend_kick_end(int how) {
+    struct pl A, B;
+    struct sdp qb;
+    int ok = open_plain(&A, 1, 0, 4096, 0) == 0 && open_sd(&B, &qb, 1, SD_C100, 0) == 0;
+    check("sd pend fail: dial", 1, ok);
+    if (!ok) {
+        close_plain(&A);
+        sd_close(&B, &qb);
+        return;
+    }
+    small_sndbuf(A.x);
+    small_sndbuf(B.x);
+    fill_windows(&A);
+    struct xs sb[2], sa;
+    uint32_t bsid[2];
+    size_t bsent[2] = { 0 };
+    for (int i = 0; i < 2; i++) {
+        xs_open(B.x, &RQ_POST, (uint16_t)(21 + i), &sb[i]);
+        bsid[i] = sb[i].sid;
+    }
+    xconn_flush(B.x);
+    sdp_pull(&qb, 10);
+    check("sd pend fail: the second xconn fills its pend", 0, sd_fill_pend(&B, &qb, sb, bsent, 2));
+    xs_open(A.x, &RQ_POST, 20, &sa);
+    for (int i = 0; i < 40 && xc_queued() < XC_OUT_HIGH + 65536; i++) {
+        xs_send(&sa, g_big, 65536, 0);
+        xconn_flush(A.x);
+    }
+    check("sd pend fail: the first fills the thread's queue", 1, xc_queued() >= XC_OUT_HIGH);
+    sdp_open_windows(&qb);
+    io_in(B.x, 0);
+    xconn_io(B.x, EPOLLOUT, 0);
+    sdp_pull(&qb, 5);
+    check("sd pend fail: the second holds its pend, its queue empty", 1,
+          B.x->pend_n > 0 && !xconn_wants_out(B.x) && xc_queued() >= XC_OUT_HIGH);
+    if (how) {
+        xconn_free(A.x);
+        A.x = NULL;
+    } else {
+        xconn_fail(A.x, TR_EIO);
+    }
+    check(how ? "sd pend fail: the free stages the second's pend" : "sd pend fail: the failure stages the second's pend", 1,
+          xconn_wants_out(B.x));
+    struct sdsum b;
+    uint64_t t1 = mono_us();
+    int done = 0;
+    while (!done && mono_us() < t1 + 1000000) {
+        sdp_pull(&qb, 1);
+        if (xconn_wants_out(B.x)) xconn_io(B.x, EPOLLOUT, 0);
+        sdp_sum(&qb, bsid, 2, &b);
+        done = !b.bad && b.bytes[0] == bsent[0] && b.bytes[1] == bsent[1] && b.end[0] && b.end[1];
+    }
+    check("sd pend fail: the second's pend arrives in 1 s, nothing else completing", 1, done);
+    close_plain(&A);
+    sd_close(&B, &qb);
+}
+
+static void t_sd_pend_kick_on_fail(void) {
+    /* catches: a gated pend left held when the xconn that filled the queue fails or is freed instead of draining */
+    pend_kick_end(0);
+    pend_kick_end(1);
+}
+
+static void t_private_send_delivers_wakes(void) {
+    /* catches: wakes queued by a private send's flush left until the next xconn_io */
+    struct pl P, B;
+    int ok = open_plain(&P, 0, 0, 1 << 20, 0) == 0 && open_plain(&B, 1, 0, 1 << 20, 0) == 0;
+    check("private wakes: dial", 1, ok);
+    if (!ok) {
+        close_plain(&P);
+        close_plain(&B);
+        return;
+    }
+    fill_windows(&P);
+    fill_windows(&B);
+    struct xs sb, sq;
+    xs_open(B.x, &RQ_POST, 31, &sb);
+    xconn_flush(B.x);
+    peer_drain(B.pfd, g_pb, sizeof g_pb, 10);
+    int32_t win = B.x->h2.send_win_conn;
+    for (int round = 0; round < 2; round++) {
+        B.x->h2.send_win_conn = 0;
+        int rc = xs_send(&sb, g_big, 4096, 0);
+        B.x->st[sb.slot].starved = 1;
+        B.x->h2.send_win_conn = win;
+        check(round ? "private wakes: send: pend held, queue empty" : "private wakes: open: pend held, queue empty", 1,
+              rc == 0 && B.x->pend_n == 4096 && !xc_queued());
+        g_wk_n = 0;
+        if (round) rc = xs_send(&sq, g_big, 100, 0);
+        else rc = xs_open(P.x, &RQ_POST, 30, &sq);
+        check(round ? "private wakes: the private send flushes the pend" : "private wakes: the private open flushes the pend",
+              1, rc == 0 && B.x->pend_n == 0);
+        check(round ? "private wakes: B woken by the private send" : "private wakes: B woken by the private open", 1,
+              wakes(31, XW_ROOM));
+        peer_drain(B.pfd, g_pb, sizeof g_pb, 10);
+        peer_drain(P.pfd, g_pb, sizeof g_pb, 10);
+    }
+    close_plain(&P);
+    close_plain(&B);
+}
+
+static void t_sd_window_floor(void) {
+    /* catches: the XC_MSS floor dropped when the connection window, not the queue, limits a growing link */
+    struct pl p;
+    struct sdp q;
+    int ok = open_sd(&p, &q, 0, SD_C100, 0) == 0;
+    check("sd window floor: dial", 1, ok);
+    if (!ok) {
+        sd_close(&p, &q);
+        return;
+    }
+    struct xs u;
+    xs_open(p.x, &RQ_POST, 1, &u);
+    xconn_flush(p.x);
+    sdp_pull(&q, 10);
+    p.x->h2.send_win_conn = 1000;
+    long w = h2m_room(&p.x->h2, p.x->st[u.slot].h2slot);
+    check("sd window floor: empty queue, stream window open, connection window 1,000", 1,
+          !p.x->q_pay && !p.x->out.head && w == 1000);
+    check("sd window floor: the room is min(XC_MSS, w)", w < XC_MSS ? w : XC_MSS, xs_room(&u));
+    sd_close(&p, &q);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -4537,6 +5028,8 @@ int main(void) {
     t_stall_holder_fills_late();
     t_fm_x55_xconn_plain();
     t_fm_x55_xconn_tls();
+    t_fm_sd_xconn_plain();
+    t_fm_sd_xconn_tls();
     t_ccs_fin_one_write();
     t_frag_ccs_count();
     t_xconn_gap();
@@ -4545,6 +5038,11 @@ int main(void) {
     t_xconn_gap_shared();
     t_transport_due();
     t_xconn_piece_cost();
+    t_sd_xconn_window_once();
+    t_sd_pend_flush_gate();
+    t_sd_pend_kick_on_fail();
+    t_private_send_delivers_wakes();
+    t_sd_window_floor();
     t_handshake_no_memory();
     t_xconn_adopt_no_scratch();
     t_xconn_seal_no_scratch();

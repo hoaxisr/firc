@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -10,9 +11,17 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
+#include <linux/sockios.h>
 #include <sys/socket.h>
 #include "fmlink.h"
 #include "transport.h"
+#include "sdpeer.h"
+
+enum { FMR_SD_PLAIN, FMR_SD_PAD, FMR_SD_DRIP };
+
+static const struct sd_set *g_fmr_sd;
+static int g_fmr_mode;
+static int g_fmr_slow;
 
 struct fmrelay {
     int fd[2], lfd;
@@ -21,6 +30,8 @@ struct fmrelay {
     long n[2];
     int on;
     pthread_t th;
+    const struct sd_set *sd;
+    int sd_mode, sd_go, sd_padded, slow;
 };
 
 static uint64_t fmr_ms(void) {
@@ -40,10 +51,52 @@ static int fmr_put(int fd, const unsigned char *b, size_t n) {
     return 0;
 }
 
+static unsigned char fmr_pad(const struct sd_set *s) {
+    for (size_t i = 0; i < s->lay[0].pool_n; i++)
+        if (s->lay[0].pool[i] != s->lay[0].marker) return s->lay[0].pool[i];
+    return 0;
+}
+
+static int fmr_drained(int fd, uint64_t dl) {
+    for (;;) {
+        int q = 0;
+        if (ioctl(fd, SIOCOUTQ, &q)) return -1;
+        if (!q) return 0;
+        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) return 0;
+        if (fmr_ms() >= dl) return -1;
+        sched_yield();
+    }
+}
+
+static int fmr_sd_put(struct fmrelay *r, int fd, const unsigned char *w, size_t n, uint64_t dl) {
+    unsigned char pad = fmr_pad(r->sd);
+    int m = __atomic_load_n(&r->sd_mode, __ATOMIC_SEQ_CST);
+    if (m == FMR_SD_PAD) {
+        __atomic_store_n(&r->sd_mode, FMR_SD_PLAIN, __ATOMIC_SEQ_CST);
+        if (fmr_put(fd, &pad, 1)) return -1;
+        __atomic_store_n(&r->sd_padded, 1, __ATOMIC_SEQ_CST);
+        while (!__atomic_load_n(&r->sd_go, __ATOMIC_SEQ_CST) && fmr_ms() < dl) poll(NULL, 0, 1);
+        return fmr_put(fd, w, n);
+    }
+    if (m != FMR_SD_DRIP) return fmr_put(fd, w, n);
+    for (size_t i = 0; i < n; i++)
+        if (fmr_put(fd, w + i, 1) || fmr_drained(fd, dl) || fmr_put(fd, &pad, 1) || fmr_drained(fd, dl)) return -1;
+    return 0;
+}
+
 static void fmr_loop(struct fmrelay *r) {
     int open[2] = { 1, 1 };
     uint64_t dl = fmr_ms() + 20000;
     static __thread unsigned char b[65536];
+    struct tdec dec;
+    memset(&dec, 0, sizeof dec);
+    struct tpk pk = { r->sd, 0, 0, 1 };
+    unsigned char *w = NULL;
+    if (r->sd && (tdec_init(&dec, r->sd) || !(w = malloc(2 * sizeof b + 16)))) {
+        tdec_free(&dec);
+        open[0] = open[1] = 0;
+    }
     while ((open[0] || open[1]) && fmr_ms() < dl) {
         struct pollfd p[2];
         for (int i = 0; i < 2; i++) {
@@ -54,21 +107,37 @@ static void fmr_loop(struct fmrelay *r) {
         if (poll(p, 2, 100) <= 0) continue;
         for (int i = 0; i < 2; i++) {
             if (!open[i] || !(p[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            ssize_t got = recv(r->fd[i], b, sizeof b, 0);
+            ssize_t got = recv(r->fd[i], b, r->slow && !i ? 4096 : sizeof b, 0);
             if (got <= 0) {
                 open[i] = 0;
                 shutdown(r->fd[1 - i], SHUT_WR);
                 continue;
             }
-            if (!__atomic_load_n(&r->off[i], __ATOMIC_SEQ_CST))
-                for (ssize_t k = 0; k < got; k++) b[k] ^= 0x55;
+            int bad;
             __atomic_add_fetch(&r->n[i], (long)got, __ATOMIC_SEQ_CST);
-            if (fmr_put(r->fd[1 - i], b, (size_t)got)) {
+            if (r->sd && !i) {
+                size_t k = tdec_run(&dec, b, (size_t)got, w);
+                bad = dec.bad || fmr_put(r->fd[1], w, k);
+            } else if (r->sd) {
+                bad = fmr_sd_put(r, r->fd[0], w, tpk_pack(&pk, b, (size_t)got, w), dl);
+            } else {
+                if (!__atomic_load_n(&r->off[i], __ATOMIC_SEQ_CST))
+                    for (ssize_t k = 0; k < got; k++) b[k] ^= 0x55;
+                bad = fmr_put(r->fd[1 - i], b, (size_t)got);
+            }
+            if (bad) {
                 open[i] = 0;
                 shutdown(r->fd[i], SHUT_RD);
             }
+            if (r->sd && !i && dec.bad) {
+                shutdown(r->fd[0], SHUT_WR);
+                shutdown(r->fd[1], SHUT_WR);
+            }
+            if (r->slow && !i) poll(NULL, 0, 1);
         }
     }
+    if (r->sd) tdec_free(&dec);
+    free(w);
     close(r->fd[0]);
     close(r->fd[1]);
 }
@@ -103,6 +172,9 @@ static int fmrelay_wrap(struct fmrelay *r, int server_fd) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, q)) return -1;
     r->fd[0] = q[1];
     r->fd[1] = server_fd;
+    r->sd = g_fmr_sd;
+    r->sd_mode = g_fmr_mode;
+    r->slow = g_fmr_slow;
     if (pthread_create(&r->th, NULL, fmr_run, r)) {
         close(q[0]);
         close(q[1]);
@@ -116,9 +188,27 @@ static int fmrelay_listen(struct fmrelay *r, int lfd, uint16_t to_port) {
     memset(r, 0, sizeof *r);
     r->lfd = lfd;
     r->to = to_port;
+    r->sd = g_fmr_sd;
+    r->sd_mode = g_fmr_mode;
+    r->slow = g_fmr_slow;
     if (pthread_create(&r->th, NULL, fmr_listen_run, r)) return -1;
     r->on = 1;
     return 0;
+}
+
+static const struct sd_set *fmr_sd_of(const char *json) {
+    const struct fm_cfg *cf = fm_cfg_get(json);
+    return cf && cf->n == 1 && cf->m[0].kind == FM_SUDOKU ? sd_tables(&cf->m[0].u.sd) : NULL;
+}
+
+static void fmrelay_sd(struct fmrelay *r, int mode) {
+    __atomic_store_n(&r->sd_go, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&r->sd_padded, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&r->sd_mode, mode, __ATOMIC_SEQ_CST);
+}
+
+static void fmrelay_go(struct fmrelay *r) {
+    __atomic_store_n(&r->sd_go, 1, __ATOMIC_SEQ_CST);
 }
 
 static void fmrelay_off(struct fmrelay *r, int dir) {

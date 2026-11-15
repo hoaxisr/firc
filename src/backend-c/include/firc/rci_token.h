@@ -1,6 +1,7 @@
 #ifndef FIRC_RCI_TOKEN_H
 #define FIRC_RCI_TOKEN_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -31,12 +32,13 @@ void firc_kn_token_setup(const char *path, const char *ndmc);
 /* Turns the token on for a release firc_kn_token_release_ok accepts; any other leaves it as it is. */
 void firc_kn_token_set_release(const char *release);
 
-/* The token to send now (read from the file once, else issued at most once a minute); empty when off or none. */
-void firc_kn_token_current(char out[FIRC_KN_TOKEN_MAX]);
+/* The token to send now (read from the file once, else issued at most once a minute); empty when off or none.
+   False, with out empty, when stop (NULL for none) ended the wait or the issue; an ended issue counts as failed. */
+bool firc_kn_token_current(char out[FIRC_KN_TOKEN_MAX], const atomic_bool *stop);
 
 /* After the router refused stale as a token: turns the token on, then gives one issued since, or a fresh one at
-   most once a minute, else empty. */
-void firc_kn_token_refused(const char *stale, char out[FIRC_KN_TOKEN_MAX]);
+   most once a minute, else empty. False when stop ended it, as for firc_kn_token_current. */
+bool firc_kn_token_refused(const char *stale, char out[FIRC_KN_TOKEN_MAX], const atomic_bool *stop);
 
 /* True when a 401/403's X-Detail names a refused or missing token. */
 bool firc_kn_token_refusal(long status, const char *detail);

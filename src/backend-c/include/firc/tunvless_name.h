@@ -3,9 +3,12 @@
 
 #include <stdbool.h>
 
-bool firc_tunvless_prefixed(const char *name);
+#define FIRC_OPKGTUN_MAX 16
 
-/* N of a canonical tunvless<N> or opkgtun<N> (N 0..99, no leading zero), else -1; NULL is -1. */
-int firc_tunvless_index(const char *name);
+/* True when name starts with opkgtun; NULL is false. */
+bool firc_tundev_is_opkg(const char *name);
+
+/* N of a canonical tunvless<N> (N 0..99) or opkgtun<N> (N 0..FIRC_OPKGTUN_MAX), no leading zero, else -1. */
+int firc_tundev_name_index(const char *name);
 
 #endif

@@ -1,0 +1,60 @@
+[
+  {
+    "interface": {
+      "description": {
+        "status": [
+          {
+            "status": "message",
+            "code": "72155140",
+            "ident": "Network::Interface::Base",
+            "message": "\"OpkgTun9\": description saved."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "interface": {
+      "security-level": {
+        "status": [
+          {
+            "status": "message",
+            "code": "72746460",
+            "ident": "Network::Interface::L3Base",
+            "message": "\"OpkgTun9\": security level set to \"public\"."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "interface": {
+      "ip": {
+        "address": {
+          "status": [
+            {
+              "status": "message",
+              "code": "72220674",
+              "ident": "Network::Interface::Ip",
+              "message": "\"OpkgTun9\": IP address is 203.0.113.250/32."
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "interface": {
+      "up": {
+        "status": [
+          {
+            "status": "message",
+            "code": "72155286",
+            "ident": "Network::Interface::Base",
+            "message": "\"OpkgTun9\": interface is up."
+          }
+        ]
+      }
+    }
+  }
+]

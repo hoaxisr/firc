@@ -24,6 +24,7 @@ void firc_fake_ipt_fail_next_write(firc_fake_ipt_t *f, firc_err_t err);
 void firc_fake_ipt_fail_at_commit(firc_fake_ipt_t *f, size_t n, firc_err_t err);
 bool firc_fake_ipt_failure_armed(firc_fake_ipt_t *f);
 void firc_fake_ipt_refuse_rules_containing(firc_fake_ipt_t *f, const char *substr);
+void firc_fake_ipt_refuse_also_containing(firc_fake_ipt_t *f, const char *substr);
 const char *firc_fake_ipt_writes_log(firc_fake_ipt_t *f);
 const char *firc_fake_ipt_reads_log(firc_fake_ipt_t *f);
 size_t firc_fake_ipt_writes(firc_fake_ipt_t *f);

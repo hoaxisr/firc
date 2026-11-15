@@ -103,6 +103,7 @@ typedef enum firc_xt_ext {
     FIRC_XT_EXT_REDIRECT = 1u << 17,
     FIRC_XT_EXT_ADDRTYPE = 1u << 18,
     FIRC_XT_EXT_SET = 1u << 19,
+    FIRC_XT_EXT_TCPMSS = 1u << 20,
 } firc_xt_ext_t;
 
 #define FIRC_XT_EXT_V4_ONLY (FIRC_XT_EXT_REDIRECT | FIRC_XT_EXT_ADDRTYPE)

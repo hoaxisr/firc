@@ -108,6 +108,20 @@ TEST an_off_tunnel_starts_over_without_a_word(void) {
     PASS();
 }
 
+/* Catches: a tunnel held for its router interface worded as a node failure. */
+TEST a_router_interface_not_ready_is_said_as_such(void) {
+    quiet(true);
+    firc_tunwatch_t w = {0};
+    firc_tunwatch_see(&w, "opkgtun3", FIRC_TUN_ST_ROUTER, 0);
+    firc_tunwatch_see(&w, "opkgtun3", FIRC_TUN_ST_ROUTER, 5 * MIN);
+    firc_event_t ev[8];
+    size_t n = journal(ev, 8);
+    quiet(false);
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    ASSERT_STR_EQ("its router interface has not been ready for 5 min; groups on it fail closed", ev[0].u.log.text);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -116,5 +130,6 @@ int main(int argc, char **argv) {
     RUN_TEST(it_is_said_again_every_ten_minutes_while_it_lasts);
     RUN_TEST(a_working_node_ends_it_with_an_info);
     RUN_TEST(an_off_tunnel_starts_over_without_a_word);
+    RUN_TEST(a_router_interface_not_ready_is_said_as_such);
     GREATEST_MAIN_END();
 }

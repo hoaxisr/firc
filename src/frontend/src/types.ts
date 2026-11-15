@@ -244,7 +244,15 @@ export type TunnelStatus =
   | "backoff"
   | "bad_config"
   | "waiting"
-  | "uplink_down";
+  | "uplink_down"
+  | "router";
+
+export type TunnelRouter = {
+  name: string;
+  state: "pending" | "ready" | "failed" | "foreign";
+  saved: boolean;
+  error: string;
+};
 
 export type TunnelNodeState = {
   key: string;
@@ -290,6 +298,8 @@ export type TunnelState = {
   rxBps: number;
   txBps: number;
   inbounds: TunnelInboundState[];
+  why?: string;
+  router?: TunnelRouter;
 };
 
 export type TunnelPreviewRow = {

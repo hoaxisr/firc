@@ -109,6 +109,8 @@ static unsigned three_links(const char *name) {
     if (strcmp(name, "up0") == 0) { return 7; }
     if (strcmp(name, "up1") == 0) { return 8; }
     if (strcmp(name, "up2") == 0) { return 9; }
+    if (strcmp(name, "opkgtun3") == 0) { return 13; }
+    if (strcmp(name, "opkgtun10") == 0) { return 10; }
     if (name[0] == 'c' && name[1] >= 'a' && name[1] <= 'z' && name[2] == '\0') { return 20u + (unsigned)(name[1] - 'a'); }
     return 0;
 }
@@ -461,18 +463,71 @@ TEST an_ndm_event_on_a_tunnel_entry_asks_nothing(void) {
 }
 
 
-TEST a_tunnel_removed_from_the_config_is_dead_and_the_group_moves(void) {
+/* Catches: a removed tunnel's device kept as a tunnel entry, so with its link up it reads alive and is never checked. */
+TEST a_tunnel_removed_from_the_config_is_checked_by_http(void) {
+    firc_ifwatch_t *w = tunnel_first_both_alive();
+    ASSERT_EQ_FMT((size_t)0, times_queued("tunvless0"), "%zu");
+    g_tunnel = NULL;
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)1, times_queued("tunvless0"), "%zu");
+    firc_if_view_t v;
+    ASSERT(firc_ifwatch_view(w, "tunvless0", &v));
+    ASSERT_EQ(FIRC_IF_UNKNOWN, v.state);
+    result(w, "tunvless0", true, false);
+    ASSERT(firc_ifwatch_view(w, "tunvless0", &v));
+    ASSERT_EQ(FIRC_IF_ALIVE, v.state);
+    done(w);
+    PASS();
+}
+
+/* Catches: a removed tunnel's missing device not taken as dead, so its group stays on it. */
+TEST a_tunnel_removed_with_its_device_is_dead_and_the_group_moves(void) {
     firc_ifwatch_t *w = tunnel_first_both_alive();
     ASSERT_EQ_FMT((size_t)0, g_n_moves, "%zu");
     g_tunnel = NULL;
+    g_down = "tunvless0";
     firc_ifwatch_tick(w);
     ASSERT(last_move_is(1, false));
     firc_if_view_t v;
     ASSERT(firc_ifwatch_view(w, "tunvless0", &v));
     ASSERT_EQ(FIRC_IF_DEAD, v.state);
-    ASSERT_STR_EQ("no configured tunnel uses this device", v.error);
+    done(w);
+    PASS();
+}
+
+/* Catches: an entry taken for a tunnel by its opkgtun or tunvless name, so another program's device is never checked. */
+TEST a_foreign_opkgtun_entry_is_checked_by_http(void) {
+    firc_ifwatch_t *w = fresh();
+    static const char *const T[] = {"opkgtun10", "up1"};
+    g_tunnel = "tunvless10";
+    g_groups[g_n++] = grp(1, T, 2);
     firc_ifwatch_tick(w);
-    ASSERT_EQ_FMTm("never checked by HTTP", (size_t)0, times_queued("tunvless0"), "%zu");
+    ASSERT_EQ_FMT((size_t)1, times_queued("opkgtun10"), "%zu");
+    result(w, "opkgtun10", true, false);
+    firc_if_view_t v;
+    ASSERT(firc_ifwatch_view(w, "opkgtun10", &v));
+    ASSERT_EQ(FIRC_IF_ALIVE, v.state);
+    done(w);
+    PASS();
+}
+
+/* Catches: the tunnel flag read once when the entry is added, so a device configured later is still checked by HTTP. */
+TEST a_name_that_becomes_a_tunnel_follows_it(void) {
+    firc_ifwatch_t *w = fresh();
+    static const char *const T[] = {"opkgtun3", "up1"};
+    g_groups[g_n++] = grp(1, T, 2);
+    firc_ifwatch_tick(w);
+    result(w, "opkgtun3", true, false);
+    result(w, "up1", true, false);
+    ASSERT_EQ_FMT((size_t)1, times_queued("opkgtun3"), "%zu");
+    ASSERT_EQ_FMT((size_t)0, g_n_moves, "%zu");
+    g_tunnel = "opkgtun3";
+    g_tunnel_is_down = true;
+    firc_ifwatch_tick(w);
+    ASSERT(last_move_is(1, false));
+    g_now += 120000;
+    firc_ifwatch_tick(w);
+    ASSERT_EQ_FMT((size_t)1, times_queued("opkgtun3"), "%zu");
     done(w);
     PASS();
 }
@@ -588,28 +643,30 @@ TEST a_starting_entry_never_unblocks_and_the_error_comes_at_5_min(void) {
     PASS();
 }
 
-TEST a_tunvless_name_with_no_tunnel_is_dead_from_the_start(void) {
+TEST a_missing_device_no_tunnel_names_is_dead_from_the_start(void) {
     firc_ifwatch_t *w = fresh();
     static const char *const T[] = {"tunvless3", "up1"};
+    g_down = "tunvless3";
     g_groups[g_n++] = grp(1, T, 2);
     firc_ifwatch_tick(w);
     ASSERT(last_move_is(1, false));
-    ASSERT_EQ_FMT((size_t)0, times_queued("tunvless3"), "%zu");
     done(w);
     PASS();
 }
 
-TEST only_tunvless_and_a_number_is_a_tunnel_entry(void) {
+/* Catches: a name taken for a tunnel entry by its stem, or a configured name matched by prefix rather than exactly. */
+TEST only_a_configured_name_is_a_tunnel_entry(void) {
     firc_ifwatch_t *w = fresh();
-    static const char *const A[] = {"tunvless1a", "tunvless05"};
-    static const char *const B[] = {"tunvless123", "tunvlessx"};
+    static const char *const A[] = {"tunvless0", "tunvless05"};
+    static const char *const B[] = {"tunvless01", "opkgtun3"};
+    g_tunnel = "tunvless0";
     g_groups[g_n++] = grp(1, A, 2);
     g_groups[g_n++] = grp(2, B, 2);
     firc_ifwatch_tick(w);
-    ASSERT_EQ_FMT((size_t)1, times_queued("tunvless1a"), "%zu");
+    ASSERT_EQ_FMT((size_t)0, times_queued("tunvless0"), "%zu");
     ASSERT_EQ_FMT((size_t)1, times_queued("tunvless05"), "%zu");
-    ASSERT_EQ_FMT((size_t)1, times_queued("tunvless123"), "%zu");
-    ASSERT_EQ_FMT((size_t)1, times_queued("tunvlessx"), "%zu");
+    ASSERT_EQ_FMT((size_t)1, times_queued("tunvless01"), "%zu");
+    ASSERT_EQ_FMT((size_t)1, times_queued("opkgtun3"), "%zu");
     done(w);
     PASS();
 }
@@ -769,6 +826,8 @@ TEST pick_puts_a_new_group_on_its_first_entry_that_is_not_dead(void) {
 TEST pick_knows_a_tunnel_entry_before_any_tick(void) {
     firc_ifwatch_t *w = fresh();
     static const char *const T[] = {"tunvless3", "up1"};
+    g_tunnel = "tunvless3";
+    g_tunnel_is_down = true;
     firc_group_t *g = grp(1, T, 2);
     firc_ifchoice_t c = firc_ifwatch_pick(w, g);
     ASSERT_EQ_FMT((size_t)1, c.active, "%zu");
@@ -967,14 +1026,17 @@ int main(int argc, char **argv) {
     RUN_TEST(an_ndm_event_never_holds_back_a_link_up);
     RUN_TEST(a_refresh_reads_the_link_and_finds_it_gone);
     RUN_TEST(a_tunnel_entry_follows_its_status_and_is_never_queued);
-    RUN_TEST(a_tunnel_removed_from_the_config_is_dead_and_the_group_moves);
+    RUN_TEST(a_tunnel_removed_from_the_config_is_checked_by_http);
+    RUN_TEST(a_tunnel_removed_with_its_device_is_dead_and_the_group_moves);
+    RUN_TEST(a_foreign_opkgtun_entry_is_checked_by_http);
+    RUN_TEST(a_name_that_becomes_a_tunnel_follows_it);
     RUN_TEST(a_starting_tunnel_keeps_its_group_for_30_s_then_dies);
     RUN_TEST(a_tunnel_up_within_30_s_keeps_its_group);
     RUN_TEST(a_restarting_tunnel_is_unknown_again);
     RUN_TEST(a_starting_tunnel_without_its_device_stays_unknown_then_dies);
     RUN_TEST(a_starting_entry_never_unblocks_and_the_error_comes_at_5_min);
-    RUN_TEST(a_tunvless_name_with_no_tunnel_is_dead_from_the_start);
-    RUN_TEST(only_tunvless_and_a_number_is_a_tunnel_entry);
+    RUN_TEST(a_missing_device_no_tunnel_names_is_dead_from_the_start);
+    RUN_TEST(only_a_configured_name_is_a_tunnel_entry);
     RUN_TEST(a_tunnel_entry_dies_with_its_link);
     RUN_TEST(a_failed_control_moves_nothing_and_says_the_check_fails);
     RUN_TEST(a_round_that_ran_no_control_does_not_blame_the_wan);

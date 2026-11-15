@@ -1,0 +1,24 @@
+[
+  {
+    "interface": {
+      "status": [
+        {
+          "status": "error",
+          "code": "72089750",
+          "ident": "Network::Interface::Factory::Base",
+          "message": "index 17 is too large for \"OpkgTun\" interface."
+        }
+      ],
+      "description": {
+        "status": [
+          {
+            "status": "error",
+            "code": "6553609",
+            "ident": "Network::Interface::Base",
+            "message": "unable to find OpkgTun17 in \"Network::Interface::Base\"."
+          }
+        ]
+      }
+    }
+  }
+]

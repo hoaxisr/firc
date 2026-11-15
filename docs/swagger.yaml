@@ -1883,7 +1883,9 @@ definitions:
         example: PRAW-1
         type: string
       device:
-        description: 'tunvless<N> or opkgtun<N>, N 0..99, N unique across both prefixes'
+        description: 'tunvless<N> with N 0..99, or opkgtun<N> with N 0..16 (the router''s limit for OpkgTun); N
+          unique across both prefixes. An opkgtun<N> tunnel runs on the router''s own OpkgTun<N> interface, which
+          firc creates, keeps and removes, saving the router''s configuration each time'
         example: tunvless0
         type: string
       enable:
@@ -2081,6 +2083,8 @@ definitions:
         items:
           $ref: '#/definitions/types.TunnelNodeState'
         type: array
+      router:
+        $ref: '#/definitions/types.TunnelRouter'
       rxBps:
         description: 'Bytes per second received on the device since the previous poll'
         example: 0
@@ -2090,7 +2094,8 @@ definitions:
         example: 1791300000
         type: integer
       status:
-        description: 'waiting: no nodes yet; uplink_down: its uplink could not be set up'
+        description: 'waiting: no nodes yet; uplink_down: its uplink could not be set up; router: its OpkgTun record
+          is not ready'
         enum:
         - "off"
         - starting
@@ -2100,6 +2105,7 @@ definitions:
         - bad_config
         - waiting
         - uplink_down
+        - router
         example: up
         type: string
       subscriptions:
@@ -2131,6 +2137,40 @@ definitions:
         description: 'The uplink route is in place (always true for auto)'
         example: true
         type: boolean
+      why:
+        description: 'starting or router only: what the tunnel waits for (waiting for the router; waiting for
+          OpkgTun<N> to be removed, with NDM''s error while the removal fails; NDM''s error for a failed record).
+          Empty otherwise'
+        example: ""
+        type: string
+    type: object
+  types.TunnelRouter:
+    description: 'Present only for an opkgtun<N> device: the router''s OpkgTun<N> record that firc keeps for it,
+      for a disabled tunnel too. firc saves the router''s configuration after it creates, changes or removes a
+      record, and that save also keeps any change made in the router and not yet saved there'
+    properties:
+      error:
+        description: 'NDM''s refusal or why the record could not be kept; empty while there is none'
+        example: ""
+        type: string
+      name:
+        example: OpkgTun2
+        type: string
+      saved:
+        description: 'Nothing firc wrote to this record waits for a router save. True also when firc has written
+          nothing: the record does not exist, or the router was never reached'
+        example: true
+        type: boolean
+      state:
+        description: 'pending: being created or checked; ready: in place; failed: refused or unreachable, retried;
+          foreign: the name or the device belongs to something else'
+        enum:
+        - pending
+        - ready
+        - failed
+        - foreign
+        example: ready
+        type: string
     type: object
   types.TunnelStatesRes:
     properties:

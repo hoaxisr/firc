@@ -15,6 +15,49 @@ static bool unlink_quiet(const char *path, firc_err_t *first) {
     return false;
 }
 
+firc_err_t firc_purge_router(const firc_opkgtun_io_t *io, firc_err_t (*revoke)(void *), void *ud) {
+    firc_err_t err = FIRC_OK;
+    if (io != NULL) {
+        size_t removed = 0;
+        bool unsaved = false;
+        err = firc_opkgtun_sweep(io, NULL, 0, &removed, &unsaved);
+        if (unsaved) {
+            FIRC_WARN("purge: firc's OpkgTun records were removed but not saved; they come back after a reboot with "
+                      "no firc to own them; save the router's configuration, or delete them again after the reboot");
+        }
+        if (err != FIRC_OK && err != FIRC_ERR_STATE) {
+            FIRC_WARN("purge: firc's OpkgTun records may remain; delete OpkgTun<N> in the router (%s)",
+                      firc_err_str(err));
+        }
+    }
+    if (revoke != NULL) { (void)revoke(ud); }
+    return err;
+}
+
+int firc_purge_begin(const firc_purge_lock_t *lock, const firc_opkgtun_io_t *io, firc_err_t (*revoke)(void *),
+                     void *ud, int *lock_fd) {
+    *lock_fd = -1;
+    firc_err_t err = lock->lock(lock->path, lock_fd);
+    if (err == FIRC_ERR_EXIST) {
+        *lock_fd = -1;
+        FIRC_ERROR("another fircd holds %s: is the service already running?", lock->path);
+        return 1;
+    }
+    if (err != FIRC_OK) {
+        *lock_fd = -1;
+        if (io != NULL) {
+            FIRC_WARN("purge could not take the instance lock (%s); firc's OpkgTun records are left; delete "
+                      "OpkgTun<N> in the router", firc_err_str(err));
+        } else {
+            FIRC_WARN("purge could not take the instance lock (%s)", firc_err_str(err));
+        }
+        (void)firc_purge_router(NULL, revoke, ud);
+        return 0;
+    }
+    (void)firc_purge_router(io, revoke, ud);
+    return 0;
+}
+
 firc_err_t firc_purge_sets(firc_setnl_t *sets, const char *chain_prefix, size_t *destroyed) {
     size_t n = 0;
     if (destroyed != NULL) { *destroyed = 0; }

@@ -20,6 +20,7 @@
 #include "firc/iptables.h"
 #include "firc/models.h"
 #include "firc/sub_worker.h"
+#include "firc/tunnels.h"
 #include "firc/port_remap.h"
 #include "firc/ptr.h"
 #include "firc/conntrack.h"
@@ -109,7 +110,7 @@ bool firc_app_is_running(const firc_app_t *app);
 
 /* startup: enables every group (chains left to the committer), marks the app running, publishes the view and routes;
  * a failed enable is logged and left out; only a failed view publish returns an error */
-firc_err_t firc_app_start_groups(firc_app_t *app);
+firc_err_t firc_app_start_groups(firc_app_t *app, const firc_tunnels_t *ts);
 
 size_t firc_app_user_group_count(const firc_app_t *app);
 firc_ruleset_t *firc_app_user_group_at(const firc_app_t *app, size_t idx);
@@ -306,13 +307,15 @@ typedef struct firc_iface_info {
 } firc_iface_info_t;
 
 /* enumerates system interfaces (getifaddrs, deduped) but lo, ezcfg0 and the radios ra<N>/rai<N>[.<M>];
- * names and roles from aliases, NULL for none */
-firc_err_t firc_app_list_interfaces(const firc_kn_aliases_t *aliases, firc_iface_info_t **out, size_t *out_n);
+ * names and roles from aliases, NULL for none; a device ts names is a tunnel's */
+firc_err_t firc_app_list_interfaces(const firc_kn_aliases_t *aliases, const firc_tunnels_t *ts, firc_iface_info_t **out,
+                                    size_t *out_n);
 
 /* "tunnel", "wan", "lan" or "other" */
 const char *firc_iface_role_name(firc_iface_role_t role);
 
-firc_iface_role_t firc_iface_role_for_test(const char *name, unsigned flags, bool inet); /* test seam */
+firc_iface_role_t firc_iface_role_for_test(const char *name, unsigned flags, bool inet,
+                                           const firc_tunnels_t *ts); /* test seam */
 
 bool firc_iface_listed_for_test(const char *name); /* test seam: the list's filter */
 
@@ -330,8 +333,10 @@ void firc_app_set_port_remap(firc_app_t *app, firc_port_remap_t *remap);
  * and asks for a pass; loop thread */
 void firc_app_refresh_remap(firc_app_t *app, const char *iface);
 
-/* The ports tunvless<N> reported, by N (0: none); a change asks for a pass. Loop thread. */
-void firc_app_set_ktcp_ports(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEVICES]);
+/* The ports each tunnel's tunvless reported and the devices tunnels.yaml names, by N (0 or "": none); only a device
+   named here is a tunnel's; a change asks for a pass. Loop thread. */
+void firc_app_set_tunnels(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEVICES],
+                          const char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP]);
 
 typedef struct {
     void (*pushed)(const firc_ktcp_image_t *prev, const firc_ktcp_image_t *next, void *ud);
@@ -344,10 +349,10 @@ typedef struct {
    Loop thread. */
 void firc_app_set_ktcp_sink(firc_app_t *app, const firc_app_ktcp_sink_t *sink);
 
-/* tunvless<dev> acked one close command: the oldest flush waiting on that device's acks counts it. Loop thread. */
+/* the tunvless of dev acked one close command: the oldest flush waiting on that device's acks counts it. Loop thread. */
 void firc_app_ktcp_closed(firc_app_t *app, uint8_t dev);
 
-/* tunvless<dev> said ready: a new child, so no ack its predecessor owed will come. Loop thread. */
+/* the tunvless of dev said ready: a new child, so no ack its predecessor owed will come. Loop thread. */
 void firc_app_ktcp_ready(firc_app_t *app, uint8_t dev);
 
 void firc_app_ktcp_due_for_test(firc_app_t *app); /* test seam: what the wait timer does when it fires */
@@ -364,7 +369,7 @@ firc_ktcp_off_t firc_app_ktcp_off(const firc_app_t *app);
 void firc_app_set_ktcp_skipped_for_test(firc_app_t *app, const firc_xt_acl_t *acl,
                                         firc_ktcp_off_t off); /* test seam: as a report would */
 
-/* real of fake when its group is routed into tunvless<dev> with a port; false answers "-". Loop thread. */
+/* real of fake when its group is routed into the device of N dev with a port; false answers "-". Loop thread. */
 bool firc_app_ktcp_real_of(firc_app_t *app, uint8_t dev, const uint8_t fake[4], firc_ip_t *real);
 
 /* stages the pool's FORWARD reject barrier on both engines without committing; every pass does this */

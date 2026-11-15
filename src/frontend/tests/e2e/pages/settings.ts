@@ -128,6 +128,9 @@ export async function openSettings(
       },
     }),
   );
+  await page.route("**/tunnels", (r) =>
+    r.fulfill({ json: { tunnels: [{ id: "t0", device: "tunvless0" }] } }),
+  );
   await page.route("**/system/settings", onSettings);
   if (opts.onRestart) await page.route("**/system/restart", opts.onRestart);
   await page.route("**/system/update", opts.onUpdate ?? ((r) => r.fulfill({ json: upToDate })));

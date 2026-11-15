@@ -315,6 +315,7 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
         size_t n = 0;
         if (t->link.plain) {
             ssize_t k = tr_lk_recv(&t->link, d, cap, 0);
+            if (k < 0 && errno == EINTR) return 0;
             if (k <= 0) return tr_lk_err(&t->link, k);
             n = (size_t)k;
         } else {
@@ -346,6 +347,7 @@ static int ws_read(struct transport *t, unsigned char *d, size_t cap, size_t *go
     } else {
         /* Bare socket: read straight into d and parse in place. */
         ssize_t k = tr_lk_recv(&t->link, d, cap, 0);
+        if (k < 0 && errno == EINTR) return 0;
         if (k <= 0) return tr_lk_err(&t->link, k);
         rc = tr_ws_parse(r, d, (size_t)k, d, cap, &on);
     }

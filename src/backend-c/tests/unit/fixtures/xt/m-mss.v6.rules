@@ -1,0 +1,6 @@
+*mangle
+:FIRC_MSS - [0:0]
+-A FIRC_MSS -o tunvless1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A FIRC_MSS -o tunvless3 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-I FORWARD 1 -j FIRC_MSS
+COMMIT

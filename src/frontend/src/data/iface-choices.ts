@@ -7,7 +7,9 @@ export const BLACKHOLE = "blackhole";
 export const BLOCK = "block";
 export const isSink = (id: string) => id === BLACKHOLE || id === BLOCK;
 export const DEVICE_PREFIXES = ["tunvless", "opkgtun"] as const;
-export const TUNVLESS_DEVICE = /^(tunvless|opkgtun)([0-9]|[1-9][0-9])$/;
+
+export const isTunnelDevice = (id: string, tunnels: readonly { device: string }[]) =>
+  tunnels.some((tn) => tn.device === id);
 
 export function splitDevice(device: string): { prefix: string; num: string } {
   const prefix = DEVICE_PREFIXES.find((p) => device.startsWith(p)) ?? DEVICE_PREFIXES[0];
@@ -32,9 +34,13 @@ export function groupChoices(list: IfaceItem[], chosen: string[]) {
   return { head, blackhole, block, rest, expanded };
 }
 
-export function lanChoices<T extends IfaceItem>(list: T[], query: string): T[] {
+export function lanChoices<T extends IfaceItem>(
+  list: T[],
+  query: string,
+  tunnels: readonly { device: string }[],
+): T[] {
   const q = query.trim().toLowerCase();
-  const usable = list.filter((i) => !isSink(i.id) && !TUNVLESS_DEVICE.test(i.id));
+  const usable = list.filter((i) => !isSink(i.id) && !isTunnelDevice(i.id, tunnels));
   if (q === "") return usable.filter((i) => i.role === "lan");
   return usable.filter((i) =>
     [i.id, i.name, i.ndmsName].some((s) => s !== undefined && s.toLowerCase().includes(q)),

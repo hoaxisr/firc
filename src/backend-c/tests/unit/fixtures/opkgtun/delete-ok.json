@@ -1,0 +1,14 @@
+[
+  {
+    "interface": {
+      "status": [
+        {
+          "status": "message",
+          "code": "6553605",
+          "ident": "Network::Interface::Repository",
+          "message": "interface \"OpkgTun9\" removed."
+        }
+      ]
+    }
+  }
+]

@@ -296,12 +296,15 @@ static void check(int ok, const char *what) {
     if (!ok) g_fail = 1;
 }
 
+static unsigned g_syn_mss = 1460;
+static unsigned g_syn6_mss = 1440;
+
 /* One client packet in the middle of a TUN batch: gathered data stays gathered. */
 static void cli_send_more(uint32_t seq, uint32_t ack, unsigned char flags, uint16_t win,
                           const unsigned char *d, size_t n) {
     unsigned char p[2048];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, seq, ack, flags,
-                         d, n, win, 0, -1);
+                         d, n, win, (flags & TCP_SYN) ? g_syn_mss : 0, -1);
     handle_packet(&g_tun, p, l);
 }
 
@@ -1847,7 +1850,7 @@ static void syn_bad(void *arg) {
     struct vless_node *bad = arg;
     unsigned char p[128];
     size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN,
-                         NULL, 0, 65535, 0, -1);
+                         NULL, 0, 65535, 1460, -1);
     g_dial.ctx = bad;
     handle_packet(&g_tun, p, l);
     g_dial.ctx = &g_node;
@@ -2178,7 +2181,8 @@ static void fake_new(void) {
 static void pm_send(uint16_t sport, uint32_t dst, uint32_t seq, uint32_t ack, unsigned char flags,
                      const unsigned char *d, size_t n) {
     unsigned char p[2048];
-    size_t l = tcp_build(p, sizeof(p), CLI_IP, dst, sport, 443, seq, ack, flags, d, n, 65535, 0, -1);
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, dst, sport, 443, seq, ack, flags, d, n, 65535,
+                         (flags & TCP_SYN) ? g_syn_mss : 0, -1);
     handle_packet(&g_tun, p, l);
     up_flush(&g_tun);                       /* a packet is a whole batch here, as in cli_send */
 }
@@ -5067,7 +5071,12 @@ static int sum6_ok(const unsigned char *p, size_t n) {
 static void p6_send(const unsigned char *src, const unsigned char *dst, uint16_t sport, uint32_t seq,
                     uint32_t ack, unsigned char flags, const unsigned char *opt, size_t opt_n,
                     const unsigned char *d, size_t n) {
-    unsigned char p[2048];
+    unsigned char p[2048], o[40] = {2, 4, (unsigned char)(g_syn6_mss >> 8), (unsigned char)g_syn6_mss};
+    if ((flags & TCP_SYN) && g_syn6_mss) {
+        if (opt_n) memcpy(o + 4, opt, opt_n);
+        opt = o;
+        opt_n += 4;
+    }
     size_t l = tcp6_build(p, sizeof p, src, dst, sport, 443, seq, ack, flags, 65535, opt, opt_n, d, n);
     handle_packet(&g_tun, p, l);
     up_flush(&g_tun);
@@ -5481,6 +5490,225 @@ static void t6_same_low_bytes(void) {
           "same address bytes: a v6 ACK of the v4 FIN is a stranger's, RST");
 }
 
+struct mss_rd { int n, extra; size_t len[64]; unsigned char head[64][80]; };
+
+static void *mss_reader(void *arg) {
+    struct mss_rd *r = arg;
+    static unsigned char b[70000];
+    struct pollfd p = { .fd = g_dev_peer, .events = POLLIN };
+    while (poll(&p, 1, 300) > 0) {
+        ssize_t got = recv(g_dev_peer, b, sizeof b, MSG_DONTWAIT);
+        if (got <= 0) continue;
+        if (r->n < 64) {
+            r->len[r->n] = (size_t)got;
+            memcpy(r->head[r->n], b, got < 80 ? (size_t)got : 80);
+        }
+        r->n++;
+    }
+    return NULL;
+}
+
+static unsigned char g_mss_buf[20000];
+
+static int mss_emit(struct conn *c, size_t n, struct mss_rd *r) {
+    memset(r, 0, sizeof *r);
+    for (size_t i = 0; i < n; i++) g_mss_buf[i] = (unsigned char)(i * 13 + 5);
+    pthread_t t;
+    if (pthread_create(&t, NULL, mss_reader, r) != 0) return -1;
+    int rc = c ? emit_to_client(c, &g_tun, g_mss_buf, n) : -1;
+    pthread_join(t, NULL);
+    unsigned char b[2048];
+    while (recv(g_dev_peer, b, sizeof b, MSG_DONTWAIT) > 0) r->extra++;
+    return rc;
+}
+
+static int mss_sizes(const struct mss_rd *r, size_t hdr, const size_t *want, int n) {
+    if (r->n != n || r->extra) return 0;
+    for (int i = 0; i < n; i++)
+        if (r->len[i] != hdr + want[i]) return 0;
+    return 1;
+}
+
+static unsigned vnet_gso_size(const unsigned char *raw) {
+    uint16_t v;
+    memcpy(&v, raw + 4, 2);
+    return v;
+}
+
+static struct conn *mss_open4(uint16_t sport, unsigned syn_mss) {
+    g_syn_mss = syn_mss;
+    struct conn *c = pm_open(sport, SRV_IP);
+    g_syn_mss = 1460;
+    return c;
+}
+
+static struct conn *mss_open6(uint16_t sport, unsigned syn_mss) {
+    g_syn6_mss = syn_mss;
+    struct conn *c = p6_open(CLI6, SRV6, sport);
+    g_syn6_mss = 1440;
+    return c;
+}
+
+static void t_mss_from_syn(void) {
+    fake_new();
+    dev_take();
+    struct mss_rd r;
+    int rc = mss_emit(mss_open4(41000, 1200), 20000, &r);
+    size_t want[17];
+    for (int i = 0; i < 16; i++) want[i] = 1200;
+    want[16] = 800;
+    /* catches: one constant MSS for every client */
+    check(rc == 0 && mss_sizes(&r, 40, want, 17),
+          "SYN MSS 1200: 20000 bytes go out as 16 segments of 1200 and one of 800");
+    t6_end();
+}
+
+static void t_mss_from_syn_gso(void) {
+    fake_new();
+    dev_take();
+    struct conn *c = mss_open4(41001, 1200);
+    g_tun.gso = 1;
+    uint16_t s = g_ip_id;
+    struct mss_rd r;
+    int rc = mss_emit(c, 20000, &r);
+    g_tun.gso = 0;
+    size_t want[2] = { 16384, 3616 };
+    /* catches: a writer that ignores the connection's MSS, or a write rounded to a multiple of it */
+    check(rc == 0 && mss_sizes(&r, 10 + 40, want, 2) && vnet_gso_size(r.head[0]) == 1200 &&
+              vnet_gso_size(r.head[1]) == 1200,
+          "SYN MSS 1200 with offload: writes of 16384 and 3616, both split by 1200");
+    /* catches: the id count and the split taking different MSS values */
+    check(r.n == 2 && ((r.head[0][14] << 8) | r.head[0][15]) == (uint16_t)(s + 1) &&
+              ((r.head[1][14] << 8) | r.head[1][15]) == (uint16_t)(s + 15) &&
+              g_ip_id == (uint16_t)(s + 18),
+          "MSS 1200 offload writes carry s+1 and s+15, the counter ends at s+18");
+    t6_end();
+}
+
+static void t_mss_from_syn_gso6(void) {
+    fake_new();
+    dev_take();
+    struct conn *c = mss_open6(52003, 1200);
+    g_tun.gso = 1;
+    struct mss_rd r;
+    int rc = mss_emit(c, 20000, &r);
+    g_tun.gso = 0;
+    size_t want[2] = { 16384, 3616 };
+    /* catches: the IPv6 writer split by the constant, not the connection's MSS */
+    check(rc == 0 && mss_sizes(&r, 10 + 60, want, 2) && vnet_gso_size(r.head[0]) == 1200 &&
+              vnet_gso_size(r.head[1]) == 1200,
+          "IPv6 SYN MSS 1200 with offload: writes of 16384 and 3616, both split by 1200");
+    t6_end();
+}
+
+static void t_mss_default(void) {
+    fake_new();
+    dev_take();
+    struct mss_rd r;
+    int rc = mss_emit(mss_open4(41002, 0), 1200, &r);
+    size_t w4[3] = { 536, 536, 128 };
+    /* catches: an IPv4 SYN without MSS taken as 1460, or as the IPv6 default */
+    check(rc == 0 && mss_sizes(&r, 40, w4, 3), "IPv4 SYN without MSS: 1200 bytes as 536 + 536 + 128");
+    rc = mss_emit(mss_open6(52000, 0), 1300, &r);
+    size_t w6[2] = { 1220, 80 };
+    /* catches: an IPv6 SYN without MSS taken as 1440, or as the IPv4 default */
+    check(rc == 0 && mss_sizes(&r, 60, w6, 2), "IPv6 SYN without MSS: 1300 bytes as 1220 + 80");
+    t6_end();
+}
+
+static void t_mss_clamp(void) {
+    fake_new();
+    dev_take();
+    struct mss_rd r;
+    int rc = mss_emit(mss_open4(41003, 9000), 3000, &r);
+    size_t w4[3] = { 1460, 1460, 80 };
+    /* catches: no upper bound on an IPv4 client's MSS */
+    check(rc == 0 && mss_sizes(&r, 40, w4, 3), "IPv4 SYN MSS 9000: 3000 bytes as 1460 + 1460 + 80");
+    rc = mss_emit(mss_open6(52001, 9000), 3000, &r);
+    size_t w6[3] = { 1440, 1440, 120 };
+    /* catches: the IPv4 bound used for IPv6 */
+    check(rc == 0 && mss_sizes(&r, 60, w6, 3), "IPv6 SYN MSS 9000: 3000 bytes as 1440 + 1440 + 120");
+    size_t lo[4] = { 64, 64, 64, 8 };
+    rc = mss_emit(mss_open4(41004, 10), 200, &r);
+    /* catches: no lower bound on an IPv4 client's MSS */
+    check(rc == 0 && mss_sizes(&r, 40, lo, 4), "IPv4 SYN MSS 10: 200 bytes as 64 + 64 + 64 + 8");
+    rc = mss_emit(mss_open6(52002, 10), 200, &r);
+    /* catches: no lower bound on an IPv6 client's MSS */
+    check(rc == 0 && mss_sizes(&r, 60, lo, 4), "IPv6 SYN MSS 10: 200 bytes as 64 + 64 + 64 + 8");
+    t6_end();
+}
+
+static void t_mss_retransmit(void) {
+    fake_new();
+    dev_take();
+    struct conn *c = mss_open4(41005, 1200);
+    struct mss_rd r;
+    int rc = mss_emit(c, 3000, &r);
+    unsigned char b[70000];
+    ssize_t n = -1;
+    if (c) {
+        rtx_resend(c, &g_tun, "test");
+        n = recv(g_dev_peer, b, sizeof b, MSG_DONTWAIT);
+    }
+    struct flow_key k;
+    size_t off;
+    /* catches: a resend sized apart from the connection's MSS */
+    check(rc == 0 && r.n == 3 && n == 40 + 1200 && ip_parse(b, (size_t)n, &k, &off) == 0 && k.seq == 2,
+          "SYN MSS 1200: a resend without offload is one segment of 1200 from seq 2");
+    t6_end();
+
+    fake_new();
+    dev_take();
+    c = mss_open4(41006, 1200);
+    g_tun.gso = 1;
+    rc = mss_emit(c, 20000, &r);
+    n = -1;
+    if (c) {
+        rtx_resend(c, &g_tun, "test");
+        n = recv(g_dev_peer, b, sizeof b, MSG_DONTWAIT);
+    }
+    g_tun.gso = 0;
+    /* catches: a resend with offload split by a constant MSS */
+    check(rc == 0 && r.n == 2 && n == 10 + 40 + 16384 && vnet_gso_size(b) == 1200,
+          "SYN MSS 1200: a resend with offload is 16384 bytes split by 1200");
+    t6_end();
+}
+
+static void stats_turn(void *arg) {
+    struct loop *L = arg;
+    L->stats_at = now_ns() - 3000000000ull;
+    loop_turn(L, 0);
+}
+
+static void t_mss_trace(void) {
+    fake_new();
+    dev_take();
+    g_stats = 1;
+    worker_init(0);
+    struct conn *a = mss_open4(41007, 1200);
+    struct conn *b = mss_open4(41008, 1400);
+    struct loop L;
+    int ok = 0;
+    if (a && b && loop_open(&L, &g_tun, 0) == 0) {
+        ok = stderr_has(stats_turn, &L, "client MSS 1200..1400");
+        loop_close(&L);
+    }
+    g_stats = 0;
+    /* catches: a trace that shows the constant, or one connection's MSS for both ends */
+    check(ok, "tun-stats with clients of MSS 1200 and 1400 says client MSS 1200..1400");
+    t6_end();
+}
+
+static void mss_part(void) {
+    t_mss_from_syn();
+    t_mss_from_syn_gso();
+    t_mss_from_syn_gso6();
+    t_mss_default();
+    t_mss_clamp();
+    t_mss_retransmit();
+    t_mss_trace();
+}
+
 static int stack_part(void) {
     signal(SIGPIPE, SIG_IGN);
     for (int i = 0; i < FN_N; i++) {
@@ -5512,6 +5740,7 @@ static int stack_part(void) {
     t6_end();
     t6_same_low_bytes();
     t6_end();
+    mss_part();
     pool_part();
     return 0;
 }
@@ -9007,6 +9236,82 @@ static void t_v4_and_v6_keys_differ(void) {
     dev_drain(NULL);
 }
 
+static void t_ipid_seq(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "fixture: ipid connection"); return; }
+    uint16_t s = g_ip_id;
+    unsigned char d[100];
+    memset(d, 'd', sizeof d);
+    int good = 0, extra = 0;
+    for (int i = 1; i <= 100; i++) {
+        unsigned char p[2048];
+        if (emit_to_client(c, &g_tun, d, sizeof d) != 0) break;
+        ssize_t r = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT);
+        if (r == 140 && ((p[4] << 8) | p[5]) == (uint16_t)(s + i)) good++;
+        while (recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT) > 0) extra++;
+    }
+    /* catches: an id fixed at 0, or a counter not advanced per packet */
+    check(good == 100 && extra == 0, "100 segments to the client carry ids s+1 .. s+100");
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+static void t_ipid_gso(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "fixture: ipid gso connection"); return; }
+    g_tun.gso = 1;
+    uint16_t s = g_ip_id;
+    static unsigned char d[20000];
+    memset(d, 'g', sizeof d);
+    int rc = emit_to_client(c, &g_tun, d, sizeof d);
+    unsigned char p[2][20000];
+    ssize_t r0 = recv(g_dev_peer, p[0], sizeof p[0], MSG_DONTWAIT);
+    ssize_t r1 = recv(g_dev_peer, p[1], sizeof p[1], MSG_DONTWAIT);
+    g_tun.gso = 0;
+    check(rc == 0 && r0 == 10 + 40 + 16384 && r1 == 10 + 40 + 3616,
+          "20000 bytes with offload are two writes of 16384 and 3616");
+    /* catches: the counter advanced by one per write, not per piece */
+    check(r0 > 16 && r1 > 16 && ((p[0][14] << 8) | p[0][15]) == (uint16_t)(s + 1) &&
+              ((p[1][14] << 8) | p[1][15]) == (uint16_t)(s + 13) && g_ip_id == (uint16_t)(s + 15),
+          "offload writes carry s+1 and s+13, the counter ends at s+15");
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+static void t_ipid_exact(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "fixture: ipid exact connection"); return; }
+    g_tun.gso = 1;
+    uint16_t s = g_ip_id;
+    static unsigned char d[14600];
+    memset(d, 'x', sizeof d);
+    int rc = emit_to_client(c, &g_tun, d, sizeof d);
+    unsigned char p[16000];
+    ssize_t r0 = recv(g_dev_peer, p, sizeof p, MSG_DONTWAIT);
+    g_tun.gso = 0;
+    /* catches: a piece count that rounds an exact multiple of the MSS up by one */
+    check(rc == 0 && r0 == 10 + 40 + 14600 && ((p[14] << 8) | p[15]) == (uint16_t)(s + 1) &&
+              g_ip_id == (uint16_t)(s + 10),
+          "14600 bytes at MSS 1460 with offload advance the id counter by exactly 10");
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+static void t_worker_ids(void) {
+    uint16_t save = g_ip_id;
+    static const uint16_t want[4] = { 0, 16384, 32768, 49152 };
+    int ok = MAX_WORKERS == 4;
+    for (int i = 0; i < 4; i++) {
+        g_ip_id = 7;
+        worker_init(i);
+        if (g_ip_id != want[i] || g_worker != i || g_st.win_min != 0xFFFFFFFFu) ok = 0;
+    }
+    worker_init(0);
+    g_ip_id = save;
+    /* catches: every loop thread starting its id counter at the same value */
+    check(ok, "loop threads 0..3 start their ids at 0, 16384, 32768 and 49152");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);       /* a crash or a hang keeps the checks printed so far */
     int sp[2];
@@ -9085,6 +9390,10 @@ int main(void) {
     t_server_first_due_at_sleep();
     t_server_first_again_no_spin();
     t_room_held();
+    t_ipid_seq();
+    t_ipid_gso();
+    t_ipid_exact();
+    t_worker_ids();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
     sock_part();
 

@@ -155,6 +155,7 @@ static firc_err_t ruleset_enable_locked(firc_ruleset_t *rs, const char **step) {
         if (step) { *step = "memory"; }
         return FIRC_ERR_NOMEM;
     }
+    firc_ipset_to_link_set_tunnel_dev(link, rs->deps.tunnel_dev, rs->deps.tunnel_ud);
     size_t n = firc_group_n_ifaces(rs->group);
     if (n > 1) {
         const char *names[FIRC_GROUP_IFACES_MAX];

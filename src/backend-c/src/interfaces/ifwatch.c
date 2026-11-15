@@ -10,7 +10,6 @@
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/mark.h"
-#include "firc/tunvless_name.h"
 
 typedef struct watched_if {
     char name[16];
@@ -107,7 +106,6 @@ static bool tunnel_still_starting(firc_ifwatch_t *w, const watched_if_t *wi, int
 }
 
 static void tunnel_step(firc_ifwatch_t *w, watched_if_t *wi, int64_t now) {
-    bool known = tunnel_known(w, wi);
     bool link = w->d.link_up == NULL || w->d.link_up(w->d.ud, wi->name);
     if (tunnel_still_starting(w, wi, now)) {
         if (wi->track.state != FIRC_IF_UNKNOWN) {
@@ -116,10 +114,20 @@ static void tunnel_step(firc_ifwatch_t *w, watched_if_t *wi, int64_t now) {
         }
         return;
     }
-    bool up = known && link && (w->d.tunnel_down == NULL || !w->d.tunnel_down(w->d.ud, wi->name));
-    firc_if_step_t s = firc_if_track_tunnel(&wi->track, up, now);
-    if (!known) { snprintf(wi->track.error, sizeof(wi->track.error), "no configured tunnel uses this device"); }
-    say_state(wi, s, false);
+    bool up = link && (w->d.tunnel_down == NULL || !w->d.tunnel_down(w->d.ud, wi->name));
+    say_state(wi, firc_if_track_tunnel(&wi->track, up, now), false);
+}
+
+static void classify(firc_ifwatch_t *w, watched_if_t *wi, int64_t now) {
+    wi->tunnel = tunnel_known(w, wi);
+    wi->gen = ++w->next_gen;
+    wi->in_flight = false;
+    wi->due_ms = now;
+    if (wi->tunnel) {
+        tunnel_step(w, wi, now);
+    } else if (w->d.link_up != NULL && !w->d.link_up(w->d.ud, wi->name)) {
+        say_state(wi, firc_if_track_link(&wi->track, false, now), true);
+    }
 }
 
 static watched_if_t *add_if(firc_ifwatch_t *w, const char *name, int64_t now) {
@@ -133,14 +141,7 @@ static watched_if_t *add_if(firc_ifwatch_t *w, const char *name, int64_t now) {
     snprintf(wi->name, sizeof(wi->name), "%s", name);
     firc_if_track_init(&wi->track, now);
     wi->since_unix = (int64_t)time(NULL);
-    wi->due_ms = now;
-    wi->tunnel = firc_tunvless_index(name) >= 0;
-    wi->gen = ++w->next_gen;
-    if (wi->tunnel) {
-        tunnel_step(w, wi, now);
-    } else if (w->d.link_up != NULL && !w->d.link_up(w->d.ud, name)) {
-        say_state(wi, firc_if_track_link(&wi->track, false, now), true);
-    }
+    classify(w, wi, now);
     return wi;
 }
 
@@ -342,7 +343,11 @@ void firc_ifwatch_tick(firc_ifwatch_t *w) {
     reconcile(w, now);
     for (size_t i = 0; i < w->n_ifs; i++) {
         watched_if_t *wi = &w->ifs[i];
-        if (wi->tunnel) {
+        if (tunnel_known(w, wi) != wi->tunnel) {
+            firc_if_track_init(&wi->track, now);
+            classify(w, wi, now);
+            if (wi->tunnel) { continue; }
+        } else if (wi->tunnel) {
             tunnel_step(w, wi, now);
             continue;
         }

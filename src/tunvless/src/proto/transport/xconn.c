@@ -277,8 +277,18 @@ static int q_move(struct xc_q *dst, struct xc_q *src, size_t n) {
     return 0;
 }
 
-static void pend_flush(struct xconn *x) {
+static int seal(struct xconn *x);
+static void fail_in(struct xconn *x, int err);
+
+static long q_wire_free(const struct xconn *x, unsigned g) {
+    size_t q = x->shared ? g_queued : x->q_pay;
+    return q < XC_OUT_HIGH ? (long)((XC_OUT_HIGH - q) / g) : 0;
+}
+
+static int pend_flush(struct xconn *x) {
     x->pend_due = 0;
+    unsigned g = fm_grow(x->link.tls.fm);
+    int staged = 0;
     uint16_t n = x->st_cap, at = x->pend_at;
     for (uint16_t j = 0; j < n && x->state == XC_LIVE; j++) {
         uint16_t i = (uint16_t)((at + j) % n);
@@ -287,7 +297,15 @@ static void pend_flush(struct xconn *x) {
         long w = h2m_room(&x->h2, e->h2slot);
         size_t k = e->pend.n;
         if (k && w <= 0) continue;
+        int rs = g > 1 ? seal(x) : 0;
+        if (rs) {
+            fail_in(x, rs);
+            return staged;
+        }
+        long f = q_wire_free(x, g);
+        if (f <= 0) break;
         if ((long)k > w) k = (size_t)w;
+        if ((long)k > f) k = (size_t)f;
         int last = e->pend_end && k == e->pend.n;
         size_t had = e->pend.n;
         int rc = h2m_send_begin(&x->h2, e->h2slot, k, last);
@@ -296,11 +314,13 @@ static void pend_flush(struct xconn *x) {
         x->pend_n -= had - e->pend.n;
         if (rc) {
             check_dead(x, rc);
-            return;
+            return staged;
         }
+        staged = 1;
         if (k) x->pend_at = (uint16_t)((i + 1) % n);
         if (last) e->pend_end = 0;
     }
+    return staged;
 }
 
 static void rx_drop(struct xconn *x, struct xc_st *e) {
@@ -369,6 +389,7 @@ static int x_emit(void *arg, const unsigned char *d, size_t n, int64_t gap) {
 static int masked(struct xconn *x, const unsigned char *d, size_t n, uint32_t pt) {
     if (x->q_pay >= 4 * XC_OUT_HIGH) return TR_EIO;
     struct xc_chunk *t = x->out.tail;
+    size_t had = x->out.n;
     int rc = fm_shape(x->link.tls.fm, d, n, x_emit, x);
     if (rc) return rc == H2_EIO ? rc : TR_EMASK;
     if (x->out.tail == t) {
@@ -376,8 +397,11 @@ static int masked(struct xconn *x, const unsigned char *d, size_t n, uint32_t pt
         if (!c) return H2_EIO;
         q_link(&x->out, c);
     }
+    size_t over = x->out.n - had > n ? x->out.n - had - n : 0;
+    x->q_pay += over;
+    if (x->shared) g_queued += over;
     x->out.tail->pt += pt;
-    x->out.tail->pay += x->stage_pay;
+    x->out.tail->pay += x->stage_pay + over;
     x->out.tail->ctl += x->stage_ctl;
     x->stage_pay = x->stage_ctl = 0;
     return 0;
@@ -721,6 +745,7 @@ int xconn_adopt(struct xconn *x, uint64_t now_ms) {
 }
 
 static void low_water(void);
+static void pend_kick(void);
 
 static void fail_in(struct xconn *x, int err) {
     if (x->state == XC_DEAD) return;
@@ -754,7 +779,10 @@ static void fail_in(struct xconn *x, int err) {
     }
     x->state = XC_DEAD;
     x->rc = err;
-    if (x->shared) low_water();
+    if (x->shared) {
+        low_water();
+        pend_kick();
+    }
 }
 
 void xconn_fail(struct xconn *x, int err) {
@@ -874,9 +902,25 @@ static void release(struct xconn *x) {
     }
 }
 
+static int flush_in(struct xconn *x);
+
+static __thread uint8_t g_kicking;
+
+static void pend_kick(void) {
+    if (!g_pend || g_kicking) return;
+    g_kicking = 1;
+    for (struct xconn *y = g_list; y; y = y->next) {
+        if (y->state != XC_LIVE || !pend_flush(y) || y->state != XC_LIVE) continue;
+        int rc = seal(y);
+        if (rc) fail_in(y, rc);
+        else flush_in(y);
+    }
+    g_kicking = 0;
+}
+
 static int flush_in(struct xconn *x) {
     if (x->state != XC_LIVE) return x->state == XC_DEAD ? x->rc : 0;
-    int sent = 0;
+    int sent = 0, done = 0;
     for (uint16_t i = 0; i < x->st_cap; i++) sent |= x->st[i].up_cur;
     for (uint16_t i = 0; sent && i < x->st_cap; i++) {
         x->st[i].up_last = x->st[i].up_cur;
@@ -918,6 +962,7 @@ static int flush_in(struct xconn *x) {
             x->out_due = now + (uint64_t)h->gap;
         }
         chunk_put(h);
+        done = 1;
     }
     if (x->h2.hold && x->q_ctl < XC_CTL_RESUME) release(x);
     for (uint16_t i = 0; x->discard && i < x->st_cap; i++) {
@@ -927,6 +972,8 @@ static int flush_in(struct xconn *x) {
         if (e->owner == XS_NOWNER && e->ended && !e->disc) ent_free(x, e);
     }
     if ((rc = check_dead(x, 0))) return rc;
+    if (done) pend_kick();
+    if (x->state != XC_LIVE) return x->state == XC_DEAD ? x->rc : 0;
     if (x->shared) low_water();
     return 0;
 }
@@ -934,6 +981,12 @@ static int flush_in(struct xconn *x) {
 int xconn_flush(struct xconn *x) {
     int rc = flush_in(x);
     budget();
+    wq_run();
+    return rc;
+}
+
+static int flush_wake(struct xconn *x) {
+    int rc = flush_in(x);
     wq_run();
     return rc;
 }
@@ -1071,6 +1124,7 @@ void xconn_free(struct xconn *x) {
     if (shared && g_links && !--g_links) free_list_drop();
     if (shared) {
         low_water();
+        pend_kick();
         budget();
         wq_run();
     }
@@ -1119,7 +1173,7 @@ int xs_open(struct xconn *x, const struct h2_req *r, uint16_t owner, struct xs *
     s->x = x;
     s->slot = idx;
     s->sid = e->sid;
-    if (!x->shared) return flush_in(x);
+    if (!x->shared) return flush_wake(x);
     return 0;
 }
 
@@ -1144,7 +1198,7 @@ static unsigned uploaders(const struct xconn *x, uint16_t owner) {
 
 static long q_free(const struct xconn *x) {
     long q = (long)(x->shared ? g_queued + g_pend : x->q_pay);
-    return q < XC_OUT_HIGH ? XC_OUT_HIGH - q : 0;
+    return q < XC_OUT_HIGH ? (XC_OUT_HIGH - q) / (long)fm_grow(x->link.tls.fm) : 0;
 }
 
 static long admit(const struct xconn *x, uint16_t owner, struct xc_st *e) {
@@ -1153,8 +1207,11 @@ static long admit(const struct xconn *x, uint16_t owner, struct xc_st *e) {
     if (c < 0) c = 0;
     long a = (c < free_q ? c : free_q) / (long)uploaders(x, owner);
     if (a >= XC_MSS) return a;
-    if (free_q < c) e->starved = 1;
-    else e->win_wait = 1;
+    if (free_q < c) {
+        e->starved = 1;
+        return fm_grow(x->link.tls.fm) > 1 ? 0 : XC_MSS;
+    }
+    e->win_wait = 1;
     return XC_MSS;
 }
 
@@ -1244,7 +1301,7 @@ static int send_src(const struct xs *s, const unsigned char *d, struct xc_q *q, 
         e->local_end = 1;
         e->half_at = x->now_ms;
     }
-    if (!x->shared) return flush_in(x);
+    if (!x->shared) return flush_wake(x);
     return 0;
 }
 

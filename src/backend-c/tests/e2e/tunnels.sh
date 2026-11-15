@@ -33,7 +33,7 @@ check() {
 }
 cleanup() {
     [ -n "${FP:-}" ] && kill "$FP" 2>/dev/null && wait "$FP" 2>/dev/null
-    for p in ${SRV_A:-} ${SRV_B:-} ${WEB:-} ${STUB:-} ${SQ:-} ${LOC:-}; do kill "$p" 2>/dev/null; done
+    for p in ${SRV_A:-} ${SRV_B:-} ${WEB:-} ${STUB:-} ${SQ:-} ${LOC:-} ${KS:-}; do kill "$p" 2>/dev/null; done
     for ns in $N ${X:-}; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null
         ip netns del "$ns" 2>/dev/null
@@ -1031,6 +1031,93 @@ check "with the node's v6 off the A answer is NODATA" rcode0 "$r"
 kill -TERM "$FP"
 wait "$FP"
 FP=
+
+KP=10801
+ntun() {
+    cat > /etc/firc/tunnels.yaml <<EOF
+tunnels:
+  - id: t0
+    device: tunvless0
+    enable: true
+    uplink: auto
+    sources:
+      - id: 0000000a
+        link: "vless://$UUID@$A:$KP?security=none&type=tcp#A"
+      - id: 0000000b
+        link: "vless://$UUID@$B:$KP?security=none&type=tcp#B"
+      - id: 0000000c
+        link: "vless://$UUID@$C:$KP?security=none&type=tcp#C"
+    active: $1
+    interval: 5s
+    advanced: { timeout: 3s }
+EOF
+}
+tact() {
+    curl -s --unix-socket "$SOCK" http://firc/api/v1/tunnels/state 2>/dev/null | python3 -c '
+import json, sys
+t = [t for t in json.load(sys.stdin)["tunnels"] if t["device"] == "tunvless0"]
+print("%s %s" % (t[0]["status"], ",".join(sorted(t[0]["active"]))) if t else "none")' 2>/dev/null
+}
+until_tact() {
+    end=$(($(date +%s%N) + $2 * 1000000000))
+    while [ "$(tact)" != "$1" ]; do
+        [ "$(date +%s%N)" -ge "$end" ] && return 1
+        sleep 0.2
+    done
+    return 0
+}
+start_fircd() {
+    FIRC_TUNVLESS_BIN="$TV/out/tunvless" "$BE/build/host/fircd" --config /etc/firc/firc.conf >> "$W/fircd.log" 2>&1 &
+    FP=$!
+}
+for n in A B C; do
+    eval addr=\$$n
+    NX python3 "$TV/tests/fake-vless.py" --port $KP --uuid $UUID --mb 1 --bind "$addr" > "$W/srv-k$n.log" 2>&1 &
+    KS="${KS:-} $!"
+done
+i=0
+while [ $i -lt 25 ] && [ "$(NX ss -Htln "sport = :$KP" | wc -l)" != 3 ]; do sleep 0.2; i=$((i + 1)); done
+CUT=10.79.0.0/24
+RECOVERED='"source":"tunvless0","message":"nodes answer again, starting over from the first"'
+NUDGED='"source":"tunvless0","message":"the network changed, starting over"'
+
+ip route add prohibit $CUT
+ntun 2
+start_fircd
+until_tact "no_node " 30
+# catches: a recovery check that proves nothing because the cut-off nodes never starved the tunnel
+check "with every node cut off tunvless0 reports no_node" 0 "$?"
+ip route del prohibit $CUT
+until_tact "up A,B" 60
+# catches: a recovered tunnel left on the nodes that answered first, its second slot waiting out the failed head's backoff
+check "nodes that come back are taken from the head within 60 s" "0 up A,B 1" "$? $(tact) $(count_ev "$RECOVERED")"
+kill -TERM "$FP"
+wait "$FP"
+FP=
+
+ip route add prohibit $CUT
+ntun 1
+start_fircd
+wait_ev 'next attempt in 20 s"' 60
+# catches: a layer-event check that proves nothing because the child never reached its 20 s pause
+check "starved tunvless0 enters its 20 s pause" 0 "$?"
+ip route del prohibit $CUT
+t0=$(date +%s%N)
+curl -s --unix-socket "$SOCK" -X POST -H 'Content-Type: application/json' \
+    -d '{"iface":"v0","layer":"ipv4","level":"running"}' http://firc/api/v1/system/hooks/iflayer >/dev/null
+until_tact "up A" 12
+r=$?
+ms=$((($(date +%s%N) - t0) / 1000000))
+# catches: a layer event that never reaches the supervisor, so the starved child sleeps out its pause
+check "a layer event starts a starved tunnel over onto A within 12 s (${ms} ms)" "0 up A 1" \
+    "$r $(tact) $(count_ev "$NUDGED")"
+kill -TERM "$FP"
+wait "$FP"
+FP=
+
+ip route del prohibit $CUT 2>/dev/null
+for p in $KS; do kill "$p" 2>/dev/null; done
+KS=
 
 echo "tunnels e2e: $pass ok, $fail fail"
 [ "$fail" = 0 ]

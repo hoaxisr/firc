@@ -4,12 +4,15 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "firc/keenetic_rci.h"
@@ -238,7 +241,7 @@ static bool bench_make(bench_t *b, const char *generate_out)
     snprintf(b->ndmc, sizeof b->ndmc, "%s/ndmc", b->dir);
     snprintf(b->token, sizeof b->token, "%s/lib/rci-token", b->dir);
     snprintf(b->calls, sizeof b->calls, "%s/calls", b->dir);
-    char path[128], script[2048];
+    char path[128], script[2560];
     snprintf(path, sizeof path, "%s/generate", b->dir);
     if (!write_text(path, generate_out, 0600)) { return false; }
     snprintf(path, sizeof path, "%s/show", b->dir);
@@ -250,12 +253,12 @@ static bool bench_make(bench_t *b, const char *generate_out)
              "[ ! -e %s/old ] || { echo 'no such command'; exit 127; }\n"
              "[ ! -e %s/firmware-libs ] || [ \"$LD_LIBRARY_PATH\" = /lib:/usr/lib ] || { echo 'ndmc: initialization failure.' >&2; exit 1; }\n"
              "case \"$2\" in\n"
-             "  'authentication token generate firc') [ ! -e %s/fail-generate ] || { printf '\\033[K\\n\\nCore::Security: user \"admin\" not found.\\n' >&2; exit 1; }; if [ -e %s/noisy-generate ]; then head -n 3 %s/generate; printf 'Core::Note: a note.\\n' >&2; tail -n +4 %s/generate; else cat %s/generate; fi ;;\n"
+             "  'authentication token generate firc') [ ! -e %s/slow-generate ] || { echo $$ > %s/pid; exec sleep 30; }; [ ! -e %s/fail-generate ] || { printf '\\033[K\\n\\nCore::Security: user \"admin\" not found.\\n' >&2; exit 1; }; if [ -e %s/noisy-generate ]; then head -n 3 %s/generate; printf 'Core::Note: a note.\\n' >&2; tail -n +4 %s/generate; else cat %s/generate; fi ;;\n"
              "  'show authentication token') cat %s/show ;;\n"
              "  'authentication token delete '*) [ ! -e %s/fail-delete ] || exit 1 ;;\n"
              "  *) echo 'no such command'; exit 127 ;;\n"
              "esac\n",
-             b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir);
+             b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir, b->dir);
     return write_text(b->ndmc, script, 0700);
 }
 
@@ -403,7 +406,7 @@ TEST a_kept_token_is_sent_before_the_release_is_known(void)
     ASSERT(bench_keep(&b, TOK_B));
     firc_kn_token_setup(b.token, b.ndmc);
     char tok[FIRC_KN_TOKEN_MAX], calls[1024];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     slurp(b.calls, calls, sizeof calls);
     ASSERT_STR_EQ(TOK_B, tok);
     ASSERT_STR_EQ("", calls);
@@ -617,8 +620,8 @@ TEST a_refusal_of_a_replaced_token_gives_the_current_one(void)
     firc_kn_token_setup(b.token, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX], fresh[FIRC_KN_TOKEN_MAX], calls[1024];
-    firc_kn_token_current(tok);
-    firc_kn_token_refused(STALE, fresh);
+    firc_kn_token_current(tok, NULL);
+    firc_kn_token_refused(STALE, fresh, NULL);
     slurp(b.calls, calls, sizeof calls);
     ASSERT_STR_EQ(TOK_B, tok);
     ASSERT_STR_EQ(TOK_B, fresh);
@@ -637,7 +640,7 @@ TEST a_token_that_cannot_be_kept_is_deleted_again(void)
     firc_kn_token_setup(path, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX], calls[1024];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     slurp(b.calls, calls, sizeof calls);
     ASSERT_STR_EQ("", tok);
     ASSERT_STR_EQ("authentication token generate firc\n"
@@ -658,7 +661,7 @@ TEST a_failed_generate_gives_no_token(void)
     firc_kn_token_setup(b.token, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     ASSERT_STR_EQ("", tok);
     ASSERT_EQ(-1, access(b.token, F_OK));
     bench_drop(&b);
@@ -677,7 +680,7 @@ TEST a_failed_generate_says_what_ndmc_answered(void)
     firc_kn_token_setup(b.token, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     firc_log_set_fd(STDOUT_FILENO);
     close(lp[1]);
     char log[4096];
@@ -700,7 +703,7 @@ TEST ndmc_runs_on_the_firmware_libraries(void)
     firc_kn_token_setup(b.token, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     unsetenv("LD_LIBRARY_PATH");
     ASSERT_STR_EQ(TOK_A, tok);
     bench_drop(&b);
@@ -716,7 +719,7 @@ TEST a_note_on_stderr_amid_the_token_keeps_it(void)
     firc_kn_token_setup(b.token, b.ndmc);
     firc_kn_token_set_release("5.02.A.11.0-1");
     char tok[FIRC_KN_TOKEN_MAX];
-    firc_kn_token_current(tok);
+    firc_kn_token_current(tok, NULL);
     ASSERT_STR_EQ(TOK_A, tok);
     bench_drop(&b);
     PASS();
@@ -767,12 +770,110 @@ TEST revoke_without_a_file_asks_unless_the_firmware_is_known_old(void)
     PASS();
 }
 
+static void *raise_later(void *ud)
+{
+    struct timespec ts = {0, 200 * 1000000L};
+    nanosleep(&ts, NULL);
+    atomic_store((atomic_bool *)ud, true);
+    return NULL;
+}
+
+static long ms_since(const struct timespec *a)
+{
+    struct timespec b;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    return (long)((b.tv_sec - a->tv_sec) * 1000 + (b.tv_nsec - a->tv_nsec) / 1000000);
+}
+
+static pid_t read_pid(bench_t *b)
+{
+    char path[128], text[32];
+    snprintf(path, sizeof path, "%s/pid", b->dir);
+    for (int i = 0; i < 2000; i++) {
+        slurp(path, text, sizeof text);
+        if (text[0] != '\0') { return (pid_t)atol(text); }
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* catches: a token issue not aborted, so a stop waits for ndmc */
+TEST a_stop_during_a_token_issue_returns_within_a_second(void)
+{
+    bench_t b;
+    ASSERT(bench_make(&b, GENERATE_OUT));
+    ASSERT(bench_flag(&b, "slow-generate"));
+    firc_kn_token_setup(b.token, b.ndmc);
+    atomic_bool stop = false;
+    pthread_t rt;
+    ASSERT_EQ(0, pthread_create(&rt, NULL, raise_later, &stop));
+    char out[FIRC_KN_TOKEN_MAX];
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    bool got = firc_kn_token_refused("", out, &stop);
+    long took = ms_since(&t0);
+    pthread_join(rt, NULL);
+    pid_t pid = read_pid(&b);
+    bool gone = pid > 0 && kill(pid, 0) != 0 && errno == ESRCH;
+    char again[FIRC_KN_TOKEN_MAX];
+    firc_kn_token_current(again, NULL);
+    char calls[1024];
+    slurp(b.calls, calls, sizeof calls);
+    ASSERT_FALSE(got);
+    ASSERT_STR_EQ("", out);
+    ASSERT(took < 1200);
+    ASSERT(gone);
+    ASSERT_STR_EQ("", again);
+    ASSERT_STR_EQ("authentication token generate firc\n", calls);
+    bench_drop(&b);
+    PASS();
+}
+
+static void *issue_without_stop(void *ud)
+{
+    (void)ud;
+    char tok[FIRC_KN_TOKEN_MAX];
+    firc_kn_token_current(tok, NULL);
+    return NULL;
+}
+
+/* catches: an untimed token-mutex wait, so a stop waits for another thread's issue */
+TEST a_stop_while_another_thread_issues_a_token_returns_at_once(void)
+{
+    bench_t b;
+    ASSERT(bench_make(&b, GENERATE_OUT));
+    ASSERT(bench_flag(&b, "slow-generate"));
+    firc_kn_token_setup(b.token, b.ndmc);
+    firc_kn_token_set_release("5.02.A.11.0-1");
+    pthread_t a;
+    ASSERT_EQ(0, pthread_create(&a, NULL, issue_without_stop, NULL));
+    ASSERT(read_pid(&b) > 0);
+    atomic_bool stop = false;
+    pthread_t rt;
+    ASSERT_EQ(0, pthread_create(&rt, NULL, raise_later, &stop));
+    char *body = NULL;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    firc_err_t err = firc_kn_rci_get_timeout("http://127.0.0.1:1", "/rci/show/version", 10, &stop, &body);
+    long took = ms_since(&t0);
+    pthread_join(rt, NULL);
+    pthread_join(a, NULL);
+    ASSERT_EQ(FIRC_ERR_CANCELED, err);
+    ASSERT_EQ(NULL, body);
+    ASSERT(took < 1200);
+    bench_drop(&b);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(only_5_02_and_later_get_a_token);
+    RUN_TEST(a_stop_during_a_token_issue_returns_within_a_second);
+    RUN_TEST(a_stop_while_another_thread_issues_a_token_returns_at_once);
     RUN_TEST(a_generated_token_is_read_from_the_bench_output);
     RUN_TEST(a_wrapped_value_is_joined);
     RUN_TEST(a_value_that_is_no_token_is_refused);

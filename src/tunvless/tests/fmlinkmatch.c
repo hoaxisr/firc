@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -9,9 +10,14 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include "unit.h"
 #include "../src/proto/transport/fmlink.c"
+#include "sdpeer.h"
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/lsan_interface.h>
+#endif
 
 static size_t fm_queued(const struct fm_link *l) {
     return l ? l->qd_len : 0;
@@ -880,28 +886,6 @@ static void t_direct_send_behind_queue(void) {
     close(sv[1]);
 }
 
-static void t_splices(void) {
-    /* catches: the hook reading one layer only, or NULL taken as a mask */
-    check("splices: no chain", 1, fm_splices(NULL));
-    const struct fm_ops *one[1] = { &op_x55s1 };
-    struct fm_link *l = fm_link_new_ops(one, (const struct fm_mask *const[1]){ NULL }, 1);
-    check("splices: [s1]", 1, fm_splices(l));
-    fm_link_free(l);
-    const struct fm_ops *gr[2] = { &op_gap, &op_rec };
-    struct fm_mask m[2] = { mk(10, 0), mk('r', 0) };
-    l = chain(2, gr, m);
-    check("splices: [gap, rec]", 1, fm_splices(l));
-    fm_link_free(l);
-    const struct fm_ops *mix[2] = { &op_x55s0, &op_x55s1 };
-    l = fm_link_new_ops(mix, (const struct fm_mask *const[2]){ NULL, NULL }, 2);
-    check("splices: lay [s1, s0]", 0, fm_splices(l));
-    fm_link_free(l);
-    const struct fm_ops *xim[2] = { &op_x55s1, &op_x55s0 };
-    l = fm_link_new_ops(xim, (const struct fm_mask *const[2]){ NULL, NULL }, 2);
-    check("splices: lay [s0, s1]", 0, fm_splices(l));
-    fm_link_free(l);
-}
-
 static void t_pending(void) {
     /* catches: held bytes not reported, which stalls a flow until more data arrives */
     int sv[2];
@@ -1014,7 +998,8 @@ static void t_open(void) {
     /* catches: an allocation for filter, or a config that fails to build dialed unmasked */
     static const char filt[] = "{\"tcp\":[{\"type\":\"filter\"}]}";
     static const char frag[] = "{\"tcp\":[{\"type\":\"fragment\",\"settings\":{\"length\":10}}]}";
-    static const char bad[] = "{\"tcp\":[{\"type\":\"sudoku\"}]}";
+    static const char bad[] = "{\"tcp\":[{\"type\":\"xmc\"}]}";
+    static const char sd[] = "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\"}}]}";
     static const char marker[] = "!fm";
     struct fm_link *l = (struct fm_link *)1;
     check("open: no mask", 0, fm_link_open(NULL, &l));
@@ -1026,6 +1011,9 @@ static void t_open(void) {
     check("open: config cached by pointer", 1, c != NULL && fm_cfg_get(filt) == c);
     check("open: fragment", 0, fm_link_open(frag, &l));
     check("open: fragment gets a link", 1, l != NULL);
+    fm_link_free(l);
+    check("open: sudoku", 0, fm_link_open(sd, &l));
+    check("open: sudoku gets a link", 1, l != NULL);
     fm_link_free(l);
     l = (struct fm_link *)1;
     check("open: refused config", -65, fm_link_open(bad, &l));
@@ -2036,6 +2024,459 @@ static void t_hc_deadline(void) {
     g_hc_ms = 0;
 }
 
+#define SD_JS "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":5,\"paddingMax\":20}}]}"
+#define SD_JS0 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+#define SD_JS100 "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMax\":100}}]}"
+
+static const struct fm_mask *sd_mask_of(const char *json) {
+    const struct fm_cfg *c = fm_cfg_get(json);
+    return c && c->n == 1 && c->m[0].kind == FM_SUDOKU ? &c->m[0] : NULL;
+}
+
+static const struct sd_set *sd_set_of(const char *json) {
+    const struct fm_mask *m = sd_mask_of(json);
+    return m ? sd_tables(&m->u.sd) : NULL;
+}
+
+static unsigned char *sd_pattern(size_t n, unsigned seed) {
+    unsigned char *b = malloc(n);
+    if (!b) exit(2);
+    for (size_t i = 0; i < n; i++) b[i] = (unsigned char)((i * 131 + seed) ^ (i >> 7));
+    return b;
+}
+
+struct sdrx { int fd; const struct sd_set *s; size_t want, got; unsigned char *out; int bad; };
+
+static void *sd_rx(void *p) {
+    struct sdrx *r = p;
+    struct tdec d;
+    unsigned char *raw = malloc(1 << 16), *tmp = malloc(1 << 16);
+    if (!raw || !tmp || tdec_init(&d, r->s)) {
+        r->bad = 1;
+        free(raw);
+        free(tmp);
+        return NULL;
+    }
+    uint64_t end = mono_ms() + 5000;
+    while (r->got < r->want && mono_ms() < end && !d.bad) {
+        struct pollfd q = { r->fd, POLLIN, 0 };
+        if (poll(&q, 1, 100) <= 0) continue;
+        ssize_t k = recv(r->fd, raw, 1 << 16, MSG_DONTWAIT);
+        if (k <= 0) continue;
+        size_t m = tdec_run(&d, raw, (size_t)k, tmp);
+        if (m > r->want - r->got) {
+            r->bad = 1;
+            break;
+        }
+        memcpy(r->out + r->got, tmp, m);
+        r->got += m;
+    }
+    r->bad |= d.bad;
+    tdec_free(&d);
+    free(raw);
+    free(tmp);
+    return NULL;
+}
+
+struct sdtx { int fd; const unsigned char *b; size_t n; };
+
+static void *sd_tx(void *p) {
+    struct sdtx *w = p;
+    size_t off = 0;
+    while (off < w->n) {
+        ssize_t k = send(w->fd, w->b + off, w->n - off, MSG_NOSIGNAL);
+        if (k <= 0) break;
+        off += (size_t)k;
+    }
+    return NULL;
+}
+
+static size_t sd_read_all(struct fm_link *l, int fd, unsigned char *out, size_t want, int flags) {
+    size_t got = 0;
+    uint64_t end = mono_ms() + 5000;
+    while (got < want && mono_ms() < end) {
+        if (flags & MSG_DONTWAIT) {
+            struct pollfd q = { fd, POLLIN, 0 };
+            poll(&q, 1, 50);
+        }
+        ssize_t r = fm_recv(l, fd, out + got, want - got, flags, 0);
+        if (r > 0) got += (size_t)r;
+        else if (r == 0) break;
+    }
+    return got;
+}
+
+static void sd_roundtrip(int loop) {
+    char what[96];
+    const char *mode = loop ? "loop" : "blocking";
+    enum { N = 65536 };
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { perror("socketpair"); exit(2); }
+    timeo(sv[0], 2000, 2000);
+    struct fm_link *l = NULL;
+    snprintf(what, sizeof what, "sd roundtrip %s: link", mode);
+    check(what, 0, fm_link_open(SD_JS, &l));
+    const struct sd_set *s = sd_set_of(SD_JS);
+    if (!l || !s) {
+        fm_link_free(l);
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    if (loop) {
+        fm_set_loop(l, 1);
+        fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+    }
+    unsigned char *up = sd_pattern(N, 3), *got = calloc(1, N), *down = sd_pattern(N, 77);
+    struct sdrx rx = { sv[1], s, N, 0, got, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, sd_rx, &rx);
+    snprintf(what, sizeof what, "sd roundtrip %s: 64 KiB written", mode);
+    check(what, N, (long)fm_send(l, sv[0], up, N, 0));
+    int nx = 0, rc = 0;
+    uint64_t end = mono_ms() + 5000;
+    while (loop && fm_queued(l) && mono_ms() < end && !rc) {
+        rc = fm_kick(l, sv[0], mono_ms(), &nx);
+        poll(NULL, 0, 1);
+    }
+    pthread_join(th, NULL);
+    snprintf(what, sizeof what, "sd roundtrip %s: the peer decodes 64 KiB", mode);
+    check(what, N, (long)rx.got);
+    snprintf(what, sizeof what, "sd roundtrip %s: the bytes sent", mode);
+    check(what, 1, !rx.bad && !memcmp(up, got, N));
+    struct tpk p = { s, 0, 30, 0x2545f4914f6cdd1du };
+    unsigned char *wire = malloc(2 * N + 16);
+    struct sdtx tx = { sv[1], wire, wire ? tpk_pack(&p, down, N, wire) : 0 };
+    pthread_t wt;
+    pthread_create(&wt, NULL, sd_tx, &tx);
+    memset(got, 0, N);
+    size_t rn = sd_read_all(l, sv[0], got, N, loop ? MSG_DONTWAIT : 0);
+    pthread_join(wt, NULL);
+    snprintf(what, sizeof what, "sd roundtrip %s: 64 KiB read back", mode);
+    check(what, N, (long)rn);
+    snprintf(what, sizeof what, "sd roundtrip %s: the bytes the peer packed", mode);
+    check(what, 0, memcmp(down, got, N));
+    fm_link_free(l);
+    free(up);
+    free(got);
+    free(down);
+    free(wire);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void t_sd_layer_roundtrip(void) {
+    /* catches: wr or rd not wired */
+    sd_roundtrip(0);
+    sd_roundtrip(1);
+}
+
+static size_t g_cnt_n[16], g_cnt_k;
+
+static int cnt_wr(struct fm_layer *me, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
+    (void)me;
+    if (g_cnt_k < 16) g_cnt_n[g_cnt_k] = n;
+    g_cnt_k++;
+    return emit(arg, d, n, 0);
+}
+
+static int cut_wr(struct fm_layer *me, const unsigned char *d, size_t n, fm_emit_fn emit, void *arg) {
+    (void)me;
+    size_t a = n / 3, b = 2 * n / 3;
+    int rc = emit(arg, d, a, 0);
+    if (!rc) rc = emit(arg, d + a, b - a, 0);
+    if (!rc) rc = emit(arg, d + b, n - b, 0);
+    return rc;
+}
+
+static const struct fm_ops op_cnt = { .splice = 1, .wr = cnt_wr };
+static const struct fm_ops op_cut = { .splice = 1, .wr = cut_wr };
+
+static void t_sd_one_emit_per_write(void) {
+    /* catches: the encoder emitting in chunks */
+    const struct fm_mask *m0 = sd_mask_of(SD_JS0), *m = sd_mask_of(SD_JS);
+    const struct sd_set *s = sd_set_of(SD_JS);
+    struct fm_mask none;
+    memset(&none, 0, sizeof none);
+    if (!m0 || !m || !s) {
+        check("sd one emit: configs", 1, 0);
+        return;
+    }
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { perror("socketpair"); exit(2); }
+    int big = 1 << 20;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
+    timeo(sv[0], 2000, 2000);
+    timeo(sv[1], 2000, 0);
+    const struct fm_ops *o1[2] = { &fm_sd_ops, &op_cnt };
+    const struct fm_mask *ms1[2] = { m0, &none };
+    struct fm_link *l = fm_link_new_ops(o1, ms1, 2);
+    check("sd one emit: [sudoku, counter] link", 1, l != NULL);
+    if (!l) {
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    unsigned char *d = sd_pattern(20000, 9);
+    g_cnt_k = 0;
+    static const size_t len[3] = { 1, 1000, 20000 };
+    unsigned char *raw = malloc(1 << 17);
+    for (int i = 0; i < 3; i++) {
+        fm_send(l, sv[0], d, len[i], 0);
+        size_t k = 0;
+        while (k < 4 * len[i]) {
+            ssize_t r = recv(sv[1], raw, 1 << 17, 0);
+            if (r <= 0) break;
+            k += (size_t)r;
+        }
+    }
+    check("sd one emit: three writes below sudoku", 3, (long)g_cnt_k);
+    check("sd one emit: 4 B for 1 B at chance 0", 4, (long)g_cnt_n[0]);
+    check("sd one emit: 4,000 B for 1,000 B", 4000, (long)g_cnt_n[1]);
+    check("sd one emit: 80,000 B for 20,000 B", 80000, (long)g_cnt_n[2]);
+    fm_link_free(l);
+    const struct fm_ops *o2[2] = { &op_cut, &fm_sd_ops };
+    const struct fm_mask *ms2[2] = { &none, m };
+    l = fm_link_new_ops(o2, ms2, 2);
+    check("sd one emit: [cutter, sudoku] link", 1, l != NULL);
+    if (l) {
+        unsigned char *got = calloc(1, 21001);
+        struct sdrx rx = { sv[1], s, 21001, 0, got, 0 };
+        pthread_t th;
+        pthread_create(&th, NULL, sd_rx, &rx);
+        for (int i = 0; i < 3; i++) fm_send(l, sv[0], d, len[i], 0);
+        pthread_join(th, NULL);
+        int same = rx.got == 21001 && !memcmp(got, d, 1) && !memcmp(got + 1, d, 1000) &&
+                   !memcmp(got + 1001, d, 20000);
+        check("sd one emit: three pieces per write decode intact", 1, !rx.bad && same);
+        free(got);
+        fm_link_free(l);
+    }
+    free(raw);
+    free(d);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void t_sd_room_grows(void) {
+    /* catches: room in wire bytes, which trips FM_Q_HARD on the next call */
+    struct fm_link *z = NULL;
+    check("sd room: chance 0 link", 0, fm_link_open(SD_JS0, &z));
+    check("sd room: chance 0, empty queue 65,536 / 4", 16384, (long)fm_room(z));
+    fm_link_free(z);
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { perror("socketpair"); exit(2); }
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+    unsigned char fill[4096];
+    memset(fill, 'f', sizeof fill);
+    while (send(sv[0], fill, sizeof fill, MSG_DONTWAIT) > 0) {}
+    while (send(sv[0], fill, 1, MSG_DONTWAIT) > 0) {}
+    struct fm_link *l = NULL;
+    check("sd room: link", 0, fm_link_open(SD_JS100, &l));
+    if (!l) {
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    fm_set_loop(l, 1);
+    check("sd room: empty queue 65,536 / 9", 7281, (long)fm_room(l));
+    unsigned char *d = sd_pattern(FM_Q_MAX, 5);
+    int eio = 0, over = 0;
+    size_t worst = 0;
+    for (int i = 0; i < 10; i++) {
+        size_t r = fm_room(l);
+        if (fm_send(l, sv[0], d, r, 0) < 0) eio = 1;
+        if (q_mem(l) > 65545) over = 1;
+        if (q_mem(l) > worst) worst = q_mem(l);
+    }
+    check("sd room: ten writes of the room, never TR_EIO", 0, eio);
+    check("sd room: queue at most 65,545 after each", 0, over);
+    check("sd room: the first write queued", 1, worst >= 4 * 7281);
+    free(d);
+    fm_link_free(l);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static int sd_sink(void *arg, const unsigned char *d, size_t n, int64_t gap) {
+    (void)d;
+    (void)gap;
+    *(size_t *)arg += n;
+    return 0;
+}
+
+struct sdth { struct fm_link *l; size_t wire; int rc; };
+
+static void *sd_thread(void *p) {
+    struct sdth *t = p;
+    unsigned char *d = sd_pattern(20000, 1);
+    t->rc = fm_shape(t->l, d, 20000, sd_sink, &t->wire);
+    free(d);
+    return NULL;
+}
+
+static void t_sd_scratch_thread(void) {
+    /* catches: the thread scratch never released */
+    static const char js[] = "{\"tcp\":[{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":100,"
+                             "\"paddingMax\":100}}]}";
+    struct sdth t = { NULL, 0, -1 };
+    check("sd scratch: link", 0, fm_link_open(js, &t.l));
+    if (!t.l) return;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33) && !defined(__SANITIZE_ADDRESS__)
+    struct mallinfo2 mb = mallinfo2();
+    size_t before = mb.uordblks + mb.hblkhd;
+#endif
+    pthread_t th;
+    pthread_create(&th, NULL, sd_thread, &t);
+    pthread_join(th, NULL);
+    check("sd scratch: the thread's write", 0, t.rc);
+    check("sd scratch: 9 x 20,000 + 1 B of wire", 180001, (long)t.wire);
+#if defined(__SANITIZE_ADDRESS__)
+    check("sd scratch: nothing left on the heap", 0, __lsan_do_recoverable_leak_check());
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
+    struct mallinfo2 ma = mallinfo2();
+    size_t after = ma.uordblks + ma.hblkhd;
+    check("sd scratch: the joined thread's buffer freed", 1, after < before + 65536);
+#endif
+    fm_link_free(t.l);
+}
+
+static void t_sd_init_refused(void) {
+    /* catches: a missing table set taken as a link */
+    struct fm_mask bad;
+    memset(&bad, 0, sizeof bad);
+    static char pat[1][9] = { "zzzzzzzz" };
+    bad.kind = FM_SUDOKU;
+    bad.u.sd.pw = (unsigned char *)"p";
+    bad.u.sd.pw_n = 1;
+    bad.u.sd.n_pat = 1;
+    bad.u.sd.pat = pat;
+    check("sd init: no table set", 1, sd_tables(&bad.u.sd) == NULL);
+    const struct fm_ops *o[1] = { &fm_sd_ops };
+    const struct fm_mask *m[1] = { &bad };
+    struct fm_link *l = fm_link_new_ops(o, m, 1);
+    check("sd init: the link refused", 1, l == NULL);
+    fm_link_free(l);
+}
+
+static long sd_inq(int fd) {
+    int n = -1;
+    return ioctl(fd, FIONREAD, &n) ? -1 : n;
+}
+
+static void t_sd_zero_yield(void) {
+    /* catches: a second recv in the same call after a zero-yield read */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { perror("socketpair"); exit(2); }
+    timeo(sv[0], 3000, 1000);
+    struct fm_link *l = NULL;
+    check("sd zero yield: link", 0, fm_link_open(SD_JS0, &l));
+    if (!l) {
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    unsigned char b[16];
+    check("sd zero yield: pad sent", 1, (long)send(sv[1], "\x10", 1, MSG_NOSIGNAL));
+    errno = 0;
+    uint64_t t0 = mono_ms();
+    ssize_t r = fm_recv(l, sv[0], b, sizeof b, 0, 0);
+    int e = errno;
+    uint64_t el = mono_ms() - t0;
+    check("sd zero yield, flags 0: -1", -1, (long)r);
+    check("sd zero yield, flags 0: EINTR", EINTR, e);
+    check("sd zero yield, flags 0: within 100 ms", 1, el < 100);
+    check("sd zero yield, flags 0: the pad was read", 0, sd_inq(sv[0]));
+    check("sd zero yield: second pad sent", 1, (long)send(sv[1], "\x10", 1, MSG_NOSIGNAL));
+    errno = 0;
+    r = fm_recv(l, sv[0], b, sizeof b, MSG_DONTWAIT, 0);
+    e = errno;
+    check("sd zero yield, MSG_DONTWAIT: -1", -1, (long)r);
+    check("sd zero yield, MSG_DONTWAIT: EAGAIN", EAGAIN, e);
+    check("sd zero yield, MSG_DONTWAIT: the pad was read", 0, sd_inq(sv[0]));
+    check("sd zero yield: hints sent", 3, (long)send(sv[1], "\x20\x20\x80", 3, MSG_NOSIGNAL));
+    r = fm_recv(l, sv[0], b, sizeof b, 0, 0);
+    check("sd zero yield: then one byte", 1, (long)r);
+    check("sd zero yield: 41", 0x41, r == 1 ? b[0] : -1);
+    fm_link_free(l);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+#define SD_HC "{\"tcp\":[{\"type\":\"header-custom\",\"settings\":{\"clients\":[[{\"packet\":[1]}]],\"servers\":[[{\"packet\":[2,2,2,2]}]]}}," \
+              "{\"type\":\"sudoku\",\"settings\":{\"password\":\"p\",\"paddingMin\":0,\"paddingMax\":0}}]}"
+
+struct sdhs { int fd, silent; const struct sd_set *s; long head; };
+
+static void *sd_hs_peer(void *p) {
+    struct sdhs *h = p;
+    unsigned char b[64], w[64];
+    struct pollfd q = { h->fd, POLLIN, 0 };
+    h->head = poll(&q, 1, 2000) == 1 ? (long)recv(h->fd, b, sizeof b, 0) : -1;
+    if (h->silent) {
+        send(h->fd, "\x10", 1, MSG_NOSIGNAL);
+        poll(NULL, 0, 800);
+        return NULL;
+    }
+    struct tpk k = { h->s, 0, 0, 1 };
+    static const unsigned char ans[4] = { 2, 2, 2, 2 };
+    size_t n = tpk_pack(&k, ans, 4, w);
+    for (size_t i = 0; i < n; i++) {
+        send(h->fd, "\x10", 1, MSG_NOSIGNAL);
+        poll(NULL, 0, 50);
+        send(h->fd, w + i, 1, MSG_NOSIGNAL);
+        poll(NULL, 0, 50);
+    }
+    return NULL;
+}
+
+static void t_sd_hs_zero_yield(void) {
+    /* catches: fm_lower_read_full treating EINTR as an error or a timeout */
+    const struct sd_set *s = sd_set_of(SD_JS0);
+    for (int silent = 0; silent < 2; silent++) {
+        const char *nm = silent ? "sd hs zero yield, silent" : "sd hs zero yield, drip";
+        char what[96];
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) { perror("socketpair"); exit(2); }
+        timeo(sv[0], 3000, 1000);
+        timeo(sv[1], 3000, 1000);
+        struct fm_link *l = NULL;
+        snprintf(what, sizeof what, "%s: link", nm);
+        check(what, 0, fm_link_open(SD_HC, &l));
+        if (!l || !s) {
+            fm_link_free(l);
+            close(sv[0]);
+            close(sv[1]);
+            continue;
+        }
+        struct sdhs h = { sv[1], silent, s, 0 };
+        pthread_t th;
+        pthread_create(&th, NULL, sd_hs_peer, &h);
+        uint64_t t0 = mono_ms();
+        int rc = fm_link_hs(l, sv[0], silent ? 300 : 3000);
+        uint64_t el = mono_ms() - t0;
+        pthread_join(th, NULL);
+        snprintf(what, sizeof what, "%s: the peer got the header", nm);
+        check(what, 1, h.head > 0);
+        if (silent) {
+            snprintf(what, sizeof what, "%s: TR_ECONNTIMEOUT", nm);
+            check(what, TR_ECONNTIMEOUT, rc);
+            snprintf(what, sizeof what, "%s: not before 290 ms", nm);
+            check(what, 1, el >= 290);
+            snprintf(what, sizeof what, "%s: not past 400 ms", nm);
+            check(what, 1, el <= 400);
+        } else {
+            snprintf(what, sizeof what, "%s: the exchange completes", nm);
+            check(what, 0, rc);
+            snprintf(what, sizeof what, "%s: why empty", nm);
+            check_str(what, "", fm_why(l));
+        }
+        fm_link_free(l);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 int main(void) {
     t_chain_order();
     t_hs_through_lower();
@@ -2053,7 +2494,6 @@ int main(void) {
     t_direct_splice();
     t_direct_send_splice();
     t_direct_send_behind_queue();
-    t_splices();
     t_pending();
     t_rand_between();
     t_open();
@@ -2082,5 +2522,12 @@ int main(void) {
     t_hc_metadata();
     t_hc_through_fragment();
     t_hc_deadline();
+    t_sd_layer_roundtrip();
+    t_sd_one_emit_per_write();
+    t_sd_room_grows();
+    t_sd_scratch_thread();
+    t_sd_init_refused();
+    t_sd_zero_yield();
+    t_sd_hs_zero_yield();
     return unit_done("fmlinkmatch");
 }

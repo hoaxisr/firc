@@ -1026,7 +1026,8 @@ static long xhttp_room(struct transport *t) {
     switch (x->mode) {
         case XH_STREAM_ONE: return xs_room(&x->f.one);
         case XH_STREAM_UP:
-            if (xs_room(&x->f.up) < UP_ROOM_LOW) post_pull(t);
+            if (xs_room(&x->f.up) < UP_ROOM_LOW / (long)fm_grow(x->f.up.x ? x->f.up.x->link.tls.fm : NULL))
+                post_pull(t);
             return xs_room(&x->f.up);
         case XH_PACKET_UP: {
             if (x->f.shared) {

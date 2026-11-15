@@ -14,7 +14,8 @@ struct fm_hc_item { struct fm_rng delay; int32_t rand; uint8_t rmin, rmax; unsig
                     char *capture, *reuse; struct fm_hc_expr *expr; };
 struct fm_hc_seq { size_t n; struct fm_hc_item *it; };
 struct fm_hc { size_t n_cl, n_sv, n_er; struct fm_hc_seq *cl, *sv, *er; };
-struct fm_mask { enum fm_kind kind; union { struct fm_frag frag; struct fm_hc hc; } u; };
+struct fm_sd { unsigned char *pw; size_t pw_n; uint8_t ascii; size_t n_pat; char (*pat)[9]; uint32_t pmin, pmax; };
+struct fm_mask { enum fm_kind kind; union { struct fm_frag frag; struct fm_hc hc; struct fm_sd sd; } u; };
 struct fm_cfg { size_t n; struct fm_mask *m; };
 
 size_t fm_compact(const char *json, size_t n, char *out, size_t cap);

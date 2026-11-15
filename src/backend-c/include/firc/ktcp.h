@@ -10,6 +10,7 @@
 #include "firc/ipset_to_link.h"
 
 #define FIRC_KTCP_DEVICES 100
+#define FIRC_KTCP_NAME_CAP 16
 #define FIRC_KTCP_MAP_MAX 65536
 #define FIRC_KTCP_CMD_LINES 4096
 

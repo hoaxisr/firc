@@ -6,6 +6,7 @@
   import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
+  import { interfaces } from "../../../data/interfaces.svelte";
   import { locale, t } from "../../../data/locale.svelte";
   import { ask } from "../../../utils/confirm.svelte";
   import type { TunnelsStore } from "../tunnels.svelte";
@@ -36,9 +37,9 @@
   import { DEVICE_PREFIXES, splitDevice } from "../../../data/iface-choices";
   import { counted } from "../../../utils/plural";
   import { usageAlert } from "../sub-usage";
-  import { descriptionProblem, formatRate } from "../tunnel-editor";
+  import { descriptionProblem, formatRate, routerWrite } from "../tunnel-editor";
   import { tunnelLook } from "../tunnel-state";
-  import type { ClientTunnel } from "../tunnels-data";
+  import { freeDevice, type ClientTunnel } from "../tunnels-data";
 
   type Props = {
     store: TunnelsStore;
@@ -68,6 +69,19 @@
   const saved = $derived(store.isSaved(tunnel.id));
   const device = $derived(splitDevice(tunnel.device));
   const prefixOptions = DEVICE_PREFIXES.map((p) => ({ value: p, label: p, mono: true }));
+  const deviceBad = $derived(store.deviceProblemOf(tunnel, t));
+  const routerName = $derived(deviceBad ? null : routerWrite(store.savedOf(tunnel.id), tunnel));
+  const ownRecord = $derived(live?.router?.state === "ready" ? live.router.name : null);
+  const why = $derived(
+    !live || live.status === "up" || (live.status === "router" && look?.icon !== "CircleX")
+      ? ""
+      : (live.why ?? ""),
+  );
+
+  function setPrefix(prefix: string) {
+    tunnel.device =
+      freeDevice(store.othersOf(tunnel.id), prefix, interfaces.list) || prefix + device.num;
+  }
   const up = $derived(live?.status === "up");
   const usable = $derived((live?.nodes ?? []).filter((n) => n.state !== "skipped").length);
   const subscriptions = $derived(tunnel.sources.filter((s) => s.kind === "subscription"));
@@ -121,7 +135,11 @@
     const ok = await ask({
       tone: "danger",
       title: t("Delete tunnel {device}?").replace("{device}", () => tunnel.device),
-      message: t("The tunnel goes away once you save."),
+      message: ownRecord
+        ? t(
+            "The tunnel goes away once you save. firc then removes {name} from the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
+          ).replace("{name}", () => ownRecord ?? "")
+        : t("The tunnel goes away once you save."),
       confirm: t("Delete"),
     });
     if (ok) store.removeTunnel(tunnel.id);
@@ -141,7 +159,7 @@
 <div class="card" data-tunnel={tunnel.id}>
   <Collapsible.Root {open} onOpenChange={(v) => onOpenChange(v)}>
     <div class="head">
-      <Tooltip value={look?.label ?? t("Not saved yet")}>
+      <Tooltip value={look ? (why ? `${look.label}: ${why}` : look.label) : t("Not saved yet")}>
         <span class="st" style:color={look?.color ?? "var(--text-2)"}>
           <Icon size={16} />
         </span>
@@ -155,9 +173,20 @@
               ariaLabel={t("Device prefix")}
               options={prefixOptions}
               selected={device.prefix}
-              onValueChange={(v: string) => (tunnel.device = v + device.num)}
+              onValueChange={setPrefix}
             />
-            <span class="title">{device.num}</span>
+            <input
+              type="text"
+              class="num"
+              inputmode="numeric"
+              maxlength="2"
+              aria-label={t("Device number")}
+              title={deviceBad ?? ""}
+              class:invalid={Boolean(deviceBad)}
+              aria-invalid={Boolean(deviceBad)}
+              value={device.num}
+              oninput={(e) => (tunnel.device = device.prefix + e.currentTarget.value.trim())}
+            />
           {/if}
           <input
             type="text"
@@ -190,6 +219,16 @@
           {:else if look}
             <span class="badge" class:toned style:--tone={look.color}>{look.label}</span>
           {/if}
+          {#if saved && live?.router}
+            <Tooltip value={t("The router's interface for this tunnel")}>
+              <span class="badge mono" data-router-name>{live.router.name}</span>
+            </Tooltip>
+            {#if live.router.state === "ready" && !live.router.saved}
+              <span class="badge toned" style:--tone="var(--orange)" data-router-unsaved>
+                {t("not saved in the router")}
+              </span>
+            {/if}
+          {/if}
           {#each alerts as a (a.name)}
             <span class="badge toned" style:--tone="var(--{a.tone})" data-sub-alert={a.name}>
               {t("«{name}»: {what}")
@@ -198,8 +237,21 @@
             </span>
           {/each}
         </div>
+        {#if deviceBad}
+          <div class="description-error" data-device-error>{deviceBad}</div>
+        {/if}
         {#if descriptionBad}
           <div class="description-error">{descriptionBad}</div>
+        {/if}
+        {#if why}
+          <div class="why" style:color={look?.color ?? "var(--text-2)"}>{why}</div>
+        {/if}
+        {#if routerName}
+          <div class="router-hint" data-router-hint>
+            {t(
+              "On save, firc writes {name} to the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
+            ).replace("{name}", () => routerName)}
+          </div>
         {/if}
         <div class="line-clip">
           <div class="line">
@@ -367,6 +419,34 @@
   .description-error {
     color: var(--red);
     font-size: 0.8rem;
+  }
+  .num {
+    width: 3ch;
+    box-sizing: content-box;
+    font: 600 1.3rem var(--font);
+    color: var(--text);
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--bg-light-extra);
+    padding: 0 0.2rem;
+  }
+  .num:focus {
+    outline: none;
+    border-bottom-color: var(--text-2);
+  }
+  .num.invalid {
+    border-bottom-color: var(--red);
+  }
+  .why,
+  .router-hint {
+    font-size: 0.8rem;
+    overflow-wrap: anywhere;
+  }
+  .router-hint {
+    color: var(--text-2);
+  }
+  .badge.mono {
+    font-family: var(--font-mono, monospace);
   }
   .line-clip {
     overflow: hidden;

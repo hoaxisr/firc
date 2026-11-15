@@ -17,6 +17,7 @@ import {
   orderByLatency,
   parseUplink,
   restartingDevices,
+  routerWrite,
   skippedLabels,
   subscriptionError,
   subscriptionIntervals,
@@ -28,6 +29,10 @@ import {
   wouldCycle,
 } from "../../src/modules/tunnels/tunnel-editor.ts";
 import type { Tunnel } from "../../src/types.ts";
+import { installSvelteRunesMocks } from "../mocks/setup-svelte-runes.ts";
+
+installSvelteRunesMocks();
+const { freeDevice } = await import("../../src/modules/tunnels/tunnels-data.ts");
 
 const t = (key: string) => key;
 
@@ -231,7 +236,7 @@ describe("the uplink choice", () => {
       { id: "ppp0", name: "Internet", role: "wan" as const },
       { id: "blackhole" },
       { id: "tunvless1", role: "tunnel" as const },
-      { id: "tunvless7", role: "tunnel" as const },
+      { id: "tunvless2", role: "tunnel" as const },
       { id: "br0", name: "Home", role: "lan" as const },
       { id: "eth2.1", role: "other" as const },
       { id: "nwg1", ndmsName: "Wireguard1", role: "tunnel" as const },
@@ -400,10 +405,18 @@ describe("device names", () => {
   it("accepts opkgtun and counts a number once across both prefixes", () => {
     const set = [tn("t0", "tunvless0"), tn("t1", "tunvless1")];
     assert.strictEqual(deviceProblem("opkgtun5", set, "t0"), null);
-    assert.strictEqual(deviceProblem("opkgtun99", set, "t0"), null);
     assert.strictEqual(deviceProblem("opkgtun1", set, "t0") !== null, true);
     assert.strictEqual(deviceProblem("opkgtun100", set, "t0") !== null, true);
     assert.strictEqual(deviceProblem("opkgtun01", set, "t0") !== null, true);
+  });
+
+  // Catches the PR's single 0..99 bound for both stems, or the router's OpkgTun limit put on tunvless.
+  it("holds opkgtun to N 0..16 and leaves tunvless at 0..99", () => {
+    const set = [tn("t0", "tunvless0")];
+    assert.strictEqual(deviceProblem("opkgtun17", set, "t0") !== null, true);
+    assert.strictEqual(deviceProblem("opkgtun99", set, "t0") !== null, true);
+    assert.strictEqual(deviceProblem("opkgtun16", set, "t0"), null);
+    assert.strictEqual(deviceProblem("tunvless17", set, "t0"), null);
   });
 });
 
@@ -559,5 +572,71 @@ describe("segments kernel TCP skips", () => {
     assert.deepStrictEqual(skippedLabels(["br1", "ppp0", "nwg2"], ifaces), ["Home", "nwg2"]);
     assert.deepStrictEqual(skippedLabels(["br1"], []), ["br1"]);
     assert.deepStrictEqual(skippedLabels(["ppp0", "nwg2", "br1"], ifaces), ["nwg2", "Home"]);
+  });
+});
+
+describe("an OpkgTun device", () => {
+  // Catches freeDevice ignoring the router's interfaces, so a new tunnel takes an OpkgTun something else holds.
+  it("picks the first N that no tunnel and no listed opkgtun holds", () => {
+    const ifaces = [{ id: "opkgtun0" }, { id: "opkgtun1" }];
+    assert.strictEqual(freeDevice([tn("t", "tunvless2")], "opkgtun", ifaces), "opkgtun3");
+  });
+
+  // Catches the listed opkgtun numbers held against tunvless, which has no router record to clash with.
+  it("leaves tunvless numbers to the tunnels alone", () => {
+    const ifaces = [{ id: "opkgtun0" }, { id: "tunvless1" }];
+    assert.strictEqual(freeDevice([tn("t", "tunvless2")], "tunvless", ifaces), "tunvless0");
+    assert.strictEqual(freeDevice([tn("t", "tunvless0")]), "tunvless1");
+  });
+
+  // Catches an opkgtun past the router's limit of 16 offered when every lower one is held.
+  it("gives nothing once opkgtun0 to opkgtun16 are held", () => {
+    const ifaces = Array.from({ length: 17 }, (_, n) => ({ id: `opkgtun${n}` }));
+    assert.strictEqual(freeDevice([], "opkgtun", ifaces), "");
+  });
+
+  // Catches a typed N that the router already holds as another program's OpkgTun accepted.
+  it("refuses an opkgtun the router already lists", () => {
+    const ifaces = [{ id: "opkgtun10" }];
+    assert.notStrictEqual(
+      deviceProblem("opkgtun10", [], "t0", (k) => k, ifaces),
+      null,
+    );
+    assert.strictEqual(
+      deviceProblem("opkgtun11", [], "t0", (k) => k, ifaces),
+      null,
+    );
+    assert.strictEqual(
+      deviceProblem("tunvless10", [], "t0", (k) => k, ifaces),
+      null,
+    );
+  });
+});
+
+describe("the router save hint", () => {
+  // Catches the hint on a tunvless tunnel, which writes nothing to the router.
+  it("is never shown for tunvless", () => {
+    assert.strictEqual(routerWrite(undefined, tn("t", "tunvless3")), null);
+    assert.strictEqual(
+      routerWrite(tn("t", "tunvless3"), tn("t", "tunvless3", { description: "x" })),
+      null,
+    );
+  });
+
+  // Catches a new opkg tunnel, or one whose description changes, saved without the warning.
+  it("names the OpkgTun a save writes", () => {
+    assert.strictEqual(routerWrite(undefined, tn("t", "opkgtun3")), "OpkgTun3");
+    assert.strictEqual(
+      routerWrite(tn("t", "opkgtun3"), tn("t", "opkgtun3", { description: "NL" })),
+      "OpkgTun3",
+    );
+  });
+
+  // Catches the hint on a saved opkg tunnel whose record a save would not touch.
+  it("stays away while the record is unchanged", () => {
+    assert.strictEqual(
+      routerWrite(tn("t", "opkgtun3"), tn("t", "opkgtun3", { filter: "NL", interval: 30 })),
+      null,
+    );
   });
 });

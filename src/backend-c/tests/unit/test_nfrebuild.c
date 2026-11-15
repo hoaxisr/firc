@@ -1559,7 +1559,9 @@ static bool add_tun_group(tun_rig_t *r, uint8_t tag, const char *iface, const ch
 
 static void set_port(tun_rig_t *r, int dev, uint16_t port) {
     r->ports[dev] = port;
-    firc_app_set_ktcp_ports(r->app, r->ports);
+    char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP];
+    for (int d = 0; d < FIRC_KTCP_DEVICES; d++) { snprintf(names[d], sizeof names[d], "tunvless%d", d); }
+    firc_app_set_tunnels(r->app, r->ports, (const char(*)[FIRC_KTCP_NAME_CAP])names);
 }
 
 static size_t redirects_of(tun_rig_t *r, uint8_t tag, uint16_t port) {

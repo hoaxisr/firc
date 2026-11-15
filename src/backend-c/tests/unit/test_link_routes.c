@@ -323,11 +323,17 @@ TEST a_down_link_is_warned_once_and_its_return_said(void) {
     PASS();
 }
 
-static size_t missing_said_at(const char *iface, firc_log_level_t level) {
+static bool only_opkgtun3(void *ud, const char *iface) {
+    (void)ud;
+    return strcmp(iface, "opkgtun3") == 0;
+}
+
+static size_t missing_said_at(const char *iface, firc_log_level_t level, firc_tunnel_dev_fn known) {
     fixture_t f;
     if (!up(&f, IFF_UP)) { return (size_t)-1; }
     firc_ipset_to_link_free(f.link);
     f.link = firc_ipset_to_link_new("FIRC_g1", iface, f.ipt, NULL, f.rtnl, 100, NULL, "g1", NULL, NULL);
+    firc_ipset_to_link_set_tunnel_dev(f.link, known, NULL);
     firc_event_reset_for_test();
     (void)firc_ipset_to_link_enable(f.link, NULL);
     char needle[64];
@@ -337,11 +343,14 @@ static size_t missing_said_at(const char *iface, firc_log_level_t level) {
     return n;
 }
 
-/* Catches: a tunnel firc has not started yet warned about, or a missing real interface no longer warned. */
-TEST a_missing_tunnel_is_info_and_a_missing_interface_a_warning(void) {
-    ASSERT_EQ_FMT((size_t)1, missing_said_at("tunvless0", FIRC_LOG_INFO), "%zu");
-    ASSERT_EQ_FMT((size_t)0, missing_said_at("tunvless0", FIRC_LOG_WARN), "%zu");
-    ASSERT_EQ_FMT((size_t)1, missing_said_at("nofirc9", FIRC_LOG_WARN), "%zu");
+/* Catches: a configured tunnel not started yet warned about, or a foreign opkgtun or tunvless taken for one by its name. */
+TEST a_configured_device_missing_is_info(void) {
+    ASSERT_EQ_FMT((size_t)1, missing_said_at("opkgtun3", FIRC_LOG_INFO, only_opkgtun3), "%zu");
+    ASSERT_EQ_FMT((size_t)0, missing_said_at("opkgtun3", FIRC_LOG_WARN, only_opkgtun3), "%zu");
+    ASSERT_EQ_FMT((size_t)1, missing_said_at("tunvless0", FIRC_LOG_WARN, only_opkgtun3), "%zu");
+    ASSERT_EQ_FMT((size_t)1, missing_said_at("opkgtun10", FIRC_LOG_WARN, only_opkgtun3), "%zu");
+    ASSERT_EQ_FMT((size_t)1, missing_said_at("opkgtun3", FIRC_LOG_WARN, NULL), "%zu");
+    ASSERT_EQ_FMT((size_t)1, missing_said_at("nofirc9", FIRC_LOG_WARN, only_opkgtun3), "%zu");
     PASS();
 }
 
@@ -1554,7 +1563,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_reject_default_on_the_interface_is_not_a_gatewayless_one);
     RUN_TEST(an_event_while_the_link_is_down_writes_nothing);
     RUN_TEST(a_down_link_is_warned_once_and_its_return_said);
-    RUN_TEST(a_missing_tunnel_is_info_and_a_missing_interface_a_warning);
+    RUN_TEST(a_configured_device_missing_is_info);
     RUN_TEST(a_missing_interface_is_said_again_every_ten_minutes);
     RUN_TEST(one_familys_failure_does_not_cost_the_other_its_refresh);
     RUN_TEST(a_refused_blackhole_on_link_up_still_writes_both_defaults);

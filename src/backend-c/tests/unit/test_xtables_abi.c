@@ -20,6 +20,7 @@
 #include <linux/netfilter/xt_connbytes.h>
 #include <linux/netfilter/xt_string.h>
 #include <linux/netfilter/xt_NFLOG.h>
+#include <linux/netfilter/xt_TCPMSS.h>
 #include <linux/netfilter_ipv4/ipt_REJECT.h>
 #include <linux/netfilter_ipv6/ip6t_REJECT.h>
 #include <linux/netfilter/xt_mark.h>
@@ -279,6 +280,9 @@ _Static_assert(offsetof(struct xt_nflog_info, threshold) == offsetof(xt_nflog_in
 _Static_assert(offsetof(struct xt_nflog_info, flags) == offsetof(xt_nflog_info_t, flags), "abi mismatch");
 _Static_assert(offsetof(struct xt_nflog_info, pad) == offsetof(xt_nflog_info_t, pad), "abi mismatch");
 _Static_assert(offsetof(struct xt_nflog_info, prefix) == offsetof(xt_nflog_info_t, prefix), "abi mismatch");
+_Static_assert(sizeof(struct xt_tcpmss_info) == sizeof(xt_tcpmss_info_t), "abi mismatch");
+_Static_assert(offsetof(struct xt_tcpmss_info, mss) == offsetof(xt_tcpmss_info_t, mss), "abi mismatch");
+_Static_assert(XT_TCPMSS_CLAMP_PMTU == 0xffff, "abi mismatch");
 
 _Static_assert(KERNEL_CB_PKTS == XT_CONNBYTES_PKTS, "abi mismatch");
 _Static_assert(KERNEL_CB_BYTES == XT_CONNBYTES_BYTES, "abi mismatch");

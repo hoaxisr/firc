@@ -131,6 +131,7 @@ NETFILTER_SRCS := \
     src/netfilter/pool_reject.c \
     src/netfilter/dnat.c \
     src/netfilter/redir.c \
+    src/netfilter/mss.c \
     src/netfilter/checkroute.c \
     src/netlink/rtnl.c \
     src/netlink/watcher.c
@@ -158,6 +159,7 @@ TUNNELS_SRCS := \
     src/tunnels/inbound_check.c \
     src/tunnels/tunproto.c \
     src/tunnels/ktcp.c \
+    src/tunnels/tunaddr.c \
     src/tunnels/tunsup.c \
     src/tunnels/tunnet.c \
     src/tunnels/tunrun.c \
@@ -224,6 +226,8 @@ INTERFACES_SRCS := \
     src/interfaces/keenetic_rci.c \
     src/interfaces/keenetic_policy.c \
     src/interfaces/keenetic_resolvers.c \
+    src/interfaces/opkgtun.c \
+    src/interfaces/opkgtun_io.c \
     src/interfaces/rci_token.c \
     src/interfaces/router_id.c
 
@@ -319,6 +323,11 @@ $(BUILDDIR)/tests/test_oom: tests/unit/test_oom.c $(LIB_OBJS) $(TEST_SUPPORT_OBJ
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(OOM_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
+$(BUILDDIR)/tests/test_tunaddr: tests/unit/test_tunaddr.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(BUILDDIR)/tunvless/src/tunnel/ifcfg.o
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit -I$(TUNVLESS_DIR)/src/tunnel $(LDFLAGS) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(BUILDDIR)/tunvless/src/tunnel/ifcfg.o $(LDLIBS) $(DEP_LIBS)
+
 APP_WRAP := -Wl,--wrap=firc_dnsproxy_close_group_pools,--wrap=firc_dnsproxy_forget_group,--wrap=if_nametoindex,--wrap=firc_loop_add_timer
 
 $(BUILDDIR)/tests/test_app: tests/unit/test_app.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
@@ -354,6 +363,13 @@ $(BUILDDIR)/tests/test_update: tests/unit/test_update.c $(LIB_OBJS) $(TEST_SUPPO
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(UPDATE_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
+OPKGTUN_WRAP := -Wl,--wrap=pthread_create
+
+$(BUILDDIR)/tests/test_opkgtun: tests/unit/test_opkgtun.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(OPKGTUN_WRAP) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
 LISTEN_WRAP := -Wl,--wrap=socket
 
 $(BUILDDIR)/tests/test_listen: tests/unit/test_listen.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
@@ -386,7 +402,7 @@ sanitize:
 	    LDFLAGS="-fsanitize=$(SAN)" test
 
 # Own build dir: TSan and ASan objects do not mix.
-TSAN_TESTS := test_keenetic_policy test_keenetic_resolvers test_loop test_queue test_nfcommit test_sub_worker test_app test_update test_update_api test_settings_api test_ifcheck test_router_id test_rci_token
+TSAN_TESTS := test_keenetic_policy test_keenetic_resolvers test_loop test_queue test_nfcommit test_sub_worker test_app test_update test_update_api test_settings_api test_ifcheck test_router_id test_rci_token test_opkgtun
 TSAN_BINS := $(TSAN_TESTS:%=build/tsan/tests/%)
 tsan:
 	$(MAKE) BUILD=tsan \

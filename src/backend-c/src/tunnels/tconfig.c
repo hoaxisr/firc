@@ -655,9 +655,6 @@ static firc_err_t parse_uplink(ctx_t *c, node_t *v, size_t ti, firc_tunnel_t *t)
     if (strcmp(buf, "auto") == 0) {
         t->uplink = FIRC_UPLINK_AUTO;
     } else if (strncmp(buf, "iface:", 6) == 0 && firc_is_interface_name(buf + 6)) {
-        if (firc_tunvless_prefixed(buf + 6)) {
-            return fail(c, "use tunnel:<id> to chain tunnels", "tunnels[%zu].uplink", ti);
-        }
         t->uplink = FIRC_UPLINK_IFACE;
         strcpy(t->uplink_ref, buf + 6);
     } else if (strncmp(buf, "tunnel:", 7) == 0 && id_ok(buf + 7) && strlen(buf + 7) < sizeof t->id) {
@@ -788,10 +785,18 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
     return FIRC_OK;
 }
 
-static bool device_ok(const char *d, bool *prefix)
+static const char *device_problem(const char *d)
 {
-    *prefix = firc_tunvless_prefixed(d);
-    return firc_tunvless_index(d) >= 0;
+    if (firc_tundev_name_index(d) >= 0 && firc_is_interface_name(d)) {
+        return NULL;
+    }
+    if (firc_tundev_is_opkg(d)) {
+        return "opkgtun<N> needs N 0..16, the router's limit for OpkgTun";
+    }
+    if (strncmp(d, "tunvless", 8) == 0) {
+        return "tunvless<N> needs N 0..99";
+    }
+    return "must start with tunvless or opkgtun";
 }
 
 static const firc_tunnel_t *find_id(const firc_tunnels_t *ts, const char *id)
@@ -862,19 +867,21 @@ static firc_err_t validate(ctx_t *c, const firc_tunnels_t *ts)
                 return fail(c, "id used twice", "tunnels[%zu].id", i);
             }
         }
-        bool prefix;
-        if (!device_ok(t->device, &prefix) || !firc_is_interface_name(t->device)) {
-            return fail(c, prefix ? "must be tunvless<N> or opkgtun<N>, N 0..99" : "must start with tunvless or opkgtun",
-                        "tunnels[%zu].device", i);
+        const char *why = device_problem(t->device);
+        if (why != NULL) {
+            return fail(c, why, "tunnels[%zu].device", i);
         }
         for (size_t j = 0; j < i; j++) {
-            if (firc_tunvless_index(ts->t[j].device) == firc_tunvless_index(t->device)) {
+            if (firc_tunnel_index(&ts->t[j]) == firc_tunnel_index(t)) {
                 return fail(c, "device used twice", "tunnels[%zu].device", i);
             }
         }
     }
     for (size_t i = 0; i < ts->n; i++) {
         const firc_tunnel_t *t = &ts->t[i];
+        if (t->uplink == FIRC_UPLINK_IFACE && firc_tunnels_by_device(ts, t->uplink_ref) != NULL) {
+            return fail(c, "use tunnel:<id> to chain tunnels", "tunnels[%zu].uplink", i);
+        }
         if (t->uplink == FIRC_UPLINK_TUNNEL) {
             if (strcmp(t->uplink_ref, t->id) == 0) {
                 return fail(c, "a tunnel cannot use itself as its uplink", "tunnels[%zu].uplink", i);
@@ -1325,16 +1332,37 @@ bool firc_tunnel_same_nodes(const firc_tunnel_t *a, const firc_tunnel_t *b)
     return true;
 }
 
+int firc_tunnel_index(const firc_tunnel_t *t)
+{
+    return firc_tundev_name_index(t->device);
+}
+
+void firc_tunnels_names(const firc_tunnels_t *ts, char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP])
+{
+    memset(names, 0, sizeof(char[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP]));
+    for (size_t i = 0; ts != NULL && i < ts->n; i++) {
+        int n = firc_tunnel_index(&ts->t[i]);
+        if (n >= 0 && n < FIRC_KTCP_DEVICES) {
+            snprintf(names[n], FIRC_KTCP_NAME_CAP, "%s", ts->t[i].device);
+        }
+    }
+}
+
+const firc_tunnel_t *firc_tunnels_by_device(const firc_tunnels_t *ts, const char *dev)
+{
+    for (size_t i = 0; ts != NULL && dev != NULL && i < ts->n; i++) {
+        if (strcmp(ts->t[i].device, dev) == 0) {
+            return &ts->t[i];
+        }
+    }
+    return NULL;
+}
+
 uint16_t firc_tunnel_tcp_port(const firc_tunnel_t *t)
 {
-    bool prefix;
-    if (!t->enable || !t->kernel_tcp || !device_ok(t->device, &prefix)) {
+    int n = firc_tunnel_index(t);
+    if (!t->enable || !t->kernel_tcp || n < 0) {
         return 0;
-    }
-    const char *d = t->device + 8;
-    int n = d[0] - '0';
-    if (d[1] != '\0') {
-        n = n * 10 + (d[1] - '0');
     }
     return (uint16_t)(FIRC_TUNNEL_TCP_PORT_BASE + n);
 }

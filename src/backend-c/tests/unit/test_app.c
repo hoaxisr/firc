@@ -238,6 +238,17 @@ static unsigned test_iface_index(const char *name) {
 static int64_t g_capture_seconds;
 static bool g_app_no_sets;
 static bool g_app_no_v6;
+static const char *g_app_lack_target;
+static bool g_app_lack_v6_only;
+
+static firc_xt_t *app_xt(firc_fake_ipt_t *f, bool v6) {
+    firc_xt_t *xt = firc_fake_ipt_as_xt(f);
+    if (g_app_lack_target != NULL && xt != NULL && (v6 || !g_app_lack_v6_only)) {
+        firc_fake_xt_lack(firc_fake_ipt_xt(f), true, g_app_lack_target, 0);
+        (void)firc_xt_probe(xt);
+    }
+    return xt;
+}
 
 static firc_dnsproxy_t *g_app_proxy;
 static firc_kn_resolvers_t *g_app_resolvers;
@@ -318,9 +329,11 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
     l->router = firc_resolve_router_new(l->pipeline);
     if (l->router == NULL) { return false; }
     l->fake = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
-    l->ipt = firc_ipt_new(firc_fake_ipt_as_xt(l->fake), "FIRC_");
+    l->ipt = firc_ipt_new(app_xt(l->fake, false), "FIRC_");
     l->fake6 = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV6);
-    l->ipt6 = firc_ipt_new(firc_fake_ipt_as_xt(l->fake6), "FIRC_");
+    l->ipt6 = firc_ipt_new(app_xt(l->fake6, true), "FIRC_");
+    g_app_lack_target = NULL;
+    g_app_lack_v6_only = false;
     firc_netfilter_register_base_chains(l->ipt, l->ipt6);
     l->kernel = fake_rtnl_start(&l->rtnl);
     if (l->kernel == NULL) { return false; }
@@ -347,6 +360,12 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
                             .iface_index = test_iface_index,
                             .capture_seconds = g_capture_seconds,
                             .mono_ms = g_app_mono};
+    g_capture_seconds = 0;
+    g_app_proxy = NULL;
+    g_app_resolvers = NULL;
+    g_app_mono = NULL;
+    g_app_no_sets = false;
+    g_app_no_v6 = false;
     l->app = firc_app_create(&deps);
     l->remap = firc_port_remap_new(l->cfg.app.netfilter.iptables.chain_prefix, 53, 3553, NULL, 0,
                                   l->ipt, NULL);
@@ -379,6 +398,8 @@ static void locked_app_down_rest(locked_app_t *l) {
     g_app_mono = NULL;
     g_app_no_sets = false;
     g_app_no_v6 = false;
+    g_app_lack_target = NULL;
+    g_app_lack_v6_only = false;
     for (int w = 0; w < 2; w++) {
         fake_nflog_stop(g_tap_kernel[w]);
         g_tap_kernel[w] = NULL;
@@ -2827,7 +2848,7 @@ TEST remove_by_id_and_by_index(void) {
 TEST the_list_never_holds_the_loopback(void) {
     firc_iface_info_t *ifaces = NULL;
     size_t n = 0;
-    ASSERT_EQ(FIRC_OK, firc_app_list_interfaces(NULL, &ifaces, &n));
+    ASSERT_EQ(FIRC_OK, firc_app_list_interfaces(NULL, NULL, &ifaces, &n));
     for (size_t i = 0; i < n; i++) {
         ASSERT(strcmp(ifaces[i].id, "lo") != 0);
         for (size_t j = i + 1; j < n; j++) {
@@ -3812,7 +3833,7 @@ TEST a_startup_whose_first_group_fails_starts_the_rest(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(2, "good.example", NULL, NULL)));
     ASSERTm("fixture: before the start the config is the view", view_owner(&l, "bad.example") != NULL);
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_FALSEm("group 1 met the refusal", fake_rtnl_failure_armed(l.kernel));
     ASSERT(firc_app_is_running(l.app));
     ASSERT_STR_EQ("not-enabled", live_reason(&l, 1));
@@ -3837,7 +3858,7 @@ TEST a_startup_whose_first_write_is_refused_comes_up_on_the_retry(void) {
     firc_id_t gid = {{1, 1, 1, 1}};
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     firc_fake_ipt_fail_at_commit(l.fake, 1, FIRC_ERR_IO);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERTm("the startup wrote no iptables", firc_fake_ipt_failure_armed(l.fake));
     ASSERT_STR_EQ("live", live_reason(&l, 1));
 
@@ -4018,7 +4039,7 @@ TEST before_the_first_pass_a_group_reads_not_written(void) {
     ASSERT(locked_app_up_no_committer(&l));
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     firc_nfcommit_health_t h;
     firc_app_netfilter_health(l.app, &h);
     ASSERT_FALSEm("no committer, nothing pending", h.first_pending);
@@ -4054,7 +4075,7 @@ TEST a_block_group_is_live_without_a_link(void) {
     free(g->iface);
     g->iface = strdup("block");
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
     firc_app_nf_enter(l.app);
     firc_app_pool_changed(l.app);
@@ -4072,7 +4093,7 @@ TEST live_follows_the_interface_link(void) {
     ASSERT(locked_app_up_no_committer(&l));
     fake_rtnl_set_link_flags(l.kernel, 0x10);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
 
     firc_app_nf_enter(l.app);
@@ -4155,7 +4176,7 @@ TEST a_dns_proxy_down_holds_every_group_and_its_return_stages_the_redirect(void)
     g3->iface = strdup("nolink0");
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g3));
     firc_app_set_dns_down(l.app, true);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
     ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(l.app));
     ASSERT(wait_written_after(&l, 0));
@@ -4194,7 +4215,7 @@ TEST live_reads_the_tunnel_behind_the_interface(void) {
     firc_app_set_tunnel_down(l.app, fake_tunnel_down, NULL);
     g_tun_down_iface = "lo";
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
 
     firc_app_nf_enter(l.app);
@@ -4342,7 +4363,7 @@ TEST a_failing_group_is_a_warning_then_an_error_and_an_end(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     fake_rtnl_fail_times(l.kernel, RTM_NEWRULE, EPERM, 4);
     uint64_t mark = journal_mark();
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     g_now_ms += 1000;
     firc_app_retry_groups(l.app, NULL);
     g_rep_ms += 5 * 60 * 1000 - 1;
@@ -4379,7 +4400,7 @@ TEST a_group_that_failed_comes_up_by_itself_on_link_up(void) {
     firc_id_t gid = {{1, 1, 1, 1}};
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_FALSEm("the refusal fired", fake_rtnl_failure_armed(l.kernel));
     ASSERT_STR_EQ("not-enabled", live_reason(&l, 1));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
@@ -4414,7 +4435,7 @@ TEST a_group_that_keeps_failing_is_retried_no_more_often_than_its_spacing(void) 
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     fake_rtnl_fail_times(l.kernel, RTM_NEWRULE, EPERM, 1000);
     uint64_t mark = journal_mark();
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     const uint64_t t0 = g_now_ms;
     static const struct { uint64_t at; size_t tries; uint64_t delay; } steps[] = {
         {0, 1, 1000},          {999, 1, 1000},        {1000, 2, 2000},     {2999, 2, 2000},
@@ -4452,7 +4473,7 @@ TEST a_failed_group_comes_up_on_its_timer_with_no_trigger(void) {
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_FALSEm("the refusal fired", fake_rtnl_failure_armed(l.kernel));
     ASSERT_STR_EQ("not-enabled", live_reason(&l, 1));
     uint64_t delay = 0;
@@ -4482,7 +4503,7 @@ TEST an_edit_that_fails_starts_a_fresh_run(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     uint64_t mark = journal_mark();
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     g_now_ms += 1000;
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
     firc_app_retry_groups(l.app, NULL);
@@ -4540,7 +4561,7 @@ TEST a_retry_that_holds_ends_the_run(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     uint64_t mark = journal_mark();
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT(wait_written_after(&l, 0));
     g_now_ms += 1000;
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
@@ -4576,7 +4597,7 @@ TEST a_group_that_failed_comes_up_by_itself_after_a_pass(void) {
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_FALSEm("the refusal fired", fake_rtnl_failure_armed(l.kernel));
     ASSERT_STR_EQ("not-enabled", live_reason(&l, 1));
 
@@ -6816,7 +6837,7 @@ TEST a_startup_after_the_lookup_writes_a_deny_policy_on_its_first_pass(void) {
     char *deny[] = {guests};
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, selector_group(1, NULL, 0, deny, 1)));
     firc_app_set_device_lookup(l.app, stub_mark, stub_hosts, stub_policy_hosts, NULL, NULL);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
     firc_app_pool_changed(l.app);
     ASSERT(wait_written_after(&l, 0));
@@ -6918,7 +6939,7 @@ static bool boot_deny_guests(locked_app_t *l, char *dchain, size_t cap) {
     }
     firc_app_set_device_lookup(l->app, boot_mark, stub_hosts, stub_policy_hosts, NULL, NULL);
     firc_app_set_policies_read(l->app, boot_read);
-    if (firc_app_start_groups(l->app) != FIRC_OK || firc_app_start_netfilter_committer(l->app) != FIRC_OK) {
+    if (firc_app_start_groups(l->app, NULL) != FIRC_OK || firc_app_start_netfilter_committer(l->app) != FIRC_OK) {
         return false;
     }
     firc_app_pool_changed(l->app);
@@ -7215,6 +7236,18 @@ TEST the_clean_writes_nothing_left_staged_before_it(void) {
     PASS();
 }
 
+static void set_ports(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEVICES]) {
+    static char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP];
+    for (int d = 0; d < FIRC_KTCP_DEVICES; d++) { snprintf(names[d], sizeof names[d], "tunvless%d", d); }
+    firc_app_set_tunnels(app, ports, (const char(*)[FIRC_KTCP_NAME_CAP])names);
+}
+
+static void name_one(firc_app_t *app, const uint16_t ports[FIRC_KTCP_DEVICES], int n, const char *name) {
+    char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP] = {{0}};
+    snprintf(names[n], sizeof names[n], "%s", name);
+    firc_app_set_tunnels(app, ports, (const char(*)[FIRC_KTCP_NAME_CAP])names);
+}
+
 typedef struct {
     firc_fakeip_t *pool;
     int calls;
@@ -7258,7 +7291,7 @@ static bool ktcp_up(locked_app_t *l, firc_loop_t *loop, ktcp_rec_t *rec, firc_ip
     firc_app_set_ktcp_sink(l->app, &sink);
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l->app, ports);
+    set_ports(l->app, ports);
     return firc_app_add_group(l->app, tunnel_group(1, "a.example", "tunvless3")) == FIRC_OK &&
            issue_unwritten(l, "a.example", 1, fake) && firc_fakeip_needs_commit(l->pool, fake);
 }
@@ -7374,7 +7407,7 @@ TEST the_image_is_sorted_by_device_and_fake(void) {
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
     ports[1] = 3601;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(4, "d.example", "tunvless1")));
     static const char *const names3[] = {"a2.example", "a3.example"};
     static const char *const names1[] = {"d1.example", "d2.example", "d3.example"};
@@ -7467,6 +7500,85 @@ TEST an_undelivered_report_frees_its_image(void) {
     PASS();
 }
 
+static bool redirected_into(const char *configured, const char *iface, firc_ip_t *fake, bool *redir, bool *real) {
+    locked_app_t l;
+    ktcp_rec_t rec;
+    if (!ktcp_up(&l, NULL, &rec, fake)) { return false; }
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[10] = 3610;
+    name_one(l.app, ports, 10, configured);
+    bool ok = firc_app_add_group(l.app, tunnel_group(2, "b.example", iface)) == FIRC_OK &&
+              issue_unwritten(&l, "b.example", 2, fake) && firc_app_rebuild_netfilter_kind(l.app, NULL, true) == FIRC_OK;
+    firc_app_nf_enter(l.app);
+    char *nat = firc_fake_ipt_print(l.fake, "nat");
+    firc_app_nf_leave(l.app);
+    *redir = nat != NULL && strstr(nat, "--to-ports 3610") != NULL;
+    free(nat);
+    firc_ip_t got = {{0}, 0};
+    *real = firc_app_ktcp_real_of(l.app, 10, fake->b, &got);
+    locked_app_down(&l);
+    return ok;
+}
+
+/* Catches: a group on another program's opkgtun10 given tunnel 10's REDIRECT and map because the digits match. */
+TEST a_foreign_opkgtun_gets_no_kernel_tcp(void) {
+    firc_ip_t fake = {{0}, 0};
+    bool redir = true, real = true;
+    ASSERT(redirected_into("tunvless10", "opkgtun10", &fake, &redir, &real));
+    ASSERT_FALSE(redir);
+    ASSERT_FALSE(real);
+    PASS();
+}
+
+/* Catches: a configured opkgtun device refused kernel TCP, or sent to another port than 3600 + N. */
+TEST a_configured_opkgtun_gets_kernel_tcp(void) {
+    firc_ip_t fake = {{0}, 0};
+    bool redir = false, real = false;
+    ASSERT(redirected_into("opkgtun10", "opkgtun10", &fake, &redir, &real));
+    ASSERT(redir);
+    ASSERT(real);
+    PASS();
+}
+
+/* Catches: the DNS cross flag raised for a group on another program's opkgtun3 because tunnel 3 has a port. */
+TEST a_foreign_opkgtun_gets_no_cross_flag(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "opkgtun3")));
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[3] = 3603;
+    name_one(l.app, ports, 3, "tunvless3");
+    firc_resolve_route_t r;
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERT_FALSE(r.ktcp);
+    name_one(l.app, ports, 3, "opkgtun3");
+    ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
+    ASSERT(r.ktcp);
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the groups started before tunnels.yaml's devices are named, so every start warns that a tunnel not up yet is missing. */
+TEST a_start_names_the_tunnels_before_the_groups(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up_no_committer(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "opkgtun2")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(2, "b.example", "opkgtun9")));
+    firc_tunnel_t t;
+    memset(&t, 0, sizeof t);
+    snprintf(t.device, sizeof t.device, "opkgtun2");
+    const firc_tunnels_t ts = {.t = &t, .n = 1};
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, &ts));
+    ASSERT_EQ_FMT((size_t)1, journal_count_at(mark, FIRC_LOG_INFO, "interface opkgtun2 not found"), "%zu");
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_WARN, "interface opkgtun2 not found"), "%zu");
+    ASSERT_EQ_FMT((size_t)1, journal_count_at(mark, FIRC_LOG_WARN, "interface opkgtun9 not found"), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
 static bool redir_there(locked_app_t *l) {
     firc_app_nf_enter(l->app);
     bool there = firc_fake_ipt_chain_exists(l->fake, "nat", "FIRC_REDIR");
@@ -7487,15 +7599,16 @@ TEST ports_change_requests_a_pass(void) {
     ASSERT(wait_written_after(&l, 0));
     ASSERT_FALSE(redir_there(&l));
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    set_ports(l.app, ports);
     firc_app_nf_enter(l.app);
     uint64_t change = firc_app_nf_change_for_test(l.app);
     firc_app_nf_leave(l.app);
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     firc_app_nf_enter(l.app);
     ASSERT_EQ_FMT(change, firc_app_nf_change_for_test(l.app), "%" PRIu64);
     firc_app_nf_leave(l.app);
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     bool there = false;
     for (int i = 0; i < 500 && !there; i++) {
         there = redir_there(&l);
@@ -7518,7 +7631,7 @@ TEST a_refused_redirect_takes_the_cross_flag_down(void) {
     ASSERT_FALSEm("no port yet", r.ktcp);
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
     ASSERTm("tunvless3 has a port", r.ktcp);
     firc_xt_acl_t acl;
@@ -7530,7 +7643,7 @@ TEST a_refused_redirect_takes_the_cross_flag_down(void) {
     ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
     ASSERTm("the next pass staged it", r.ktcp);
     ports[3] = 0;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT(firc_resolve_router_route(l.router, tag_id(1), &r));
     ASSERT_FALSEm("the port is gone", r.ktcp);
     locked_app_down(&l);
@@ -7543,14 +7656,371 @@ TEST an_unchanged_port_table_interrupts_no_pass(void) {
     ASSERT(locked_app_up(&l));
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     uint64_t enters = firc_app_nf_enters_for_test(l.app);
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT_EQ_FMT(enters, firc_app_nf_enters_for_test(l.app), "%" PRIu64);
     ports[5] = 3605;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT_EQ_FMT(enters + 1, firc_app_nf_enters_for_test(l.app), "%" PRIu64);
     locked_app_down(&l);
+    PASS();
+}
+
+static const char *const k_mss_jump[] = {"-j", "FIRC_MSS"};
+static const char *const k_clamp_tunvless1[] = {"-o", "tunvless1", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST",
+                                                "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
+static const char *const k_clamp_tunvless2[] = {"-o", "tunvless2", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST",
+                                                "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
+
+static bool mss_parts_are(const firc_ipt_rule_t *rule, const char *const *want, size_t n) {
+    if (rule->n_parts != n) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(rule->parts[i], want[i]) != 0) { return false; }
+    }
+    return true;
+}
+
+static bool clamps_are(locked_app_t *l, firc_fake_ipt_t *fake, const char *const *const *want, size_t n_want) {
+    firc_app_nf_enter(l->app);
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    bool ok = firc_fake_ipt_get_rules(fake, "mangle", "FIRC_MSS", &rules, &n) && n == n_want;
+    for (size_t i = 0; ok && i < n; i++) { ok = mss_parts_are(rules[i], want[i], 12); }
+    firc_ipt_rule_t *const *fwd = NULL;
+    size_t n_fwd = 0;
+    ok = ok && firc_fake_ipt_get_rules(fake, "mangle", "FORWARD", &fwd, &n_fwd) && n_fwd > 0 &&
+         mss_parts_are(fwd[0], k_mss_jump, 2);
+    firc_app_nf_leave(l->app);
+    return ok;
+}
+
+static bool no_clamp(locked_app_t *l, firc_fake_ipt_t *fake) {
+    firc_app_nf_enter(l->app);
+    bool chain = firc_fake_ipt_chain_exists(fake, "mangle", "FIRC_MSS");
+    char *text = firc_fake_ipt_print(fake, "mangle");
+    bool jump = text == NULL || strstr(text, "FIRC_MSS") != NULL;
+    free(text);
+    firc_app_nf_leave(l->app);
+    return !chain && !jump;
+}
+
+static unsigned mss_links(const char *name) {
+    if (strcmp(name, "nwg0") == 0) { return 11; }
+    if (strncmp(name, "tunvless", 8) == 0) { return 12; }
+    return if_nametoindex(name);
+}
+
+static bool mss_up(locked_app_t *l) {
+    if (!locked_app_up_no_committer(l)) { return false; }
+    fake_rtnl_set_link_flags(l->kernel, 0x1 | 0x10);
+    firc_rtnl_set_nametoindex_for_test(mss_links);
+    firc_app_set_running(l->app, true);
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    set_ports(l->app, none);
+    return true;
+}
+
+static void mss_down(locked_app_t *l) {
+    locked_app_down(l);
+    firc_rtnl_set_nametoindex_for_test(NULL);
+}
+
+static firc_group_t *listed_tunnel_group(uint8_t tag, const char *host, const char *const *names, size_t n) {
+    firc_group_t *g = activation_group(tag, host, NULL, NULL);
+    firc_group_set_ifaces(g, names, n);
+    return g;
+}
+
+/* Catches: the active entry only, a duplicate per group, a non-tunvless interface or a disabled group clamped. */
+TEST the_clamp_covers_every_tunvless_entry_once(void) {
+    static const char *const listed[] = {"nwg0", "tunvless2"};
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(2, "b.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(3, "c.example", listed, 2)));
+    firc_group_t *off = tunnel_group(4, "d.example", "tunvless4");
+    off->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, off));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(clamps_are(&l, l.fake6, want, 2));
+    for (size_t to = 0; to < 2; to++) {
+        ASSERT_EQ(FIRC_OK, firc_app_move_group(l.app, tag_id(3), 1 - to, false));
+        ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+        ASSERT(clamps_are(&l, l.fake, want, 2));
+        ASSERT(clamps_are(&l, l.fake6, want, 2));
+    }
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a clamp or an empty chain staged for a group that names no tunvless device. */
+TEST a_group_on_no_tunvless_stages_no_clamp(void) {
+    static const char *const plain[] = {"nwg0"};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(1, "a.example", plain, 1)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a stale chain kept across passes. */
+TEST the_clamp_leaves_with_the_last_tunvless_group(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    mss_down(&l);
+    PASS();
+}
+
+static const char *const k_clamp_opkgtun2[] = {"-o", "opkgtun2", "-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST",
+                                               "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"};
+
+/* Catches: a clamp staged for an entry by its opkgtun name, so another program's device gets firc's MSS rule. */
+TEST a_foreign_opkgtun_gets_no_clamp(void) {
+    static const char *const listed[] = {"nwg0", "opkgtun10"};
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    name_one(l.app, none, 10, "tunvless10");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(1, "a.example", listed, 2)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: the clamp written for tunvless<N> whatever the configured device of N is. */
+TEST the_clamp_names_the_configured_device(void) {
+    static const char *const *const want[] = {k_clamp_opkgtun2};
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    name_one(l.app, none, 2, "opkgtun2");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "opkgtun2")));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a new device for the same N ignored because the ports did not change. */
+TEST a_name_change_restages_the_clamp(void) {
+    static const char *const listed[] = {"opkgtun2", "tunvless2"};
+    static const char *const *const before[] = {k_clamp_opkgtun2};
+    static const char *const *const after[] = {k_clamp_tunvless2};
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    name_one(l.app, none, 2, "opkgtun2");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_tunnel_group(1, "a.example", listed, 2)));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(clamps_are(&l, l.fake, before, 1));
+    name_one(l.app, none, 2, "tunvless2");
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT(clamps_are(&l, l.fake, after, 1));
+    ASSERT(clamps_are(&l, l.fake6, after, 1));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a missing target failing the whole pass, or staged anyway and refused. */
+TEST a_kernel_without_tcpmss_writes_the_pass_without_the_clamp(void) {
+    g_app_lack_target = "TCPMSS";
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT(pass_landed(&l));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_ERROR, "the kernel refused the TCP MSS clamp"), "%zu");
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: the chain staged only on a config change, so a firmware rewrite of mangle loses it for good. */
+TEST a_rewrite_of_mangle_brings_the_clamp_back(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    set_ports(l.app, none);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT(first_pass_done(&l));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    firc_app_nf_enter(l.app);
+    firc_fake_ipt_reset(l.fake);
+    firc_fake_ipt_reset(l.fake6);
+    firc_app_nf_leave(l.app);
+    ASSERT(no_clamp(&l, l.fake));
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_force_commit_iptables(l.app));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(clamps_are(&l, l.fake6, want, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: the TCPMSS gate read from one family for both, so a v6 kernel without it fails the pass or loses the v4 clamp. */
+TEST a_v6_kernel_without_tcpmss_keeps_the_v4_clamp(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1};
+    g_app_lack_target = "TCPMSS";
+    g_app_lack_v6_only = true;
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT(clamps_are(&l, l.fake, want, 1));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)0, journal_count_at(mark, FIRC_LOG_ERROR, "the kernel refused the TCP MSS clamp"), "%zu");
+    mss_down(&l);
+    PASS();
+}
+
+static bool two_redirected_tunnels_up(locked_app_t *l) {
+    if (!mss_up(l)) { return false; }
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[1] = 3601;
+    ports[2] = 3602;
+    set_ports(l->app, ports);
+    return firc_app_add_group(l->app, tunnel_group(1, "a.example", "tunvless1")) == FIRC_OK &&
+           firc_app_add_group(l->app, tunnel_group(2, "b.example", "tunvless2")) == FIRC_OK;
+}
+
+/* Catches: a refused clamp leaving groups out, or the retry dropping REDIR with MSS. */
+TEST a_refused_mss_chain_costs_only_itself(void) {
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the kernel TCP redirect"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a refused clamp sent to the group search when no REDIR was staged, leaving groups out. */
+TEST a_refused_clamp_without_redir_leaves_no_group_out(void) {
+    locked_app_t l;
+    ASSERT(mss_up(&l));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(1, "a.example", "tunvless1")));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, tunnel_group(2, "b.example", "tunvless2")));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a v6 refusal of the clamp also dropping the v4 clamp or REDIR. */
+TEST a_refused_v6_clamp_keeps_the_v4_clamp_and_redir(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the kernel TCP redirect"));
+    mss_down(&l);
+    PASS();
+}
+
+/* Catches: a ladder that drops MSS whenever anything is refused. */
+TEST a_refused_redir_keeps_the_clamp(void) {
+    static const char *const *const want[] = {k_clamp_tunvless1, k_clamp_tunvless2};
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j REDIRECT");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(clamps_are(&l, l.fake, want, 2));
+    ASSERT(clamps_are(&l, l.fake6, want, 2));
+    ASSERT_FALSE(journal_says(mark, "the kernel refused the TCP MSS clamp"));
+    mss_down(&l);
+    PASS();
+}
+
+/* catches: one pass refusing the clamp and REDIR keeping either, or saying either twice. */
+TEST a_refused_clamp_and_redir_in_one_pass_drop_both(void) {
+    locked_app_t l;
+    ASSERT(two_redirected_tunnels_up(&l));
+    firc_fake_ipt_refuse_rules_containing(l.fake, "-j TCPMSS");
+    firc_fake_ipt_refuse_also_containing(l.fake, "-j REDIRECT");
+    firc_fake_ipt_refuse_rules_containing(l.fake6, "-j TCPMSS");
+    uint64_t mark = journal_mark();
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, true));
+    ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 2));
+    ASSERT_FALSE(firc_fake_ipt_chain_exists(l.fake, "nat", "FIRC_REDIR"));
+    ASSERT(no_clamp(&l, l.fake));
+    ASSERT(no_clamp(&l, l.fake6));
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the TCP MSS clamp; TCP into tunvless keeps the client's MSS"),
+                  "%zu");
+    ASSERT_EQ_FMT((size_t)1,
+                  journal_count_at(mark, FIRC_LOG_ERROR,
+                                   "the kernel refused the kernel TCP redirect; TCP stays on the TUN"),
+                  "%zu");
+    ASSERT_FALSE(journal_says(mark, "is left out of netfilter"));
+    mss_down(&l);
     PASS();
 }
 
@@ -7592,7 +8062,7 @@ static void attach_close(locked_app_t *l, close_rec_t *rec) {
     firc_app_set_ktcp_sink(l->app, &sink);
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l->app, ports);
+    set_ports(l->app, ports);
 }
 
 static firc_group_t *tunnel_subnet_group(uint8_t tag, const char *iface, const char *const *subnets, size_t n) {
@@ -8198,6 +8668,51 @@ TEST a_kept_group_still_sweeps_the_prefix_it_lost(void) {
     PASS();
 }
 
+/* Catches: a group on another program's opkgtun3 sent tunnel 3's close and left waiting for an ack that never comes. */
+TEST a_foreign_group_withdraw_pays_at_once(void) {
+    locked_app_t l;
+    close_rec_t rec;
+    const uint8_t sub[4] = {10, 81, 0, 9};
+    ASSERT(closing_up(&l, &rec, "opkgtun3", k_closed_subnet, 1));
+    firc_app_nf_enter(l.app);
+    rec.sent = 1;
+    firc_app_nf_leave(l.app);
+    plant_flow(&l, 1, sub, sub);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    ASSERT(wait_written_after(&l, started));
+    ASSERT_EQ_FMT(0, close_seen(&l, &rec).calls, "%d");
+    ASSERTm("paid without an ack", fake_ct_deleted(l.ctk, sub, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+/* Catches: a queued flush resolving its device when it is paid, so a rename in between drops the close it owed. */
+TEST a_queued_flush_keeps_its_tunnel_after_a_rename(void) {
+    locked_app_t l;
+    close_rec_t rec;
+    const uint8_t sub[4] = {10, 81, 0, 9};
+    g_now_ms = 5000;
+    g_app_mono = test_clock;
+    ASSERT(closing_up(&l, &rec, "tunvless3", k_closed_subnet, 1));
+    plant_flow(&l, 1, sub, sub);
+    static const uint16_t none[FIRC_KTCP_DEVICES] = {0};
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    firc_app_nf_enter(l.app);
+    rec.sent = 1;
+    ASSERT(firc_app_remove_group_by_id(l.app, tag_id(1)));
+    name_one(l.app, none, 0, "");
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT_EQ_FMT(1, close_seen(&l, &rec).calls, "%d");
+    ASSERT_EQ_FMT(3, close_seen(&l, &rec).dev, "%d");
+    ASSERT_FALSEm("waits for the ack", fake_ct_deleted(l.ctk, sub, 4));
+    firc_app_ktcp_closed(l.app, 3);
+    ASSERTm("paid on tunnel 3's ack", fake_ct_deleted(l.ctk, sub, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
 /* Catches: a close sent for a group whose interface is no tunnel. */
 TEST a_non_tunnel_group_sends_no_close(void) {
     locked_app_t l;
@@ -8224,17 +8739,17 @@ TEST a_miss_answers_real_only_for_a_group_routed_into_that_device(void) {
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
     ports[4] = 3604;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     firc_ip_t real = {{0}, 0};
     ASSERTm("routed into tunvless3", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
     ASSERT_EQ(4, real.len);
     ASSERT_EQ(0, memcmp(real.b, k_issued_real, 4));
     ASSERT_FALSEm("asked by tunvless4", firc_app_ktcp_real_of(l.app, 4, f1.b, &real));
     ports[3] = 0;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     ASSERT_FALSEm("tunvless3 has no port", firc_app_ktcp_real_of(l.app, 3, f1.b, &real));
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
 
     ASSERT(issue_unwritten(&l, "a.example", 2, &moved));
     memset(&real, 0, sizeof(real));
@@ -8727,7 +9242,7 @@ static bool redirected_listed_up_ex(locked_app_t *l, close_rec_t *rec, const cha
     firc_app_set_ktcp_sink(l->app, &sink);
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[0] = 3600;
-    firc_app_set_ktcp_ports(l->app, ports);
+    set_ports(l->app, ports);
     firc_group_t *g = activation_group(1, "a.example", NULL, NULL);
     firc_group_set_ifaces(g, names, n);
     firc_ip_t fake = {{0}, 0};
@@ -8980,7 +9495,7 @@ TEST a_failed_list_group_is_retried_when_its_second_entry_comes_up(void) {
     firc_rtnl_set_nametoindex_for_test(up_links);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, listed_group(2, "b.example")));
     fake_rtnl_fail_next_of(l.kernel, RTM_NEWRULE, EPERM);
-    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
     ASSERT_FALSEm("fixture: the refusal fired", fake_rtnl_failure_armed(l.kernel));
     ASSERT_STR_EQ("not-enabled", live_reason(&l, 2));
     g_now_ms += FIRC_APP_RETRY_MIN_MS;
@@ -9417,7 +9932,7 @@ TEST a_trial_search_writes_each_set_once(void) {
     ASSERT(sets_up(&l));
     uint16_t ports[FIRC_KTCP_DEVICES] = {0};
     ports[3] = 3603;
-    firc_app_set_ktcp_ports(l.app, ports);
+    set_ports(l.app, ports);
     static const char *const one[] = {"10.1.0.0/16"};
     static const char *const two[] = {"10.2.0.0/16"};
     firc_group_t *tun = bare_group(1, "one", one, 1);
@@ -10219,11 +10734,29 @@ int main(int argc, char **argv) {
     RUN_TEST(the_map_is_pushed_before_held_answers_are_released);
     RUN_TEST(the_image_holds_only_redirect_groups_pairs);
     RUN_TEST(the_image_is_sorted_by_device_and_fake);
+    RUN_TEST(a_foreign_opkgtun_gets_no_kernel_tcp);
+    RUN_TEST(a_configured_opkgtun_gets_kernel_tcp);
+    RUN_TEST(a_foreign_opkgtun_gets_no_cross_flag);
+    RUN_TEST(a_start_names_the_tunnels_before_the_groups);
     RUN_TEST(a_failed_report_post_keeps_the_last_pushed_image);
     RUN_TEST(ports_change_requests_a_pass);
     RUN_TEST(an_undelivered_report_frees_its_image);
     RUN_TEST(an_unchanged_port_table_interrupts_no_pass);
     RUN_TEST(a_refused_redirect_takes_the_cross_flag_down);
+    RUN_TEST(the_clamp_covers_every_tunvless_entry_once);
+    RUN_TEST(a_group_on_no_tunvless_stages_no_clamp);
+    RUN_TEST(the_clamp_leaves_with_the_last_tunvless_group);
+    RUN_TEST(a_kernel_without_tcpmss_writes_the_pass_without_the_clamp);
+    RUN_TEST(a_rewrite_of_mangle_brings_the_clamp_back);
+    RUN_TEST(a_refused_mss_chain_costs_only_itself);
+    RUN_TEST(a_refused_clamp_without_redir_leaves_no_group_out);
+    RUN_TEST(a_refused_redir_keeps_the_clamp);
+    RUN_TEST(a_refused_clamp_and_redir_in_one_pass_drop_both);
+    RUN_TEST(a_foreign_opkgtun_gets_no_clamp);
+    RUN_TEST(the_clamp_names_the_configured_device);
+    RUN_TEST(a_name_change_restages_the_clamp);
+    RUN_TEST(a_refused_v6_clamp_keeps_the_v4_clamp_and_redir);
+    RUN_TEST(a_v6_kernel_without_tcpmss_keeps_the_v4_clamp);
     RUN_TEST(removing_a_tunnel_group_closes_its_chunks_and_subnets);
     RUN_TEST(a_narrowed_selector_closes_chunks_and_subnets);
     RUN_TEST(a_narrowing_edit_closes_each_prefix_once);
@@ -10231,6 +10764,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_routed_again_the_same_way_closes_nothing);
     RUN_TEST(the_stop_closes_nothing);
     RUN_TEST(a_non_tunnel_group_sends_no_close);
+    RUN_TEST(a_foreign_group_withdraw_pays_at_once);
+    RUN_TEST(a_queued_flush_keeps_its_tunnel_after_a_rename);
     RUN_TEST(a_withdrawn_tunnel_groups_flush_waits_for_the_close_ack);
     RUN_TEST(an_unanswered_close_pays_the_flush_after_a_second);
     RUN_TEST(a_tunnel_group_with_no_live_child_is_flushed_at_once);

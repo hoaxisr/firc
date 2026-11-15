@@ -726,17 +726,11 @@ static int hu_write(struct transport *t, const unsigned char *d, size_t n) {
 static int hu_read_wait(struct transport *t, unsigned char *d, size_t cap, size_t *got) {
     const unsigned char *in = d;
     size_t n = 0;
-    if (t->link.plain) {
-        ssize_t k = tr_lk_recv(&t->link, d, cap, 0);
-        if (k <= 0) return tr_lk_err(&t->link, k);
-        n = (size_t)k;
-    } else {
-        int rc = tls13_read_ref(&t->link.tls, &in, &n);
-        if (rc) return rc;
-    }
+    int rc = tls13_read_ref(&t->link.tls, &in, &n);
+    if (rc) return rc;
     if (!n) return 0;
     size_t used = 0;
-    int rc = tr_h1_lazy(t, 0, in, n, &used);
+    rc = tr_h1_lazy(t, 0, in, n, &used);
     if (rc <= 0) return rc;
     size_t rest = n - used;
     if (rest > cap) return H2_ETOOBIG;
