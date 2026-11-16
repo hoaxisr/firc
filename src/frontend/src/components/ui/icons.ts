@@ -21,6 +21,7 @@ export { default as Filter } from "@lucide/svelte/icons/filter";
 export { default as Ban } from "@lucide/svelte/icons/ban";
 export { default as Sigma } from "@lucide/svelte/icons/sigma";
 export { default as Bug } from "@lucide/svelte/icons/bug";
+export { default as Braces } from "@lucide/svelte/icons/braces";
 export { default as MoveUp } from "@lucide/svelte/icons/chevron-up";
 export { default as MoveDown } from "@lucide/svelte/icons/chevron-down";
 export { default as CircleCheck } from "@lucide/svelte/icons/circle-check";

@@ -2,7 +2,7 @@
   import { t } from "../data/locale.svelte";
   import GenericDialog from "./ui/GenericDialog.svelte";
 
-  import { BookOpen, Bug, Globe } from "./ui/icons";
+  import { BookOpen, Braces, Bug, Globe } from "./ui/icons";
 
   const version = import.meta.env.VITE_PKG_VERSION || "0.0.0";
 
@@ -47,6 +47,20 @@
           {t("Bug Tracker")}
           <a target="_blank" rel="noopener noreferrer" href="https://github.com/hoaxisr/firc/issues"
             >https://github.com/hoaxisr/firc/issues</a
+          >
+        </div>
+      </div>
+      <div class="block">
+        <div class="icon">
+          <Braces size={22} />
+        </div>
+        <div class="text">
+          {t("API")}
+          <a
+            target="_blank"
+            rel="noopener noreferrer"
+            href="https://github.com/hoaxisr/firc/blob/main/docs/swagger.yaml"
+            >https://github.com/hoaxisr/firc/blob/main/docs/swagger.yaml</a
           >
         </div>
       </div>

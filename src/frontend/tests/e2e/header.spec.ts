@@ -84,6 +84,12 @@ test.describe("Header Settings", () => {
       "href",
       "https://firc.hoaxisr.ru",
     );
+    await expect(dialog.locator("text=API")).toBeVisible();
+    await expect(
+      dialog.getByRole("link", {
+        name: "https://github.com/hoaxisr/firc/blob/main/docs/swagger.yaml",
+      }),
+    ).toHaveAttribute("href", "https://github.com/hoaxisr/firc/blob/main/docs/swagger.yaml");
 
     await page.keyboard.press("Escape");
     await expect(dialog).not.toBeVisible();

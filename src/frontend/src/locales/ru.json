@@ -997,5 +997,6 @@
   "{n} times packets were lost before the capture read them: this capture is not complete.": "Потерь пакетов до того, как захват их прочитал: {n}. Этот захват неполный.",
   "The dedup table filled at {n} pairs: past that, a bypass is reported every time rather than once a minute.": "Таблица повторов заполнилась (пар: {n}): дальше об утечке сообщается каждый раз, а не раз в минуту.",
   "There was no memory to remember some pairs by: those are reported every time rather than once a minute.": "Не хватило памяти, чтобы запомнить некоторые пары: о них сообщается каждый раз, а не раз в минуту.",
-  "{n} datagrams came from another process on this machine and were ignored: the capture reads what the kernel sends it and nothing else.": "Датаграмм от другого процесса на роутере, оставленных без внимания: {n}. Захват читает только то, что ему присылает ядро."
+  "{n} datagrams came from another process on this machine and were ignored: the capture reads what the kernel sends it and nothing else.": "Датаграмм от другого процесса на роутере, оставленных без внимания: {n}. Захват читает только то, что ему присылает ядро.",
+  "API": "API"
 }
