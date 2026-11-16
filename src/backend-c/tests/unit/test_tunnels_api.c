@@ -318,6 +318,7 @@ static struct {
     int p[2];
     bool open;
     uint32_t recheck;
+    bool pol_failed;
 } g_rt;
 
 static char g_wake_dir[64];
@@ -535,7 +536,7 @@ TEST get_answers_every_tunnel_in_the_agreed_shape(void)
     cJSON *ans = NULL;
     ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &ans));
     ASSERT(same_json(ans,
-                     "{\"tunnels\":[{\"id\":\"a\",\"device\":\"tunvless0\",\"description\":\"PRAW-1\",\"enable\":true,"
+                     "{\"tunnels\":[{\"id\":\"a\",\"device\":\"tunvless0\",\"description\":\"PRAW-1\",\"enable\":true,\"routerPolicies\":false,"
                      "\"uplink\":{\"kind\":\"auto\",\"ref\":\"\"},"
                      "\"sources\":[{\"id\":\"0000000a\",\"kind\":\"link\",\"link\":\"" LINK_A "\"},"
                      "{\"id\":\"0000000b\",\"kind\":\"subscription\",\"name\":\"P\",\"url\":\"" SUB_URL "\","
@@ -543,7 +544,7 @@ TEST get_answers_every_tunnel_in_the_agreed_shape(void)
                      "\"filter\":\"^(A|B)$\",\"order\":[\"0000000b:B\"],\"exclude\":[\"0000000b:C\"],\"inbounds\":[],"
                      "\"active\":2,\"by\":\"site\",\"interval\":30,\"silence\":10,"
                      "\"advanced\":{\"timeout\":5,\"insecure\":true,\"ca\":\"/etc/ca.pem\",\"fingerprint\":\"\",\"kernelTcp\":false}},"
-                     "{\"id\":\"b\",\"device\":\"tunvless1\",\"description\":\"\",\"enable\":false,"
+                     "{\"id\":\"b\",\"device\":\"tunvless1\",\"description\":\"\",\"enable\":false,\"routerPolicies\":false,"
                      "\"uplink\":{\"kind\":\"iface\",\"ref\":\"eth9\"},\"sources\":[],"
                      "\"filter\":\"\",\"order\":[],\"exclude\":[],\"inbounds\":[],"
                      "\"active\":1,\"by\":\"connection\",\"interval\":60,\"silence\":20,"
@@ -1980,6 +1981,10 @@ static size_t rt_seen(firc_opkgtun_seen_t *out, size_t cap, uint32_t *swept, voi
     out->saved = true;
     out->rechecked = g_rt.recheck;
     snprintf(out->error, sizeof out->error, "NDM said no");
+    if (g_rt.pol_failed) {
+        out->policies = FIRC_OPKG_POL_FAILED;
+        snprintf(out->pol_error, sizeof out->pol_error, "global priority should be non-zero");
+    }
     return 1;
 }
 
@@ -1990,7 +1995,7 @@ static void rt_none(void *ud)
 
 static void rt_attach(hx_t *h)
 {
-    const firc_tunrun_router_t r = {rt_want, rt_seen, rt_none, rt_none, g_rt.p[0], NULL};
+    const firc_tunrun_router_t r = {rt_want, rt_seen, rt_none, rt_none, g_rt.p[0], NULL, NULL};
     firc_tunrun_set_router(h->run, &r);
 }
 
@@ -2037,8 +2042,58 @@ TEST router_only_for_opkg(void)
     ASSERT(cJSON_GetObjectItemCaseSensitive(v, "router") == NULL);
     ASSERT_STR_EQ("", at(v, "why")->valuestring);
     ASSERT_STR_EQ("router", at(o, "status")->valuestring);
-    ASSERT(same_json(at(o, "router"),
-                     "{\"name\":\"OpkgTun2\",\"state\":\"failed\",\"saved\":true,\"error\":\"NDM said no\"}"));
+    ASSERT(same_json(at(o, "router"), "{\"name\":\"OpkgTun2\",\"state\":\"failed\",\"saved\":true,\"error\":\"NDM said "
+                                      "no\",\"policies\":{\"state\":\"off\",\"error\":\"\"}}"));
+    cJSON_Delete(ans);
+    on_loop(g_hx, rt_detach);
+    PASS();
+}
+
+/* catches: routerPolicies dropped on the way in or out, router.policies not shown, or the switch let onto a tunvless device */
+TEST router_policies_are_echoed_shown_and_refused_off_opkg(void)
+{
+    memset(&g_rt, 0, sizeof g_rt);
+    ASSERT_EQ(0, pipe(g_rt.p));
+    fcntl(g_rt.p[0], F_SETFL, O_NONBLOCK);
+    g_rt.open = true;
+    g_rt.pol_failed = true;
+    ASSERT(hx_start(NULL, 0) != NULL);
+    on_loop(g_hx, rt_attach);
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("PUT", "/api/v1/tunnels",
+                            "{\"tunnels\":[{\"id\":\"o\",\"device\":\"opkgtun2\",\"routerPolicies\":true,\"sources\":"
+                            "[{\"id\":\"0000000a\",\"kind\":\"link\",\"link\":\"" LINK_A "\"}]}]}",
+                            &ans));
+    cJSON_Delete(ans);
+    ans = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &ans));
+    const cJSON *t = cJSON_GetArrayItem(at(ans, "tunnels"), 0);
+    ASSERT(cJSON_IsTrue(at(t, "routerPolicies")));
+    cJSON_Delete(ans);
+    ans = NULL;
+    bool seen = false;
+    for (int i = 0; i < 100 && !seen; i++) {
+        cJSON_Delete(ans);
+        ans = NULL;
+        ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/state", NULL, &ans));
+        const cJSON *o = tunnel_named(ans, "o");
+        seen = o != NULL && cJSON_IsObject(at(o, "router"));
+        if (!seen) {
+            sleep_ms(30);
+        }
+    }
+    ASSERT(seen);
+    ASSERT(same_json(at(at(tunnel_named(ans, "o"), "router"), "policies"),
+                     "{\"state\":\"failed\",\"error\":\"global priority should be non-zero\"}"));
+    cJSON_Delete(ans);
+    ans = NULL;
+    ASSERT_EQ(400, put_field_error("{\"id\":\"v\",\"device\":\"tunvless1\",\"routerPolicies\":true,\"enable\":false}", &ans));
+    ASSERT(same_json(ans, "{\"error\":\"routerPolicies needs an opkgtun<N> device\",\"field\":\"routerPolicies\","
+                          "\"tunnel\":\"v\"}"));
+    cJSON_Delete(ans);
+    ans = NULL;
+    ASSERT_EQ(400, put_field_error("{\"id\":\"v\",\"device\":\"opkgtun1\",\"routerPolicies\":\"yes\",\"enable\":false}", &ans));
+    ASSERT(same_json(ans, "{\"error\":\"must be true or false\",\"field\":\"routerPolicies\",\"tunnel\":\"v\"}"));
     cJSON_Delete(ans);
     on_loop(g_hx, rt_detach);
     PASS();
@@ -2130,6 +2185,7 @@ SUITE(tunnels_api)
     RUN_TEST(state_has_inbounds);
     RUN_TEST(inbound_rates_are_the_byte_difference_over_the_time_between_polls);
     RUN_TEST(router_only_for_opkg);
+    RUN_TEST(router_policies_are_echoed_shown_and_refused_off_opkg);
 }
 
 GREATEST_MAIN_DEFS();

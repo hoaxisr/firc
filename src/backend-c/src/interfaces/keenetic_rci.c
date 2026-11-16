@@ -326,16 +326,22 @@ static size_t header_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
     return n;
 }
 
+typedef struct {
+    const atomic_bool *stop;
+    const atomic_bool *cut;
+} flags_t;
+
 static int stop_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     (void)dltotal;
     (void)dlnow;
     (void)ultotal;
     (void)ulnow;
-    return atomic_load((const atomic_bool *)ud) ? 1 : 0;
+    const flags_t *f = ud;
+    return (f->stop != NULL && atomic_load(f->stop)) || (f->cut != NULL && atomic_load(f->cut)) ? 1 : 0;
 }
 
 static firc_err_t rci_once(const char *url, const char *post_body, long timeout_s, const atomic_bool *stop,
-                           const char *tok, long *status, char *detail, rci_buf_t *buf) {
+                           const atomic_bool *cut, const char *tok, long *status, char *detail, rci_buf_t *buf) {
     *status = 0;
     detail[0] = '\0';
     CURL *curl = curl_easy_init();
@@ -370,10 +376,11 @@ static firc_err_t rci_once(const char *url, const char *post_body, long timeout_
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, detail);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     if (headers) { curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers); }
-    if (stop) {
+    flags_t flags = {stop, cut};
+    if (stop != NULL || cut != NULL) {
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, stop_cb);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)stop);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&flags);
     }
     if (post_body) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
@@ -400,7 +407,7 @@ static firc_err_t rci_once(const char *url, const char *post_body, long timeout_
 }
 
 static firc_err_t rci_call(const char *url, const char *post_body, long timeout_s, const atomic_bool *stop,
-                           char **out_body) {
+                           const atomic_bool *cut, char **out_body) {
     *out_body = NULL;
 
     char tok[FIRC_KN_TOKEN_MAX];
@@ -410,7 +417,7 @@ static firc_err_t rci_call(const char *url, const char *post_body, long timeout_
     rci_buf_t *buf = &first;
     long status = 0;
     char detail[DETAIL_MAX];
-    firc_err_t err = rci_once(url, post_body, timeout_s, stop, tok, &status, detail, &first);
+    firc_err_t err = rci_once(url, post_body, timeout_s, stop, cut, tok, &status, detail, &first);
     if (err == FIRC_OK && firc_kn_token_refusal(status, detail)) {
         char fresh[FIRC_KN_TOKEN_MAX];
         if (!firc_kn_token_refused(tok, fresh, stop)) {
@@ -418,7 +425,7 @@ static firc_err_t rci_call(const char *url, const char *post_body, long timeout_
             return FIRC_ERR_CANCELED;
         }
         if (strcmp(fresh, tok) != 0) {
-            err = rci_once(url, post_body, timeout_s, stop, fresh, &status, detail, &again);
+            err = rci_once(url, post_body, timeout_s, stop, cut, fresh, &status, detail, &again);
             free(first.data);
             first.data = NULL;
             buf = &again;
@@ -470,7 +477,7 @@ firc_err_t firc_kn_rci_get_timeout(const char *base_url, const char *path, long 
     *out_body = NULL;
     char url[512];
     firc_err_t err = rci_url(base_url, path, url, sizeof url);
-    return err != FIRC_OK ? err : rci_call(url, NULL, timeout_s, stop, out_body);
+    return err != FIRC_OK ? err : rci_call(url, NULL, timeout_s, stop, NULL, out_body);
 }
 
 firc_err_t firc_kn_rci_post(const char *base_url, const char *path, const char *body, char **out_body) {
@@ -479,11 +486,16 @@ firc_err_t firc_kn_rci_post(const char *base_url, const char *path, const char *
 
 firc_err_t firc_kn_rci_post_timeout(const char *base_url, const char *path, const char *body, long timeout_s,
                                     const atomic_bool *stop, char **out_body) {
+    return firc_kn_rci_post_cut(base_url, path, body, timeout_s, stop, NULL, out_body);
+}
+
+firc_err_t firc_kn_rci_post_cut(const char *base_url, const char *path, const char *body, long timeout_s,
+                                const atomic_bool *stop, const atomic_bool *cut, char **out_body) {
     *out_body = NULL;
     char url[512];
     firc_err_t err = rci_url(base_url, path, url, sizeof url);
     if (err == FIRC_OK && !body) { err = FIRC_ERR_INVAL; }
-    return err != FIRC_OK ? err : rci_call(url, body, timeout_s, stop, out_body);
+    return err != FIRC_OK ? err : rci_call(url, body, timeout_s, stop, cut, out_body);
 }
 
 /* n == 0 leaves *metas NULL and makes no batch call. */

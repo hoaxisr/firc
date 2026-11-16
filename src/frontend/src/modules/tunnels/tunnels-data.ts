@@ -37,6 +37,7 @@ export function normalizeTunnel(raw: Partial<Tunnel>): Tunnel {
     device: raw.device ?? "",
     description: raw.description ?? "",
     enable: raw.enable ?? true,
+    routerPolicies: raw.routerPolicies ?? false,
     active: raw.active ?? 1,
     by: raw.by ?? "connection",
     interval: raw.interval ?? 60,

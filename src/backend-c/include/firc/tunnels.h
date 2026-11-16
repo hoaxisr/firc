@@ -51,6 +51,7 @@ typedef struct {
     char device[16];
     char description[FIRC_TUN_DESCRIPTION_MAX + 1];
     bool enable;
+    bool router_policies;
     firc_uplink_kind_t uplink;
     char uplink_ref[16];
     firc_tun_src_t *src;

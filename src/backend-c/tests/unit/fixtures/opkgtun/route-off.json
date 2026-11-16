@@ -1,0 +1,17 @@
+[
+  {
+    "ip": {
+      "route": {
+        "status": [
+          {
+            "status": "error",
+            "code": "268239279",
+            "ident": "Io::Netlink",
+            "critical": "yes",
+            "message": "system failed [0xcffd01af], got an error response: file exists."
+          }
+        ]
+      }
+    }
+  }
+]

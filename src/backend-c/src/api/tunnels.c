@@ -162,7 +162,8 @@ static cJSON *tunnel_json(const firc_tunnel_t *t)
     ok = ok && cJSON_AddStringToObject(o, "id", t->id) != NULL &&
          cJSON_AddStringToObject(o, "device", t->device) != NULL &&
          cJSON_AddStringToObject(o, "description", t->description) != NULL &&
-         cJSON_AddBoolToObject(o, "enable", t->enable) != NULL;
+         cJSON_AddBoolToObject(o, "enable", t->enable) != NULL &&
+         cJSON_AddBoolToObject(o, "routerPolicies", t->router_policies) != NULL;
     if (ok) {
         ok = put_item(o, "uplink", up);
         up = NULL;
@@ -467,7 +468,7 @@ static const jkey_t TUNNEL_KEYS[] = {
     {"id", T_STR},     {"device", T_STR},  {"enable", T_BOOL},  {"uplink", T_OBJ},
     {"sources", T_ARR}, {"filter", T_STR},  {"order", T_ARR},    {"exclude", T_ARR},
     {"active", T_NUM}, {"by", T_STR},      {"interval", T_NUM}, {"silence", T_NUM},
-    {"advanced", T_OBJ}, {"description", T_STR}, {"inbounds", T_ARR},
+    {"advanced", T_OBJ}, {"description", T_STR}, {"inbounds", T_ARR}, {"routerPolicies", T_BOOL},
 };
 static const jkey_t INBOUND_KEYS[] = {
     {"port", T_NUM}, {"listen", T_STR}, {"node", T_STR}, {"user", T_STR}, {"password", T_STR}};
@@ -1066,6 +1067,19 @@ static const char *opkg_state_name(firc_opkg_state_t s)
     return "pending";
 }
 
+static const char *pol_state_name(firc_opkg_pol_t p)
+{
+    switch (p) {
+    case FIRC_OPKG_POL_ON:
+        return "on";
+    case FIRC_OPKG_POL_FAILED:
+        return "failed";
+    case FIRC_OPKG_POL_OFF:
+        break;
+    }
+    return "off";
+}
+
 static bool put_router(cJSON *o, firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t)
 {
     firc_opkgtun_seen_t r;
@@ -1073,10 +1087,18 @@ static bool put_router(cJSON *o, firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t
         return true;
     }
     cJSON *x = cJSON_CreateObject();
-    bool ok = x != NULL && cJSON_AddStringToObject(x, "name", r.name) != NULL &&
+    cJSON *p = cJSON_CreateObject();
+    bool ok = x != NULL && p != NULL && cJSON_AddStringToObject(x, "name", r.name) != NULL &&
               cJSON_AddStringToObject(x, "state", opkg_state_name(r.state)) != NULL &&
               cJSON_AddBoolToObject(x, "saved", r.saved) != NULL &&
-              cJSON_AddStringToObject(x, "error", r.error) != NULL;
+              cJSON_AddStringToObject(x, "error", r.error) != NULL &&
+              cJSON_AddStringToObject(p, "state", pol_state_name(r.policies)) != NULL &&
+              cJSON_AddStringToObject(p, "error", r.pol_error) != NULL;
+    if (ok) {
+        ok = put_item(x, "policies", p);
+        p = NULL;
+    }
+    cJSON_Delete(p);
     if (!ok) {
         cJSON_Delete(x);
         return false;

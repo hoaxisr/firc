@@ -16,7 +16,9 @@ import {
   orderAfterDrop,
   orderByLatency,
   parseUplink,
+  policiesLeaving,
   restartingDevices,
+  routerName,
   routerWrite,
   skippedLabels,
   subscriptionError,
@@ -637,6 +639,43 @@ describe("the router save hint", () => {
     assert.strictEqual(
       routerWrite(tn("t", "opkgtun3"), tn("t", "opkgtun3", { filter: "NL", interval: 30 })),
       null,
+    );
+  });
+});
+
+describe("router policies", () => {
+  // Catches a tunvless device given an OpkgTun name, or the name built from the wrong number.
+  it("routerName names only an opkg device", () => {
+    assert.strictEqual(routerName("opkgtun3"), "OpkgTun3");
+    assert.strictEqual(routerName("opkgtun16"), "OpkgTun16");
+    assert.strictEqual(routerName("tunvless3"), null);
+  });
+
+  // Catches the permit-loss warning missing when the switch goes off, the device changes or the tunnel is deleted, or shown when nothing leaves.
+  it("policiesLeaving names the record only when its policies go", () => {
+    const on = tn("t", "opkgtun3", { routerPolicies: true });
+    assert.strictEqual(
+      policiesLeaving(on, tn("t", "opkgtun3", { routerPolicies: false })),
+      "OpkgTun3",
+    );
+    assert.strictEqual(
+      policiesLeaving(on, tn("t", "opkgtun4", { routerPolicies: true })),
+      "OpkgTun3",
+    );
+    assert.strictEqual(policiesLeaving(on, null), "OpkgTun3");
+    assert.strictEqual(policiesLeaving(on, tn("t", "opkgtun3", { routerPolicies: true })), null);
+    assert.strictEqual(policiesLeaving(tn("t", "opkgtun3"), null), null);
+    assert.strictEqual(
+      policiesLeaving(undefined, tn("t", "opkgtun3", { routerPolicies: true })),
+      null,
+    );
+  });
+
+  // Catches a routerPolicies flip read as a restart, though the daemon keeps the child running.
+  it("restartingDevices ignores the routerPolicies switch", () => {
+    assert.deepStrictEqual(
+      restartingDevices([tn("t", "opkgtun3")], [tn("t", "opkgtun3", { routerPolicies: true })]),
+      [],
     );
   });
 });

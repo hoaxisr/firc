@@ -374,6 +374,23 @@ describe("TunnelsStore.saveChanges", () => {
     assert.strictEqual(store.data[0].advanced.kernelTcp, true);
   });
 
+  // Catches a WebUI save turning router policies off because normalize dropped routerPolicies.
+  it("normalize keeps routerPolicies", async () => {
+    const on = tunnel("main", { device: "opkgtun3", routerPolicies: true });
+    const s = stub({
+      "/tunnels": (body: any) => (body ? { tunnels: body.tunnels } : { tunnels: [on] }),
+      "/system/interfaces": { interfaces: [{ id: "opkgtun3" }] },
+      "/tunnels/state": { tunnels: [stateOf("main")] },
+    });
+    const store = new TunnelsStore();
+    await store.load();
+    store.data[0].interval = 90;
+    await store.saveChanges();
+    const put = s.requests.find((r) => r.method === "PUT");
+    assert.strictEqual(put!.body.tunnels[0].routerPolicies, true);
+    assert.strictEqual(store.data[0].routerPolicies, true);
+  });
+
   // Catches a WebUI save turning the fingerprint to the link default because normalize dropped it.
   it("normalize keeps advanced.fingerprint", async () => {
     const on = tunnel("main", {

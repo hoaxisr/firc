@@ -456,6 +456,29 @@ TEST the_reply_delete_names_its_iif(void) {
     PASS();
 }
 
+/* catches: a lookup in place of a dump, a table filter dropped, or a filter by metric */
+TEST main_defaults_reads_a_dump_filtered_by_table(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    static const uint8_t any[4] = {0};
+    fake_rtnl_add_route(f.kernel, AF_INET, RT_TABLE_MAIN, RTN_UNICAST, RTPROT_BOOT, any, 0, 1000);
+    fake_rtnl_route_via(f.kernel, 7, NULL, 0);
+    fake_rtnl_add_route(f.kernel, AF_INET, 4099, RTN_UNICAST, RTPROT_BOOT, any, 0, 0);
+    fake_rtnl_route_via(f.kernel, 9, NULL, 0);
+    fake_rtnl_add_route(f.kernel, AF_INET, RT_TABLE_MAIN, RTN_UNICAST, RTPROT_BOOT, any, 0, 50);
+    fake_rtnl_route_via(f.kernel, 9, NULL, 0);
+    static const uint8_t net[4] = {192, 0, 2, 0};
+    fake_rtnl_add_route(f.kernel, AF_INET, RT_TABLE_MAIN, RTN_UNICAST, RTPROT_BOOT, net, 24, 0);
+    fake_rtnl_route_via(f.kernel, 11, NULL, 0);
+    int oifs[8] = {0};
+    size_t n = 99;
+    ASSERT_EQ(FIRC_OK, firc_rtnl_main_defaults(f.rtnl, oifs, 8, &n));
+    ASSERT_EQ_FMT((size_t)2, n, "%zu");
+    ASSERT((oifs[0] == 7 && oifs[1] == 9) || (oifs[0] == 9 && oifs[1] == 7));
+    down(&f);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -481,5 +504,6 @@ int main(int argc, char **argv) {
     RUN_TEST(the_store_is_told_at_every_change_and_only_then);
     RUN_TEST(the_table_is_handed_whole_on_demand);
     RUN_TEST(the_reply_delete_names_its_iif);
+    RUN_TEST(main_defaults_reads_a_dump_filtered_by_table);
     GREATEST_MAIN_END();
 }

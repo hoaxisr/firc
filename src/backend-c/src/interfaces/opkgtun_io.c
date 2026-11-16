@@ -26,7 +26,7 @@ static firc_err_t rci_get(void *ud, const char *path, char **body)
 static firc_err_t rci_post(void *ud, const char *body, long timeout_s, char **out)
 {
     firc_opkgtun_rci_t *r = ud;
-    return firc_kn_rci_post_timeout(r->base_url, "/rci/", body, timeout_s, &r->stop, out);
+    return firc_kn_rci_post_cut(r->base_url, "/rci/", body, timeout_s, &r->stop, &r->cut, out);
 }
 
 static bool dev_exists(void *ud, const char *dev)
@@ -87,6 +87,7 @@ void firc_opkgtun_rci_io(firc_opkgtun_rci_t *rci, const char *base_url, const ch
                          firc_opkgtun_io_t *io)
 {
     atomic_init(&rci->stop, false);
+    atomic_init(&rci->cut, false);
     snprintf(rci->base_url, sizeof rci->base_url, "%s", base_url);
     memset(io, 0, sizeof *io);
     io->get = rci_get;
@@ -98,5 +99,6 @@ void firc_opkgtun_rci_io(firc_opkgtun_rci_t *rci, const char *base_url, const ch
     io->sleep_ms = nap;
     io->intent_path = intent_path;
     io->stop = &rci->stop;
+    io->cut = &rci->cut;
     io->ud = rci;
 }

@@ -56,6 +56,10 @@ typedef struct {
     unsigned attempts;
     bool own_create;
     bool unsaved;
+    bool hold;
+    bool adopt;
+    bool pol_retry;
+    unsigned pol_attempts;
     char kept[FIRC_OPKGTUN_DESC_MAX + 1];
 } rec_t;
 
@@ -89,7 +93,9 @@ struct firc_opkgtun {
     atomic_bool own_stop;
     bool sweep_due;
     bool sweep_warned;
+    bool saving;
     uint32_t swept;
+    uint32_t trips;
 };
 
 typedef enum { L_OK, L_UNKNOWN, L_STOP } lread_t;
@@ -97,6 +103,7 @@ typedef enum { P_ANSWERED, P_LOST, P_STOP } post_t;
 typedef enum { S_DONE, S_STOP } seq_t;
 typedef enum { RM_DONE, RM_RETRY, RM_UNKNOWN, RM_STOP } rm_t;
 typedef enum { H_FREE, H_HELD, H_STOP } hold_t;
+typedef enum { RT_NONE, RT_HAS, RT_UNKNOWN, RT_STOP } route_t;
 
 void firc_opkgtun_reach_for_test(bool on)
 {
@@ -153,7 +160,7 @@ static void copy_str(char *dst, size_t cap, const char *src)
 {
     size_t n = src != NULL ? strlen(src) : 0;
     if (n >= cap) { n = cap - 1; }
-    if (n > 0) { memcpy(dst, src, n); }
+    if (n > 0 && src != NULL) { memcpy(dst, src, n); }
     dst[n] = '\0';
 }
 
@@ -191,6 +198,8 @@ static void classify_in(const cJSON *root, const char *name, firc_opkgtun_rc_t *
     copy_str(out->address, sizeof out->address, str_at(addr, "address"));
     copy_str(out->mask, sizeof out->mask, str_at(addr, "mask"));
     out->up = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "up"));
+    const cJSON *global = cJSON_GetObjectItemCaseSensitive(ip, "global");
+    out->global = cJSON_IsObject(global);
     bool unmarked = desc == NULL || desc[0] == '\0';
     if (name_index(name) >= 0 && unmarked) {
         out->kind = FIRC_OPKG_RC_UNMARKED;
@@ -402,6 +411,30 @@ static char *delete_body(const char *name)
     cJSON *arr = cJSON_CreateArray();
     cJSON *iface = arr != NULL ? iface_item(arr, name) : NULL;
     return dump(arr, iface != NULL && cJSON_AddTrueToObject(iface, "no") != NULL);
+}
+
+static char *global_body(const char *name, bool on)
+{
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *iface = arr != NULL ? iface_item(arr, name) : NULL;
+    cJSON *ip = iface != NULL ? cJSON_AddObjectToObject(iface, "ip") : NULL;
+    cJSON *g = ip != NULL ? cJSON_AddObjectToObject(ip, "global") : NULL;
+    bool ok = g != NULL && (on ? cJSON_AddTrueToObject(g, "auto") != NULL
+                               : cJSON_AddTrueToObject(g, "no") != NULL);
+    return dump(arr, ok);
+}
+
+static char *route_body(const char *name, bool on)
+{
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *item = cJSON_CreateObject();
+    cJSON *ip = cJSON_AddObjectToObject(item, "ip");
+    cJSON *rt = cJSON_AddObjectToObject(ip, "route");
+    bool ok = arr != NULL && cJSON_AddTrueToObject(rt, "default") != NULL &&
+              cJSON_AddStringToObject(rt, "interface", name) != NULL &&
+              (on || cJSON_AddTrueToObject(rt, "no") != NULL) && cJSON_AddItemToArray(arr, item);
+    if (!ok) { cJSON_Delete(item); }
+    return dump(arr, ok);
 }
 
 static char *save_body(void)
@@ -645,7 +678,266 @@ static seq_t device_step(ctx_t *c, rec_t *r)
     }
     r->own_create = false;
     finish(c, r, FIRC_OPKG_READY, false, "%s", "");
+    if (r->pol_retry) {
+        r->due = true;
+        r->next_ms = now_of(c) + backoff(&r->pol_attempts);
+    }
     return S_DONE;
+}
+
+static void pol_set(rec_t *r, firc_opkg_pol_t st, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void pol_set(rec_t *r, firc_opkg_pol_t st, const char *fmt, ...)
+{
+    char msg[MSG_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    bool changed = r->s.policies != st || strcmp(r->s.pol_error, msg) != 0;
+    r->s.policies = st;
+    copy_str(r->s.pol_error, sizeof r->s.pol_error, msg);
+    r->pol_retry = st == FIRC_OPKG_POL_FAILED;
+    if (!r->pol_retry) { r->pol_attempts = 0; }
+    if (changed && st == FIRC_OPKG_POL_FAILED) {
+        FIRC_WARN("opkgtun: %s: router policies: %s", r->w.name, msg);
+    } else if (changed) {
+        FIRC_INFO("opkgtun: %s: router policies are %s", r->w.name, st == FIRC_OPKG_POL_ON ? "on" : "off");
+    }
+}
+
+static void clear_on_refusal(ctx_t *c)
+{
+    if (c->pending) { return; }
+    intent_t next = c->in;
+    next.dirty = false;
+    if (!put_intent(c, &next)) { FIRC_WARN("opkgtun: cannot write %s", c->io->intent_path); }
+}
+
+static route_t read_route(ctx_t *c, rec_t *r, const char *name, char *err, size_t err_cap)
+{
+    char *body = NULL;
+    firc_err_t e = c->io->get(c->io->ud, FIRC_OPKGTUN_ROUTE_PATH, &body);
+    if (halted(c)) {
+        free(body);
+        return RT_STOP;
+    }
+    cJSON *root = e == FIRC_OK && body != NULL ? cJSON_Parse(body) : NULL;
+    free(body);
+    if (!cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        say(err, err_cap, "the router's routes cannot be read (%s)", e != FIRC_OK ? firc_err_str(e) : "not a list");
+        return RT_UNKNOWN;
+    }
+    bool has = false;
+    const cJSON *it = NULL;
+    cJSON_ArrayForEach(it, root) {
+        const char *iface = str_at(it, "interface");
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(it, "default")) && iface != NULL && strcmp(iface, name) == 0) {
+            has = true;
+        }
+    }
+    cJSON_Delete(root);
+    if (r != NULL) {
+        if (r->adopt && has) {
+            r->s.route_adds++;
+            r->hold = true;
+        }
+        r->adopt = false;
+        r->s.route = has;
+        r->s.route_reads++;
+        if (!has) { r->hold = false; }
+    }
+    return has ? RT_HAS : RT_NONE;
+}
+
+static rm_t route_clear(ctx_t *c, rec_t *r, const char *name, char *err, size_t err_cap)
+{
+    route_t rt = read_route(c, r, name, err, err_cap);
+    if (rt == RT_STOP) { return RM_STOP; }
+    if (rt == RT_UNKNOWN) { return RM_RETRY; }
+    if (rt == RT_NONE) { return RM_DONE; }
+    if (!mark_dirty(c)) {
+        say(err, err_cap, "cannot write %s", c->io->intent_path);
+        return RM_RETRY;
+    }
+    firc_opkg_item_t out[1] = {FIRC_OPKG_ITEM_REFUSED};
+    char perr[MSG_MAX];
+    post_t p = post_items(c, route_body(name, false), T_WRITE, out, 1, perr, sizeof perr);
+    if (p == P_STOP) { return RM_STOP; }
+    c->pending = true;
+    if (r != NULL) { r->unsaved = true; }
+    rt = read_route(c, r, name, err, err_cap);
+    if (rt == RT_STOP) { return RM_STOP; }
+    if (rt == RT_UNKNOWN) { return RM_RETRY; }
+    if (rt == RT_HAS) {
+        say(err, err_cap, "the router kept the default route via %s (%.100s)", name, perr[0] != '\0' ? perr : "no answer");
+        return RM_RETRY;
+    }
+    return RM_DONE;
+}
+
+static seq_t global_off(ctx_t *c, rec_t *r)
+{
+    if (!mark_dirty(c)) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "cannot write %s", c->io->intent_path);
+        return S_DONE;
+    }
+    firc_opkg_item_t out[1] = {FIRC_OPKG_ITEM_REFUSED};
+    char perr[MSG_MAX];
+    post_t p = post_items(c, global_body(r->w.name, false), T_WRITE, out, 1, perr, sizeof perr);
+    if (p == P_STOP) { return S_STOP; }
+    if (p == P_ANSWERED && out[0] == FIRC_OPKG_ITEM_REFUSED) {
+        clear_on_refusal(c);
+        pol_set(r, FIRC_OPKG_POL_FAILED,
+                "%s is still in a router policy; remove it there to finish turning router policies off (%.60s)",
+                r->w.name, perr);
+        return S_DONE;
+    }
+    c->pending = true;
+    r->unsaved = true;
+    if (p == P_LOST) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "ip global was not cleared on %s (%s)", r->w.name, perr);
+        return S_DONE;
+    }
+    pol_set(r, FIRC_OPKG_POL_OFF, "%s", "");
+    return S_DONE;
+}
+
+static bool global_on(ctx_t *c, rec_t *r, seq_t *seq)
+{
+    *seq = S_DONE;
+    const char *name = r->w.name;
+    if (!mark_dirty(c)) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "cannot write %s", c->io->intent_path);
+        return false;
+    }
+    firc_opkg_item_t out[1] = {FIRC_OPKG_ITEM_REFUSED};
+    char perr[MSG_MAX];
+    post_t p = post_items(c, global_body(name, true), T_WRITE, out, 1, perr, sizeof perr);
+    if (p == P_STOP) {
+        *seq = S_STOP;
+        return false;
+    }
+    if (p == P_ANSWERED && out[0] == FIRC_OPKG_ITEM_REFUSED) {
+        clear_on_refusal(c);
+        pol_set(r, FIRC_OPKG_POL_FAILED, "%s", perr);
+        return false;
+    }
+    c->pending = true;
+    r->unsaved = true;
+    firc_opkgtun_rc_t back;
+    char lerr[MSG_MAX];
+    lread_t lr = list_class(c, name, &back, lerr, sizeof lerr);
+    if (lr == L_STOP) {
+        *seq = S_STOP;
+        return false;
+    }
+    if (lr == L_UNKNOWN) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "%s", lerr);
+        return false;
+    }
+    if (!back.global) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "the router did not keep global on %s", name);
+        return false;
+    }
+    return true;
+}
+
+static seq_t route_on(ctx_t *c, rec_t *r)
+{
+    const char *name = r->w.name;
+    char err[MSG_MAX];
+    route_t rt = read_route(c, r, name, err, sizeof err);
+    if (rt == RT_STOP) { return S_STOP; }
+    if (rt == RT_UNKNOWN) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err);
+        return S_DONE;
+    }
+    if (rt == RT_HAS) {
+        pol_set(r, FIRC_OPKG_POL_ON, "%s", "");
+        return S_DONE;
+    }
+    if (!mark_dirty(c)) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "cannot write %s", c->io->intent_path);
+        return S_DONE;
+    }
+    firc_opkg_item_t out[1] = {FIRC_OPKG_ITEM_REFUSED};
+    char perr[MSG_MAX];
+    post_t p = post_items(c, route_body(name, true), T_WRITE, out, 1, perr, sizeof perr);
+    if (p == P_STOP) { return S_STOP; }
+    r->s.route_adds++;
+    r->hold = true;
+    rt = read_route(c, r, name, err, sizeof err);
+    if (rt == RT_STOP) { return S_STOP; }
+    if (rt == RT_HAS) {
+        c->pending = true;
+        r->unsaved = true;
+    } else if (rt == RT_NONE && p == P_ANSWERED && out[0] == FIRC_OPKG_ITEM_REFUSED) {
+        clear_on_refusal(c);
+    }
+    if (rt == RT_UNKNOWN) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err);
+        return S_DONE;
+    }
+    if (rt == RT_NONE) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "the router did not add the default route via %s (%.100s)", name,
+                perr[0] != '\0' ? perr : "no answer");
+        return S_DONE;
+    }
+    pol_set(r, FIRC_OPKG_POL_ON, "%s", "");
+    return S_DONE;
+}
+
+static seq_t policies_step(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc)
+{
+    const char *name = r->w.name;
+    char err[MSG_MAX];
+    if (!r->w.policies && !rc->global && !r->s.route && r->s.route_reads > 0 && r->s.policies == FIRC_OPKG_POL_OFF) {
+        pol_set(r, FIRC_OPKG_POL_OFF, "%s", "");
+        return S_DONE;
+    }
+    if (!r->w.policies || !rc->global) {
+        rm_t g = route_clear(c, r, name, err, sizeof err);
+        if (g == RM_STOP) { return S_STOP; }
+        if (g != RM_DONE) {
+            pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err);
+            return S_DONE;
+        }
+    }
+    if (!r->w.policies && !rc->global) {
+        pol_set(r, FIRC_OPKG_POL_OFF, "%s", "");
+        return S_DONE;
+    }
+    if (!r->w.policies) { return global_off(c, r); }
+    if (!rc->global) {
+        seq_t seq;
+        if (!global_on(c, r, &seq)) { return seq; }
+    }
+    if (r->w.route) { return route_on(c, r); }
+    if (r->w.keep) {
+        route_t rt = read_route(c, r, name, err, sizeof err);
+        if (rt == RT_STOP) { return S_STOP; }
+        if (rt == RT_UNKNOWN) {
+            pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err);
+            return S_DONE;
+        }
+        pol_set(r, FIRC_OPKG_POL_ON, "%s", "");
+        return S_DONE;
+    }
+    rm_t g = route_clear(c, r, name, err, sizeof err);
+    if (g == RM_STOP) { return S_STOP; }
+    if (g != RM_DONE) {
+        pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err);
+        return S_DONE;
+    }
+    pol_set(r, FIRC_OPKG_POL_ON, "%s", "");
+    return S_DONE;
+}
+
+static seq_t settle(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc)
+{
+    seq_t p = policies_step(c, r, rc);
+    return p == S_STOP ? S_STOP : device_step(c, r);
 }
 
 static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool held_ok)
@@ -658,7 +950,7 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
     bool d_level = !rc->public_level;
     bool d_addr = strcmp(rc->address, addr) != 0 || strcmp(rc->mask, HOST32) != 0;
     bool d_up = !rc->up;
-    if (!d_desc && !d_level && !d_addr && !d_up) { return device_step(c, r); }
+    if (!d_desc && !d_level && !d_addr && !d_up) { return settle(c, r, rc); }
     if (d_addr && !held_ok) {
         char holder[16];
         hold_t h = hold(c, w, holder);
@@ -717,7 +1009,7 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
         return S_DONE;
     }
     if (d_desc) { copy_str(r->kept, sizeof r->kept, back.description); }
-    return device_step(c, r);
+    return settle(c, r, &back);
 }
 
 static seq_t create(ctx_t *c, rec_t *r, int k)
@@ -883,9 +1175,36 @@ static rm_t clear_name_servers(ctx_t *c, const char *name, char *err, size_t err
     return res;
 }
 
-static rm_t remove_record(ctx_t *c, const char *name, const char *dev, char *err, size_t err_cap)
+static rm_t clear_global(ctx_t *c, const char *name)
 {
-    rm_t res = clear_name_servers(c, name, err, err_cap);
+    if (!mark_dirty(c)) {
+        FIRC_WARN("opkgtun: cannot write %s", c->io->intent_path);
+        return RM_RETRY;
+    }
+    firc_opkg_item_t out[1] = {FIRC_OPKG_ITEM_REFUSED};
+    char perr[MSG_MAX];
+    post_t p = post_items(c, global_body(name, false), T_WRITE, out, 1, perr, sizeof perr);
+    if (p == P_STOP) { return RM_STOP; }
+    if (p == P_LOST || out[0] != FIRC_OPKG_ITEM_REFUSED) { c->pending = true; }
+    if (p != P_ANSWERED || out[0] != FIRC_OPKG_ITEM_APPLIED) {
+        FIRC_WARN("opkgtun: ip global on %s was not cleared (%s); it goes with the interface", name, perr);
+    }
+    return RM_DONE;
+}
+
+static rm_t remove_record(ctx_t *c, rec_t *r, const char *name, const char *dev, bool global, char *err,
+                          size_t err_cap)
+{
+    rm_t res = route_clear(c, r, name, err, err_cap);
+    if (res != RM_DONE) { return res; }
+    if (global) {
+        res = clear_global(c, name);
+        if (res != RM_DONE) {
+            say(err, err_cap, "cannot write %s", c->io->intent_path);
+            return res;
+        }
+    }
+    res = clear_name_servers(c, name, err, err_cap);
     if (res != RM_DONE) { return res; }
     if (!mark_dirty(c)) {
         say(err, err_cap, "cannot write %s", c->io->intent_path);
@@ -940,7 +1259,7 @@ static seq_t absent(ctx_t *c, rec_t *r)
         finish(c, r, FIRC_OPKG_READY, false, "%s", "");
         return S_DONE;
     }
-    rm_t res = remove_record(c, r->w.name, r->w.device, err, sizeof err);
+    rm_t res = remove_record(c, r, r->w.name, r->w.device, rc.global, err, sizeof err);
     if (res == RM_STOP) { return S_STOP; }
     if (res != RM_DONE) {
         finish(c, r, FIRC_OPKG_FAILED, true, "%s", err);
@@ -967,6 +1286,7 @@ static rm_t sweep_core(ctx_t *c, const char (*keep)[16], size_t n_keep, size_t *
     if (lr == L_STOP) { return RM_STOP; }
     if (lr == L_UNKNOWN) { return RM_UNKNOWN; }
     char doomed[N_MAX][16];
+    bool global[N_MAX];
     size_t n = 0;
     const cJSON *e = NULL;
     cJSON_ArrayForEach(e, root) {
@@ -975,6 +1295,7 @@ static rm_t sweep_core(ctx_t *c, const char (*keep)[16], size_t n_keep, size_t *
         firc_opkgtun_rc_t rc;
         classify_in(root, e->string, &rc);
         if (rc.kind == FIRC_OPKG_RC_OURS && n < N_MAX) {
+            global[n] = rc.global;
             copy_str(doomed[n++], sizeof doomed[0], e->string);
         } else if (rc.kind == FIRC_OPKG_RC_UNMARKED && c->in.creating[k]) {
             FIRC_WARN("opkgtun: %s has no description and may be firc's; delete it in the router if it is not",
@@ -987,12 +1308,15 @@ static rm_t sweep_core(ctx_t *c, const char (*keep)[16], size_t n_keep, size_t *
         char dev[16];
         say(dev, sizeof dev, "opkgtun%d", name_index(doomed[i]));
         char rerr[MSG_MAX];
-        rm_t one = remove_record(c, doomed[i], dev, rerr, sizeof rerr);
+        rm_t one = remove_record(c, NULL, doomed[i], dev, global[i], rerr, sizeof rerr);
         if (one == RM_STOP) { return RM_STOP; }
         if (one == RM_DONE) {
             (*removed)++;
             *gone |= 1u << name_index(doomed[i]);
             FIRC_INFO("opkgtun: %s is removed", doomed[i]);
+            if (global[i]) {
+                FIRC_WARN("opkgtun: %s was removed; router policies that used it no longer have it", doomed[i]);
+            }
         } else {
             FIRC_WARN("opkgtun: %s", rerr);
             if (res == RM_DONE) { say(err, err_cap, "%s", rerr); }
@@ -1002,7 +1326,7 @@ static rm_t sweep_core(ctx_t *c, const char (*keep)[16], size_t n_keep, size_t *
     return res;
 }
 
-typedef enum { SV_OK, SV_FAIL, SV_STOP } save_t;
+typedef enum { SV_OK, SV_FAIL, SV_STOP, SV_CUT } save_t;
 
 static save_t save_now(ctx_t *c)
 {
@@ -1115,6 +1439,12 @@ static void sync_wants(firc_opkgtun_t *m)
         }
         if (old != NULL && same_want(&old->w, &wants[i])) {
             *r = *old;
+            if (old->w.policies != wants[i].policies || old->w.route != wants[i].route ||
+                old->w.keep != wants[i].keep) {
+                r->due = true;
+                r->next_ms = 0;
+                r->pol_attempts = 0;
+            }
             if (old->w.recheck != wants[i].recheck) {
                 r->due = true;
                 r->next_ms = 0;
@@ -1122,12 +1452,22 @@ static void sync_wants(firc_opkgtun_t *m)
                 r->s.state = FIRC_OPKG_PENDING;
             }
         } else {
-            if (old != NULL) { r->unsaved = old->unsaved; }
+            r->unsaved = old != NULL ? old->unsaved : m->c.in.dirty;
+            if (old != NULL) {
+                r->hold = old->hold;
+                r->adopt = old->adopt;
+                r->s.route = old->s.route;
+                r->s.route_reads = old->s.route_reads;
+                r->s.route_adds = old->s.route_adds;
+            } else {
+                r->adopt = m->c.in.dirty;
+            }
             r->due = true;
             copy_str(r->s.name, sizeof r->s.name, wants[i].name);
             r->s.state = FIRC_OPKG_PENDING;
             r->s.removing = !wants[i].present;
         }
+        if (wants[i].checked == r->s.route_adds) { r->hold = false; }
         r->w = wants[i];
     }
     memcpy(m->recs, next, sizeof m->recs);
@@ -1149,7 +1489,7 @@ static bool nap(firc_opkgtun_t *m, int64_t ms)
 static void wait_work(firc_opkgtun_t *m)
 {
     pthread_mutex_lock(&m->mu);
-    while (!halted(&m->c) && m->gen == m->gen_seen && !m->sweep_req) {
+    while (!halted(&m->c) && m->gen == m->gen_seen && !m->sweep_req && m->trips == 0) {
         m->idle = true;
         pthread_cond_wait(&m->cv, &m->mu);
     }
@@ -1199,6 +1539,48 @@ static bool run_sweep(firc_opkgtun_t *m)
     return true;
 }
 
+static bool run_trips(firc_opkgtun_t *m)
+{
+    pthread_mutex_lock(&m->mu);
+    uint32_t bits = m->trips;
+    m->trips = 0;
+    pthread_mutex_unlock(&m->mu);
+    for (size_t i = 0; bits != 0 && i < m->n_recs; i++) {
+        rec_t *r = &m->recs[i];
+        int k = name_index(r->w.name);
+        if (k < 0 || (bits & (1u << k)) == 0 || !r->w.present) { continue; }
+        char err[MSG_MAX];
+        rm_t res = route_clear(&m->c, r, r->w.name, err, sizeof err);
+        if (res == RM_STOP) { return false; }
+        if (res != RM_DONE) { pol_set(r, FIRC_OPKG_POL_FAILED, "%s", err); }
+        publish(m);
+    }
+    return true;
+}
+
+static bool held(const firc_opkgtun_t *m)
+{
+    for (size_t i = 0; i < m->n_recs; i++) {
+        if (m->recs[i].hold) { return true; }
+    }
+    return false;
+}
+
+static save_t save_cut(firc_opkgtun_t *m)
+{
+    pthread_mutex_lock(&m->mu);
+    bool queued = m->trips != 0;
+    m->saving = !queued;
+    pthread_mutex_unlock(&m->mu);
+    if (queued) { return SV_CUT; }
+    save_t s = save_now(&m->c);
+    pthread_mutex_lock(&m->mu);
+    m->saving = false;
+    if (m->io.cut != NULL && atomic_exchange(m->io.cut, false) && s == SV_FAIL) { s = SV_CUT; }
+    pthread_mutex_unlock(&m->mu);
+    return s;
+}
+
 static int64_t later(int64_t a, int64_t b)
 {
     return a > b ? a : b;
@@ -1213,6 +1595,7 @@ static void *worker(void *arg)
     m->settled_at = t0;
     while (!halted(c)) {
         sync_wants(m);
+        if (!run_trips(m)) { break; }
         int64_t now = now_of(c);
         if (now < m->gate_ms) {
             if (!nap(m, m->gate_ms - now)) { break; }
@@ -1240,17 +1623,17 @@ static void *worker(void *arg)
         if (moved) { m->settled_at = now_of(c); }
         if (worked) { continue; }
         int64_t deadline = INT64_MAX;
-        if (c->in.dirty) {
+        if (c->in.dirty && !held(m)) {
             int64_t at = later(later(m->settled_at + DEBOUNCE_MS, m->gate_ms), m->save_next);
             if (c->any_a3) { at = later(at, c->last_a3 + DELETE_GAP_MS); }
             if (now >= at) {
-                save_t s = save_now(c);
+                save_t s = save_cut(m);
                 if (s == SV_STOP) { return NULL; }
                 if (s == SV_OK) {
                     m->save_attempts = 0;
                     m->save_next = 0;
                     for (size_t i = 0; i < m->n_recs; i++) { m->recs[i].unsaved = false; }
-                } else {
+                } else if (s == SV_FAIL) {
                     m->save_next = now_of(c) + backoff(&m->save_attempts);
                 }
                 publish(m);
@@ -1364,6 +1747,17 @@ void firc_opkgtun_want(firc_opkgtun_t *m, const firc_opkgtun_want_t *w, size_t n
     if (m->host) { signal_fd(m); }
 }
 
+void firc_opkgtun_trip(firc_opkgtun_t *m, const char *name)
+{
+    int k = name_index(name);
+    if (k < 0) { return; }
+    pthread_mutex_lock(&m->mu);
+    m->trips |= 1u << k;
+    if (m->saving && m->io.cut != NULL) { atomic_store(m->io.cut, true); }
+    pthread_cond_broadcast(&m->cv);
+    pthread_mutex_unlock(&m->mu);
+}
+
 void firc_opkgtun_sweep_now(firc_opkgtun_t *m)
 {
     pthread_mutex_lock(&m->mu);
@@ -1409,6 +1803,7 @@ void firc_opkgtun_stop(firc_opkgtun_t *m)
 {
     if (m == NULL) { return; }
     atomic_store(m->io.stop, true);
+    if (m->io.cut != NULL) { atomic_store(m->io.cut, true); }
     pthread_mutex_lock(&m->mu);
     pthread_cond_broadcast(&m->cv);
     pthread_mutex_unlock(&m->mu);

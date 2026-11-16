@@ -37,7 +37,7 @@
   import { DEVICE_PREFIXES, splitDevice } from "../../../data/iface-choices";
   import { counted } from "../../../utils/plural";
   import { usageAlert } from "../sub-usage";
-  import { descriptionProblem, formatRate, routerWrite } from "../tunnel-editor";
+  import { descriptionProblem, formatRate, policiesLeaving, routerWrite } from "../tunnel-editor";
   import { tunnelLook } from "../tunnel-state";
   import { freeDevice, type ClientTunnel } from "../tunnels-data";
 
@@ -81,6 +81,7 @@
   function setPrefix(prefix: string) {
     tunnel.device =
       freeDevice(store.othersOf(tunnel.id), prefix, interfaces.list) || prefix + device.num;
+    if (prefix !== "opkgtun") tunnel.routerPolicies = false;
   }
   const up = $derived(live?.status === "up");
   const usable = $derived((live?.nodes ?? []).filter((n) => n.state !== "skipped").length);
@@ -132,14 +133,20 @@
   );
 
   async function remove() {
+    const leaving = policiesLeaving(store.savedOf(tunnel.id), null);
+    const base = ownRecord
+      ? t(
+          "The tunnel goes away once you save. firc then removes {name} from the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
+        ).replace("{name}", () => ownRecord ?? "")
+      : t("The tunnel goes away once you save.");
     const ok = await ask({
       tone: "danger",
       title: t("Delete tunnel {device}?").replace("{device}", () => tunnel.device),
-      message: ownRecord
-        ? t(
-            "The tunnel goes away once you save. firc then removes {name} from the router and saves the router's configuration, along with changes made in the router itself and not yet saved.",
-          ).replace("{name}", () => ownRecord ?? "")
-        : t("The tunnel goes away once you save."),
+      message: leaving
+        ? `${base} ${t(
+            "Router policies that use {name} lose it, and the router does not put it back.",
+          ).replace("{name}", () => leaving)}`
+        : base,
       confirm: t("Delete"),
     });
     if (ok) store.removeTunnel(tunnel.id);

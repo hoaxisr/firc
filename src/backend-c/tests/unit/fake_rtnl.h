@@ -43,6 +43,7 @@ void fake_rtnl_add_route(fake_rtnl_t *f, int family, uint32_t table, uint8_t rtm
                          const uint8_t *dst, uint8_t dst_len, uint32_t priority);
 void fake_rtnl_add_addr(fake_rtnl_t *f, int family, uint32_t ifindex, uint8_t scope, uint8_t flags);
 void fake_rtnl_clear_addrs(fake_rtnl_t *f);
+void fake_rtnl_clear_routes(fake_rtnl_t *f);
 void fake_rtnl_scope_last_route(fake_rtnl_t *f, uint8_t scope);
 void fake_rtnl_route_via(fake_rtnl_t *f, uint32_t oif, const uint8_t *gw, uint8_t gw_len);
 void fake_rtnl_route_multipath(fake_rtnl_t *f);

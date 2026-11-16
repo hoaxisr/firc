@@ -627,6 +627,11 @@ static void opkg_sweep(void *ud)
     firc_opkgtun_sweep_now(((struct daemon *)ud)->opkg);
 }
 
+static void opkg_trip(const char *name, void *ud)
+{
+    firc_opkgtun_trip(((struct daemon *)ud)->opkg, name);
+}
+
 static void opkg_pass(void *ud)
 {
     (void)firc_app_force_commit_iptables(((struct daemon *)ud)->app);
@@ -1660,7 +1665,7 @@ int main(int argc, char **argv)
             FIRC_ERROR("tunnels: the router's OpkgTun records cannot be kept; opkgtun tunnels will not start");
         } else {
             const firc_tunrun_router_t router = {opkg_want, opkg_seen, opkg_sweep, opkg_pass,
-                                                 firc_opkgtun_fd(d.opkg), &d};
+                                                 firc_opkgtun_fd(d.opkg), &d, opkg_trip};
             firc_tunrun_set_router(d.tunrun, &router);
         }
         (void)firc_tunrun_start(d.tunrun, tunnels_ok ? &tunnels : NULL);

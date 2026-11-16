@@ -1,0 +1,16 @@
+[
+  {
+    "ip": {
+      "route": {
+        "status": [
+          {
+            "status": "message",
+            "code": "5046275",
+            "ident": "Network::RoutingTable",
+            "message": "added static route: 0.0.0.0/0 via OpkgTun9."
+          }
+        ]
+      }
+    }
+  }
+]

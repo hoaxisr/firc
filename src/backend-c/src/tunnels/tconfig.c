@@ -737,6 +737,10 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
             if (!parse_bool(v, &t->enable)) {
                 return fail(c, "must be true or false", "tunnels[%zu].enable", ti);
             }
+        } else if (strcmp(key, "routerPolicies") == 0) {
+            if (!parse_bool(v, &t->router_policies)) {
+                return fail(c, "must be true or false", "tunnels[%zu].routerPolicies", ti);
+            }
         } else if (strcmp(key, "uplink") == 0) {
             r = parse_uplink(c, v, ti, t);
         } else if (strcmp(key, "sources") == 0) {
@@ -870,6 +874,9 @@ static firc_err_t validate(ctx_t *c, const firc_tunnels_t *ts)
         const char *why = device_problem(t->device);
         if (why != NULL) {
             return fail(c, why, "tunnels[%zu].device", i);
+        }
+        if (t->router_policies && !firc_tundev_is_opkg(t->device)) {
+            return fail(c, "routerPolicies needs an opkgtun<N> device", "tunnels[%zu].routerPolicies", i);
         }
         for (size_t j = 0; j < i; j++) {
             if (firc_tunnel_index(&ts->t[j]) == firc_tunnel_index(t)) {
@@ -1183,6 +1190,9 @@ static void emit_tunnel(em_t *e, const firc_tunnel_t *t)
         kv(e, "description", t->description, true);
     }
     kv(e, "enable", t->enable ? "true" : "false", false);
+    if (t->router_policies) {
+        kv(e, "routerPolicies", "true", false);
+    }
     if (t->uplink == FIRC_UPLINK_AUTO) {
         snprintf(b, sizeof b, "auto");
     } else {

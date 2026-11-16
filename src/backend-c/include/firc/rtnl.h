@@ -68,6 +68,7 @@ struct nlmsghdr *firc_rtnl_build_unreachable(void *buf, bool add, uint32_t seq, 
 typedef struct firc_link_info {
     int ifindex;
     bool up;
+    bool carrier;
     bool point_to_point;
 } firc_link_info_t;
 
@@ -84,6 +85,10 @@ firc_err_t firc_rtnl_gateway_for_iface(firc_rtnl_t *r, int family, int ifindex, 
 /* Also sets *gatewayless when the default route on the interface has no next hop. */
 firc_err_t firc_rtnl_gateway_for_iface2(firc_rtnl_t *r, int family, int ifindex, bool *found, uint8_t *gw,
                                         uint8_t *gw_len, bool *gatewayless);
+
+/* The oif of every IPv4 default in table main, from a dump filtered here (not a lookup through the ip rules), any
+   metric, each next hop of a multipath route too; *n counts them all, at most cap are written. */
+firc_err_t firc_rtnl_main_defaults(firc_rtnl_t *r, int *oifs, size_t cap, size_t *n);
 
 /* Whether the interface carries IPv6: a usable global-scope address on it, or a v6 default through it. */
 firc_err_t firc_rtnl_iface_carries_v6(firc_rtnl_t *r, int ifindex, bool *carries);

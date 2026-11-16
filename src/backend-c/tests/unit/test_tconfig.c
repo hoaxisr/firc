@@ -889,6 +889,44 @@ TEST an_enable_that_is_not_a_bool_is_refused(void) {
     PASS();
 }
 
+/* catches: routerPolicies accepted on a tunvless device, or refused on an opkgtun one */
+TEST router_policies_need_an_opkg_device(void) {
+    ASSERT(with_extra("    routerPolicies: true\n", "tunnels[0].routerPolicies", "routerPolicies needs an opkgtun<N> device"));
+    ASSERT(loads_extra("    routerPolicies: false\n"));
+    static const char opkg[] = "tunnels:\n  - id: a1\n    device: opkgtun3\n    routerPolicies: true\n    sources:\n" LINK;
+    firc_tunnels_t t = {0};
+    firc_tun_err_t e = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&t, opkg, sizeof opkg - 1, &e));
+    ASSERT(t.t[0].router_policies);
+    firc_tunnels_free(&t);
+    ASSERT(with_extra("    routerPolicies: yes\n", "tunnels[0].routerPolicies", "true or false"));
+    PASS();
+}
+
+/* catches: the switch on by default, lost on save, or written when off */
+TEST router_policies_default_off_and_round_trip(void) {
+    static const char off[] = "tunnels:\n  - id: a1\n    device: opkgtun3\n    sources:\n" LINK;
+    static const char on[] = "tunnels:\n  - id: a1\n    device: opkgtun3\n    routerPolicies: true\n    sources:\n" LINK;
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(off, &b, file, sizeof file));
+    ASSERT_FALSE(b.t[0].router_policies);
+    ASSERT(strstr(file, "routerPolicies") == NULL);
+    firc_tunnels_free(&b);
+    ASSERT(save_and_reload(on, &b, file, sizeof file));
+    ASSERT(b.t[0].router_policies);
+    ASSERT(strstr(file, "\n  routerPolicies: true\n") != NULL);
+    firc_tunnels_free(&b);
+    PASS();
+}
+
+/* catches: a flip of the switch read as an argv change, which would restart the child */
+TEST router_policies_do_not_change_the_argv(void) {
+    static const char base[] = "tunnels:\n  - id: x1\n    device: opkgtun3\n    active: 1\n    sources:\n" LINK;
+    ASSERT_EQ(3, same_after_in(base, "active: 1", "active: 1\n    routerPolicies: true"));
+    PASS();
+}
+
 /* catches: a wrong key name, a non-bool coerced, or save leaving kernelTcp out */
 TEST kernel_tcp_loads_saves_and_refuses_a_non_bool(void) {
     static const char on[] = "tunnels:\n  - id: a1\n    device: tunvless0\n    sources:\n" LINK
@@ -1354,5 +1392,8 @@ int main(int argc, char **argv) {
     RUN_TEST(seventeen_inbounds_refused);
     RUN_TEST(inbounds_shape_is_checked);
     RUN_TEST(inbounds_change_nothing_sent_and_no_restart);
+    RUN_TEST(router_policies_need_an_opkg_device);
+    RUN_TEST(router_policies_default_off_and_round_trip);
+    RUN_TEST(router_policies_do_not_change_the_argv);
     GREATEST_MAIN_END();
 }

@@ -869,6 +869,7 @@ let TUNNELS: any[] = [
     device: "tunvless0",
     description: "PRAW-1",
     enable: true,
+    routerPolicies: false,
     active: 1,
     by: "connection",
     interval: 60,
@@ -917,6 +918,7 @@ let TUNNELS: any[] = [
     device: "opkgtun2",
     description: "NL",
     enable: true,
+    routerPolicies: true,
     active: 1,
     by: "connection",
     interval: 60,
@@ -944,6 +946,9 @@ const tunnelRouter = (tn: any) => {
     state: age < 3 ? "pending" : "ready",
     saved: age >= 8,
     error: "",
+    policies: tn.routerPolicies
+      ? { state: age < 3 ? "off" : "on", error: "" }
+      : { state: "off", error: "" },
   };
 };
 
@@ -989,6 +994,13 @@ const tunnelRefusal = (tunnels: any[]) => {
     }
     if (devices.has(tn.device))
       return { error: "device is used twice", field: "device", tunnel: tn.id };
+    if (tn.routerPolicies && !String(tn.device).startsWith("opkgtun")) {
+      return {
+        error: "routerPolicies needs an opkgtun<N> device",
+        field: "routerPolicies",
+        tunnel: tn.id,
+      };
+    }
     devices.add(tn.device);
     for (const [i, src] of (tn.sources ?? []).entries()) {
       if (src.kind === "link" && !String(src.link ?? "").startsWith("vless://")) {
@@ -1119,6 +1131,7 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
   TUNNELS = tunnels.map((tn: any) => ({
     ...tn,
     description: tn.description ?? "",
+    routerPolicies: tn.routerPolicies ?? false,
     advanced: {
       ca: "",
       insecure: false,

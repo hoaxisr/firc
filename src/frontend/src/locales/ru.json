@@ -976,5 +976,10 @@
   "Hide for a minute": "Скрыть на минуту",
   "Open Settings": "Открыть настройки",
   "Another program holds firc's DNS port, so firc answers no DNS and the group's names resolve without it.": "Порт DNS firc занят другой программой, поэтому firc не отвечает на DNS, и имена группы разрешаются без него.",
-  "The group starts working by itself once firc gets the port. The warning over the page says what to do.": "Группа заработает сама, как только firc получит порт. Что сделать, написано в предупреждении поверх страницы."
+  "The group starts working by itself once firc gets the port. The warning over the page says what to do.": "Группа заработает сама, как только firc получит порт. Что сделать, написано в предупреждении поверх страницы.",
+  "Router policies": "Политики роутера",
+  "The router's own policies can use {name} as a way to the internet. It starts at the lowest priority, so a policy that also permits a WAN uses it only while they are down. Its priority is set in the router; if that makes it the router's main route, firc turns this off": "Политики самого роутера смогут выходить в интернет через {name}. Сначала у него самый низкий приоритет, поэтому политика, где разрешён и WAN, использует его, только пока они недоступны. Приоритет задаётся в роутере; если из-за него {name} станет основным маршрутом роутера, firc выключит это",
+  "Which policies use {name} is set in the router. Switching this off, deleting the tunnel or changing its device takes {name} out of them, and the router does not put it back": "Какие политики используют {name}, задаётся в роутере. Если выключить это, удалить туннель или сменить его устройство, {name} пропадёт из этих политик, и роутер не вернёт его сам",
+  "On save, {name} leaves every router policy that uses it": "При сохранении {name} пропадёт из всех политик роутера, где он есть",
+  "Router policies that use {name} lose it, and the router does not put it back.": "Политики роутера, где есть {name}, потеряют его, и роутер не вернёт его сам."
 }

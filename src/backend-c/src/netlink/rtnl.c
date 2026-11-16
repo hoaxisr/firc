@@ -537,9 +537,67 @@ firc_err_t firc_rtnl_link_by_name(firc_rtnl_t *r, const char *name, firc_link_in
 
     out->ifindex = (int)idx;
     out->up = (ctx.flags & IFF_UP) != 0;
+    out->carrier = (ctx.flags & IFF_LOWER_UP) != 0;
     out->point_to_point = (ctx.flags & IFF_POINTOPOINT) != 0;
     *found = true;
     return FIRC_OK;
+}
+
+typedef struct {
+    int *oifs;
+    size_t cap;
+    size_t n;
+} defaults_ctx_t;
+
+static void default_oif(defaults_ctx_t *ctx, int oif) {
+    if (ctx->n < ctx->cap) { ctx->oifs[ctx->n] = oif; }
+    ctx->n++;
+}
+
+static void defaults_cb(const struct nlmsghdr *h, void *ud) {
+    defaults_ctx_t *ctx = ud;
+    if (h->nlmsg_type != RTM_NEWROUTE || !payload_at_least(h, sizeof(struct rtmsg))) { return; }
+    const struct rtmsg *rtm = mnl_nlmsg_get_payload(h);
+    if (rtm->rtm_family != AF_INET || rtm->rtm_dst_len != 0) { return; }
+    uint32_t table = rtm->rtm_table;
+    int oif = 0;
+    const struct nlattr *multi = NULL;
+    firc_nlattr_iter_t it;
+    const struct nlattr *attr;
+    if (!firc_nlattr_iter_init_nlmsg(&it, h, sizeof(struct rtmsg))) { return; }
+    while (firc_nlattr_iter_next(&it, &attr)) {
+        uint16_t type = mnl_attr_get_type(attr);
+        if (type == RTA_TABLE && mnl_attr_get_payload_len(attr) == 4) {
+            table = *(const uint32_t *)mnl_attr_get_payload(attr);
+        } else if (type == RTA_OIF && mnl_attr_get_payload_len(attr) == 4) {
+            oif = (int)*(const uint32_t *)mnl_attr_get_payload(attr);
+        } else if (type == RTA_MULTIPATH) {
+            multi = attr;
+        }
+    }
+    if (table != RT_TABLE_MAIN) { return; }
+    if (oif > 0) { default_oif(ctx, oif); }
+    if (multi == NULL) { return; }
+    const struct rtnexthop *nh = mnl_attr_get_payload(multi);
+    size_t left = mnl_attr_get_payload_len(multi);
+    while (left >= sizeof(*nh) && nh->rtnh_len >= sizeof(*nh) && (size_t)nh->rtnh_len <= left) {
+        if (nh->rtnh_ifindex > 0) { default_oif(ctx, nh->rtnh_ifindex); }
+        size_t step = (size_t)RTNH_ALIGN(nh->rtnh_len);
+        if (step == 0 || step > left) { break; }
+        left -= step;
+        nh = (const struct rtnexthop *)(const void *)((const char *)nh + step);
+    }
+}
+
+static void defaults_begin(void *ud, bool retry) {
+    if (retry) { ((defaults_ctx_t *)ud)->n = 0; }
+}
+
+firc_err_t firc_rtnl_main_defaults(firc_rtnl_t *r, int *oifs, size_t cap, size_t *n) {
+    defaults_ctx_t ctx = {oifs, cap, 0};
+    firc_err_t err = dump_family(r, RTM_GETROUTE, AF_INET, defaults_cb, &ctx, defaults_begin);
+    *n = err == FIRC_OK ? ctx.n : 0;
+    return err;
 }
 
 typedef struct gw_ctx {

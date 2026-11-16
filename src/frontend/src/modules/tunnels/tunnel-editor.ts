@@ -218,6 +218,16 @@ export function routerWrite(saved: Tunnel | undefined, draft: Tunnel): string | 
   return `OpkgTun${splitDevice(draft.device).num}`;
 }
 
+export function routerName(device: string): string | null {
+  return device.startsWith("opkgtun") ? `OpkgTun${splitDevice(device).num}` : null;
+}
+
+export function policiesLeaving(saved: Tunnel | undefined, draft: Tunnel | null): string | null {
+  if (!saved?.routerPolicies) return null;
+  if (draft && draft.routerPolicies && draft.device === saved.device) return null;
+  return routerName(saved.device);
+}
+
 export const DESCRIPTION_MAX_BYTES = 63 as const;
 
 export function descriptionProblem(text: string, t: T): string | null {

@@ -712,6 +712,12 @@ void fake_rtnl_add_route(fake_rtnl_t *f, int family, uint32_t table, uint8_t rtm
     pthread_mutex_unlock(&f->mu);
 }
 
+void fake_rtnl_clear_routes(fake_rtnl_t *f) {
+    pthread_mutex_lock(&f->mu);
+    f->n_routes = 0;
+    pthread_mutex_unlock(&f->mu);
+}
+
 void fake_rtnl_scope_last_route(fake_rtnl_t *f, uint8_t scope) {
     pthread_mutex_lock(&f->mu);
     if (f->n_routes > 0) { f->routes[f->n_routes - 1].scope = scope; }

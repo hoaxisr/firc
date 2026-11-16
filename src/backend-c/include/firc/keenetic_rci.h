@@ -47,6 +47,10 @@ firc_err_t firc_kn_rci_post(const char *base_url, const char *path, const char *
 firc_err_t firc_kn_rci_post_timeout(const char *base_url, const char *path, const char *body, long timeout_s,
                                     const atomic_bool *stop, char **out_body);
 
+/* The same, also ended by cut (NULL for none) once the transfer runs; the token wait ends on stop only. */
+firc_err_t firc_kn_rci_post_cut(const char *base_url, const char *path, const char *body, long timeout_s,
+                                const atomic_bool *stop, const atomic_bool *cut, char **out_body);
+
 /* NDMS description for system_name, or NULL; a NULL or empty set is fine. */
 const char *firc_kn_aliases_lookup(const firc_kn_aliases_t *aliases, const char *system_name);
 

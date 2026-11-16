@@ -63,6 +63,10 @@ struct fake {
     int n_posts, i_posts;
     answer_t ns[MAX_ANS];
     int n_ns, i_ns;
+    answer_t routes[MAX_ANS];
+    int n_routes, i_routes;
+    atomic_bool cut;
+    atomic_bool block_save;
     bool devs[32];
     int n_devs, i_devs;
     char holder[16];
@@ -248,6 +252,14 @@ static firc_err_t f_get(void *ud, const char *path, char **body)
         say_line(f, "GET name-server");
         return answer(f, f->ns, f->n_ns, &f->i_ns, body);
     }
+    if (strcmp(path, FIRC_OPKGTUN_ROUTE_PATH) == 0) {
+        say_line(f, "GET route");
+        if (f->n_routes == 0) {
+            *body = strdup("[]");
+            return FIRC_OK;
+        }
+        return answer(f, f->routes, f->n_routes, &f->i_routes, body);
+    }
     say_line(f, "GET %s", path);
     *body = NULL;
     return FIRC_ERR_UPSTREAM;
@@ -257,6 +269,15 @@ static firc_err_t f_post(void *ud, const char *body, long timeout_s, char **out)
 {
     fake_t *f = ud;
     say_line(f, "POST %s T=%ld", body, timeout_s);
+    if (strstr(body, "\"save\"") != NULL && atomic_exchange(&f->block_save, false)) {
+        while (!atomic_load(&f->cut) && !atomic_load(&f->stop)) {
+            struct timespec ts = {0, 1000000L};
+            nanosleep(&ts, NULL);
+        }
+        say_line(f, "CUT");
+        *out = NULL;
+        return FIRC_ERR_CANCELED;
+    }
     return answer(f, f->posts, f->n_posts, &f->i_posts, out);
 }
 
@@ -336,7 +357,8 @@ static firc_opkgtun_io_t fake_io(fake_t *f)
                                .sleep_ms = f_sleep,
                                .intent_path = f->path,
                                .stop = &f->stop,
-                               .ud = f};
+                               .ud = f,
+                               .cut = &f->cut};
 }
 
 static firc_opkgtun_t *fake_start(fake_t *f)
@@ -378,6 +400,7 @@ static void fake_end(fake_t *f)
     free_answers(f->lists, f->n_lists);
     free_answers(f->posts, f->n_posts);
     free_answers(f->ns, f->n_ns);
+    free_answers(f->routes, f->n_routes);
     char cmd[96];
     snprintf(cmd, sizeof cmd, "rm -rf %s", f->dir);
     int rc = system(cmd);
@@ -390,6 +413,7 @@ static bool log_is(fake_t *f, bool sleeps, const char *const *want)
 {
     int k = 0;
     bool same = true;
+    pthread_mutex_lock(&f->mu);
     for (int i = 0; i < f->n; i++) {
         if (!sleeps && strncmp(f->lines[i], "SLEEP ", 6) == 0) { continue; }
         if (want[k] == NULL || strcmp(want[k], f->lines[i]) != 0) { same = false; }
@@ -402,22 +426,28 @@ static bool log_is(fake_t *f, bool sleeps, const char *const *want)
         fprintf(stderr, "want:\n");
         for (int i = 0; want[i] != NULL; i++) { fprintf(stderr, "  %s\n", want[i]); }
     }
+    pthread_mutex_unlock(&f->mu);
     return same;
 }
 
 static int count(fake_t *f, const char *prefix)
 {
     int c = 0;
+    pthread_mutex_lock(&f->mu);
     for (int i = 0; i < f->n; i++) { c += strncmp(f->lines[i], prefix, strlen(prefix)) == 0; }
+    pthread_mutex_unlock(&f->mu);
     return c;
 }
 
 static int64_t time_of(fake_t *f, const char *line)
 {
-    for (int i = 0; i < f->n; i++) {
-        if (strcmp(f->lines[i], line) == 0) { return f->at[i]; }
+    int64_t at = -1;
+    pthread_mutex_lock(&f->mu);
+    for (int i = 0; i < f->n && at < 0; i++) {
+        if (strcmp(f->lines[i], line) == 0) { at = f->at[i]; }
     }
-    return -1;
+    pthread_mutex_unlock(&f->mu);
+    return at;
 }
 
 static firc_opkgtun_seen_t seen_of(fake_t *f)
@@ -662,6 +692,7 @@ TEST a_new_record_is_created_marked_configured_and_waits_for_its_device(void)
                                        "INTENT dirty",
                                        P5_3,
                                        "L",
+                                       "GET route",
                                        "DEV opkgtun3",
                                        "SLEEP 500",
                                        "DEV opkgtun3",
@@ -712,7 +743,7 @@ TEST an_adopted_record_that_matches_writes_nothing(void)
     want1(f, want3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "DEV opkgtun3", NULL};
+    static const char *const want[] = {"L", "GET route", "DEV opkgtun3", NULL};
     ASSERT(log_is(f, true, want));
     firc_opkgtun_seen_t s = seen_of(f);
     ASSERT_EQ(FIRC_OPKG_READY, s.state);
@@ -736,7 +767,7 @@ TEST an_adopted_record_that_differs_is_reconfigured_and_saved(void)
     want1(f, want3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "INTENT dirty", "POST [" DESC3 "] T=10", "L", "DEV opkgtun3",
+    static const char *const want[] = {"L", "INTENT dirty", "POST [" DESC3 "] T=10", "L", "GET route", "DEV opkgtun3",
                                        SAVE, "INTENT ", NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(1000, time_of(f, SAVE));
@@ -758,7 +789,7 @@ TEST an_up_only_restore_saves_nothing(void)
     want1(f, want3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "POST [" UP3 "] T=10", "L", "DEV opkgtun3", NULL};
+    static const char *const want[] = {"L", "POST [" UP3 "] T=10", "L", "GET route", "DEV opkgtun3", NULL};
     ASSERT(log_is(f, true, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
     ASSERT(seen_of(f).saved);
@@ -821,7 +852,7 @@ TEST a_timed_out_create_whose_record_exists_is_adopted(void)
     fake_go(f);
     ASSERT(fake_settle(f));
     static const char *const want[] = {"L",  "DEV opkgtun3", "HOLD 3 opkgtun3", "INTENT creating OpkgTun3\ndirty",
-                                       CREATE3, "L", "INTENT dirty", P5_3, "L", "DEV opkgtun3", SAVE, "INTENT ",
+                                       CREATE3, "L", "INTENT dirty", P5_3, "L", "GET route", "DEV opkgtun3", SAVE, "INTENT ",
                                        NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
@@ -949,7 +980,7 @@ TEST a_removal_clears_its_name_servers_first(void)
     ASSERT(fake_settle(f));
     static const char *const want[] = {
         "L",
-        "GET name-server",
+        "GET route", "GET name-server",
         "INTENT dirty",
         "POST [{\"ip\":{\"name-server\":{\"no\":true,\"address\":\"192.0.2.53\",\"domain\":\"\",\"interface\":"
         "\"OpkgTun3\"}}}] T=10",
@@ -981,7 +1012,7 @@ TEST a_device_left_behind_is_unpersisted_after_the_record(void)
     want1(f, gone3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L",          "GET name-server", "INTENT dirty", DELETE3,      "DEV opkgtun3",
+    static const char *const want[] = {"L",          "GET route", "GET name-server", "INTENT dirty", DELETE3,      "DEV opkgtun3",
                                        "SLEEP 500",  "DEV opkgtun3",    "SLEEP 500",    "DEV opkgtun3", "SLEEP 500",
                                        "DEV opkgtun3", "SLEEP 500",     "DEV opkgtun3", "UNPERSIST opkgtun3",
                                        "SLEEP 1000", "SLEEP 1000",      "SLEEP 1000",   SAVE,         "INTENT ",
@@ -1054,9 +1085,9 @@ TEST the_sweep_keeps_what_is_wanted_when_it_runs(void)
     fake_go(f);
     ASSERT(fake_settle(f));
     static const char *const want[] = {"L",
-                                       "DEV opkgtun2",
+                                       "GET route", "DEV opkgtun2",
                                        "L",
-                                       "GET name-server",
+                                       "GET route", "GET name-server",
                                        "INTENT dirty",
                                        "POST [{\"interface\":{\"name\":\"OpkgTun1\",\"no\":true}}] T=10",
                                        "DEV opkgtun1",
@@ -1133,7 +1164,7 @@ TEST a_failed_read_is_never_absence(void)
     want1(f, want3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "L", "L", "L", "DEV opkgtun3", NULL};
+    static const char *const want[] = {"L", "L", "L", "L", "GET route", "DEV opkgtun3", NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(0, count(f, "POST"));
     int64_t t[4];
@@ -1278,7 +1309,7 @@ TEST a_timed_out_configure_reads_back_before_failing(void)
     fake_go(f);
     ASSERT(fake_settle(f));
     static const char *const want[] = {"L",  "DEV opkgtun3", "HOLD 3 opkgtun3", "INTENT creating OpkgTun3\ndirty",
-                                       CREATE3, "L", "INTENT dirty", P5_3, "L", "DEV opkgtun3", SAVE, "INTENT ",
+                                       CREATE3, "L", "INTENT dirty", P5_3, "L", "GET route", "DEV opkgtun3", SAVE, "INTENT ",
                                        NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
@@ -1318,7 +1349,7 @@ TEST a_timed_out_delete_whose_record_is_gone_goes_on(void)
     want1(f, gone3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "GET name-server", "INTENT dirty", DELETE3, "L", "DEV opkgtun3",
+    static const char *const want[] = {"L", "GET route", "GET name-server", "INTENT dirty", DELETE3, "L", "DEV opkgtun3",
                                        SAVE, "INTENT ", NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(15000, time_of(f, SAVE));
@@ -1338,7 +1369,7 @@ TEST a_refused_delete_of_an_absent_record_goes_on(void)
     want1(f, gone3());
     fake_go(f);
     ASSERT(fake_settle(f));
-    static const char *const want[] = {"L", "GET name-server", "INTENT dirty", DELETE3, "INTENT ", "L",
+    static const char *const want[] = {"L", "GET route", "GET name-server", "INTENT dirty", DELETE3, "INTENT ", "L",
                                        "DEV opkgtun3", NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
@@ -1485,7 +1516,7 @@ TEST a_partial_create_leaves_a_claimable_record(void)
     fake_go(f);
     ASSERT(fake_settle(f));
     static const char *const want[] = {"L",  "DEV opkgtun3", "HOLD 3 opkgtun3", "INTENT creating OpkgTun3\ndirty",
-                                       CREATE3, "L", P5_3, "L", "INTENT dirty", "DEV opkgtun3", SAVE, "INTENT ",
+                                       CREATE3, "L", P5_3, "L", "INTENT dirty", "GET route", "DEV opkgtun3", SAVE, "INTENT ",
                                        NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
@@ -1508,7 +1539,7 @@ TEST a_half_made_record_is_claimed_when_wanted(void)
     fake_go(f);
     ASSERT(fake_settle(f));
     static const char *const want[] = {"L", "HOLD 3 opkgtun3", "INTENT creating OpkgTun3\ndirty", P5_3, "L",
-                                       "INTENT dirty", "DEV opkgtun3", SAVE, "INTENT ", NULL};
+                                       "INTENT dirty", "GET route", "DEV opkgtun3", SAVE, "INTENT ", NULL};
     ASSERT(log_is(f, false, want));
     ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
     fake_end(f);
@@ -1627,7 +1658,7 @@ TEST a_restart_keeps_a_creating_line(void)
     want1(g, want3());
     fake_go(g);
     ASSERT(fake_settle(g));
-    static const char *const want[] = {"L", "HOLD 3 opkgtun3", P5_3, "L", "INTENT dirty", "DEV opkgtun3", SAVE,
+    static const char *const want[] = {"L", "HOLD 3 opkgtun3", P5_3, "L", "INTENT dirty", "GET route", "DEV opkgtun3", SAVE,
                                        "INTENT ", NULL};
     ASSERT(log_is(g, false, want));
     ASSERT_EQ(10000, time_of(g, "L"));
@@ -1674,7 +1705,7 @@ TEST the_one_pass_sweep_removes_then_saves(void)
     note_intent(f);
     pthread_mutex_unlock(&f->mu);
     static const char *const want[] = {"L",
-                                       "GET name-server",
+                                       "GET route", "GET name-server",
                                        "INTENT dirty",
                                        "POST [{\"interface\":{\"name\":\"OpkgTun2\",\"no\":true}}] T=10",
                                        "DEV opkgtun2",
@@ -1982,8 +2013,8 @@ static bool settles_after_one_write(const char *sent, const char *kept)
     bool settled = fake_settle(f);
     char post[256];
     snprintf(post, sizeof post, "POST [{\"interface\":{\"name\":\"OpkgTun3\",\"description\":\"%s\"}}] T=10", sent);
-    const char *const want[] = {"L", "INTENT dirty", post, "L", "DEV opkgtun3", SAVE, "INTENT ", "L", "DEV opkgtun3",
-                                NULL};
+    const char *const want[] = {"L", "INTENT dirty", post, "L", "GET route", "DEV opkgtun3", SAVE, "INTENT ", "L",
+                                "DEV opkgtun3", NULL};
     bool same = settled && log_is(f, false, want) && seen_of(f).state == FIRC_OPKG_READY &&
                 seen_of(f).rechecked == 1 && seen_of(f).saved;
     fake_end(f);
@@ -2060,6 +2091,878 @@ TEST the_tunnels_own_tunvless_device_does_not_hold_its_address(void)
     PASS();
 }
 
+#define GLOBAL3 "POST [{\"interface\":{\"name\":\"OpkgTun3\",\"ip\":{\"global\":{\"auto\":true}}}}] T=10"
+#define NOGLOBAL3 "POST [{\"interface\":{\"name\":\"OpkgTun3\",\"ip\":{\"global\":{\"no\":true}}}}] T=10"
+#define ROUTE3 "POST [{\"ip\":{\"route\":{\"default\":true,\"interface\":\"OpkgTun3\"}}}] T=10"
+#define NOROUTE3 "POST [{\"ip\":{\"route\":{\"default\":true,\"interface\":\"OpkgTun3\",\"no\":true}}}] T=10"
+
+static char *with_priority(char *list, const char *name, long prio)
+{
+    cJSON *root = cJSON_Parse(list);
+    free(list);
+    cJSON *g = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root, name), "ip"), "global");
+    cJSON_ReplaceItemInObjectCaseSensitive(g, "priority", cJSON_CreateNumber((double)prio));
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return out;
+}
+
+static char *global3(long prio)
+{
+    char *t = rc_from("rc-list-global.json", "OpkgTun3", "firc:t1 PRAW-1", "203.0.113.4", "255.255.255.255", 1, false);
+    return prio == 8191 ? t : with_priority(t, "OpkgTun3", prio);
+}
+
+static char *renamed(const char *fixture, const char *name)
+{
+    char *t = fx(fixture);
+    char *at = strstr(t, "OpkgTun9");
+    size_t cap = strlen(t) + 16;
+    char *out = malloc(cap);
+    snprintf(out, cap, "%.*s%s%s", (int)(at - t), t, name, at + 8);
+    free(t);
+    return out;
+}
+
+static firc_opkgtun_want_t pol3(bool policies, bool route, uint32_t checked)
+{
+    firc_opkgtun_want_t w = want3();
+    w.policies = policies;
+    w.route = route;
+    w.checked = checked;
+    return w;
+}
+
+static void routes(fake_t *f, const char *a, const char *b, const char *c)
+{
+    const char *v[] = {a, b, c};
+    for (int i = 0; i < 3 && v[i] != NULL; i++) {
+        add(f->routes, &f->n_routes,
+            ok(strcmp(v[i], "with") == 0 ? renamed("rc-route-with.json", "OpkgTun3") : fx("rc-route-without.json")));
+    }
+}
+
+/* catches: the route before global, no read-back of global, or a save before the route is checked */
+TEST policies_on_reads_global_back_before_the_route(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", "without", "with");
+    add(f->posts, &f->n_posts, ok(fx("global-on.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-on.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",    "GET route", "INTENT dirty", GLOBAL3, "L", "GET route",
+                                       ROUTE3, "GET route", "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_READY, s.state);
+    ASSERT_EQ(FIRC_OPKG_POL_ON, s.policies);
+    ASSERT(s.route);
+    ASSERT_EQ(1u, s.route_adds);
+    f->now += 60000;
+    want1(f, pol3(true, true, 0));
+    struct timespec nap = {0, 50 * 1000000L};
+    nanosleep(&nap, NULL);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(0, count(f, SAVE));
+    want1(f, pol3(true, true, 1));
+    for (int i = 0; i < 5000 && count(f, SAVE) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(1, count(f, SAVE));
+    ASSERT_STR_EQ("INTENT ", f->lines[f->n - 1]);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a fixed priority in the global item, which would override the one the user picks on the router */
+TEST the_global_item_is_auto(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", "without", "with");
+    add(f->posts, &f->n_posts, ok(fx("global-on.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-on.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(1, count(f, GLOBAL3));
+    ASSERT_EQ(0, count(f, "POST [{\"interface\":{\"name\":\"OpkgTun3\",\"ip\":{\"global\":{\"priority\""));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a route sent after a refused global */
+TEST a_refused_global_sends_no_route(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->posts, &f->n_posts, ok(fx("global-0-refused.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, true, 0);
+    w.recheck = 5;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "GET route", "INTENT dirty", GLOBAL3, "INTENT ", "DEV opkgtun3", "L",
+                                       NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(0, count(f, ROUTE3));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_READY, s.state);
+    ASSERT_EQ(5u, s.rechecked);
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, s.policies);
+    ASSERT(strstr(s.pol_error, "global priority should be non-zero") != NULL);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a policies failure that fails the record, so the spawn gate would hold the tunnel */
+TEST a_policies_failure_keeps_the_tunnel_running(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", "without", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, true, 0);
+    w.recheck = 2;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_READY, s.state);
+    ASSERT_EQ(2u, s.rechecked);
+    ASSERT_STR_EQ("", s.error);
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, s.policies);
+    ASSERT(strstr(s.pol_error, "did not add the default route via OpkgTun3") != NULL);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: global set over a route left without it, instead of the route removed first and set up again */
+TEST a_route_without_global_is_removed(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->routes, &f->n_routes, ok(renamed("rc-route-with.json", "OpkgTun3")));
+    add(f->routes, &f->n_routes, ok(fx("rc-route-after-off.json")));
+    add(f->routes, &f->n_routes, ok(fx("rc-route-without.json")));
+    add(f->routes, &f->n_routes, ok(renamed("rc-route-with.json", "OpkgTun3")));
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-on.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-on.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",       "GET route", "INTENT dirty", NOROUTE3,  "GET route",
+                                       GLOBAL3,   "L",         "GET route",    ROUTE3,    "GET route",
+                                       "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(FIRC_OPKG_POL_ON, seen_of(f).policies);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a kept route removed before the daemon has seen the record, which a restart then saves again */
+TEST a_kept_route_is_read_and_left_in_place(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", NULL, NULL);
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "GET route", "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(FIRC_OPKG_POL_ON, seen_of(f).policies);
+    ASSERT(seen_of(f).route);
+    fake_end(f);
+    PASS();
+}
+
+static int g_saved_at_read = -1;
+
+static void note_saved_at_read(fake_t *f, const char *line)
+{
+    if (strcmp(line, "GET route") == 0 && g_saved_at_read < 0) { g_saved_at_read = seen_of(f).saved ? 1 : 0; }
+}
+
+/* catches: a record taken as saved while a save owed from before the restart is still pending */
+TEST a_record_after_a_dirty_start_is_not_saved(void)
+{
+    fake_t *f = fake_new();
+    fake_intent(f, "dirty\n");
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", NULL, NULL);
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    g_saved_at_read = -1;
+    f->hook = note_saved_at_read;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(0, g_saved_at_read);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: an unsaved kept line written to flash before the daemon decides whether it stays */
+TEST an_unsaved_kept_line_holds_the_save(void)
+{
+    fake_t *f = fake_new();
+    fake_intent(f, "dirty\n");
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", "without");
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    bool settled = fake_settle(f);
+    int saves = count(f, SAVE);
+    want1(f, pol3(true, false, 0));
+    for (int i = 0; i < 5000 && count(f, SAVE) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    settled = settled && fake_settle(f);
+    ASSERT(settled);
+    ASSERT_EQ(0, saves);
+    static const char *const want[] = {"L", "GET route", "DEV opkgtun3", "L", "GET route", NOROUTE3, "GET route",
+                                       "DEV opkgtun3", SAVE, "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: keep honoured with global gone, which leaves a route line with no global */
+TEST keep_without_global_still_clears_the_route(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "without", "with");
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-on.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(1, count(f, NOROUTE3));
+    ASSERT_EQ(1, count(f, GLOBAL3));
+    ASSERT_EQ(0, count(f, ROUTE3));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a want that only drops keep left unacted, so a kept route outlives the decision to remove it */
+TEST dropping_keep_removes_the_kept_route(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", "without");
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    bool settled = fake_settle(f);
+    want1(f, pol3(true, false, 0));
+    for (int i = 0; i < 5000 && count(f, NOROUTE3) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    settled = settled && fake_settle(f);
+    ASSERT(settled);
+    ASSERT_EQ(1, count(f, NOROUTE3));
+    ASSERT_FALSE(seen_of(f).route);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a removal driven by the want and not by the route read, or global cleared before the route */
+TEST policies_off_removes_the_route_then_global(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "without", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(false, false, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",       "GET route",    "INTENT dirty", NOROUTE3, "GET route",
+                                       NOGLOBAL3, "DEV opkgtun3", SAVE,           "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_POL_OFF, s.policies);
+    ASSERT_FALSE(s.route);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: the item status trusted over the read-back, either way */
+TEST a_route_removal_answered_with_an_error_counts_when_the_route_is_gone(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "without", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, false, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",          "GET route", "INTENT dirty", NOROUTE3, "GET route",
+                                       "DEV opkgtun3", SAVE,      "INTENT ",      NULL};
+    ASSERT(log_is(f, false, want));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_POL_ON, s.policies);
+    ASSERT_FALSE(s.route);
+    fake_end(f);
+
+    f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, false, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const kept[] = {"L",          "GET route", "INTENT dirty", NOROUTE3, "GET route",
+                                       "DEV opkgtun3", "L",       NULL};
+    ASSERT(log_is(f, false, kept));
+    s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, s.policies);
+    ASSERT(s.route);
+    ASSERT(strstr(s.pol_error, "the router kept the default route via OpkgTun3") != NULL);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a refused `no ip global` taken as off, or the route left in place before it */
+TEST off_with_a_permit_in_place(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "without", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-0-refused.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(false, false, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(1, count(f, NOROUTE3));
+    ASSERT_EQ(1, count(f, NOGLOBAL3));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_READY, s.state);
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, s.policies);
+    ASSERT_FALSE(s.route);
+    ASSERT(strstr(s.pol_error,
+                  "OpkgTun3 is still in a router policy; remove it there to finish turning router policies off") !=
+           NULL);
+    ASSERT_STR_EQ("L", f->lines[f->n - 1]);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a priority the user set on the router sent back at a converge */
+TEST a_priority_set_on_the_router_is_kept(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(20000)));
+    routes(f, "with", NULL, NULL);
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "GET route", "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(0, count(f, "POST"));
+    ASSERT_EQ(FIRC_OPKG_POL_ON, seen_of(f).policies);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: the switch off writing a route or global item on a record that never had them */
+TEST policies_off_by_default_send_nothing_extra(void)
+{
+    fake_t *f = fake_new();
+    base_script(f);
+    f->devs[f->n_devs++] = false;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, want3());
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",
+                                       "DEV opkgtun3",
+                                       "HOLD 3 opkgtun3",
+                                       "INTENT creating OpkgTun3\ndirty",
+                                       CREATE3,
+                                       "L",
+                                       "INTENT dirty",
+                                       P5_3,
+                                       "L",
+                                       "GET route",
+                                       "DEV opkgtun3",
+                                       SAVE,
+                                       "INTENT ",
+                                       NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(FIRC_OPKG_POL_OFF, seen_of(f).policies);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: an Absent path that deletes the interface with its route line still there, or skips global */
+TEST a_removal_clears_the_route_then_global_before_the_interface(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "without", NULL);
+    add(f->ns, &f->n_ns, ok(fx("name-server-after.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("delete-ok.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    fake_start(f);
+    want1(f, gone3());
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",       "GET route",       "INTENT dirty", NOROUTE3,       "GET route",
+                                       NOGLOBAL3, "GET name-server", DELETE3,        "DEV opkgtun3", SAVE,
+                                       "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a failed A1c that still deletes the interface */
+TEST a_failed_route_removal_blocks_the_interface_delete(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    fake_start(f);
+    want1(f, gone3());
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "GET route", "INTENT dirty", NOROUTE3, "GET route", "L", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(0, count(f, DELETE3));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_FAILED, s.state);
+    ASSERT(s.removing);
+    ASSERT(strstr(s.error, "the router kept the default route via OpkgTun3") != NULL);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a refused `no ip global` that blocks the delete, though the route is gone */
+TEST a_refused_no_global_does_not_block_the_delete(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", NULL, NULL);
+    add(f->ns, &f->n_ns, ok(fx("name-server-after.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-0-refused.json")));
+    add(f->posts, &f->n_posts, ok(fx("delete-ok.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    fake_start(f);
+    want1(f, gone3());
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",     "GET route",    "INTENT dirty", NOGLOBAL3, "GET name-server",
+                                       DELETE3, "DEV opkgtun3", SAVE,           "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    fake_end(f);
+    PASS();
+}
+
+static char *swept_global(void)
+{
+    char *t = rc_from("rc-list-global.json", "OpkgTun1", "firc:a", "203.0.113.2", "255.255.255.255", 1, false);
+    return with_priority(t, "OpkgTun1", 1);
+}
+
+/* catches: A1c missing from the sweep */
+TEST a_sweep_removes_the_route_before_the_interface(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(swept_global()));
+    add(f->routes, &f->n_routes, ok(renamed("rc-route-with.json", "OpkgTun1")));
+    add(f->routes, &f->n_routes, ok(fx("rc-route-after-off.json")));
+    add(f->ns, &f->n_ns, ok(fx("name-server-after.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("global-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("delete-ok.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    fake_start(f);
+    firc_opkgtun_want(f->m, NULL, 0);
+    firc_opkgtun_sweep_now(f->m);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {
+        "L",
+        "GET route",
+        "INTENT dirty",
+        "POST [{\"ip\":{\"route\":{\"default\":true,\"interface\":\"OpkgTun1\",\"no\":true}}}] T=10",
+        "GET route",
+        "POST [{\"interface\":{\"name\":\"OpkgTun1\",\"ip\":{\"global\":{\"no\":true}}}}] T=10",
+        "GET name-server",
+        "POST [{\"interface\":{\"name\":\"OpkgTun1\",\"no\":true}}] T=10",
+        "DEV opkgtun1",
+        SAVE,
+        "INTENT ",
+        NULL};
+    ASSERT(log_is(f, false, want));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a trip queued behind a save, or a save in flight left to finish first */
+TEST a_trip_cuts_a_save_and_removes_the_route_first(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", "without");
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    fake_intent(f, "dirty\n");
+    atomic_store(&f->block_save, true);
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    bool settled = fake_settle(f);
+    want1(f, pol3(true, true, 1));
+    for (int i = 0; i < 5000 && count(f, SAVE) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    firc_opkgtun_trip(f->m, "OpkgTun3");
+    for (int i = 0; i < 5000 && count(f, SAVE) < 2; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    ASSERT(settled && fake_settle(f));
+    static const char *const want[] = {"L",   "GET route", "DEV opkgtun3", SAVE, "CUT",    "GET route",
+                                       NOROUTE3, "GET route", SAVE,        "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    int64_t second = -1;
+    for (int i = 0, k = 0; i < f->n; i++) {
+        if (strcmp(f->lines[i], SAVE) == 0 && ++k == 2) { second = f->at[i]; }
+    }
+    ASSERT_EQ(time_of(f, "CUT"), second);
+    ASSERT_FALSE(seen_of(f).route);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a switch-off with no global left in the router that skips the route read, so firc's line outlives global */
+TEST policies_off_without_global_still_clears_a_route_it_saw(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    routes(f, "with", "with", "without");
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(FIRC_OPKG_POL_ON, seen_of(f).policies);
+    want1(f, pol3(false, false, 0));
+    for (int i = 0; i < 5000 && count(f, SAVE) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",        "GET route", "DEV opkgtun3", "L",    "GET route", "INTENT dirty",
+                                       NOROUTE3,   "GET route", "DEV opkgtun3", SAVE,   "INTENT ",   NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(0, count(f, NOGLOBAL3));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_POL_OFF, s.policies);
+    ASSERT_FALSE(s.route);
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a withdrawn route that keeps the save held, so the router's unsaved changes wait for a link that never comes */
+TEST a_withdrawn_route_releases_the_save(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", "with", "with");
+    add(f->routes, &f->n_routes, ok(fx("rc-route-after-off.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-on.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(0, count(f, SAVE));
+    want1(f, pol3(true, false, 0));
+    for (int i = 0; i < 5000 && count(f, SAVE) == 0; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L",        "GET route", "INTENT dirty", ROUTE3, "GET route", "DEV opkgtun3",
+                                       "L",        "GET route", NOROUTE3,       "GET route", "DEV opkgtun3",
+                                       SAVE,       "INTENT ",   NULL};
+    ASSERT(log_is(f, false, want));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: an add answered with an error item taken as refused though the read-back shows the line */
+TEST an_add_answered_with_an_error_counts_when_the_route_is_there(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "without", "with", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "GET route", "INTENT dirty", ROUTE3, "GET route", "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(FIRC_OPKG_POL_ON, s.policies);
+    ASSERT(s.route);
+    ASSERT_FALSE(s.saved);
+    ASSERT_EQ(-1, time_of(f, "INTENT "));
+    fake_end(f);
+    PASS();
+}
+
+static bool reach(fake_t *f, const char *prefix, int n)
+{
+    for (int i = 0; i < 5000 && count(f, prefix) < n; i++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return count(f, prefix) >= n && fake_settle(f);
+}
+
+static char *global_desc3(const char *desc)
+{
+    return rc_from("rc-list-global.json", "OpkgTun3", desc, "203.0.113.4", "255.255.255.255", 1, false);
+}
+
+static int g_lists_seen;
+
+static void seen_at_third_list(fake_t *f, const char *line)
+{
+    if (strcmp(line, "L") == 0 && ++g_lists_seen == 3) { record_seen(f, line); }
+}
+
+static firc_opkgtun_want_t desc3(const char *desc, uint32_t checked)
+{
+    firc_opkgtun_want_t w = pol3(true, true, checked);
+    snprintf(w.desc, sizeof w.desc, "%s", desc);
+    return w;
+}
+
+/* catches: an edit that rebuilds the record dropping the hold or the route counts, so an unchecked route is saved */
+TEST an_edit_keeps_the_hold_of_an_unchecked_route(void)
+{
+    fake_t *f = fake_new();
+    static const int idx[] = {0};
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global_desc3("firc:t1 PRAW-2")));
+    add(f->lists, &f->n_lists, ok(global_desc3("firc:t1 PRAW-2")));
+    add(f->lists, &f->n_lists, ok(global_desc3("firc:t1 PRAW-3")));
+    routes(f, "without", "without", "with");
+    routes(f, "with", "with", NULL);
+    add(f->posts, &f->n_posts, ok(fx("global-on.json")));
+    add(f->posts, &f->n_posts, ok(fx("route-on.json")));
+    add(f->posts, &f->n_posts, ok(pick("configure-ok.json", idx, 1)));
+    add(f->posts, &f->n_posts, ok(pick("configure-ok.json", idx, 1)));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    for (int i = 0; i < 3; i++) { f->devs[f->n_devs++] = true; }
+    g_lists_seen = 0;
+    f->hook = seen_at_third_list;
+    fake_start(f);
+    want1(f, pol3(true, true, 0));
+    fake_go(f);
+    ASSERT(reach(f, "DEV opkgtun3", 1));
+    firc_opkgtun_seen_t s = seen_of(f);
+    ASSERT_EQ(1u, s.route_adds);
+    uint32_t reads = s.route_reads;
+    want1(f, desc3("firc:t1 PRAW-2", 0));
+    ASSERT(reach(f, "DEV opkgtun3", 2));
+    ASSERT_EQ(1, f->n_hook_seen);
+    ASSERT(f->hook_seen[0].route);
+    ASSERT_EQ(reads, f->hook_seen[0].route_reads);
+    ASSERT_EQ(1u, f->hook_seen[0].route_adds);
+    ASSERT_EQ(0, count(f, SAVE));
+    ASSERT_EQ(1u, seen_of(f).route_adds);
+    want1(f, desc3("firc:t1 PRAW-3", 1));
+    ASSERT(reach(f, SAVE, 1));
+    ASSERT_EQ(1, count(f, SAVE));
+    ASSERT_EQ(1, count(f, ROUTE3));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: a line found after a dirty start adopted as checked, so it is saved before the guard has looked at main */
+TEST a_line_found_after_a_dirty_start_counts_as_an_add(void)
+{
+    fake_t *f = fake_new();
+    fake_intent(f, "dirty\n");
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    routes(f, "with", "with", NULL);
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(reach(f, "DEV opkgtun3", 1));
+    ASSERT_EQ(1u, seen_of(f).route_adds);
+    want1(f, pol3(true, true, 0));
+    ASSERT(reach(f, "DEV opkgtun3", 2));
+    ASSERT_EQ(0, count(f, SAVE));
+    ASSERT_EQ(1u, seen_of(f).route_adds);
+    want1(f, pol3(true, true, 1));
+    ASSERT(reach(f, SAVE, 1));
+    static const char *const want[] = {"L", "GET route", "DEV opkgtun3", "L", "GET route", "DEV opkgtun3", SAVE,
+                                       "INTENT ", NULL};
+    ASSERT(log_is(f, false, want));
+    fake_end(f);
+    PASS();
+}
+
+/* catches: the switch off trusting a route state it never read, so a line left without global outlives a restart */
+TEST an_orphan_route_with_the_switch_off_is_removed_once(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    routes(f, "with", "without", NULL);
+    add(f->posts, &f->n_posts, ok(fx("route-off.json")));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    want1(f, want3());
+    fake_go(f);
+    ASSERT(reach(f, SAVE, 1));
+    firc_opkgtun_want_t w = want3();
+    w.recheck = 1;
+    want1(f, w);
+    ASSERT(reach(f, "DEV opkgtun3", 2));
+    static const char *const want[] = {"L",       "GET route", "INTENT dirty", NOROUTE3, "GET route", "DEV opkgtun3",
+                                       SAVE,      "INTENT ",   "L",            "DEV opkgtun3", NULL};
+    ASSERT(log_is(f, false, want));
+    ASSERT_EQ(FIRC_OPKG_POL_OFF, seen_of(f).policies);
+    ASSERT_FALSE(seen_of(f).route);
+    fake_end(f);
+    PASS();
+}
+
+static void edit_at_first_list(fake_t *f, const char *line)
+{
+    if (strcmp(line, "L") == 0 && f->hook_fired++ == 0) {
+        firc_opkgtun_want_t w = desc3("firc:t1 PRAW-2", 0);
+        w.route = false;
+        w.keep = true;
+        want1(f, w);
+    }
+}
+
+/* catches: an edit before the first route read that forgets the dirty start, so the line it then finds is saved */
+TEST an_edit_before_the_first_route_read_still_holds_a_found_line(void)
+{
+    fake_t *f = fake_new();
+    fake_intent(f, "dirty\n");
+    static const int idx[] = {0};
+    add(f->lists, &f->n_lists, fail(FIRC_ERR_UPSTREAM));
+    add(f->lists, &f->n_lists, ok(global3(8191)));
+    add(f->lists, &f->n_lists, ok(global_desc3("firc:t1 PRAW-2")));
+    routes(f, "with", NULL, NULL);
+    add(f->posts, &f->n_posts, ok(pick("configure-ok.json", idx, 1)));
+    add(f->posts, &f->n_posts, ok(strdup(SAVE_OK)));
+    f->devs[f->n_devs++] = true;
+    f->hook = edit_at_first_list;
+    fake_start(f);
+    firc_opkgtun_want_t w = pol3(true, false, 0);
+    w.keep = true;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(reach(f, "DEV opkgtun3", 1));
+    ASSERT_EQ(1u, seen_of(f).route_adds);
+    ASSERT_EQ(0, count(f, SAVE));
+    fake_end(f);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2127,5 +3030,32 @@ int main(int argc, char **argv)
     RUN_TEST(a_description_the_router_rewrites_is_sent_once);
     RUN_TEST(an_unreachable_sweep_warns_once_and_only_with_something_to_sweep);
     RUN_TEST(the_tunnels_own_tunvless_device_does_not_hold_its_address);
+    RUN_TEST(policies_on_reads_global_back_before_the_route);
+    RUN_TEST(the_global_item_is_auto);
+    RUN_TEST(a_refused_global_sends_no_route);
+    RUN_TEST(a_policies_failure_keeps_the_tunnel_running);
+    RUN_TEST(a_route_without_global_is_removed);
+    RUN_TEST(a_kept_route_is_read_and_left_in_place);
+    RUN_TEST(dropping_keep_removes_the_kept_route);
+    RUN_TEST(a_record_after_a_dirty_start_is_not_saved);
+    RUN_TEST(keep_without_global_still_clears_the_route);
+    RUN_TEST(an_unsaved_kept_line_holds_the_save);
+    RUN_TEST(policies_off_removes_the_route_then_global);
+    RUN_TEST(a_route_removal_answered_with_an_error_counts_when_the_route_is_gone);
+    RUN_TEST(off_with_a_permit_in_place);
+    RUN_TEST(a_priority_set_on_the_router_is_kept);
+    RUN_TEST(policies_off_by_default_send_nothing_extra);
+    RUN_TEST(a_removal_clears_the_route_then_global_before_the_interface);
+    RUN_TEST(a_failed_route_removal_blocks_the_interface_delete);
+    RUN_TEST(a_refused_no_global_does_not_block_the_delete);
+    RUN_TEST(a_sweep_removes_the_route_before_the_interface);
+    RUN_TEST(a_trip_cuts_a_save_and_removes_the_route_first);
+    RUN_TEST(policies_off_without_global_still_clears_a_route_it_saw);
+    RUN_TEST(a_withdrawn_route_releases_the_save);
+    RUN_TEST(an_add_answered_with_an_error_counts_when_the_route_is_there);
+    RUN_TEST(an_edit_keeps_the_hold_of_an_unchecked_route);
+    RUN_TEST(a_line_found_after_a_dirty_start_counts_as_an_add);
+    RUN_TEST(an_orphan_route_with_the_switch_off_is_removed_once);
+    RUN_TEST(an_edit_before_the_first_route_read_still_holds_a_found_line);
     GREATEST_MAIN_END();
 }

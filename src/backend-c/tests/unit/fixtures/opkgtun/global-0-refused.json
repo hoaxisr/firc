@@ -1,0 +1,18 @@
+[
+  {
+    "interface": {
+      "ip": {
+        "global": {
+          "status": [
+            {
+              "status": "error",
+              "code": "72744992",
+              "ident": "Network::Interface::L3Base",
+              "message": "\"OpkgTun9\": global priority should be non-zero."
+            }
+          ]
+        }
+      }
+    }
+  }
+]

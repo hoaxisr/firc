@@ -53,6 +53,7 @@ typedef struct firc_tunrun_router {
     void (*pass)(void *ud);
     int fd;
     void *ud;
+    void (*trip)(const char *name, void *ud);
 } firc_tunrun_router_t;
 
 /* Takes a copy of r: the opkgtun<N> records are wanted through it, its fd is watched for their states, and every
@@ -165,6 +166,8 @@ bool firc_tunrun_ktcp_bytes(const firc_tunrun_t *t, const char *device, uint64_t
 void firc_tunrun_ktcp_bytes_add_for_test(firc_tunrun_t *t, const char *device, uint32_t rx, uint32_t tx); /* test seam */
 
 void firc_tunrun_set_list_max_for_test(firc_tunrun_t *t, size_t bytes); /* test seam: tunvless's stdin limit */
+/* Test seam: one pass of the main-default guard now, on the clock firc_tunrun_set_watch_for_test sets. */
+void firc_tunrun_guard_for_test(firc_tunrun_t *t);
 /* Test seam: the clock and the period of the check for a tunnel with no working node; returns its timer, 0 none. */
 int firc_tunrun_set_watch_for_test(firc_tunrun_t *t, int64_t (*now_ms)(void), int period_ms);
 

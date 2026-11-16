@@ -10,6 +10,7 @@
 
 #define FIRC_OPKGTUN_LIST_PATH "/rci/show/rc/interface"
 #define FIRC_OPKGTUN_NS_PATH "/rci/show/rc/ip/name-server"
+#define FIRC_OPKGTUN_ROUTE_PATH "/rci/show/rc/ip/route"
 #define FIRC_OPKGTUN_MAX_WANTS 32
 #define FIRC_OPKGTUN_DESC_MAX 256
 
@@ -24,9 +25,12 @@ typedef struct {
     const char *intent_path;
     atomic_bool *stop;
     void *ud;
+    atomic_bool *cut;
 } firc_opkgtun_io_t;
 
 typedef enum { FIRC_OPKG_PENDING, FIRC_OPKG_READY, FIRC_OPKG_FAILED, FIRC_OPKG_FOREIGN } firc_opkg_state_t;
+
+typedef enum { FIRC_OPKG_POL_OFF, FIRC_OPKG_POL_ON, FIRC_OPKG_POL_FAILED } firc_opkg_pol_t;
 
 typedef struct {
     char name[16];
@@ -36,6 +40,10 @@ typedef struct {
     char desc[85];
     bool present;
     uint32_t recheck;
+    bool policies;
+    bool route;
+    bool keep;
+    uint32_t checked;
 } firc_opkgtun_want_t;
 
 typedef struct {
@@ -45,6 +53,11 @@ typedef struct {
     bool removing;
     uint32_t rechecked;
     char error[160];
+    firc_opkg_pol_t policies;
+    char pol_error[160];
+    bool route;
+    uint32_t route_reads;
+    uint32_t route_adds;
 } firc_opkgtun_seen_t;
 
 typedef enum { FIRC_OPKG_RC_ABSENT, FIRC_OPKG_RC_OURS, FIRC_OPKG_RC_UNMARKED, FIRC_OPKG_RC_FOREIGN } firc_opkg_rc_kind_t;
@@ -57,6 +70,7 @@ typedef struct {
     char address[16];
     char mask[16];
     bool up;
+    bool global;
 } firc_opkgtun_rc_t;
 
 typedef enum { FIRC_OPKG_ITEM_APPLIED, FIRC_OPKG_ITEM_PARTIAL, FIRC_OPKG_ITEM_REFUSED } firc_opkg_item_t;
@@ -65,6 +79,7 @@ typedef struct firc_opkgtun firc_opkgtun_t;
 
 typedef struct {
     atomic_bool stop;
+    atomic_bool cut;
     char base_url[128];
 } firc_opkgtun_rci_t;
 
@@ -78,8 +93,13 @@ void firc_opkgtun_rci_io(firc_opkgtun_rci_t *rci, const char *base_url, const ch
 firc_opkgtun_t *firc_opkgtun_start(const firc_opkgtun_io_t *io);
 
 /* Replaces the wanted set: present records to keep configured, absent ones to remove. A set over
-   FIRC_OPKGTUN_MAX_WANTS, or naming a record twice, is warned and the last set stays. */
+   FIRC_OPKGTUN_MAX_WANTS, or naming a record twice, is warned and the last set stays. A change of only policies,
+   route, keep or checked keeps the record's state; keep leaves a route line as found and adds none. No save starts
+   while a route added, or found after a start with unsaved changes, is not yet checked. */
 void firc_opkgtun_want(firc_opkgtun_t *m, const firc_opkgtun_want_t *w, size_t n);
+
+/* Queues a removal of the default route via name ahead of every other job, and cuts a save in flight. */
+void firc_opkgtun_trip(firc_opkgtun_t *m, const char *name);
 
 /* Queues a sweep of firc's records no want names; the wants are read when it runs. */
 void firc_opkgtun_sweep_now(firc_opkgtun_t *m);

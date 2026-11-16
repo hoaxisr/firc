@@ -181,6 +181,7 @@ static void teardown(void *ud)
     kx_reset();
     fr_close();
     firc_tun_addr_set_ifaddrs_for_test(NULL, 0);
+    firc_rtnl_set_nametoindex_for_test(NULL);
     g_watch_pid = 0;
     g_watch_pid2 = 0;
     unsetenv("FAKE_STUBBORN_DEV");
@@ -3419,6 +3420,15 @@ typedef struct {
     char log[8192];
     pid_t watch;
     int absent_while_alive;
+    bool pol;
+    bool route_line;
+    bool unsaved;
+    bool stuck;
+    bool no_read;
+    uint32_t adds;
+    uint32_t reads;
+    int64_t route_at;
+    int64_t trip_at;
 } fr_t;
 
 static fr_t g_fr;
@@ -3442,6 +3452,37 @@ static void fr_seen_of(const firc_opkgtun_want_t *w, firc_opkgtun_seen_t *s)
     } else if (!w->present && g_fr.mode == FR_REFUSE_REMOVAL) {
         s->state = FIRC_OPKG_FAILED;
         snprintf(s->error, sizeof s->error, "RCI refused");
+    }
+    if (g_fr.pol && w->present) {
+        if (w->policies && w->route && !g_fr.route_line) {
+            g_fr.route_line = true;
+            g_fr.adds++;
+            g_fr.route_at = now_ms();
+        } else if (!w->route && !w->keep && g_fr.route_line && !g_fr.stuck) {
+            g_fr.route_line = false;
+        }
+    }
+    if (g_fr.pol && w->present && !g_fr.no_read) {
+        if (g_fr.reads == 0 && g_fr.unsaved && g_fr.route_line) {
+            g_fr.adds++;
+        }
+        g_fr.reads++;
+        s->policies = w->policies ? FIRC_OPKG_POL_ON : FIRC_OPKG_POL_OFF;
+        s->route = g_fr.route_line;
+        s->route_reads = g_fr.reads;
+        s->route_adds = g_fr.adds;
+        s->saved = !g_fr.unsaved;
+    }
+}
+
+static void fr_route_now(void)
+{
+    for (size_t i = 0; i < g_fr.n_seen; i++) {
+        if (strcmp(g_fr.seen[i].name, "OpkgTun3") == 0) {
+            g_fr.seen[i].route = g_fr.route_line;
+            g_fr.seen[i].route_reads = g_fr.reads;
+            g_fr.seen[i].route_adds = g_fr.adds;
+        }
     }
 }
 
@@ -3496,6 +3537,28 @@ static void fr_pass(void *ud)
     g_fr.passes++;
 }
 
+static void fr_trip(const char *name, void *ud)
+{
+    (void)ud;
+    size_t off = strlen(g_fr.log);
+    snprintf(g_fr.log + off, sizeof g_fr.log - off, "T %s;", name);
+    g_fr.trip_at = now_ms();
+    if (!g_fr.stuck) {
+        g_fr.route_line = false;
+    }
+    g_fr.reads++;
+    fr_route_now();
+    fr_signal();
+}
+
+static void fr_route_read(bool line)
+{
+    g_fr.route_line = line;
+    g_fr.reads++;
+    fr_route_now();
+    fr_signal();
+}
+
 static void fr_attach(fx_t *f, fr_mode_t mode)
 {
     memset(&g_fr, 0, sizeof g_fr);
@@ -3505,7 +3568,7 @@ static void fr_attach(fx_t *f, fr_mode_t mode)
     fcntl(g_fr.p[0], F_SETFL, O_NONBLOCK);
     g_fr.open = true;
     g_fr.mode = mode;
-    const firc_tunrun_router_t r = {fr_want, fr_seen, fr_sweep, fr_pass, g_fr.p[0], NULL};
+    const firc_tunrun_router_t r = {fr_want, fr_seen, fr_sweep, fr_pass, g_fr.p[0], NULL, fr_trip};
     firc_tunrun_set_router(f->run, &r);
 }
 
@@ -4122,6 +4185,768 @@ TEST a_nudged_opkg_tunnel_waits_for_its_record_again(void)
     PASS();
 }
 
+#define WAN_IF 5u
+#define LIVE_FROM (-4000)
+#define TUN_IF 9u
+
+static unsigned pol_index(const char *name)
+{
+    if (strcmp(name, "opkgtun3") == 0) {
+        return TUN_IF;
+    }
+    return strcmp(name, "ppp0") == 0 ? WAN_IF : 0;
+}
+
+static void main_default(fx_t *f, uint32_t oif)
+{
+    static const uint8_t any[4] = {0};
+    fake_rtnl_add_route(f->kernel, AF_INET, RT_TABLE_MAIN, RTN_UNICAST, RTPROT_BOOT, any, 0, 0);
+    fake_rtnl_route_via(f->kernel, oif, NULL, 0);
+}
+
+static void tick(fx_t *f, int64_t at)
+{
+    g_watch_now = at;
+    firc_tunrun_guard_for_test(f->run);
+    run_ms(f, 60);
+}
+
+static void carrier(fx_t *f, int64_t at, bool on)
+{
+    g_watch_now = at;
+    fake_rtnl_set_link_flags(f->kernel, on ? IFF_UP | IFF_LOWER_UP : IFF_UP);
+    tick(f, at);
+}
+
+static int levels(firc_log_level_t level, const char *text)
+{
+    static firc_event_t ev[64];
+    uint64_t since = 0, dropped = 0;
+    int c = 0;
+    for (;;) {
+        uint64_t next = since;
+        size_t n = firc_event_read(since, ev, 64, &next, &dropped);
+        for (size_t i = 0; i < n; i++) {
+            if (ev[i].kind == FIRC_EVENT_LOG && ev[i].u.log.level == level && strstr(ev[i].u.log.text, text) != NULL) {
+                c++;
+            }
+        }
+        if (n == 0 || next == since) {
+            return c;
+        }
+        since = next;
+    }
+}
+
+static void papply(fx_t *f, bool policies, bool enable)
+{
+    const ospec_t o[] = {{"t1", "opkgtun3", !enable}};
+    firc_tunnels_t t;
+    otunnels(&t, o, 1);
+    t.t[0].router_policies = policies;
+    (void)firc_tunrun_apply(f->run, &t);
+    firc_tunnels_free(&t);
+}
+
+static bool pol_up(fx_t *f, unsigned flags)
+{
+    if (!fx_up(f, flags)) {
+        return false;
+    }
+    firc_event_reset_for_test();
+    firc_rtnl_set_nametoindex_for_test(pol_index);
+    g_watch_now = LIVE_FROM;
+    (void)firc_tunrun_set_watch_for_test(f->run, watch_now, 3600000);
+    fr_attach(f, FR_READY);
+    g_fr.pol = true;
+    papply(f, true, true);
+    if (run_until_status(f, "t1", FIRC_TUN_ST_UP, 3000) != FIRC_TUN_ST_UP) {
+        return false;
+    }
+    tick(f, LIVE_FROM);
+    return true;
+}
+
+static bool route_wanted(void)
+{
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    return w != NULL && w->route;
+}
+
+static uint32_t checked(void)
+{
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    return w != NULL ? w->checked : 99;
+}
+
+static int trips(void)
+{
+    int c = 0;
+    for (const char *p = strstr(g_fr.log, "T OpkgTun3;"); p != NULL; p = strstr(p + 1, "T OpkgTun3;")) {
+        c++;
+    }
+    return c;
+}
+
+static firc_opkgtun_seen_t router_of_t1(fx_t *f)
+{
+    firc_opkgtun_seen_t r;
+    memset(&r, 0, sizeof r);
+    (void)firc_tunrun_router_of(f->run, "t1", &r);
+    return r;
+}
+
+/* catches: the guard off, a trip that does not remove the route, or a trip said nowhere */
+TEST the_main_default_guard_removes_the_route(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT(route_wanted());
+    ASSERT(g_fr.route_line);
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    ASSERT_EQ(1, trips());
+    ASSERT_FALSE(route_wanted());
+    ASSERT_FALSE(g_fr.route_line);
+    ASSERT(strstr(g_fr.log, "-OpkgTun3") == NULL);
+    firc_opkgtun_seen_t r = router_of_t1(&f);
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, r.policies);
+    ASSERT(strstr(r.pol_error, "made OpkgTun3 its main default") != NULL);
+    ASSERT_EQ(1, levels(FIRC_LOG_ERROR, "made OpkgTun3 its main default"));
+    ASSERT_EQ(FIRC_TUN_ST_UP, state_of(&f, "t1").status);
+    fx_down(&f);
+    PASS();
+}
+
+static void add_tun_default(firc_loop_t *loop, void *ud)
+{
+    (void)loop;
+    main_default(ud, TUN_IF);
+}
+
+/* catches: the guard on the 15 s watch instead of a one-second timer of its own */
+TEST the_guard_runs_on_its_own_one_second_timer(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, IFF_UP | IFF_LOWER_UP));
+    firc_event_reset_for_test();
+    firc_rtnl_set_nametoindex_for_test(pol_index);
+    (void)firc_tunrun_set_watch_for_test(f.run, now_ms, 15000);
+    fr_attach(&f, FR_READY);
+    g_fr.pol = true;
+    papply(&f, true, true);
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 3000));
+    for (int i = 0; i < 80 && !route_wanted(); i++) {
+        run_ms(&f, 100);
+    }
+    ASSERT(route_wanted());
+    add_tun_default(f.loop, &f);
+    run_ms(&f, 3000);
+    ASSERT_EQ(1, trips());
+    int64_t gap = g_fr.trip_at - g_fr.route_at;
+    ASSERT(gap >= 800 && gap <= 1400);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: no child stop at the bound, a stop before it, or a gate that lets the child back with the route there */
+TEST the_guard_stops_the_child_when_the_route_stays(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    tick(&f, 1000);
+    ASSERT(g_fr.route_line);
+    pid_t first = last_pid(&f, "opkgtun3");
+    g_fr.stuck = true;
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    ASSERT_EQ(1, trips());
+    tick(&f, 6999);
+    run_ms(&f, 300);
+    ASSERT_EQ(0, kill(first, 0));
+    tick(&f, 7000);
+    run_ms(&f, 1500);
+    ASSERT(kill(first, 0) != 0);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun3"));
+    firc_tun_state_t st = state_of(&f, "t1");
+    ASSERT_EQ(FIRC_TUN_ST_ROUTER, st.status);
+    ASSERT_STR_EQ("router policies: the default route could not be removed; the tunnel is stopped", st.why);
+    g_fr.stuck = false;
+    fr_route_read(false);
+    run_ms(&f, 100);
+    tick(&f, 8000);
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun3", 2, 3000));
+    fx_down(&f);
+    PASS();
+}
+
+static void flap(fx_t *f, int64_t *at)
+{
+    fake_rtnl_clear_routes(f->kernel);
+    main_default(f, TUN_IF);
+    tick(f, *at);
+    fake_rtnl_clear_routes(f->kernel);
+    main_default(f, WAN_IF);
+    for (int i = 1; i <= 7; i++) {
+        tick(f, *at + i * 1000);
+    }
+    *at += 8000;
+}
+
+/* catches: a latching trip, or no cap on how often a flapping WAN re-adds the route */
+TEST a_trip_does_not_latch(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT_EQ(1u, g_fr.adds);
+    int64_t at = 2000;
+    flap(&f, &at);
+    ASSERT_EQ(1, trips());
+    ASSERT_EQ(2u, g_fr.adds);
+    ASSERT(route_wanted());
+    flap(&f, &at);
+    ASSERT_EQ(3u, g_fr.adds);
+    ASSERT_EQ(0, levels(FIRC_LOG_ERROR, "router policies are off for it until the next edit"));
+    flap(&f, &at);
+    ASSERT_EQ(3, trips());
+    ASSERT_EQ(3u, g_fr.adds);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(1, levels(FIRC_LOG_ERROR,
+                        "the router keeps making OpkgTun3 its main default; router policies are off for it until the "
+                        "next edit"));
+    uint32_t saved = checked();
+    flap(&f, &at);
+    ASSERT_EQ(3u, g_fr.adds);
+    ASSERT_EQ(saved, checked());
+    ASSERT_EQ(1, levels(FIRC_LOG_ERROR, "router policies are off for it until the next edit"));
+    ASSERT_EQ(FIRC_OPKG_POL_FAILED, router_of_t1(&f).policies);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: no trip on a WAN-down main, or a restore before 5000 ms of another device's default */
+TEST the_wan_down_case_trips_and_restores(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT(g_fr.route_line);
+    fake_rtnl_clear_routes(f.kernel);
+    main_default(&f, TUN_IF);
+    tick(&f, 1500);
+    ASSERT_EQ(1, trips());
+    ASSERT_FALSE(g_fr.route_line);
+    const char *t = strstr(g_fr.log, "T OpkgTun3;");
+    ASSERT(t != NULL && strstr(t, "+OpkgTun3") == NULL);
+    fake_rtnl_clear_routes(f.kernel);
+    main_default(&f, WAN_IF);
+    tick(&f, 2000);
+    tick(&f, 6999);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(1u, g_fr.adds);
+    tick(&f, 7000);
+    ASSERT(route_wanted());
+    ASSERT_EQ(2u, g_fr.adds);
+    ASSERT_EQ(0u, checked());
+    tick(&f, 7000);
+    tick(&f, 11999);
+    ASSERT_EQ(0u, checked());
+    tick(&f, 12000);
+    ASSERT_EQ(2u, checked());
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: the save window counted with the link down, or a route added before the link */
+TEST a_window_with_the_link_down_saves_no_route(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    tick(&f, 1000);
+    ASSERT_EQ(1u, g_fr.adds);
+    tick(&f, 2000);
+    carrier(&f, 3000, false);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_FALSE(g_fr.route_line);
+    carrier(&f, 4000, true);
+    tick(&f, 8999);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(1u, g_fr.adds);
+    tick(&f, 9000);
+    ASSERT_EQ(2u, g_fr.adds);
+    tick(&f, 9000);
+    tick(&f, 13999);
+    ASSERT_EQ(0u, checked());
+    tick(&f, 14000);
+    ASSERT_EQ(2u, checked());
+    fx_down(&f);
+
+    ASSERT(pol_up(&f, IFF_UP));
+    main_default(&f, WAN_IF);
+    for (int i = 1; i <= 10; i++) {
+        tick(&f, i * 1000);
+    }
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(0u, g_fr.adds);
+    ASSERT_EQ(0u, checked());
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: the route sent before the child is up, a disabled tunnel given the route, or global dropped with it */
+TEST a_disabled_tunnel_holds_global_only(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, IFF_UP | IFF_LOWER_UP));
+    firc_event_reset_for_test();
+    firc_rtnl_set_nametoindex_for_test(pol_index);
+    g_watch_now = 1000;
+    (void)firc_tunrun_set_watch_for_test(f.run, watch_now, 3600000);
+    fr_attach(&f, FR_MANUAL);
+    papply(&f, true, false);
+    tick(&f, 1000);
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present && w->policies && !w->route);
+    papply(&f, true, true);
+    run_ms(&f, 100);
+    tick(&f, 1100);
+    ASSERT_EQ(0, starts_of(&f, "opkgtun3"));
+    ASSERT_FALSE(route_wanted());
+    g_watch_now = 2000;
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, fr_last("OpkgTun3")->recheck, "", true);
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 3000));
+    tick(&f, 2000);
+    tick(&f, 6999);
+    ASSERT_FALSE(route_wanted());
+    tick(&f, 7000);
+    ASSERT(route_wanted());
+    papply(&f, true, false);
+    w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present && w->policies && !w->route);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: the guard disarmed while a removal is failing, or never disarmed after a read shows none */
+TEST the_guard_runs_while_a_removal_is_failing(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    tick(&f, 1000);
+    ASSERT(g_fr.route_line);
+    g_fr.stuck = true;
+    papply(&f, false, true);
+    run_ms(&f, 100);
+    ASSERT(g_fr.route_line);
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    ASSERT_EQ(1, trips());
+    fx_down(&f);
+
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    tick(&f, 1000);
+    papply(&f, false, true);
+    run_ms(&f, 100);
+    ASSERT_FALSE(g_fr.route_line);
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    ASSERT_EQ(0, trips());
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a save released before the guard has seen main clean for 5000 ms, or after a trip */
+TEST no_save_until_main_was_checked(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    tick(&f, 1000);
+    for (int i = 1; i <= 4; i++) {
+        tick(&f, 1000 + i * 1000);
+        ASSERT_EQ(0u, checked());
+    }
+    tick(&f, 5999);
+    ASSERT_EQ(0u, checked());
+    tick(&f, 6000);
+    ASSERT_EQ(1u, checked());
+    fx_down(&f);
+
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    tick(&f, 1000);
+    tick(&f, 2000);
+    main_default(&f, TUN_IF);
+    tick(&f, 3000);
+    ASSERT_EQ(1, trips());
+    for (int i = 4; i <= 9; i++) {
+        tick(&f, i * 1000);
+    }
+    ASSERT_EQ(0u, checked());
+    ASSERT_FALSE(g_fr.route_line);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: an edit that drops a policies record without saying the router lost it */
+TEST a_removed_policies_record_warns(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    firc_tunnels_t none = {0};
+    (void)firc_tunrun_apply(f.run, &none);
+    run_ms(&f, 200);
+    ASSERT_EQ(1, levels(FIRC_LOG_WARN, "OpkgTun3 was removed; router policies that used it no longer have it"));
+    fx_down(&f);
+
+    ASSERT(fx_up(&f, IFF_UP | IFF_LOWER_UP));
+    firc_event_reset_for_test();
+    fr_attach(&f, FR_READY);
+    papply(&f, false, true);
+    (void)firc_tunrun_apply(f.run, &none);
+    run_ms(&f, 200);
+    ASSERT_EQ(0, levels(FIRC_LOG_WARN, "router policies that used it"));
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a cut left set by a switch-off apply, which holds the child at the gate for good */
+TEST a_switch_off_frees_a_child_the_bound_stopped(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    tick(&f, 1000);
+    g_fr.stuck = true;
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    tick(&f, 7000);
+    run_ms(&f, 1500);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun3"));
+    papply(&f, false, true);
+    run_ms(&f, 200);
+    fake_rtnl_clear_routes(f.kernel);
+    main_default(&f, WAN_IF);
+    g_fr.stuck = false;
+    fr_route_read(false);
+    run_ms(&f, 100);
+    tick(&f, 8000);
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun3", 2, 3000));
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: an unchecked route kept while the link is down, which holds every save of the router */
+TEST an_unchecked_route_is_withdrawn_while_the_link_is_down(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT(g_fr.route_line);
+    carrier(&f, 2000, false);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_FALSE(g_fr.route_line);
+    for (int i = 3; i <= 30; i++) {
+        tick(&f, i * 1000);
+    }
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(1u, g_fr.adds);
+    ASSERT_EQ(0u, checked());
+    carrier(&f, 31000, true);
+    tick(&f, 35999);
+    ASSERT_FALSE(route_wanted());
+    tick(&f, 36000);
+    ASSERT(route_wanted());
+    ASSERT_EQ(2u, g_fr.adds);
+    fx_down(&f);
+
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    tick(&f, 1000);
+    tick(&f, 6000);
+    ASSERT_EQ(1u, checked());
+    carrier(&f, 7000, false);
+    ASSERT(route_wanted());
+    ASSERT(g_fr.route_line);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a restart dropping a saved route while the link is not up yet, then saving it again */
+TEST a_saved_route_is_kept_while_the_link_comes_up(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, IFF_UP));
+    firc_event_reset_for_test();
+    firc_rtnl_set_nametoindex_for_test(pol_index);
+    g_watch_now = 1000;
+    (void)firc_tunrun_set_watch_for_test(f.run, watch_now, 3600000);
+    fr_attach(&f, FR_READY);
+    g_fr.pol = true;
+    g_fr.route_line = true;
+    papply(&f, true, true);
+    ASSERT_EQ(FIRC_TUN_ST_UP, run_until_status(&f, "t1", FIRC_TUN_ST_UP, 3000));
+    main_default(&f, WAN_IF);
+    for (int i = 1; i <= 5; i++) {
+        tick(&f, i * 1000);
+    }
+    ASSERT(route_wanted());
+    ASSERT(g_fr.route_line);
+    ASSERT_EQ(0u, g_fr.adds);
+    carrier(&f, 6000, true);
+    ASSERT(route_wanted());
+    ASSERT_EQ(0u, g_fr.adds);
+    fx_down(&f);
+    PASS();
+}
+
+static void saved_start(fx_t *f, bool enable, bool unsaved, bool no_read)
+{
+    (void)fx_up(f, IFF_UP);
+    firc_event_reset_for_test();
+    firc_rtnl_set_nametoindex_for_test(pol_index);
+    g_watch_now = 1000;
+    (void)firc_tunrun_set_watch_for_test(f->run, watch_now, 3600000);
+    fr_attach(f, FR_READY);
+    g_fr.pol = true;
+    g_fr.route_line = true;
+    g_fr.unsaved = unsaved;
+    g_fr.no_read = no_read;
+    papply(f, true, enable);
+    main_default(f, WAN_IF);
+    for (int i = 1; i <= 5; i++) {
+        tick(f, i * 1000);
+    }
+}
+
+/* catches: keep dropped before the route is read, which removes the saved line, or no resend once it is read */
+TEST keep_holds_until_the_route_is_read(void)
+{
+    static fx_t f;
+    saved_start(&f, true, false, true);
+    ASSERT(g_fr.route_line);
+    papply(&f, true, true);
+    tick(&f, 5500);
+    ASSERT(g_fr.route_line);
+    unsigned sent = (unsigned)g_fr.wants;
+    tick(&f, 5800);
+    tick(&f, 5900);
+    ASSERT_EQ(sent, (unsigned)g_fr.wants);
+    ASSERT(fr_last("OpkgTun3")->keep);
+    g_fr.no_read = false;
+    fr_route_read(true);
+    run_ms(&f, 20);
+    ASSERT_EQ(sent + 1, (unsigned)g_fr.wants);
+    ASSERT_FALSE(fr_last("OpkgTun3")->keep);
+    ASSERT(route_wanted());
+    ASSERT(g_fr.route_line);
+    ASSERT_EQ(0u, g_fr.adds);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a route line kept on a disabled tunnel because it was there at the start */
+TEST a_disabled_tunnel_drops_a_route_found_at_start(void)
+{
+    static fx_t f;
+    saved_start(&f, false, false, false);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_FALSE(g_fr.route_line);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: an unsaved line found at start kept without a link, so the next save writes it unchecked */
+TEST an_unsaved_route_found_at_start_is_withdrawn_without_a_link(void)
+{
+    static fx_t f;
+    saved_start(&f, true, true, false);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_FALSE(g_fr.route_line);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a restore that ignores the link, re-adding the route while the device has no carrier */
+TEST a_restore_waits_for_the_link(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    tick(&f, 1000);
+    main_default(&f, TUN_IF);
+    tick(&f, 2000);
+    ASSERT_EQ(1, trips());
+    fake_rtnl_clear_routes(f.kernel);
+    main_default(&f, WAN_IF);
+    carrier(&f, 3000, false);
+    for (int i = 4; i <= 12; i++) {
+        tick(&f, i * 1000);
+    }
+    ASSERT_FALSE(route_wanted());
+    carrier(&f, 13000, true);
+    tick(&f, 17999);
+    ASSERT_FALSE(route_wanted());
+    tick(&f, 18000);
+    ASSERT(route_wanted());
+    fx_down(&f);
+    PASS();
+}
+
+static void papply_desc(fx_t *f, const char *desc)
+{
+    const ospec_t o[] = {{"t1", "opkgtun3", false}};
+    firc_tunnels_t t;
+    otunnels(&t, o, 1);
+    t.t[0].router_policies = true;
+    snprintf(t.t[0].description, sizeof t.t[0].description, "%s", desc);
+    (void)firc_tunrun_apply(f->run, &t);
+    firc_tunnels_free(&t);
+}
+
+/* catches: a latch cleared by any apply, such as a reload or another tunnel's edit */
+TEST a_latch_holds_until_its_tunnel_is_edited(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    int64_t at = 2000;
+    flap(&f, &at);
+    flap(&f, &at);
+    flap(&f, &at);
+    ASSERT_EQ(1, levels(FIRC_LOG_ERROR, "router policies are off for it until the next edit"));
+    papply(&f, true, true);
+    for (int i = 0; i < 7; i++) {
+        tick(&f, at + i * 1000);
+    }
+    ASSERT_FALSE(route_wanted());
+    papply_desc(&f, "edited");
+    tick(&f, at + 8000);
+    for (int i = 9; i <= 15; i++) {
+        tick(&f, at + i * 1000);
+    }
+    ASSERT(route_wanted());
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a route sent at the first live tick, after a live spell under 5000 ms, or a spell not restarted by a drop */
+TEST a_route_waits_for_five_seconds_of_live(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP));
+    main_default(&f, WAN_IF);
+    carrier(&f, 1000, true);
+    ASSERT_FALSE(route_wanted());
+    for (int at = 2000; at <= 5000; at += 1000) {
+        tick(&f, at);
+        ASSERT_FALSE(route_wanted());
+    }
+    tick(&f, 5999);
+    ASSERT_FALSE(route_wanted());
+    carrier(&f, 6000, false);
+    for (int at = 7000; at <= 10000; at += 1000) {
+        tick(&f, at);
+        ASSERT_FALSE(route_wanted());
+    }
+    ASSERT_EQ(0u, g_fr.adds);
+    carrier(&f, 11000, true);
+    tick(&f, 15999);
+    ASSERT_FALSE(route_wanted());
+    ASSERT_EQ(0u, g_fr.adds);
+    tick(&f, 16000);
+    ASSERT(route_wanted());
+    ASSERT_EQ(1u, g_fr.adds);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: an edit inside the save window that marks the route checked early or restarts the window */
+TEST an_edit_inside_the_window_does_not_save_early(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT_EQ(1u, g_fr.adds);
+    tick(&f, 1000);
+    tick(&f, 3000);
+    papply_desc(&f, "edited");
+    run_ms(&f, 100);
+    ASSERT_EQ(0u, checked());
+    ASSERT_STR_EQ("firc:t1 edited", fr_last("OpkgTun3")->desc);
+    tick(&f, 5999);
+    ASSERT_EQ(0u, checked());
+    tick(&f, 6000);
+    ASSERT_EQ(1u, checked());
+    ASSERT_EQ(1u, g_fr.adds);
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a switch turned on over a tunnel the guard stopped watching, so a stale live spell sends the route at once */
+TEST a_switch_on_waits_for_five_seconds_of_live(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    ASSERT(route_wanted());
+    g_watch_now = 2000;
+    papply(&f, false, true);
+    run_ms(&f, 100);
+    tick(&f, 2000);
+    ASSERT_FALSE(g_fr.route_line);
+    g_watch_now = 3000;
+    fake_rtnl_set_link_flags(f.kernel, IFF_UP);
+    run_ms(&f, 100);
+    g_watch_now = 4000;
+    fake_rtnl_set_link_flags(f.kernel, IFF_UP | IFF_LOWER_UP);
+    run_ms(&f, 100);
+    g_watch_now = 5000;
+    papply(&f, true, true);
+    run_ms(&f, 100);
+    tick(&f, 5000);
+    tick(&f, 9999);
+    ASSERT_FALSE(route_wanted());
+    tick(&f, 10000);
+    ASSERT(route_wanted());
+    fx_down(&f);
+    PASS();
+}
+
+/* catches: a removed record keeping its checked count, which a new record's first add could equal */
+TEST a_removed_record_forgets_its_checked_route(void)
+{
+    static fx_t f;
+    ASSERT(pol_up(&f, IFF_UP | IFF_LOWER_UP));
+    main_default(&f, WAN_IF);
+    tick(&f, 1000);
+    tick(&f, 1000);
+    tick(&f, 6000);
+    ASSERT_EQ(1u, checked());
+    firc_tunnels_t none = {0};
+    (void)firc_tunrun_apply(f.run, &none);
+    run_ms(&f, 200);
+    papply(&f, true, true);
+    run_ms(&f, 100);
+    const firc_opkgtun_want_t *w = fr_last("OpkgTun3");
+    ASSERT(w != NULL && w->present);
+    ASSERT_EQ(0u, w->checked);
+    fx_down(&f);
+    PASS();
+}
+
 SUITE(opkg)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -4149,6 +4974,28 @@ SUITE(opkg)
     RUN_TEST(a_failed_load_sweeps_nothing);
     RUN_TEST(a_failed_apply_sweeps_nothing);
     RUN_TEST(an_absent_file_loads_empty);
+    RUN_TEST(the_main_default_guard_removes_the_route);
+    RUN_TEST(the_guard_runs_on_its_own_one_second_timer);
+    RUN_TEST(the_guard_stops_the_child_when_the_route_stays);
+    RUN_TEST(a_trip_does_not_latch);
+    RUN_TEST(the_wan_down_case_trips_and_restores);
+    RUN_TEST(a_window_with_the_link_down_saves_no_route);
+    RUN_TEST(a_disabled_tunnel_holds_global_only);
+    RUN_TEST(the_guard_runs_while_a_removal_is_failing);
+    RUN_TEST(no_save_until_main_was_checked);
+    RUN_TEST(a_removed_policies_record_warns);
+    RUN_TEST(a_switch_off_frees_a_child_the_bound_stopped);
+    RUN_TEST(an_unchecked_route_is_withdrawn_while_the_link_is_down);
+    RUN_TEST(a_saved_route_is_kept_while_the_link_comes_up);
+    RUN_TEST(keep_holds_until_the_route_is_read);
+    RUN_TEST(a_disabled_tunnel_drops_a_route_found_at_start);
+    RUN_TEST(an_unsaved_route_found_at_start_is_withdrawn_without_a_link);
+    RUN_TEST(a_restore_waits_for_the_link);
+    RUN_TEST(a_latch_holds_until_its_tunnel_is_edited);
+    RUN_TEST(a_route_waits_for_five_seconds_of_live);
+    RUN_TEST(an_edit_inside_the_window_does_not_save_early);
+    RUN_TEST(a_switch_on_waits_for_five_seconds_of_live);
+    RUN_TEST(a_removed_record_forgets_its_checked_route);
 }
 
 GREATEST_MAIN_DEFS();

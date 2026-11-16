@@ -4,6 +4,7 @@
 
   import Button from "../../../components/ui/Button.svelte";
   import Select from "../../../components/ui/Select.svelte";
+  import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { t } from "../../../data/locale.svelte";
   import { persistedState } from "../../../utils/persisted-state.svelte";
@@ -13,6 +14,7 @@
 
   import { ChevronRight, GroupCollapse, GroupExpand } from "../../../components/ui/icons";
   import type { Tunnel } from "../../../types";
+  import { policiesLeaving, routerName } from "../tunnel-editor";
   import { plain, type ClientTunnel } from "../tunnels-data";
 
   let { store, tunnel = $bindable() }: { store: TunnelsStore; tunnel: ClientTunnel } = $props();
@@ -40,6 +42,9 @@
     { value: "site-client", label: t("by site and device") },
   ]);
   const tunnels = $derived(plain(store.data as Tunnel[]));
+  const recordName = $derived(routerName(tunnel.device));
+  const leaving = $derived(policiesLeaving(store.savedOf(tunnel.id), tunnel));
+  const policies = $derived(store.stateOf(tunnel.id)?.router?.policies);
 </script>
 
 <section class="sec">
@@ -144,6 +149,42 @@
         <span class="field"><UplinkSelect bind:tunnel {tunnels} /></span>
       </div>
     </div>
+    {#if recordName}
+      <div class="row" data-router-policies>
+        <div class="label">
+          <div class="name">{t("Router policies")}</div>
+          <div class="hint">
+            {t(
+              "The router's own policies can use {name} as a way to the internet. It starts at the lowest priority, so a policy that also permits a WAN uses it only while they are down. Its priority is set in the router; if that makes it the router's main route, firc turns this off",
+            ).replaceAll("{name}", () => recordName)}
+          </div>
+          {#if tunnel.routerPolicies}
+            <div class="hint" data-policies-permits>
+              {t(
+                "Which policies use {name} is set in the router. Switching this off, deleting the tunnel or changing its device takes {name} out of them, and the router does not put it back",
+              ).replaceAll("{name}", () => recordName)}
+            </div>
+          {/if}
+          {#if leaving}
+            <div class="hint bad" data-policies-leaving>
+              {t("On save, {name} leaves every router policy that uses it").replace(
+                "{name}",
+                () => leaving,
+              )}
+            </div>
+          {:else if policies?.state === "failed" && policies.error}
+            <div class="hint bad" data-policies-error>{policies.error}</div>
+          {/if}
+        </div>
+        <div class="controls">
+          <Switch
+            aria-label={t("Router policies")}
+            checked={tunnel.routerPolicies}
+            onCheckedChange={(v: boolean) => (tunnel.routerPolicies = v)}
+          />
+        </div>
+      </div>
+    {/if}
     <Collapsible.Root bind:open={more}>
       <Collapsible.Trigger class="more">
         {#if more}<GroupCollapse size={15} />{:else}<ChevronRight size={15} />{/if}

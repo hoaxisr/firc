@@ -1,0 +1,18 @@
+[
+  {
+    "interface": {
+      "ip": {
+        "global": {
+          "status": [
+            {
+              "status": "message",
+              "code": "72744997",
+              "ident": "Network::Interface::L3Base",
+              "message": "global priority recalculated."
+            }
+          ]
+        }
+      }
+    }
+  }
+]

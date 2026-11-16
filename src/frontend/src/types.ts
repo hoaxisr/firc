@@ -219,6 +219,7 @@ export type Tunnel = {
   device: string;
   description: string;
   enable: boolean;
+  routerPolicies: boolean;
   active: number;
   by: "connection" | "site" | "site-client";
   interval: number;
@@ -247,11 +248,17 @@ export type TunnelStatus =
   | "uplink_down"
   | "router";
 
+export type TunnelRouterPolicies = {
+  state: "off" | "on" | "failed";
+  error: string;
+};
+
 export type TunnelRouter = {
   name: string;
   state: "pending" | "ready" | "failed" | "foreign";
   saved: boolean;
   error: string;
+  policies?: TunnelRouterPolicies;
 };
 
 export type TunnelNodeState = {

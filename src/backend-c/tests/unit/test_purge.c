@@ -444,6 +444,8 @@ typedef struct {
     bool save_fails;
     bool delete_fails;
     const char *refuse;
+    const char *routes[4];
+    int n_routes;
     int64_t now;
     int sleeps;
     firc_err_t lock_rc;
@@ -473,6 +475,11 @@ static char *slurp_fx(const char *name) {
 static firc_err_t p_get(void *ud, const char *path, char **body) {
     (void)ud;
     *body = NULL;
+    if (strcmp(path, FIRC_OPKGTUN_ROUTE_PATH) == 0) {
+        plog("R");
+        *body = slurp_fx(g_p.n_routes > 0 ? g_p.routes[--g_p.n_routes] : "rc-route-without.json");
+        return FIRC_OK;
+    }
     if (strcmp(path, FIRC_OPKGTUN_LIST_PATH) != 0) {
         plog("NS");
         *body = strdup("[]");
@@ -490,6 +497,16 @@ static firc_err_t p_post(void *ud, const char *body, long timeout_s, char **out)
     if (strstr(body, "\"save\"") != NULL) {
         plog("SAVE");
         *out = strdup(g_p.save_fails ? SAVE_REFUSED : SAVE_OK);
+        return FIRC_OK;
+    }
+    if (strstr(body, "\"route\"") != NULL) {
+        plog("NOROUTE");
+        *out = slurp_fx("route-off.json");
+        return FIRC_OK;
+    }
+    if (strstr(body, "\"global\"") != NULL) {
+        plog("NOGLOBAL");
+        *out = slurp_fx("global-off.json");
         return FIRC_OK;
     }
     plog(strstr(body, "\"no\":true") != NULL ? "DELETE" : "POST");
@@ -560,7 +577,7 @@ static firc_opkgtun_io_t pio_up(const char *list_fx, bool dirty) {
     }
     firc_event_reset_for_test();
     atomic_store(&g_pstop, false);
-    firc_opkgtun_io_t io = {p_get, p_post, p_dev, p_unpersist, p_holder, p_now, p_sleep, g_p.intent, &g_pstop, NULL};
+    firc_opkgtun_io_t io = {p_get, p_post, p_dev, p_unpersist, p_holder, p_now, p_sleep, g_p.intent, &g_pstop, NULL, NULL};
     return io;
 }
 
@@ -607,7 +624,7 @@ TEST the_purge_runs_lock_sweep_save_revoke(void) {
     g_p.lock_rc = FIRC_OK;
     int fd = -1;
     ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
-    ASSERT_STR_EQ("LOCK L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_STR_EQ("LOCK L R NS DELETE SAVE REVOKE ", g_p.log);
     ASSERT_EQ(99, fd);
     pio_down();
     PASS();
@@ -663,7 +680,7 @@ TEST the_router_step_removes_records_then_revokes(void) {
     /* catches: the router step revoking the token before the RCI calls that need it */
     firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
     (void)firc_purge_router(&io, p_revoke, NULL);
-    ASSERT_STR_EQ("L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_STR_EQ("L R NS DELETE SAVE REVOKE ", g_p.log);
     ASSERT_EQ(0, warns_with("OpkgTun"));
     pio_down();
     PASS();
@@ -687,7 +704,7 @@ TEST a_refused_removal_with_nothing_unsaved_saves_nothing(void) {
     firc_opkgtun_io_t io = pio_up("rc-list-ours.json", false);
     g_p.delete_fails = true;
     (void)firc_purge_router(&io, p_revoke, NULL);
-    ASSERT_STR_EQ("L NS DELETE L REVOKE ", g_p.log);
+    ASSERT_STR_EQ("L R NS DELETE L REVOKE ", g_p.log);
     pio_down();
     PASS();
 }
@@ -698,9 +715,42 @@ TEST a_failed_save_after_removal_says_they_come_back(void) {
     g_p.save_fails = true;
     int fd = -1;
     ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
-    ASSERT_STR_EQ("LOCK L NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_STR_EQ("LOCK L R NS DELETE SAVE REVOKE ", g_p.log);
     ASSERT_EQ(1, warns_with("they come back after a reboot"));
     ASSERT_EQ(0, warns_with("may remain"));
+    pio_down();
+    PASS();
+}
+
+TEST a_purge_removes_the_route_first(void) {
+    /* catches: a purge that deletes the interface with its route line still there, or clears global first */
+    firc_opkgtun_io_t io = pio_up(NULL, false);
+    g_p.routes[0] = "rc-route-after-off.json";
+    g_p.routes[1] = "rc-route-with.json";
+    g_p.n_routes = 2;
+    g_p.list = strdup("{\"OpkgTun9\":{\"description\":\"firc:a\",\"ip\":{\"global\":{\"order\":2,"
+                      "\"priority\":1}},\"up\":true}}");
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L R NOROUTE R NOGLOBAL NS DELETE SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(1, warns_with("OpkgTun9 was removed; router policies that used it no longer have it"));
+    pio_down();
+    PASS();
+}
+
+TEST a_failed_route_removal_in_the_purge_leaves_the_record(void) {
+    /* catches: a purge that deletes an interface whose route line NDM kept */
+    firc_opkgtun_io_t io = pio_up(NULL, false);
+    g_p.list = strdup("{\"OpkgTun9\":{\"description\":\"firc:a\",\"ip\":{\"global\":{\"order\":2,"
+                      "\"priority\":1}},\"up\":true}}");
+    g_p.routes[0] = "rc-route-with.json";
+    g_p.routes[1] = "rc-route-with.json";
+    g_p.n_routes = 2;
+    int fd = -1;
+    ASSERT_EQ(0, firc_purge_begin(&k_lock, &io, p_revoke, NULL, &fd));
+    ASSERT_STR_EQ("LOCK L R NOROUTE R SAVE REVOKE ", g_p.log);
+    ASSERT_EQ(1, warns_with("the router kept the default route via OpkgTun9"));
+    ASSERT_EQ(1, warns_with("firc's OpkgTun records may remain; delete OpkgTun<N> in the router"));
     pio_down();
     PASS();
 }
@@ -713,7 +763,7 @@ TEST a_partial_removal_whose_save_failed_says_both(void) {
     g_p.refuse = "OpkgTun9";
     g_p.save_fails = true;
     (void)firc_purge_router(&io, p_revoke, NULL);
-    ASSERT_STR_EQ("L NS DELETE NS DELETE L SAVE REVOKE ", g_p.log);
+    ASSERT_STR_EQ("L R NS DELETE R NS DELETE L SAVE REVOKE ", g_p.log);
     ASSERT_EQ(1, warns_with("may remain"));
     ASSERT_EQ(1, warns_with("they come back after a reboot"));
     pio_down();
@@ -760,6 +810,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_refused_removal_with_nothing_unsaved_saves_nothing);
     RUN_TEST(a_failed_save_after_removal_says_they_come_back);
     RUN_TEST(a_partial_removal_whose_save_failed_says_both);
+    RUN_TEST(a_purge_removes_the_route_first);
+    RUN_TEST(a_failed_route_removal_in_the_purge_leaves_the_record);
     RUN_TEST(a_failed_save_of_an_earlier_run_s_removal_warns);
     GREATEST_MAIN_END();
 }

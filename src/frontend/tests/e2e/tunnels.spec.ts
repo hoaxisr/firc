@@ -142,6 +142,7 @@ test.describe("Tunnels page", () => {
             device: "tunvless0",
             description: "",
             enable: true,
+            routerPolicies: false,
             active: 1,
             by: "connection",
             interval: 60,

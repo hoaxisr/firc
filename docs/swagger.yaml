@@ -1918,6 +1918,16 @@ definitions:
         items:
           type: string
         type: array
+      routerPolicies:
+        description: 'opkgtun<N> only (refused with 400 otherwise): firc gives OpkgTun<N> ip global (auto, the lowest
+          priority; a priority set in the router is kept, and one that makes it the main route turns this off). Once
+          the tunnel has been enabled and up for 5 seconds it also gets a default route through it, so the router''s
+          own policies can use it. A route that has stood 5 seconds with no main default through the tunnel stays
+          while the link is down; a newer one is taken back. Which policies do is set in the router; turning this off,
+          deleting the tunnel or changing its device drops OpkgTun<N> from them. Not part of what tunvless runs with,
+          so a flip restarts nothing. Default false'
+        example: false
+        type: boolean
       silence:
         description: 'Seconds of silence before a node is checked, 0..3600'
         example: 20
@@ -2156,6 +2166,8 @@ definitions:
       name:
         example: OpkgTun2
         type: string
+      policies:
+        $ref: '#/definitions/types.TunnelRouterPolicies'
       saved:
         description: 'Nothing firc wrote to this record waits for a router save. True also when firc has written
           nothing: the record does not exist, or the router was never reached'
@@ -2170,6 +2182,25 @@ definitions:
         - failed
         - foreign
         example: ready
+        type: string
+    type: object
+  types.TunnelRouterPolicies:
+    description: 'The tunnel''s routerPolicies as the router has them; a failure here never holds or stops the
+      tunnel, except that a default route firc cannot take back out of main stops it until it can'
+    properties:
+      error:
+        description: 'Why router policies are not as asked; empty while there is none'
+        example: ""
+        type: string
+      state:
+        description: 'off: no ip global and no default route of firc''s; on: ip global set, and the default route
+          as routerPolicies says; failed: retried, except after the router made the tunnel its main default three
+          times in 10 minutes, which waits for an edit of the tunnel'
+        enum:
+        - "off"
+        - "on"
+        - failed
+        example: "on"
         type: string
     type: object
   types.TunnelStatesRes:
