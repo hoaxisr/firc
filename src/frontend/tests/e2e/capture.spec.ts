@@ -219,6 +219,31 @@ test("a finished capture shows its span, leaks and summary after a reload", asyn
   await check();
 });
 
+// Catches the daemon's summary shown in English to a Russian reader, or a sentence it has no translation for dropped.
+test("Итог от демона is in Russian", async ({ page }) => {
+  await inRussian(page);
+  await shell(page, () => ({
+    running: false,
+    last: {
+      startedAt: T0,
+      endedAt: T0 + 300,
+      ended: "reached-end",
+      leaks: 121,
+      summary: [
+        "1850 packets read, 121 bypasses reported, 575 repeats not reported on its own.",
+        "6 packets carried no server name this reader could take: a hello spanning segments reads the same as a client that sent none.",
+        "A sentence with no translation.",
+      ],
+    },
+  }));
+
+  await expect(page.locator(".cap-sum p")).toHaveText([
+    "Прочитано пакетов: 1850, утечек: 121, повторов, о которых не сообщалось отдельно: 575.",
+    "Пакетов без имени сервера, которое удалось бы прочитать: 6. ClientHello, разбитый на несколько сегментов, выглядит так же, как клиент, не приславший имени.",
+    "A sentence with no translation.",
+  ]);
+});
+
 // Catches a finished capture without leaks shown as idle, or with a leak count.
 test("a capture that found nothing says so", async ({ page }) => {
   await shell(page, () => ({

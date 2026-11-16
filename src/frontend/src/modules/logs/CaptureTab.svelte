@@ -4,9 +4,10 @@
   import Button from "../../components/ui/Button.svelte";
   import { capture, CAPTURE_SECONDS, isOurs } from "../../data/capture.svelte";
   import { journal, type BypassEvent } from "../../data/events.svelte";
-  import { t } from "../../data/locale.svelte";
+  import { locale, t } from "../../data/locale.svelte";
 
   import { Capture, CaptureStop } from "../../components/ui/icons";
+  import { summaryLine } from "./capture-summary";
 
   let {
     clock,
@@ -126,7 +127,7 @@
 {#if !capture.running && capture.last && capture.last.summary.length > 0}
   <div class="cap-sum">
     <div class="cap-sum-title">{t("The daemon's summary")}</div>
-    {#each capture.last.summary as line, i (i)}<p>{line}</p>{/each}
+    {#each capture.last.summary as line, i (i)}<p>{summaryLine(line, locale.current, t)}</p>{/each}
   </div>
 {/if}
 
