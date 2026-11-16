@@ -3,7 +3,7 @@ import type { Tunnel, TunnelSource } from "../../types";
 import { HttpError } from "../../utils/fetcher";
 import { randomId } from "../../utils/random-id";
 
-export const MAX_TUNNELS = 8 as const;
+export const MAX_TUNNELS = 16 as const;
 export const OPKGTUN_MAX = 16 as const;
 
 export type TunnelFieldError = { tunnel: string; field: string; error: string };

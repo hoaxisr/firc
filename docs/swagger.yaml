@@ -1942,7 +1942,7 @@ definitions:
   types.TunnelsReq:
     properties:
       tunnels:
-        description: 'The whole set, at most 8; a missing field takes its default'
+        description: 'The whole set, at most 16; a missing field takes its default'
         items:
           $ref: '#/definitions/types.Tunnel'
         type: array

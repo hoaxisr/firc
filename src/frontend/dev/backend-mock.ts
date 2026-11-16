@@ -959,7 +959,7 @@ const derivedId = (text: string) => {
 };
 
 const tunnelRefusal = (tunnels: any[]) => {
-  if (tunnels.length > 8) return { error: "at most 8 tunnels", field: null, tunnel: null };
+  if (tunnels.length > 16) return { error: "at most 16 tunnels", field: null, tunnel: null };
   const ids = new Set<string>();
   const devices = new Set<string>();
   for (const tn of tunnels) {

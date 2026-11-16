@@ -153,6 +153,19 @@ describe("TunnelsStore load and dirty", () => {
     assert.strictEqual(store.canAdd, true);
   });
 
+  // Catches the add button kept at the old cap of eight, or let past the daemon's sixteen.
+  it("a sixteenth tunnel can be added and a seventeenth cannot", async () => {
+    const many = (n: number) => Array.from({ length: n }, (_, i) => tunnel(`t${i}`));
+    stub({ "/tunnels": { tunnels: many(15) } });
+    const store = new TunnelsStore();
+    await store.load();
+    assert.strictEqual(store.canAdd, true);
+    stub({ "/tunnels": { tunnels: many(16) } });
+    const full = new TunnelsStore();
+    await full.load();
+    assert.strictEqual(full.canAdd, false);
+  });
+
   // Catches an edit that never reaches the tracker, the save button staying dead.
   it("editing a field makes the set savable, and undoing it makes it clean again", async () => {
     stub({ "/tunnels": { tunnels: [tunnel("main")] } });

@@ -732,16 +732,34 @@ TEST same_run_ignores_the_description(void) {
     PASS();
 }
 
-/* catches: a ninth tunnel accepted past the cap */
-TEST nine_tunnels_are_refused(void) {
-    char doc[16384] = "tunnels:\n";
-    for (int i = 0; i < 9; i++) {
+static void n_tunnels(char *doc, size_t cap, int n)
+{
+    snprintf(doc, cap, "tunnels:\n");
+    for (int i = 0; i < n; i++) {
         char id[8], dev[16];
         snprintf(id, sizeof id, "t%d", i);
         snprintf(dev, sizeof dev, "tunvless%d", i);
-        tun_text(doc + strlen(doc), sizeof doc - strlen(doc), id, dev, "auto", "1", "site", LINK);
+        tun_text(doc + strlen(doc), cap - strlen(doc), id, dev, "auto", "1", "site", LINK);
     }
-    ASSERT(refused(doc, "tunnels[8]", "at most 8"));
+}
+
+/* catches: the tunnel cap left below sixteen */
+TEST sixteen_tunnels_load(void) {
+    char doc[32768];
+    n_tunnels(doc, sizeof doc, 16);
+    firc_tunnels_t t = {0};
+    firc_tun_err_t e = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_buffer(&t, doc, strlen(doc), &e));
+    ASSERT_EQ(16, (int)t.n);
+    firc_tunnels_free(&t);
+    PASS();
+}
+
+/* catches: a seventeenth tunnel accepted past the cap */
+TEST seventeen_tunnels_are_refused(void) {
+    char doc[32768];
+    n_tunnels(doc, sizeof doc, 17);
+    ASSERT(refused(doc, "tunnels[16]", "at most 16 tunnels"));
     PASS();
 }
 
@@ -1338,7 +1356,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_long_order_or_exclude_key_is_refused);
     RUN_TEST(same_run_ignores_filter_order_and_exclude);
     RUN_TEST(order_and_exclude_lose_only_keys_of_deleted_sources);
-    RUN_TEST(nine_tunnels_are_refused);
+    RUN_TEST(sixteen_tunnels_load);
+    RUN_TEST(seventeen_tunnels_are_refused);
     RUN_TEST(a_description_survives_save_and_load);
     RUN_TEST(no_description_is_empty_and_not_written);
     RUN_TEST(subscription_headers_survive_save_and_load);

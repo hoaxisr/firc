@@ -911,7 +911,7 @@ static firc_err_t validate(ctx_t *c, const firc_tunnels_t *ts)
                 cur = find_id(ts, cur->uplink_ref);
             }
         }
-        if (t->active < 1 || t->active > FIRC_TUN_MAX) {
+        if (t->active < 1 || t->active > FIRC_TUN_MAX_ACTIVE) {
             return fail(c, "active must be 1..8", "tunnels[%zu].active", i);
         }
         if (strcmp(t->by, "connection") != 0 && strcmp(t->by, "site") != 0 && strcmp(t->by, "site-client") != 0) {
@@ -954,7 +954,7 @@ static firc_err_t load_doc(ctx_t *c, firc_tunnels_t *out)
     }
     size_t n = seq_len(list);
     if (n > FIRC_TUN_MAX) {
-        return fail(c, "at most 8 tunnels", "tunnels[%d]", FIRC_TUN_MAX);
+        return fail(c, "at most 16 tunnels", "tunnels[%d]", FIRC_TUN_MAX);
     }
     if (n == 0) {
         return FIRC_OK;

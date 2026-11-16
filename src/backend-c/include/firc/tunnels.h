@@ -9,7 +9,8 @@
 #include "firc/ktcp.h"
 #include "firc/subhdr.h"
 
-#define FIRC_TUN_MAX 8
+#define FIRC_TUN_MAX 16
+#define FIRC_TUN_MAX_ACTIVE 8
 #define FIRC_TUN_MAX_SOURCES 256
 #define FIRC_TUN_MAX_KEYS 1024
 #define FIRC_TUN_KEY_MAX 191
