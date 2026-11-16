@@ -141,6 +141,13 @@ test.describe("Header Settings", () => {
     });
   }
 
+  // Catches a page title on a phone that does not open the menu when tapped.
+  test("a tap on the page title opens the phone menu", async ({ page }) => {
+    await page.setViewportSize({ width: 360, height: 760 });
+    await page.locator(".mobile-title").click();
+    await expect(page.locator(".mobile-dropdown-btn")).toHaveAttribute("aria-expanded", "true");
+  });
+
   // Catches a phone menu that ignores Escape.
   test("Escape closes the phone menu", async ({ page }) => {
     await page.setViewportSize({ width: 360, height: 760 });

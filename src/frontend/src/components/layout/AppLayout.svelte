@@ -116,8 +116,8 @@
           <span class="menu-morph" class:open={isMenuOpen} aria-hidden="true">
             <Menu size={24} />
           </span>
+          <span class="mobile-title">{t(TAB_TITLES[active_tab])}</span>
         </button>
-        <span class="mobile-title">{t(TAB_TITLES[active_tab])}</span>
 
         <div class="tabs-panel" class:open={isMenuOpen}>
           <Tabs.List>
@@ -278,6 +278,7 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 0.4rem;
       padding: 0.5rem;
       border: 0;
       background: transparent;
