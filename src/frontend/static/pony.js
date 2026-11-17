@@ -1968,16 +1968,37 @@
   const STYLE = `
 .upt-zone{position:fixed;left:0;bottom:0;width:${ZONE}px;height:${ZONE}px;z-index:2147483001;pointer-events:none}
 .upt-zone[data-off]{pointer-events:auto}
-.upt{position:absolute;left:12px;bottom:12px;box-sizing:border-box;width:40px;height:40px;display:inline-flex;align-items:center;justify-content:center;padding:0;border-radius:.5rem;border:1px solid var(--bg-light-extra,#282a39);background:var(--bg-light,#20202c);color:var(--text-2,#aaa);cursor:pointer;pointer-events:auto;transition:background-color .1s ease-in-out,color .1s ease-in-out,opacity .2s ease,transform .2s ease}
+.upt{position:absolute;left:max(12px,env(safe-area-inset-left));bottom:max(12px,env(safe-area-inset-bottom));box-sizing:border-box;width:40px;height:40px;display:inline-flex;align-items:center;justify-content:center;padding:0;border-radius:.5rem;border:1px solid var(--bg-light-extra,#282a39);background:var(--bg-light,#20202c);color:var(--text-2,#aaa);cursor:pointer;pointer-events:auto;transition:background-color .1s ease-in-out,color .1s ease-in-out,opacity .2s ease,transform .2s ease}
 .upt:hover{background:var(--bg-light-extra,#282a39);color:var(--text,#fff)}
 .upt[aria-pressed=true]{color:var(--accent,#42bdf9)}
 .upt[data-hidden]{opacity:0;pointer-events:none;transform:translateY(6px)}
 .upt:focus-visible{outline:2px solid var(--accent,#42bdf9);outline-offset:2px}
+@media (pointer:coarse){.upt{width:46px;height:46px;border-color:color-mix(in oklab,var(--accent,#42bdf9) 50%,var(--bg-light-extra,#282a39));box-shadow:0 2px 12px rgba(0,0,0,.55)}}
 `;
   const PAW =
     '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
     '<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/>' +
     '<path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/></svg>';
+  function parseChoice(search) {
+    const v = new URLSearchParams(search || "").get("pony");
+    if (v === "off" || v === "0") return false;
+    if (v === "on" || v === "1") return true;
+    return null;
+  }
+  function applyUrlChoice(loc = globalThis.location, storage = globalThis.localStorage) {
+    let choice = null;
+    try {
+      choice = parseChoice(loc.search);
+      if (choice === null) return null;
+      writeEnabled(choice, storage);
+      const url = new URL(loc.href);
+      url.searchParams.delete("pony");
+      history.replaceState(history.state, "", url);
+    } catch (e) {
+      return choice;
+    }
+    return choice;
+  }
   function readEnabled(storage = globalThis.localStorage) {
     try {
       return storage.getItem(STORAGE_KEY) !== "off";
@@ -2160,6 +2181,7 @@
   }
   const DEFAULT_SIZE = 80;
   const FRAME_CAP = 0.1;
+  const LAYOUT_EVERY = 120;
   const TURN_POSE = poseAt("rear", 0.62 * ACTIONS.rear.duration);
   const TURN_REAR = 0.3;
   const HOP_ENTER = 0.12;
@@ -2272,6 +2294,14 @@
       }
       return pickPlatform(rects, groundLine, 2 * size);
     }
+    let layoutAt = -Infinity;
+    let layoutDirty = true;
+    let groundLine = 0;
+    let pageWidth = 0;
+    let candidate = null;
+    const markLayout = () => {
+      layoutDirty = true;
+    };
     function frame(now) {
       if (!layer.isConnected) {
         stopPony();
@@ -2280,11 +2310,17 @@
       const dt = last === null || !Number.isFinite(now) ? 0 : (now - last) / 1000;
       last = Number.isFinite(now) ? now : last;
       const d = Math.min(FRAME_CAP, dt);
-      director.setWidth(viewportWidth());
+      if (layoutDirty || now - layoutAt >= LAYOUT_EVERY || !Number.isFinite(now)) {
+        layoutAt = Number.isFinite(now) ? now : 0;
+        layoutDirty = false;
+        groundLine = layer.getBoundingClientRect().bottom;
+        pageWidth = viewportWidth();
+        candidate = findPlatform(groundLine);
+      }
+      director.setWidth(pageWidth);
       const s = director.step(dt);
-      const groundLine = layer.getBoundingClientRect().bottom;
       const mid = s.x + 0.5 * WIDTH_PER_SIZE * size;
-      const found = findPlatform(groundLine);
+      const found = candidate;
       const next = found && mid >= found.left && mid <= found.right ? found : null;
       if ((next && next.el) !== (plat && plat.el)) hop = { t: 0, from: base, h: 0 };
       plat = next;
@@ -2429,6 +2465,8 @@
     document.addEventListener("pointerup", onUp, true);
     document.addEventListener("pointercancel", onUp, true);
     window.addEventListener("toast", onToast);
+    window.addEventListener("scroll", markLayout, { passive: true, capture: true });
+    window.addEventListener("resize", markLayout, { passive: true });
     const inputEvents = ["keydown", "wheel", "touchstart", "scroll"];
     inputEvents.forEach((n) =>
       window.addEventListener(n, onInput, { passive: true, capture: true }),
@@ -2441,6 +2479,8 @@
       () => document.removeEventListener("pointerup", onUp, true),
       () => document.removeEventListener("pointercancel", onUp, true),
       () => window.removeEventListener("toast", onToast),
+      () => window.removeEventListener("scroll", markLayout, { capture: true }),
+      () => window.removeEventListener("resize", markLayout),
       () => inputEvents.forEach((n) => window.removeEventListener(n, onInput, { capture: true })),
     );
     rt.raf = requestAnimationFrame(frame);
@@ -2459,6 +2499,8 @@
   if (!window.UnicornPony) {
     window.UnicornPony = { start: startPony, stop: stopPony, play: playAction };
     const boot = () => {
+      if (navigator.webdriver) return;
+      if (AUTO_TOGGLE) applyUrlChoice();
       const enabled = readEnabled();
       if (AUTO_TOGGLE) createToggle({ enabled, onChange: (on) => (on ? startPony() : stopPony()) });
       if (enabled || !AUTO_TOGGLE) startPony();
