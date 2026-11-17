@@ -24,5 +24,6 @@ size_t hpe_bound(const struct h2_field *f, size_t n);
 size_t hpe_block(struct hpe *e, const struct h2_field *f, size_t n, unsigned char *out, size_t cap);
 size_t hpe_huff_len(const char *s, size_t n);
 size_t hpe_huff(unsigned char *out, const char *s, size_t n);
+int    hpack_huff_decode(const uint8_t *in, size_t n, uint8_t *out, size_t cap);
 
 #endif

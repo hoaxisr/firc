@@ -91,7 +91,15 @@ enum { XA_NONE = 0, XA_READY = 1, XA_WAIT = 2 };
 enum { XW_READ = 1, XW_ROOM = 2, XW_DONE = 4 };
 enum { MUXP_EARLY = 0, MUXP_LATE = 1, MUXP_EXIT = 2 };
 
+/* Connections per loop thread. Browsers keep connections alive between requests: with a wide set
+ * of routes into the tunnel, two open sites filled a table of 64. An idle slot costs little (see
+ * the connection table in stack.c and RTX_START). When the table is full, conn_new evicts an idle
+ * connection or refuses the SYN and logs it, rather than growing until the OOM killer comes. */
+#define MAX_CONNS 320
+
 #define XC_MAX 64
+#define MUX_HY2_LINKS 32
+#define MUX_IDX_MAX (XC_MAX + MUX_HY2_LINKS)
 #define DIAL_NOSPARE 1
 
 struct xc_ref { const void *node; int slot; unsigned gen; };
@@ -103,6 +111,10 @@ struct mux_host {
     void *arg;
     unsigned loops;
     unsigned wait_ms;
+    unsigned idx_base;
+    void (*seen)(const struct xc_ref *r, int rc, uint64_t started_ms);
+    int (*stale)(const struct xc_ref *r);
+    void (*fd_extra)(int delta);
 };
 
 struct dialer_mux {
@@ -115,6 +127,7 @@ struct dialer_mux {
     int  (*busy)(void);
     void (*dropped)(void *link);
     int  (*shares)(const void *ctx);
+    void (*stop)(void);
 };
 
 struct dialer_ops {
@@ -172,6 +185,7 @@ struct dialer_ops {
      * that held uploads to 10-20 Mbit/s with multi-second stalls. When the room grows back
      * (WINDOW_UPDATE, read by drain_conn) the stack sends the client a window update. */
     long (*room)(const void *ctx, void *sess);
+    int  (*finish)(const void *ctx, void *sess);
     /* Send what the link holds back for a delay (a finalmask piece queued behind its gap) once it
      * is due, at now_ms (CLOCK_MONOTONIC). *next_ms: in how many ms to ask again, 0 when the
      * socket must become writable first, -1 when nothing waits. Returns SEND_OK or SEND_FATAL.
@@ -182,7 +196,8 @@ struct dialer_ops {
     size_t (*up_write)(const void *ctx, void *sess);
     /* Frame a client datagram into stream bytes for the node. Returns the length, or 0 if it does
      * not fit. */
-    size_t (*dgram_frame)(const unsigned char *p, size_t n, unsigned char *out, size_t cap);
+    size_t (*dgram_frame)(const void *ctx, const void *sess, const unsigned char *p, size_t n, unsigned char *out,
+                          size_t cap);
     /* Read from the link into buf, or point *data at the bytes where they already lie. *got is
      * their count, before deliver parses them (the stack meters its per-pass budget by it). rc 0
      * with *got 0 is valid (a control frame); a non-zero rc means the link is over. */

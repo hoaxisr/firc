@@ -3,6 +3,7 @@
 #include "firc/tunnodes.h"
 #include "vless.h"
 #include "vlink.h"
+#include "hy2link.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,6 +112,44 @@ TEST a_base64_list_gives_its_nodes_in_order(void)
     }
     ASSERT_STR_EQ("B", g_nodes.v[1].name);
     ASSERT(strstr(g_nodes.v[1].link, "@b.example:443?") != NULL);
+    PASS();
+}
+
+TEST a_body_of_hysteria2_nodes_gives_rows(void)
+{
+    const firc_tunnel_t *t = tunnel(SUB_A, "");
+    static const char body[] = "vless://u@h.example:443?security=none#v\n"
+                               "hysteria2://pw@h.example:443/?sni=s.example#a\n"
+                               "hy2://pw@h2.example:443/?sni=s.example#b\n"
+                               "trojan://p@h.example:1#t\n";
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
+    const char *want[] = {"aaaaaaaa:v", "aaaaaaaa:a", "aaaaaaaa:b"};
+    ASSERT(keys_are(want, 3));
+    ASSERT_EQ(3u, sendable());
+    ASSERT(strncmp(g_nodes.v[0].link, "vless://", 8) == 0);
+    ASSERT(strncmp(g_nodes.v[1].link, "hysteria2://", 12) == 0);
+    ASSERT(strncmp(g_nodes.v[2].link, "hysteria2://", 12) == 0);
+    ASSERT(strstr(g_nodes.v[2].link, "@h2.example:443") != NULL);
+    PASS();
+}
+
+TEST an_xray_hop_node_keeps_its_mode(void)
+{
+    const firc_tunnel_t *t = tunnel(SUB_A, "");
+    static const char body[] =
+        "{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"x\",\"settings\":{\"version\":2,\"address\":\"h.example\","
+        "\"port\":443},\"streamSettings\":{\"network\":\"hysteria\",\"security\":\"tls\",\"tlsSettings\":"
+        "{\"serverName\":\"s.example\"},\"hysteriaSettings\":{\"version\":2,\"auth\":\"pw\"},\"finalmask\":{\"udp\":"
+        "[{\"type\":\"udphop\",\"settings\":{\"mode\":\"intervalRemote\",\"remotePorts\":\"20000-20010\"}}]}}}]}";
+    firc_tun_body_t b = {"https://a.example", 0, body, sizeof body - 1, 0};
+    ASSERT_EQ(FIRC_OK, build(t, 0, &b, 1));
+    ASSERT_EQ(1u, sendable());
+    ASSERT(strstr(g_nodes.v[0].link, "@h.example:20000-20010?") != NULL);
+    ASSERT(strstr(g_nodes.v[0].link, "&hopmode=remote") != NULL);
+    struct vless_node m;
+    ASSERT_EQ(0, vless_parse_url(g_nodes.v[0].link, &m));
+    ASSERT_EQ(HY2_HOP_REMOTE, m.hop_mode);
     PASS();
 }
 
@@ -644,6 +683,38 @@ TEST a_body_reads_at_most_1024_nodes(void)
     PASS();
 }
 
+static char *secrets_body(size_t n, size_t from)
+{
+    size_t cap = n * 400 + 1, off = 0;
+    char *b = malloc(cap);
+    for (size_t i = from; i < from + n; i++) {
+        off += (size_t)snprintf(b + off, cap - off,
+                                "hysteria2://auth%zu@h%zu.example:443/?sni=s.example&obfs=salamander&obfs-password=obfs%zu"
+                                "&pinSHA256=%064zx&qp=%%7B%%22k%%22%%3A%zu%%7D#n%zu\n",
+                                i, i, i, i + 1, i, i);
+    }
+    return b;
+}
+
+TEST every_body_keeps_the_secrets_of_all_its_nodes(void)
+{
+    /* catches: the parser's table of long values shared by every source of a build, so a later body is refused */
+    char *a = secrets_body(1024, 0), *q = secrets_body(1000, 5000);
+    const firc_tunnel_t *t = tunnel(SUB_A SUB_B, "");
+    ASSERT(t != NULL);
+    firc_tun_body_t b[2] = {{"https://a.example", 0, a, strlen(a), 0}, {"https://b.example", 0, q, strlen(q), 0}};
+    ASSERT_EQ(FIRC_OK, build(t, 0, b, 2));
+    free(a);
+    free(q);
+    ASSERT_EQ(2024u, g_nodes.total);
+    ASSERT_EQ(2024u, g_nodes.n);
+    for (size_t i = 0; i < g_nodes.n; i++) {
+        ASSERT_STR_EQ("", g_nodes.v[i].skip_reason);
+    }
+    ASSERT_STR_EQ("bbbbbbbb:n5999", g_nodes.v[2023].key);
+    PASS();
+}
+
 static int flat_and_unique(void)
 {
     for (size_t i = 0; i < g_nodes.n; i++) {
@@ -858,6 +929,8 @@ int main(int argc, char **argv)
     GREATEST_MAIN_BEGIN();
     GREATEST_SET_TEARDOWN_CB(cleanup, NULL);
     RUN_TEST(a_base64_list_gives_its_nodes_in_order);
+    RUN_TEST(a_body_of_hysteria2_nodes_gives_rows);
+    RUN_TEST(an_xray_hop_node_keeps_its_mode);
     RUN_TEST(a_clash_body_gives_its_two_nodes);
     RUN_TEST(order_pins_its_keys_first);
     RUN_TEST(an_excluded_node_is_listed_but_not_sent);
@@ -889,6 +962,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_key_repeated_in_order_counts_once);
     RUN_TEST(nodes_at_a_sink_are_counted_with_the_first_name);
     RUN_TEST(a_body_reads_at_most_1024_nodes);
+    RUN_TEST(every_body_keeps_the_secrets_of_all_its_nodes);
     RUN_TEST(a_reversed_order_lists_every_node_once);
     RUN_TEST(a_prune_drops_a_renamed_nodes_key_from_order_and_exclude);
     RUN_TEST(a_filter_hidden_key_its_body_gives_survives_a_prune);

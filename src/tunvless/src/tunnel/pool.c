@@ -86,12 +86,14 @@ struct pl_sess {
     int slot;                   /* -1 — none */
     uint8_t udp, opened;        /* flow_open was called with k */
     uint8_t pinned;
+    uint8_t kind;
     struct flow_key k;
 };
 #define PL_HDR 96
 _Static_assert(sizeof(struct pl_sess) <= PL_HDR, "pool session header larger than PL_HDR");
 #define INNER(s) ((void *)((unsigned char *)(s) + PL_HDR))
 #define CINNER(s) ((const void *)((const unsigned char *)(s) + PL_HDR))
+#define PL_K(s) ((s)->kind == 1)
 
 struct pl_slot {
     int node;                   /* node index; -1 — empty */
@@ -121,7 +123,8 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     struct pool_cfg cf;
-    const struct dialer_ops *in;
+    const struct dialer_ops *in[2];
+    unsigned (*kind)(const void *node);
     struct pl_slot *slot;
     struct pl_sel *sel;
     int n;                      /* slots: active, but no more than candidates */
@@ -227,6 +230,30 @@ static void pl_bind(struct pl_sess *s, int slot) {
     s->slot = slot;
     s->node = slot >= 0 ? pl_node(g_pl.slot[slot].node) : NULL;
     s->gen = slot >= 0 ? g_pl.slot[slot].gen : 0;
+}
+
+static uint8_t pl_kind_of(const void *node) { return node && g_pl.kind && g_pl.kind(node) ? 1 : 0; }
+
+static const struct dialer_ops *pl_ops_of(const void *node) { return g_pl.in[pl_kind_of(node)]; }
+
+static void pl_leave(struct pl_sess *s) {
+    g_pl.in[1]->clear(INNER(s));
+    memset(INNER(s), 0, g_pl.in[1]->sess_size);
+    g_pl.in[0]->clear(INNER(s));
+    s->kind = 0;
+}
+
+static void pl_enter(struct pl_sess *s) {
+    uint8_t k = pl_kind_of(s->node);
+    s->kind = PL_K(s);
+    if (k == s->kind) return;
+    if (!k) {
+        pl_leave(s);
+        return;
+    }
+    memset(INNER(s), 0, g_pl.in[1]->sess_size);
+    g_pl.in[1]->clear(INNER(s));
+    s->kind = 1;
 }
 
 /* ---- health: state in the log ----------------------------------------------------------- */
@@ -499,7 +526,7 @@ static int pl_refill(int i, int own) {
     if (m && g_pl.cf.proto->reach) {
         const void *nd[POOL_WALK_DOWN];
         for (size_t k = 0; k < m; k++) nd[k] = pl_node(out[k]);
-        if (g_pl.cf.proto->reach(nd, m, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
+        if (pool_reach_some(g_pl.cf.proto, nd, m, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
     }
     for (size_t k = 0; k < m; k++) {
         int c = out[k];
@@ -703,14 +730,18 @@ static const char *pl_peer(const void *ctx) {
     const char *r = "?";
     pthread_mutex_lock(&g_pl.mu);
     for (int i = 0; i < g_pl.n; i++)
-        if (g_pl.slot[i].node >= 0) { r = g_pl.in->peer(pl_node(g_pl.slot[i].node)); break; }
+        if (g_pl.slot[i].node >= 0) {
+            const void *nd = pl_node(g_pl.slot[i].node);
+            r = pl_ops_of(nd)->peer(nd);
+            break;
+        }
     pthread_mutex_unlock(&g_pl.mu);
     return r;
 }
 
 static const char *pl_peer_of(const void *ctx, const void *sess) {
     const struct pl_sess *s = sess;
-    return s->node ? g_pl.in->peer(s->node) : pl_peer(ctx);
+    return s->node ? g_pl.in[PL_K(s)]->peer(s->node) : pl_peer(ctx);
 }
 
 static void pl_describe(const void *ctx, char *out, size_t n) {
@@ -722,7 +753,8 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
         if (g_pl.slot[i].node < 0) continue;
         if (w) w += (size_t)snprintf(out + w, n - w, ", ");
         if (w < n) {
-            g_pl.in->describe(pl_node(g_pl.slot[i].node), out + w, n - w);
+            const void *nd = pl_node(g_pl.slot[i].node);
+            pl_ops_of(nd)->describe(nd, out + w, n - w);
             w += strlen(out + w);
         }
     }
@@ -731,8 +763,12 @@ static void pl_describe(const void *ctx, char *out, size_t n) {
         snprintf(out + w, n - w, " — %d active, spread by %s", g_pl.cf.active, pool_by_name(g_pl.cf.by));
 }
 
-static const char *pl_strerror(int rc) { return g_pl.in->strerror(rc); }
-static const char *pl_why(const void *sess, int rc) { return g_pl.in->why(CINNER(sess), rc); }
+static const char *pl_strerror(int rc) { return g_pl.in[0]->strerror(rc); }
+static const char *pl_why(const void *sess, int rc) {
+    const struct pl_sess *s = sess;
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    return o->why ? o->why(CINNER(s), rc) : o->strerror(rc);
+}
 
 /* A connect outcome for the slot's health: a streak of failures brings its check forward. */
 static void pl_seen(int slot, unsigned gen, int rc, uint64_t started) {
@@ -759,19 +795,24 @@ static int pl_slot_dead(int slot) {
     return dead;
 }
 
+static int pl_mux_shares(const void *node) {
+    if (pl_kind_of(node)) return 1;
+    const struct dialer_mux *m = g_pl.in[0]->mux;
+    return m && m->shares && m->shares(node);
+}
+
 static int pl_connect(const void *ctx, void *sess, int timeout_s) {
     (void)ctx;
     struct pl_sess *s = sess;
     if (!s->node) {
         /* A spare: to the live slots in turn, past the nodes whose flows share links and never
          * take one. */
-        const struct dialer_mux *mx = g_pl.in->mux;
         pthread_mutex_lock(&g_pl.mu);
         int pick = -1, shared = 0;
         for (int d = 0; d < g_pl.n && pick < 0; d++) {
             int i = (int)((g_pl.rr + (unsigned)d) % (unsigned)g_pl.n);
             if (g_pl.slot[i].node < 0 || !g_pl.slot[i].up) continue;
-            if (mx && mx->shares && mx->shares(pl_node(g_pl.slot[i].node))) shared = 1;
+            if (pl_mux_shares(pl_node(g_pl.slot[i].node))) shared = 1;
             else pick = i;
         }
         if (pick >= 0) {
@@ -783,8 +824,10 @@ static int pl_connect(const void *ctx, void *sess, int timeout_s) {
     } else if (pl_slot_dead(s->slot)) {
         return TR_ENONODE;
     }
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    if (!o->connect) return TR_ENONODE;
     uint64_t started = pl_now_ms();
-    int rc = g_pl.in->connect(s->node, INNER(s), timeout_s);
+    int rc = o->connect(s->node, INNER(s), timeout_s);
     pl_seen_at(s, rc, started);
     return rc;
 }
@@ -795,17 +838,22 @@ static int pl_connect(const void *ctx, void *sess, int timeout_s) {
 static void pl_take(void *dst, void *src) {
     struct pl_sess *d = dst, *s = src;
     if (d->node != s->node) {
+        if (PL_K(d) != PL_K(s)) g_pl.in[PL_K(d)]->close(INNER(d));
         d->node = s->node;
         d->slot = s->slot;
         d->gen = s->gen;
-        if (d->opened) g_pl.in->flow_open(d->node, INNER(d), &d->k, d->udp);
+        pl_enter(d);
+        if (d->opened) g_pl.in[PL_K(d)]->flow_open(d->node, INNER(d), &d->k, d->udp);
     }
-    g_pl.in->take(INNER(d), INNER(s));
+    g_pl.in[PL_K(d)]->take(INNER(d), INNER(s));
     s->node = NULL;
     s->slot = -1;
 }
 
-static void pl_close(void *sess) { g_pl.in->close(INNER(sess)); }
+static void pl_close(void *sess) {
+    struct pl_sess *s = sess;
+    g_pl.in[PL_K(s)]->close(INNER(s));
+}
 
 static void pl_clear(void *sess) {
     struct pl_sess *s = sess;
@@ -813,12 +861,31 @@ static void pl_clear(void *sess) {
     s->slot = -1;
     s->opened = 0;
     s->pinned = 0;
-    g_pl.in->clear(INNER(s));
+    if (PL_K(s)) {
+        pl_leave(s);
+        return;
+    }
+    s->kind = 0;
+    g_pl.in[0]->clear(INNER(s));
 }
 
-static int pl_fd(const void *sess) { return g_pl.in->fd(CINNER(sess)); }
-static int pl_has_data(const void *sess) { return g_pl.in->has_data(CINNER(sess)); }
-static int pl_due(void *sess, uint64_t now_ms, int *next_ms) { return g_pl.in->due(INNER(sess), now_ms, next_ms); }
+static int pl_fd(const void *sess) {
+    const struct pl_sess *s = sess;
+    return g_pl.in[PL_K(s)]->fd(CINNER(s));
+}
+static int pl_has_data(const void *sess) {
+    const struct pl_sess *s = sess;
+    return g_pl.in[PL_K(s)]->has_data(CINNER(s));
+}
+static int pl_due(void *sess, uint64_t now_ms, int *next_ms) {
+    struct pl_sess *s = sess;
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    if (!o->due) {
+        *next_ms = -2;
+        return SEND_OK;
+    }
+    return o->due(INNER(s), now_ms, next_ms);
+}
 
 static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, int udp) {
     (void)ctx;
@@ -827,10 +894,11 @@ static int pl_flow_open(const void *ctx, void *sess, const struct flow_key *k, i
     pl_bind(s, pl_pick(k));
     pthread_mutex_unlock(&g_pl.mu);
     if (!s->node) return -1;
+    pl_enter(s);
     s->k = *k;
     s->udp = (uint8_t)udp;
     s->opened = 1;
-    return g_pl.in->flow_open(s->node, INNER(s), k, udp);
+    return g_pl.in[PL_K(s)]->flow_open(s->node, INNER(s), k, udp);
 }
 
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host) {
@@ -853,50 +921,69 @@ int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, c
         s->gen = 0;
         s->pinned = 1;
     }
+    pl_enter(s);
     s->k = *k;
     s->udp = (uint8_t)udp;
     s->opened = 1;
-    int rc = g_pl.in->flow_open(s->node, INNER(s), k, udp);
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    int rc = o->flow_open(s->node, INNER(s), k, udp);
     if (rc || !host || !host[0]) return rc;
-    return g_pl.in->set_host && g_pl.in->set_host(INNER(s), host) == 0 ? 0 : -1;
+    return o->set_host && o->set_host(INNER(s), host) == 0 ? 0 : -1;
 }
 
-static int pl_set_host(void *sess, const char *host) { return g_pl.in->set_host(INNER(sess), host); }
+static int pl_set_host(void *sess, const char *host) {
+    struct pl_sess *s = sess;
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    return o->set_host ? o->set_host(INNER(s), host) : -1;
+}
 
 static int pl_send(const void *ctx, void *sess, const struct flow_key *k, int udp,
                    const unsigned char *d, size_t n) {
     (void)ctx;
     struct pl_sess *s = sess;
-    return g_pl.in->send(s->node, INNER(s), k, udp, d, n);
+    return g_pl.in[PL_K(s)]->send(s->node, INNER(s), k, udp, d, n);
 }
 
 static long pl_room(const void *ctx, void *sess) {
     (void)ctx;
     struct pl_sess *s = sess;
-    if (!g_pl.in->room || !s->node) return -1;
-    return g_pl.in->room(s->node, INNER(s));
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    if (!o->room || !s->node) return -1;
+    return o->room(s->node, INNER(s));
+}
+
+static int pl_finish(const void *ctx, void *sess) {
+    (void)ctx;
+    struct pl_sess *s = sess;
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    return o->finish && s->node ? o->finish(s->node, INNER(s)) : SEND_OK;
 }
 
 static size_t pl_up_write(const void *ctx, void *sess) {
     (void)ctx;
     struct pl_sess *s = sess;
-    if (!s->node) return 0;
-    return g_pl.in->up_write(s->node, INNER(s));
+    const struct dialer_ops *o = g_pl.in[PL_K(s)];
+    if (!s->node || !o->up_write) return 0;
+    return o->up_write(s->node, INNER(s));
 }
 
-static size_t pl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
-    return g_pl.in->dgram_frame(p, n, out, cap);
+static size_t pl_dgram_frame(const void *ctx, const void *sess, const unsigned char *p, size_t n, unsigned char *out,
+                             size_t cap) {
+    (void)ctx;
+    const struct pl_sess *s = sess;
+    return g_pl.in[PL_K(s)]->dgram_frame(s->node, CINNER(s), p, n, out, cap);
 }
 
 static int pl_read(void *sess, unsigned char *buf, size_t cap, const unsigned char **data, size_t *got) {
-    return g_pl.in->read(INNER(sess), buf, cap, data, got);
+    struct pl_sess *s = sess;
+    return g_pl.in[PL_K(s)]->read(INNER(s), buf, cap, data, got);
 }
 
 static int pl_deliver(const void *ctx, void *sess, int udp, const unsigned char *d, size_t n,
                       dialer_emit_fn emit, void *arg) {
     (void)ctx;
     struct pl_sess *s = sess;
-    return g_pl.in->deliver(s->node, INNER(s), udp, d, n, emit, arg);
+    return g_pl.in[PL_K(s)]->deliver(s->node, INNER(s), udp, d, n, emit, arg);
 }
 
 static int pl_match(const void *ctx, const void *dst, const void *src) {
@@ -933,12 +1020,49 @@ static int pl_stale(const void *ctx, const void *sess) {
 
 int pool_ref_stale(const struct xc_ref *r) { return pl_gen_stale(r->node, r->slot, r->gen) > 0; }
 
+static void pl_ref_seen(const struct xc_ref *r, int rc, uint64_t started) { pl_seen(r->slot, r->gen, rc, started); }
+
+int pool_reach_some(const struct pool_proto *p, const void *const *nodes, size_t n, int timeout_ms, char *ok, int *err) {
+    if (!p->reach) return -1;
+    if (!p->kind) return p->reach(nodes, n, timeout_ms, ok, err);
+    size_t c = n ? n : 1;
+    const void **sub = malloc(c * sizeof(*sub));
+    size_t *at = malloc(c * sizeof(*at));
+    char *sok = malloc(c);
+    int *serr = malloc(c * sizeof(*serr));
+    int rc = -1;
+    if (sub && at && sok && serr) {
+        size_t m = 0;
+        for (size_t k = 0; k < n; k++) {
+            ok[k] = 1;
+            err[k] = 0;
+            if (p->kind(nodes[k])) continue;
+            sub[m] = nodes[k];
+            at[m++] = k;
+        }
+        rc = m ? p->reach(sub, m, timeout_ms, sok, serr) : 0;
+        for (size_t j = 0; rc >= 0 && j < m; j++) {
+            ok[at[j]] = sok[j];
+            err[at[j]] = serr[j];
+        }
+        if (rc >= 0) rc += (int)(n - m);
+    }
+    free(sub);
+    free(at);
+    free(sok);
+    free(serr);
+    return rc;
+}
+
 static int pl_mux_attach(const void *ctx, void *sess, uint16_t owner, const struct xc_ref *ref) {
     (void)ctx;
     (void)ref;
     struct pl_sess *s = sess;
+    const struct dialer_mux *m = g_pl.in[PL_K(s)]->mux;
+    if (!m) return XA_NONE;
+    if (PL_K(s) && pl_slot_dead(s->slot)) return TR_ENONODE;
     struct xc_ref r = { s->node, s->slot, s->gen };
-    return g_pl.in->mux->attach(s->node, INNER(s), owner, &r);
+    return m->attach(s->node, INNER(s), owner, &r);
 }
 
 static int pl_mux_dial(const void *ctx, void *link, int timeout_s) {
@@ -946,12 +1070,51 @@ static int pl_mux_dial(const void *ctx, void *link, int timeout_s) {
     struct xc_ref r = ((const struct xconn *)link)->ref;
     if (pl_slot_dead(r.slot)) return TR_ENONODE;
     uint64_t started = pl_now_ms();
-    int rc = g_pl.in->mux->dial(r.node, link, timeout_s);
+    int rc = g_pl.in[0]->mux->dial(r.node, link, timeout_s);
     pl_seen(r.slot, r.gen, rc, started);
     return rc;
 }
 
-static int pl_mux_cut(const void *sess) { return g_pl.in->mux->cut(CINNER(sess)); }
+static int pl_mux_cut(const void *sess) {
+    const struct pl_sess *s = sess;
+    return g_pl.in[PL_K(s)]->mux->cut(CINNER(s));
+}
+
+static void pl_mux_host(const struct mux_host *h) {
+    const struct dialer_mux *a = g_pl.in[0]->mux;
+    if (a) a->host(h);
+    struct mux_host c = *h;
+    c.submit = NULL;
+    c.idx_base = XC_MAX;
+    c.seen = pl_ref_seen;
+    c.stale = pool_ref_stale;
+    g_pl.in[1]->mux->host(&c);
+}
+
+static int pl_mux_event(unsigned idx, uint32_t ev) {
+    const struct dialer_mux *a = g_pl.in[0]->mux;
+    if (idx >= XC_MAX) return g_pl.in[1]->mux->event(idx - XC_MAX, ev);
+    return a ? a->event(idx, ev) : 0;
+}
+
+static int pl_mux_pass(uint64_t now_ms, int phase) {
+    const struct dialer_mux *a = g_pl.in[0]->mux;
+    int x = a ? a->pass(now_ms, phase) : 0;
+    int y = g_pl.in[1]->mux->pass(now_ms, phase);
+    if (x > 0 && (y <= 0 || x < y)) return x;
+    return y > 0 ? y : 0;
+}
+
+static int pl_mux_busy(void) {
+    const struct dialer_mux *a = g_pl.in[0]->mux, *b = g_pl.in[1]->mux;
+    return (a && a->busy ? a->busy() : 0) + (b->busy ? b->busy() : 0);
+}
+
+static void pl_mux_stop(void) {
+    const struct dialer_mux *a = g_pl.in[0]->mux, *b = g_pl.in[1]->mux;
+    if (a && a->stop) a->stop();
+    if (b->stop) b->stop();
+}
 
 static struct dialer_mux g_pl_mux;
 
@@ -1001,9 +1164,14 @@ static struct pl_sel *pl_sel_new(const int *c, size_t n) {
     return s;
 }
 
-/* Slots and the pool's dialer for configuration pc, or NULL — out of memory. Separate from pool_run
+/* Slots and the pool's dialer for configuration pc. Separate from pool_run
  * for the tests, which set the pool up without a device. */
 static const struct dialer *pool_setup(const struct pool_cfg *pc) {
+    const struct dialer_ops *in0 = pc->proto->ops, *in1 = pc->proto->alt;
+    if (!in0->has_data || (in1 && !in1->has_data)) {
+        fprintf(stderr, PL_LOG_E "dialer %s has no has_data\n", !in0->has_data ? in0->name : in1->name);
+        return NULL;
+    }
     /* CLOCK_MONOTONIC: deadlines must not move with the wall clock (NTP steps it after boot). */
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
@@ -1011,7 +1179,9 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     pthread_cond_init(&g_pl.cv, &ca);
     pthread_condattr_destroy(&ca);
     g_pl.cf = *pc;
-    g_pl.in = pc->proto->ops;
+    g_pl.in[0] = in0;
+    g_pl.in[1] = in1;
+    g_pl.kind = in1 ? pc->proto->kind : NULL;
     if (g_pl.cf.interval_s <= 0) g_pl.cf.interval_s = POOL_INTERVAL_S;
     if (g_pl.cf.active < 1) g_pl.cf.active = 1;
     g_pl.n = g_pl.cf.active;
@@ -1041,12 +1211,12 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl.slot[0].checked_at = now;
     g_pl.slot[0].due = pc->checked ? now + (uint64_t)g_pl.cf.interval_s * 1000ull : now;
 
-    g_pl_ops = *g_pl.in;
-    g_pl_ops.sess_size = PL_HDR + g_pl.in->sess_size;
+    g_pl_ops = *in0;
+    g_pl_ops.sess_size = PL_HDR + (in1 && in1->sess_size > in0->sess_size ? in1->sess_size : in0->sess_size);
     g_pl_ops.peer = pl_peer;
     g_pl_ops.describe = pl_describe;
     g_pl_ops.strerror = pl_strerror;
-    g_pl_ops.why = g_pl.in->why ? pl_why : NULL;
+    g_pl_ops.why = in0->why || in1 ? pl_why : NULL;
     g_pl_ops.connect = pl_connect;
     g_pl_ops.take = pl_take;
     g_pl_ops.close = pl_close;
@@ -1056,8 +1226,9 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.flow_open = pl_flow_open;
     g_pl_ops.send = pl_send;
     g_pl_ops.room = pl_room;
-    g_pl_ops.due = g_pl.in->due ? pl_due : NULL;
-    g_pl_ops.up_write = g_pl.in->up_write ? pl_up_write : NULL;
+    g_pl_ops.finish = in0->finish || (in1 && in1->finish) ? pl_finish : NULL;
+    g_pl_ops.due = in0->due || (in1 && in1->due) ? pl_due : NULL;
+    g_pl_ops.up_write = in0->up_write || (in1 && in1->up_write) ? pl_up_write : NULL;
     g_pl_ops.dgram_frame = pl_dgram_frame;
     g_pl_ops.read = pl_read;
     g_pl_ops.deliver = pl_deliver;
@@ -1065,15 +1236,24 @@ static const struct dialer *pool_setup(const struct pool_cfg *pc) {
     g_pl_ops.match = pl_match;
     g_pl_ops.stale = pl_stale;
     g_pl_ops.lost = pl_lost;
-    g_pl_ops.set_host = g_pl.in->set_host ? pl_set_host : NULL;
+    g_pl_ops.set_host = in0->set_host || (in1 && in1->set_host) ? pl_set_host : NULL;
     g_pl_ops.flow_open_on = pool_flow_open_on;
-    if (g_pl.in->mux) {
-        g_pl_mux = *g_pl.in->mux;
+    if (in1 && in1->mux) {
+        g_pl_mux = (struct dialer_mux){
+            .host = pl_mux_host, .attach = pl_mux_attach, .event = pl_mux_event, .pass = pl_mux_pass,
+            .cut = pl_mux_cut, .busy = pl_mux_busy, .shares = pl_mux_shares, .stop = pl_mux_stop,
+        };
+        if (in0->mux) {
+            g_pl_mux.dial = pl_mux_dial;
+            g_pl_mux.dropped = in0->mux->dropped;
+        }
+    } else if (in0->mux) {
+        g_pl_mux = *in0->mux;
         g_pl_mux.attach = pl_mux_attach;
         g_pl_mux.dial = pl_mux_dial;
         g_pl_mux.cut = pl_mux_cut;
     }
-    g_pl_ops.mux = g_pl.in->mux ? &g_pl_mux : NULL;
+    g_pl_ops.mux = in0->mux || (in1 && in1->mux) ? &g_pl_mux : NULL;
 
     /* The stack keeps the pointer until the process ends. */
     static struct dialer d;

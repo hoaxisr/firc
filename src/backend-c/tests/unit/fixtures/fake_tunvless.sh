@@ -110,7 +110,7 @@ badconf) echo 'tunvless[warn]: bad option' >&2; exit 2 ;;
 warnsp)
     echo "tunvless[warn] tunnel: device $3 was not created" >&2
     echo 'tunvless[warn]ing: not a warn tag' >&2
-    echo 'tunvless[error]: no usable VLESS node' >&2
+    echo 'tunvless[error]: no usable node' >&2
     echo 'tunvless[debug] tun: rx 40' >&2
     echo 'tunvless: by hand' >&2
     exec sleep 3600 ;;

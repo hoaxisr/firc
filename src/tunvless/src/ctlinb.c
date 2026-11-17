@@ -151,7 +151,7 @@ int ctlinb_read_cmd(FILE *in, char **line, size_t *cap) {
         }
         char *got[2];
         int r = parse_line(*line, &buf[n], &got[0], &got[1]);
-        if (r == -2) fprintf(stderr, LOG_W "inbounds line %zu: not a usable vless:// link\n", lineno);
+        if (r == -2) fprintf(stderr, LOG_W "inbounds line %zu: not a usable node link\n", lineno);
         else if (r == -3) fprintf(stderr, LOG_W "inbounds line %zu: no room for another node\n", lineno);
         else if (r != 0) fprintf(stderr, LOG_W "inbounds line %zu: malformed line\n", lineno);
         if (r != 0) continue;

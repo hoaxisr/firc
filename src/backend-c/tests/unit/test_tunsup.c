@@ -1269,10 +1269,10 @@ TEST each_tag_is_relayed_at_its_level_without_it(void)
     read_file(g_log, buf, sizeof buf);
     ASSERT(strstr(buf, "WRN tunvless0: tunnel: device tunvless0 was not created\n") != NULL);
     ASSERT(strstr(buf, "INF tunvless0: tunvless[warn]ing: not a warn tag\n") != NULL);
-    ASSERT(strstr(buf, "ERR tunvless0: no usable VLESS node\n") != NULL);
+    ASSERT(strstr(buf, "ERR tunvless0: no usable node\n") != NULL);
     ASSERT(strstr(buf, "DBG tunvless0: tun: rx 40\n") != NULL);
     ASSERT(strstr(buf, "INF tunvless0: tunvless: by hand\n") != NULL);
-    ASSERT(journal_has(FIRC_LOG_ERROR, "tunvless0", "no usable VLESS node"));
+    ASSERT(journal_has(FIRC_LOG_ERROR, "tunvless0", "no usable node"));
     ASSERT(journal_has(FIRC_LOG_WARN, "tunvless0", "tunnel: device tunvless0 was not created"));
     ASSERT(strstr(buf, "tunvless[error]") == NULL);
     ASSERT(strstr(buf, "tunvless[debug]") == NULL);

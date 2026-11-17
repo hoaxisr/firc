@@ -27,6 +27,9 @@
 #include "vless.h"
 #include "vlink.h"
 #include "client.h"
+#include "hy2check.h"
+#include "hy2dial.h"
+#include "hy2node.h"
 #include "vldial.h"
 #include "stack.h"
 #include "pool.h"
@@ -87,20 +90,21 @@ static size_t g_sel_n;
 
 static void usage(FILE *f) {
     fprintf(f,
-"Usage: tunvless [options] <vless://link | file | ->...\n"
+"Usage: tunvless [options] <vless://link | hysteria2://link | file | ->...\n"
 "       tunvless --control [options]    nodes on stdin (one link per line, an empty line\n"
 "                                       ends them), events as JSON lines on stdout\n"
 "                                       then \"nodes\", links and an empty line replace\n"
 "                                       them without recreating the device\n"
 "\n"
 "Creates a TUN device and carries its TCP and UDP traffic to VLESS servers\n"
-"(Reality, TLS or none; tcp, grpc, xhttp, ws or httpupgrade; Vision; VLESS encryption).\n"
+"(Reality, TLS or none; tcp, grpc, xhttp, ws or httpupgrade; Vision; VLESS encryption)\n"
+"or to Hysteria2 servers (QUIC; Salamander).\n"
 "\n"
 "The nodes (every source adds its nodes, numbered from 0 in order, as --list shows):\n"
-"  vless://...            a VLESS link\n"
-"  file                   vless:// links (plain or base64), or an Xray, sing-box or\n"
-"                         Clash config with VLESS outbounds\n"
-"  -                      vless:// links on stdin, one per line (an empty line ends them)\n"
+"  vless://...            a VLESS link; hysteria2://... or hy2://... a Hysteria2 link\n"
+"  file                   vless://, hysteria2:// or hy2:// links (plain or base64), or an Xray, sing-box or\n"
+"                         Clash config with VLESS or Hysteria2 outbounds\n"
+"  -                      links on stdin, one per line (an empty line ends them)\n"
 "  -n, --node N[,N...]    candidates, in order of preference; repeatable; default: every\n"
 "                         node. A single one is used without a probe at startup\n"
 "  -l, --list             print the usable nodes and exit\n"
@@ -348,7 +352,7 @@ static int load_link(const char *src) {
     memset(&n, 0, sizeof(n));
     int r = vless_parse_url(src, &n);
     if (r < 0) {
-        fprintf(stderr, "tunvless: not a vless:// link: %.64s\n", src);
+        fprintf(stderr, "tunvless: not a vless:// or hysteria2:// link: %.64s\n", src);
         return 2;
     }
     if (r > 0) {
@@ -367,7 +371,7 @@ static int load_file(const char *src) {
         return 2;
     }
     if (cnt == 0 || st.skipped)
-        fprintf(stderr, "%s%s: %zu usable VLESS nodes (skipped %zu, other protocols %zu)\n",
+        fprintf(stderr, "%s%s: %zu usable nodes (skipped %zu, other protocols %zu)\n",
                 cnt ? LOG_I : LOG_W, src, cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < st.reasons_n; i++)
         fprintf(stderr, "%s  %s — %zu node(s)%s%s\n", cnt ? LOG_I : LOG_W, st.reasons[i].reason,
@@ -396,7 +400,7 @@ static int load_stdin_nodes(void) {
         memset(&n, 0, sizeof(n));
         int r = vless_parse_url(line, &n);
         if (r < 0) {
-            fprintf(stderr, LOG_W "line %zu: not a vless:// link\n", lineno);
+            fprintf(stderr, LOG_W "line %zu: not a vless:// or hysteria2:// link\n", lineno);
             continue;
         }
         if (r > 0) {
@@ -420,14 +424,14 @@ static int load_nodes(void) {
     }
     for (int i = 0; i < g.sources_n && !g.control; i++) {
         const char *src = g.sources[i];
-        int link = !strncmp(src, "vless://", 8), in = !strcmp(src, "-");
+        int link = vless_link_scheme(src) != 0, in = !strcmp(src, "-");
         if (!link && !in) g_links_only = 0;
         int rc = in ? load_stdin_nodes() : link ? load_link(src) : load_file(src);
         if (rc) return rc;
     }
     int cnt = nodes_count();
     if (!cnt) {
-        fprintf(stderr, LOG_E "no usable VLESS node\n");
+        fprintf(stderr, LOG_E "no usable node\n");
         return 2;
     }
     g_sel = calloc(g.want_n ? g.want_n : (size_t)cnt, sizeof(*g_sel));
@@ -448,13 +452,37 @@ static int load_nodes(void) {
     return 0;
 }
 
+static const char *field(const char *s, char *out, size_t n) {
+    size_t o = 0;
+    for (; *s && o + 1 < n; s++) {
+        unsigned char c = (unsigned char)*s;
+        out[o++] = c < 0x20 || c == 0x7f ? ' ' : (char)c;
+    }
+    out[o] = 0;
+    return out;
+}
+
 static int cmd_list(void) {
     for (int i = 0; i < nodes_count(); i++) {
         const struct vless_node *n = vnode(i);
-        printf("%d\t%s\t%s:%u\t%s/%s%s%s\n", i, n->name, n->host, n->port, n->type, n->security,
-               n->flow[0] ? " vision" : "", n->encryption ? " encryption" : "");
+        char nm[sizeof n->name], h[sizeof n->host], t[sizeof n->type], sc[sizeof n->security];
+        int hy2 = n->proto == VLESS_PROTO_HY2;
+        printf("%d\t%s\t%s:%u\t%s/%s%s%s%s\n", i, field(n->name, nm, sizeof nm), field(n->host, h, sizeof h), n->port,
+               hy2 ? "hysteria2" : field(n->type, t, sizeof t), field(n->security, sc, sizeof sc),
+               n->flow[0] ? " vision" : "", n->encryption ? " encryption" : "",
+               hy2 && !strcmp(n->obfs, "salamander") ? " salamander" : "");
     }
     return 0;
+}
+
+static int node_probe(const struct vless_node *v, int timeout_s, char *why, size_t why_n, int *hs, int *ttfb) {
+    if (v->proto == VLESS_PROTO_HY2) return hy2_probe_timed(v, timeout_s, why, why_n, hs, ttfb);
+    return vless_probe_timed(v, timeout_s, why, why_n, hs, ttfb);
+}
+
+static int node_probe6(const struct vless_node *v, int timeout_s, char *why, size_t why_n) {
+    if (v->proto == VLESS_PROTO_HY2) return hy2_probe6(v, timeout_s, why, why_n);
+    return vless_probe6(v, timeout_s, why, why_n);
 }
 
 /* --probe: the same check as at startup, with timings. */
@@ -464,12 +492,14 @@ static int cmd_probe(void) {
         int i = g_sel[k];
         char why[256] = "";
         int hs = -1, ttfb = -1;
-        int rc = vless_probe_timed(vnode(i), g.timeout_s, why, sizeof(why), &hs, &ttfb);
+        int rc = node_probe(vnode(i), g.timeout_s, why, sizeof(why), &hs, &ttfb);
+        char nm[sizeof vnode(i)->name], wy[sizeof why];
+        field(vnode(i)->name, nm, sizeof nm);
         if (rc == 0) {
             found = 1;
-            printf("%d\t%s\tok\thandshake %d ms, first byte %d ms\n", i, vnode(i)->name, hs, ttfb);
+            printf("%d\t%s\tok\thandshake %d ms, first byte %d ms\n", i, nm, hs, ttfb);
         } else {
-            printf("%d\t%s\tfailed\t%s\n", i, vnode(i)->name, why);
+            printf("%d\t%s\tfailed\t%s\n", i, nm, field(why, wy, sizeof wy));
         }
         fflush(stdout);
     }
@@ -569,12 +599,31 @@ static int pool_reach(const void *const *nodes, size_t n, int timeout_ms, char *
     return rc;
 }
 
+/* The pool's view of a node. */
+static int pool_probe(const void *node, int timeout_s, char *why, size_t why_n) {
+    return node_probe(node, timeout_s, why, why_n, NULL, NULL);
+}
+static int pool_probe6(const void *node, int timeout_s, char *why, size_t why_n) {
+    return node_probe6(node, timeout_s, why, why_n);
+}
+static const char *pool_name(const void *node) {
+    return ((const struct vless_node *)node)->name;
+}
+static unsigned node_kind(const void *node) {
+    return ((const struct vless_node *)node)->proto == VLESS_PROTO_HY2;
+}
+
+static const struct pool_proto g_proto = {
+    .ops = &vless_dialer, .alt = &hy2_dialer, .kind = node_kind,
+    .probe = pool_probe, .probe6 = pool_probe6, .reach = pool_reach, .name = pool_name,
+};
+
 static int probe_walk(const int *c, size_t n) {
     const void *nd[POOL_WALK_DOWN] = { 0 };
     char ok[POOL_WALK_DOWN];
     int err[POOL_WALK_DOWN] = { 0 };
     for (size_t k = 0; k < n; k++) nd[k] = vnode(c[k]);
-    if (pool_reach(nd, n, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
+    if (pool_reach_some(&g_proto, nd, n, POOL_REACH_MS, ok, err) < 0) memset(ok, 1, sizeof ok);
     for (size_t k = 0; k < n; k++) {
         const struct vless_node *v = vnode(c[k]);
         if (!ok[k]) {
@@ -584,7 +633,7 @@ static int probe_walk(const int *c, size_t n) {
             continue;
         }
         char why[256] = "";
-        int rc = vless_probe(v, g.timeout_s, why, sizeof(why));
+        int rc = node_probe(v, g.timeout_s, why, sizeof(why), NULL, NULL);
         pool_note(c[k], rc == 0);
         if (rc == 0) {
             fprintf(stderr, LOG_I "chose %s (%s)\n", v->name, why);
@@ -618,17 +667,6 @@ static int choose_node(int *checked) {
             return c;
         }
     }
-}
-
-/* The pool's view of a node. */
-static int pool_probe(const void *node, int timeout_s, char *why, size_t why_n) {
-    return vless_probe(node, timeout_s, why, why_n);
-}
-static int pool_probe6(const void *node, int timeout_s, char *why, size_t why_n) {
-    return vless_probe6(node, timeout_s, why, why_n);
-}
-static const char *pool_name(const void *node) {
-    return ((const struct vless_node *)node)->name;
 }
 
 /* ---- routes --------------------------------------------------------------------------- */
@@ -837,8 +875,12 @@ int main(int argc, char **argv) {
     vless_set_fp(g.fp);
     if (g.ca) tls_set_cert_roots(g.ca);
     /* Before the first connection, so probes go the way the tunnel will. */
-    transport_set_sock_mark(g.mark, g.mark != 0);
+    transport_set_sock_mark(g.mark);
     transport_set_bind_dev(g.bind_dev);
+    const char *nb = getenv("TUNVLESS_NO_BATCH");
+    hy2_no_batch = nb && !strcmp(nb, "1");
+    char budgets[200];
+    hy2_budget_init("/proc/meminfo", budgets, sizeof budgets);
 
     rc = load_nodes();
     if (rc) return rc;
@@ -847,6 +889,8 @@ int main(int argc, char **argv) {
 
     stop_on_signals();
     fprintf(stderr, LOG_I "tunvless %s\n", TUNVLESS_VERSION);
+    if (hy2_no_batch) fprintf(stderr, LOG_I "UDP batching off\n");
+    fprintf(stderr, LOG_I "%s\n", budgets);
     if (g.insecure)
         fprintf(stderr, LOG_W "--insecure: certificates of security=tls nodes are NOT verified\n");
     if (pin_candidates() != 0) {
@@ -860,11 +904,8 @@ int main(int argc, char **argv) {
         ctl_emit_no_node(0);
         return 1;
     }
-    static const struct pool_proto proto = {
-        .ops = &vless_dialer, .probe = pool_probe, .probe6 = pool_probe6, .reach = pool_reach, .name = pool_name,
-    };
     struct pool_cfg pc = {
-        .proto = &proto,
+        .proto = &g_proto,
         .node = node_at,
         .sel = g_sel,
         .sel_n = g_sel_n,

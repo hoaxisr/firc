@@ -361,14 +361,14 @@ TEST a_tunnel_line_names_its_device_as_the_source(void) {
     harness_t *h = harness_start(false);
     ASSERT(h != NULL);
     firc_event_reset_for_test();
-    firc_log_from(FIRC_LOG_ERROR, "tunvless1", "no usable VLESS node");
+    firc_log_from(FIRC_LOG_ERROR, "tunvless1", "no usable node");
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/events", NULL, &out));
     cJSON *e = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(out, "events"), 0);
     ASSERT(e != NULL);
     ASSERT_STR_EQ("log", cJSON_GetObjectItemCaseSensitive(e, "kind")->valuestring);
     ASSERT_STR_EQ("tunvless1", cJSON_GetObjectItemCaseSensitive(e, "source")->valuestring);
-    ASSERT_STR_EQ("no usable VLESS node", cJSON_GetObjectItemCaseSensitive(e, "message")->valuestring);
+    ASSERT_STR_EQ("no usable node", cJSON_GetObjectItemCaseSensitive(e, "message")->valuestring);
     ASSERT_STR_EQ("error", cJSON_GetObjectItemCaseSensitive(e, "level")->valuestring);
     cJSON_Delete(out);
     harness_stop(h);

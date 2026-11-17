@@ -60,9 +60,16 @@ void tcg_key_free(struct tcg_key *k) {
     free(k);
 }
 
-int tcg_issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
-              struct tcg_key *ikey, const unsigned char *issuer_der, size_t issuer_n,
-              unsigned char *der, size_t cap, size_t *der_n) {
+int tcg_key_der(struct tcg_key *k, unsigned char *der, size_t cap, size_t *der_n) {
+    int n = wc_EccKeyToDer(&k->k, der, (word32)cap);
+    if (n <= 0) return -1;
+    *der_n = (size_t)n;
+    return 0;
+}
+
+static int issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
+                 struct tcg_key *ikey, const unsigned char *issuer_der, size_t issuer_n,
+                 const unsigned char *ip4, unsigned char *der, size_t cap, size_t *der_n) {
     Cert *c = calloc(1, sizeof(*c));
     int rc = -1;
     if (!c || !rng()) goto out;
@@ -73,6 +80,12 @@ int tcg_issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
     c->sigType = CTC_SHA256wECDSA;
     /* Validity from the current time: wolfSSL sets the start to now, the end daysValid later. */
     c->daysValid = 365 * 5;
+    if (ip4) {
+        static const unsigned char head[] = { 0x30, 0x06, 0x87, 0x04 };
+        memcpy(c->altNames, head, sizeof head);
+        memcpy(c->altNames + sizeof head, ip4, 4);
+        c->altNamesSz = (int)sizeof head + 4;
+    }
 #ifdef WOLFSSL_CERT_EXT
     if (wc_SetSubjectKeyIdFromPublicKey(c, NULL, &subj->k) != 0) goto out;
     if (is_ca) c->keyUsage = KEYUSE_KEY_CERT_SIGN | KEYUSE_CRL_SIGN;
@@ -93,6 +106,17 @@ int tcg_issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
 out:
     free(c);
     return rc;
+}
+
+int tcg_issue(struct tcg_key *subj, const char *cn, const char *org, int is_ca,
+              struct tcg_key *ikey, const unsigned char *issuer_der, size_t issuer_n,
+              unsigned char *der, size_t cap, size_t *der_n) {
+    return issue(subj, cn, org, is_ca, ikey, issuer_der, issuer_n, NULL, der, cap, der_n);
+}
+
+int tcg_issue_ip4(struct tcg_key *subj, const char *cn, const unsigned char ip4[4], struct tcg_key *ikey,
+                  const unsigned char *issuer_der, size_t issuer_n, unsigned char *der, size_t cap, size_t *der_n) {
+    return issue(subj, cn, NULL, 0, ikey, issuer_der, issuer_n, ip4, der, cap, der_n);
 }
 
 int tcg_der_to_pem(const unsigned char *der, size_t n, char *pem, size_t cap) {
@@ -135,4 +159,12 @@ int tcg_count_pem_certs(const char *pem, size_t n) {
     }
     free(der);
     return count;
+}
+
+int tcg_wolfssl_aligned(void) {
+#ifdef WOLFSSL_USE_ALIGN
+    return 1;
+#else
+    return 0;
+#endif
 }

@@ -77,9 +77,18 @@ typedef int (*sl_own_fn)(struct vless_node *n, const char *k, size_t klen, const
  * to n->uuid, and its start and length in the link to *secret and *secret_n (for a protocol that
  * needs it longer than the field, or decoded). Each parameter goes to own first (own may be NULL),
  * then to the transport and security fields (sl_link_param). type defaults to tcp. 0 — parsed
- * (usability not checked yet), -1 — another scheme or a link that does not parse. */
+ * (usability not checked yet), -1 — another scheme or a link that does not parse.
+ * flags 0: the secret and a single port are required, as in a vless:// link.
+ * SL_LINK_ANON: the secret is optional and ends at the last '@' of the authority; without one it
+ * is empty. SL_LINK_PORTS: the port is optional (443), may be a list (n->port is its first port,
+ * n->ports the canonical list when it is more than one plain port), and '/' may stand before '?'.
+ * A list that does not fit n->ports parses, with the reason in n->skip_reason. */
+#define SL_LINK_ANON 1u
+#define SL_LINK_PORTS 2u
 int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_own_fn own,
-                  const char **secret, size_t *secret_n);
+                  const char **secret, size_t *secret_n, unsigned flags);
+/* 1 and the reason when the node's address leads nowhere (the check of sl_link_usable_post). */
+int sl_link_nowhere(struct vless_node *n);
 /* A transport or security parameter of the link: 1 — parsed, 0 — not one of them. */
 int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *v, size_t vlen);
 

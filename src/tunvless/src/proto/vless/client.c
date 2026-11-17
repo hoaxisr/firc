@@ -49,15 +49,19 @@ static int64_t now_ms(void) {
  * to blame: the server connection came up but no data came back. A handshake failure or a
  * Reality rejection belongs to the node, and retrying it would double the probe time of every
  * dead node. */
-struct probe_target { unsigned char ip[16]; size_t ip_len; const char *host; };
-static const struct probe_target PROBE_TARGETS[] = {
+const struct probe_target PROBE_TARGETS[2] = {
     { { 1, 1, 1, 1 }, 4, "1.1.1.1" },
     { { 8, 8, 8, 8 }, 4, "8.8.8.8" },
 };
-static const struct probe_target PROBE6_TARGETS[] = {
+const struct probe_target PROBE6_TARGETS[2] = {
     { { 0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11 }, 16, "[2606:4700:4700::1111]" },
     { { 0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88 }, 16, "[2001:4860:4860::8888]" },
 };
+
+size_t probe_get(const struct probe_target *tg, char *out, size_t cap) {
+    int n = snprintf(out, cap, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+    return n > 0 && (size_t)n < cap ? (size_t)n : 0;
+}
 
 static int probe_once(const struct vless_node *node, int timeout_s, char *why, size_t why_n,
                       int *handshake_ms, int *ttfb_ms,
@@ -126,15 +130,14 @@ static int probe_once(const struct vless_node *node, int timeout_s, char *why, s
     /* A minimal HTTP request goes with the header: the server does not answer until it has
      * data to forward, and without it the probe would wait for the timeout. */
     char http[128];
-    int http_n = snprintf(http, sizeof(http),
-                          "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+    size_t http_n = probe_get(tg, http, sizeof(http));
     /* How much data actually follows the header. Vision below subtracts exactly this to split
      * the VLESS header from the data, and the HTTP request may not have fit. */
     size_t http_used = 0;
-    if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
-        memcpy(req + req_n, http, (size_t)http_n);
-        req_n += (size_t)http_n;
-        http_used = (size_t)http_n;
+    if (http_n > 0 && req_n + http_n <= sizeof(req)) {
+        memcpy(req + req_n, http, http_n);
+        req_n += http_n;
+        http_used = http_n;
     }
 
     /* With Vision the VLESS header goes raw, immediately followed by the first Vision frame

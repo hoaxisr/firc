@@ -1003,9 +1003,9 @@ const tunnelRefusal = (tunnels: any[]) => {
     }
     devices.add(tn.device);
     for (const [i, src] of (tn.sources ?? []).entries()) {
-      if (src.kind === "link" && !String(src.link ?? "").startsWith("vless://")) {
+      if (src.kind === "link" && !/^(vless|hysteria2|hy2):\/\//.test(String(src.link ?? ""))) {
         return {
-          error: "link must be a vless:// link",
+          error: "link must be a vless://, hysteria2:// or hy2:// link",
           field: `sources[${i}].link`,
           tunnel: tn.id,
         };

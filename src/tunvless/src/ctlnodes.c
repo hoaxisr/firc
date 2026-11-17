@@ -204,7 +204,7 @@ static int command(FILE *in, char **line, size_t *cap) {
         memset(&nd, 0, sizeof(nd));
         int r = vless_parse_url(*line, &nd);
         if (r < 0) {
-            fprintf(stderr, LOG_W "nodes line %zu: not a vless:// link\n", lineno);
+            fprintf(stderr, LOG_W "nodes line %zu: not a vless:// or hysteria2:// link\n", lineno);
             continue;
         }
         if (r > 0) {

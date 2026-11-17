@@ -479,7 +479,7 @@ jobs:
         run: make -C src/tunvless test
 
       - name: Interop probes build
-        run: make -C src/tunvless out/tests/vencprobe out/tests/xudpprobe out/tests/h2tap out/tunvless
+        run: make -C src/tunvless out/tests/vencprobe out/tests/xudpprobe out/tests/h2tap out/tests/hy2probe out/tunvless
 
       - name: Unit tests under AddressSanitizer
         run: make -C src/tunvless O=out-asan SANITIZE=address test
@@ -521,7 +521,7 @@ jobs:
       - name: Build
         run: |
           make -C src/tunvless -j"$(nproc)" O=out-${{ matrix.arch }} \
-            CC=${{ matrix.arch }}-linux-gnu-gcc AR=${{ matrix.arch }}-linux-gnu-ar
+            CC=${{ matrix.arch }}-linux-gnu-gcc AR=${{ matrix.arch }}-linux-gnu-ar all
           file src/tunvless/out-${{ matrix.arch }}/tunvless
 
       - name: Static TLS bound
@@ -535,12 +535,15 @@ jobs:
           ARCH: ${{ matrix.arch }}
           SKIP: ${{ matrix.skip }}
           TUNVLESS_NO_SOCKOPT_READ: 1
+          QC_TEST_NO_BATCH: 1
+          QC_TEST_TIME_X: 8
         run: |
           set -eu
           tests="h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq tungromatch tunnelmatch \
                  rtxmatch grpcmatch vlinkmatch ctlmatch nodesmatch ctlnodesmatch tunnamematch xhoptsmatch xmuxmatch tun6match vreqmatch \
                  scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch dialmatch probematch xconnmatch \
-                 fmaskmatch fmlinkmatch tscratchmatch gorandmatch fmsdmatch"
+                 fmaskmatch fmlinkmatch tscratchmatch gorandmatch fmsdmatch quicmatch hy2wirematch hy2connmatch hy2checkmatch hy2dialmatch brutalmatch portpickmatch \
+                 ctlmapmatch ctlinbmatch ibhsmatch ratelogmatch addr6match tstackmatch"
           run=""
           for t in $tests; do
             case " $SKIP " in *" $t "*) echo "skipped under qemu: $t"; continue ;; esac

@@ -99,7 +99,7 @@
       <HeadersEditor {defaults} bind:rows bind:open={headersOpen} onedit={() => (edited = true)} />
     {:else}
       <label>
-        <span>{t("vless:// link")}</span>
+        <span>{t("Node link")}</span>
         <textarea rows="4" bind:value={link} spellcheck="false" autocomplete="off"></textarea>
       </label>
     {/if}

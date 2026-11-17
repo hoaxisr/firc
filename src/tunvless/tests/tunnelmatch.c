@@ -672,6 +672,113 @@ static void t_room_window(void) {
     dev_drain(NULL);
 }
 
+static int g_fin_calls, g_fin_rc, g_fin_at;
+static int t_fin_count(const void *ctx, void *sess) {
+    (void)ctx;
+    (void)sess;
+    g_fin_calls++;
+    g_fin_at = g_send_calls;
+    return g_fin_rc;
+}
+
+static void t_client_fin_reaches_the_dialer(void) {
+    static struct dialer_ops fo;
+    fo = vless_dialer;
+    fo.finish = t_fin_count;
+    static struct dialer fd = { .ops = &fo, .ctx = &g_node };
+    stack_setup(&fd);
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "client FIN: test connection did not open"); stack_setup(&g_dial); return; }
+    unsigned char d[10];
+    memset(d, 'f', sizeof d);
+    g_fin_calls = 0;
+    g_fin_rc = SEND_AGAIN;
+    int calls = g_send_calls;
+    cli_send(1001, 2, TCP_ACK | TCP_FIN, 65535, d, sizeof d);
+    check(c->client_fin && g_fin_calls == 0, "client FIN: taken, the dialer not asked yet");
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(g_fin_calls == 1 && g_fin_at == calls + 1, "client FIN: the dialer is told after the segment's data");
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(g_fin_calls == 2, "client FIN: a FIN the dialer cannot take yet is offered again");
+    g_fin_rc = SEND_OK;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(g_fin_calls == 3 && conn_find(&c->key) == c, "client FIN: once taken, never again, and the flow stays");
+    conn_drop(c);
+    dev_drain(NULL);
+    c = open_conn(65535);
+    if (!c) { check(0, "client FIN: test connection did not open"); stack_setup(&g_dial); return; }
+    g_fin_calls = 0;
+    cli_send(1001, 2, TCP_ACK | TCP_FIN, 65535, d, sizeof d);
+    c->srv_closed = 1;
+    c->closed_at = g_now_ns;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(g_fin_calls == 0, "client FIN: not told once the server has closed");
+    conn_drop(c);
+    dev_drain(NULL);
+    c = open_conn(65535);
+    if (!c) { check(0, "client FIN: test connection did not open"); stack_setup(&g_dial); return; }
+    g_fin_calls = 0;
+    check(early_hold(c, d, sizeof d) == 0, "client FIN: a tail held for the node");
+    c->client_fin = 1;
+    g_send_again_n = 1;
+    calls = g_send_calls;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->early && g_fin_calls == 0, "client FIN: not told while data before the FIN waits");
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(!c->early && g_fin_calls == 1 && g_fin_at > calls, "client FIN: told once that data went");
+    conn_drop(c);
+    dev_drain(NULL);
+    c = open_conn(65535);
+    if (!c) { check(0, "client FIN: test connection did not open"); stack_setup(&g_dial); return; }
+    struct flow_key k = c->key, last;
+    g_fin_rc = SEND_FATAL;
+    cli_send(1001, 2, TCP_ACK | TCP_FIN, 65535, NULL, 0);
+    dev_drain(NULL);
+    int gone = conn_deadlines(c, &g_tun, g_now_ns);
+    memset(&last, 0, sizeof last);
+    dev_drain(&last);
+    check(gone == 1 && !conn_find(&k) && (last.tcp_flags & TCP_RST), "client FIN: a FIN the dialer refuses resets the client");
+    g_fin_rc = SEND_OK;
+    stack_setup(&g_dial);
+}
+
+static void t_drain_waits_for_the_dialers_fin(void) {
+    static struct dialer_ops fo;
+    fo = vless_dialer;
+    fo.finish = t_fin_count;
+    static struct dialer fd = { .ops = &fo, .ctx = &g_node };
+    stack_setup(&fd);
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "drain: test connection did not open"); stack_setup(&g_dial); return; }
+    struct flow_key k = c->key;
+    g_fin_rc = SEND_AGAIN;
+    g_fin_calls = 0;
+    cli_send(1001, 2, TCP_ACK | TCP_FIN, 65535, NULL, 0);
+    c->last = g_now_s - 10;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(conn_find(&k) == c && !c->srv_closed && g_fin_calls == 1,
+          "drain: a FIN the dialer has not taken keeps the flow past the drain time");
+    g_fin_rc = SEND_OK;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->fin_up && !c->srv_closed, "drain: once the dialer takes the FIN, the drain starts from there");
+    c->last = g_now_s - 10;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->srv_closed, "drain: then the silence closes it as before");
+    conn_drop(c);
+    dev_drain(NULL);
+    stack_setup(&g_dial);
+    c = open_conn(65535);
+    if (!c) { check(0, "drain: test connection did not open"); return; }
+    cli_send(1001, 2, TCP_ACK | TCP_FIN, 65535, NULL, 0);
+    c->last = g_now_s - 10;
+    conn_deadlines(c, &g_tun, g_now_ns);
+    check(c->srv_closed, "drain: a dialer without finish drains as before");
+    conn_drop(c);
+    dev_drain(NULL);
+    g_fin_rc = SEND_OK;
+}
+
 /* Consecutive data segments of one flow in one TUN batch go to the node as ONE send (g_up in
  * stack.c): one TLS record and one write instead of one per 1.4 KB segment, which cost uploads
  * 80% of the loop. Acknowledged only once the node took them, as before. */
@@ -1719,7 +1826,7 @@ static void t_window_scale(void) {
     check(c && n == 1 && (last.tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) && last.ws_seen &&
               last.wscale == 5,
           "SYN with window scale: SYN-ACK carries our option with shift 5");
-    check(n == 1 && last.window == 65535, "  window in the SYN-ACK itself: 65535, unscaled");
+    check(n == 1 && last.window == EARLY_CAP, "  window in the SYN-ACK itself: the early buffer, unscaled");
     check(c && c->ws_on && c->client_wscale == 7, "  connection: scaling on, client shift 7 read");
     if (c && wait_ready(c, 2000) == 0) {
         cli_send(1001, 2, TCP_ACK, 65535, NULL, 0);
@@ -1768,8 +1875,8 @@ static void t_window_scale(void) {
     c = conn_find(&k);
     memset(&last, 0, sizeof(last));
     n = dev_drain(&last);
-    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == 65535,
-          "SYN without window scale: SYN-ACK without it, window 65535");
+    check(c && !c->ws_on && n == 1 && !last.ws_seen && last.window == EARLY_CAP,
+          "SYN without window scale: SYN-ACK without it, window the early buffer");
     if (c && wait_ready(c, 2000) == 0) {
         cli_send(3001, 2, TCP_ACK, 65535, NULL, 0);
         n = ack_after_data(3001, &last);
@@ -1781,6 +1888,60 @@ static void t_window_scale(void) {
     if (c) conn_drop(c);
     dev_drain(NULL);
 
+    rcv_window_set(keep_wnd);
+    g_rcv_shift = keep_shift;
+}
+
+/* catches: a window wider than the early buffer while the flow dials, which drops the client's segments past it unacknowledged */
+static void t_early_window(void) {
+    uint32_t keep_wnd = g_rcv_wnd;
+    uint8_t keep_shift = g_rcv_shift;
+    rcv_window_set(1u << 20);
+    struct flow_key k = cli_key(), last;
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    __atomic_store_n(&g_connect_ms, 50, __ATOMIC_RELEASE);
+    syn_opts(5000, 7);
+    c = conn_find(&k);
+    memset(&last, 0, sizeof last);
+    int n = dev_drain(&last);
+    if (!c || !c->pending || n != 1 || !(last.tcp_flags & TCP_SYN)) {
+        check(0, "early window: fixture pending flow and its SYN-ACK");
+        sf_end(c && c->pending ? (sf_ready(c) == 0 ? c : NULL) : c);
+        rcv_window_set(keep_wnd);
+        g_rcv_shift = keep_shift;
+        return;
+    }
+    check(last.window <= EARLY_CAP, "early window: the SYN-ACK offers no more than the early buffer holds");
+    uint32_t seq = 5001, edge = 5001 + last.window;
+    int refused = 0;
+    unsigned char d[1460];
+    memset(d, 'u', sizeof d);
+    cli_send(seq, 2, TCP_ACK, 65535, NULL, 0);
+    dev_drain(NULL);
+    while ((int32_t)(edge - seq) > 0 && seq - 5001 < 65536 && !refused) {
+        size_t m = edge - seq < sizeof d ? edge - seq : sizeof d;
+        cli_send(seq, 2, TCP_ACK | TCP_PSH, 65535, d, m);
+        seq += (uint32_t)m;
+        flush_acks(&g_tun);
+        memset(&last, 0, sizeof last);
+        if (dev_drain(&last) != 1 || last.ack != seq) refused = 1;
+        uint32_t e = last.ack + ((uint32_t)last.window << g_rcv_shift);
+        if ((int32_t)(e - edge) > 0) edge = e;
+    }
+    check(!refused && c->early_n == seq - 5001 && seq - 5001 >= 4096,
+          "early window: every byte inside the offered window is held and acknowledged");
+    g_win_woke = 0;
+    int r = sf_ready(c);
+    check(r == 0 && c->ack_due && g_win_woke,
+          "early window: the ready flow's window update is due this turn");
+    g_win_woke = 0;
+    memset(&last, 0, sizeof last);
+    n = r == 0 ? (flush_acks(&g_tun), dev_drain(&last)) : 0;
+    check(r == 0 && n == 1 && last.ack == seq && last.window == 32768,
+          "early window: the flow ready, the window opens to 32768 (1 MiB at shift 5)");
+    sf_end(r == 0 ? c : NULL);
     rcv_window_set(keep_wnd);
     g_rcv_shift = keep_shift;
 }
@@ -1927,7 +2088,10 @@ static void t_send_refused(void) {
  * flight (two Initials, or an Initial with 0-RTT) would be lost. */
 static size_t g_es_len[8];
 static int g_es_n;
-static size_t es_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
+static size_t es_frame(const void *ctx, const void *sess, const unsigned char *p, size_t n, unsigned char *out,
+                       size_t cap) {
+    (void)ctx;
+    (void)sess;
     if (n > cap) return 0;
     memcpy(out, p, n);
     return n;
@@ -2140,7 +2304,10 @@ static int f_send(const void *ctx, void *sess, const struct flow_key *k, int udp
     struct fsess *s = sess;
     return n == 0 || send(s->fd, d, n, MSG_NOSIGNAL) == (ssize_t)n ? SEND_OK : SEND_FATAL;
 }
-static size_t f_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
+static size_t f_dgram_frame(const void *ctx, const void *sess, const unsigned char *p, size_t n, unsigned char *out,
+                            size_t cap) {
+    (void)ctx;
+    (void)sess;
     if (n + 2 > cap) return 0;
     out[0] = (unsigned char)(n >> 8);
     out[1] = (unsigned char)n;
@@ -2320,6 +2487,10 @@ static void pool_build(int active, int by, int ncand, int checked) {
     const struct dialer *d = pool_setup(&pc);
     g_spare_want = 0;
     stack_setup(d);
+    if (g_conns) {
+        memset(g_sess, 0, g_tables_len - TABLES_HEAD);
+        conn_table_init();
+    }
 }
 static void pool_new_ex(int active, int by, int ncand, int checked) {
     free(g_pl.cand);
@@ -5167,6 +5338,95 @@ static struct conn *p6_open(const unsigned char *src, const unsigned char *dst, 
     return p6_ready(p6_syn(src, dst, sport, NULL, 0), src, dst, sport);
 }
 
+/* catches: a client without window scaling offered the scaled-down space, a v6 SYN-ACK still at 65535, a SYN-ACK of a flow with its link up cut to the early buffer */
+static void t_early_window_rows(void) {
+    uint32_t keep_wnd = g_rcv_wnd;
+    uint8_t keep_shift = g_rcv_shift;
+    rcv_window_set(1u << 20);
+    struct flow_key k = cli_key(), last;
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    __atomic_store_n(&g_connect_ms, 50, __ATOMIC_RELEASE);
+    syn_opts(6000, -1);
+    c = conn_find(&k);
+    memset(&last, 0, sizeof last);
+    int n = dev_drain(&last);
+    if (!c || !c->pending || n != 1 || !(last.tcp_flags & TCP_SYN)) {
+        check(0, "early window rows: fixture pending flow without scaling");
+        sf_end(c && c->pending ? (sf_ready(c) == 0 ? c : NULL) : c);
+    } else {
+        static unsigned char d[1460];
+        memset(d, 'u', sizeof d);
+        cli_send(6001, 2, TCP_ACK, 65535, NULL, 0);
+        dev_drain(NULL);
+        cli_send(6001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof d);
+        flush_acks(&g_tun);
+        memset(&last, 0, sizeof last);
+        n = dev_drain(&last);
+        check(n == 1 && last.ack == 7461 && last.window == 6732,
+              "early window rows: no scaling, 1460 held, the field is the bytes left, 6732");
+        int r = sf_ready(c);
+        memset(&last, 0, sizeof last);
+        n = r == 0 ? (flush_acks(&g_tun), dev_drain(&last)) : 0;
+        check(r == 0 && n == 1 && last.ack == 7461 && last.window == 65535,
+              "early window rows: no scaling, the flow ready, 65535");
+        sf_end(r == 0 ? c : NULL);
+    }
+
+    c = p6_syn(CLI6, SRV6, 51900, NULL, 0);
+    n = dev_take();
+    check(c && n == 1 && from6(0, SRV6, CLI6, 51900) && g_pk_k[0].window == 8192,
+          "early window rows: a v6 SYN-ACK of a pending flow offers 8192");
+    if (c) sf_end(sf_ready(c) == 0 ? c : NULL);
+    else sf_end(NULL);
+
+    void *old = g_spares[0].sess;
+    int keep_own = __atomic_load_n(&g_own_fd, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_own_fd, 1, __ATOMIC_RELEASE);
+    g_spare_want = 1;
+    stack_setup(&g_dial);
+    free(old);
+    g_spare_syn_ns = 0;
+    spare_refill();
+    spare_refill();
+    int ready = 0;
+    for (int i = 0; i < 500 && !ready; i++) {
+        pthread_mutex_lock(&g_spare_mu);
+        ready = g_spares[0].state == SPARE_READY;
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!ready) usleep(2000);
+    }
+    check(ready, "early window rows: fixture, a spare session is ready");
+    __atomic_store_n(&g_connect_ms, 0, __ATOMIC_RELEASE);
+    syn_opts(7000, 7);
+    c = conn_find(&k);
+    memset(&last, 0, sizeof last);
+    n = dev_drain(&last);
+    check(c && !c->pending && n == 1 && (last.tcp_flags & TCP_SYN) && last.window == 65535,
+          "early window rows: a flow with its link up, the SYN-ACK still offers 65535");
+    sf_end(c);
+    g_spare_want = 0;
+    for (int i = 0, filling = 1; i < 500 && filling; i++) {
+        filling = 0;
+        pthread_mutex_lock(&g_spare_mu);
+        for (int j = 0; j < SPARE_MAX; j++) filling |= g_spares[j].state == SPARE_FILLING;
+        pthread_mutex_unlock(&g_spare_mu);
+        if (filling) usleep(2000);
+    }
+    for (int j = 0; j < SPARE_MAX; j++)
+        if (g_spares[j].state == SPARE_READY) {
+            g_dl->ops->close(g_spares[j].sess);
+            g_spares[j].state = SPARE_EMPTY;
+        }
+    free(g_spares[0].sess);
+    for (int j = 0; j < SPARE_MAX; j++) g_spares[j].sess = NULL;
+    stack_setup(&g_dial);
+    __atomic_store_n(&g_own_fd, keep_own, __ATOMIC_RELEASE);
+    rcv_window_set(keep_wnd);
+    g_rcv_shift = keep_shift;
+}
+
 static void settle(void) {
     struct timespec ts = { 0, 30000000 };
     nanosleep(&ts, NULL);
@@ -6121,6 +6381,51 @@ static void t_host_needs_set_host(void) {
           "a dialer without set_host: a named open fails, an address-only open goes");
 }
 
+static int g_pf_calls;
+static const void *g_pf_ctx;
+static int t_pf(const void *ctx, void *sess) {
+    (void)sess;
+    g_pf_calls++;
+    g_pf_ctx = ctx;
+    return SEND_AGAIN;
+}
+
+static unsigned t_pf_kind(const void *node) { return node == f_at(1); }
+
+static void t_pool_passes_a_client_fin(void) {
+    static struct dialer_ops fo;
+    fo = f_ops;
+    fo.finish = t_pf;
+    static const struct pool_proto mp = { .ops = &f_ops, .alt = &fo, .kind = t_pf_kind, .probe = f_probe,
+                                          .name = f_name };
+    static const struct pool_proto np = { .ops = &f_ops, .probe = f_probe, .name = f_name };
+    struct pool_cfg pc = { .proto = &np, .node = f_at, .sel = g_cand, .sel_n = 3, .first = 0, .checked = 1,
+                           .active = 1, .by = POOL_BY_CONNECTION, .interval_s = 60 };
+    free(g_pl.slot);
+    g_pl.slot = NULL;
+    const struct dialer *d = pool_setup(&pc);
+    check(d->ops->finish == NULL, "pool: no FIN to pass when the dialer takes none");
+    pc.proto = &mp;
+    free(g_pl.slot);
+    g_pl.slot = NULL;
+    d = pool_setup(&pc);
+    check(d->ops->finish != NULL, "pool: the second kind's FIN turns the op on");
+    static _Alignas(64) unsigned char buf[PL_HDR + sizeof(struct fsess)];
+    struct flow_key k = cli_key();
+    d->ops->clear(buf);
+    g_pf_calls = 0;
+    int op = pool_flow_open_on(buf, 1, &k, 0, NULL);
+    int r = d->ops->finish ? d->ops->finish(d->ctx, buf) : -100;
+    check(op == 0 && r == SEND_AGAIN && g_pf_calls == 1 && g_pf_ctx == f_at(1),
+          "pool: a client FIN on a second-kind node reaches its dialer and its answer comes back");
+    d->ops->clear(buf);
+    g_pf_calls = 0;
+    op = pool_flow_open_on(buf, 0, &k, 0, NULL);
+    r = d->ops->finish ? d->ops->finish(d->ctx, buf) : -100;
+    check(op == 0 && r == SEND_OK && g_pf_calls == 0, "pool: a client FIN on a first-kind node is taken as done");
+    d->ops->clear(buf);
+}
+
 static size_t wire_of(const struct conn *c, unsigned char *out, size_t cap) {
     const struct transport *t = &((const struct vl_sess *)SESS(c))->t;
     size_t n = 0;
@@ -6522,17 +6827,17 @@ static void t_k_fd_table(void) {
     struct rlimit save, rl;
     getrlimit(RLIMIT_NOFILE, &save);
     rl = save;
-    rl.rlim_cur = 908;
+    rl.rlim_cur = 940;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
-    int cap100 = g_park_cap;
-    rl.rlim_cur = 808;
+    int cap100 = park_cap();
+    rl.rlim_cur = 840;
     setrlimit(RLIMIT_NOFILE, &rl);
     park_cap_init();
-    int cap0 = g_park_cap;
+    int cap0 = park_cap();
     setrlimit(RLIMIT_NOFILE, &save);
     park_cap_init();
-    check(cap100 == 100 && cap0 == 0 && g_park_cap == PARK_MAX, "the parked cap follows the fd limit");
+    check(cap100 == 100 && cap0 == 0 && park_cap() == PARK_MAX, "the parked cap follows the fd limit");
 
     int fd = k_sock(ip4(93, 184, 216, 38), 443, 1);
     int top = open("/dev/null", O_RDONLY);
@@ -9312,6 +9617,849 @@ static void t_worker_ids(void) {
     check(ok, "loop threads 0..3 start their ids at 0, 16384, 32768 and 49152");
 }
 
+struct kc {
+    int flow_open, send, read, deliver, room, close, clear, connect, strerror, why, due, up_write, dgram_frame,
+        attach, event, pass, host, fd, has_data, take, peer, describe, cut, busy, set_host;
+};
+static struct kc g_d0, g_d1;
+static unsigned g_kind[FN_N];
+static char g_klog[64];
+static size_t g_klog_n;
+static int g_d1_fill;
+static unsigned g_d1_clear_saw;
+static unsigned char g_d1_saw[4];
+static int g_d0_attach_rc, g_d1_attach_rc, g_d0_connect_rc, g_d1_connect_rc, g_d0_busy_rc, g_d1_busy_rc;
+static const void *g_d0_frame_sess, *g_d1_frame_sess, *g_d1_frame_ctx;
+static unsigned g_d0_ev, g_d1_ev;
+static int g_d0_pass_rc, g_d1_pass_rc;
+static const struct mux_host *g_d0_h;
+static struct mux_host g_d1_h;
+static int g_d1_hold;
+static pthread_barrier_t g_d1_bar;
+static __thread int g_d1_tid;
+struct d1_rec {
+    const void *arg;
+    unsigned base;
+    void (*seen)(const struct xc_ref *r, int rc, uint64_t started_ms);
+    int (*stale)(const struct xc_ref *r);
+};
+static struct d1_rec g_d1_rec[2];
+static int g_k_marks[2];
+
+static void k_log(char ch) {
+    if (g_klog_n + 1 < sizeof g_klog) g_klog[g_klog_n++] = ch;
+    g_klog[g_klog_n] = 0;
+}
+
+#define K_COUNTED(p, c)                                                                                          \
+    static int p##_connect(const void *x, void *s, int t) {                                                      \
+        __atomic_add_fetch(&c.connect, 1, __ATOMIC_SEQ_CST);                                                     \
+        int rc = __atomic_load_n(&g_##p##_connect_rc, __ATOMIC_SEQ_CST);                                         \
+        return rc ? rc : f_connect(x, s, t);                                                                     \
+    }                                                                                                            \
+    static int p##_fd(const void *s) {                                                                           \
+        c.fd++;                                                                                                  \
+        return f_fd(s);                                                                                          \
+    }                                                                                                            \
+    static int p##_has_data(const void *s) {                                                                     \
+        c.has_data++;                                                                                            \
+        return f_has_data(s);                                                                                    \
+    }                                                                                                            \
+    static void p##_take(void *d, void *s) {                                                                     \
+        c.take++;                                                                                                \
+        f_take(d, s);                                                                                            \
+    }                                                                                                            \
+    static const char *p##_peer(const void *x) {                                                                 \
+        (void)x;                                                                                                 \
+        c.peer++;                                                                                                \
+        return #p "-peer";                                                                                       \
+    }                                                                                                            \
+    static void p##_describe(const void *x, char *out, size_t n) {                                               \
+        (void)x;                                                                                                 \
+        c.describe++;                                                                                            \
+        snprintf(out, n, "%s", #p "-node");                                                                      \
+    }                                                                                                            \
+    static int p##_set_host(void *s, const char *h) {                                                            \
+        c.set_host++;                                                                                            \
+        return f_set_host(s, h);                                                                                 \
+    }                                                                                                            \
+    static int p##_busy(void) {                                                                                  \
+        c.busy++;                                                                                                \
+        return g_##p##_busy_rc;                                                                                  \
+    }                                                                                                            \
+    static int p##_send(const void *x, void *s, const struct flow_key *k, int u, const unsigned char *d,        \
+                        size_t n) {                                                                              \
+        c.send++;                                                                                                \
+        return f_send(x, s, k, u, d, n);                                                                         \
+    }                                                                                                            \
+    static int p##_read(void *s, unsigned char *b, size_t cap, const unsigned char **d, size_t *got) {           \
+        c.read++;                                                                                                \
+        return f_read(s, b, cap, d, got);                                                                        \
+    }                                                                                                            \
+    static int p##_deliver(const void *x, void *s, int u, const unsigned char *d, size_t n, dialer_emit_fn e,  \
+                           void *a) {                                                                            \
+        c.deliver++;                                                                                             \
+        return f_deliver(x, s, u, d, n, e, a);                                                                   \
+    }                                                                                                            \
+    static long p##_room(const void *x, void *s) {                                                               \
+        (void)x;                                                                                                 \
+        (void)s;                                                                                                 \
+        c.room++;                                                                                                \
+        return -1;                                                                                               \
+    }                                                                                                            \
+    static const char *p##_strerror(int rc) {                                                                    \
+        (void)rc;                                                                                                \
+        c.strerror++;                                                                                            \
+        return #p "-err";                                                                                        \
+    }                                                                                                            \
+    static size_t p##_dgram_frame(const void *x, const void *s, const unsigned char *d, size_t n,              \
+                                  unsigned char *out, size_t cap) {                                              \
+        c.dgram_frame++;                                                                                         \
+        g_##p##_frame_sess = s;                                                                                  \
+        return f_dgram_frame(x, s, d, n, out, cap);                                                              \
+    }                                                                                                            \
+    static int p##_attach(const void *x, void *s, uint16_t o, const struct xc_ref *r) {                          \
+        (void)x;                                                                                                 \
+        (void)s;                                                                                                 \
+        (void)o;                                                                                                 \
+        (void)r;                                                                                                 \
+        c.attach++;                                                                                              \
+        return g_##p##_attach_rc;                                                                                \
+    }                                                                                                            \
+    static int p##_event(unsigned i, uint32_t ev) {                                                              \
+        (void)ev;                                                                                                \
+        c.event++;                                                                                               \
+        g_##p##_ev = i;                                                                                          \
+        return 0;                                                                                                \
+    }                                                                                                            \
+    static int p##_pass(uint64_t now, int ph) {                                                                  \
+        (void)now;                                                                                               \
+        (void)ph;                                                                                                \
+        c.pass++;                                                                                                \
+        return g_##p##_pass_rc;                                                                                  \
+    }                                                                                                            \
+    static int p##_cut(const void *s) {                                                                          \
+        (void)s;                                                                                                 \
+        c.cut++;                                                                                                 \
+        return 0;                                                                                                \
+    }
+
+K_COUNTED(d0, g_d0)
+K_COUNTED(d1, g_d1)
+
+static void d0_close(void *s) {
+    g_d0.close++;
+    f_close(s);
+}
+static void d1_close(void *s) {
+    g_d1.close++;
+    k_log('x');
+    f_close(s);
+}
+static void d0_clear(void *s) {
+    g_d0.clear++;
+    f_clear(s);
+}
+static void d1_clear(void *s) {
+    g_d1.clear++;
+    k_log('c');
+    g_d1_clear_saw = ((const unsigned char *)s)[511];
+    if (g_d1.clear <= 4) g_d1_saw[g_d1.clear - 1] = ((const unsigned char *)s)[511];
+    f_clear(s);
+}
+static int d0_flow_open(const void *x, void *s, const struct flow_key *k, int u) {
+    g_d0.flow_open++;
+    return f_flow_open(x, s, k, u);
+}
+static int d1_flow_open(const void *x, void *s, const struct flow_key *k, int u) {
+    g_d1.flow_open++;
+    k_log('o');
+    if (!g_d1_fill) return f_flow_open(x, s, k, u);
+    memset(s, 0xAA, 512);
+    return 0;
+}
+static int d0_due(void *s, uint64_t now, int *next_ms) {
+    (void)s;
+    (void)now;
+    g_d0.due++;
+    *next_ms = -1;
+    return SEND_OK;
+}
+static size_t d0_up_write(const void *x, void *s) {
+    (void)x;
+    (void)s;
+    g_d0.up_write++;
+    return 0;
+}
+static const char *d0_why(const void *s, int rc) {
+    (void)s;
+    (void)rc;
+    g_d0.why++;
+    return "d0-why";
+}
+static void d0_host(const struct mux_host *h) {
+    __atomic_add_fetch(&g_d0.host, 1, __ATOMIC_SEQ_CST);
+    if (!g_d1_hold) g_d0_h = h;
+}
+static void d1_host(const struct mux_host *h) {
+    if (!g_d1_hold) {
+        g_d1.host++;
+        g_d1_h = *h;
+        return;
+    }
+    const struct mux_host *p = h;
+    pthread_barrier_wait(&g_d1_bar);
+    g_d1_rec[g_d1_tid] = (struct d1_rec){ p->arg, p->idx_base, p->seen, p->stale };
+}
+static int d0_shares(const void *x) {
+    (void)x;
+    return 0;
+}
+static int d1_shares(const void *x) {
+    (void)x;
+    return 1;
+}
+
+static struct dialer_ops g_d0_ops, g_d1_ops;
+static struct dialer_mux g_d0_mux, g_d1_mux;
+static struct pool_proto g_kp;
+
+static void k_tables(int mux) {
+    k_reset();
+    g_d0_mux = (struct dialer_mux){ .host = d0_host, .attach = d0_attach, .event = d0_event, .pass = d0_pass,
+                                    .cut = d0_cut, .busy = d0_busy, .shares = d0_shares };
+    g_d1_mux = (struct dialer_mux){ .host = d1_host, .attach = d1_attach, .event = d1_event, .pass = d1_pass,
+                                    .cut = d1_cut, .busy = d1_busy, .shares = d1_shares };
+    g_d0_ops = (struct dialer_ops){
+        .name = "d0", .caps = DC_PRECONNECT, .sess_size = sizeof(struct fsess), .peer = d0_peer,
+        .describe = d0_describe, .strerror = d0_strerror, .why = d0_why, .connect = d0_connect, .take = d0_take,
+        .close = d0_close, .clear = d0_clear, .fd = d0_fd, .has_data = d0_has_data, .flow_open = d0_flow_open,
+        .send = d0_send, .room = d0_room, .due = d0_due, .up_write = d0_up_write, .dgram_frame = d0_dgram_frame,
+        .read = d0_read, .deliver = d0_deliver, .set_host = d0_set_host, .mux = mux ? &g_d0_mux : NULL,
+    };
+    g_d1_ops = (struct dialer_ops){
+        .name = "d1", .sess_size = 512, .peer = d1_peer, .describe = d1_describe, .strerror = d1_strerror,
+        .connect = d1_connect, .take = d1_take, .close = d1_close, .clear = d1_clear, .fd = d1_fd,
+        .has_data = d1_has_data, .flow_open = d1_flow_open, .send = d1_send, .room = d1_room,
+        .dgram_frame = d1_dgram_frame, .read = d1_read, .deliver = d1_deliver, .set_host = d1_set_host,
+        .mux = mux ? &g_d1_mux : NULL,
+    };
+}
+
+static void k_zero(void) {
+    memset(&g_d0, 0, sizeof g_d0);
+    memset(&g_d1, 0, sizeof g_d1);
+    g_klog_n = 0;
+    g_klog[0] = 0;
+    g_d1_fill = 0;
+    g_d1_clear_saw = 0;
+    memset(g_d1_saw, 0, sizeof g_d1_saw);
+    g_d0_attach_rc = g_d1_attach_rc = XA_NONE;
+    g_d0_connect_rc = g_d1_connect_rc = 0;
+    g_d0_busy_rc = g_d1_busy_rc = 0;
+    g_d0_frame_sess = g_d1_frame_sess = g_d1_frame_ctx = NULL;
+    g_d0_ev = g_d1_ev = 0;
+    g_d0_pass_rc = g_d1_pass_rc = 0;
+}
+
+static unsigned k_kind(const void *node) { return g_kind[(const struct fnode *)node - g_fn]; }
+
+static void k_pool(int active, int by, int ncand) {
+    srv_reset();
+    all_alive();
+    g_kp = (struct pool_proto){ .ops = &g_d0_ops, .alt = &g_d1_ops, .kind = k_kind, .probe = f_probe,
+                                .name = f_name };
+    g_pproto = &g_kp;
+    pool_new(active, by, ncand);
+    g_pproto = &f_proto;
+    for (int i = 1; i < g_pl.n; i++) pl_check(i);
+    k_zero();
+}
+
+static const struct pl_sess *k_sess(const struct conn *c) { return c ? SESS(c) : NULL; }
+
+static void t_flows_follow_their_nodes_protocol(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    k_pool(2, POOL_BY_SITE, 2);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[1].node == 1, "fixture: slot 0 holds node 0, slot 1 node 1");
+    unsigned char got[16];
+    struct conn *a = pm_open(52001, 0x0771cbcbu);
+    const struct pl_sess *sa = k_sess(a);
+    check(sa && sa->slot == 0 && sa->kind == 0 && g_d0.flow_open == 1 && g_d0.connect == 1 &&
+              g_d1.flow_open == 0 && g_d1.connect == 0 && g_d1.clear == 0,
+          "a flow hashed to slot 0 opens and connects through the kind-0 table only");
+    if (!a) return;
+    pm_send(52001, 0x0771cbcbu, 1001, 2, TCP_ACK | TCP_PSH, (const unsigned char *)"hello", 5);
+    int fa = pm_srv_of(a);
+    ssize_t ra = fa >= 0 ? recv(fa, got, sizeof got, 0) : -1;
+    if (fa >= 0 && send(fa, "world", 5, 0) != 5) ra = -1;
+    usleep(20000);
+    drain_conn(a, &g_tun);
+    pm_drain(NULL, NULL);
+    conn_drop(a);
+    check(ra == 5 && g_d0.send >= 1 && g_d0.read >= 1 && g_d0.deliver >= 1 && g_d0.room >= 1 && g_d0.close == 1 &&
+              g_d0.due >= 1 && g_d0.up_write >= 1,
+          "  its send, read, deliver, room, due, piece size and close reach the kind-0 table");
+    check(g_d1.send == 0 && g_d1.read == 0 && g_d1.deliver == 0 && g_d1.room == 0 && g_d1.close == 0,
+          "  and none of them the kind-1 table");
+    k_zero();
+    struct conn *b = pm_open(52002, 0x0971cbcbu);
+    const struct pl_sess *sb = k_sess(b);
+    check(sb && sb->slot == 1 && sb->kind == 1 && g_d1.flow_open == 1 && g_d1.connect == 1 &&
+              !strcmp(g_klog, "co") && g_d0.flow_open == 0 && g_d0.connect == 0,
+          "a flow hashed to slot 1 is cleared by the kind-1 table, then opens and connects through it only");
+    if (!b) return;
+    pm_send(52002, 0x0971cbcbu, 1001, 2, TCP_ACK | TCP_PSH, (const unsigned char *)"hello", 5);
+    int fb = pm_srv_of(b);
+    ssize_t rb = fb >= 0 ? recv(fb, got, sizeof got, 0) : -1;
+    check(rb == 5 && !memcmp(got, "hello", 5) && b->no_due && g_d1.send == 1 && g_d0.send == 0 &&
+              g_d0.due == 0 && g_d0.up_write == 0,
+          "  a kind-1 table without due or a piece size: the send goes whole, nothing is ever held back");
+    if (fb >= 0 && send(fb, "world", 5, 0) != 5) rb = -1;
+    usleep(20000);
+    drain_conn(b, &g_tun);
+    pm_drain(NULL, NULL);
+    const char *why = g_dl->ops->why ? g_dl->ops->why(SESS(b), TR_ECONNECT) : "";
+    check(rb == 5 && g_d1.read >= 1 && g_d1.deliver >= 1 && g_d1.room >= 1 && g_d0.read == 0 && g_d0.deliver == 0 &&
+              g_d0.room == 0,
+          "  its read, deliver and room reach the kind-1 table only");
+    check(!strcmp(why, "d1-err") && g_d1.strerror == 1 && g_d0.why == 0 && g_d0.strerror == 0,
+          "  a failed open of a kind-1 table without why is told by that table's strerror");
+    conn_drop(b);
+    check(g_d1.close == 1 && g_d0.close == 0, "  its close reaches the kind-1 table only");
+    struct pool_cfg pc = { .proto = &g_kp, .node = f_at, .sel = g_cand, .sel_n = 2, .first = 0, .checked = 1,
+                           .active = 2, .by = POOL_BY_SITE, .interval_s = 60 };
+    g_d1_ops.has_data = NULL;
+    const struct dialer *nb = pool_setup(&pc);
+    g_d1_ops.has_data = f_has_data;
+    g_d0_ops.has_data = NULL;
+    const struct dialer *na = pool_setup(&pc);
+    g_d0_ops.has_data = f_has_data;
+    check(!nb && !na, "a table without has_data is refused, as either kind");
+    k_reset();
+}
+
+_Static_assert(512 <= offsetof(struct vl_sess, t), "a 512-byte second session ends before the VLESS transport");
+
+static const void *k2_at(int i) { return i == 3 ? (const void *)&g_node : (const void *)&g_fn[i]; }
+static unsigned k2_kind(const void *n) { return n != (const void *)&g_node; }
+
+static void t_a_slot_after_a_hysteria_flow_is_a_clean_vless_session(void) {
+    k_tables(0);
+    static struct pool_proto p;
+    p = (struct pool_proto){ .ops = &vless_dialer, .alt = &g_d1_ops, .kind = k2_kind, .probe = f_probe,
+                             .name = f_name };
+    struct pool_cfg pc = { .proto = &p, .node = k2_at, .sel = g_cand, .sel_n = 1, .first = 3, .checked = 1,
+                           .active = 1, .by = POOL_BY_CONNECTION, .interval_s = 60 };
+    free(g_pl.slot);
+    g_pl.slot = NULL;
+    const struct dialer *d = pool_setup(&pc);
+    unsigned char *buf = d ? calloc(1, d->ops->sess_size) : NULL;
+    if (!buf) {
+        check(0, "fixture: a pool over VLESS and the 512-byte table");
+        return;
+    }
+    struct pl_sess *ps = (struct pl_sess *)buf;
+    struct vl_sess *v = (struct vl_sess *)(buf + PL_HDR);
+    v->t.link.fd = -1;
+    d->ops->clear(buf);
+    k_zero();
+    g_d1_fill = 1;
+    buf[PL_HDR + 511] = 0x5C;
+    struct flow_key k = cli_key();
+    int r1 = pool_flow_open_on(buf, 4, &k, 0, NULL);
+    int filled = 1;
+    for (int i = 0; i < 512; i++)
+        if (buf[PL_HDR + i] != 0xAA) filled = 0;
+    check(r1 == 0 && ps->kind == 1 && !strcmp(g_klog, "co") && g_d1_saw[0] == 0 && filled,
+          "a slot last used by VLESS: the kind-1 table clears it before its flow_open");
+    v->t.link.fd = 77;
+    d->ops->close(buf);
+    d->ops->clear(buf);
+    int left = 0;
+    for (int i = 0; i < 512; i++)
+        if (buf[PL_HDR + i] == 0xAA) left++;
+    check(!strcmp(g_klog, "coxc") && g_d1_clear_saw == 0xAA && left == 0 && v->t.link.fd == -1 && ps->kind == 0,
+          "release: the kind-1 clear over its own bytes, its bytes zeroed, then the VLESS clear");
+    k_zero();
+    int r2 = pool_flow_open_on(buf, 3, &k, 0, NULL);
+    int kind0 = ps->kind == 0;
+    d->ops->close(buf);
+    d->ops->clear(buf);
+    check(r2 == 0 && kind0 && g_d1.clear == 0 && g_d1.flow_open == 0 && g_d1.close == 0,
+          "the next flow on that slot opens as VLESS, and the kind-1 table never sees it");
+    free(buf);
+    g_pproto = &f_proto;
+    pool_new(1, POOL_BY_CONNECTION, 1);
+}
+
+static void t_the_stride_is_the_larger_session(void) {
+    k_tables(0);
+    g_d0_ops.sess_size = 100;
+    g_d1_ops.sess_size = 5000;
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    size_t one = g_pl_ops.sess_size, s1 = g_sess_stride;
+    g_d0_ops.sess_size = 5000;
+    g_d1_ops.sess_size = 100;
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    size_t two = g_pl_ops.sess_size, s2 = g_sess_stride;
+    k_tables(0);
+    check(one == 5096 && two == 5096 && s1 >= 5096 && s2 >= 5096,
+          "a session holds the larger table's session: 5096 bytes both ways round");
+}
+
+static void *k_host_thread(void *arg) {
+    int t = (int)(intptr_t)arg;
+    g_d1_tid = t;
+    struct mux_host h = { .submit = mux_submit, .watch = mux_watch, .wake = mux_wake, .arg = &g_k_marks[t],
+                          .loops = 2 };
+    g_pl_ops.mux->host(&h);
+    return NULL;
+}
+
+static void t_mux_indexes_do_not_collide(void) {
+    k_tables(1);
+    k_pool(2, POOL_BY_CONNECTION, 2);
+    loop_mux(&g_L);
+    int hosted = g_d1.host == 1 && g_d1_h.idx_base == XC_MAX && g_d1_h.arg == &g_L && g_d0_h == &g_L.mh &&
+                 g_L.mh.idx_base == 0 && !g_d1_h.submit && g_d0_h->submit == mux_submit;
+    int p[2] = { -1, -1 };
+    int w = -1;
+    if (pipe(p) == 0 && write(p[1], "x", 1) == 1 && g_d1_h.watch)
+        w = g_d1_h.watch(g_d1_h.idx_base + 2, p[0], EPOLLIN);
+    loop_turn(&g_L, 0);
+    check(hosted && w == 0 && g_d1.event == 1 && g_d1_ev == 2 && g_d0.event == 0,
+          "the kind-1 mux's link 2 is watched as XC_MAX + 2 and its event comes back as its own 2");
+    if (w == 0) g_d1_h.watch(g_d1_h.idx_base + 2, p[0], 0);
+    if (p[0] >= 0) close(p[0]);
+    if (p[1] >= 0) close(p[1]);
+    if (g_pl_ops.mux) g_pl_ops.mux->event(3, EPOLLIN);
+    check(g_d0.event == 1 && g_d0_ev == 3 && g_d1.event == 1, "  an event below XC_MAX goes to the kind-0 mux as is");
+    memset(g_d1_rec, 0, sizeof g_d1_rec);
+    pthread_barrier_init(&g_d1_bar, NULL, 2);
+    g_d1_hold = 1;
+    pthread_t t[2];
+    int made = g_pl_ops.mux && pthread_create(&t[0], NULL, k_host_thread, (void *)(intptr_t)0) == 0;
+    if (made && pthread_create(&t[1], NULL, k_host_thread, (void *)(intptr_t)1) != 0) {
+        made = 0;
+        pthread_cancel(t[0]);
+    }
+    if (made) {
+        pthread_join(t[0], NULL);
+        pthread_join(t[1], NULL);
+    }
+    g_d1_hold = 0;
+    pthread_barrier_destroy(&g_d1_bar);
+    int ok = made;
+    for (int i = 0; i < 2; i++)
+        if (g_d1_rec[i].arg != &g_k_marks[i] || g_d1_rec[i].base != XC_MAX || g_d1_rec[i].seen != pl_ref_seen ||
+            g_d1_rec[i].stale != pool_ref_stale) ok = 0;
+    check(ok, "two loop threads: each kind-1 host is its own thread's, with XC_MAX and the pool's seen and stale");
+    loop_mux(&g_L);
+    k_reset();
+}
+
+static void t_hopping_links_take_their_fds_from_the_parked_cap(void) {
+    k_tables(1);
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    loop_mux(&g_L);
+    struct rlimit save, rl;
+    getrlimit(RLIMIT_NOFILE, &save);
+    rl = save;
+    rl.rlim_cur = 1024;
+    setrlimit(RLIMIT_NOFILE, &rl);
+    park_cap_init();
+    int none = park_cap();
+    int carried = g_d0_h && g_d0_h->fd_extra && g_d1_h.fd_extra == g_d0_h->fd_extra;
+    if (carried) {
+        g_d0_h->fd_extra(2);
+        g_d1_h.fd_extra(2);
+    }
+    int two = park_cap();
+    if (carried) {
+        g_d1_h.fd_extra(-2);
+        g_d0_h->fd_extra(-2);
+    }
+    int back = park_cap();
+    setrlimit(RLIMIT_NOFILE, &save);
+    park_cap_init();
+    check(carried, "fd_extra reaches both kinds' hosts, the pool's copy carries the stack's");
+    check(none == 184 && two == 180 && back == 184 && park_cap() == PARK_MAX,
+          "at 1024 fds the parked cap is 184, 180 with two hopping links, 184 again after them");
+    k_reset();
+}
+
+static int k_late(int a, int b) {
+    g_d0_pass_rc = a;
+    g_d1_pass_rc = b;
+    return g_pl_ops.mux ? g_pl_ops.mux->pass(1000, MUXP_LATE) : -9;
+}
+
+static int g_d1_stops;
+static void d1_stop(void) { g_d1_stops++; }
+
+static void t_stop_runs_the_mux_stop_once(void) {
+    k_tables(1);
+    g_d1_mux.stop = d1_stop;
+    g_d1_stops = 0;
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    struct loop L;
+    if (loop_open(&L, &g_tun, 0) != 0) {
+        check(0, "fixture: a loop");
+        k_reset();
+        return;
+    }
+    __atomic_store_n(&g_stop_ms, -1, __ATOMIC_RELEASE);
+    pthread_t t;
+    if (pthread_create(&t, NULL, stop_thread, NULL) != 0) {
+        check(0, "fixture: a thread");
+        loop_close(&L);
+        k_reset();
+        return;
+    }
+    for (int i = 0; i < 50 && __atomic_load_n(&g_stop_ms, __ATOMIC_ACQUIRE) < 0; i++) loop_turn(&L, 100);
+    pthread_join(t, NULL);
+    loop_turn(&L, 0);
+    loop_turn(&L, 0);
+    uint64_t v;
+    ssize_t rd = read(g_stop_efd, &v, sizeof v);
+    (void)rd;
+    check(g_d1_stops == 1 && g_stop_ms >= 0 && g_stop_ms < 1000,
+          "stop: the pool's mux stop reaches the kind-1 mux once, and the stop returns at once");
+    loop_close(&L);
+    k_reset();
+}
+
+static void t_the_late_pass_combines(void) {
+    k_tables(1);
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    int r00 = k_late(0, 0), r40 = k_late(40, 0), r47 = k_late(40, 7), r14 = k_late(1, 40), r01 = k_late(0, 1);
+    check(r00 == 0 && r40 == 40 && r47 == 7 && r14 == 1 && r01 == 1 && g_d0.pass == 5 && g_d1.pass == 5,
+          "LATE asks both muxes: (0,0) 0, (40,0) 40, (40,7) 7, (1,40) 1, (0,1) 1");
+    k_zero();
+    if (g_pl_ops.mux) g_pl_ops.mux->pass(1000, MUXP_EARLY);
+    check(g_d0.pass == 1 && g_d1.pass == 1, "  EARLY reaches both muxes too");
+    k_zero();
+    if (g_pl_ops.mux) g_pl_ops.mux->pass(1000, MUXP_EXIT);
+    check(g_d0.pass == 1 && g_d1.pass == 1, "  EXIT reaches both muxes");
+    g_d0_busy_rc = 2;
+    g_d1_busy_rc = 3;
+    int busy = g_pl_ops.mux ? g_pl_ops.mux->busy() : -1;
+    check(busy == 5 && g_d0.busy == 1 && g_d1.busy == 1, "  busy is both muxes' jobs together");
+}
+
+static void t_a_datagram_is_framed_by_its_flows_dialer(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    k_pool(2, POOL_BY_SITE, 2);
+    struct flow_key k = pm_key(52011, 0x0971cbcbu);
+    k.proto = 17;
+    struct conn *c = key_link(&k);
+    c->is_udp = 1;
+    int op = g_dl->ops->flow_open(g_dl->ctx, SESS(c), &k, 1);
+    c->pending = 1;
+    k_zero();
+    int rc = udp_send_dgram(c, (const unsigned char *)"dns?", 4);
+    const struct pl_sess *s = SESS(c);
+    check(op == 0 && s->kind == 1 && rc == SEND_OK && g_d1.dgram_frame == 1 && g_d1_frame_sess == CINNER(s) &&
+              g_d0.dgram_frame == 0,
+          "a datagram of a kind-1 flow is framed by the kind-1 table, given that flow's session");
+    c->pending = 0;
+    conn_drop(c);
+}
+
+static void t_reach_tests_only_kind_zero_nodes(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    struct pool_proto p = { .ops = &g_d0_ops, .alt = &g_d1_ops, .kind = k_kind, .probe = f_probe,
+                            .reach = f_reach, .name = f_name };
+    memset(g_reach_ok, 0, sizeof g_reach_ok);
+    const void *nd[3] = { &g_fn[0], &g_fn[1], &g_fn[2] };
+    char ok[3] = { 9, 9, 9 };
+    int err[3] = { 7, 7, 7 };
+    g_reach_calls = 0;
+    int rc = pool_reach_some(&p, nd, 3, 100, ok, err);
+    static const int want[2] = { 0, 2 };
+    check(rc >= 0 && g_reach_calls == 1 && reach_at_are(want, 2) && ok[0] == 0 && ok[1] == 1 && ok[2] == 0 &&
+              err[0] == TR_ECONNREFUSED && err[1] == 0 && err[2] == TR_ECONNREFUSED,
+          "reach: only the kind-0 nodes are tried; the kind-1 node counts as reached");
+    k_reset();
+    srv_reset();
+    all_alive();
+    static struct pool_proto pp;
+    pp = p;
+    g_pproto = &pp;
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pproto = &f_proto;
+    g_fn[0].alive = 0;
+    g_reach_calls = 0;
+    memset(g_probes, 0, sizeof g_probes);
+    pl_check(0);
+    pl_check(0);
+    static const int want2[1] = { 2 };
+    check(g_reach_calls == 1 && reach_at_are(want2, 1) && g_probes[1] == 1 && g_pl.slot[0].node == 1,
+          "  a dead slot's search tries only node 2 first and takes kind-1 node 1 on its probe");
+    all_alive();
+}
+
+static void t_spares_never_go_to_a_sharing_node(void) {
+    k_tables(1);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[0] = 1;
+    k_pool(2, POOL_BY_CONNECTION, 2);
+    sh_spares(4);
+    int ready, shared;
+    sh_round(&ready, &shared);
+    check(ready == 4 && shared == 0 && g_spare_fail_n == 0,
+          "spares: none to the kind-1 node whose flows share, all four to the kind-0 node");
+    g_spare_clock_ns = 0;
+    sh_spares(0);
+    srv_reset();
+    memset(g_kind, 0, sizeof g_kind);
+}
+
+static void t_seen_counts_shared_link_failures(void) {
+    k_tables(1);
+    k_pool(2, POOL_BY_CONNECTION, 2);
+    loop_mux(&g_L);
+    if (!g_d1_h.seen) {
+        check(0, "the kind-1 host carries seen");
+        return;
+    }
+    struct xc_ref r = { &g_fn[1], 1, g_pl.slot[1].gen };
+    struct xc_ref old = { &g_fn[1], 1, g_pl.slot[1].gen - 1 };
+    uint64_t t = pl_now_ms() + 1;
+    g_pl.slot[1].kick = g_pl.slot[1].streak = 0;
+    g_d1_h.seen(&r, -5, t);
+    g_d1_h.seen(&r, -5, t);
+    int two = g_pl.slot[1].kick;
+    g_d1_h.seen(&r, -5, t);
+    int three = g_pl.slot[1].kick;
+    g_pl.slot[1].kick = g_pl.slot[1].streak = 0;
+    for (int i = 0; i < 3; i++) g_d1_h.seen(&old, -5, t);
+    check(!two && three && !g_pl.slot[1].kick && !g_pl.slot[1].streak,
+          "three failed shared dials bring the slot's check forward; an old generation's change nothing");
+    g_pl.slot[1].kick = 0;
+}
+
+static void t_a_dead_slot_refuses_a_hysteria_flow_at_once(void) {
+    k_tables(1);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[0] = 1;
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    unsigned char *buf = calloc(1, g_pl_ops.sess_size);
+    if (!buf || !g_pl_ops.mux) {
+        free(buf);
+        check(0, "fixture: a pool with a combined mux");
+        return;
+    }
+    ((struct fsess *)(buf + PL_HDR))->fd = -1;
+    g_pl_ops.clear(buf);
+    g_pl.slot[0].up = 0;
+    struct flow_key k = cli_key();
+    k_zero();
+    int op = g_pl_ops.flow_open(&g_pl, buf, &k, 0);
+    int at = g_pl_ops.mux->attach(&g_pl, buf, 7, NULL);
+    check(op == 0 && ((struct pl_sess *)buf)->kind == 1 && at == TR_ENONODE && g_d1.attach == 0,
+          "a kind-1 flow on a dead slot: attach refuses with no node, the kind-1 mux never asked");
+    g_pl_ops.close(buf);
+    g_pl_ops.clear(buf);
+    g_kind[0] = 0;
+    int op0 = g_pl_ops.flow_open(&g_pl, buf, &k, 0);
+    int cn = g_pl_ops.connect(&g_pl, buf, 1);
+    check(op0 == 0 && ((struct pl_sess *)buf)->kind == 0 && cn == TR_ENONODE && g_d0.connect == 0,
+          "  the same refusal a kind-0 flow on that slot gets from connect");
+    g_pl_ops.close(buf);
+    g_pl_ops.clear(buf);
+    free(buf);
+    g_pl.slot[0].up = 1;
+}
+
+static void t_every_session_call_follows_the_flows_kind(void) {
+    k_tables(1);
+    g_d1_ops.set_host = NULL;
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[0] = 1;
+    k_pool(1, POOL_BY_CONNECTION, 1);
+    loop_mux(&g_L);
+    g_d1_attach_rc = XA_READY;
+    pm_send(52021, SRV_IP, 1000, 0, TCP_SYN, NULL, 0);
+    pm_send(52021, SRV_IP, 1001, 2, TCP_ACK, NULL, 0);
+    pm_drain(NULL, NULL);
+    struct flow_key k = pm_key(52021, SRV_IP);
+    struct conn *c = conn_find(&k);
+    const struct pl_sess *s = k_sess(c);
+    check(c && c->mux && !c->pending && s->kind == 1 && g_d1.attach == 1 && g_d0.attach == 0,
+          "a live kind-1 flow is attached by the kind-1 mux only");
+    if (!c) return;
+    k_zero();
+    void *ss = SESS(c);
+    int hd = g_dl->ops->has_data(ss), fd = g_dl->ops->fd(ss);
+    const char *po = g_dl->ops->peer_of(g_dl->ctx, ss);
+    int cut = g_dl->ops->mux->cut(ss);
+    int sh = g_dl->ops->set_host ? g_dl->ops->set_host(ss, "example.com") : 0;
+    char dsc[64];
+    g_dl->ops->describe(g_dl->ctx, dsc, sizeof dsc);
+    const char *pe = g_dl->ops->peer(g_dl->ctx);
+    check(hd == 0 && fd == -1 && g_d1.has_data == 1 && g_d0.has_data == 0 && g_d1.fd == 1 && g_d0.fd == 0,
+          "  its has_data and fd reach the kind-1 table only");
+    check(!strcmp(po, "d1-peer") && cut == 0 && g_d1.cut == 1 && g_d0.cut == 0,
+          "  its peer and its cut come from the kind-1 table and mux");
+    check(sh == -1 && g_d0.set_host == 0, "  a kind-1 table without set_host refuses a host, the kind-0 one is not asked");
+    check(!strncmp(dsc, "d1-node", 7) && !strcmp(pe, "d1-peer") && g_d0.describe == 0 && g_d0.peer == 0,
+          "  the active kind-1 node is described and named by its own table");
+    conn_drop(c);
+    unsigned char *a = calloc(1, g_pl_ops.sess_size), *b = calloc(1, g_pl_ops.sess_size);
+    if (a && b) {
+        g_pl_ops.clear(a);
+        g_pl_ops.clear(b);
+        pool_flow_open_on(a, 0, &k, 0, NULL);
+        pool_flow_open_on(b, 0, &k, 0, NULL);
+        k_zero();
+        g_pl_ops.take(a, b);
+        check(g_d1.take == 1 && g_d0.take == 0, "  a take between two kind-1 sessions is the kind-1 table's");
+        g_pl_ops.close(a);
+        g_pl_ops.clear(a);
+        g_pl_ops.clear(b);
+    }
+    free(a);
+    free(b);
+    k_reset();
+}
+
+static void t_a_kind_without_a_second_table_stays_kind_zero(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    srv_reset();
+    all_alive();
+    static struct pool_proto p;
+    p = (struct pool_proto){ .ops = &g_d0_ops, .kind = k_kind, .probe = f_probe, .reach = f_reach, .name = f_name };
+    g_pproto = &p;
+    pool_new(1, POOL_BY_CONNECTION, 2);
+    g_pproto = &f_proto;
+    unsigned char *buf = calloc(1, g_pl_ops.sess_size);
+    if (!buf) return;
+    ((struct fsess *)(buf + PL_HDR))->fd = -1;
+    g_pl_ops.clear(buf);
+    k_zero();
+    struct flow_key k = cli_key();
+    int op = pool_flow_open_on(buf, 1, &k, 0, NULL);
+    struct pl_sess *ps = (struct pl_sess *)buf;
+    check(op == 0 && ps->kind == 0 && g_d0.flow_open == 1 && g_d1.flow_open == 0 && g_d1.clear == 0,
+          "kind set, no second table: a flow to a kind-1 node opens as kind 0");
+    memset(g_reach_ok, 0, sizeof g_reach_ok);
+    const void *nd[2] = { &g_fn[0], &g_fn[1] };
+    char ok[2];
+    int err[2];
+    g_reach_calls = 0;
+    pool_reach_some(&p, nd, 2, 100, ok, err);
+    static const int want[1] = { 0 };
+    check(g_reach_calls == 1 && reach_at_are(want, 1) && ok[1] == 1, "  and reach still skips the kind-1 node");
+    g_pl_ops.close(buf);
+    g_pl_ops.clear(buf);
+    ps->kind = 7;
+    k_zero();
+    int fd = g_pl_ops.fd(buf);
+    g_pl_ops.clear(buf);
+    int again = pool_flow_open_on(buf, 0, &k, 0, NULL);
+    check(fd == -1 && g_d0.fd == 1 && g_d0.clear == 1 && ps->kind == 0 && again == 0 && g_d0.flow_open == 1,
+          "a kind byte the pool never wrote is read as kind 0, and the slot is kind 0 again after clear");
+    g_pl_ops.close(buf);
+    g_pl_ops.clear(buf);
+    free(buf);
+}
+
+static void t_a_hysteria_flow_moves_to_a_vless_spare(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    k_pool(2, POOL_BY_CONNECTION, 2);
+    sh_spares(1);
+    for (int i = 0; i < SPARE_MAX; i++) g_spares[i].state = SPARE_EMPTY;
+    g_spare_fail_ns = 0;
+    g_spare_fail_n = 0;
+    g_spare_syn_ns = 0;
+    g_spare_clock_ns = 7000000000000ull;
+    spare_refill();
+    g_spare_clock_ns += 100000000ull;
+    spare_refill();
+    sh_settle();
+    struct flow_key k = pm_key(52041, SRV_IP);
+    struct conn *c = key_link(&k);
+    g_pl.slot[0].up = 0;
+    int op = g_dl->ops->flow_open(g_dl->ctx, SESS(c), &k, 0);
+    g_pl.slot[0].up = 1;
+    const struct pl_sess *s = SESS(c);
+    int was1 = op == 0 && s->kind == 1 && s->node == &g_fn[1];
+    k_zero();
+    int took = spare_checkout(SESS(c));
+    check(was1 && took == 0 && !strcmp(g_klog, "xc") && s->kind == 0 && s->node == &g_fn[0] && g_d0.clear == 1 &&
+              g_d0.flow_open == 1 && g_d0.take == 1 && g_d1.take == 0,
+          "by connection a kind-1 flow takes a kind-0 spare: closed and cleared as kind 1, reopened as kind 0");
+    conn_drop(c);
+    g_spare_clock_ns = 0;
+    sh_spares(0);
+    srv_reset();
+}
+
+static struct conn *k_wait_open(uint16_t sport, uint32_t dst) {
+    pm_send(sport, dst, 1000, 0, TCP_SYN, NULL, 0);
+    struct flow_key k = pm_key(sport, dst);
+    struct conn *c = conn_find(&k);
+    for (int i = 0; c && i < 3000 && !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE); i++) usleep(1000);
+    return c && __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) ? c : NULL;
+}
+
+static void t_a_hysteria_flow_without_a_link_ends_with_its_connect_error(void) {
+    k_tables(0);
+    memset(g_kind, 0, sizeof g_kind);
+    g_kind[1] = 1;
+    k_pool(2, POOL_BY_SITE, 2);
+    g_d1_connect_rc = -77;
+    struct conn *c = k_wait_open(52051, 0x0971cbcbu);
+    int rc = c ? c->rc : 0;
+    unsigned fl = 0;
+    int ended = c && conn_ready(c, &g_tun) == 1;
+    pm_drain(&fl, NULL);
+    check(rc == -77 && ended && (fl & TCP_RST) && g_d1.connect == 1 && g_d0.connect == 0,
+          "a kind-1 flow with no link is dialled by the kind-1 connect, and its error ends the flow");
+    g_d1_ops.connect = NULL;
+    k_pool(2, POOL_BY_SITE, 2);
+    struct conn *n = k_wait_open(52052, 0x0971cbcbu);
+    int nrc = n ? n->rc : 0;
+    int nended = n && conn_ready(n, &g_tun) == 1;
+    pm_drain(NULL, NULL);
+    check(nrc == TR_ENONODE && nended && g_d0.connect == 0,
+          "  a kind-1 table without connect: the flow ends with no node, nothing is called");
+    k_tables(0);
+}
+
+static void kind_part(void) {
+    t_flows_follow_their_nodes_protocol();
+    t_a_slot_after_a_hysteria_flow_is_a_clean_vless_session();
+    t_the_stride_is_the_larger_session();
+    t_mux_indexes_do_not_collide();
+    t_hopping_links_take_their_fds_from_the_parked_cap();
+    t_the_late_pass_combines();
+    t_stop_runs_the_mux_stop_once();
+    t_a_datagram_is_framed_by_its_flows_dialer();
+    t_reach_tests_only_kind_zero_nodes();
+    t_spares_never_go_to_a_sharing_node();
+    t_seen_counts_shared_link_failures();
+    t_a_dead_slot_refuses_a_hysteria_flow_at_once();
+    t_every_session_call_follows_the_flows_kind();
+    t_a_kind_without_a_second_table_stays_kind_zero();
+    t_a_hysteria_flow_moves_to_a_vless_spare();
+    t_a_hysteria_flow_without_a_link_ends_with_its_connect_error();
+    k_reset();
+    g_pproto = &f_proto;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);       /* a crash or a hang keeps the checks printed so far */
     int sp[2];
@@ -9337,6 +10485,8 @@ int main(void) {
     t_sendagain_eof();
     t_out_of_order_dupack();
     t_window_scale();
+    t_early_window();
+    t_early_window_rows();
     t_release_last_sleep();
     t_bad_uuid();
     t_send_refused();
@@ -9351,6 +10501,7 @@ int main(void) {
     t_room_vision_reserve();
     t_long_host_refused();
     t_host_needs_set_host();
+    t_pool_passes_a_client_fin();
     t_udp_early_bounds();
     t_server_first();
     t_server_first_from_ready();
@@ -9359,6 +10510,8 @@ int main(void) {
     t_server_first_srv_closed();
     t_room_window();
     t_gather();
+    t_client_fin_reaches_the_dialer();
+    t_drain_waits_for_the_dialers_fin();
     t_up_cut();
     t_up_cut_partial();
     t_up_cut_resend_whole();
@@ -9396,6 +10549,7 @@ int main(void) {
     t_worker_ids();
     if (stack_part() != 0) check(0, "fixture: loopback listener failed");
     sock_part();
+    kind_part();
 
     printf(g_fail ? "\ntunnelmatch: FAIL\n" : "\nall checks passed\n");
     return g_fail;

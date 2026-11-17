@@ -68,12 +68,6 @@
 #define LOG_I  "tunvless[info] tunnel: "
 #define LOG_E  "tunvless[error] tunnel: "
 
-/* Connections per loop thread. Browsers keep connections alive between requests: with a wide set
- * of routes into the tunnel, two open sites filled a table of 64. An idle slot costs little (see
- * the connection table below and RTX_START). When the table is full, conn_new evicts an idle
- * connection or refuses the SYN and logs it, rather than growing until the OOM killer comes. */
-#define MAX_CONNS 320
-
 /* How long a connection must be silent before it may be evicted (conn_new) or cleaned up as dead
  * (conn_deadlines): one notion of a dead connection for the whole file.
  *
@@ -248,6 +242,7 @@ struct conn {
     uint8_t mux;
     uint8_t fm_wait;
     uint8_t no_due;
+    uint8_t fin_up;
 };
 
 /* The hot record must stay small: that is the whole point of the split. A build check rather
@@ -263,11 +258,9 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 224 ? 1 : -1];
  * the client may be gone, and then the ring never empties. */
 #define CLOSE_DRAIN_MS 5000
 
-/* Early data limit per connection. Usually a single ClientHello, up to 2 KB; 8 KB also covers
- * an impatient client's pipelining. Beyond that data is neither taken nor ACKNOWLEDGED: the
- * client retransmits once the flow is ready — the same flow control by withheld ACKs as on the
- * SEND_AGAIN path. */
+/* Early data limit per connection, and the window a waiting flow offers. */
 #define EARLY_CAP 8192
+_Static_assert(EARLY_CAP <= 65535, "EARLY_CAP fits the unscaled window field of a SYN-ACK");
 
 /* How long a client may stay silent before the flow is opened without its data: SSH, SMTP, FTP
  * and the like wait for the server's greeting, and VLESS carries the destination only with the
@@ -330,8 +323,8 @@ typedef char conn_hot_size_check[sizeof(struct conn) <= 224 ? 1 : -1];
  * not matter: the node is the limit.
  *
  * A client that offers window scaling in its SYN (ws_seen) gets our option with shift
- * g_rcv_shift in the SYN-ACK; the SYN-ACK's own window is 65535 unscaled, since a SYN window is
- * never scaled (RFC 7323, 2.2). After that its window field is g_rcv_wnd >> g_rcv_shift
+ * g_rcv_shift in the SYN-ACK; the SYN-ACK's own window is never scaled
+ * (RFC 7323, 2.2). After that its window field is g_rcv_wnd >> g_rcv_shift
  * (rcv_win_field). A client without the option gets no option back (it may only answer a SYN
  * that has it) and a window of 65535. The shift is the smallest whose 16-bit field holds the
  * ceiling, at most 14. The option matters both ways: scaling is on only if both sides send it,
@@ -385,8 +378,9 @@ static void rcv_window_set(uint32_t wnd) {
     g_rcv_wnd = wnd < room ? wnd : (uint32_t)room;
 }
 
-/* The window field of a packet to the client: 65535 to a client without scaling, otherwise the
- * window divided by the shift named in the SYN-ACK. Rounded up because the window need not be a
+/* The window field of a packet to the client: what the early buffer still holds while the flow
+ * waits for its link, then 65535 to a client without scaling, otherwise the window divided by
+ * the shift named in the SYN-ACK. Rounded up because the window need not be a
  * multiple of 2^shift (a ceiling set by number, or the dialer's limit): rounding down, a limit
  * of 65535 at shift 7 would become 65408. */
 static long conn_room(const struct conn *c);
@@ -405,6 +399,10 @@ static long conn_room(const struct conn *c);
 static __thread uint8_t g_tun_backlog;
 
 static uint16_t rcv_win_field(const struct conn *c) {
+    if (c->pending && !c->is_udp) {
+        uint32_t e = EARLY_CAP - c->early_n;
+        return (uint16_t)(c->ws_on ? e >> g_rcv_shift : e);
+    }
     /* The dialer's limit (dialer_ops.rcv_wnd_max): with DC_ACK_PACED the window must fit the
      * queue to the node, and the ceiling, chosen by machine memory, would overflow it. */
     uint32_t cap = g_rcv_wnd_max;
@@ -1598,16 +1596,17 @@ static int upstream_send(struct conn *c, const unsigned char *data, size_t n) {
 static void send_synack(struct conn *c, const struct tun_dev *tun) {
     unsigned char sa[80];
     size_t sl;
+    uint16_t win = c->pending ? EARLY_CAP : RCV_WND_MIN;
     if (c->key.v6) {
         unsigned char opt[8] = { 2, 4, TUN6_MSS >> 8, TUN6_MSS & 0xFF, 1, 3, 3, g_rcv_shift };
         sl = tcp6_build(sa, sizeof(sa), c->key.dst.b, c->key.src.b, c->key.dport, c->key.sport,
-                        1, c->client_seq, TCP_SYN | TCP_ACK, RCV_WND_MIN, opt,
+                        1, c->client_seq, TCP_SYN | TCP_ACK, win, opt,
                         c->ws_on ? 8 : 4, NULL, 0);
     } else {
         sl = tcp_build(sa, sizeof(sa), c->key.dst.v4, c->key.src.v4,
                        c->key.dport, c->key.sport,
                        1, c->client_seq, TCP_SYN | TCP_ACK,
-                       NULL, 0, RCV_WND_MIN, TUN_MSS, c->ws_on ? (int)g_rcv_shift : -1);
+                       NULL, 0, win, TUN_MSS, c->ws_on ? (int)g_rcv_shift : -1);
     }
     if (sl) tun_write_ctl(tun, sa, sl);
     TR("SYN-ACK sent (ack=%u)\n", c->client_seq);
@@ -1705,7 +1704,7 @@ static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
 static int udp_send_dgram(struct conn *c, const unsigned char *p, size_t n) {
     unsigned char *fr = g_ls->dgram;
     if (n > UDP_DGRAM_MAX) return SEND_FATAL;
-    size_t fn = g_dl->ops->dgram_frame(p, n, fr, sizeof g_ls->dgram);
+    size_t fn = g_dl->ops->dgram_frame(g_dl->ctx, SESS(c), p, n, fr, sizeof g_ls->dgram);
     if (!fn) return SEND_FATAL;
     /* The session is still being set up: it must not be written to — a connector is working in
      * it — but the datagram can be held. The check is HERE, in the only place that knows the
@@ -2449,7 +2448,7 @@ static void handle_packet(const struct tun_dev *tun, const unsigned char *pkt, s
         }
         size_t dn = n - off;
         if ((!dn && !fin) || k.seq != c->client_seq) return;
-        /* Does not fit: do not acknowledge, the client resends when the flow is ready. */
+        /* Does not fit the early buffer: not acknowledged. */
         if (dn && early_hold(c, pkt + off, dn) != 0) return;
         c->client_seq += (uint32_t)dn;
         if (fin) { c->client_seq += 1; c->client_fin = 1; }
@@ -2827,6 +2826,10 @@ static int conn_ready(struct conn *c, const struct tun_dev *tun) {
     }
     if (c->estab_ns) c->estab_ns = g_now_ns ? g_now_ns : 1;
     c->last = g_now_s;
+    if (!c->sock && !c->is_udp) {
+        c->ack_due = 1;
+        g_win_woke = 1;
+    }
     TR("flow ready (conn#%ld), early data sent\n", (long)(c - g_conns));
     if (c->sock) return sock_read(c, tun);
     return 0;
@@ -2907,10 +2910,22 @@ static int conn_deadlines(struct conn *c, const struct tun_dev *tun, uint64_t no
         return 1;
     }
 
+    if (c->client_fin && !c->fin_up && !c->early && !c->srv_closed && !c->is_udp && g_dl->ops->finish) {
+        int fr = g_dl->ops->finish(g_dl->ctx, SESS(c));
+        if (fr == SEND_FATAL) {
+            conn_reset(c, tun);
+            return 1;
+        }
+        if (fr == SEND_OK) {
+            c->fin_up = 1;
+            c->last = g_now_s;
+        }
+    }
+
     /* The client closed its half and went silent, and the server does not close its own (it
      * cannot know about the client's FIN): nothing more to wait for, close the same way as after
      * the server. */
-    if (c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
+    if (c->client_fin && !c->srv_closed && (c->fin_up || !g_dl->ops->finish) && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
         c->srv_closed = 1;
         c->closed_at = now;
     }
@@ -2999,8 +3014,8 @@ struct worker {
 #define IB_UDP_BASE (IB_CTL_BASE + (uint32_t)IB_ASSOC_MAX)
 #define IB_TOKEN_END (IB_UDP_BASE + (uint32_t)IB_ASSOC_MAX)
 #define XC_BASE IB_TOKEN_END
-#define EVS_MAX (2 * MAX_CONNS + 6 + 144 + XC_MAX)
-_Static_assert(XC_BASE + XC_MAX < UINT32_MAX, "shared link tokens fit");
+#define EVS_MAX (2 * MAX_CONNS + 6 + 144 + MUX_IDX_MAX)
+_Static_assert(XC_BASE + MUX_IDX_MAX < UINT32_MAX, "shared link tokens fit");
 _Static_assert(CFD_BASE > IBW_TOKEN && IBW_TOKEN > STOP_TOKEN, "socket slots start after the fixed tokens");
 _Static_assert(IB_LST_BASE >= CFD_BASE + MAX_CONNS && IB_HS_BASE >= IB_LST_BASE + IB_MAX &&
                    IB_CTL_BASE >= IB_HS_BASE + IB_HS_MAX && IB_UDP_BASE >= IB_CTL_BASE + IB_ASSOC_MAX &&
@@ -3009,8 +3024,9 @@ _Static_assert(IB_LST_BASE >= CFD_BASE + MAX_CONNS && IB_HS_BASE >= IB_LST_BASE 
                "inbound token ranges are disjoint, above the socket slots");
 #define ACCEPT_MAX 64
 #define PARK_MAX 256
+#define PARK_ROOM_MAX (1 << 20)
 #define PARK_MS 300
-#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + CONNECTORS * CONNECTOR_FDS + 32 + XC_MAX)
+#define FD_RESERVE (2 * MAX_CONNS + SPARE_MAX + CONNECTORS * CONNECTOR_FDS + 32 + MUX_IDX_MAX)
 #define MISS_WINDOW_NS 60000000000ull
 
 struct loop {
@@ -3033,7 +3049,8 @@ struct parked {
 
 static int g_lst_fd = -1;
 static int g_tcp_port;
-static int g_park_cap = PARK_MAX;
+static int g_park_room = PARK_MAX;
+static int g_fd_extra;
 static struct parked g_park[PARK_MAX];
 static int g_park_n;
 static struct {
@@ -3515,13 +3532,20 @@ static int lst_open(int port) {
 
 static void park_cap_init(void) {
     struct rlimit rl;
-    if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= (rlim_t)(FD_RESERVE + PARK_MAX))
-        g_park_cap = PARK_MAX;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= (rlim_t)(FD_RESERVE + PARK_ROOM_MAX))
+        g_park_room = PARK_ROOM_MAX;
     else if (rl.rlim_cur <= (rlim_t)FD_RESERVE)
-        g_park_cap = 0;
+        g_park_room = 0;
     else
-        g_park_cap = (int)(rl.rlim_cur - FD_RESERVE);
+        g_park_room = (int)(rl.rlim_cur - FD_RESERVE);
 }
+
+static int park_cap(void) {
+    int room = g_park_room - __atomic_load_n(&g_fd_extra, __ATOMIC_RELAXED);
+    return room < 0 ? 0 : room > PARK_MAX ? PARK_MAX : room;
+}
+
+static void mux_fd_extra(int delta) { __atomic_add_fetch(&g_fd_extra, delta, __ATOMIC_RELAXED); }
 
 static void sock_open(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t pport,
                       const struct cm_real *dst, uint32_t od, uint16_t oport) {
@@ -3575,7 +3599,7 @@ static struct parked park_take(int i) {
 static void park(const struct tun_dev *tun, int fd, uint32_t peer, uint16_t pport, uint32_t od,
                  uint16_t oport) {
     g_miss.miss++;
-    if (g_park_n >= g_park_cap) {
+    if (g_park_n >= park_cap()) {
         sock_rst(fd);
         return;
     }
@@ -3749,7 +3773,7 @@ static __thread unsigned g_mux_woke;
 static unsigned g_loops = 1;
 
 static int mux_watch(unsigned idx, int fd, unsigned ev) {
-    if (!g_loop || idx >= XC_MAX) return -1;
+    if (!g_loop || idx >= MUX_IDX_MAX) return -1;
     if (!ev) return epoll_ctl(g_loop->ep, EPOLL_CTL_DEL, fd, NULL) == 0 || errno == ENOENT ? 0 : -1;
     struct epoll_event e = { .events = ev, .data = { .u32 = XC_BASE + idx } };
     if (epoll_ctl(g_loop->ep, EPOLL_CTL_MOD, fd, &e) == 0) return 0;
@@ -3780,7 +3804,7 @@ static void loop_mux(struct loop *L) {
     const struct dialer_mux *mx = g_dl->ops->mux;
     if (!mx) return;
     L->mh = (struct mux_host){ .submit = mux_submit, .watch = mux_watch, .wake = mux_wake, .arg = L, .loops = g_loops,
-                              .wait_ms = CONNECT_TIMEOUT_S * 1000 };
+                              .wait_ms = CONNECT_TIMEOUT_S * 1000, .fd_extra = mux_fd_extra };
     mx->host(&L->mh);
 }
 
@@ -4032,6 +4056,7 @@ static int loop_turn(struct loop *L, int max_ms) {
     }
     if (stop && L->stop_in) {
         stop_reset(tun, L->own);
+        if (g_dl->ops->mux && g_dl->ops->mux->stop) g_dl->ops->mux->stop();
         epoll_ctl(L->ep, EPOLL_CTL_DEL, g_stop_efd, NULL);
         L->stop_in = 0;
         __atomic_sub_fetch(&g_stop_loops, 1, __ATOMIC_ACQ_REL);
@@ -4087,7 +4112,7 @@ static int loop_turn(struct loop *L, int max_ms) {
             ib_udp_event(L, &g_assoc[t - IB_UDP_BASE]);
             continue;
         }
-        if (t >= XC_BASE && t < XC_BASE + XC_MAX) {
+        if (t >= XC_BASE && t < XC_BASE + MUX_IDX_MAX) {
             if (g_dl->ops->mux) g_dl->ops->mux->event(t - XC_BASE, L->evs[i].events);
             continue;
         }

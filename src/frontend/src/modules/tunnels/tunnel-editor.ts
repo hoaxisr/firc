@@ -308,7 +308,9 @@ export function subscriptionProblem(
 }
 
 export function linkProblem(link: string, t: T): string | null {
-  return /^vless:\/\/\S+$/.test(link) ? null : t("One vless:// link");
+  return /^(vless|hysteria2|hy2):\/\/\S+$/.test(link)
+    ? null
+    : t("One vless://, hysteria2:// or hy2:// link");
 }
 
 export function uniqueByKey<R extends { key: string }>(rows: R[]): R[] {

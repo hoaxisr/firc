@@ -12,7 +12,7 @@
  * name and validity (RSA PKCS#1 v1.5 and PSS, ECDSA P-256/P-384/P-521 signatures). The chain is
  * checked by wolfSSL's X509 store, which is why part of its TLS layer (OPENSSL_EXTRA) is built.
  *
- * WHAT IS LEFT OUT ON PURPOSE: wolfSSL's TLS 1.2 and older, a TLS server, QUIC, DH, DSA, DES, RC4, MD4, PSK, PBKDF, Ed25519 (certverify.c
+ * WHAT IS LEFT OUT ON PURPOSE: wolfSSL's TLS 1.2 and older, a TLS server, DH, DSA, DES, RC4, MD4, PSK, PBKDF, Ed25519 (certverify.c
  * reads the Ed25519 Reality certificate itself), the filesystem (certverify.c reads the roots
  * itself, into a buffer) and socket I/O.
  *
@@ -69,11 +69,16 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
 #ifndef STEER_WOLFSSL_SERVER
 #define NO_WOLFSSL_SERVER
 #endif
+#if defined(STEER_WOLFSSL_SERVER) || defined(__mips__)
+#define WOLFSSL_USE_ALIGN
+#endif
 #define HAVE_TLS_EXTENSIONS
 #define HAVE_SUPPORTED_CURVES
 #define HAVE_SNI
 #define HAVE_ALPN
 #define HAVE_EX_DATA
+#define WOLFSSL_QUIC
+#define HAVE_SESSION_TICKET
 #define OPENSSL_EXTRA
 
 /* ---- primitives ------------------------------------------------------------------------ */
@@ -85,6 +90,8 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
  * flash. SHA-256 (which also hashes the transcript) stays fast. */
 #define USE_SLOW_SHA512
 #define HAVE_HASHDRBG
+#define HAVE_BLAKE2
+#define HAVE_BLAKE2B
 
 #define HAVE_AESGCM
 /* A 4-bit GHASH table (512 bytes per key), not 8-bit (4 KB): there is a key per direction of
@@ -94,6 +101,7 @@ extern int os_rand_seed(unsigned char *out, unsigned int n);
  * for setting a key without a mode (wc_AesSetKeyDirect) and for encrypting one block. */
 #define WOLFSSL_AES_COUNTER
 #define WOLFSSL_AES_DIRECT
+#define HAVE_AES_ECB
 #define NO_AES_192
 #define NO_AES_CBC
 /* Not NO_AES_DECRYPT: GCM and CTR do not use the Td table or the inverse block, but in wolfSSL

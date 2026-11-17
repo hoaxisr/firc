@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <arpa/inet.h>
 #include "vless.h"
 #include "sublink.h"
 #include "vlink.h"
@@ -21,6 +22,7 @@
 /* vencp_parse: a VLESS encryption string is checked here, before connecting. Strings only, no
  * cryptography. */
 #include "vencp.h"
+#include "hy2link.h"
 
 /* Link strings, transport and security parameters, long values and certificate checks are in
  * sublink.c. Here: whole subscriptions and the VLESS fields (flow, encryption, the id). */
@@ -52,13 +54,22 @@ static int vless_own(struct vless_node *n, const char *k, size_t klen, const cha
     return 1;
 }
 
+size_t vless_link_scheme(const char *s) {
+    if (!strncmp(s, "vless://", 8)) return 8;
+    if (!strncmp(s, "hysteria2://", 12)) return 12;
+    if (!strncmp(s, "hy2://", 6)) return 6;
+    return 0;
+}
+
 /* vless://UUID@host:port?params#name. An unusable node is not an error of the subscription: the
  * server may offer a transport the client does not support, and only that node is skipped. */
 int vless_parse_url(const char *url, struct vless_node *n) {
+    size_t scheme = vless_link_scheme(url);
+    if (scheme && scheme != 8) return hy2_link_parse(url, n);
     /* Omitted fields default to type=tcp and security=none (sl_link_parse, node_usable).
      * security=none is plain VLESS over TCP, without TLS: supported, and sensible inside a
      * trusted network or over an already protected channel. */
-    int rc = sl_link_parse(url, "vless://", n, vless_own, NULL, NULL);
+    int rc = sl_link_parse(url, "vless://", n, vless_own, NULL, NULL, 0);
     if (rc) return rc;
     /* Checked here, not at connect time, so that an unusable node never becomes a candidate. */
     return node_usable(n);
@@ -68,6 +79,7 @@ int vless_parse_url(const char *url, struct vless_node *n) {
  * (links, Xray, sing-box, Clash) goes through it, so a node cannot be usable in one form and
  * unusable in another. */
 static int node_usable(struct vless_node *n) {
+    if (n->proto == VLESS_PROTO_HY2) return n->skip_reason[0] ? 1 : hy2_node_usable(n);
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
 
     /* flow=xtls-rprx-vision-udp443 is Vision with UDP to port 443 allowed: without the suffix
@@ -184,9 +196,11 @@ static void sj_skip(struct sj *j) {
     while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
 }
 
+static int qp_str(struct sj *j, char *buf, size_t n, int *flag);
+
 /* Enter an object and return its keys one by one: 0 — a key in key, 1 — the object ended,
  * -1 — not an object. The caller reads the value, or must call sj_skip. */
-static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) {
+static int obj_key(struct sj *j, int *first, char *key, size_t key_n, int *odd) {
     sj_ws(j);
     if (*first) {
         if (*j->p != '{') return -1;
@@ -198,12 +212,14 @@ static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) {
     }
     sj_ws(j);
     if (*j->p == '}') { j->p++; return 1; }
-    if (sj_str(j, key, key_n) != 0) return -1;
+    if ((odd ? qp_str(j, key, key_n, odd) : sj_str(j, key, key_n)) != 0) return -1;
     sj_ws(j);
     if (*j->p != ':') return -1;
     j->p++;
     return 0;
 }
+
+static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) { return obj_key(j, first, key, key_n, NULL); }
 
 /* The same for an array: 0 — an element starts here, 1 — the array ended, -1 — malformed. */
 static int sj_arr_next(struct sj *j, int *first) {
@@ -309,7 +325,8 @@ static int sj_bool(struct sj *j);
 
 struct xh_set { struct vless_node n; struct sl_xh a; struct upg_cfg h; struct sl_dl *dl; };
 
-static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d);
+struct hx;
+static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d, struct hx *h);
 
 static const char XH_NOT_A_STRING[] = "\"";
 
@@ -408,7 +425,7 @@ static int xh_dl(struct sj *j, struct xh_set *s, int dl_ok) {
     if (!strncmp(j->p, "null", 4)) { j->p += 4; return 0; }
     s->dl = calloc(1, sizeof *s->dl);
     if (!s->dl) return -1;
-    if (*j->p == '{') xray_stream(j, &s->dl->n, s->dl);
+    if (*j->p == '{') xray_stream(j, &s->dl->n, s->dl, NULL);
     else { sj_skip(j); s->dl->bad = 1; }
     return j->p == b ? -1 : 0;
 }
@@ -537,8 +554,511 @@ static void xray_alpn(struct sj *j, struct sl_dl *d) {
     d->alpn = cnt == 1 ? alpn_of(v) : 0;
 }
 
+
+struct hx {
+    struct hy2_in in;
+    unsigned long sver, hver;
+};
+
+static int hx_str(struct sj *j, char *buf, size_t cap, int *nul) {
+    sj_ws(j);
+    buf[0] = '\0';
+    if (*j->p == '"') return xh_string(j, buf, cap, nul);
+    sj_skip(j);
+    return -1;
+}
+
+static int hx_tok(struct sj *j, char *buf, size_t cap) {
+    sj_ws(j);
+    buf[0] = '\0';
+    if (*j->p == '{' || *j->p == '[') { sj_skip(j); return -1; }
+    const char *b = j->p;
+    int r = xh_token(j, buf, cap);
+    if (r && j->p == b) sj_skip(j);
+    sj_ws(j);
+    if (!r && *j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') {
+        sj_skip(j);
+        buf[0] = '\0';
+        return -1;
+    }
+    if (!strcmp(buf, "null")) buf[0] = '\0';
+    return r;
+}
+
+static int hx_range(const char *t, unsigned long *a, unsigned long *b) {
+    const char *dash = strchr(t, '-');
+    size_t al = dash ? (size_t)(dash - t) : strlen(t);
+    if (!al || al > 6 || (dash && (!dash[1] || strlen(dash + 1) > 6))) return 0;
+    for (size_t i = 0; i < al; i++) if (t[i] < '0' || t[i] > '9') return 0;
+    for (const char *p = dash ? dash + 1 : t + al; *p; p++) if (*p < '0' || *p > '9') return 0;
+    *a = strtoul(t, NULL, 10);
+    *b = dash ? strtoul(dash + 1, NULL, 10) : *a;
+    return 1;
+}
+
+static int bps_fail(char *why, size_t why_n, const char *fmt, const char *arg) {
+    if (why_n) snprintf(why, why_n, fmt, arg);
+    return -1;
+}
+
+static const char *shown(const char *s, char *out, size_t n) {
+    size_t o = 0;
+    for (; *s && o + 1 < n; s++) out[o++] = (unsigned char)*s < 0x20 || *s == 0x7f ? '?' : *s;
+    out[o] = '\0';
+    return out;
+}
+
+static int bps_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'; }
+
+static int xray_bps(const char *s, uint64_t *bytes, char *why, size_t why_n) {
+    char t[256];
+    size_t n = 0;
+    while (bps_space(*s)) s++;
+    for (; *s && n + 1 < sizeof t; s++) t[n++] = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s;
+    while (n && bps_space(t[n - 1])) n--;
+    t[n] = '\0';
+    *bytes = 0;
+    if (!n) return 0;
+    size_t i = 0, digits = 0, dots = 0;
+    for (; t[i] == '.' || (t[i] >= '0' && t[i] <= '9'); i++) {
+        if (t[i] == '.') dots++; else digits++;
+    }
+    char num[sizeof t];
+    memcpy(num, t, i);
+    num[i] = '\0';
+    if (!digits || dots > 1) return bps_fail(why, why_n, "strconv.ParseFloat: parsing \"%s\": invalid syntax", num);
+    double val = strtod(num, NULL);
+    if (val > 1.7976931348623157e308) return bps_fail(why, why_n, "strconv.ParseFloat: parsing \"%s\": value out of range", num);
+    const char *u = t + i;
+    while (bps_space(*u)) u++;
+    static const struct { const char *name[3]; double mul; } units[] = {
+        { { "", "b", "bps" }, 1 }, { { "k", "kb", "kbps" }, 1024 }, { { "m", "mb", "mbps" }, 1048576 },
+        { { "g", "gb", "gbps" }, 1073741824 }, { { "t", "tb", "tbps" }, 1099511627776.0 },
+    };
+    double mul = 0;
+    for (size_t k = 0; k < sizeof units / sizeof *units && !mul; k++)
+        for (size_t m = 0; m < 3; m++)
+            if (!strcmp(u, units[k].name[m])) mul = units[k].mul;
+    char us[sizeof t];
+    if (!mul) return bps_fail(why, why_n, "unsupported unit: %s", shown(u, us, sizeof us));
+    double v = val * mul;
+    *bytes = v > 1e18 ? (uint64_t)1000000000000000000ull / 8 : (uint64_t)v / 8;
+    return 0;
+}
+
+enum { QPK_STR, QPK_UINT, QPK_INT, QPK_BOOL };
+enum {
+    QP_CONG, QP_PROFILE, QP_UP, QP_DOWN, QP_ISW, QP_MSW, QP_ICW, QP_MCW, QP_IDLE, QP_KEEP, QP_STREAMS,
+    QP_DEBUG, QP_LOSS, QP_PMTUD, QP_PARROT, QP_GSO, QP_SRESET, QP_N
+};
+
+static const struct { const char *name; int kind; } qp_keys[QP_N] = {
+    { "congestion", QPK_STR }, { "bbrProfile", QPK_STR }, { "brutalUp", QPK_STR }, { "brutalDown", QPK_STR },
+    { "initStreamReceiveWindow", QPK_UINT }, { "maxStreamReceiveWindow", QPK_UINT },
+    { "initConnectionReceiveWindow", QPK_UINT }, { "maxConnectionReceiveWindow", QPK_UINT },
+    { "maxIdleTimeout", QPK_INT }, { "keepAlivePeriod", QPK_INT }, { "maxIncomingStreams", QPK_INT },
+    { "debug", QPK_BOOL }, { "brutalDisableLossCompensation", QPK_BOOL }, { "disablePathMTUDiscovery", QPK_BOOL },
+    { "disableChromeParrot", QPK_BOOL }, { "disableGSO", QPK_BOOL }, { "disableStatelessReset", QPK_BOOL },
+};
+
+#define QP_STR_LONG 1
+#define QP_STR_NUL 2
+
+struct qp_vals {
+    char str[4][128];
+    int sflag[4];
+    uint64_t u[4];
+    int64_t i[3];
+    int b[6];
+};
+
+static int qp_str(struct sj *j, char *buf, size_t n, int *flag) {
+    sj_ws(j);
+    if (*j->p != '"') return -1;
+    j->p++;
+    size_t i = 0;
+    *flag = 0;
+    while (*j->p && *j->p != '"') {
+        char o[4] = { *j->p, 0, 0, 0 };
+        size_t ol = 1;
+        if (*j->p == '\\' && j->p[1]) j->p += 1 + sl_unescape(j->p + 1, 0, o, &ol);
+        else j->p++;
+        if (!ol) { *flag |= QP_STR_NUL; continue; }
+        if ((*flag & QP_STR_LONG) || i + ol >= n) { *flag |= QP_STR_LONG; continue; }
+        memcpy(buf + i, o, ol);
+        i += ol;
+    }
+    if (*j->p != '"') return -1;
+    j->p++;
+    buf[i] = '\0';
+    return 0;
+}
+
+static int qp_scalar(struct sj *j, char *tok, size_t cap) {
+    sj_ws(j);
+    size_t n = 0;
+    while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']' && !bps_space(*j->p)) {
+        if (n + 1 < cap) tok[n] = *j->p;
+        n++;
+        j->p++;
+    }
+    tok[n < cap ? n : cap - 1] = '\0';
+    return n ? 0 : -1;
+}
+
+static int qp_uint(const char *t, uint64_t *v) {
+    if (!*t || (t[0] == '0' && t[1])) return -1;
+    uint64_t x = 0;
+    for (; *t; t++) {
+        if (*t < '0' || *t > '9' || x > (UINT64_MAX - (uint64_t)(*t - '0')) / 10) return -1;
+        x = x * 10 + (uint64_t)(*t - '0');
+    }
+    *v = x;
+    return 0;
+}
+
+static int qp_int(const char *t, int64_t *v) {
+    int neg = *t == '-';
+    uint64_t x;
+    if (neg) t++;
+    if (qp_uint(t, &x)) return -1;
+    if (x > (uint64_t)INT64_MAX + (uint64_t)neg) return -1;
+    *v = neg ? (int64_t)(0 - x) : (int64_t)x;
+    return 0;
+}
+
+static int qp_read(struct sj *j, int key, struct qp_vals *v, char *why, size_t why_n) {
+    static const char *const kind_name[] = { "string", "number", "number", "boolean" };
+    int kind = qp_keys[key].kind, bad = 0;
+    char tok[40];
+    sj_ws(j);
+    if (!strncmp(j->p, "null", 4) && (!j->p[4] || strchr(", \t\r\n}]", j->p[4]))) { j->p += 4; return 0; }
+    if (kind == QPK_STR) {
+        char *dst = v->str[key];
+        if (*j->p != '"') bad = 1, sj_skip(j);
+        else if (qp_str(j, dst, sizeof v->str[0], &v->sflag[key])) return -2;
+    } else if (*j->p == '"' || *j->p == '{' || *j->p == '[') {
+        bad = 1;
+        sj_skip(j);
+    } else if (qp_scalar(j, tok, sizeof tok)) {
+        return -2;
+    } else if (kind == QPK_UINT) {
+        bad = qp_uint(tok, &v->u[key - QP_ISW]);
+    } else if (kind == QPK_INT) {
+        bad = qp_int(tok, &v->i[key - QP_IDLE]);
+    } else if (!strcmp(tok, "true") || !strcmp(tok, "false")) {
+        v->b[key - QP_DEBUG] = tok[0] == 't';
+    } else {
+        bad = 1;
+    }
+    if (bad && why_n && !why[0]) snprintf(why, why_n, "quicParams: %s is not a %s", qp_keys[key].name, kind_name[kind]);
+    return 0;
+}
+
+static void qp_lower(char *s) {
+    for (; *s; s++)
+        if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32);
+}
+
+static int qp_str_fail(const struct qp_vals *v, int key, char *why, size_t why_n, const char *xray) {
+    int f = v->sflag[key];
+    if (!f) return 0;
+    if (!why_n) return -1;
+    if (xray && !(f & QP_STR_LONG)) snprintf(why, why_n, "%s", xray);
+    else snprintf(why, why_n, "quicParams: %s %s", qp_keys[key].name, f & QP_STR_LONG ? "is too long" : "holds a NUL byte");
+    return -1;
+}
+
+static int qp_build(struct qp_vals *v, struct hy2_qp *out, char *why, size_t why_n) {
+    if (qp_str_fail(v, QP_PROFILE, why, why_n, "unknown bbr profile")) return -1;
+    qp_lower(v->str[QP_PROFILE]);
+    const char *prof = v->str[QP_PROFILE];
+    if (*prof && strcmp(prof, "conservative") && strcmp(prof, "standard") && strcmp(prof, "aggressive"))
+        return bps_fail(why, why_n, "%s", "unknown bbr profile");
+    if (*prof) out->ignored |= HY2_QP_IGN_PROFILE;
+    if (qp_str_fail(v, QP_UP, why, why_n, NULL)) return -1;
+    if (xray_bps(v->str[QP_UP], &out->up_bps, why, why_n)) return -1;
+    if (qp_str_fail(v, QP_DOWN, why, why_n, NULL)) return -1;
+    if (xray_bps(v->str[QP_DOWN], &out->down_bps, why, why_n)) return -1;
+    if (out->up_bps > 0 && out->up_bps < 65536) return bps_fail(why, why_n, "%s", "BrutalUp must be at least 65536 bytes per second");
+    if (out->down_bps > 0 && out->down_bps < 65536) return bps_fail(why, why_n, "%s", "BrutalDown must be at least 65536 bytes per second");
+    if (qp_str_fail(v, QP_CONG, why, why_n, NULL)) return -1;
+    qp_lower(v->str[QP_CONG]);
+    const char *cc = v->str[QP_CONG];
+    if (!*cc || !strcmp(cc, "brutal")) out->cc = HY2_CC_AUTO;
+    else if (!strcmp(cc, "reno")) out->cc = HY2_CC_RENO;
+    else if (!strcmp(cc, "bbr")) out->cc = HY2_CC_BBR;
+    else if (!strcmp(cc, "force-brutal")) {
+        if (!out->up_bps) return bps_fail(why, why_n, "%s", "force-brutal requires up");
+        out->cc = HY2_CC_FORCE;
+    } else {
+        char cs[128];
+        if (why_n) snprintf(why, why_n, "unknown congestion control: %s, valid values: reno, bbr, brutal, force-brutal", shown(cc, cs, sizeof cs));
+        return -1;
+    }
+    static const char *const win_name[4] = {
+        "InitStreamReceiveWindow", "MaxStreamReceiveWindow", "InitConnectionReceiveWindow", "MaxConnectionReceiveWindow",
+    };
+    uint64_t *win[4] = { &out->init_stream_win, &out->max_stream_win, &out->init_conn_win, &out->max_conn_win };
+    for (int k = 0; k < 4; k++) {
+        if (v->u[k] > 0 && v->u[k] < 16384) {
+            if (why_n) snprintf(why, why_n, "%s must be at least 16384", win_name[k]);
+            return -1;
+        }
+        *win[k] = v->u[k];
+    }
+    if (v->i[0] != 0 && (v->i[0] < 4 || v->i[0] > 120)) return bps_fail(why, why_n, "%s", "MaxIdleTimeout must be between 4 and 120");
+    if (v->i[1] != 0 && (v->i[1] < 2 || v->i[1] > 60)) return bps_fail(why, why_n, "%s", "KeepAlivePeriod must be between 2 and 60");
+    if (v->i[2] != 0 && v->i[2] < 8) return bps_fail(why, why_n, "%s", "MaxIncomingStreams must be at least 8");
+    out->idle_s = (unsigned)v->i[0];
+    out->keepalive_s = (unsigned)v->i[1];
+    out->no_loss_comp = (uint8_t)v->b[QP_LOSS - QP_DEBUG];
+    out->no_pmtud = (uint8_t)v->b[QP_PMTUD - QP_DEBUG];
+    if (v->b[0]) out->ignored |= HY2_QP_IGN_DEBUG;
+    out->no_parrot = (uint8_t)v->b[QP_PARROT - QP_DEBUG];
+    if (v->b[QP_GSO - QP_DEBUG]) out->ignored |= HY2_QP_IGN_GSO;
+    if (v->i[2]) out->ignored |= HY2_QP_IGN_STREAMS;
+    if (v->b[QP_SRESET - QP_DEBUG]) out->ignored |= HY2_QP_IGN_SRESET;
+    return 0;
+}
+
+int hy2_qp_parse(const char *json, size_t n, struct hy2_qp *out, char *why, size_t why_n) {
+    char buf[2049];
+    struct qp_vals v;
+    struct sj j;
+    memset(out, 0, sizeof *out);
+    memset(&v, 0, sizeof v);
+    if (why_n) why[0] = '\0';
+    if (n >= sizeof buf) return bps_fail(why, why_n, "%s", "quicParams is too long");
+    memcpy(buf, json, n);
+    buf[n] = '\0';
+    j.p = buf;
+    int f = 1, r;
+    char k[32];
+    int odd = 0;
+    while ((r = obj_key(&j, &f, k, sizeof k, &odd)) == 0) {
+        int key = 0;
+        while (key < QP_N && strcasecmp(k, qp_keys[key].name)) key++;
+        if (key == QP_N || odd) { sj_skip(&j); continue; }
+        if (qp_read(&j, key, &v, why, why_n)) { r = -1; break; }
+    }
+    if (r != 1) {
+        if (why_n) snprintf(why, why_n, "quicParams is not an object");
+        return -1;
+    }
+    if (why_n && why[0]) return -1;
+    return qp_build(&v, out, why, why_n);
+}
+
+static void hx_quic(struct sj *j, struct hx *h) {
+    sj_ws(j);
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return; }
+    if (*j->p != '{') { sj_skip(j); hy2_in_fail(&h->in, "finalmask quicParams is not an object"); return; }
+    const char *b = j->p;
+    sj_skip(j);
+    struct hy2_qp q;
+    char why[sizeof h->in.why];
+    if (hy2_qp_parse(b, (size_t)(j->p - b), &q, why, sizeof why)) hy2_in_fail(&h->in, why);
+    h->in.up_mbps = hy2_mbps(q.up_bps);
+    h->in.down_mbps = hy2_mbps(q.down_bps);
+    h->in.qp = b;
+    h->in.qp_n = (size_t)(j->p - b);
+}
+
+static void hx_salamander(struct sj *j, struct hx *h) {
+    int f = 1;
+    char k[32], pw[HY2_SECRET_MAX + 2], ps[24] = "";
+    int nul = 0;
+    pw[0] = '\0';
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcasecmp(k, "password")) { if (hx_str(j, pw, sizeof pw, &nul)) pw[0] = '\0'; }
+        else if (!strcasecmp(k, "packetSize")) { if (hx_tok(j, ps, sizeof ps)) snprintf(ps, sizeof ps, "?"); }
+        else sj_skip(j);
+    }
+    unsigned long a = 0, b = 0;
+    if (ps[0] && (!hx_range(ps, &a, &b) || a || b)) hy2_in_fail(&h->in, "salamander packetSize is not supported");
+    snprintf(h->in.obfs, sizeof h->in.obfs, "salamander");
+    hy2_in_secret(&h->in, h->in.obfs_pw, pw, strlen(pw), nul);
+}
+
+static int hx_ip_ok(const char *s) {
+    char a[48];
+    const char *sl = strchr(s, '/');
+    size_t l = sl ? (size_t)(sl - s) : strlen(s);
+    unsigned char buf[16];
+    if (l >= sizeof a) return 0;
+    memcpy(a, s, l);
+    a[l] = '\0';
+    int v6 = strchr(a, ':') != NULL;
+    if (inet_pton(v6 ? AF_INET6 : AF_INET, a, buf) != 1) return 0;
+    if (!sl) return 1;
+    const char *d = sl + 1;
+    size_t dl = strlen(d);
+    if (!dl || dl > 3 || (dl > 1 && d[0] == '0')) return 0;
+    for (size_t i = 0; i < dl; i++)
+        if (d[i] < '0' || d[i] > '9') return 0;
+    return atoi(d) <= (v6 ? 128 : 32);
+}
+
+static int hx_ips(struct sj *j, struct hy2_in *in) {
+    static const char notlist[] = "remoteIPs is not a list of addresses";
+    int f = 1, n = 0;
+    sj_ws(j);
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return 0; }
+    if (*j->p != '[') { sj_skip(j); hy2_in_fail(in, notlist); return 0; }
+    while (sj_arr_next(j, &f) == 0) {
+        char e[64];
+        sj_ws(j);
+        if (*j->p != '"' || sj_str(j, e, sizeof e)) {
+            sj_skip(j);
+            hy2_in_fail(in, notlist);
+        } else if (!hx_ip_ok(e)) {
+            char why[96];
+            size_t o = (size_t)snprintf(why, sizeof why, "invalid ip ");
+            for (size_t i = 0; e[i] && o + 1 < sizeof why; i++)
+                why[o++] = (unsigned char)e[i] < 0x20 || e[i] == 0x7f ? '?' : e[i];
+            why[o] = '\0';
+            hy2_in_fail(in, why);
+        }
+        n++;
+    }
+    return n > 0;
+}
+
+static void hx_udphop(struct sj *j, struct hx *h) {
+    int f = 1;
+    char k[32], mode[48], iv[24] = "", ports[1024] = "";
+    int have_mode = 0, bad_ports = 0, bad_iv = 0, nul = 0, long_ports = 0, ips = 0;
+    mode[0] = '\0';
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcasecmp(k, "mode")) have_mode = hx_str(j, mode, sizeof mode, &nul) == 0;
+        else if (!strcasecmp(k, "interval")) bad_iv = hx_tok(j, iv, sizeof iv) != 0;
+        else if (!strcasecmp(k, "remoteIPs")) ips = hx_ips(j, &h->in);
+        else if (!strcasecmp(k, "remotePorts")) {
+            char raw[sizeof ports];
+            bad_ports = hx_tok(j, raw, sizeof raw) != 0;
+            long_ports = strlen(raw) + 1 >= sizeof raw;
+            size_t o = 0;
+            for (const char *p = raw; *p; ) {
+                const char *e = strchr(p, ',');
+                const char *ie = e ? e : p + strlen(p);
+                const char *ib = p;
+                while (ib < ie && (*ib == ' ' || *ib == '\t' || *ib == '\n' || *ib == '\r' || *ib == '\v' || *ib == '\f')) ib++;
+                while (ie > ib && (ie[-1] == ' ' || ie[-1] == '\t' || ie[-1] == '\n' || ie[-1] == '\r' || ie[-1] == '\v' || ie[-1] == '\f')) ie--;
+                if (ie > ib && o + (size_t)(ie - ib) + 2 < sizeof ports) {
+                    if (o) ports[o++] = ',';
+                    memcpy(ports + o, ib, (size_t)(ie - ib));
+                    o += (size_t)(ie - ib);
+                }
+                if (!e) break;
+                p = e + 1;
+            }
+            ports[o] = '\0';
+        }
+        else sj_skip(j);
+    }
+    if (!have_mode) mode[0] = '\0';
+    char why[96];
+    unsigned mb = 0;
+    for (const char *p = mode;;) {
+        const char *e = strchr(p, ',');
+        size_t pl = e ? (size_t)(e - p) : strlen(p);
+        if (pl == 13 && !strncasecmp(p, "intervallocal", 13)) mb |= HY2_HOP_LOCAL;
+        else if (pl == 14 && !strncasecmp(p, "intervalremote", 14)) mb |= HY2_HOP_REMOTE;
+        else if (pl == 13 && !strncasecmp(p, "perconnremote", 13)) mb |= HY2_HOP_ONCE;
+        else {
+            size_t o = (size_t)snprintf(why, sizeof why, "invalid mode ");
+            for (size_t i = 0; i < pl && o + 1 < sizeof why; i++)
+                why[o++] = (unsigned char)p[i] < 0x20 || p[i] == 0x7f ? '?' : p[i];
+            why[o] = '\0';
+            hy2_in_fail(&h->in, why);
+            return;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    unsigned hops = mb & (HY2_HOP_REMOTE | HY2_HOP_ONCE);
+    if (bad_ports) { hy2_in_fail(&h->in, "remotePorts: not a port list"); return; }
+    if (long_ports && hops) { hy2_in_fail(&h->in, "port list too long"); return; }
+    struct hy2_in t;
+    memset(&t, 0, sizeof t);
+    if (!long_ports) hy2_in_ports(&t, ports, strlen(ports), "remotePorts");
+    if (t.why[0] && (hops || strcmp(t.why, "port list too long"))) { hy2_in_fail(&h->in, t.why); return; }
+    if (hops) {
+        memcpy(h->in.ports, t.ports, sizeof t.ports);
+        h->in.first = t.first;
+    }
+    h->in.hop_mode = (uint8_t)(mb | (hops && ips ? HY2_HOP_IPS : 0u));
+    const char *iw = bad_iv ? "interval is not a number or range" : hy2_interval(iv, &h->in.hop_from, &h->in.hop_to);
+    if (iw) hy2_in_fail(&h->in, iw);
+}
+
+static void hx_udp(struct sj *j, struct hx *h) {
+    sj_ws(j);
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return; }
+    if (*j->p != '[') { sj_skip(j); hy2_in_fail(&h->in, "finalmask udp is not a list"); return; }
+    int f = 1, sal = 0, hop = 0;
+    while (sj_arr_next(j, &f) == 0) {
+        sj_ws(j);
+        if (*j->p != '{') { sj_skip(j); hy2_in_fail(&h->in, "finalmask udp mask is not an object"); continue; }
+        int fo = 1, nul = 0;
+        char k[32], type[24] = "";
+        const char *set = NULL;
+        while (sj_obj_key(j, &fo, k, sizeof k) == 0) {
+            if (!strcasecmp(k, "type")) { if (hx_str(j, type, sizeof type, &nul)) type[0] = '\0'; }
+            else if (!strcasecmp(k, "settings")) { sj_ws(j); set = j->p; sj_skip(j); }
+            else sj_skip(j);
+        }
+        struct sj s = { set ? set : "{}" };
+        if (!type[0]) hy2_in_fail(&h->in, "finalmask udp mask has no type");
+        else if (!strcasecmp(type, "salamander")) {
+            if (sal++) hy2_in_fail(&h->in, "finalmask udp salamander twice is not supported");
+            else hx_salamander(&s, h);
+        } else if (!strcasecmp(type, "udphop")) {
+            if (hop++) hy2_in_fail(&h->in, "finalmask udp udphop twice is not supported");
+            else hx_udphop(&s, h);
+        } else {
+            char why[96], t[24];
+            snprintf(why, sizeof why, "finalmask udp %s is not supported", shown(type, t, sizeof t));
+            hy2_in_fail(&h->in, why);
+        }
+    }
+}
+
+static void hx_finalmask(const char *p, struct hx *h) {
+    struct sj j = { p };
+    int f = 1;
+    char k[32];
+    while (sj_obj_key(&j, &f, k, sizeof k) == 0) {
+        if (!strcasecmp(k, "udp")) hx_udp(&j, h);
+        else if (!strcasecmp(k, "quicParams")) hx_quic(&j, h);
+        else sj_skip(&j);
+    }
+}
+
+static unsigned long hx_version(struct sj *j) {
+    char v[16];
+    return hx_tok(j, v, sizeof v) ? 0 : hy2_digits(v, strlen(v), 1000000);
+}
+
+static void hx_hysteria(struct sj *j, struct hx *h) {
+    sj_ws(j);
+    if (*j->p != '{') { sj_skip(j); return; }
+    int f = 1, nul;
+    char k[32];
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcmp(k, "version")) h->hver = hx_version(j);
+        else if (!strcmp(k, "auth")) {
+            char a[HY2_SECRET_MAX + 2];
+            nul = 0;
+            if (hx_str(j, a, sizeof a, &nul)) a[0] = '\0';
+            hy2_in_secret(&h->in, h->in.auth, a, strlen(a), nul);
+        } else sj_skip(j);
+    }
+}
+
 /* streamSettings: the transport, security and everything that depends on them. */
-static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d) {
+static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d, struct hx *h) {
     int first = 1;
     char k[64];
     struct upg_cfg ws, hu;
@@ -562,7 +1082,9 @@ static void xray_stream(struct sj *j, struct vless_node *n, struct sl_dl *d) {
             const char *p0 = j->p;
             sj_skip(j);
             sl_set_fm(n, p0, (size_t)(j->p - p0));
+            if (h) hx_finalmask(p0, h);
         }
+        else if (h && !strcmp(k, "hysteriaSettings")) hx_hysteria(j, h);
         else if (d && !strcmp(k, "quicParams")) d->quic = (uint8_t)xray_present(j);
         else if (!strcmp(k, "tcpSettings") || !strcmp(k, "rawSettings")) {
             int f2 = 1;
@@ -650,7 +1172,7 @@ static void json_encryption(struct sj *j, struct vless_node *n) {
 
 /* settings of a vless outbound: vnext[0] gives the address, the port and the first user. Only
  * the first: a subscription describes a node for one user. */
-static void xray_settings(struct sj *j, struct vless_node *n) {
+static void xray_settings(struct sj *j, struct vless_node *n, struct hx *h) {
     int first = 1;
     char k[64];
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
@@ -661,6 +1183,7 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
         if (!strcmp(k, "flow")) { sj_str(j, n->flow, sizeof(n->flow)); continue; }
         if (!strcmp(k, "encryption")) { json_encryption(j, n); continue; }
         if (!strcmp(k, "port")) { n->port = xray_port(j); continue; }
+        if (!strcmp(k, "version")) { h->sver = hx_version(j); continue; }
         if (strcmp(k, "vnext") != 0) { sj_skip(j); continue; }
         int fa = 1, taken = 0;
         while (sj_arr_next(j, &fa) == 0) {
@@ -838,9 +1361,135 @@ static void sb_transport(struct sj *j, struct vless_node *n, struct sb_ws *w, st
 
 /* A sing-box outbound: it has type where Xray has protocol. xray_outbound calls it after looking
  * ahead; it reads the whole object. */
+static int sb_dur(const char *s, int64_t *out) {
+    const char *p = s;
+    int neg = 0;
+    uint64_t total = 0;
+    if (*p == '-' || *p == '+') neg = *p++ == '-';
+    *out = 0;
+    if (!strcmp(p, "0")) return 0;
+    if (!*p) return -1;
+    while (*p) {
+        uint64_t v = 0, f = 0, scale = 1;
+        size_t nd = 0, nf = 0;
+        for (; *p >= '0' && *p <= '9'; p++, nd++) {
+            if (v > (UINT64_MAX - 9) / 10) return -1;
+            v = v * 10 + (uint64_t)(*p - '0');
+        }
+        if (*p == '.') {
+            for (p++; *p >= '0' && *p <= '9'; p++, nf++) {
+                if (nf < 18) { f = f * 10 + (uint64_t)(*p - '0'); scale *= 10; }
+            }
+        }
+        if (!nd && !nf) return -1;
+        const char *u = p;
+        while (*p && *p != '.' && (*p < '0' || *p > '9')) p++;
+        size_t ul = (size_t)(p - u);
+        uint64_t unit = 0;
+        if (ul == 2 && !memcmp(u, "ns", 2)) unit = 1;
+        else if (ul == 2 && !memcmp(u, "us", 2)) unit = 1000;
+        else if (ul == 3 && (!memcmp(u, "\xc2\xb5s", 3) || !memcmp(u, "\xce\xbcs", 3))) unit = 1000;
+        else if (ul == 2 && !memcmp(u, "ms", 2)) unit = 1000000;
+        else if (ul == 1 && *u == 's') unit = 1000000000ull;
+        else if (ul == 1 && *u == 'm') unit = 60000000000ull;
+        else if (ul == 1 && *u == 'h') unit = 3600000000000ull;
+        else if (ul == 1 && *u == 'd') unit = 86400000000000ull;
+        if (!unit || v > ((uint64_t)1 << 63) / unit) return -1;
+        v *= unit;
+        v += (uint64_t)((double)f * ((double)unit / (double)scale));
+        if (v > (uint64_t)1 << 63 || total > ((uint64_t)1 << 63) - v) return -1;
+        total += v;
+    }
+    if (total == (uint64_t)1 << 63) {
+        if (!neg) return -1;
+        *out = INT64_MIN;
+        return 0;
+    }
+    *out = neg ? -(int64_t)total : (int64_t)total;
+    return 0;
+}
+
+static void sb_hop_key(struct sj *j, struct hy2_in *h, const char *key, int64_t *ns) {
+    char t[48], why[48];
+    int nul = 0;
+    if (hx_str(j, t, sizeof t, &nul) || sb_dur(t, ns)) {
+        snprintf(why, sizeof why, "%s: not a duration", key);
+        hy2_in_fail(h, why);
+    }
+}
+
+static void sb_hop(struct hy2_in *h, int64_t lo, int64_t hi) {
+    if (!h->first || (!lo && !hi)) return;
+    if (lo < 0 || hi < 0) { hy2_in_fail(h, "hop_interval must be at least 5 seconds"); return; }
+    if (lo % 1000000000 || hi % 1000000000) { hy2_in_fail(h, "hop_interval: not whole seconds up to 65535"); return; }
+    if (lo > 65535000000000ll || hi > 65535000000000ll) { hy2_in_fail(h, "hop_interval: not whole seconds up to 65535"); return; }
+    if (!hi) hi = lo;
+    else if (!lo) { hy2_in_fail(h, "hop_interval_max needs hop_interval"); return; }
+    if (lo > hi) { hy2_in_fail(h, "hop_interval must not exceed hop_interval_max"); return; }
+    if (lo < 5000000000ll) { hy2_in_fail(h, "hop_interval must be at least 5 seconds"); return; }
+    h->hop_from = (uint16_t)(lo / 1000000000);
+    h->hop_to = (uint16_t)(hi / 1000000000);
+}
+
+static void sb_port_item(struct sj *j, char *spec, size_t *o, size_t cap, int *bad) {
+    char one[48];
+    sj_ws(j);
+    if (*j->p != '"') { sj_skip(j); *bad = 1; return; }
+    if (sj_str(j, one, sizeof one)) { *bad = 1; return; }
+    char *colon = strchr(one, ':');
+    size_t ol = strlen(one);
+    if (!colon || ol + 6 >= sizeof one) { *bad = 1; return; }
+    if (colon[1] == '\0') snprintf(colon + 1, sizeof one - (size_t)(colon + 1 - one), "65535");
+    *colon = '-';
+    ol = strlen(one);
+    if (*o + ol + 2 > cap) { *bad = 1; return; }
+    if (*o) spec[(*o)++] = ',';
+    memcpy(spec + *o, one, ol);
+    *o += ol;
+}
+
+static void sb_server_ports(struct sj *j, struct hy2_in *h) {
+    char spec[256];
+    size_t o = 0;
+    int bad = 0;
+    sj_ws(j);
+    if (*j->p == '[') {
+        int f = 1;
+        while (sj_arr_next(j, &f) == 0) sb_port_item(j, spec, &o, sizeof spec, &bad);
+    } else sb_port_item(j, spec, &o, sizeof spec, &bad);
+    if (bad) { hy2_in_fail(h, "server_ports: not a port list"); return; }
+    hy2_in_ports(h, spec, o, "server_ports");
+}
+
+static void sb_obfs(struct sj *j, struct hy2_in *h) {
+    sj_ws(j);
+    if (!strncmp(j->p, "null", 4)) { j->p += 4; return; }
+    if (*j->p != '{') { sj_skip(j); hy2_in_fail(h, "obfs is not an object"); return; }
+    int f = 1, nul = 0;
+    char k[32], pw[HY2_SECRET_MAX + 2];
+    while (sj_obj_key(j, &f, k, sizeof k) == 0) {
+        if (!strcmp(k, "type")) { if (hx_str(j, h->obfs, sizeof h->obfs, &nul)) h->obfs[0] = '\0'; }
+        else if (!strcmp(k, "password")) {
+            nul = 0;
+            if (hx_str(j, pw, sizeof pw, &nul)) pw[0] = '\0';
+            hy2_in_secret(h, h->obfs_pw, pw, strlen(pw), nul);
+        } else sj_skip(j);
+    }
+    if (!h->obfs_pw[0]) hy2_in_fail(h, "obfs-password missing");
+    else if (!h->obfs[0]) hy2_in_fail(h, "obfs type is missing");
+}
+
+static unsigned long sb_mbps(struct sj *j) {
+    char v[24];
+    return hx_tok(j, v, sizeof v) ? 0 : hy2_digits(v, strlen(v), 100000);
+}
+
 static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, size_t proto_n) {
     int first = 1, tls_on = 0, reality = 0;
     char k[64];
+    struct hy2_in hin;
+    int64_t hop = 0, hop_max = 0;
+    memset(&hin, 0, sizeof hin);
     struct sb_ws w; struct upg_cfg u;
     memset(&w, 0, sizeof w); memset(&u, 0, sizeof u);
     while (sj_obj_key(j, &first, k, sizeof k) == 0) {
@@ -852,8 +1501,22 @@ static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, si
         else if (!strcmp(k, "flow")) sj_str(j, n->flow, sizeof n->flow);
         else if (!strcmp(k, "tls")) sb_tls(j, n, &tls_on, &reality);
         else if (!strcmp(k, "transport")) sb_transport(j, n, &w, &u);
+        else if (!strcmp(k, "server_ports")) sb_server_ports(j, &hin);
+        else if (!strcmp(k, "hop_interval")) sb_hop_key(j, &hin, k, &hop);
+        else if (!strcmp(k, "hop_interval_max")) sb_hop_key(j, &hin, k, &hop_max);
+        else if (!strcmp(k, "up_mbps")) hin.up_mbps = (uint32_t)sb_mbps(j);
+        else if (!strcmp(k, "down_mbps")) hin.down_mbps = (uint32_t)sb_mbps(j);
+        else if (!strcmp(k, "password")) {
+            char pw[HY2_SECRET_MAX + 2];
+            int nul = 0;
+            if (hx_str(j, pw, sizeof pw, &nul)) pw[0] = '\0';
+            hy2_in_secret(&hin, hin.auth, pw, strlen(pw), nul);
+        }
+        else if (!strcmp(k, "obfs")) sb_obfs(j, &hin);
         else sj_skip(j);
     }
+    sb_hop(&hin, hop, hop_max);
+    if (!tls_on) hy2_in_fail(&hin, "hysteria2 needs tls");
     snprintf(n->security, sizeof n->security, "%s", reality ? "reality" : tls_on ? "tls" : "none");
     if (!n->type[0]) snprintf(n->type, sizeof n->type, "tcp");
     if (!strcmp(n->type, "ws") && w.ed > 0 && !strcmp(w.ed_hdr, "Sec-WebSocket-Protocol") && !strchr(u.path, '?')) {
@@ -867,6 +1530,7 @@ static void sb_outbound_body(struct sj *j, struct vless_node *n, char *proto, si
         snprintf(n->headers, sizeof n->headers, "%s", u.headers);
         n->headers_bad = u.bad;
     }
+    if (!strcmp(proto, "hysteria2")) hy2_apply(n, &hin);
 }
 
 /* One outbound. 1 — a vless node, written into n; 0 — not ours. */
@@ -877,6 +1541,8 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
     snprintf(n->type, sizeof(n->type), "tcp");
     int first = 1, is_vless = 0;
     char k[64], proto[32] = "";
+    struct hx h;
+    memset(&h, 0, sizeof h);
     /* Xray (protocol) or sing-box (type)? Look ahead at the top-level keys, as for remarks: the
      * key order is not defined, and the parse is a single pass. */
     {
@@ -891,7 +1557,7 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
         j->p = save;
         if (has_type && !has_protocol) {
             sb_outbound_body(j, n, proto, sizeof proto);
-            return !strcmp(proto, "vless");
+            return !strcmp(proto, "vless") || !strcmp(proto, "hysteria2");
         }
     }
     /* The key order is not defined, so protocol may come after settings: read everything and
@@ -902,12 +1568,22 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
         /* tag is cut by bytes like a link's name, so an incomplete UTF-8 tail is dropped the
          * same way. */
         else if (!strcmp(k, "tag")) { sj_str(j, n->name, sizeof(n->name)); sl_utf8_trim_tail(n->name); }
-        else if (!strcmp(k, "settings")) xray_settings(j, n);
-        else if (!strcmp(k, "streamSettings")) xray_stream(j, n, NULL);
+        else if (!strcmp(k, "settings")) xray_settings(j, n, &h);
+        else if (!strcmp(k, "streamSettings")) xray_stream(j, n, NULL, &h);
         else sj_skip(j);
     }
     is_vless = !strcmp(proto, "vless");
-    return is_vless;
+    if (strcmp(proto, "hysteria")) return is_vless;
+    if (h.sver != 2)
+        snprintf(n->skip_reason, sizeof n->skip_reason, "hysteria version %lu is not supported", h.sver);
+    else if (h.hver != 2)
+        snprintf(n->skip_reason, sizeof n->skip_reason, "hysteriaSettings version %lu is not supported", h.hver);
+    else if (strcmp(n->type, "hysteria"))
+        snprintf(n->skip_reason, sizeof n->skip_reason, "hysteria needs network hysteria");
+    else if (strcmp(n->security, "tls"))
+        snprintf(n->skip_reason, sizeof n->skip_reason, "hysteria needs security tls");
+    hy2_apply(n, &h.in);
+    return 1;
 }
 
 /* The name the panel shows lives in the config's remarks, not in the outbound's tag: panels give
@@ -1020,6 +1696,7 @@ struct yflat {
     char buf[12288];
     size_t used, n;
     struct { const char *k, *v; } kv[YF_MAX];
+    uint8_t nulv[YF_MAX];
 };
 
 static void yf_add(struct yflat *f, const char *path, size_t pn, const char *val, size_t vn) {
@@ -1030,6 +1707,17 @@ static void yf_add(struct yflat *f, const char *path, size_t pn, const char *val
     memcpy(v, val, vn); v[vn] = 0;
     f->used += pn + vn + 2;
     f->kv[f->n].k = k; f->kv[f->n].v = v; f->n++;
+}
+
+static void yf_addz(struct yflat *f, const char *path, size_t pn, const char *val, size_t vn, int nul) {
+    size_t n0 = f->n;
+    yf_add(f, path, pn, val, vn);
+    if (f->n > n0) f->nulv[n0] = (uint8_t)nul;
+}
+
+static int yf_nul(const struct yflat *f, const char *path) {
+    for (size_t i = 0; i < f->n; i++) if (!strcmp(f->kv[i].k, path)) return f->nulv[i];
+    return 0;
 }
 
 static const char *yf_get(const struct yflat *f, const char *path) {
@@ -1044,7 +1732,7 @@ static const char *yf_geti(const struct yflat *f, const char *path) {
 
 /* The scalar at p, quoted or plain. flow != 0: a plain scalar ends at , } ]. Returns a pointer past
  * the scalar; the value (unquoted) goes to out, its length to *on. */
-static const char *y_scalar(const char *p, const char *end, int flow, char *out, size_t cap, size_t *on) {
+static const char *y_scalar2(const char *p, const char *end, int flow, char *out, size_t cap, size_t *on, int *nul) {
     size_t o = 0;
     while (p < end && (*p == ' ' || *p == '\t')) p++;
     /* An anchor or a tag before the value. */
@@ -1055,7 +1743,10 @@ static const char *y_scalar(const char *p, const char *end, int flow, char *out,
         while (p < end && *p != q) {
             char e[4] = { *p, 0, 0, 0 };
             size_t el = 1;
-            if (q == '"' && *p == '\\' && p + 1 < end) p += sl_unescape(p + 1, 1, e, &el);
+            if (q == '"' && *p == '\\' && p + 1 < end) {
+                p += sl_unescape(p + 1, 1, e, &el);
+                if (!el && nul) *nul = 1;
+            }
             else if (q == '\'' && *p == '\'' && p + 1 < end && p[1] == '\'') p++;
             if (!full && o + el < cap) {
                 memcpy(out + o, e, el);
@@ -1083,6 +1774,10 @@ static const char *y_scalar(const char *p, const char *end, int flow, char *out,
     return p;
 }
 
+static const char *y_scalar(const char *p, const char *end, int flow, char *out, size_t cap, size_t *on) {
+    return y_scalar2(p, end, flow, out, cap, on, NULL);
+}
+
 static const char *y_flow(struct yflat *f, const char *p, const char *end, char *path, size_t pn, int depth);
 
 /* A value in flow form: {…}, […] or a scalar. */
@@ -1091,8 +1786,9 @@ static const char *y_flow_val(struct yflat *f, const char *p, const char *end, c
     if (p < end && (*p == '{' || *p == '[')) return y_flow(f, p, end, path, pn, depth + 1);
     char v[3300];
     size_t vn;
-    p = y_scalar(p, end, 1, v, sizeof v, &vn);
-    if (v[0] != '*') yf_add(f, path, pn, v, vn);
+    int z = 0;
+    p = y_scalar2(p, end, 1, v, sizeof v, &vn, &z);
+    if (v[0] != '*') yf_addz(f, path, pn, v, vn, z);
     return p;
 }
 
@@ -1165,10 +1861,11 @@ static const char *y_item(struct yflat *f, const char *p, const char *end, size_
         if (!first && ind > dash && (*s == '-' && (e - s == 1 || s[1] == ' '))) {
             char v[3300];
             size_t vn;
-            y_scalar(s + 1, e, 0, v, sizeof v, &vn);
+            int z = 0;
+            y_scalar2(s + 1, e, 0, v, sizeof v, &vn, &z);
             char np[200];
             int n2 = snprintf(np, sizeof np, "%s.%u", lastkey, seq++);
-            if (lastkey[0] && n2 > 0 && n2 < (int)sizeof np && v[0] != '*') yf_add(f, np, (size_t)n2, v, vn);
+            if (lastkey[0] && n2 > 0 && n2 < (int)sizeof np && v[0] != '*') yf_addz(f, np, (size_t)n2, v, vn, z);
             p = next;
             continue;
         }
@@ -1192,8 +1889,9 @@ static const char *y_item(struct yflat *f, const char *p, const char *end, size_
         } else {
             char v[3300];
             size_t vn;
-            y_scalar(c, e, 0, v, sizeof v, &vn);
-            if (v[0] != '*') yf_add(f, np, (size_t)n2, v, vn);
+            int z = 0;
+            y_scalar2(c, e, 0, v, sizeof v, &vn, &z);
+            if (v[0] != '*') yf_addz(f, np, (size_t)n2, v, vn, z);
         }
         p = next;
     }
@@ -1318,10 +2016,95 @@ static void clash_dl(const struct yflat *f, const struct vless_node *main, struc
 #undef DS
 
 /* A flattened node into a vless node. 1 — it is vless, written into n. */
+static unsigned clash_rate(const char *v) {
+    if (!*v) return 0;
+    const char *p = v;
+    int neg = *p == '-';
+    if (*p == '-' || *p == '+') p++;
+    const char *d = p;
+    while (*p >= '0' && *p <= '9') p++;
+    if (p != d && !*p) {
+        if (neg || p - d > 9) return 0;
+        unsigned long m = strtoul(d, NULL, 10);
+        return m > 100000 ? 0 : (unsigned)m;
+    }
+    p = v;
+    uint64_t n = 0;
+    while (*p >= '0' && *p <= '9') {
+        if (n > 100000000000000000ull) return 0;
+        n = n * 10 + (uint64_t)(*p++ - '0');
+    }
+    if (p == v || p - v > 18) return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\f' || *p == '\r') p++;
+    uint64_t mul = 1;
+    if (*p && strchr("KMGT", *p)) {
+        for (const char *q = "KMGT"; *q != *p; q++) mul *= 1000;
+        mul *= 1000;
+        p++;
+    }
+    if ((*p != 'b' && *p != 'B') || strcmp(p + 1, "ps")) return 0;
+    if (n > UINT64_MAX / mul) return 0;
+    n *= mul;
+    return hy2_mbps(*p == 'b' ? n / 8 : n);
+}
+
+static void clash_secret(const struct yflat *f, struct hy2_in *h, char *dst, const char *key) {
+    const char *v = yf_get(f, key);
+    if (v) hy2_in_secret(h, dst, v, strlen(v), yf_nul(f, key));
+}
+
+static int clash_hy2(const struct yflat *f, struct vless_node *n) {
+    struct hy2_in h;
+    const char *v;
+    memset(&h, 0, sizeof h);
+    snprintf(n->type, sizeof n->type, "quic");
+    if ((v = yf_get(f, "name"))) { sl_set_field(n->name, sizeof n->name, v, strlen(v)); sl_utf8_trim_tail(n->name); }
+    if ((v = yf_get(f, "server"))) { sl_set_field(n->host, sizeof n->host, v, strlen(v)); sl_host_unbracket(n->host); }
+    if ((v = yf_get(f, "port"))) n->port = sl_port_of(v);
+    if ((v = yf_get(f, "sni"))) sl_set_field(n->sni, sizeof n->sni, v, strlen(v));
+    if ((v = yf_get(f, "fingerprint")) && v[0]) sl_add_pins(n, v, 0);
+    if ((v = yf_get(f, "name-cert-verify")) && v[0]) sl_set_vcn(n, v);
+    if ((v = yf_get(f, "skip-cert-verify")) && sl_truthy(v)) n->allow_insecure = 1;
+    if ((v = yf_get(f, "ech-opts.config")) && v[0]) sl_set_ech(n, v);
+    clash_secret(f, &h, h.auth, "password");
+    if ((v = yf_get(f, "obfs"))) snprintf(h.obfs, sizeof h.obfs, "%s", v);
+    clash_secret(f, &h, h.obfs_pw, "obfs-password");
+    if ((v = yf_get(f, "up"))) h.up_mbps = clash_rate(v);
+    if ((v = yf_get(f, "down"))) h.down_mbps = clash_rate(v);
+    if ((v = yf_get(f, "ports"))) {
+        char spec[160];
+        size_t o = 0;
+        for (; *v && o + 1 < sizeof spec; v++) {
+            char c = *v == '/' ? ',' : *v;
+            if (c == ' ' || c == '\t' || (c == ',' && (!o || spec[o - 1] == ','))) continue;
+            spec[o++] = c;
+        }
+        while (o && spec[o - 1] == ',') o--;
+        if (*v) hy2_in_fail(&h, "port list too long");
+        else hy2_in_ports(&h, spec, o, "ports");
+    }
+    if ((v = yf_get(f, "hop-interval")) && v[0]) {
+        unsigned long a, b;
+        if (!hx_range(v, &a, &b) || a > 65535 || b > 65535) hy2_in_fail(&h, "hop-interval: not a number or range");
+        else if (a || b) {
+            if (a > b) { unsigned long t = a; a = b; b = t; }
+            if (a == 0) a = 30;
+            else if (a < 5) a = 5;
+            if (b < a) b = a;
+            h.hop_from = (uint16_t)a;
+            h.hop_to = (uint16_t)b;
+        }
+    }
+    hy2_apply(n, &h);
+    return 1;
+}
+
 static int clash_node(const struct yflat *f, struct vless_node *n) {
     memset(n, 0, sizeof *n);
     const char *v;
-    if (!(v = yf_get(f, "type")) || strcmp(v, "vless")) return 0;
+    if (!(v = yf_get(f, "type"))) return 0;
+    if (!strcmp(v, "hysteria2")) return clash_hy2(f, n);
+    if (strcmp(v, "vless")) return 0;
     snprintf(n->type, sizeof n->type, "tcp");
     if ((v = yf_get(f, "name"))) { sl_set_field(n->name, sizeof n->name, v, strlen(v)); sl_utf8_trim_tail(n->name); }
     if ((v = yf_get(f, "server"))) { sl_set_field(n->host, sizeof n->host, v, strlen(v)); sl_host_unbracket(n->host); }
@@ -1601,12 +2384,12 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
              * the two cannot drift apart. */
             char why[64];
             snprintf(why, sizeof why, "link longer than %zu bytes", sizeof(line) - 1);
-            const char *glue = strncmp(p, "vless://", 8) ? NULL : glued_tail(p, e);
+            const char *glue = vless_link_scheme(p) ? glued_tail(p, e) : NULL;
             if (glue) {
                 /* A glued pair is reported before the length: the length is only its
                  * consequence, and "link longer than 8191 bytes" does not tell what to fix. */
                 glue_note(st, glue, e);
-            } else if (!strncmp(p, "vless://", 8)) {
+            } else if (vless_link_scheme(p)) {
                 /* The example gives the length and the start of the address, telling a link
                  * just over the limit from a blob of many kilobytes; the reason itself cannot,
                  * since sl_skip_note groups by it. It starts after '@': the id before it does
@@ -1633,11 +2416,11 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
             /* One reason for every glued pair; what tells the cases apart goes into the
              * example. A glued link is not parsed at all: its name is certainly wrong and its
              * address may be, and a "may be" is worse than a refusal. */
-            const char *glue = strncmp(line, "vless://", 8)
-                                   ? NULL : glued_tail(line, line + len);
+            const char *glue = vless_link_scheme(line)
+                                   ? glued_tail(line, line + len) : NULL;
             if (glue) {
                 glue_note(st, glue, line + len);
-            } else if (!strncmp(line, "vless://", 8)) {
+            } else if (vless_link_scheme(line)) {
                 struct vless_node node;
                 int rc = vless_parse_url(line, &node);
                 /* rc 1: the parser named the reason. rc -1: the link did not parse at all
@@ -1674,12 +2457,12 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
     return dec;
 }
 
-/* How many times "vless" occurs in text, in any case: every VLESS node has it in its own text
- * (vless://, "protocol": "vless", "type": "vless", type: vless), so this bounds the node count. */
-static size_t count_vless(const char *text) {
+size_t vless_sub_count(const char *text) {
     size_t n = 0;
-    for (const char *q = text; *q; q++)
+    for (const char *q = text; *q; q++) {
         if ((*q == 'v' || *q == 'V') && !strncasecmp(q, "vless", 5)) n++;
+        else if ((*q == 'h' || *q == 'H') && (!strncasecmp(q, "hysteria", 8) || !strncasecmp(q, "hy2", 3))) n++;
+    }
     return n;
 }
 
@@ -1706,7 +2489,7 @@ struct vless_node *vless_load_sub(const char *path, size_t *cnt, struct vless_su
     raw[n] = '\0';
     dec[0] = '\0';
     const char *text = vless_sub_text(raw, n, dec, sz + 16);
-    size_t hint = 1 + count_vless(text);
+    size_t hint = 1 + vless_sub_count(text);
     struct vless_node *nodes = calloc(hint, sizeof(*nodes));
     if (nodes) *cnt = vless_parse_sub(text, nodes, hint, st);
     free(raw);

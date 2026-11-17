@@ -489,7 +489,7 @@ TEST each_tag_gives_its_level_and_is_cut(void)
         {"tunvless[info]: up", FIRC_LOG_INFO, "up"},
         {"tunvless[warn]: bad option", FIRC_LOG_WARN, "bad option"},
         {"tunvless[warn] tunnel: device x was not created", FIRC_LOG_WARN, "tunnel: device x was not created"},
-        {"tunvless[error]: no usable VLESS node", FIRC_LOG_ERROR, "no usable VLESS node"},
+        {"tunvless[error]: no usable node", FIRC_LOG_ERROR, "no usable node"},
         {"tunvless[error]:no space", FIRC_LOG_ERROR, "no space"},
         {"tunvless[error]:", FIRC_LOG_ERROR, ""},
     };

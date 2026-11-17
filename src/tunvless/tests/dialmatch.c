@@ -3,6 +3,7 @@
 #include <sys/resource.h>
 #include "unit.h"
 #include "../src/proto/transport/trdial.c"
+#include "../src/proto/transport/sockmark.c"
 
 static char g_err[4096];
 
@@ -20,7 +21,13 @@ static void put6(struct tr_ip *ip, const char *s) {
     ip->v6 = 1;
 }
 
+static unsigned g_stub_calls;
+
 static unsigned two_addrs(const char *host, struct tr_ip out[ADDR_MAX]) {
+    g_stub_calls++;
+    if (!strcmp(host, "nip")) { put4(&out[0], 0xc0000207u); put6(&out[1], "2001:db8::5"); return 2; }
+    if (!strcmp(host, "unp")) { put4(&out[0], 0xc0000209u); return 1; }
+    if (!strcmp(host, "gone")) return 0;
     if (!strcmp(host, "dual")) { put4(&out[0], 0x7f000001u); put6(&out[1], "::1"); return 2; }
     if (!strcmp(host, "::1") || !strcmp(host, "w")) {
         put4(&out[0], 0x7f000002u);
@@ -244,6 +251,34 @@ static int have_lo6(void) {
     return 1;
 }
 
+static int g_mark_fail, g_mark_calls, g_bind_fail, g_bind_calls;
+int __real_setsockopt(int fd, int level, int name, const void *val, socklen_t len);
+
+static int sockopt_refused(int level, int name) {
+    if (level == SOL_SOCKET && name == SO_MARK) {
+        g_mark_calls++;
+        if (g_mark_fail) { errno = EPERM; return 1; }
+    }
+    if (level == SOL_SOCKET && name == SO_BINDTODEVICE) {
+        g_bind_calls++;
+        if (g_bind_fail) { errno = EPERM; return 1; }
+    }
+    return 0;
+}
+
+int __wrap_setsockopt(int fd, int level, int name, const void *val, socklen_t len) {
+    return sockopt_refused(level, name) ? -1 : __real_setsockopt(fd, level, name, val, len);
+}
+
+#if (defined(__GLIBC__) && defined(__USE_TIME_BITS64) && __TIMESIZE == 32) || (defined(_REDIR_TIME64) && _REDIR_TIME64)
+int __real___setsockopt64(int fd, int level, int name, const void *val, socklen_t len);
+int __wrap___setsockopt64(int fd, int level, int name, const void *val, socklen_t len);
+
+int __wrap___setsockopt64(int fd, int level, int name, const void *val, socklen_t len) {
+    return sockopt_refused(level, name) ? -1 : __real___setsockopt64(fd, level, name, val, len);
+}
+#endif
+
 static int fd_count(void) {
     DIR *d = opendir("/proc/self/fd");
     if (!d) return -1;
@@ -259,6 +294,133 @@ static int mark_settable(void) {
     int r = s >= 0 && setsockopt(s, SOL_SOCKET, SO_MARK, &m, sizeof m) == 0;
     if (s >= 0) close(s);
     return r;
+}
+
+static void the_helper_refuses_an_unmarkable_socket(void) {
+    int fds = fd_count();
+    struct tr_ip lo4;
+    put4(&lo4, 0x7f000001u);
+    uint16_t lp = 0;
+    int ls = listener(&lp);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int pipefd[2];
+    char first[4096];
+    transport_set_sock_mark(0x10000);
+    g_mark_fail = 1;
+    g_mark_calls = 0;
+    g_mark_told = 0;
+    check("helper: pipe", 0, pipe(pipefd));
+    fflush(stderr);
+    int save = dup(2);
+    dup2(pipefd[1], 2);
+    int r1 = tr_sock_prepare(s);
+    int r2 = tr_sock_prepare(s);
+    fflush(stderr);
+    dup2(save, 2);
+    close(save);
+    close(pipefd[1]);
+    ssize_t n = read(pipefd[0], first, sizeof first - 1);
+    close(pipefd[0]);
+    first[n > 0 ? n : 0] = 0;
+    check("helper: refused mark, -1", -1, r1);
+    check("helper: refused mark again, -1", -1, r2);
+    check("helper: SO_MARK tried once per call", 2, g_mark_calls);
+    const char *pre = "tunvless[warn]: cannot set mark 0x00010000 on a socket to the node";
+    check("helper: the warning names the mark", 1, !strncmp(first, pre, strlen(pre)));
+    int lines = 0;
+    for (const char *q = first; (q = strstr(q, "tunvless[warn]")); q++) lines++;
+    check("helper: exactly one warning for two refusals", 1, lines);
+    g_mark_calls = 0;
+    int d = fd_count();
+    int fd = attempt_logged(&lo4, lp);
+    check("attempt: no socket handed back", -1, fd);
+    check("attempt: SO_MARK asked exactly once", 1, g_mark_calls);
+    check("attempt: its socket closed", d, fd_count());
+    g_mark_fail = 0;
+    if (mark_settable()) check("helper: accepted mark, 0", 0, tr_sock_prepare(s));
+    transport_set_sock_mark(0);
+    check("helper: no mark and no device, 0", 0, tr_sock_prepare(s));
+    close(s);
+    close(ls);
+    check("helper: no fd left", fds, fd_count());
+}
+
+static void the_helper_refuses_an_unbindable_socket(void) {
+    int fds = fd_count();
+    struct tr_ip lo4;
+    put4(&lo4, 0x7f000001u);
+    uint16_t lp = 0;
+    int ls = listener(&lp);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int pipefd[2];
+    char out[4096];
+    transport_set_bind_dev("lo");
+    g_bind_fail = 1;
+    g_bind_calls = 0;
+    g_bind_told = 0;
+    check("bind: pipe", 0, pipe(pipefd));
+    fflush(stderr);
+    int save = dup(2);
+    dup2(pipefd[1], 2);
+    int r1 = tr_sock_prepare(s);
+    int r2 = tr_sock_prepare(s);
+    fflush(stderr);
+    dup2(save, 2);
+    close(save);
+    close(pipefd[1]);
+    ssize_t n = read(pipefd[0], out, sizeof out - 1);
+    close(pipefd[0]);
+    out[n > 0 ? n : 0] = 0;
+    check("bind: refused, -1", -1, r1);
+    check("bind: refused again, -1", -1, r2);
+    check("bind: SO_BINDTODEVICE tried once per call", 2, g_bind_calls);
+    const char *pre = "tunvless[warn]: cannot bind a socket for the node to lo";
+    check("bind: the warning names the device", 1, !strncmp(out, pre, strlen(pre)));
+    int lines = 0;
+    for (const char *q = out; (q = strstr(q, "tunvless[warn]")); q++) lines++;
+    check("bind: exactly one warning for two refusals", 1, lines);
+    g_bind_calls = 0;
+    int d = fd_count();
+    check("bind attempt: no socket handed back", -1, attempt_logged(&lo4, lp));
+    check("bind attempt: SO_BINDTODEVICE asked exactly once", 1, g_bind_calls);
+    check("bind attempt: its socket closed", d, fd_count());
+    g_bind_fail = 0;
+    check("bind: accepted, 0", 0, tr_sock_prepare(s));
+    transport_set_bind_dev(NULL);
+    close(s);
+    close(ls);
+    check("bind: no fd left", fds, fd_count());
+}
+
+static void node_ip_writes_literals_in_turn(void) {
+    char lit[64];
+    unsigned calls = g_stub_calls;
+    check("pinned pair: pinned", 2, transport_pin_host("nip"));
+    unsigned pins = g_pin_n;
+    check("pinned pair: count", 2, transport_node_ip("nip", 0, lit, sizeof lit));
+    check_str("pinned pair: address 0", "192.0.2.7", lit);
+    check("pinned pair: count again", 2, transport_node_ip("nip", 1, lit, sizeof lit));
+    check_str("pinned pair: address 1", "2001:db8::5", lit);
+    check("pinned pair: count a third time", 2, transport_node_ip("nip", 2, lit, sizeof lit));
+    check_str("pinned pair: address 2 wraps to 0", "192.0.2.7", lit);
+    check("pinned pair: count for 3", 2, transport_node_ip("nip", 3, lit, sizeof lit));
+    check_str("pinned pair: address 3 wraps to 1", "2001:db8::5", lit);
+    check("pinned pair: count for 7", 2, transport_node_ip("nip", 7, lit, sizeof lit));
+    check_str("pinned pair: address 7 wraps to 1", "2001:db8::5", lit);
+    check("pinned pair: resolver asked once, by the pin", (long)calls + 1, g_stub_calls);
+    check("pinned pair: pin table unchanged", pins, g_pin_n);
+    check("a literal too long for the buffer is refused", -1, transport_node_ip("nip", 1, lit, 4));
+}
+
+static void an_unpinned_name_is_resolved_once(void) {
+    char lit[64];
+    unsigned calls = g_stub_calls, pins = g_pin_n;
+    check("unpinned: count", 1, transport_node_ip("unp", 0, lit, sizeof lit));
+    check_str("unpinned: address", "192.0.2.9", lit);
+    check("unpinned: the resolver ran once", (long)calls + 1, g_stub_calls);
+    check("unpinned: pin table unchanged", pins, g_pin_n);
+    check("unpinned: still not pinned", 0, transport_pin_count("unp"));
+    check("nothing resolves: -1", -1, transport_node_ip("gone", 0, lit, sizeof lit));
 }
 
 static void t_reach_parallel(void) {
@@ -289,7 +451,7 @@ static void t_reach_parallel(void) {
 }
 
 static void t_reach_mark_refused(void) {
-    /* catches: a socket whose required mark cannot be set used for the pre-pass, so it leaves unmarked into the tunnel */
+    /* catches: a socket whose mark cannot be set used for the pre-pass, so it leaves unmarked into the tunnel */
     if (mark_settable()) {
         printf("dialmatch: the mark can be set here, the refused mark is not checked\n");
         return;
@@ -300,12 +462,12 @@ static void t_reach_mark_refused(void) {
     uint16_t ports[1] = { open_p };
     char ok[1] = { 7 };
     int err[1] = { 7 };
-    transport_set_sock_mark(1, 1);
+    transport_set_sock_mark(1);
     int before = fd_count();
     int64_t t0 = now_ms();
     tr_reach(hosts, ports, 1, 3000, ok, err);
     int64_t el = now_ms() - t0;
-    transport_set_sock_mark(0, 0);
+    transport_set_sock_mark(0);
     check("reach: no mark, a listening host not reached", 0, ok[0]);
     check("reach: no mark, told as a failed connect", TR_ECONNECT, err[0]);
     check("reach: no mark, at once", 1, el < 1000);
@@ -490,6 +652,11 @@ int main(void) {
         printf("dialmatch: SKIPPED the IPv6 loopback checks (no ::1)\n");
         return 2;
     }
+    g_resolve = two_addrs;
+    the_helper_refuses_an_unmarkable_socket();
+    the_helper_refuses_an_unbindable_socket();
+    node_ip_writes_literals_in_turn();
+    an_unpinned_name_is_resolved_once();
     uint16_t port = 0;
     int ls = listener(&port);
     check("a listener on 127.0.0.1", 1, ls >= 0);
@@ -763,6 +930,7 @@ int main(void) {
     struct tr_ip lo6;
     put6(&lo6, "::1");
     transport_set_bind_dev("lo");
+    g_bind_told = 0;
     fd = attempt_logged(&lo6, p6);
     char dev[IFNAMSIZ] = "";
     socklen_t dl = sizeof dev;
@@ -778,7 +946,8 @@ int main(void) {
     if (fd >= 0) close(fd);
     transport_set_bind_dev(NULL);
 
-    transport_set_sock_mark(0x10000, 1);
+    transport_set_sock_mark(0x10000);
+    g_mark_told = 0;
     fd = attempt_logged(&lo6, p6);
     if (fd >= 0) {
         uint32_t mk = 0;
@@ -790,7 +959,7 @@ int main(void) {
         const char *pre = "tunvless[warn]: cannot set mark 0x00010000 on a socket to the node";
         check("IPv6 socket without its mark is not used", 1, !strncmp(g_err, pre, strlen(pre)));
     }
-    transport_set_sock_mark(0, 0);
+    transport_set_sock_mark(0);
     t_reach_parallel();
     t_reach_mark_refused();
     t_reach_deadline();

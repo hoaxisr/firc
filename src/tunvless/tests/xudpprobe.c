@@ -84,12 +84,12 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 3; i++) {
             char msg[32];
             int ml = snprintf(msg, sizeof msg, "burst-%d", i);
-            fn += ops->dgram_frame((unsigned char *)msg, (size_t)ml, fr + fn, sizeof fr - fn);
+            fn += ops->dgram_frame(&n, sess, (unsigned char *)msg, (size_t)ml, fr + fn, sizeof fr - fn);
         }
         printf("burst send: rc=%d\n", ops->send(&n, sess, &k, 1, fr, fn));
         unsigned char big[1400];
         memset(big, 'B', sizeof big);
-        fn = ops->dgram_frame(big, sizeof big, fr, sizeof fr);
+        fn = ops->dgram_frame(&n, sess, big, sizeof big, fr, sizeof fr);
         printf("big send: rc=%d\n", ops->send(&n, sess, &k, 1, fr, fn));
         for (int t = 0; t < 60 && g_got < 4; t++)
             if (pump(ops, &n, sess) != 0) return 4;
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
         char msg[64];
         int ml = snprintf(msg, sizeof msg, "xudp-ping-%d", i);
         unsigned char fr[200];
-        size_t fn = ops->dgram_frame((unsigned char *)msg, (size_t)ml, fr, sizeof fr);
+        size_t fn = ops->dgram_frame(&n, sess, (unsigned char *)msg, (size_t)ml, fr, sizeof fr);
         printf("send %d: rc=%d\n", i, ops->send(&n, sess, &k, 1, fr, fn));
         int before = g_got;
         for (int t = 0; t < 30 && g_got == before; t++)

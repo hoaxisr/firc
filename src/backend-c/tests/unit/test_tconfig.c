@@ -498,7 +498,25 @@ TEST a_subscription_alone_is_a_source(void) {
 /* catches: a non-vless link handed to tunvless */
 TEST a_link_that_is_not_vless_is_refused(void) {
     ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"vmess://abc\"\n",
-                       "tunnels[0].sources[0]", "vless://"));
+                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
+    PASS();
+}
+
+/* catches: a hysteria2 link refused as a source, or a bare scheme or a space accepted */
+TEST a_hysteria2_link_is_a_source(void) {
+    char doc[2048] = "tunnels:\n";
+    tun_text(doc + strlen(doc), sizeof doc - strlen(doc), "a1", "tunvless0", "auto", "1", "site",
+             "      - link: \"hysteria2://pw@h:443#A\"\n      - link: \"hy2://pw@h#A\"\n");
+    firc_tunnels_t t = {0};
+    firc_tun_err_t e = {0};
+    ASSERT(firc_tunnels_load_buffer(&t, doc, strlen(doc), &e) == FIRC_OK);
+    ASSERT_STR_EQ("hysteria2://pw@h:443#A", t.t[0].src[0].link);
+    ASSERT_STR_EQ("hy2://pw@h#A", t.t[0].src[1].link);
+    firc_tunnels_free(&t);
+    ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"hysteria2://\"\n",
+                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
+    ASSERT(refused_one("a1", "tunvless0", "auto", "1", "site", "      - link: \"hysteria2://p w@h\"\n",
+                       "tunnels[0].sources[0]", "must be one vless://, hysteria2:// or hy2:// link without whitespace"));
     PASS();
 }
 
@@ -1351,6 +1369,8 @@ int main(int argc, char **argv) {
     RUN_TEST(an_unknown_source_kind_or_subscription_key_is_refused);
     RUN_TEST(a_subscription_alone_is_a_source);
     RUN_TEST(a_link_that_is_not_vless_is_refused);
+    RUN_TEST(a_hysteria2_link_is_a_source);
+    RUN_TEST(a_hysteria2_link_is_a_source);
     RUN_TEST(a_link_with_a_newline_is_refused);
     RUN_TEST(a_filter_that_does_not_compile_is_refused);
     RUN_TEST(a_long_order_or_exclude_key_is_refused);

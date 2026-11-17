@@ -41,7 +41,7 @@ trap 'exit 1' INT TERM
 "$BIN" --control -d tvc0 < /dev/null 2> "$W/empty.err"
 # catches: a tunvless that has no node to carry and says so untagged, so fircd keeps it at info
 check "no node on stdin: exits 2" 2 "$?"
-check "no node on stdin: an error line" "tunvless[error]: no usable VLESS node" "$(cat "$W/empty.err")"
+check "no node on stdin: an error line" "tunvless[error]: no usable node" "$(cat "$W/empty.err")"
 "$BIN" --control -d tvc0 -A 0 < /dev/null 2> "$W/opt.err"
 # catches: a refused option told untagged
 check "a bad option value: an error line" "tunvless[error]: bad option value: 0" "$(cat "$W/opt.err")"
@@ -110,8 +110,43 @@ check "probe from stdin: no link in stderr" 0 "$(grep -c "vless://\|$UUID" "$W/p
 printf 'garbage-%s@host:1\nvless://%s@%s:%s?security=none&type=tcp#A\n\n' "$UUID" "$UUID" "$A" "$PORT" \
   | HX "$BIN" --list - > "$W/list.out" 2> "$W/list.err"
 check "list from stdin: the link line listed" 1 "$(grep -c "^0${TAB}A${TAB}" "$W/list.out")"
-check "list from stdin: malformed line named by number" 1 "$(grep -c 'line 1: not a vless:// link' "$W/list.err")"
+check "list from stdin: malformed line named by number" 1 "$(grep -c 'line 1: not a vless:// or hysteria2:// link' "$W/list.err")"
 check "list from stdin: no uuid on either stream" 0 "$(cat "$W/list.out" "$W/list.err" | grep -c "$UUID")"
+EVIL='A%0A5%09X%09ok%09handshake%201%20ms,%20first%20byte%201%20ms'
+printf 'vless://%s@%s:%s?security=none&type=tcp#%s\n\n' "$UUID" "$A" "$PORT" "$EVIL" \
+  | HX "$BIN" --probe -t 3 - > "$W/evil.out" 2> /dev/null
+check "probe: a name with a newline and tabs stays one line" 1 "$(wc -l < "$W/evil.out")"
+check "probe: that line keeps four fields" 4 "$(awk -F "$TAB" '{ print NF }' "$W/evil.out")"
+check "probe: the name's control bytes become spaces" "0${TAB}A 5 X ok handshake 1 ms, first byte 1 ms${TAB}ok" \
+    "$(cut -f 1-3 "$W/evil.out")"
+printf 'vless://%s@%s:%s?security=none&type=tcp#%s\n\n' "$UUID" "$A" "$PORT" "$EVIL" \
+  | HX "$BIN" --list - > "$W/evil.list" 2> /dev/null
+check "list: a name with a newline and tabs stays one line of four fields" "1 4" \
+    "$(wc -l < "$W/evil.list") $(awk -F "$TAB" '{ print NF }' "$W/evil.list")"
+HY2L='hysteria2://pw@192.0.2.1:443?sni=a&obfs=salamander&obfs-password=secret12#H'
+printf '%s\n\n' "$HY2L" | HX "$BIN" --list - > "$W/hy2.list" 2> /dev/null
+# catches: a Hysteria2 node listed as quic/tls, or its obfuscation left out
+check "list: a Hysteria2 node names its transport and obfuscation" "0${TAB}H${TAB}192.0.2.1:443${TAB}hysteria2/tls salamander" "$(cat "$W/hy2.list")"
+printf 'hysteria2://pw@192.0.2.1:443?sni=a#P\n\n' | HX "$BIN" --list - > "$W/hy2p.list" 2> /dev/null
+# catches: obfuscation shown for a node that has none
+check "list: a Hysteria2 node without obfuscation" "0${TAB}P${TAB}192.0.2.1:443${TAB}hysteria2/tls" "$(cat "$W/hy2p.list")"
+printf '%s\n\n' "$HY2L" | HX timeout 3 "$BIN" --control --no-probe -d tvh0 > "$W/hy2.ev" 2> "$W/hy2.err"
+# catches: a Hysteria2 first node refused by the UUID check
+check "a Hysteria2 first node: the tunnel stays up" 124 "$?"
+VL="vless://$UUID@192.0.2.2:443?security=none&type=tcp#V"
+printf '%s\n%s\n\n' "$VL" "$HY2L" | HX "$BIN" --list - > "$W/mix.list" 2> /dev/null
+# catches: a mixed list cut at its first Hysteria2 node, or its nodes listed out of order
+check "list: a VLESS node, then a Hysteria2 node" "V H" "$(cut -f 2 "$W/mix.list" | tr '\n' ' ' | sed 's/ $//')"
+printf '%s\n%s\n\n' "$HY2L" "$VL" | HX timeout 3 "$BIN" --control --no-probe -d tvh1 > /dev/null 2> "$W/mix.err"
+# catches: a VLESS node after a Hysteria2 first node stopping the tunnel
+check "a Hysteria2 first node, then a VLESS node: the tunnel stays up" 124 "$?"
+printf 'hy2://pw@192.0.2.1:443?sni=a#S\n\n' | HX "$BIN" --list - > "$W/hy2s.list" 2> /dev/null
+# catches: the short hy2:// scheme not read as Hysteria2
+check "list: an hy2:// link is a Hysteria2 node" "0${TAB}S${TAB}192.0.2.1:443${TAB}hysteria2/tls" "$(cat "$W/hy2s.list")"
+printf 'hysteria2://pw@192.0.2.1:443?sni=a&obfs=gecko&obfs-password=secret12#G\n\n' | HX "$BIN" --list - > "$W/hy2g.list" 2> "$W/hy2g.err"
+# catches: an obfuscation other than salamander taken as none
+check "list: an unknown obfuscation is refused with its name" "0 1" \
+    "$(wc -l < "$W/hy2g.list") $(grep -c 'line 1: link cannot be used: obfs gecko is not supported' "$W/hy2g.err")"
 tv_pid() {
     for d in /proc/[0-9]*; do
         [ "$(cat "$d/comm" 2>/dev/null)" = tunvless ] && [ "$(readlink "$d/fd/0" 2>/dev/null)" = "$W/nodes" ] && { echo "${d#/proc/}"; return; }
@@ -137,7 +172,7 @@ check "A takes over again" '{"type":"active","nodes":["A"],"index":[0],"v6":[tru
 node_up B; sleep 1
 printf 'garbage-%s@host:1\n\n' "$UUID" | HX "$BIN" --control -d tvc1 > /dev/null 2> "$W/bad.log"
 check "malformed line: no uuid in stderr" 0 "$(grep -c "$UUID" "$W/bad.log")"
-check "malformed line named by number" 1 "$(grep -c 'line 1: not a vless:// link' "$W/bad.log")"
+check "malformed line named by number" 1 "$(grep -c 'line 1: not a vless:// or hysteria2:// link' "$W/bad.log")"
 HX "$BIN" --control -d tvc2 "vless://$UUID@$A:$PORT#x" < /dev/null > /dev/null 2> "$W/argv.err"
 check "--control with a link on argv exits 2" 2 "$?"
 # catches: a refused --control invocation told as a warning, so it never reaches an error-only log
@@ -271,13 +306,14 @@ for i in 1 2 3 4; do sizes="$sizes $(fetch s$i)"; done
 check "swap: new connections go to B" " 2097152 2097152 2097152 2097152" "$sizes"
 A6='"nodes":["A"],"index":[0],"v6":[true]'
 A6N=$(grep -cF "$A6" "$W/ev2")
-{ echo nodes; lnk A; lnk C; echo; } >&8
+{ echo nodes; echo trojan://x@h:1; lnk A; lnk C; echo; } >&8
 wait_more "$A6" "$A6N" 10
 check "swap: two commands acknowledged" 2 "$(grep -c '"type":"nodes"' "$W/ev2")"
 check "swap: A comes back under its first index" '{"type":"active","nodes":["A"],"index":[0],"v6":[true]}' "$(grep '"active"' "$W/ev2" | tail -1)"
 check "swap: new connections go to A again" 1048576 "$(fetch a1)"
 check "swap: every added node's name resolves" 0 "$(grep -c 'does not resolve' "$W/tun2.log")"
-check "swap: malformed line named, not shown" 1 "$(grep -c 'line 2: not a vless:// link' "$W/tun2.log")"
+check "swap: malformed line named, not shown" 1 "$(grep -c 'line 2: not a vless:// or hysteria2:// link' "$W/tun2.log")"
+check "swap: a trojan line named by number" 1 "$(grep -c 'nodes line 1: not a vless:// or hysteria2:// link' "$W/tun2.log")"
 check "swap: no link in stderr" 0 "$(grep -c "$UUID" "$W/tun2.log")"
 check "swap: no link in stdout" 0 "$(grep -c "vless://\|$UUID" "$W/ev2")"
 exec 8>&-

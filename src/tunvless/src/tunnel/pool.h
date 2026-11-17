@@ -21,6 +21,8 @@ const char *pool_by_name(int by);
 /* What the pool needs from the protocol. The dialer's ctx is a node. */
 struct pool_proto {
     const struct dialer_ops *ops;
+    const struct dialer_ops *alt;
+    unsigned (*kind)(const void *node);
     /* The same check that chose the node at startup: 0 — alive, otherwise why says what failed. */
     int (*probe)(const void *node, int timeout_s, char *why, size_t why_n);
     int (*probe6)(const void *node, int timeout_s, char *why, size_t why_n);
@@ -63,5 +65,7 @@ void pool_note(int c, int ok);
 int pool_flow_open_on(void *sess, int node, const struct flow_key *k, int udp, const char *host);
 
 int pool_ref_stale(const struct xc_ref *r);
+
+int pool_reach_some(const struct pool_proto *p, const void *const *nodes, size_t n, int timeout_ms, char *ok, int *err);
 
 #endif

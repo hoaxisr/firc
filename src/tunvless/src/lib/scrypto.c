@@ -21,6 +21,10 @@
 #include <arpa/inet.h>
 
 #include <wolfssl/wolfcrypt/settings.h>
+
+#if defined(__mips__) && !defined(WOLFSSL_USE_ALIGN)
+#error "wolfSSL on MIPS needs WOLFSSL_USE_ALIGN"
+#endif
 #include <wolfssl/version.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/sha256.h>
@@ -28,6 +32,7 @@
 #include <wolfssl/wolfcrypt/sha.h>
 #include <wolfssl/wolfcrypt/md5.h>
 #include <wolfssl/wolfcrypt/sha3.h>
+#include <wolfssl/wolfcrypt/blake2.h>
 #include <wolfssl/wolfcrypt/hmac.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/chacha.h>
@@ -811,6 +816,13 @@ out:
     if (sk) wolfSSL_sk_X509_pop_free(sk, wolfSSL_X509_free);
     wolfSSL_X509_free(leaf);
     return rc;
+}
+
+void sc_blake2b256(const uint8_t *in, size_t n, uint8_t out[32]) {
+    Blake2b b;
+    (void)wc_InitBlake2b(&b, 32);
+    (void)wc_Blake2bUpdate(&b, in, (word32)n);
+    (void)wc_Blake2bFinal(&b, out, 32);
 }
 
 /* ---- BLAKE3 --------------------------------------------------------------------------------- */

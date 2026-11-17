@@ -746,6 +746,18 @@ static void cert_window_is_its_own_dates(void) {
     check("garbage leaves the window", 1, nb == 7 && na == 9);
 }
 
+static void blake2b256_matches_python_hashlib(void) {
+    unsigned char out[32];
+    sc_blake2b256((const uint8_t *)"abc", 3, out);
+    check_bytes("BLAKE2b-256(abc)", "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319", out, 32);
+    sc_blake2b256((const uint8_t *)"", 0, out);
+    check_bytes("BLAKE2b-256(empty)", "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8", out, 32);
+    uint8_t ramp[200];
+    for (int i = 0; i < 200; i++) ramp[i] = (uint8_t)(i & 0xff);
+    sc_blake2b256(ramp, sizeof(ramp), out);
+    check_bytes("BLAKE2b-256(0..199)", "63c3d97a9f8894d5e043a707b0fee7f7ec4c049a23bbf1079df20b4165f9e22d", out, 32);
+}
+
 int main(void) {
     struct { const char *pem; struct der *d; } all[] = {
         { PEM_LEAF, &D_LEAF }, { PEM_INTER, &D_INTER }, { PEM_RSALEAF, &D_RSALEAF }, { PEM_P384, &D_P384 },
@@ -758,6 +770,7 @@ int main(void) {
         all[i].d->n = pem_der(all[i].pem, all[i].d->b, sizeof(all[i].d->b));
 
     test_hash();
+    blake2b256_matches_python_hashlib();
     test_hmac();
     test_hkdf();
     test_aead();

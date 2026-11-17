@@ -29,6 +29,7 @@
 #include "tls13.h"
 #include "h2.h"
 #include "xhopts.h"
+#include "sockmark.h"
 
 /* Transport error codes. They share one number space with the VLESS client's codes: -35 and -36
  * are VLESS_CONN_* (client.h), so a new code must not take them. */
@@ -428,16 +429,13 @@ void transport_close(struct transport *t);
 
 const char *transport_strerror(int rc);
 
-/* SO_MARK on sockets to the node, set before connect (--mark): policy routing can then keep them
- * out of the tunnel. 0: no mark. required: a socket the mark cannot be set on is not used. */
-void transport_set_sock_mark(uint32_t mark, int required);
-
-/* SO_BINDTODEVICE on sockets to the node (--bind-dev); NULL or "": none. */
-void transport_set_bind_dev(const char *ifname);
-
 /* Resolve host once and use these addresses for every later connection to it, instead of a DNS
  * query per connection (trdial.c says why). Number of addresses of both families, or TR_EDNS. */
 int transport_pin_host(const char *host);
+
+/* Address i % count of the node's addresses (the pinned ones, else one resolution) as an IP
+ * literal in lit. The count, or -1 when none resolves or lit is too small. */
+int transport_node_ip(const char *host, unsigned i, char *lit, size_t cap);
 int transport_pin_count(const char *host);
 /* host as a URL or Host value has it: an IPv6 address in brackets, else as it is. */
 const char *tr_host_literal(const char *host, char *buf, size_t cap);

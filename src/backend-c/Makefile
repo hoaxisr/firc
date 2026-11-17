@@ -172,6 +172,7 @@ TUNNELS_SRCS := \
 TUNVLESS_PARSER_SRCS := \
     $(TUNVLESS_DIR)/src/proto/vless/sub.c \
     $(TUNVLESS_DIR)/src/proto/vless/sublink.c \
+    $(TUNVLESS_DIR)/src/proto/vless/hy2link.c \
     $(TUNVLESS_DIR)/src/proto/vless/vless_proto.c \
     $(TUNVLESS_DIR)/src/proto/vless/vlink.c \
     $(TUNVLESS_DIR)/src/proto/transport/trpath.c \

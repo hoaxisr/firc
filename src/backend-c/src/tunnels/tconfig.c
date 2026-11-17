@@ -1,4 +1,5 @@
 #include "firc/tunnels.h"
+#include "vless.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -160,7 +161,8 @@ static bool key_seen(ctx_t *c, const node_t *m, const yaml_node_pair_t *p)
 
 static bool link_ok(const char *s)
 {
-    if (strncmp(s, "vless://", 8) != 0 || s[8] == '\0') {
+    size_t scheme = vless_link_scheme(s);
+    if (scheme == 0 || s[scheme] == '\0') {
         return false;
     }
     for (; *s != '\0'; s++) {
@@ -384,7 +386,7 @@ static firc_err_t parse_source(ctx_t *c, node_t *item, size_t ti, size_t i, firc
         return parse_sub(c, sub, ti, i, &src->sub);
     }
     if (!is_scalar(link) || !link_ok(text(link))) {
-        return fail(c, "must be one vless:// link without whitespace", "tunnels[%zu].sources[%zu]", ti, i);
+        return fail(c, "must be one vless://, hysteria2:// or hy2:// link without whitespace", "tunnels[%zu].sources[%zu]", ti, i);
     }
     src->kind = FIRC_TUN_SRC_LINK;
     src->link = strdup(text(link));

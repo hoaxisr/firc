@@ -4203,7 +4203,7 @@ static int gs_watch(unsigned idx, int fd, unsigned ev) {
     return 0;
 }
 
-static const struct mux_host GS_HOST = { gs_submit, gs_watch, rec_wake, NULL, 1, 8000 };
+static const struct mux_host GS_HOST = { gs_submit, gs_watch, rec_wake, NULL, 1, 8000, 0, NULL, NULL, NULL };
 
 /* catches: shared xmux links never woken for their delayed pieces */
 static void t_xconn_gap_shared(void) {

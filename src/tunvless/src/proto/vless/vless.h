@@ -9,6 +9,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define VLESS_PROTO_VLESS 0
+#define VLESS_PROTO_HY2 1
+
+#define HY2_RANGES_MAX 32
+#define HY2_PORTS_CAP (HY2_RANGES_MAX * 12)
+
 /* A node. Fields stay strings, as the link gives them, and the transport takes them as they are
  * (sl_tr_node): there is no second, converted form that could diverge from the first. */
 struct vless_node {
@@ -86,6 +92,15 @@ struct vless_node {
      * built without sublink.c. */
     uint8_t insecure;
     char skip_reason[96];  /* why the node is unusable, for display */
+    uint8_t proto;
+    const char *auth;
+    char obfs[16];
+    const char *obfs_pw;
+    uint32_t up_mbps, down_mbps;
+    char ports[HY2_PORTS_CAP];
+    uint16_t hop_from, hop_to;
+    uint8_t hop_mode;
+    const char *qp;
 };
 
 size_t b64_decode(const char *in, size_t n, char *out, size_t out_n);
@@ -93,11 +108,15 @@ size_t b64_decode(const char *in, size_t n, char *out, size_t out_n);
 /* 0 — usable node, 1 — skipped (reason in skip_reason), -1 — not a vless link. */
 int vless_parse_url(const char *url, struct vless_node *n);
 
+size_t vless_link_scheme(const char *s);
+
 /* Skip reasons, grouped by their text: a subscription of 26 nodes with the same unsupported
  * security gives one line, not 26. There is no reason code on purpose: the text already names the
  * class and the value ("transport X is not supported"), and a code would be a second way to say
  * the same thing that drifts away from the first. */
 #define VLESS_SKIP_REASONS 8
+
+#define VLESS_SUB_NODES_MAX 1024
 
 struct vless_skip {
     /* The same string vless_node.skip_reason would hold, and the same size, so it is not cut. */
@@ -148,6 +167,8 @@ const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_
 /* st may be NULL. */
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
+
+size_t vless_sub_count(const char *text);
 
 /* Subscription file → array of nodes on the heap (the caller frees it), *cnt — usable nodes.
  * NULL — the file did not open, is over 64 MiB, or there is no memory. Below that cap, neither

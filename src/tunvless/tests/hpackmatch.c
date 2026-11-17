@@ -379,7 +379,62 @@ static void t_empty_refused(void) {
     check_prefix("empty: the update still leads the next block", "3f 45", g_out, enc(&g_e, b1, 3));
 }
 
+static uint8_t *hdup(const unsigned char *p, size_t n) {
+    uint8_t *m = malloc(n ? n : 1);
+    if (n) memcpy(m, p, n);
+    return m;
+}
+
+static void t_huffman_decode(void) {
+    static const unsigned char rfc[] = { 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff };
+    uint8_t out[64];
+    uint8_t *in = hdup(rfc, sizeof rfc);
+    check("huffman decode: RFC 7541 C.4.1 length", 15, hpack_huff_decode(in, sizeof rfc, out, sizeof out));
+    check_mem("huffman decode: RFC 7541 C.4.1 bytes", "www.example.com", out, 15);
+    check("huffman decode: output exactly cap", 15, hpack_huff_decode(in, sizeof rfc, out, 15));
+    check("huffman decode: output over cap", -1, hpack_huff_decode(in, sizeof rfc, out, 14));
+    check("huffman decode: cap 0", -1, hpack_huff_decode(in, sizeof rfc, out, 0));
+    free(in);
+
+    unsigned char bad[13];
+    memcpy(bad, rfc, sizeof rfc);
+    bad[12] = 0xff;
+    in = hdup(bad, 13);
+    check("huffman decode: padding of 13 bits", -1, hpack_huff_decode(in, 13, out, sizeof out));
+    free(in);
+    memcpy(bad, rfc, sizeof rfc);
+    bad[11] = 0xfe;
+    in = hdup(bad, 12);
+    check("huffman decode: padding not all ones", -1, hpack_huff_decode(in, 12, out, sizeof out));
+    free(in);
+
+    in = hdup((const unsigned char *)"\xff\xff\xff\xff", 4);
+    check("huffman decode: EOS inside", -1, hpack_huff_decode(in, 4, out, sizeof out));
+    free(in);
+    in = hdup((const unsigned char *)"\xff", 1);
+    check("huffman decode: 8 bits of padding", -1, hpack_huff_decode(in, 1, out, sizeof out));
+    free(in);
+    in = hdup((const unsigned char *)"", 0);
+    check("huffman decode: empty", 0, hpack_huff_decode(in, 0, out, sizeof out));
+    free(in);
+
+    unsigned char all[256], enc[1024], back[256];
+    for (int i = 0; i < 256; i++) all[i] = (unsigned char)i;
+    size_t n = hpe_huff(enc, (const char *)all, 256);
+    in = hdup(enc, n);
+    check("huffman decode: every byte round trips, length", 256, hpack_huff_decode(in, n, back, sizeof back));
+    check_mem("huffman decode: every byte round trips", all, back, 256);
+    free(in);
+    for (size_t k = 0; k < n; k++) {
+        in = hdup(enc, k);
+        int rc = hpack_huff_decode(in, k, back, sizeof back);
+        check("huffman decode: a cut stream is never read past", 1, rc >= -1 && rc <= 256);
+        free(in);
+    }
+}
+
 int main(void) {
+    t_huffman_decode();
     t_rfc_c4();
     t_huffman();
     t_newest_static_name();

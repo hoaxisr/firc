@@ -267,3 +267,37 @@ size_t hpe_block(struct hpe *e, const struct h2_field *f, size_t n, unsigned cha
     for (size_t i = 0; i < n; i++) p = field(e, &f[i], out, p);
     return p;
 }
+
+int hpack_huff_decode(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
+    uint16_t cnt[31] = { 0 }, off[31], sym[256];
+    for (unsigned c = 0; c < 256; c++) cnt[huff_len[c]]++;
+    off[1] = 0;
+    for (unsigned l = 1; l < 30; l++) off[l + 1] = (uint16_t)(off[l] + cnt[l]);
+    for (unsigned c = 0; c < 256; c++) sym[off[huff_len[c]]++] = (uint16_t)c;
+    uint32_t code = 0, first = 0, acc = 0;
+    unsigned idx = 0, len = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        for (int b = 7; b >= 0; b--) {
+            unsigned bit = (in[i] >> b) & 1u;
+            code |= bit;
+            acc = (acc << 1) | bit;
+            len++;
+            uint32_t c = cnt[len];
+            if (code < first + c) {
+                unsigned s = sym[idx + (code - first)];
+                if (o >= cap) return -1;
+                out[o++] = (uint8_t)s;
+                code = first = acc = 0;
+                idx = len = 0;
+            } else {
+                if (len == 30) return -1;
+                idx += c;
+                first = (first + c) << 1;
+                code <<= 1;
+            }
+        }
+    }
+    if (len > 7 || acc != (((uint32_t)1 << len) - 1)) return -1;
+    return (int)o;
+}

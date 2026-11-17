@@ -2,7 +2,7 @@
 #define TUNVLESS_TSCRATCH_H
 #include <stddef.h>
 
-enum ts_slot { TS_H2, TS_H2MUX, TS_H2WIRE, TS_XCONN, TS_GRPC, TS_VENC, TS_WS, TS_XHTTP, TS_N };
+enum ts_slot { TS_H2, TS_H2MUX, TS_H2WIRE, TS_XCONN, TS_GRPC, TS_VENC, TS_WS, TS_XHTTP, TS_QUIC, TS_N };
 
 extern __thread void *ts_g[TS_N];
 

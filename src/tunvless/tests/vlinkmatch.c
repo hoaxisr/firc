@@ -7,6 +7,7 @@
 #include "vless.h"
 #include "sublink.h"
 #include "vlink.h"
+#include "hy2link.h"
 #include "fmask.h"
 #include "sub-pq-samples.h"
 #include "reality.h"
@@ -374,6 +375,219 @@ static void t_fm_roundtrip(void) {
     check("fm overflow: some masked nodes fit", 1, fit > 0);
     check("fm overflow: some masked nodes overflow", 1, over > 0);
     check("fm overflow: refused exactly when the link does not fit", 0, bad);
+}
+
+#define HY2_PIN8 "AB:CD:EF:01:23:45:67:89"
+#define HY2_PIN HY2_PIN8 ":" HY2_PIN8 ":" HY2_PIN8 ":" HY2_PIN8
+#define HY2_P2 "0000000000000000000000000000000000000000000000000000000000000002"
+#define HY2_PIN_HEX "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+static const char *hy2_diff(const struct vless_node *n, const struct vless_node *m) {
+    if (n->proto != m->proto) return "proto";
+    if (strcmp(n->name, m->name)) return "name";
+    if (strcmp(n->host, m->host)) return "host";
+    if (n->port != m->port) return "port";
+    if (strcmp(n->ports, m->ports)) return "ports";
+    if (!same_ptr(n->auth, m->auth)) return "auth";
+    if (strcmp(n->sni, m->sni)) return "sni";
+    if (strcmp(n->obfs, m->obfs)) return "obfs";
+    if (!same_ptr(n->obfs_pw, m->obfs_pw)) return "obfs_pw";
+    if (!same_ptr(n->pcs, m->pcs)) return "pcs";
+    if (!same_ptr(n->vcn, m->vcn)) return "vcn";
+    if (n->allow_insecure != m->allow_insecure) return "allow_insecure";
+    if (n->hop_from != m->hop_from || n->hop_to != m->hop_to) return "hop";
+    if (n->hop_mode != m->hop_mode) return "hop mode";
+    if (n->up_mbps != m->up_mbps || n->down_mbps != m->down_mbps) return "mbps";
+    if (!same_ptr(n->qp, m->qp)) return "qp";
+    return NULL;
+}
+
+static void t_hy2_links(void) {
+    static char buf[1024];
+    struct vless_node n, m;
+    vless_set_insecure(0);
+
+    int rc = vless_parse_url("hysteria2://p%40ss%3Aw@example.com:8443/?sni=cdn.example&obfs=salamander"
+                             "&obfs-password=secret12&pinSHA256=" HY2_PIN "&insecure=0#Node%201", &n);
+    check_str("a_hysteria2_node_writes_its_canonical_link: parsed", "0", rc ? "1" : "0");
+    size_t l = vless_node_link(&n, buf, sizeof buf);
+    check_str("a_hysteria2_node_writes_its_canonical_link",
+          "hysteria2://p%40ss%3Aw@example.com:8443?sni=cdn.example&obfs=salamander&obfs-password=secret12"
+          "&pinSHA256=" HY2_PIN_HEX "#Node%201", buf);
+    check("a_hysteria2_node_writes_its_canonical_link: length", (long)strlen(buf), (long)l);
+
+    rc = vless_parse_url("hysteria2://pw@h.example:443/?sni=s&hop=5-10&upmbps=100&downmbps=200"
+                         "&qp=%7B%20%22initStreamReceiveWindow%22%20%3A%208388608%20%7D", &n);
+    check_str("the_canonical_link_parses_back_to_the_same_node: qp parsed", "0", rc ? "1" : "0");
+    check_str("the_canonical_link_parses_back_to_the_same_node: qp compacted",
+          "{\"initStreamReceiveWindow\":8388608}", n.qp ? n.qp : "(null)");
+    check("the_canonical_link_parses_back_to_the_same_node: hop from", 5, n.hop_from);
+    check("the_canonical_link_parses_back_to_the_same_node: hop to", 10, n.hop_to);
+    check("the_canonical_link_parses_back_to_the_same_node: up", 100, n.up_mbps);
+    check("the_canonical_link_parses_back_to_the_same_node: down", 200, n.down_mbps);
+    vless_node_link(&n, buf, sizeof buf);
+    check_str("the_canonical_link_parses_back_to_the_same_node: link",
+          "hysteria2://pw@h.example:443?sni=s&hop=5-10&upmbps=100&downmbps=200"
+          "&qp=%7B%22initStreamReceiveWindow%22%3A8388608%7D", buf);
+
+    static const char *const v[] = {
+        "hysteria2://p%40ss%3Aw@example.com:8443/?sni=cdn.example&obfs=salamander&obfs-password=secret12"
+        "&pinSHA256=" HY2_PIN "#Node%201",
+        "hy2://pw@1.2.3.4",
+        "hysteria2://pw@h.example:443,5000-6000/?sni=s",
+        "hysteria2://pw@h.example:5000-6000,443/?sni=s&vcn=real.example",
+        "hysteria2://pw@h.example:443/?sni=s&mport=5000-6000",
+        "hysteria2://pw@h.example:443,6000/?sni=s&mport=7000-7100",
+        "hysteria2://a@b@h.example/?sni=s&pcs=" HY2_PIN_HEX "," HY2_P2,
+        "hysteria2://pw@[2001:db8::1]:8443/?sni=s",
+        "hysteria2://pw@[2001:db8::1]:443,5000-6000/?sni=s",
+        "hysteria2://pw@h.example/?sni=s&hop=7&upmbps=1&downmbps=2&qp=%7B%22a%22%3A%5B1%2C2%5D%7D#%D0%A3%D0%B7%D0%B5%D0%BB",
+        "hysteria2://%D0%BF%D0%B0%D1%80@h.example/?sni=s&insecure=1",
+    };
+    for (size_t i = 0; i < sizeof v / sizeof *v; i++) {
+        char what[96];
+        vless_set_insecure(i == sizeof v / sizeof *v - 1);
+        snprintf(what, sizeof what, "the_canonical_link_parses_back_to_the_same_node: input %zu", i);
+        rc = vless_parse_url(v[i], &n);
+        const char *why = rc ? "does not parse" : NULL;
+        if (!why && !vless_node_link(&n, buf, sizeof buf)) why = "no link";
+        if (!why && strncmp(buf, "hysteria2://", 12)) why = "not canonical";
+        if (!why && vless_parse_url(buf, &m)) why = "link does not parse back";
+        if (!why) why = hy2_diff(&n, &m);
+        check_str(what, "ok", why ? why : "ok");
+    }
+    vless_set_insecure(0);
+
+    {
+        struct vless_node x[2];
+        memset(x, 0, sizeof x);
+        size_t got = vless_parse_sub("{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"x\",\"settings\":{\"version\":2,"
+                                     "\"address\":\"h.example\",\"port\":443},\"streamSettings\":{\"network\":\"hysteria\","
+                                     "\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"s.example\"},\"hysteriaSettings\":"
+                                     "{\"version\":2,\"auth\":\"pw\"},\"finalmask\":{\"udp\":[{\"type\":\"udphop\",\"settings\":"
+                                     "{\"mode\":\"intervalRemote\",\"remotePorts\":\"5000-6000\"}}]}}}]}",
+                                     x, 2, NULL);
+        check("an_xray_node_dials_one_port_read_or_linked: parsed", 1, (long)got);
+        check("an_xray_node_dials_one_port_read_or_linked: read directly", 5000, got ? x[0].port : 0);
+        rc = got && vless_node_link(&x[0], buf, sizeof buf) ? vless_parse_url(buf, &m) : -1;
+        check("an_xray_node_dials_one_port_read_or_linked: its link parses", 0, rc);
+        check("an_xray_node_dials_one_port_read_or_linked: through the link", 5000, rc ? 0 : m.port);
+    }
+
+    rc = vless_parse_url("hysteria2://pw@h.example:443/?sni=s&qp=%7B%22a%22%3A1%7D", &n);
+    check("a_bad_qp_marker_is_never_written: parsed", 0, rc);
+    n.qp = HY2_BAD_QP;
+    vless_node_link(&n, buf, sizeof buf);
+    check_str("a_bad_qp_marker_is_never_written", "hysteria2://pw@h.example:443?sni=s", buf);
+}
+
+#define HOPX(settings) "{\"outbounds\":[{\"protocol\":\"hysteria\",\"tag\":\"x\",\"settings\":{\"version\":2," \
+                       "\"address\":\"h.example\",\"port\":443},\"streamSettings\":{\"network\":\"hysteria\"," \
+                       "\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"s.example\"},\"hysteriaSettings\":" \
+                       "{\"version\":2,\"auth\":\"pw\"},\"finalmask\":{\"udp\":[{\"type\":\"udphop\",\"settings\":" \
+                       settings "}]}}}]}"
+
+static void hop_row(const char *what, const char *body, const char *want_link, unsigned want_mode) {
+    static char buf[1024];
+    struct vless_node x[2], m;
+    memset(x, 0, sizeof x);
+    char w[160];
+    size_t got = vless_parse_sub(body, x, 2, NULL);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: parsed", what);
+    check(w, 1, (long)got);
+    if (!got) return;
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: mode read", what);
+    check(w, want_mode, x[0].hop_mode);
+    size_t l = vless_node_link(&x[0], buf, sizeof buf);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: link", what);
+    check_str(w, want_link, l ? buf : "(none)");
+    int rc = l ? vless_parse_url(buf, &m) : -1;
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: link parses", what);
+    check(w, 0, rc);
+    if (rc) return;
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: mode back", what);
+    check(w, want_mode, m.hop_mode);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: same node", what);
+    const char *why = hy2_diff(&x[0], &m);
+    check_str(w, "ok", why ? why : "ok");
+}
+
+static void hop_link_row(const char *url, unsigned want_mode, const char *want_link) {
+    static char buf[1024];
+    struct vless_node n, m;
+    char w[200];
+    int rc = vless_parse_url(url, &n);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: parsed", url);
+    check(w, 0, rc);
+    if (rc) return;
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: mode", url);
+    check(w, want_mode, n.hop_mode);
+    size_t l = vless_node_link(&n, buf, sizeof buf);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: link", url);
+    check_str(w, want_link, l ? buf : "(none)");
+    rc = l ? vless_parse_url(buf, &m) : -1;
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: parses back", url);
+    check(w, 0, rc);
+    if (rc) return;
+    const char *why = hy2_diff(&n, &m);
+    snprintf(w, sizeof w, "hop_mode_round_trips: %s: same node", url);
+    check_str(w, "ok", why ? why : "ok");
+}
+
+static void t_hop_mode_round_trips(void) {
+    hop_row("intervalRemote", HOPX("{\"mode\":\"intervalRemote\",\"remotePorts\":\"20000-20010\",\"interval\":\"10-30\"}"),
+            "hysteria2://pw@h.example:20000-20010?sni=s.example&hop=10-30&hopmode=remote#x", HY2_HOP_REMOTE);
+    hop_row("intervalLocal", HOPX("{\"mode\":\"intervalLocal\"}"),
+            "hysteria2://pw@h.example:443?sni=s.example&hopmode=local#x", HY2_HOP_LOCAL);
+    hop_row("remoteIPs", HOPX("{\"mode\":\"intervalRemote\",\"remotePorts\":\"20000-20010\",\"remoteIPs\":[\"192.0.2.0/24\"]}"),
+            "hysteria2://pw@h.example:20000-20010?sni=s.example&hopmode=remote,ips#x", HY2_HOP_REMOTE | HY2_HOP_IPS);
+    hop_row("perConnRemote", HOPX("{\"mode\":\"perConnRemote\",\"remotePorts\":\"20000-20010\"}"),
+            "hysteria2://pw@h.example:20000-20010?sni=s.example&hopmode=once#x", HY2_HOP_ONCE);
+    hop_row("all three", HOPX("{\"mode\":\"intervalLocal,intervalRemote,perConnRemote\",\"remotePorts\":\"20000-20010\"}"),
+            "hysteria2://pw@h.example:20000-20010?sni=s.example&hopmode=local,remote,once#x",
+            HY2_HOP_LOCAL | HY2_HOP_REMOTE | HY2_HOP_ONCE);
+    hop_row("one remote port", HOPX("{\"mode\":\"intervalRemote\",\"remotePorts\":\"5000\"}"),
+            "hysteria2://pw@h.example:5000?sni=s.example&hopmode=remote#x", HY2_HOP_REMOTE);
+    hop_row("local and remote", HOPX("{\"mode\":\"intervalLocal,intervalRemote\",\"remotePorts\":\"20000-20010\"}"),
+            "hysteria2://pw@h.example:20000-20010?sni=s.example#x", HY2_HOP_LOCAL | HY2_HOP_REMOTE);
+
+    hop_link_row("hysteria2://pw@h.example:443,20000-20002/?sni=s", HY2_HOP_LOCAL | HY2_HOP_REMOTE,
+                 "hysteria2://pw@h.example:443,20000-20002?sni=s");
+    hop_link_row("hysteria2://pw@h.example:443/?sni=s", 0, "hysteria2://pw@h.example:443?sni=s");
+    hop_link_row("hysteria2://pw@h.example:443,20000-20002/?sni=s&hopmode=ips,remote", HY2_HOP_REMOTE | HY2_HOP_IPS,
+                 "hysteria2://pw@h.example:443,20000-20002?sni=s&hopmode=remote,ips");
+    hop_link_row("hysteria2://pw@h.example:443,20000-20002/?sni=s&hopmode=remote&mport=30000", HY2_HOP_REMOTE,
+                 "hysteria2://pw@h.example:443,20000-20002,30000?sni=s&hopmode=remote");
+    hop_link_row("hysteria2://pw@h.example:443-443/?sni=s", HY2_HOP_LOCAL | HY2_HOP_REMOTE,
+                 "hysteria2://pw@h.example:443?sni=s&hopmode=local,remote");
+    hop_link_row("hysteria2://pw@h.example:443,443/?sni=s", HY2_HOP_LOCAL | HY2_HOP_REMOTE,
+                 "hysteria2://pw@h.example:443,443?sni=s");
+    hop_link_row("hysteria2://pw@h.example:443,20000-20002/?sni=s&hopmode=ips", 0,
+                 "hysteria2://pw@h.example:443,20000-20002?sni=s&hopmode=ips");
+    hop_link_row("hysteria2://pw@h.example:443/?sni=s&hopmode=local,ips", HY2_HOP_LOCAL,
+                 "hysteria2://pw@h.example:443?sni=s&hopmode=local");
+    hop_link_row("hysteria2://pw@h.example:443/?sni=s&hopmode=once,ips", HY2_HOP_ONCE | HY2_HOP_IPS,
+                 "hysteria2://pw@h.example:443?sni=s&hopmode=once,ips");
+    hop_link_row("hysteria2://pw@h.example:443/?sni=s&hopmode=local,remote", HY2_HOP_LOCAL | HY2_HOP_REMOTE,
+                 "hysteria2://pw@h.example:443?sni=s&hopmode=local,remote");
+    hop_link_row("hysteria2://pw@h.example:443,20000-20002/?sni=s&hopmode=remote%2Conce", HY2_HOP_REMOTE | HY2_HOP_ONCE,
+                 "hysteria2://pw@h.example:443,20000-20002?sni=s&hopmode=remote,once");
+
+    static const struct { const char *url; const char *why; } bad[] = {
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=far", "hopmode: far is not a mode" },
+        { "hysteria2://pw@h.example:443,20000-20002/?sni=s&hopmode=", "hopmode:  is not a mode" },
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=a%01b", "hopmode: a?b is not a mode" },
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=remote,far", "hopmode: far is not a mode" },
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=remote,,once", "hopmode:  is not a mode" },
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=Remote", "hopmode: Remote is not a mode" },
+        { "hysteria2://pw@h.example:443/?sni=s&hopmode=remotex", "hopmode: remotex is not a mode" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        struct vless_node n;
+        int rc = vless_parse_url(bad[i].url, &n);
+        check("hop_mode_round_trips: a bad mode refuses the node", 1, rc);
+        check_str("hop_mode_round_trips: the refusal names the token", bad[i].why, n.skip_reason);
+    }
 }
 
 int main(void) {
@@ -1132,7 +1346,7 @@ int main(void) {
     }
     {
         char v[32];
-        for (int i = 0; i < 300; i++) {
+        for (int i = 0; i < 5000; i++) {
             snprintf(v, sizeof v, "intern-%d", i);
             sl_intern(v, strlen(v));
         }
@@ -1215,6 +1429,8 @@ int main(void) {
     }
 
     t_fm_roundtrip();
+    t_hy2_links();
+    t_hop_mode_round_trips();
 
     for (size_t i = 0; i < NFIELDS; i++) {
         char what[96];

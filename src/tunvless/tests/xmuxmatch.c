@@ -1130,7 +1130,7 @@ static int gl_watch(unsigned idx, int fd, unsigned ev) {
 
 static int gl_stale(const struct xc_ref *r) { return g_stale_on && (r->node == g_stale_node || r->node == g_stale_node2); }
 
-static const struct mux_host GL_HOST = { gl_submit, gl_watch, gl_wake, NULL, 1, 8000 };
+static const struct mux_host GL_HOST = { gl_submit, gl_watch, gl_wake, NULL, 1, 8000, 0, NULL, NULL, NULL };
 
 static void jobs_run(void) {
     while (g_job_n && !g_hold) {

@@ -1771,7 +1771,7 @@ definitions:
         example: subscription
         type: string
       link:
-        description: 'link only: one vless:// link'
+        description: 'link only: one vless://, hysteria2:// or hy2:// link'
         example: vless://00000000-0000-4000-8000-000000000001@a.example.invalid:443?security=none#A
         type: string
       name:

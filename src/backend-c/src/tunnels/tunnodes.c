@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/socket.h>
 
 #include "vless.h"
@@ -15,6 +14,8 @@
 #define KEY_SUFFIX_ROOM 8
 #define NODES_PER_BODY ((size_t)FIRC_TUN_MAX_NODES * 4)
 #define ROWS_MAX ((size_t)FIRC_TUN_MAX_NODES * 8)
+
+_Static_assert(NODES_PER_BODY <= VLESS_SUB_NODES_MAX, "a body must fit the parser's table of long values");
 
 pthread_mutex_t firc_tun_parse_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_parses;
@@ -232,17 +233,6 @@ static void parse_link(build_t *b, const firc_tun_src_t *src)
     }
 }
 
-static size_t count_vless(const char *s)
-{
-    size_t n = 0;
-    for (const char *p = s; *p != 0; p++) {
-        if ((*p == 'v' || *p == 'V') && strncasecmp(p, "vless", 5) == 0) {
-            n++;
-        }
-    }
-    return n;
-}
-
 static const firc_tun_body_t *find_body(const firc_tun_body_t *bodies, size_t n, const char *url, uint32_t mark,
                                         uint64_t hsig)
 {
@@ -269,7 +259,7 @@ static void parse_body(build_t *b, const firc_tun_src_t *src, const firc_tun_bod
     raw[body->len] = 0;
     dec[0] = 0;
     const char *text = vless_sub_text(raw, body->len, dec, body->len + 16);
-    size_t hint = 1 + count_vless(text);
+    size_t hint = 1 + vless_sub_count(text);
     if (hint > NODES_PER_BODY) {
         hint = NODES_PER_BODY;
     }
@@ -378,6 +368,7 @@ static void collect(build_t *b, uint32_t mark, const firc_tun_body_t *bodies, si
             }
             size_t from = b->n;
             b->refused = false;
+            sl_intern_reset();
             bool have = true;
             if (kind == FIRC_TUN_SRC_LINK) {
                 parse_link(b, src);

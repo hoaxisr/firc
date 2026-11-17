@@ -542,6 +542,18 @@ describe("a new source", () => {
     assert.notStrictEqual(linkProblem("vless://u@h:443 vless://v@h:1", t), null);
     assert.notStrictEqual(linkProblem("", t), null);
   });
+
+  it("hysteria2_and_hy2_links_are_accepted", () => {
+    assert.strictEqual(linkProblem("hysteria2://p@h:443#A", t), null);
+    assert.strictEqual(linkProblem("hy2://p@h", t), null);
+  });
+
+  it("other_schemes_stay_refused", () => {
+    const message = "One vless://, hysteria2:// or hy2:// link";
+    assert.strictEqual(linkProblem("vmess://u@h:443", t), message);
+    assert.strictEqual(linkProblem("hysteria://p@h", t), message);
+    assert.strictEqual(linkProblem("hysteria2:// ", t), message);
+  });
 });
 
 describe("subscription errors", () => {

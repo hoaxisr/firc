@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include "vless.h"
 #include "sublink.h"
+#include "hy2link.h"
 /* tr_upgrade_target: a ws or httpupgrade path is checked here by the same rule the transport
  * builds the request with (src/proto/transport/trpath.c: strings only, no network or libraries). */
 #include "trpath.h"
@@ -328,7 +329,7 @@ void sl_post_range(struct vless_node *n, const char *v) {
  * are copied by value), and parsing the same subscription again finds them already there. The
  * table is bounded: when it is full the node is unusable with a named reason, so a hostile
  * subscription with random keys cannot keep growing memory. */
-#define SUB_INTERN_MAX 256
+#define SUB_INTERN_MAX (VLESS_SUB_NODES_MAX * 4)
 #define SUB_INTERN_DL_MAX 512
 static const char *g_intern[SUB_INTERN_MAX];
 static size_t g_intern_len[SUB_INTERN_MAX];
@@ -754,29 +755,39 @@ int sl_link_param(struct vless_node *n, const char *k, size_t klen, const char *
 }
 
 int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_own_fn own,
-                  const char **secret, size_t *secret_n) {
+                  const char **secret, size_t *secret_n, unsigned flags) {
     memset(n, 0, sizeof(*n));
     size_t scl = strlen(scheme);
     if (strncmp(url, scheme, scl) != 0) return -1;
     const char *p = url + scl;
 
-    const char *at = strchr(p, '@');
-    if (!at) return -1;
-    sl_set_field(n->uuid, sizeof(n->uuid), p, (size_t)(at - p));
+    const char *at = NULL;
+    if (flags & SL_LINK_ANON) {
+        for (const char *q = p + strcspn(p, "/?#"); q > p;)
+            if (*--q == '@') { at = q; break; }
+    } else at = strchr(p, '@');
+    if (!at && !(flags & SL_LINK_ANON)) return -1;
+    size_t sn = at ? (size_t)(at - p) : 0;
+    sl_set_field(n->uuid, sizeof(n->uuid), p, sn);
     if (secret) *secret = p;
-    if (secret_n) *secret_n = (size_t)(at - p);
+    if (secret_n) *secret_n = sn;
 
-    p = at + 1;
+    if (at) p = at + 1;
     /* Host and port end at '?' or '#', parameters end at '#': a name "Fast?type=ws" is not
      * parameters, and "host?type=tcp#name:1" has no port 1. */
     const char *hash = strchr(p, '#');
     const char *hp_end = hash ? hash : p + strlen(p);
     const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
     const char *hend = qmark ? qmark : hp_end;
+    if (flags & SL_LINK_PORTS) {
+        const char *slash = memchr(p, '/', (size_t)(hend - p));
+        if (slash) hend = slash;
+    }
     const char *colon;
     if (*p == '[') {
         const char *rb = memchr(p, ']', (size_t)(hend - p));
-        if (!rb || rb == p + 1 || rb + 1 >= hend || rb[1] != ':') return -1;
+        if (!rb || rb == p + 1) return -1;
+        if (rb + 1 < hend ? rb[1] != ':' : !(flags & SL_LINK_PORTS)) return -1;
         int has_colon = 0;
         for (const char *c = p + 1; c < rb; c++) {
             if (*c == ':') has_colon = 1;
@@ -788,19 +799,29 @@ int sl_link_parse(const char *url, const char *scheme, struct vless_node *n, sl_
         sl_set_field(n->host, sizeof(n->host), p + 1, (size_t)(rb - p - 1));
     } else {
         colon = memchr(p, ':', (size_t)(hend - p));
-        if (!colon) return -1;
+        if (!colon && !(flags & SL_LINK_PORTS)) return -1;
+        if (!colon) colon = hend;
         sl_set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
     }
-    {
+    if ((flags & SL_LINK_PORTS) && !n->host[0]) return -1;
+    if (colon >= hend) {
+        n->port = 443;
+    } else if (flags & SL_LINK_PORTS) {
+        int pr = hy2_ports_canon(colon + 1, (size_t)(hend - colon - 1), n->ports, sizeof n->ports, &n->port);
+        if (pr < 0) return -1;
+        if (pr > 0) snprintf(n->skip_reason, sizeof n->skip_reason, "port list too long");
+        else if (memchr(colon + 1, ',', (size_t)(hend - colon - 1)) || memchr(colon + 1, '-', (size_t)(hend - colon - 1)))
+            n->hop_mode = HY2_HOP_LOCAL | HY2_HOP_REMOTE;
+    } else {
         /* Digits only, up to the end of the host, 1..65535: atoi with a cast would turn
          * ":70000" into 4464, ":-1" into 65535 and ":443abc" into 443. */
         char pnum[8];
         const char *pe = colon + 1;
         size_t pl = 0;
-        while (pe < (qmark ? qmark : hp_end) && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
+        while (pe < hend && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
             pnum[pl++] = *pe++;
         pnum[pl] = '\0';
-        if (!pl || pe != (qmark ? qmark : hp_end)) return -1;
+        if (!pl || pe != hend) return -1;
         n->port = sl_port_of(pnum);
     }
     if (!n->port) return -1;
@@ -930,6 +951,12 @@ int sl_link_usable_pre(struct vless_node *n) {
     return 0;
 }
 
+int sl_link_nowhere(struct vless_node *n) {
+    if (!sl_host_leads_nowhere(n->host)) return 0;
+    snprintf(n->skip_reason, sizeof(n->skip_reason), "%.20s: nobody to answer", n->host);
+    return 1;
+}
+
 /* Second half (sublink.h): what VLESS checks after the id. */
 int sl_link_usable_post(struct vless_node *n) {
     if (strcmp(n->security, "reality") != 0 && strcmp(n->security, "none") != 0 &&
@@ -978,10 +1005,7 @@ int sl_link_usable_post(struct vless_node *n) {
      * would reach this machine (the kernel takes 0.0.0.0 as local) or someone else's network.
      * The reason is reported with the node name as its example, so the panel's message reaches
      * the user. Private networks are not rejected (sl_host_leads_nowhere). */
-    if (sl_host_leads_nowhere(n->host)) {
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "%.20s: nobody to answer", n->host);
-        return 1;
-    }
+    if (sl_link_nowhere(n)) return 1;
 
     /* Supported xhttp modes (empty means auto):
      *

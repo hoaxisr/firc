@@ -122,8 +122,8 @@ static int vl_has_data(const void *sess) {
 
 /* The node's id does not parse, and the connection is closed. Say why: from outside a silent
  * close looks like "no traffic". It cannot happen today (a node with a bad UUID is dropped when
- * the nodes are parsed, and vless_tunnel_run checks the first node's before the device comes
- * up), so the line is rate limited rather than per packet. The UUID is not printed: it is the
+ * the nodes are parsed, and vless_tunnel_run checks the first node's, when it is VLESS, before
+ * the device comes up), so the line is rate limited rather than per packet. The UUID is not printed: it is the
  * key to the node. */
 static void node_id_refused(const struct vless_node *node, const char *what) {
     static __thread time_t said;
@@ -470,7 +470,10 @@ static int vl_send(const void *ctx, void *sess, const struct flow_key *k, int ud
  * or nothing, and a datagram split over two calls could leave half-sent on a closed window: the
  * server would read the length and wait for a tail that never comes, and the next datagram
  * would land inside the previous one. */
-static size_t vl_dgram_frame(const unsigned char *p, size_t n, unsigned char *out, size_t cap) {
+static size_t vl_dgram_frame(const void *ctx, const void *sess, const unsigned char *p, size_t n, unsigned char *out,
+                             size_t cap) {
+    (void)ctx;
+    (void)sess;
     if (n > UDP_DGRAM_MAX || 2 + n > cap) return 0;
     out[0] = (unsigned char)(n >> 8);
     out[1] = (unsigned char)n;
@@ -676,7 +679,7 @@ int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_
      * mean a tunnel that is up but closes everything. */
     const struct vless_node *node = pc->node(pc->first);
     unsigned char id[16];
-    if (vless_uuid_parse(node->uuid, id) != 0) {
+    if (node->proto != VLESS_PROTO_HY2 && vless_uuid_parse(node->uuid, id) != 0) {
         fprintf(stderr, "tunvless[error]: the UUID of node %s does not parse — %s is not brought up; "
                         "check the node's link\n", node->name, tc->dev);
         return 1;

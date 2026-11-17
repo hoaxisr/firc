@@ -166,3 +166,9 @@ firc, [mt-c](https://github.com/dan0102dan/mt-c) и оригинальный Mag
 ## Лицензия
 
 GPL-3.0-or-later, см. [LICENSE](LICENSE).
+
+Шесть файлов клиента Hysteria2 адаптированы из [steer](https://github.com/splify2/steer) (ревизия 70d11eb, GPL-3.0) и изменены: `quic.c`, `quic.h`, `qcssl.c`, `qcssl.h` в `src/tunvless/src/proto/quic/` и `hy2conn.c`, `hy2conn.h` в `src/tunvless/src/proto/hysteria2/`. Об этом говорит первая строка каждого из них.
+
+QUIC в tunvless — библиотека [ngtcp2](https://github.com/ngtcp2/ngtcp2) под лицензией MIT, Copyright (c) 2016 ngtcp2 contributors; её исходники скачиваются при сборке.
+
+Так же при сборке скачиваются и входят в tunvless: wolfSSL (GPL-3.0), zlib (лицензия zlib, Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler), brotli (MIT, Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors) и zstd (BSD, Copyright (c) Meta Platforms, Inc. and affiliates).

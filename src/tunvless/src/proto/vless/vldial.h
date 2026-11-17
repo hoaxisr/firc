@@ -58,7 +58,8 @@ extern const struct dialer_ops vless_dialer;
 void vl_set_trace(int on);
 
 /* Bring the tunnel up over the node pool pc (src/tunnel/pool.h) with this dialer as its protocol:
- * first the check that cannot wait for the first connection (the UUID of pc->first), then
+ * first the check that cannot wait for the first connection (the UUID of pc->first when it is a
+ * VLESS node), then
  * pool_run. Returns the process exit code, never 0: the loop has no successful exit. */
 int vless_tunnel_run(const struct tun_cfg *tc, const struct pool_cfg *pc, stack_ready_fn ready,
                      void *arg);

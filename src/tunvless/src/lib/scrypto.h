@@ -209,6 +209,8 @@ void sc_blake3_hash(unsigned char out[32], const void *in, size_t n);
 void sc_blake3_derive_key(unsigned char *out, size_t out_n, const void *ctx, size_t ctx_n,
                           const void *material, size_t material_n);
 
+void sc_blake2b256(const uint8_t *in, size_t n, uint8_t out[32]);
+
 /* ---- signatures and certificates ---------------------------------------------------------- */
 
 enum sc_sig_alg { SC_SIG_RSA_PKCS1 = 1, SC_SIG_RSA_PSS = 2, SC_SIG_ECDSA = 3 };

@@ -288,7 +288,7 @@ export class TunnelsPage {
   async addLink(id: string, link: string) {
     await this.card(id).getByRole("button", { name: "Link", exact: true }).click();
     const dialog = this.page.getByRole("dialog");
-    await dialog.getByLabel("vless:// link").fill(link);
+    await dialog.getByLabel("Node link").fill(link);
     await dialog.getByRole("button", { name: "Add", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
   }

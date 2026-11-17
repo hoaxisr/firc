@@ -3,6 +3,7 @@
 #include <string.h>
 #include "vlink.h"
 #include "sublink.h"
+#include "hy2link.h"
 
 struct wbuf { char *p; size_t cap, n, need; int over, q, bad; };
 
@@ -51,7 +52,7 @@ static void param(struct wbuf *w, const char *k, const char *v) {
 
 static int is_marker(const char *v) {
     return v == SL_BAD_PQV || v == SL_FULL || v == SL_BAD_PIN || v == SL_BAD_ECH || v == SL_ECH_DNS ||
-           v == SL_BAD_XHX || v == SL_BAD_XHX_JSON || v == SL_BAD_FM;
+           v == SL_BAD_XHX || v == SL_BAD_XHX_JSON || v == SL_BAD_FM || v == HY2_BAD_QP;
 }
 
 static void param_long(struct wbuf *w, const char *k, const char *v) {
@@ -225,8 +226,71 @@ static int clean(const char *s, const char *bad) {
     return 1;
 }
 
+static int hy2_link_build(const struct vless_node *n, struct wbuf *w0) {
+    if (!n->auth || is_marker(n->auth) || !n->auth[0]) return -1;
+    int v6 = strchr(n->host, ':') != NULL;
+    if (!clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return -1;
+    if (v6 && strspn(n->host, "0123456789abcdefABCDEF:.") != strlen(n->host)) return -1;
+    struct wbuf w = *w0;
+    if (w.p) w.p[0] = '\0';
+    puts_(&w, "hysteria2://");
+    put_pct(&w, n->auth);
+    put(&w, "@", 1);
+    if (v6) put(&w, "[", 1);
+    puts_(&w, n->host);
+    if (v6) put(&w, "]", 1);
+    if (n->ports[0]) {
+        put(&w, ":", 1);
+        puts_(&w, n->ports);
+        put(&w, "?", 1);
+    } else {
+        char port[8];
+        snprintf(port, sizeof port, ":%u?", n->port);
+        puts_(&w, port);
+    }
+    char num[16];
+    param(&w, "sni", n->sni);
+    param(&w, "obfs", n->obfs);
+    param_long(&w, "obfs-password", n->obfs_pw);
+    param_long(&w, "pinSHA256", n->pcs);
+    param_long(&w, "vcn", n->vcn);
+    if (n->allow_insecure) param(&w, "insecure", "1");
+    if (n->hop_to) {
+        range(num, sizeof num, n->hop_from, n->hop_to);
+        param(&w, "hop", num);
+    }
+    if (n->hop_mode != (n->ports[0] ? HY2_HOP_LOCAL | HY2_HOP_REMOTE : 0u)) {
+        char t[24];
+        size_t o = 0;
+        t[0] = '\0';
+        if (n->hop_mode & HY2_HOP_LOCAL) o += (size_t)snprintf(t + o, sizeof t - o, "%slocal", o ? "," : "");
+        if (n->hop_mode & HY2_HOP_REMOTE) o += (size_t)snprintf(t + o, sizeof t - o, "%sremote", o ? "," : "");
+        if (n->hop_mode & HY2_HOP_ONCE) o += (size_t)snprintf(t + o, sizeof t - o, "%sonce", o ? "," : "");
+        if (n->hop_mode & HY2_HOP_IPS || !o) snprintf(t + o, sizeof t - o, "%sips", o ? "," : "");
+        if (w.q++) put(&w, "&", 1);
+        puts_(&w, "hopmode=");
+        puts_(&w, t);
+    }
+    if (n->up_mbps) {
+        snprintf(num, sizeof num, "%u", n->up_mbps);
+        param(&w, "upmbps", num);
+    }
+    if (n->down_mbps) {
+        snprintf(num, sizeof num, "%u", n->down_mbps);
+        param(&w, "downmbps", num);
+    }
+    param_long(&w, "qp", n->qp);
+    if (n->name[0]) {
+        put(&w, "#", 1);
+        put_pct(&w, n->name);
+    }
+    *w0 = w;
+    return w.bad ? -1 : 0;
+}
+
 static int link_build(const struct vless_node *n, struct wbuf *w0) {
     if (n->skip_reason[0] || !n->port || !n->host[0]) return -1;
+    if (n->proto == VLESS_PROTO_HY2) return hy2_link_build(n, w0);
     int v6 = strchr(n->host, ':') != NULL;
     if (!clean(n->uuid, "@") || !clean(n->host, v6 ? "?#[]@/%" : "?#[]@/:")) return -1;
     if (v6 && strspn(n->host, "0123456789abcdefABCDEF:.") != strlen(n->host)) return -1;

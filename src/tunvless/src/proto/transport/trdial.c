@@ -1,7 +1,7 @@
-/* The socket to the node: TCP to EVERY address of the name, not just the first, plus the mark
- * and the bound device that keep it out of the tunnel (the bottom layer in transport.h). Nothing
- * here depends on the protocol. Every connection to a node goes through tr_dial, so all of them
- * share the address search, the winner cache and the mark.
+/* The socket to the node: TCP to EVERY address of the name, not just the first (the bottom layer
+ * in transport.h). Nothing here depends on the protocol. Every connection to a node goes through
+ * tr_dial, so all of them share the address search and the winner cache; the mark and the bound
+ * device are applied through tr_sock_prepare.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,7 +17,6 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <time.h>
-#include <net/if.h>
 #include <pthread.h>
 
 #include "transport.h"
@@ -103,27 +102,6 @@ static void sock_ready(int fd, int timeout_s) {
      * to several megabytes on its own. The limits belong to the system, in net.ipv4.tcp_rmem. */
 }
 
-/* --mark: SO_MARK on every socket to the node, set before connect — the route, and with it the
- * device and the source address, is chosen there, by the mark. required: a socket the mark cannot
- * be set on is not used, or it would silently take the unmarked route — into the tunnel. */
-static uint32_t g_sock_mark;
-static int g_sock_mark_req;
-
-void transport_set_sock_mark(uint32_t mark, int required) {
-    g_sock_mark = mark;
-    g_sock_mark_req = mark && required;
-}
-
-/* --bind-dev: sockets to the node leave through this interface (SO_BINDTODEVICE) whatever the
- * routing table says — the other way, next to SO_MARK, to keep them out of the tunnel when the
- * default route points into it. A socket that cannot be bound is not used: unbound, it would go
- * into the tunnel and loop. */
-static char g_bind_dev[IFNAMSIZ];
-
-void transport_set_bind_dev(const char *ifname) {
-    snprintf(g_bind_dev, sizeof(g_bind_dev), "%s", ifname ? ifname : "");
-}
-
 /* Addresses of the nodes resolved once, at startup (transport_pin_host). Once the routes point into
  * the tunnel, the DNS query for a node's name would itself go into the tunnel and wait for a
  * connection that is waiting for that query. */
@@ -196,6 +174,16 @@ static unsigned pinned(const char *host, struct tr_ip out[ADDR_MAX]) {
     if (!p) return 0;
     memcpy(out, p->ip, p->n * sizeof(out[0]));
     return p->n;
+}
+
+int transport_node_ip(const char *host, unsigned i, char *lit, size_t cap) {
+    struct tr_ip a[ADDR_MAX];
+    unsigned n = pinned(host, a);
+    if (n == 0) n = g_resolve(host, a);
+    if (n == 0) return -1;
+    const struct tr_ip *p = &a[i % n];
+    if (!inet_ntop(p->v6 ? AF_INET6 : AF_INET, p->b, lit, (socklen_t)cap)) return -1;
+    return (int)n;
 }
 
 int transport_pin_count(const char *host) {
@@ -353,30 +341,7 @@ void transport_pin_hosts(const char *const *hosts, size_t n, int timeout_ms, tra
 static int attempt_start(const struct tr_ip *ip, uint16_t port, int *done) {
     int fd = socket(ip->v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
-    /* Before connect(): connect is where the kernel picks the route by the mark (see --mark
-     * above). */
-    if (g_sock_mark &&
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
-        g_sock_mark_req) {
-        static int told;
-        if (!told) {
-            told = 1;
-            fprintf(stderr, "tunvless[warn]: cannot set mark 0x%08x on a socket to the node "
-                            "(%s) — not connecting: unmarked, it would go into the tunnel\n",
-                    g_sock_mark, strerror(errno));
-        }
-        close(fd);
-        return -1;
-    }
-    if (g_bind_dev[0] &&
-        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_bind_dev, (socklen_t)strlen(g_bind_dev) + 1) != 0) {
-        static int told;
-        if (!told) {
-            told = 1;
-            fprintf(stderr, "tunvless[warn]: cannot bind a socket for the node to %s (%s) — not "
-                            "connecting: unbound, it would go into the tunnel\n",
-                    g_bind_dev, strerror(errno));
-        }
+    if (tr_sock_prepare(fd) != 0) {
         close(fd);
         return -1;
     }

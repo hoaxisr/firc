@@ -36,6 +36,10 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
 
 int vless_probe6(const struct vless_node *node, int timeout_s, char *why, size_t why_n);
 
+struct probe_target { unsigned char ip[16]; size_t ip_len; const char *host; };
+extern const struct probe_target PROBE_TARGETS[2], PROBE6_TARGETS[2];
+size_t probe_get(const struct probe_target *tg, char *out, size_t cap);
+
 /* The reason text for a VLESS or transport code. */
 const char *vless_strerror(int rc);
 

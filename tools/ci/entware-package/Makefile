@@ -399,7 +399,8 @@ define Build/Compile
 			-Wl,-rpath-link,$(STAGING_DIR)/opt/lib"
 	$(MAKE) -C $(PKG_BUILD_DIR)/src/tunvless CC="$(TARGET_CC)" AR="$(TARGET_CROSS)ar" \
 		CFLAGS="$(TARGET_CFLAGS)" VERSION="$(PKG_VERSION)" \
-		LDFLAGS="$(TARGET_LDFLAGS) -Wl,--dynamic-linker=/opt/lib/$(FIRC_DYNAMIC_LINKER) -Wl,-rpath,/opt/lib"
+		LDFLAGS="$(TARGET_LDFLAGS) -Wl,--dynamic-linker=/opt/lib/$(FIRC_DYNAMIC_LINKER) -Wl,-rpath,/opt/lib" \
+		all
 endef
 
 define Package/firc/install
