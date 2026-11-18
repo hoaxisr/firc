@@ -11,6 +11,7 @@
 #include "hy2conn.h"
 #include "hy2node.h"
 #include "hy2link.h"
+#include "hy2loss.h"
 #include "transport.h"
 
 #define DIAL_MS 8000
@@ -23,6 +24,8 @@
 #define UDP_QMAX 128
 #define PRE_MAX (4 * RXC_CAP)
 #define SAID_MAX 64
+#define STATS_NS 1000000000ull
+#define LOSS_SAY_MS 600000u
 
 enum { S_NONE, S_OPEN, S_WAIT, S_LIVE, S_FAIL };
 enum { E_NONE, E_FIN, E_RESET, E_LINK };
@@ -42,7 +45,10 @@ struct link {
     struct hy2c *c;
     const void *node;
     struct xc_ref ref;
-    uint64_t started, rx_asked;
+    uint64_t started, rx_asked, st_at;
+    struct qc_stats st;
+    struct hy2loss loss;
+    uint64_t wait[3];
     unsigned ign, unparroted;
     uint16_t port;
     struct hy2_sess *head, *tail;
@@ -70,6 +76,8 @@ static __thread struct thr *g_t;
 
 static struct { const void *node; uint64_t h; int kind; } g_said[SAID_MAX];
 static unsigned g_said_rr;
+static struct { const void *node; uint64_t next; } g_loss_said[SAID_MAX];
+static unsigned g_loss_rr;
 static pthread_mutex_t g_said_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t tkey(int64_t sid) { return ((uint64_t)sid >> 2) << 1; }
@@ -345,6 +353,30 @@ static int said_new(const void *node, int kind, const char *line, size_t cut_fro
     return fresh;
 }
 
+static int loss_due(const void *node, uint64_t now) {
+    pthread_mutex_lock(&g_said_mu);
+    unsigned i = 0;
+    while (i < SAID_MAX && g_loss_said[i].node != node) i++;
+    if (i == SAID_MAX) {
+        i = g_loss_rr++ % SAID_MAX;
+        g_loss_said[i].node = node;
+        g_loss_said[i].next = 0;
+    }
+    int due = now >= g_loss_said[i].next;
+    if (due) g_loss_said[i].next = now + LOSS_SAY_MS;
+    pthread_mutex_unlock(&g_said_mu);
+    return due;
+}
+
+static void loss_say(const struct link *l, uint64_t now) {
+    const struct vless_node *n = l->node;
+    if (!loss_due(n, now)) return;
+    char nm[sizeof n->name];
+    fprintf(stderr, "tunvless[info]: hysteria2 %s: lossy path on port %u: %llu of %llu packets lost\n",
+            clean(n->name, nm, sizeof nm), (unsigned)hy2c_sock_port(l->c), (unsigned long long)l->loss.run_lost,
+            (unsigned long long)l->loss.run_sent);
+}
+
 static void ready_say(const struct link *l) {
     static const char *const keys[] = { "bbrProfile", "debug", "initStreamReceiveWindow", "maxStreamReceiveWindow",
                                         "initConnectionReceiveWindow", "maxConnectionReceiveWindow", "maxIdleTimeout",
@@ -374,10 +406,49 @@ static void ready_say(const struct link *l) {
     if (said_new(n, 0, b, cut_from, cut_to)) fprintf(stderr, "tunvless[info]: %s\n", b);
 }
 
+static void stats_take(struct link *l, uint64_t t) {
+    l->st_at = t;
+    hy2c_stats(l->c, &l->st);
+    hy2c_wait(l->c, t, l->wait);
+}
+
+static void stats_say(struct link *l, uint64_t now) {
+    uint64_t t = hy2c_clock(l->c, now * 1000000u);
+    if (t < l->st_at + STATS_NS) return;
+    struct qc_stats p = l->st;
+    uint64_t span = t - l->st_at, w[3];
+    memcpy(w, l->wait, sizeof w);
+    stats_take(l, t);
+    const struct qc_stats *s = &l->st;
+    if (hy2loss_step(&l->loss, s->cc_sent - p.cc_sent, s->cc_lost - p.cc_lost, s->hops != p.hops, span / 1000000u) ==
+        HY2LOSS_LOSSY)
+        loss_say(l, now);
+    if (s->pay_tx == p.pay_tx && s->pay_rx == p.pay_rx) return;
+    const struct vless_node *n = l->node;
+    char nm[sizeof n->name], b[sizeof nm + 448];
+    size_t k = 0;
+    put(b, sizeof b, &k, "hysteria2 %s: stats span %llu port %u %s cwnd %llu flight %llu srtt %llu min %llu",
+        clean(n->name, nm, sizeof nm), (unsigned long long)(span / 1000000u), (unsigned)s->port, s->cc == QC_CC_BRUTAL ? "brutal" : s->cc == QC_CC_RENO ? "reno" : "bbr",
+        (unsigned long long)s->cwnd, (unsigned long long)s->in_flight, (unsigned long long)(s->rtt_us / 1000),
+        (unsigned long long)(s->min_rtt_us / 1000));
+    put(b, sizeof b, &k, " sent %llu lost %llu/%llu acked %llu rx %llu", (unsigned long long)(s->bytes_sent - p.bytes_sent),
+        (unsigned long long)(s->cc_lost - p.cc_lost), (unsigned long long)(s->cc_sent - p.cc_sent),
+        (unsigned long long)(s->bytes_acked - p.bytes_acked), (unsigned long long)(s->bytes_recv - p.bytes_recv));
+    put(b, sizeof b, &k, " wait cwnd %llu credit %llu budget %llu",
+        (unsigned long long)((l->wait[QC_WAIT_CWND] - w[QC_WAIT_CWND]) / 1000000u),
+        (unsigned long long)((l->wait[QC_WAIT_CREDIT] - w[QC_WAIT_CREDIT]) / 1000000u),
+        (unsigned long long)((l->wait[QC_WAIT_BUDGET] - w[QC_WAIT_BUDGET]) / 1000000u));
+    if (s->bbr_state)
+        put(b, sizeof b, &k, " bbr %s bw %llu pace %llu", s->bbr_state, (unsigned long long)s->bbr_bw,
+            (unsigned long long)s->pacing_bps);
+    fprintf(stderr, "tunvless[debug]: %s\n", b);
+}
+
 static void c_ready(void *u, uint64_t rx, int udp) {
     (void)rx;
     struct link *l = u;
     ready_say(l);
+    stats_take(l, hy2c_clock(l->c, g_t->now * 1000000u));
     l->state = L_READY;
     l->udp_ok = (uint8_t)udp;
     for (struct hy2_sess *s = l->head, *nx; s; s = nx) {
@@ -790,6 +861,7 @@ static int m_pass(uint64_t now, int phase) {
         if (l->state == L_DEAD || (l->state == L_READY && !l->flows && stale(l))) link_free(i);
         if (l->state != L_DIAL && l->state != L_READY) continue;
         if (l->fdx && !l->hop_said) hop_say(l);
+        if (l->state == L_READY) stats_say(l, now);
         int moved = l->state == L_READY && l->pre_n ? pre_pass(l) : 0;
         hy2c_flush(l->c);
         int ms = moved ? 1 : due_of(l, now);
@@ -1042,6 +1114,10 @@ unsigned long hy2d_udp_in(void) { return g_t ? g_t->udp_in : 0; }
 int hy2d_link_dead(const struct hy2_sess *s) {
     const struct link *l = link_of(s);
     return l && l->state == L_DEAD;
+}
+void hy2d_loss_said_reset(void) {
+    memset(g_loss_said, 0, sizeof g_loss_said);
+    g_loss_rr = 0;
 }
 #endif
 

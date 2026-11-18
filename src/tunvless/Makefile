@@ -107,7 +107,7 @@ $(O)/scrypto.o: $(CRYPTO_SRC) src/lib/scrypto.h src/lib/blake3.h $(WOLFSSL_LIB)
 
 QUIC_FLAGS = -Isrc/proto/quic $(shell cat $(NGTCP2_LIB).cflags 2>/dev/null)
 
-HY2_OBJS := $(O)/quic.o $(O)/qcssl.o $(O)/qcbrutal.o $(O)/hy2wire.o $(O)/hy2conn.o $(O)/hy2node.o $(O)/hy2run.o $(O)/hy2check.o $(O)/hy2dial.o
+HY2_OBJS := $(O)/quic.o $(O)/qcssl.o $(O)/qcbrutal.o $(O)/hy2wire.o $(O)/hy2conn.o $(O)/hy2node.o $(O)/hy2run.o $(O)/hy2check.o $(O)/hy2dial.o $(O)/hy2loss.o
 
 $(O)/quic.o: src/proto/quic/quic.c src/proto/quic/quic.h src/proto/quic/qcssl.h src/proto/quic/ngcc.h src/proto/quic/qcbrutal.h src/lib/osrand.h src/lib/tscratch.h src/lib/portpick.h $(NGTCP2_LIB)
 	@mkdir -p $(O)
@@ -147,6 +147,10 @@ $(O)/hy2dial.o: src/proto/hysteria2/hy2dial.c $(HDR)
 	@mkdir -p $(O)
 	$(CC) $(ALL_CFLAGS) $(HY2_CFLAGS) -c $< -o $@
 
+$(O)/hy2loss.o: src/proto/hysteria2/hy2loss.c src/proto/hysteria2/hy2loss.h
+	@mkdir -p $(O)
+	$(CC) $(ALL_CFLAGS) -c $< -o $@
+
 $(O)/tunvless: $(SRC) $(HDR) $(HY2_OBJS) $(O)/scrypto.o $(O)/certzip.o $(NGTCP2_LIB) $(WOLFSSL_LIB) $(CERTZIP_LIBS)
 	@mkdir -p $(O)
 	$(CC) $(ALL_CFLAGS) $(HY2_CFLAGS) $(DEFS) -o $@ $(SRC) $(HY2_OBJS) $(O)/scrypto.o $(O)/certzip.o $(NGTCP2_LIB) $(WOLFSSL_LIB) \
@@ -172,7 +176,7 @@ SCRATCH_SRC := src/lib/tscratch.c
 FMLINK_SRC := src/proto/transport/fmlink.c src/proto/transport/fmask.c src/proto/transport/fmfrag.c src/proto/transport/fmhc.c src/lib/osrand.c \
               src/proto/transport/fmsd.c src/proto/transport/fmsdtab.c src/lib/gorand.c
 
-UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch tscratchmatch gorandmatch brutalmatch portpickmatch
+UNIT := h2match h2muxmatch hpackmatch xhupmatch wsmatch pqfallbackmatch b3match visionmatch submatch subpq vlinkmatch tungromatch tunnamematch tunnelmatch rtxmatch grpcmatch ctlmatch nodesmatch ctlnodesmatch ctlmapmatch ctlinbmatch ibhsmatch dialmatch ratelogmatch xhoptsmatch xmuxmatch tun6match vreqmatch addr6match fmaskmatch fmlinkmatch tstackmatch tscratchmatch gorandmatch brutalmatch portpickmatch hy2lossmatch
 CRYPTO_TESTS := scryptomatch hellofreeze echmatch vlessmatch takematch certzipmatch xudpmatch probematch xconnmatch fmsdmatch quicmatch hy2wirematch hy2connmatch hy2checkmatch hy2dialmatch
 
 test: unit-test crypto-test $(O)/tunvless
@@ -323,6 +327,10 @@ $(T)/portpickmatch: tests/portpickmatch.c src/lib/portpick.c src/lib/portpick.h 
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -o $@ tests/portpickmatch.c src/lib/portpick.c
 
+$(T)/hy2lossmatch: tests/hy2lossmatch.c src/proto/hysteria2/hy2loss.c src/proto/hysteria2/hy2loss.h tests/unit.h
+	@mkdir -p $(T)
+	$(CC) $(T_CFLAGS) -o $@ tests/hy2lossmatch.c src/proto/hysteria2/hy2loss.c
+
 $(T)/tscratchmatch: tests/tscratchmatch.c src/lib/tscratch.c src/lib/tscratch.h tests/unit.h
 	@mkdir -p $(T)
 	$(CC) $(T_CFLAGS) -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_setspecific -o $@ tests/tscratchmatch.c src/lib/tscratch.c -lpthread
@@ -443,7 +451,7 @@ $(T)/hy2checkmatch: tests/hy2checkmatch.c tests/hy2peer.h tests/hy2-frozen.h tes
 	$(CC) $(T_CFLAGS) $(QC_TFLAGS) -Isrc/proto/hysteria2 $(HY2CHK_WRAP) -o $@ tests/hy2checkmatch.c $(HY2CHK_SRC) \
 		$(T)/quic.o $(T)/qcssl.o $(T)/qcbrutal.o $(T)/certgen.o $(T_CERTZIP) $(TN_LIB) $(T_CRYPTO)
 
-HY2DIAL_SRC := src/proto/hysteria2/hy2dial.c $(filter-out src/proto/hysteria2/hy2run.c src/proto/hysteria2/hy2check.c,$(HY2CHK_SRC))
+HY2DIAL_SRC := src/proto/hysteria2/hy2dial.c src/proto/hysteria2/hy2loss.c $(filter-out src/proto/hysteria2/hy2run.c src/proto/hysteria2/hy2check.c,$(HY2CHK_SRC))
 $(T)/hy2dialmatch: tests/hy2dialmatch.c tests/hy2peer.h tests/hy2-frozen.h tests/certgen.h tests/unit.h $(HY2DIAL_SRC) \
                    src/proto/transport/trdial.c $(T)/quic.o $(T)/qcssl.o $(T)/qcbrutal.o $(T)/certgen.o $(T)/scrypto.o $(T)/certzip.o $(HDR)
 	$(CC) $(T_CFLAGS) $(QC_TFLAGS) -Isrc/proto/hysteria2 -Wl,--wrap=tr_sock_prepare -Wl,--wrap=connect \

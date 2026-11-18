@@ -436,6 +436,7 @@ static void begin(void) {
     g_due = 0;
     g_room_owner = -1;
     g_room_at_wake = -1;
+    hy2d_loss_said_reset();
     hy2_mux.host(&g_h);
     hy2_mux.pass(ms_now(), MUXP_EARLY);
 }
@@ -938,6 +939,324 @@ static void a_cut_link_is_named_once(void) {
     e = err_close();
     check("cut line: an idle link closes", 1, r == 0 && off && g_sn_n == 1);
     check("cut line: an idle close is no cut", 0, err_lines(e, "link cut", 0));
+    end();
+}
+
+#define SEC_NS 1000000000ull
+
+static int link_quiet(struct hy2c *c) {
+    struct qc_stats a, b;
+    hy2c_stats(c, &a);
+    qc_stats_get(g_p[0].q, &b);
+    return a.in_flight == 0 && b.in_flight == 0;
+}
+
+static struct hy2c *clocked_link(int i, const struct vless_node *n, const char *ip, uint64_t *t0) {
+    if (fl_open(i, n, ip, 80, 0) != 0 || fl_attach(i, 0) != XA_WAIT) return NULL;
+    struct hy2c *c = hy2d_link_conn(last_link());
+    if (!c) return NULL;
+    *t0 = hy2c_opened_ns(c);
+    hy2c_clock_set(c, *t0);
+    if (!PUMP_UNTIL(wakes((uint16_t)i, XW_DONE) > 0) || wake_rc((uint16_t)i, XW_DONE) != 0) return NULL;
+    return c;
+}
+
+static void stats_at(struct hy2c *c, uint64_t t) {
+    hy2c_clock_set(c, t);
+    hy2_mux.pass(ms_now(), MUXP_LATE);
+}
+
+static void peer_only_for(unsigned ms) {
+    uint64_t e = ms_now() + ms;
+    while (ms_now() < e) {
+        struct epoll_event ev[64];
+        int n = epoll_wait(g_ep, ev, 64, 5);
+        for (int i = 0; i < n; i++) {
+            uint32_t tok = ev[i].data.u32;
+            if (tok >= TOK_PEER && tok < TOK_PEER + NP && g_p_on[tok - TOK_PEER] && !g_p[tok - TOK_PEER].closed)
+                (void)qc_on_readable(g_p[tok - TOK_PEER].q);
+        }
+        for (int k = 0; k < NP; k++) {
+            if (!g_p_on[k]) continue;
+            if (!g_p[k].closed && qc_timeout_ms(g_p[k].q) == 0) (void)qc_on_timer(g_p[k].q);
+            hp_drain(&g_p[k]);
+            qc_flush(g_p[k].q);
+        }
+    }
+}
+
+static unsigned long long field(const char *line, const char *key) {
+    const char *p = line ? strstr(line, key) : NULL;
+    return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
+}
+
+static void stats_round(const char *name, const char *shown, const char *qp, const char *rx, const char *cc) {
+    begin();
+    uint16_t port = peer_start(0, 0);
+    if (rx) {
+        g_p[0].auth_mode = HP_AUTH_RX;
+        g_p[0].rx_answer = rx;
+    }
+    struct vless_node n;
+    node_make(&n, "127.0.0.1", port);
+    snprintf(n.name, sizeof n.name, "%s", name);
+    n.qp = qp;
+    char b[160], head[160], want[600];
+    uint64_t t0 = 0;
+    struct hy2c *c = clocked_link(1, &n, "10.0.0.1", &t0);
+    snprintf(b, sizeof b, "stats %s: a ready link on the test clock", cc);
+    check(b, 1, c != NULL);
+    NEED(c);
+    g_sk[1].auto_rd = 1;
+    snprintf(b, sizeof b, "stats %s: 1000 bytes echo in the first second", cc);
+    check(b, 1, fl_send(1, g_pat, 1000) == SEND_OK && PUMP_UNTIL(g_sk[1].n == 1000 && link_quiet(c)));
+    err_open();
+    stats_at(c, t0 + SEC_NS);
+    pump_for(100);
+    struct qc_stats before, after, pb, pa;
+    hy2c_stats(c, &before);
+    qc_stats_get(g_p[0].q, &pb);
+    stats_at(c, t0 + 2 * SEC_NS);
+    int third = fl_send(1, g_pat, 3000) == SEND_OK;
+    hy2c_flush(c);
+    peer_only_for(400);
+    third = third && PUMP_UNTIL(g_sk[1].n == 4000 && link_quiet(c));
+    hy2c_stats(c, &after);
+    qc_stats_get(g_p[0].q, &pa);
+    stats_at(c, t0 + 3 * SEC_NS + 250000000ull);
+    const char *e = err_close();
+    snprintf(b, sizeof b, "stats %s: 3000 bytes echo in the third second", cc);
+    check(b, 1, third);
+    snprintf(head, sizeof head, "tunvless[debug]: hysteria2 %s: stats span ", shown);
+    snprintf(b, sizeof b, "stats %s: the two busy seconds say a line each, the idle one none", cc);
+    check(b, 2, err_lines(e, head, 0));
+    int k = snprintf(want, sizeof want,
+                     "%s1250 port %u %s cwnd %llu flight %llu srtt %llu min %llu sent %llu lost %llu/%llu acked %llu rx %llu "
+                     "wait cwnd 0 credit 0 budget 0",
+                     head, port, cc, (unsigned long long)after.cwnd, (unsigned long long)after.in_flight,
+                     (unsigned long long)(after.rtt_us / 1000), (unsigned long long)(after.min_rtt_us / 1000),
+                     (unsigned long long)(after.bytes_sent - before.bytes_sent),
+                     (unsigned long long)(after.cc_lost - before.cc_lost),
+                     (unsigned long long)(after.cc_sent - before.cc_sent),
+                     (unsigned long long)(after.bytes_acked - before.bytes_acked),
+                     (unsigned long long)(after.bytes_recv - before.bytes_recv));
+    if (!strcmp(cc, "bbr"))
+        snprintf(want + k, sizeof want - (size_t)k, " bbr %s bw %llu pace %llu", after.bbr_state ? after.bbr_state : "",
+                 (unsigned long long)after.bbr_bw, (unsigned long long)after.pacing_bps);
+    snprintf(b, sizeof b, "stats %s: the third second's line holds that second only", cc);
+    check(b, 1, err_lines(e, want, 1));
+    snprintf(b, sizeof b, "stats %s: its sent bytes cover the 3000 sent", cc);
+    check(b, 1, after.bytes_sent - before.bytes_sent >= 3000);
+    snprintf(b, sizeof b, "stats %s: its received bytes cover the 3000 echoed", cc);
+    check(b, 1, after.bytes_recv - before.bytes_recv >= 3000);
+    const char *l3 = strstr(e, "stats span 1250 ");
+    unsigned long long sent = field(l3, " sent "), acked = field(l3, " acked "), srtt = field(l3, " srtt "),
+                       min = field(l3, " min ");
+    snprintf(b, sizeof b, "stats %s: acked covers the 3000 bytes", cc);
+    check(b, 1, acked >= 3000 && acked != ~0ull);
+    snprintf(b, sizeof b, "stats %s: acked leaves out the ACK-only packets sent", cc);
+    check(b, 1, acked < sent);
+    snprintf(b, sizeof b, "stats %s: acked is no more than the peer received", cc);
+    check(b, 1, acked <= pa.bytes_recv - pb.bytes_recv);
+    snprintf(b, sizeof b, "stats %s: a 400 ms answer lifts srtt to 10 ms or more", cc);
+    check(b, 1, srtt >= 10 && srtt != ~0ull);
+    snprintf(b, sizeof b, "stats %s: min stays below srtt", cc);
+    check(b, 1, min < srtt);
+    if (!strcmp(cc, "bbr")) {
+        unsigned long long bw = field(l3, " bw "), pace = field(l3, " pace ");
+        check("stats bbr: a fresh app-limited link is in startup", 1, err_lines(e, " budget 0 bbr startup bw ", 0) == 2);
+        check("stats bbr: a bandwidth estimate", 1, bw > 0 && bw != ~0ull);
+        check("stats bbr: startup paces at more than twice it", 1, pace != ~0ull && pace >= 2 * bw);
+    }
+    snprintf(b, sizeof b, "stats %s: the controller tail only on BBR", cc);
+    check(b, strcmp(cc, "bbr") ? 0 : 2, err_lines(e, " pace ", 0));
+    end();
+}
+
+static void a_busy_link_says_its_stats_each_second(void) {
+    stats_round("a\nb", "a b", NULL, NULL, "bbr");
+    stats_round("N1", "N1", "{\"brutalUp\":\"100 mbps\",\"brutalDown\":\"50 mbps\"}", "10000000", "brutal");
+}
+
+static void the_stats_line_says_how_long_credit_held_it(void) {
+    begin();
+    g_peer_msd = 16384;
+    uint16_t port = peer_start(0, 0);
+    g_peer_msd = 0;
+    g_p[0].echo = 0;
+    g_p[0].no_consume = 1;
+    struct vless_node n;
+    node_make(&n, "127.0.0.1", port);
+    snprintf(n.name, sizeof n.name, "W1");
+    uint64_t t0 = 0;
+    struct hy2c *c = clocked_link(1, &n, "10.0.0.1", &t0);
+    check("stats credit: a ready link on the test clock", 1, c != NULL);
+    NEED(c);
+    check("stats credit: 40000 bytes taken", SEND_OK, fl_send(1, g_pat, 40000));
+    check("stats credit: the peer window stops them", 1,
+          PUMP_UNTIL(hy2c_tcp_unsent(c, g_s[1].sid) > 0 && link_quiet(c)));
+    pump_for(100);
+    err_open();
+    hy2c_clock_set(c, t0 + 400000000ull);
+    g_p[0].no_consume = 0;
+    hp_consume_all(&g_p[0]);
+    struct hp_st *st = NULL;
+    int all = PUMP_UNTIL((st = peer_st(0, "10.0.0.1:80")) != NULL && st->payload == 40000 && link_quiet(c));
+    stats_at(c, t0 + SEC_NS);
+    const char *e = err_close();
+    check("stats credit: the rest goes once the peer reads", 1, all);
+    check("stats credit: the second's line says 400 ms on peer credit", 1,
+          err_lines(e, " wait cwnd 0 credit 400 budget 0", 0));
+    check("stats credit: over a span of 1000 ms", 1, err_lines(e, "tunvless[debug]: hysteria2 W1: stats span 1000 port ", 0));
+    err_open();
+    g_p[0].no_consume = 1;
+    hy2c_clock_set(c, t0 + 1200000000ull);
+    check("stats credit: 40000 more bytes taken", SEND_OK, fl_send(1, g_pat, 40000));
+    check("stats credit: the peer window stops them again", 1,
+          PUMP_UNTIL(hy2c_tcp_unsent(c, g_s[1].sid) > 0 && link_quiet(c)));
+    pump_for(100);
+    hy2c_clock_set(c, t0 + 1500000000ull);
+    g_p[0].no_consume = 0;
+    hp_consume_all(&g_p[0]);
+    all = PUMP_UNTIL((st = peer_st(0, "10.0.0.1:80")) != NULL && st->payload == 80000 && link_quiet(c));
+    stats_at(c, t0 + 2 * SEC_NS);
+    e = err_close();
+    check("stats credit: the rest goes once the peer reads again", 1, all);
+    check("stats credit: the next line says only this second's 300 ms", 1,
+          err_lines(e, " wait cwnd 0 credit 300 budget 0", 0));
+    end();
+}
+
+static void loss_feed(struct hy2c *c, uint64_t *t, uint64_t pass_ms, uint64_t sent, uint64_t lost) {
+    hy2c_tally_add(c, sent, lost);
+    *t += SEC_NS;
+    hy2c_clock_set(c, *t);
+    hy2_mux.pass(pass_ms, MUXP_LATE);
+}
+
+static void loss_settle(struct hy2c *c, uint64_t *t, uint64_t pass_ms) {
+    *t += 11 * SEC_NS;
+    hy2c_clock_set(c, *t);
+    hy2_mux.pass(pass_ms, MUXP_LATE);
+}
+
+static void a_lossy_path_is_said_at_most_every_ten_minutes(void) {
+    begin();
+    uint16_t port = peer_start(0, 0);
+    struct vless_node n;
+    node_make(&n, "127.0.0.1", port);
+    snprintf(n.name, sizeof n.name, "L1\nx");
+    uint64_t t = 0, p0 = ms_now() + 1000000;
+    char lossy[160], lossy2[160];
+    struct hy2c *c = clocked_link(1, &n, "10.0.0.1", &t);
+    check("lossy: a ready link on the test clock", 1, c != NULL);
+    NEED(c);
+    check("lossy: the link is quiet", 1, PUMP_UNTIL(link_quiet(c)));
+    uint16_t lp = qc_peer_port(g_p[0].q);
+    snprintf(lossy, sizeof lossy, "tunvless[info]: hysteria2 L1 x: lossy path on port %u: 100 of 2000 packets lost", lp);
+    snprintf(lossy2, sizeof lossy2, "tunvless[info]: hysteria2 L1 x: lossy path on port %u: 400 of 4000 packets lost", lp);
+    err_open();
+    loss_settle(c, &t, p0);
+    loss_feed(c, &t, p0 + 1000, 1000, 50);
+    loss_feed(c, &t, p0 + 2000, 1000, 50);
+    const char *e = err_close();
+    check("lossy: two lossy idle seconds say the path with its totals and port", 1, err_lines(e, lossy, 1));
+    check("lossy: and nothing else", 1, err_lines(e, "tunvless[", 0));
+    err_open();
+    loss_feed(c, &t, p0 + 3000, 1000, 50);
+    loss_feed(c, &t, p0 + 4000, 1000, 50);
+    loss_feed(c, &t, p0 + 300000, 1000, 50);
+    loss_feed(c, &t, p0 + 301000, 1000, 50);
+    e = err_close();
+    check("lossy: continuing loss within ten minutes is not said again", 0, err_lines(e, "lossy path", 0));
+    err_open();
+    loss_feed(c, &t, p0 + 601000, 2000, 200);
+    loss_feed(c, &t, p0 + 602000, 2000, 200);
+    loss_feed(c, &t, p0 + 603000, 1000, 50);
+    e = err_close();
+    check("lossy: ten minutes after the line continuing loss is said again", 1, err_lines(e, lossy2, 1));
+    unsigned li = last_link();
+    qc_close(g_p[0].q, 0x100);
+    qc_flush(g_p[0].q);
+    check("lossy: the link is cut", 1, PUMP_UNTIL(watch_off(XC_MAX + li)));
+    fl_close(1);
+    peer_stop(0);
+    check("lossy: a fresh peer on the port", port, peer_start(0, port));
+    c = clocked_link(2, &n, "10.0.0.2", &t);
+    check("lossy: the node is redialled", 1, c != NULL);
+    NEED(c);
+    check("lossy: the new link is quiet", 1, PUMP_UNTIL(link_quiet(c)));
+    lp = qc_peer_port(g_p[0].q);
+    snprintf(lossy, sizeof lossy, "tunvless[info]: hysteria2 L1 x: lossy path on port %u: 100 of 2000 packets lost", lp);
+    err_open();
+    loss_settle(c, &t, p0 + 1300000);
+    loss_feed(c, &t, p0 + 1301000, 1000, 50);
+    const char *e1 = err_close();
+    check("lossy: one lossy second on the new link says nothing", 0, err_lines(e1, "lossy path", 0));
+    err_open();
+    loss_feed(c, &t, p0 + 1302000, 1000, 50);
+    e = err_close();
+    check("lossy: a second one says it with the new link's port", 1, err_lines(e, lossy, 1));
+    end();
+}
+
+static void a_hop_starts_the_lossy_count_over(void) {
+    begin();
+    uint16_t port = peer_start(0, 0);
+    struct vless_node n;
+    node_make(&n, "127.0.0.1", port);
+    snprintf(n.name, sizeof n.name, "H1");
+    snprintf(n.ports, sizeof n.ports, "%u", port);
+    n.hop_mode = HY2_HOP_LOCAL;
+    uint64_t t = 0, p0 = ms_now() + 1000000;
+    struct hy2c *c = clocked_link(1, &n, "10.0.0.1", &t);
+    check("lossy hop: a hopping link on the test clock", 1, c != NULL);
+    NEED(c);
+    check("lossy hop: quiet", 1, PUMP_UNTIL(link_quiet(c)));
+    err_open();
+    loss_settle(c, &t, p0);
+    loss_feed(c, &t, p0 + 1000, 1000, 50);
+    hy2c_hop_now(c);
+    loss_feed(c, &t, p0 + 2000, 1000, 50);
+    loss_feed(c, &t, p0 + 3000, 1000, 50);
+    const char *e = err_close();
+    check("lossy hop: a hop between lossy seconds says nothing", 0, err_lines(e, "lossy path", 0));
+    err_open();
+    loss_feed(c, &t, p0 + 4000, 1000, 50);
+    e = err_close();
+    check("lossy hop: two lossy seconds after it say the path", 1, err_lines(e, ": 100 of 2000 packets lost", 0));
+    end();
+}
+
+static void a_download_second_tracks_few_packets(void) {
+    begin();
+    uint16_t port = peer_start(0, 0);
+    g_p[0].echo = 0;
+    g_p[0].send_bytes = 262144;
+    struct vless_node n;
+    node_make(&n, "127.0.0.1", port);
+    snprintf(n.name, sizeof n.name, "D1");
+    uint64_t t0 = 0;
+    struct hy2c *c = clocked_link(1, &n, "10.0.0.1", &t0);
+    check("stats download: a ready link on the test clock", 1, c != NULL);
+    NEED(c);
+    check("stats download: quiet", 1, PUMP_UNTIL(link_quiet(c)));
+    stats_at(c, t0 + SEC_NS);
+    struct qc_stats before, after;
+    hy2c_stats(c, &before);
+    g_sk[1].auto_rd = 1;
+    check("stats download: 256 KiB come down", 1,
+          fl_send(1, NULL, 0) == SEND_OK && PUMP_UNTIL(g_sk[1].n == 262144 && link_quiet(c)));
+    hy2c_stats(c, &after);
+    err_open();
+    stats_at(c, t0 + 2 * SEC_NS);
+    const char *e = err_close();
+    char want[80];
+    unsigned long long b = after.cc_sent - before.cc_sent, pkts = after.pkt_sent - before.pkt_sent;
+    printf("     stats download: %llu tracked of %llu sent\n", b, pkts);
+    snprintf(want, sizeof want, " lost %llu/%llu acked ", (unsigned long long)(after.cc_lost - before.cc_lost), b);
+    check("stats download: lost a/b are the tracked counts", 1, err_lines(e, want, 0));
+    check("stats download: each tracked past the request leaves an ACK-only", 1, b * 2 <= pkts + 1);
     end();
 }
 
@@ -2082,6 +2401,11 @@ int main(void) {
     a_silence_cut_is_reported_as_a_failed_dial();
     a_ready_link_says_how_it_sends();
     a_cut_link_is_named_once();
+    a_busy_link_says_its_stats_each_second();
+    the_stats_line_says_how_long_credit_held_it();
+    a_download_second_tracks_few_packets();
+    a_lossy_path_is_said_at_most_every_ten_minutes();
+    a_hop_starts_the_lossy_count_over();
     a_silent_node_wakes_its_waiters_by_the_budget();
     a_stale_link_takes_no_new_flows();
     tcp_echo_through_send_read_deliver();

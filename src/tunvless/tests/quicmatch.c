@@ -2628,6 +2628,149 @@ static void a_lost_probe_sample_is_hidden_from_bbr(void) {
     pair_free(&p);
 }
 
+static int c_upload_done(struct pair *p, void *a) {
+    struct want *w = a;
+    struct strm *s = strm_get(&p->s, w->sid);
+    return s && s->got == MIB && s->fin && c_cli_idle(p, NULL);
+}
+
+struct bigdrop { unsigned n, dropped; int armed; };
+
+static size_t drop_big_tx(void *u, uint8_t *dst, const uint8_t *src, size_t n) {
+    struct bigdrop *f = u;
+    if (f->armed && n >= 1000 && ++f->n % 10 == 0) {
+        f->dropped++;
+        return 0;
+    }
+    memcpy(dst, src, n);
+    return n;
+}
+
+static void tracked_upload_round(const char *tag, int algo) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    struct qc_stats a, b;
+    struct bigdrop df = { 0, 0, 0 };
+    struct qc_filter fd = { drop_big_tx, f_id_rx, &df, 0 };
+    int64_t sid = -1;
+    char nm[120];
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    cc.filter = &fd;
+    cc.cc = algo == QC_CC_RENO ? QC_CC_RENO : QC_CC_BBR;
+    snprintf(nm, sizeof nm, "tracked %s: pair opens", tag);
+    check(nm, 0, pair_open(&p, &cc, &sc));
+    p.s.consume_in_cb = 1;
+    p.c.consume_in_cb = 1;
+    snprintf(nm, sizeof nm, "tracked %s: handshake", tag);
+    check(nm, 1, pump_until(&p, c_both_hs, NULL, 10000));
+    if (algo == QC_CC_BRUTAL) {
+        snprintf(nm, sizeof nm, "tracked %s: swap at 2 MB/s", tag);
+        check(nm, 0, qc_cc_brutal(p.c.q, 2000000, 0));
+    }
+    snprintf(nm, sizeof nm, "tracked %s: idle before the upload", tag);
+    check(nm, 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_stats_get(p.c.q, &a);
+    df.armed = 1;
+    snprintf(nm, sizeof nm, "tracked %s: upload opens", tag);
+    check(nm, 0, echo_open(&p, &sid));
+    struct want w = { &p.c, sid, 0 };
+    snprintf(nm, sizeof nm, "tracked %s: 1 MiB arrives through one full drop in ten", tag);
+    check(nm, 1, pump_until(&p, c_upload_done, &w, 20000));
+    df.armed = 0;
+    qc_stats_get(p.c.q, &b);
+    uint64_t sent = b.cc_sent - a.cc_sent, lost = b.cc_lost - a.cc_lost;
+    printf("     tracked %s: %llu sent, %llu lost, %u dropped, %llu datagrams\n", tag, (unsigned long long)sent,
+           (unsigned long long)lost, df.dropped, (unsigned long long)(b.pkt_sent - a.pkt_sent));
+    snprintf(nm, sizeof nm, "tracked %s: at least 723 packets for 1 MiB", tag);
+    check(nm, 1, sent >= 723);
+    snprintf(nm, sizeof nm, "tracked %s: at least 72 full datagrams dropped", tag);
+    check(nm, 1, df.dropped >= 72);
+    snprintf(nm, sizeof nm, "tracked %s: every dropped one counted lost", tag);
+    check(nm, 1, lost >= df.dropped);
+    snprintf(nm, sizeof nm, "tracked %s: and little else", tag);
+    check(nm, 1, lost * 10 <= df.dropped * 11);
+    pair_free(&p);
+}
+
+static void a_plain_link_tells_its_socket_port(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    check("socket port: pair opens", 0, pair_open(&p, &cc, &sc));
+    check("socket port: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    check("socket port: the one the server sees", qc_peer_port(p.s.q), qc_sock_port(p.c.q));
+    pair_free(&p);
+}
+
+static int upload(struct pair *p) {
+    int64_t sid = -1;
+    if (echo_open(p, &sid) != 0) return 0;
+    struct want w = { &p->c, sid, 0 };
+    return pump_until(p, c_upload_done, &w, 20000);
+}
+
+static void the_counts_carry_over_a_controller_swap(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    struct qc_stats a, b, c;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    check("tracked swap: pair opens", 0, pair_open(&p, &cc, &sc));
+    p.s.consume_in_cb = 1;
+    p.c.consume_in_cb = 1;
+    check("tracked swap: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    check("tracked swap: 1 MiB up on BBR", 1, upload(&p));
+    qc_stats_get(p.c.q, &a);
+    check("tracked swap: BBR counted at least 723 packets", 1, a.cc_sent >= 723);
+    check("tracked swap: swap to Brutal at 2 MB/s", 0, qc_cc_brutal(p.c.q, 2000000, 0));
+    qc_stats_get(p.c.q, &b);
+    check("tracked swap: the swap keeps the sent count", 1, b.cc_sent == a.cc_sent);
+    check("tracked swap: 1 MiB up on Brutal", 1, upload(&p));
+    qc_stats_get(p.c.q, &c);
+    check("tracked swap: Brutal adds at least 723 packets", 1, c.cc_sent >= b.cc_sent + 723);
+    check("tracked swap: no packet counted twice", 1, c.cc_sent <= c.pkt_sent);
+    pair_free(&p);
+}
+
+static void the_controller_counts_what_it_can_lose(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    struct qc_stats a, b;
+    int64_t sid = -1;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    cc.no_pmtud = 1;
+    cc.max_data = cc.max_stream_data = 8 * MIB;
+    check("tracked download: pair opens", 0, pair_open(&p, &cc, &sc));
+    p.s.consume_in_cb = 1;
+    p.c.consume_in_cb = 1;
+    p.s.respond = MIB;
+    check("tracked download: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    check("tracked download: stream opens", 0, open_stream(&p, &sid));
+    check("tracked download: idle", 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_stats_get(p.c.q, &a);
+    out_static(&p.c, sid, g_pat, 10, 0);
+    struct want w = { &p.c, sid, MIB };
+    check("tracked download: 1 MiB comes down", 1, pump_until(&p, c_got, &w, 20000));
+    check("tracked download: idle after", 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_stats_get(p.c.q, &b);
+    uint64_t sent = b.cc_sent - a.cc_sent, pkts = b.pkt_sent - a.pkt_sent;
+    printf("     tracked download: %llu tracked of %llu sent\n", (unsigned long long)sent, (unsigned long long)pkts);
+    check("tracked download: nothing lost", 0, (long)(b.cc_lost - a.cc_lost));
+    check("tracked download: the request is tracked", 1, sent >= 1);
+    check("tracked download: each tracked past the request leaves an ACK-only", 1, sent * 2 <= pkts + 1);
+    pair_free(&p);
+    tracked_upload_round("bbr", QC_CC_BBR);
+    tracked_upload_round("brutal", QC_CC_BRUTAL);
+    tracked_upload_round("reno", QC_CC_RENO);
+}
+
 static void the_blind_controller_goes_on_bbr_only_once(void) {
     struct pair p;
     struct qc_cfg cc;
@@ -3373,9 +3516,11 @@ static void ngtcp2_never_sees_a_local_hop(void) {
     int pf = -1;
     check("fixed local path: pair opens", 0, hop_pair_open(&p, QC_HOP_LOCAL, NULL, 0, rand_7));
     qc_sock_ports(p.cli, &c0, &pre, &pf);
+    check("fixed local path: the socket port is the first local port", c0, qc_sock_port(p.cli));
     qc_hop_now(p.cli);
     qc_sock_ports(p.cli, &c1, &pre, &pf);
     check("fixed local path: the hop moved the socket", 1, c1 != 0 && c1 != c0);
+    check("fixed local path: the socket port follows the hop", c1, qc_sock_port(p.cli));
     check("fixed local path: 1 MiB echo after the hop intact with FIN", 0, hop_pair_echo(&p, MIB, 20000));
     qc_path_ports(p.cli, &nl, &nr);
     check("fixed local path: ngtcp2 holds the open's local port", c0, nl);
@@ -3973,6 +4118,176 @@ static void a_combined_hop_dials_the_new_port_from_a_new_socket(void) {
     relay_close(&r);
 }
 
+#define WAIT_T 1000000000000ull
+#define WAIT_MS(n) (WAIT_T + (uint64_t)(n) * 1000000ull)
+
+static void check_ns(const char *what, uint64_t want_ms, uint64_t got_ns) {
+    uint64_t want = want_ms * 1000000ull;
+    check(what, 1, want == got_ns);
+    if (want != got_ns) printf("     want ns: %llu\n     got ns:  %llu\n", (unsigned long long)want, (unsigned long long)got_ns);
+}
+
+static void waits_are(const char *tag, struct qc *q, uint64_t at, uint64_t cwnd_ms, uint64_t credit_ms, uint64_t budget_ms) {
+    uint64_t w[3] = { 1, 1, 1 };
+    char b[160];
+    qc_wait_get(q, at, w);
+    snprintf(b, sizeof b, "%s: %llu ms on the window", tag, (unsigned long long)cwnd_ms);
+    check_ns(b, cwnd_ms, w[QC_WAIT_CWND]);
+    snprintf(b, sizeof b, "%s: %llu ms on peer credit", tag, (unsigned long long)credit_ms);
+    check_ns(b, credit_ms, w[QC_WAIT_CREDIT]);
+    snprintf(b, sizeof b, "%s: %llu ms on our budget", tag, (unsigned long long)budget_ms);
+    check_ns(b, budget_ms, w[QC_WAIT_BUDGET]);
+}
+
+static int c_got_idle(struct pair *p, void *a) { return c_got(p, a) && c_cli_idle(p, NULL); }
+
+static void credit_wait_round(const char *tag, uint64_t max_data, uint64_t max_stream_data, size_t window, size_t total) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    char b[160];
+    int64_t sid = -1;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    sc.max_data = max_data;
+    sc.max_stream_data = max_stream_data;
+    snprintf(b, sizeof b, "%s: pair opens", tag);
+    check(b, 0, pair_open(&p, &cc, &sc));
+    snprintf(b, sizeof b, "%s: handshake", tag);
+    check(b, 1, pump_until(&p, c_both_hs, NULL, 10000));
+    qc_clock_set(p.c.q, WAIT_MS(0));
+    snprintf(b, sizeof b, "%s: stream opens", tag);
+    check(b, 0, open_stream(&p, &sid));
+    out_static(&p.c, sid, g_pat, total, 0);
+    struct want w = { &p.s, sid, window };
+    snprintf(b, sizeof b, "%s: the window fills and is acknowledged", tag);
+    check(b, 1, pump_until(&p, c_got_idle, &w, 10000));
+    pump_for(&p, 100);
+    struct strm *s = strm_get(&p.s, sid);
+    snprintf(b, sizeof b, "%s: and stays at %zu", tag, window);
+    check(b, (long)window, s ? (long)s->got : -1);
+    snprintf(b, sizeof b, "%s, held 300 ms", tag);
+    waits_are(b, p.c.q, WAIT_MS(300), 0, 300, 0);
+    qc_clock_set(p.c.q, WAIT_MS(300));
+    p.s.consume_in_cb = 1;
+    if (s) {
+        qc_stream_consumed(p.s.q, sid, s->got);
+        s->consumed = s->got;
+        qc_flush(p.s.q);
+    }
+    w.n = total;
+    snprintf(b, sizeof b, "%s: the rest arrives once credit comes", tag);
+    check(b, 1, pump_until(&p, c_got_idle, &w, 10000));
+    snprintf(b, sizeof b, "%s, read a second in", tag);
+    waits_are(b, p.c.q, WAIT_MS(1000), 0, 300, 0);
+    pair_free(&p);
+}
+
+static void a_closed_peer_window_is_counted_as_credit(void) {
+    credit_wait_round("stream credit wait", 0, 65536, 65536, 200000);
+    credit_wait_round("connection credit wait", 131072, 0, 131072, 300000);
+}
+
+static void a_reset_blocked_stream_ends_the_credit_wait(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    int64_t sid = -1;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    sc.max_stream_data = 65536;
+    check("reset credit wait: pair opens", 0, pair_open(&p, &cc, &sc));
+    check("reset credit wait: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    qc_clock_set(p.c.q, WAIT_MS(0));
+    check("reset credit wait: stream opens", 0, open_stream(&p, &sid));
+    out_static(&p.c, sid, g_pat, 200000, 0);
+    struct want w = { &p.s, sid, 65536 };
+    check("reset credit wait: the window fills and is acknowledged", 1, pump_until(&p, c_got_idle, &w, 10000));
+    qc_clock_set(p.c.q, WAIT_MS(300));
+    struct out *o = out_for(&p.c, sid);
+    if (o) o->dead = 1;
+    strm_get(&p.c, sid);
+    check("reset credit wait: the blocked stream is reset", 0, qc_stream_reset(p.c.q, sid, 7));
+    qc_flush(p.c.q);
+    struct want wc = { &p.c, sid, 0 };
+    check("reset credit wait: the stream closes", 1, pump_until(&p, c_closed_st, &wc, 10000));
+    check("reset credit wait: idle", 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_ping(p.c.q);
+    pump_for(&p, 50);
+    waits_are("reset credit wait, read a second in", p.c.q, WAIT_MS(1000), 0, 300, 0);
+    pair_free(&p);
+}
+
+static size_t rx_gate(void *u, uint8_t *dst, const uint8_t *src, size_t n) {
+    if (*(int *)u) return 0;
+    memcpy(dst, src, n);
+    return n;
+}
+
+struct sent_full { int64_t sid; size_t n; };
+
+static int c_sent_full(struct pair *p, void *a) {
+    struct sent_full *f = a;
+    return qc_stream_unsent(p->c.q, f->sid) == 0 && qc_stream_queued(p->c.q, f->sid) == f->n;
+}
+
+static void a_full_send_buffer_is_counted_as_budget(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    int64_t sid = -1;
+    int shut = 0;
+    struct qc_filter gate = { NULL, rx_gate, &shut, 0 };
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    cc.send_buf = 16384;
+    cc.filter = &gate;
+    check("budget wait: pair opens", 0, pair_open(&p, &cc, &sc));
+    p.s.consume_in_cb = 1;
+    check("budget wait: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    check("budget wait: stream opens", 0, open_stream(&p, &sid));
+    check("budget wait: idle", 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_clock_set(p.c.q, WAIT_MS(0));
+    shut = 1;
+    out_static(&p.c, sid, g_pat, 20000, 0);
+    struct sent_full f = { sid, 16384 };
+    check("budget wait: 16384 bytes queued and all sent", 1, pump_until(&p, c_sent_full, &f, 10000));
+    waits_are("budget wait, held 300 ms", p.c.q, WAIT_MS(300), 0, 0, 300);
+    qc_clock_set(p.c.q, WAIT_MS(300));
+    shut = 0;
+    struct want w = { &p.s, sid, 20000 };
+    check("budget wait: the rest goes once acknowledgements come", 1, pump_until(&p, c_got_idle, &w, 10000));
+    waits_are("budget wait, read a second in", p.c.q, WAIT_MS(1000), 0, 0, 300);
+    pair_free(&p);
+}
+
+static void a_slow_controller_is_counted_as_the_window(void) {
+    struct pair p;
+    struct qc_cfg cc;
+    struct qc_srv_cfg sc;
+    int64_t sid = -1;
+    cli_cfg(&cc, "h3");
+    srv_cfg(&sc, "h3");
+    check("window wait: pair opens", 0, pair_open(&p, &cc, &sc));
+    p.s.consume_in_cb = 1;
+    check("window wait: handshake", 1, pump_until(&p, c_both_hs, NULL, 10000));
+    check("window wait: Brutal at 20000 B/s", 0, qc_cc_brutal(p.c.q, 20000, 0));
+    check("window wait: stream opens", 0, open_stream(&p, &sid));
+    check("window wait: idle", 1, pump_until(&p, c_cli_idle, NULL, 10000));
+    qc_clock_set(p.c.q, WAIT_MS(0));
+    out_static(&p.c, sid, g_pat, 100000, 0);
+    struct want w = { &p.s, sid, 4000 };
+    check("window wait: the first bytes arrive", 1, pump_until(&p, c_got, &w, 10000));
+    check("window wait: the rest waits unsent", 1, qc_stream_unsent(p.c.q, sid) > 0);
+    waits_are("window wait, held 300 ms", p.c.q, WAIT_MS(300), 300, 0, 0);
+    qc_clock_set(p.c.q, WAIT_MS(300));
+    check("window wait: Brutal at 1 GiB/s", 0, qc_cc_brutal(p.c.q, 1ull << 30, 0));
+    w.n = 100000;
+    check("window wait: the rest arrives", 1, pump_until(&p, c_got_idle, &w, 10000));
+    waits_are("window wait, read a second in", p.c.q, WAIT_MS(1000), 300, 0, 0);
+    pair_free(&p);
+}
+
 int main(void) {
     g_pat = malloc(4 * MIB);
     for (size_t i = 0; i < 4 * MIB; i++) g_pat[i] = pat(i);
@@ -4036,9 +4351,16 @@ int main(void) {
     the_blind_controller_goes_on_bbr_only_once();
     brutal_without_an_rtt_sample_uses_the_minimum_window();
     losses_never_shrink_the_brutal_window();
+    the_controller_counts_what_it_can_lose();
+    the_counts_carry_over_a_controller_swap();
+    a_plain_link_tells_its_socket_port();
     an_installed_controller_sets_a_window_and_a_pace();
     the_window_floor_lets_a_second_packet_go();
     a_loss_found_by_the_timer_keeps_the_window();
+    a_closed_peer_window_is_counted_as_credit();
+    a_reset_blocked_stream_ends_the_credit_wait();
+    a_full_send_buffer_is_counted_as_budget();
+    a_slow_controller_is_counted_as_the_window();
     a_remote_hop_keeps_the_local_port();
     ngtcp2_never_sees_a_remote_hop();
     a_failed_remote_hop_keeps_the_link();

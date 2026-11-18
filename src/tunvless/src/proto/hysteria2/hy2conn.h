@@ -57,7 +57,10 @@ int  hy2c_ready(const struct hy2c *c);
 int  hy2c_closed(const struct hy2c *c);
 int  hy2c_cc(const struct hy2c *c, uint64_t *tx_bps);
 void hy2c_stats(struct hy2c *c, struct qc_stats *st);
+uint64_t hy2c_clock(const struct hy2c *c, uint64_t now_ns);
+void hy2c_wait(const struct hy2c *c, uint64_t now_ns, uint64_t ns[3]);
 uint64_t hy2c_hop_fails(const struct hy2c *c);
+uint16_t hy2c_sock_port(const struct hy2c *c);
 
 int  hy2c_tcp_open(struct hy2c *c, const char *host, uint16_t port, int64_t *sid);
 ssize_t hy2c_tcp_send(struct hy2c *c, int64_t sid, const uint8_t *d, size_t n);
@@ -78,6 +81,7 @@ void hy2c_udp_next_set(struct hy2c *c, uint32_t id);
 size_t hy2c_tcp_unsent(const struct hy2c *c, int64_t sid);
 void hy2c_clock_set(struct hy2c *c, uint64_t ns);
 void hy2c_hop_now(struct hy2c *c);
+void hy2c_tally_add(struct hy2c *c, uint64_t sent, uint64_t lost);
 uint64_t hy2c_opened_ns(const struct hy2c *c);
 uint64_t hy2c_live_wake_ns(const struct hy2c *c);
 uint64_t hy2c_drain_due_ns(const struct hy2c *c);

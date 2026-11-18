@@ -4,10 +4,16 @@
 
 #include <ngtcp2/ngtcp2.h>
 
+struct ngcc_tally {
+    uint64_t sent, lost;
+};
+
 int ngcc_brutal(ngtcp2_conn *conn, uint64_t bps, int no_comp, ngtcp2_tstamp ts);
 uint32_t ngcc_brutal_ack_q16(const ngtcp2_conn *conn);
 int ngcc_brutal_no_comp(const ngtcp2_conn *conn);
 uint64_t ngcc_pacing_bps(const ngtcp2_conn *conn);
+uint64_t ngcc_delivered(const ngtcp2_conn *conn);
+const char *ngcc_bbr_state(const ngtcp2_conn *conn, uint64_t *bw);
 int ngcc_initcwnd(ngtcp2_conn *conn, uint64_t packets, ngtcp2_tstamp ts);
 int ngcc_bbr_blind(ngtcp2_conn *conn);
 #ifdef QC_WITH_SERVER

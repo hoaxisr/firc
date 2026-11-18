@@ -33,6 +33,10 @@
 #define QC_HOP_REMOTE 2u
 #define QC_HOP_LINGER_MIN_MS 2000
 
+#define QC_WAIT_CWND   0
+#define QC_WAIT_CREDIT 1
+#define QC_WAIT_BUDGET 2
+
 struct qc;
 struct qc_tls;
 
@@ -100,6 +104,9 @@ struct qc_stats {
     int no_loss_comp;
     uint64_t hops, hop_fails;
     uint16_t port;
+    uint64_t min_rtt_us, bytes_acked, pay_tx, pay_rx, bbr_bw;
+    const char *bbr_state;
+    uint64_t cc_sent, cc_lost;
 };
 
 struct qc_tls *qc_tls_new(int insecure, const uint8_t *ca_pem, size_t ca_pem_n, const char *ca_file);
@@ -140,7 +147,9 @@ int  qc_datagram_send(struct qc *q, const uint8_t *d, size_t n);
 size_t qc_datagram_max(const struct qc *q);
 unsigned qc_datagram_slots(const struct qc *q);
 void qc_stats_get(struct qc *q, struct qc_stats *st);
+void qc_wait_get(const struct qc *q, uint64_t now_ns, uint64_t ns[3]);
 uint64_t qc_hop_fails(const struct qc *q);
+uint16_t qc_sock_port(const struct qc *q);
 uint64_t qc_opened_ns(const struct qc *q);
 int qc_cc_brutal(struct qc *q, uint64_t bytes_per_s, int no_loss_comp);
 
@@ -184,6 +193,8 @@ int qc_bbr_poke_probe(struct qc *q);
 int qc_bbr_blind(struct qc *q);
 int qc_cc_brutal_now(struct qc *q, uint64_t bytes_per_s, int no_loss_comp);
 void qc_hop_now(struct qc *q);
+void qc_tally_add(struct qc *q, uint64_t sent, uint64_t lost);
+void qc_clock_set(struct qc *q, uint64_t ns);
 uint64_t qc_hop_due_ns(const struct qc *q);
 uint64_t qc_linger_end_ns(const struct qc *q);
 uint64_t qc_hop_linger_ns(uint64_t srtt_ns, uint64_t interval_ns);

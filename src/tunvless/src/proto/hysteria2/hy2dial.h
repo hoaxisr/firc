@@ -34,6 +34,7 @@ size_t hy2d_rx_held(const struct hy2_sess *s);
 struct hy2c *hy2d_link_conn(unsigned i);
 unsigned long hy2d_udp_in(void);
 int hy2d_link_dead(const struct hy2_sess *s);
+void hy2d_loss_said_reset(void);
 #endif
 
 #endif

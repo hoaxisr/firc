@@ -881,7 +881,10 @@ int hy2c_ready(const struct hy2c *c) { return c && c->state == ST_READY; }
 int hy2c_closed(const struct hy2c *c) { return !c || c->state == ST_DEAD; }
 
 void hy2c_stats(struct hy2c *c, struct qc_stats *st) { qc_stats_get(c->q, st); }
+uint64_t hy2c_clock(const struct hy2c *c, uint64_t now_ns) { return on_clock(c, now_ns); }
+void hy2c_wait(const struct hy2c *c, uint64_t now_ns, uint64_t ns[3]) { qc_wait_get(c->q, now_ns, ns); }
 uint64_t hy2c_hop_fails(const struct hy2c *c) { return qc_hop_fails(c->q); }
+uint16_t hy2c_sock_port(const struct hy2c *c) { return qc_sock_port(c->q); }
 
 int hy2c_cc(const struct hy2c *c, uint64_t *tx_bps) {
     struct qc_stats st;
@@ -1045,7 +1048,11 @@ void hy2c_probe_get(const struct hy2c *c, struct hy2c_probe *p) {
 #ifdef QC_WITH_SERVER
 void hy2c_udp_next_set(struct hy2c *c, uint32_t id) { c->udp_next = id; }
 size_t hy2c_tcp_unsent(const struct hy2c *c, int64_t sid) { return s_live(c, sid) ? qc_stream_unsent(c->q, sid) : 0; }
-void hy2c_clock_set(struct hy2c *c, uint64_t ns) { c->clock = ns; }
+void hy2c_clock_set(struct hy2c *c, uint64_t ns) {
+    c->clock = ns;
+    qc_clock_set(c->q, ns);
+}
 void hy2c_hop_now(struct hy2c *c) { qc_hop_now(c->q); }
+void hy2c_tally_add(struct hy2c *c, uint64_t sent, uint64_t lost) { qc_tally_add(c->q, sent, lost); }
 uint64_t hy2c_opened_ns(const struct hy2c *c) { return qc_opened_ns(c->q); }
 #endif

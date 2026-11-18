@@ -77,7 +77,7 @@ struct qc_stream {
     int64_t id;
     struct qc_chunk *head, *tail, *cur;
     uint64_t total, sent, acked;
-    int fin_req, fin_sent, blocked, want_room;
+    int fin_req, fin_sent, blocked, want_room, full;
     int in_pend, in_wr, in_bw;
     struct qc_stream *pprev, *pnext, *wprev, *wnext, *bprev, *bnext;
 };
@@ -124,6 +124,7 @@ static size_t g_nested_max;
 #endif
 
 struct qc {
+    struct ngcc_tally tally;
     struct qc_ops ops;
     void *user;
     int fd;
@@ -160,6 +161,8 @@ struct qc {
     struct qc_dg dgq[QC_DG_QUEUE];
     unsigned dg_head, dg_n;
     uint64_t dg_dropped, dg_tx, dg_rx;
+    uint64_t wait[3], hold_at, pay_tx, pay_rx;
+    int hold, hit, blocked_n, full_n;
 
     int hs_done;
     int closed;
@@ -197,11 +200,14 @@ struct qc {
     unsigned hop_mode;
     int (*prepare)(int fd);
 #ifdef QC_WITH_SERVER
+    uint64_t clock;
     int follow;
     struct sockaddr_storage peer;
     socklen_t peer_len;
 #endif
 };
+
+_Static_assert(offsetof(struct qc, tally) == 0, "the congestion shim reads the tally at the connection's user data");
 
 struct qc_tls {
     void *ctx;
@@ -457,6 +463,8 @@ static void chunks_free(struct qc *q, struct qc_stream *s) {
 
 static void stream_free(struct qc *q, struct qc_stream *s) {
     q->queued -= (size_t)(s->total - s->acked);
+    q->blocked_n -= s->blocked;
+    q->full_n -= s->full;
     chunks_free(q, s);
     free(s);
 }
@@ -475,6 +483,10 @@ static void stream_tx_done(struct qc *q, struct qc_stream *s) {
     s->sent = s->total;
     s->fin_sent = 1;
     s->want_room = 0;
+    q->blocked_n -= s->blocked;
+    s->blocked = 0;
+    q->full_n -= s->full;
+    s->full = 0;
     chunks_free(q, s);
     pend_del(q, s);
     wr_del(q, s);
@@ -523,6 +535,12 @@ static int stream_append(struct qc *q, struct qc_stream *s, const uint8_t *d, si
 static size_t stream_own_room(const struct qc *q, const struct qc_stream *s) {
     size_t used = (size_t)(s->total - s->acked);
     return used < q->send_buf ? q->send_buf - used : 0;
+}
+
+static void full_sync(struct qc *q, struct qc_stream *s) {
+    int full = stream_own_room(q, s) == 0;
+    q->full_n += full - s->full;
+    s->full = full;
 }
 
 static size_t stream_budget(const struct qc *q, const struct qc_stream *s) {
@@ -605,6 +623,7 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags, int64_t sid, u
                                const uint8_t *data, size_t datalen, void *ud, void *sud) {
     struct qc *q = ud;
     (void)conn; (void)offset; (void)sud;
+    q->pay_rx += datalen;
     if (q->ops.on_stream_data) {
         q->in_cb++;
         q->ops.on_stream_data(q->user, sid, data, datalen, (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0);
@@ -622,6 +641,7 @@ static int acked_stream_data_offset_cb(ngtcp2_conn *conn, int64_t sid, uint64_t 
         q->queued -= (size_t)(offset + datalen - s->acked);
         s->acked = offset + datalen;
         stream_trim(q, s);
+        full_sync(q, s);
         if (s->want_room && stream_room_of(q, s) > 0) {
             s->want_room = 0;
             wr_add(q, s);
@@ -678,11 +698,13 @@ static int recv_stop_sending_cb(ngtcp2_conn *conn, int64_t sid, uint64_t err, vo
 }
 
 static int extend_max_stream_data_cb(ngtcp2_conn *conn, int64_t sid, uint64_t max, void *ud, void *sud) {
+    struct qc *q = ud;
     struct qc_stream *s = sud;
     (void)conn; (void)max; (void)sid;
     if (s) {
+        q->blocked_n -= s->blocked;
         s->blocked = 0;
-        pend_add(ud, s);
+        pend_add(q, s);
     }
     return 0;
 }
@@ -691,6 +713,7 @@ static int recv_datagram_cb(ngtcp2_conn *conn, uint32_t flags, const uint8_t *da
     struct qc *q = ud;
     (void)conn; (void)flags;
     q->dg_rx++;
+    q->pay_rx += datalen;
     if (q->ops.on_datagram) {
         q->in_cb++;
         q->ops.on_datagram(q->user, data, datalen);
@@ -873,6 +896,12 @@ static void dg_pop(struct qc *q, int dropped) {
     if (dropped) q->dg_dropped++;
 }
 
+enum { HOLD_NONE, HOLD_CWND = QC_WAIT_CWND + 1, HOLD_CREDIT = QC_WAIT_CREDIT + 1, HOLD_BUDGET = QC_WAIT_BUDGET + 1 };
+
+static void hit_on(struct qc *q, int h) {
+    if (!q->hit) q->hit = h;
+}
+
 static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi,
                                  uint8_t *dest, size_t destlen, ngtcp2_tstamp ts, void *ud) {
     struct qc *q = ud;
@@ -892,7 +921,10 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
             nw = ngtcp2_conn_writev_datagram(conn, path, pi, dest, destlen, &accepted,
                                              NGTCP2_WRITE_DATAGRAM_FLAG_MORE | NGTCP2_WRITE_DATAGRAM_FLAG_PADDING, 0, &v, 1,
                                              ts);
-            if (accepted) dg_pop(q, 0);
+            if (accepted) {
+                q->pay_tx += g->n;
+                dg_pop(q, 0);
+            }
             if (nw == NGTCP2_ERR_WRITE_MORE) continue;
             if (nw < 0 && !accepted) dg_pop(q, 1);
             return nw;
@@ -920,10 +952,13 @@ static ngtcp2_ssize write_pkt_cb(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pk
                                        nv, ts);
         if (dl >= 0) {
             s->sent += (uint64_t)dl;
+            q->pay_tx += (uint64_t)dl;
             if (fin && s->sent == s->total) s->fin_sent = 1;
         }
         if (nw == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
             s->blocked = 1;
+            q->blocked_n++;
+            hit_on(q, HOLD_CREDIT);
             pend_del(q, s);
             continue;
         }
@@ -968,6 +1003,27 @@ static uint64_t in_flight(const struct qc *q) {
     return ci.bytes_in_flight;
 }
 
+static uint64_t acct_now(const struct qc *q) {
+#ifdef QC_WITH_SERVER
+    if (q->clock) return q->clock;
+#endif
+    return q->now;
+}
+
+static void hold_set(struct qc *q, int h) {
+    if (h == q->hold) return;
+    uint64_t t = acct_now(q);
+    if (q->hold && t > q->hold_at) q->wait[q->hold - 1] += t - q->hold_at;
+    q->hold = h;
+    q->hold_at = t;
+}
+
+static void hold_after(struct qc *q) {
+    if (!q->tx_full && q->pend_head) hit_on(q, ngtcp2_conn_get_max_data_left2(q->conn) ? HOLD_CWND : HOLD_CREDIT);
+    int full = !q->pend_head && (q->full_n || !budget_left(q));
+    hold_set(q, q->hit ? q->hit : q->blocked_n ? HOLD_CREDIT : full ? HOLD_BUDGET : HOLD_NONE);
+}
+
 static int flush(struct qc *q) {
     q->want_flush = 0;
     if (q->closed || !q->conn) return QC_ECLOSED;
@@ -977,7 +1033,9 @@ static int flush(struct qc *q) {
     uint64_t f0 = track ? in_flight(q) : 0;
     int ping = q->ping_req && q->hs_done;
     if (ping) ngtcp2_conn_set_keep_alive_timeout(q->conn, 1);
+    q->hit = 0;
     int rv = flush_with(q, q->ts);
+    if (q->hs_done) hold_after(q);
     if (ping) {
         q->ping_req = 0;
         if (q->keepalive_ms) keepalive_tune(q);
@@ -1250,6 +1308,17 @@ static struct qc *qc_alloc(const struct qc_ops *ops, void *user, const struct qc
     return q;
 }
 
+static uint16_t ss_port(const struct sockaddr_storage *a) {
+    if (a->ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)a)->sin6_port);
+    return ntohs(((const struct sockaddr_in *)a)->sin_port);
+}
+
+static uint16_t fd_port(int fd) {
+    struct sockaddr_storage a;
+    socklen_t l = sizeof a;
+    return fd >= 0 && getsockname(fd, (struct sockaddr *)&a, &l) == 0 ? ss_port(&a) : 0;
+}
+
 #ifdef QC_WITH_SERVER
 static const ngtcp2_callbacks g_server_cbs = {
     .recv_client_initial = ngtcp2_crypto_recv_client_initial_cb,
@@ -1416,6 +1485,13 @@ uint64_t qc_srtt_ns(const struct qc *q) {
     return ci.smoothed_rtt;
 }
 
+void qc_clock_set(struct qc *q, uint64_t ns) { q->clock = ns; }
+
+void qc_tally_add(struct qc *q, uint64_t sent, uint64_t lost) {
+    q->tally.sent += sent;
+    q->tally.lost += lost;
+}
+
 void qc_hop_now(struct qc *q) {
     if (q->closed || q->hop_due == UINT64_MAX) return;
     q->now = now_ns();
@@ -1437,17 +1513,6 @@ void qc_path_ports(const struct qc *q, uint16_t *ng_local, uint16_t *ng_remote) 
     const ngtcp2_path *p = ngtcp2_conn_get_path(q->conn);
     *ng_local = sa_port(&p->local);
     *ng_remote = sa_port(&p->remote);
-}
-
-static uint16_t ss_port(const struct sockaddr_storage *a) {
-    if (a->ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)a)->sin6_port);
-    return ntohs(((const struct sockaddr_in *)a)->sin_port);
-}
-
-static uint16_t fd_port(int fd) {
-    struct sockaddr_storage a;
-    socklen_t l = sizeof a;
-    return fd >= 0 && getsockname(fd, (struct sockaddr *)&a, &l) == 0 ? ss_port(&a) : 0;
 }
 
 uint16_t qc_peer_port(const struct qc *srv) { return ss_port(srv->follow ? &srv->peer : &srv->remote); }
@@ -1956,6 +2021,7 @@ ssize_t qc_stream_send(struct qc *q, int64_t sid, const uint8_t *d, size_t n, in
     size_t room = own < bud ? own : bud;
     size_t take = n < room ? n : room;
     if (take > 0 && stream_append(q, s, d, take) != 0) return QC_ENOMEM;
+    full_sync(q, s);
     if (fin && take == n) s->fin_req = 1;
     if (take < n) {
         if (bud < own) {
@@ -1985,6 +2051,8 @@ size_t qc_stream_queued(const struct qc *q, int64_t sid) {
 size_t qc_send_total(const struct qc *q) { return q ? q->send_total : 0; }
 size_t qc_send_buf(const struct qc *q) { return q ? q->send_buf : 0; }
 uint64_t qc_hop_fails(const struct qc *q) { return q ? q->hop_fails : 0; }
+
+uint16_t qc_sock_port(const struct qc *q) { return q->hop_mode & QC_HOP_LOCAL ? fd_port(q->fd) : ss_port(&q->local); }
 
 size_t qc_stream_unsent(const struct qc *q, int64_t sid) {
     const struct qc_stream *s = q ? stream_find(q, sid) : NULL;
@@ -2115,13 +2183,20 @@ void qc_stats_get(struct qc *q, struct qc_stats *st) {
     st->hops = q->hops;
     st->hop_fails = q->hop_fails;
     st->port = q->port;
+    st->pay_tx = q->pay_tx;
+    st->pay_rx = q->pay_rx;
+    st->cc_sent = q->tally.sent;
+    st->cc_lost = q->tally.lost;
     if (!q->conn) return;
     st->pacing_bps = ngcc_pacing_bps(q->conn);
+    st->bytes_acked = ngcc_delivered(q->conn);
+    st->bbr_state = ngcc_bbr_state(q->conn, &st->bbr_bw);
     st->ack_q16 = ngcc_brutal_ack_q16(q->conn);
     st->no_loss_comp = ngcc_brutal_no_comp(q->conn);
     ngtcp2_conn_info ci;
     ngtcp2_conn_get_conn_info2(q->conn, &ci);
     st->rtt_us = ci.smoothed_rtt / NGTCP2_MICROSECONDS;
+    st->min_rtt_us = ci.min_rtt / NGTCP2_MICROSECONDS;
     st->cwnd = ci.cwnd;
     st->in_flight = ci.bytes_in_flight;
     st->pkt_sent = ci.pkt_sent;
@@ -2129,4 +2204,9 @@ void qc_stats_get(struct qc *q, struct qc_stats *st) {
     st->bytes_sent = ci.bytes_sent;
     st->bytes_recv = ci.bytes_recv;
     st->pkt_lost = ci.pkt_lost;
+}
+
+void qc_wait_get(const struct qc *q, uint64_t now_ns, uint64_t ns[3]) {
+    memcpy(ns, q->wait, sizeof q->wait);
+    if (q->hold && now_ns > q->hold_at) ns[q->hold - 1] += now_ns - q->hold_at;
 }

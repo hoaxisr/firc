@@ -2499,7 +2499,7 @@
   if (!window.UnicornPony) {
     window.UnicornPony = { start: startPony, stop: stopPony, play: playAction };
     const boot = () => {
-      if (navigator.webdriver) return;
+      if (navigator.webdriver || prefersReducedMotion()) return;
       if (AUTO_TOGGLE) applyUrlChoice();
       const enabled = readEnabled();
       if (AUTO_TOGGLE) createToggle({ enabled, onChange: (on) => (on ? startPony() : stopPony()) });
