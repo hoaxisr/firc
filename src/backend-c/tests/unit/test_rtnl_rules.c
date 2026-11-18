@@ -1,7 +1,9 @@
 #include "greatest.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
 
@@ -479,6 +481,84 @@ TEST main_defaults_reads_a_dump_filtered_by_table(void) {
     PASS();
 }
 
+typedef struct {
+    firc_rtnl_t *rtnl;
+    size_t failures;
+} rtnl_race_arg_t;
+
+static unsigned fixed_ifindex_one(const char *name) {
+    (void)name;
+    return 1u;
+}
+
+static void *rtnl_race_link_thread(void *ud) {
+    rtnl_race_arg_t *arg = ud;
+    for (int i = 0; i < 400; i++) {
+        firc_link_info_t li;
+        bool found = false;
+        if (firc_rtnl_link_by_name(arg->rtnl, "lo", &li, &found) != FIRC_OK || !found || !li.up) {
+            arg->failures++;
+        }
+    }
+    return NULL;
+}
+
+static void *rtnl_race_rules_thread(void *ud) {
+    rtnl_race_arg_t *arg = ud;
+    for (int i = 0; i < 200; i++) {
+        uint32_t field = 0;
+        if (firc_rtnl_alloc_mark_field_for(arg->rtnl, "race0001", &field) != FIRC_OK || field == 0) {
+            arg->failures++;
+            continue;
+        }
+        uint32_t mark = firc_mark_group_value(field);
+        uint32_t prio = firc_rule_priority_for_field(field);
+        if (firc_rtnl_rule_add(arg->rtnl, AF_INET, mark, FIRC_MARK_GROUP_MASK, 200u, prio) != FIRC_OK) {
+            arg->failures++;
+        }
+        if (firc_rtnl_rule_del(arg->rtnl, AF_INET, mark, FIRC_MARK_GROUP_MASK, 200u, prio) != FIRC_OK) {
+            arg->failures++;
+        }
+        firc_rtnl_forget_mark_field(arg->rtnl, "race0001");
+    }
+    return NULL;
+}
+
+/* Catches: concurrent callers on a shared firc_rtnl_t racing on ++seq and discarding each other's Netlink replies. */
+TEST concurrent_callers_on_one_rtnl_handle_never_steal_replies(void) {
+    fx_t f;
+    ASSERT(up(&f));
+    firc_rtnl_set_nametoindex_for_test(fixed_ifindex_one);
+
+    rtnl_race_arg_t a_link = {.rtnl = f.rtnl, .failures = 0};
+    rtnl_race_arg_t a_rules = {.rtnl = f.rtnl, .failures = 0};
+    pthread_t th_link, th_rules;
+    ASSERT_EQ(0, pthread_create(&th_link, NULL, rtnl_race_link_thread, &a_link));
+    ASSERT_EQ(0, pthread_create(&th_rules, NULL, rtnl_race_rules_thread, &a_rules));
+    ASSERT_EQ(0, pthread_join(th_link, NULL));
+    ASSERT_EQ(0, pthread_join(th_rules, NULL));
+
+    firc_rtnl_set_nametoindex_for_test(NULL);
+    down(&f);
+    ASSERT_EQ_FMT((size_t)0, a_link.failures, "%zu");
+    ASSERT_EQ_FMT((size_t)0, a_rules.failures, "%zu");
+    PASS();
+}
+
+TEST firc_rtnl_open_fd_and_close_handle_invalid_and_valid_fds(void) {
+    firc_rtnl_t *neg = firc_rtnl_open_fd(-1);
+    ASSERT(neg != NULL);
+    firc_rtnl_close(neg);
+
+    int sv[2] = {-1, -1};
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+    firc_rtnl_t *ok = firc_rtnl_open_fd(sv[0]);
+    ASSERT(ok != NULL);
+    firc_rtnl_close(ok);
+    ASSERT_EQ(0, close(sv[1]));
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -505,5 +585,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_table_is_handed_whole_on_demand);
     RUN_TEST(the_reply_delete_names_its_iif);
     RUN_TEST(main_defaults_reads_a_dump_filtered_by_table);
+    RUN_TEST(concurrent_callers_on_one_rtnl_handle_never_steal_replies);
+    RUN_TEST(firc_rtnl_open_fd_and_close_handle_invalid_and_valid_fds);
     GREATEST_MAIN_END();
 }

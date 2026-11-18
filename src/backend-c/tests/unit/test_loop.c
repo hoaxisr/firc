@@ -400,8 +400,11 @@ TEST a_signal_blocked_before_a_thread_starts_reaches_the_loop(void) {
 }
 
 static void count_timer_cb(firc_loop_t *loop, void *ud) {
-    (void)loop;
-    (*(int *)ud)++;
+    int *fired = ud;
+    (*fired)++;
+    if (*fired >= 3) {
+        firc_loop_stop(loop);
+    }
 }
 
 static size_t open_fds(void) {
@@ -452,11 +455,12 @@ TEST a_periodic_timer_survives_its_first_firing(void) {
     int fired = 0;
     int id = 0;
     ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 1, 1, count_timer_cb, &fired, &id));
-    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 40, 0, stop_timer_cb, &fired, NULL));
+    ASSERT_EQ(FIRC_OK, firc_loop_add_timer(loop, 2000, 0, stop_after, NULL, NULL));
     ASSERT_EQ(FIRC_OK, firc_loop_run(loop));
-    ASSERTm("it fired more than once", fired > 2);
-    ASSERT_EQ_FMTm("and is still there to be deleted", FIRC_OK, firc_loop_del_timer(loop, id), "%d");
+    int del_rc = firc_loop_del_timer(loop, id);
     firc_loop_destroy(loop);
+    ASSERTm("it fired more than once", fired >= 3);
+    ASSERT_EQ_FMTm("and is still there to be deleted", FIRC_OK, del_rc, "%d");
     PASS();
 }
 

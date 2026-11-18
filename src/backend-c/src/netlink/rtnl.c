@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <libmnl/libmnl.h>
 #include <linux/fib_rules.h>
 #include <linux/if.h>
@@ -27,12 +28,22 @@ typedef struct {
 struct firc_rtnl {
     struct mnl_socket *nl; /* NULL when opened over a caller's fd */
     int fd;
+    pthread_mutex_t mu;
     uint32_t seq;
     field_hint_t hints[FIRC_MARK_MAX_GROUPS];
     size_t n_hints;
     firc_rtnl_fields_fn on_fields;
     void *on_fields_ud;
 };
+
+static bool rtnl_mu_init(firc_rtnl_t *r) {
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) { return false; }
+    bool ok = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0 &&
+              pthread_mutex_init(&r->mu, &attr) == 0;
+    pthread_mutexattr_destroy(&attr);
+    return ok;
+}
 
 static uint32_t hint_for(const firc_rtnl_t *r, const char *owner) {
     if (owner == NULL) { return 0; }
@@ -75,13 +86,19 @@ static void notify_fields(const firc_rtnl_t *r) {
 firc_rtnl_t *firc_rtnl_open(void) {
     firc_rtnl_t *r = calloc(1, sizeof(*r));
     if (!r) { return NULL; }
+    if (!rtnl_mu_init(r)) {
+        free(r);
+        return NULL;
+    }
     r->nl = mnl_socket_open(NETLINK_ROUTE);
     if (!r->nl) {
+        pthread_mutex_destroy(&r->mu);
         free(r);
         return NULL;
     }
     if (mnl_socket_bind(r->nl, 0, MNL_SOCKET_AUTOPID) < 0) {
         mnl_socket_close(r->nl);
+        pthread_mutex_destroy(&r->mu);
         free(r);
         return NULL;
     }
@@ -91,7 +108,15 @@ firc_rtnl_t *firc_rtnl_open(void) {
 
 firc_rtnl_t *firc_rtnl_open_fd(int fd) {
     firc_rtnl_t *r = calloc(1, sizeof(*r));
-    if (!r) { return NULL; }
+    if (!r) {
+        if (fd >= 0) { close(fd); }
+        return NULL;
+    }
+    if (!rtnl_mu_init(r)) {
+        free(r);
+        if (fd >= 0) { close(fd); }
+        return NULL;
+    }
     r->fd = fd;
     return r;
 }
@@ -100,9 +125,10 @@ void firc_rtnl_close(firc_rtnl_t *r) {
     if (!r) { return; }
     if (r->nl) {
         mnl_socket_close(r->nl);
-    } else {
+    } else if (r->fd >= 0) {
         close(r->fd);
     }
+    pthread_mutex_destroy(&r->mu);
     free(r);
 }
 
@@ -112,7 +138,7 @@ static bool payload_at_least(const struct nlmsghdr *h, size_t n) {
 
 /* An abandoned dump blocks the socket's next dump until its DONE is read. */
 static void drain_dump(firc_rtnl_t *r, uint32_t seq) {
-    uint8_t buf[FIRC_RTNL_RECVBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_RECVBUF];
     for (int guard = 0; guard < 65536; guard++) {
         struct pollfd pfd = {.fd = r->fd, .events = POLLIN};
         if (poll(&pfd, 1, 200) <= 0) { return; }
@@ -136,7 +162,7 @@ static firc_err_t nl_execute(firc_rtnl_t *r, struct nlmsghdr *nlh, int *out_code
     const uint32_t seq = nlh->nlmsg_seq;
     const bool dump = (nlh->nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP;
     const bool acked = dump || (nlh->nlmsg_flags & NLM_F_ACK) != 0;
-    uint8_t buf[FIRC_RTNL_RECVBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_RECVBUF];
     bool torn = false;
     for (;;) {
         /* MSG_TRUNC: an oversized reply is an error, never a shortened dump. */
@@ -219,7 +245,8 @@ struct nlmsghdr *firc_rtnl_build_rule(void *buf, bool add, uint32_t seq, int fam
 
 static firc_err_t rule_add(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask,
                            uint32_t table, uint32_t priority, const char *reply_iif) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh =
         firc_rtnl_build_rule(buf, true, ++r->seq, family, mark, mask, table, priority);
@@ -230,6 +257,7 @@ static firc_err_t rule_add(firc_rtnl_t *r, int family, uint32_t mark, uint32_t m
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -249,12 +277,14 @@ firc_err_t firc_rtnl_rule_add_reply(firc_rtnl_t *r, int family, uint32_t mark, u
 firc_err_t firc_rtnl_rule_del_reply(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask, const char *iif,
                                     uint32_t table, uint32_t priority) {
     if (iif == NULL || iif[0] == '\0' || strlen(iif) >= IFNAMSIZ) { return FIRC_ERR_INVAL; }
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = firc_rtnl_build_rule(buf, false, ++r->seq, family, mark, mask, table, priority);
     mnl_attr_put_strz(nlh, FRA_IIFNAME, iif);
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0 || code == ENOENT) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -262,13 +292,15 @@ firc_err_t firc_rtnl_rule_del_reply(firc_rtnl_t *r, int family, uint32_t mark, u
 
 firc_err_t firc_rtnl_rule_del(firc_rtnl_t *r, int family, uint32_t mark, uint32_t mask,
                               uint32_t table, uint32_t priority) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh =
         firc_rtnl_build_rule(buf, false, ++r->seq, family, mark, mask, table, priority);
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0 || code == ENOENT) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -296,7 +328,8 @@ static struct nlmsghdr *put_route_header(uint8_t *buf, uint16_t type, uint16_t f
 
 firc_err_t firc_rtnl_route_add_reject(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
                                      uint8_t rtm_type) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = put_route_header(
         buf, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK, ++r->seq, family,
@@ -306,6 +339,7 @@ firc_err_t firc_rtnl_route_add_reject(firc_rtnl_t *r, int family, uint32_t table
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -313,7 +347,8 @@ firc_err_t firc_rtnl_route_add_reject(firc_rtnl_t *r, int family, uint32_t table
 
 firc_err_t firc_rtnl_route_del_reject(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
                                      uint8_t rtm_type) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = put_route_header(buf, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, ++r->seq,
                                             family, table, rtm_type);
@@ -322,6 +357,7 @@ firc_err_t firc_rtnl_route_del_reject(firc_rtnl_t *r, int family, uint32_t table
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0 || code == ESRCH) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -347,10 +383,10 @@ struct nlmsghdr *firc_rtnl_build_unreachable(void *buf, bool add, uint32_t seq, 
     return nlh;
 }
 
-firc_err_t firc_rtnl_route_add_unreachable(firc_rtnl_t *r, int family, uint32_t table,
-                                           uint32_t priority, const uint8_t *dst,
-                                           uint8_t prefix_len) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+static firc_err_t route_add_unreachable_locked(firc_rtnl_t *r, int family, uint32_t table,
+                                               uint32_t priority, const uint8_t *dst,
+                                               uint8_t prefix_len) {
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh =
         firc_rtnl_build_unreachable(buf, true, ++r->seq, family, table, priority, dst, prefix_len);
@@ -396,17 +432,31 @@ firc_err_t firc_rtnl_route_add_unreachable(firc_rtnl_t *r, int family, uint32_t 
     return firc_err_from_errno(code);
 }
 
+firc_err_t firc_rtnl_route_add_unreachable(firc_rtnl_t *r, int family, uint32_t table,
+                                           uint32_t priority, const uint8_t *dst,
+                                           uint8_t prefix_len) {
+    pthread_mutex_lock(&r->mu);
+    firc_err_t err = route_add_unreachable_locked(r, family, table, priority, dst, prefix_len);
+    pthread_mutex_unlock(&r->mu);
+    return err;
+}
+
 firc_err_t firc_rtnl_route_del_unreachable(firc_rtnl_t *r, int family, uint32_t table,
                                            uint32_t priority, const uint8_t *dst,
                                            uint8_t prefix_len) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh =
         firc_rtnl_build_unreachable(buf, false, ++r->seq, family, table, priority, dst, prefix_len);
-    if (nlh == NULL) { return FIRC_ERR_INVAL; }
+    if (nlh == NULL) {
+        pthread_mutex_unlock(&r->mu);
+        return FIRC_ERR_INVAL;
+    }
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0 || code == ESRCH || code == ENOENT) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -415,7 +465,8 @@ firc_err_t firc_rtnl_route_del_unreachable(firc_rtnl_t *r, int family, uint32_t 
 firc_err_t firc_rtnl_route_add_iface(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
                                  int oif, const uint8_t *gw, uint8_t gw_len, bool *unavailable) {
     *unavailable = false;
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = put_route_header(
         buf, RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK, ++r->seq, family,
@@ -427,6 +478,7 @@ firc_err_t firc_rtnl_route_add_iface(firc_rtnl_t *r, int family, uint32_t table,
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == ENODEV || code == ENETDOWN) {
         *unavailable = true;
@@ -438,7 +490,8 @@ firc_err_t firc_rtnl_route_add_iface(firc_rtnl_t *r, int family, uint32_t table,
 
 firc_err_t firc_rtnl_route_del_iface(firc_rtnl_t *r, int family, uint32_t table, uint32_t priority,
                                  int oif, const uint8_t *gw, uint8_t gw_len) {
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = put_route_header(buf, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, ++r->seq,
                                             family, table, RTN_UNICAST);
@@ -449,6 +502,7 @@ firc_err_t firc_rtnl_route_del_iface(firc_rtnl_t *r, int family, uint32_t table,
 
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, NULL, NULL);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code == 0 || code == ESRCH) { return FIRC_OK; }
     return firc_err_from_errno(code);
@@ -463,7 +517,7 @@ static firc_err_t dump_family(firc_rtnl_t *r, uint16_t msg_type, int family,
     firc_err_t err = FIRC_ERR_AGAIN;
     for (int attempt = 0; attempt < FIRC_RTNL_DUMP_TRIES && err == FIRC_ERR_AGAIN; attempt++) {
         if (begin != NULL) { begin(ud, attempt > 0); }
-        uint8_t buf[FIRC_RTNL_REQBUF];
+        _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
         memset(buf, 0, sizeof(buf));
         struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
         nlh->nlmsg_type = msg_type;
@@ -517,7 +571,8 @@ firc_err_t firc_rtnl_link_by_name(firc_rtnl_t *r, const char *name, firc_link_in
     unsigned idx = g_nametoindex(name);
     if (idx == 0) { return FIRC_OK; }
 
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    pthread_mutex_lock(&r->mu);
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
     nlh->nlmsg_type = RTM_GETLINK;
@@ -531,6 +586,7 @@ firc_err_t firc_rtnl_link_by_name(firc_rtnl_t *r, const char *name, firc_link_in
     link_ctx_t ctx = {0};
     int code = 0;
     firc_err_t err = nl_execute(r, nlh, &code, link_msg_cb, &ctx);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     if (code != 0 && code != ENODEV) { return firc_err_from_errno(code); }
     if (!ctx.found) { return FIRC_OK; }
@@ -661,7 +717,7 @@ static void gw_msg_cb(const struct nlmsghdr *h, void *ud) {
         switch (mnl_attr_get_type(attr)) {
         case RTA_OIF:
             if (mnl_attr_get_payload_len(attr) == 4) {
-                oif = (int)*(const uint32_t *)mnl_attr_get_payload(attr);
+                oif = (int)mnl_attr_get_u32(attr);
             }
             break;
         case RTA_GATEWAY: {
@@ -673,10 +729,10 @@ static void gw_msg_cb(const struct nlmsghdr *h, void *ud) {
             break;
         }
         case RTA_TABLE:
-            if (mnl_attr_get_payload_len(attr) == 4) { table = *(const uint32_t *)mnl_attr_get_payload(attr); }
+            if (mnl_attr_get_payload_len(attr) == 4) { table = mnl_attr_get_u32(attr); }
             break;
         case RTA_PRIORITY:
-            if (mnl_attr_get_payload_len(attr) == 4) { priority = *(const uint32_t *)mnl_attr_get_payload(attr); }
+            if (mnl_attr_get_payload_len(attr) == 4) { priority = mnl_attr_get_u32(attr); }
             break;
         case RTA_MULTIPATH:
             if (multipath_gw(attr, ctx->want_oif, gw, &gwlen)) { oif = ctx->want_oif; }
@@ -717,7 +773,9 @@ firc_err_t firc_rtnl_gateway_for_iface2(firc_rtnl_t *r, int family, int ifindex,
     *found = false;
     *gatewayless = false;
     gw_ctx_t ctx = {.want_oif = ifindex};
+    pthread_mutex_lock(&r->mu);
     firc_err_t err = dump_family(r, RTM_GETROUTE, family, gw_msg_cb, &ctx, gw_begin);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
 
     if (ctx.found) {
@@ -771,9 +829,9 @@ static void rule_scan_cb(const struct nlmsghdr *h, void *ud) {
     while (firc_nlattr_iter_next(&attr_it, &attr)) {
         uint16_t type = mnl_attr_get_type(attr);
         if (type == FRA_FWMARK && mnl_attr_get_payload_len(attr) == 4) {
-            used_set_add(&ctx->marks, *(const uint32_t *)mnl_attr_get_payload(attr));
+            used_set_add(&ctx->marks, mnl_attr_get_u32(attr));
         } else if (type == FRA_TABLE && mnl_attr_get_payload_len(attr) == 4) {
-            used_set_add(&ctx->tables, *(const uint32_t *)mnl_attr_get_payload(attr));
+            used_set_add(&ctx->tables, mnl_attr_get_u32(attr));
         }
     }
 }
@@ -789,7 +847,7 @@ static void route_scan_cb(const struct nlmsghdr *h, void *ud) {
     if (!firc_nlattr_iter_init_nlmsg(&attr_it, h, sizeof(struct rtmsg))) { return; }
     while (firc_nlattr_iter_next(&attr_it, &attr)) {
         if (mnl_attr_get_type(attr) == RTA_TABLE && mnl_attr_get_payload_len(attr) == 4) {
-            used_set_add(&ctx->tables, *(const uint32_t *)mnl_attr_get_payload(attr));
+            used_set_add(&ctx->tables, mnl_attr_get_u32(attr));
         }
     }
 }
@@ -816,17 +874,23 @@ static void v6_addr_begin(void *ud, bool retry) {
 
 firc_err_t firc_rtnl_iface_carries_v6(firc_rtnl_t *r, int ifindex, bool *carries) {
     *carries = false;
+    pthread_mutex_lock(&r->mu);
     v6_addr_ctx_t ctx = {.ifindex = ifindex};
     firc_err_t err = dump_family(r, RTM_GETADDR, AF_INET6, v6_addr_cb, &ctx, v6_addr_begin);
-    if (err != FIRC_OK) { return err; }
+    if (err != FIRC_OK) {
+        pthread_mutex_unlock(&r->mu);
+        return err;
+    }
     if (ctx.found) {
         *carries = true;
+        pthread_mutex_unlock(&r->mu);
         return FIRC_OK;
     }
     bool found = false, gatewayless = false;
     uint8_t gw[16];
     uint8_t gw_len = 0;
     err = firc_rtnl_gateway_for_iface2(r, AF_INET6, ifindex, &found, gw, &gw_len, &gatewayless);
+    pthread_mutex_unlock(&r->mu);
     if (err != FIRC_OK) { return err; }
     *carries = found || gatewayless;
     return FIRC_OK;
@@ -858,7 +922,7 @@ static void stale_scan_cb(const struct nlmsghdr *h, void *ud) {
     while (firc_nlattr_iter_next(&it, &a)) {
         uint16_t t = mnl_attr_get_type(a);
         if (mnl_attr_get_payload_len(a) != 4) { continue; }
-        uint32_t v = *(const uint32_t *)mnl_attr_get_payload(a);
+        uint32_t v = mnl_attr_get_u32(a);
         if (t == FRA_FWMARK) {
             mark = v;
         } else if (t == FRA_FWMASK) {
@@ -910,6 +974,7 @@ firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed) {
     if (removed != NULL) { *removed = 0; }
     if (r == NULL) { return FIRC_ERR_INVAL; }
 
+    pthread_mutex_lock(&r->mu);
     stale_ctx_t ctx = {0};
     firc_err_t err = FIRC_OK;
     const int fams[2] = {AF_INET, AF_INET6};
@@ -945,6 +1010,7 @@ firc_err_t firc_rtnl_clean_stale_rules(firc_rtnl_t *r, size_t *removed) {
     }
     free(gone);
     free(ctx.v);
+    pthread_mutex_unlock(&r->mu);
     return err;
 }
 
@@ -996,13 +1062,13 @@ static void routes_scan_cb(const struct nlmsghdr *h, void *ud) {
         uint16_t t = mnl_attr_get_type(a);
         uint16_t len = mnl_attr_get_payload_len(a);
         if (t == RTA_TABLE && len == 4) {
-            o.table = *(const uint32_t *)mnl_attr_get_payload(a);
+            o.table = mnl_attr_get_u32(a);
         } else if (t == RTA_PRIORITY && len == 4) {
-            o.priority = *(const uint32_t *)mnl_attr_get_payload(a);
+            o.priority = mnl_attr_get_u32(a);
         } else if (t == RTA_DST && len == addr_len) {
             memcpy(o.dst, mnl_attr_get_payload(a), addr_len);
         } else if (t == RTA_OIF && len == 4) {
-            o.oif = *(const uint32_t *)mnl_attr_get_payload(a);
+            o.oif = mnl_attr_get_u32(a);
         } else if (t == RTA_GATEWAY && len == addr_len) {
             memcpy(o.gw, mnl_attr_get_payload(a), addr_len);
             o.gw_len = (uint8_t)addr_len;
@@ -1031,7 +1097,7 @@ static firc_err_t dump_routes(firc_rtnl_t *r, routes_ctx_t *ctx) {
 /* Names type, scope and next hop: an IPv6 delete otherwise takes the first route at the key. */
 static firc_err_t del_seen_route(firc_rtnl_t *r, const seen_route_t *o, bool *deleted) {
     *deleted = false;
-    uint8_t buf[FIRC_RTNL_REQBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_RTNL_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = put_route_header(buf, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, ++r->seq, o->family,
                                             o->table, o->rtm_type);
@@ -1080,6 +1146,7 @@ firc_err_t firc_rtnl_purge_tagged_routes(firc_rtnl_t *r, size_t *removed, size_t
     if (removed != NULL) { *removed = 0; }
     if (left != NULL) { *left = 0; }
     if (r == NULL) { return FIRC_ERR_INVAL; }
+    pthread_mutex_lock(&r->mu);
     routes_ctx_t ctx = {0};
     firc_err_t err = dump_routes(r, &ctx);
     if (err == FIRC_OK) {
@@ -1105,6 +1172,7 @@ firc_err_t firc_rtnl_purge_tagged_routes(firc_rtnl_t *r, size_t *removed, size_t
         err = e;
     }
     free(after.v);
+    pthread_mutex_unlock(&r->mu);
     return err;
 }
 
@@ -1138,12 +1206,15 @@ static firc_err_t occupant_of(firc_rtnl_t *r, int family, uint32_t table, uint32
 
 void firc_rtnl_forget_mark_field(firc_rtnl_t *r, const char *owner) {
     if (r == NULL || owner == NULL) { return; }
+    pthread_mutex_lock(&r->mu);
     for (size_t i = 0; i < r->n_hints; i++) {
         if (strcmp(r->hints[i].owner, owner) != 0) { continue; }
         r->hints[i] = r->hints[--r->n_hints];
         notify_fields(r);
+        pthread_mutex_unlock(&r->mu);
         return;
     }
+    pthread_mutex_unlock(&r->mu);
 }
 
 firc_err_t firc_rtnl_alloc_mark_field(firc_rtnl_t *r, uint32_t *out_field) {
@@ -1151,6 +1222,7 @@ firc_err_t firc_rtnl_alloc_mark_field(firc_rtnl_t *r, uint32_t *out_field) {
 }
 
 firc_err_t firc_rtnl_alloc_mark_field_for(firc_rtnl_t *r, const char *owner, uint32_t *out_field) {
+    pthread_mutex_lock(&r->mu);
     scan_ctx_t ctx = {0};
 
     firc_err_t err = dump_family(r, RTM_GETRULE, AF_INET, rule_scan_cb, &ctx, NULL);
@@ -1190,10 +1262,12 @@ firc_err_t firc_rtnl_alloc_mark_field_for(firc_rtnl_t *r, const char *owner, uin
 
     free(ctx.marks.vals);
     free(ctx.tables.vals);
+    pthread_mutex_unlock(&r->mu);
     return err;
 }
 
 firc_err_t firc_rtnl_alloc_mark_table(firc_rtnl_t *r, uint32_t start_idx, uint32_t *out_idx) {
+    pthread_mutex_lock(&r->mu);
     scan_ctx_t ctx = {0};
     used_set_add(&ctx.tables, RT_TABLE_UNSPEC);
     used_set_add(&ctx.tables, 253);
@@ -1217,28 +1291,43 @@ firc_err_t firc_rtnl_alloc_mark_table(firc_rtnl_t *r, uint32_t start_idx, uint32
 
     free(ctx.marks.vals);
     free(ctx.tables.vals);
+    pthread_mutex_unlock(&r->mu);
     return err;
 }
 
 firc_err_t firc_rtnl_seed_mark_field(firc_rtnl_t *r, const char *owner, uint32_t field) {
     if (r == NULL || owner == NULL || strlen(owner) >= sizeof(r->hints[0].owner)) { return FIRC_ERR_INVAL; }
     if (field < 1 || field > FIRC_MARK_MAX_GROUPS) { return FIRC_ERR_INVAL; }
+    pthread_mutex_lock(&r->mu);
     for (size_t i = 0; i < r->n_hints; i++) {
-        if (r->hints[i].field == field || strcmp(r->hints[i].owner, owner) == 0) { return FIRC_ERR_EXIST; }
+        if (r->hints[i].field == field || strcmp(r->hints[i].owner, owner) == 0) {
+            pthread_mutex_unlock(&r->mu);
+            return FIRC_ERR_EXIST;
+        }
     }
-    if (r->n_hints == FIRC_MARK_MAX_GROUPS) { return FIRC_ERR_LIMIT; }
+    if (r->n_hints == FIRC_MARK_MAX_GROUPS) {
+        pthread_mutex_unlock(&r->mu);
+        return FIRC_ERR_LIMIT;
+    }
     snprintf(r->hints[r->n_hints].owner, sizeof(r->hints[0].owner), "%s", owner);
     r->hints[r->n_hints].field = field;
     r->n_hints++;
+    pthread_mutex_unlock(&r->mu);
     return FIRC_OK;
 }
 
 void firc_rtnl_watch_mark_fields(firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud) {
     if (r == NULL) { return; }
+    pthread_mutex_lock(&r->mu);
     r->on_fields = fn;
     r->on_fields_ud = ud;
+    pthread_mutex_unlock(&r->mu);
 }
 
 void firc_rtnl_fields_now(const firc_rtnl_t *r, firc_rtnl_fields_fn fn, void *ud) {
-    if (r != NULL) { hand_fields(r, fn, ud); }
+    if (r == NULL) { return; }
+    firc_rtnl_t *mut = (firc_rtnl_t *)r;
+    pthread_mutex_lock(&mut->mu);
+    hand_fields(r, fn, ud);
+    pthread_mutex_unlock(&mut->mu);
 }

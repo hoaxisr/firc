@@ -110,7 +110,7 @@ static void set_fat_headers(firc_http_res_t *res) {
     memset(value, 'v', sizeof(value) - 1);
     value[sizeof(value) - 1] = '\0';
     for (int i = 0; i < 4; i++) {
-        char name[16];
+        char name[32];
         snprintf(name, sizeof(name), "X-Pad-%d", i);
         firc_http_res_set_header(res, name, value);
     }
@@ -778,7 +778,9 @@ static size_t mapped_bytes(void) {
 
 /* Catches: a keep-alive connection holding the buffer of its largest body until it closes. */
 TEST a_kept_connection_lets_go_of_a_large_body(void) {
+#if defined(__GLIBC__)
     mallopt(M_MMAP_THRESHOLD, 64 * 1024);
+#endif
     char *volatile probe = malloc(KEPT_BODY);
     ASSERT(probe != NULL);
     probe[0] = 1;

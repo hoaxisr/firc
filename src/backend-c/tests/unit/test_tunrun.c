@@ -2656,6 +2656,25 @@ TEST a_listen_outside_app_link_sends_no_line(void)
     PASS();
 }
 
+/* catches: rejecting private loopback diagnostics when app.link does not list lo */
+TEST lo_listen_without_app_link_is_allowed(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    const char *const br0_only[] = {"br0"};
+    const firc_tunrun_lan_t lan = {br0_only, 1, wan_from_globals, &g_wan_calls};
+    firc_tunrun_t *r = firc_tunrun_new(f.loop, f.rtnl, START + 100u, FAKE, &lan);
+    ASSERT(r != NULL);
+    ASSERT(firc_tunrun_lan_ok(r, "br0"));
+    ASSERT(firc_tunrun_lan_ok(r, "lo"));
+    ASSERT_FALSE(firc_tunrun_lan_ok(r, "eth9"));
+    ASSERT_FALSE(firc_tunrun_lan_ok(r, "0.0.0.0"));
+    ASSERT_FALSE(firc_tunrun_lan_ok(r, ""));
+    firc_tunrun_free(r);
+    fx_down(&f);
+    PASS();
+}
+
 /* catches: an app.link entry the firmware calls a WAN listened on */
 TEST a_wan_listen_sends_no_line(void)
 {
@@ -3298,6 +3317,44 @@ TEST an_event_on_another_tunnel_s_device_is_not_a_network_change(void)
     PASS();
 }
 
+static void *stack_budget_worker(void *ud)
+{
+    firc_tunrun_t *run = ud;
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        return (void *)1;
+    }
+    size_t n = firc_tunrun_states(run, st, FIRC_TUN_MAX);
+    bool down = firc_tunrun_device_down(run, "tunvless0");
+    int64_t since = -1;
+    bool starting = firc_tunrun_device_starting(run, "tunvless0", &since);
+    free(st);
+    (void)n;
+    (void)down;
+    (void)starting;
+    return NULL;
+}
+
+TEST tunrun_states_and_device_checks_fit_inside_128k_musl_stack(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    apply_yaml(&f, AB_LINKS);
+    ASSERT_EQ(1, run_until_starts(&f, "tunvless0", 1, 2000));
+
+    pthread_attr_t attr;
+    ASSERT_EQ(0, pthread_attr_init(&attr));
+    ASSERT_EQ(0, pthread_attr_setstacksize(&attr, 128 * 1024));
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, &attr, stack_budget_worker, f.run));
+    void *ret = NULL;
+    ASSERT_EQ(0, pthread_join(th, &ret));
+    ASSERT_EQ(NULL, ret);
+    pthread_attr_destroy(&attr);
+    fx_down(&f);
+    PASS();
+}
+
 SUITE(tunrun)
 {
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
@@ -3372,6 +3429,7 @@ SUITE(tunrun)
     RUN_TEST(an_excluded_node_still_binds);
     RUN_TEST(a_filtered_out_node_still_binds);
     RUN_TEST(a_listen_outside_app_link_sends_no_line);
+    RUN_TEST(lo_listen_without_app_link_is_allowed);
     RUN_TEST(a_wan_listen_sends_no_line);
     RUN_TEST(the_wan_roles_are_read_once_when_an_inbound_is_first_judged);
     RUN_TEST(no_inbound_reads_no_wan_roles);
@@ -3400,6 +3458,7 @@ SUITE(tunrun)
     RUN_TEST(an_event_with_no_name_is_a_network_change);
     RUN_TEST(an_event_on_a_tunnel_s_own_device_is_not_a_network_change);
     RUN_TEST(an_event_on_another_tunnel_s_device_is_not_a_network_change);
+    RUN_TEST(tunrun_states_and_device_checks_fit_inside_128k_musl_stack);
 }
 
 typedef enum { FR_MANUAL, FR_READY, FR_PRESENT_ONLY, FR_REFUSE_REMOVAL } fr_mode_t;

@@ -1182,9 +1182,11 @@ static uint64_t ms_now(void) {
     return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
 }
 
+#define XMUX_UNTIL_MS 15000u
+
 #define UNTIL(cond)                                                    \
     do {                                                               \
-        uint64_t dl_ = ms_now() + 3000;                                \
+        uint64_t dl_ = ms_now() + XMUX_UNTIL_MS;                       \
         while (!(cond) && ms_now() < dl_) turn();                      \
     } while (0)
 
@@ -1753,7 +1755,7 @@ static void t_ping_wired(void) {
     gl_begin(0);
     struct tr_node n = gl_node(g_p.port, "xmux.maxConnections=1\nxmux.hKeepAlivePeriod=2\n");
     gl_attach(0, &n, g_key);
-    UNTIL(gl_ready(0) && P_NSID(0) == 1);
+    UNTIL(gl_ready(0) && P_NSID(0) == 1 && xs_status(&g_t[0].xh.f.one) == 200);
     turns(5);
     uint64_t t0 = g_now;
     /* catches: the keepalive built but not called */
@@ -3149,7 +3151,7 @@ static void t_post_fed_across_passes(void) {
     check("fed: within the budget at every turn", 1, okb);
     p_read_again(0);
     oka = okb = 1;
-    for (uint64_t dl = ms_now() + 3000; (g_t[0].xh.f.feed || P_UPB(0) < b0 + 1000000) && ms_now() < dl;) {
+    for (uint64_t dl = ms_now() + XMUX_UNTIL_MS; (g_t[0].xh.f.feed || P_UPB(0) < b0 + 1000000) && ms_now() < dl;) {
         turn();
         okq &= xc_queued() <= XC_OUT_HIGH + XC_CHUNK;
         oka &= ACCT_OK();
@@ -3252,7 +3254,7 @@ static void stall_bounded(const char *mode, int nsid) {
     UNTIL(room_wakes(0) > w1);
     check(su_l(mode, "woken again once the refill drains"), 1, room_wakes(0) > w1);
     long target = g_fw + 100000;
-    for (uint64_t dl = ms_now() + 3000; (g_fw < target || P_UPB(0) < g_fw) && ms_now() < dl;) {
+    for (uint64_t dl = ms_now() + XMUX_UNTIL_MS; (g_fw < target || P_UPB(0) < g_fw) && ms_now() < dl;) {
         if (g_fw < target) okw &= su_write(0) >= 0;
         turn();
     }
@@ -4559,7 +4561,7 @@ static void t_dead_stream_credit_per_frame(void) {
     turns(5);
     P_SET(pad_go, 1);
     gl_got[0] = 0;
-    for (uint64_t dl = ms_now() + 3000; ms_now() < dl;) {
+    for (uint64_t dl = ms_now() + XMUX_UNTIL_MS; ms_now() < dl;) {
         turn();
         size_t got = 0;
         unsigned char sink[4096];

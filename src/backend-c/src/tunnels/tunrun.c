@@ -489,11 +489,15 @@ static void watch(firc_tunrun_t *t)
     if (t->stopped || t->ext == NULL) {
         return;
     }
-    firc_tun_state_t st[FIRC_TUN_MAX];
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        return;
+    }
     size_t n = firc_tunrun_states(t, st, FIRC_TUN_MAX);
     for (size_t i = 0; i < n && i < FIRC_TUN_MAX; i++) {
         firc_tunwatch_see(&t->ext[i].watch, st[i].device, st[i].status, t->now());
     }
+    free(st);
 }
 
 static void on_watch(firc_loop_t *loop, void *ud)
@@ -545,7 +549,8 @@ static bool lan_ok(firc_tunrun_t *t, const char *name)
             return !t->wan[i];
         }
     }
-    return false;
+    /* AWGM: private diagnostics do not participate in LAN interception. */
+    return strcmp(name, "lo") == 0;
 }
 
 bool firc_tunrun_lan_ok(firc_tunrun_t *t, const char *name)
@@ -1895,10 +1900,14 @@ void firc_tunrun_bodies_changed(void *ud)
 
 size_t firc_tunrun_states(const firc_tunrun_t *t, firc_tun_state_t *out, size_t cap)
 {
-    firc_tun_state_t run[FIRC_TUN_MAX * 2];
-    size_t n_run = firc_tunsup_states(t->sup, run, sizeof run / sizeof run[0]);
-    if (n_run > sizeof run / sizeof run[0]) {
-        n_run = sizeof run / sizeof run[0];
+    size_t run_cap = (size_t)FIRC_TUN_MAX * 2;
+    firc_tun_state_t *run = calloc(run_cap, sizeof(*run));
+    if (run == NULL) {
+        return 0;
+    }
+    size_t n_run = firc_tunsup_states(t->sup, run, run_cap);
+    if (n_run > run_cap) {
+        n_run = run_cap;
     }
     for (size_t i = 0; i < t->cur.n && i < cap; i++) {
         const firc_tunnel_t *tun = &t->cur.t[i];
@@ -1933,6 +1942,7 @@ size_t firc_tunrun_states(const firc_tunrun_t *t, firc_tun_state_t *out, size_t 
             st->ib[k].tx = s->tx;
         }
     }
+    free(run);
     return t->cur.n;
 }
 
@@ -1941,14 +1951,20 @@ bool firc_tunrun_device_down(const firc_tunrun_t *t, const char *device)
     if (device == NULL) {
         return false;
     }
-    firc_tun_state_t st[FIRC_TUN_MAX];
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        return false;
+    }
     size_t n = firc_tunrun_states(t, st, FIRC_TUN_MAX);
+    bool down = false;
     for (size_t i = 0; i < n && i < FIRC_TUN_MAX; i++) {
         if (strcmp(st[i].device, device) == 0) {
-            return st[i].status != FIRC_TUN_ST_UP;
+            down = st[i].status != FIRC_TUN_ST_UP;
+            break;
         }
     }
-    return false;
+    free(st);
+    return down;
 }
 
 bool firc_tunrun_device_starting(const firc_tunrun_t *t, const char *device, int64_t *since_ms)
@@ -1956,21 +1972,26 @@ bool firc_tunrun_device_starting(const firc_tunrun_t *t, const char *device, int
     if (device == NULL) {
         return false;
     }
-    firc_tun_state_t st[FIRC_TUN_MAX];
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        return false;
+    }
     size_t n = firc_tunrun_states(t, st, FIRC_TUN_MAX);
+    bool starting = false;
     for (size_t i = 0; i < n && i < FIRC_TUN_MAX; i++) {
         if (strcmp(st[i].device, device) != 0) {
             continue;
         }
         int k = opkg_n(device);
         bool pending = st[i].status == FIRC_TUN_ST_ROUTER && k >= 0 && router_pending(&t->orec[k]);
-        if (st[i].status != FIRC_TUN_ST_STARTING && st[i].status != FIRC_TUN_ST_WAITING && !pending) {
-            return false;
+        if (st[i].status == FIRC_TUN_ST_STARTING || st[i].status == FIRC_TUN_ST_WAITING || pending) {
+            *since_ms = st[i].since_ms;
+            starting = true;
         }
-        *since_ms = st[i].since_ms;
-        return true;
+        break;
     }
-    return false;
+    free(st);
+    return starting;
 }
 
 const firc_tunnels_t *firc_tunrun_config(const firc_tunrun_t *t)

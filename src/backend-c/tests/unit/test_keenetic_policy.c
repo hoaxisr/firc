@@ -296,6 +296,18 @@ static void *wait_long(void *ud) {
     return NULL;
 }
 
+#if defined(__SANITIZE_ADDRESS__)
+#define KN_POLICY_ASAN_ACTIVE 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define KN_POLICY_ASAN_ACTIVE 1
+#else
+#define KN_POLICY_ASAN_ACTIVE 0
+#endif
+#else
+#define KN_POLICY_ASAN_ACTIVE 0
+#endif
+
 static void loop_took_too_long(int sig) {
     (void)sig;
     static const char msg[] =
@@ -311,14 +323,19 @@ TEST a_stop_does_not_free_the_object_under_a_waiter(void) {
     signal(SIGALRM, loop_took_too_long);
     alarm(60);
     firc_log_set_output_floor(FIRC_LOG_ERROR);
-    const int rounds = 2000;
+    const int rounds = KN_POLICY_ASAN_ACTIVE ? 500 : 2000;
     for (int i = 0; i < rounds; i++) {
+        if ((i & 31) == 0) { alarm(60); }
         firc_kn_policies_t *p = firc_kn_policies_start("http://127.0.0.1:9", 30);
         if (p == NULL) { FAIL(); }
         waiter_t w = {p, true, false};
         pthread_t th;
         if (pthread_create(&th, NULL, wait_long, &w) != 0) { FAIL(); }
-        while (firc_kn_policies_waiters_for_test(p) == 0) { sched_yield(); }
+        while (firc_kn_policies_waiters_for_test(p) == 0 && !atomic_load(&w.left)) {
+            sched_yield();
+            struct timespec pause = {0, 100 * 1000L};
+            nanosleep(&pause, NULL);
+        }
         firc_kn_policies_stop(p);
         pthread_join(th, NULL);
     }

@@ -403,7 +403,7 @@ sanitize:
 	    LDFLAGS="-fsanitize=$(SAN)" test
 
 # Own build dir: TSan and ASan objects do not mix.
-TSAN_TESTS := test_keenetic_policy test_keenetic_resolvers test_loop test_queue test_nfcommit test_sub_worker test_app test_update test_update_api test_settings_api test_ifcheck test_router_id test_rci_token test_opkgtun
+TSAN_TESTS := test_keenetic_policy test_keenetic_resolvers test_loop test_queue test_nfcommit test_sub_worker test_app test_update test_update_api test_settings_api test_ifcheck test_router_id test_rci_token test_opkgtun test_rtnl_rules
 TSAN_BINS := $(TSAN_TESTS:%=build/tsan/tests/%)
 tsan:
 	$(MAKE) BUILD=tsan \

@@ -943,11 +943,13 @@ static size_t dnsor_rules(fixture_t *fx) {
 
 static bool wait_dnsor_rule(fixture_t *fx, const char *const *rule) {
     bool written = false;
-    for (int i = 0; i < 400 && !written; i++) {
+    long backoff_ns = 10000000L;
+    for (int i = 0; i < 120 && !written; i++) {
+        nanosleep(&(struct timespec){.tv_nsec = backoff_ns}, NULL);
         firc_app_nf_enter(fx->app);
         written = chain_has_rule(fx->fake, "nat", "FIRC_DNSOR", rule, 12);
         firc_app_nf_leave(fx->app);
-        if (!written) { nanosleep(&(struct timespec){.tv_nsec = 5000000}, NULL); }
+        if (backoff_ns < 80000000L) { backoff_ns *= 2; }
     }
     return written;
 }

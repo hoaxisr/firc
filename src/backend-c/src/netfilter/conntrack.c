@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <libmnl/libmnl.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
@@ -30,6 +31,7 @@
 
 struct firc_ct {
     int fd;
+    pthread_mutex_t mu;
     uint32_t seq;
     /* Set once a filtered dump fails and the unfiltered one works; see dump_family. */
     bool filter_refused;
@@ -94,12 +96,29 @@ firc_ct_t *firc_ct_open_fd(int fd) {
         close(fd);
         return NULL;
     }
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) {
+        free(ct);
+        close(fd);
+        return NULL;
+    }
+    bool ok = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) == 0 &&
+              pthread_mutex_init(&ct->mu, &attr) == 0;
+    pthread_mutexattr_destroy(&attr);
+    if (!ok) {
+        free(ct);
+        close(fd);
+        return NULL;
+    }
     ct->fd = fd;
     return ct;
 }
 
 void firc_ct_set_clock(firc_ct_t *ct, int64_t (*clock_ms)(void)) {
-    if (ct != NULL) { ct->clock_ms = clock_ms; }
+    if (ct == NULL) { return; }
+    pthread_mutex_lock(&ct->mu);
+    ct->clock_ms = clock_ms;
+    pthread_mutex_unlock(&ct->mu);
 }
 
 firc_ct_t *firc_ct_open(void) {
@@ -125,6 +144,7 @@ firc_ct_t *firc_ct_open(void) {
 void firc_ct_close(firc_ct_t *ct) {
     if (ct == NULL) { return; }
     if (ct->fd >= 0) { close(ct->fd); }
+    pthread_mutex_destroy(&ct->mu);
     free(ct);
 }
 
@@ -452,7 +472,7 @@ static int left_ms(const firc_ct_t *ct, int64_t deadline) {
 
 /* An abandoned dump blocks later dumps (EBUSY) until read to its end. */
 static void drain_dump(firc_ct_t *ct, uint32_t seq) {
-    uint8_t buf[FIRC_CT_RECVBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_CT_RECVBUF];
     const int64_t deadline = now_ms(ct) + FIRC_CT_DRAIN_BUDGET_MS;
     for (int guard = 0; guard < 65536; guard++) {
         int wait = left_ms(ct, deadline);
@@ -481,7 +501,7 @@ static firc_err_t ct_execute(firc_ct_t *ct, struct nlmsghdr *nlh, int *out_code,
     if (send(ct->fd, nlh, nlh->nlmsg_len, 0) < 0) { return firc_err_from_errno(errno); }
     const uint32_t seq = nlh->nlmsg_seq;
     const bool dump = (nlh->nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP;
-    uint8_t buf[FIRC_CT_RECVBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_CT_RECVBUF];
     for (;;) {
         struct pollfd pfd = {.fd = ct->fd, .events = POLLIN};
         int waited = left_ms(ct, deadline);
@@ -548,7 +568,7 @@ static firc_err_t dump_family(firc_ct_t *ct, int family, scan_t *s, int64_t dead
     for (int attempt = 0; attempt < 2; attempt++) {
         bool asked = s->filter_mark && !ct->filter_refused && !retried_unfiltered;
 
-        uint8_t buf[FIRC_CT_REQBUF];
+        _Alignas(struct nlmsghdr) uint8_t buf[FIRC_CT_REQBUF];
         memset(buf, 0, sizeof(buf));
         struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
         nlh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET);
@@ -595,7 +615,7 @@ static firc_err_t dump_family(firc_ct_t *ct, int family, scan_t *s, int64_t dead
 static firc_err_t delete_hit(firc_ct_t *ct, const ct_hit_t *hit, bool *deleted,
                              int64_t deadline) {
     *deleted = false;
-    uint8_t buf[FIRC_CT_REQBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_CT_REQBUF];
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
     nlh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_DELETE);
@@ -622,9 +642,7 @@ static firc_err_t delete_hit(firc_ct_t *ct, const ct_hit_t *hit, bool *deleted,
 }
 
 /* A refusal never discards work: other entries and families go on; the first error is returned. */
-static firc_err_t flush(firc_ct_t *ct, scan_t *s, size_t *deleted) {
-    if (deleted != NULL) { *deleted = 0; }
-    if (ct == NULL) { return FIRC_ERR_INVAL; }
+static firc_err_t flush_locked(firc_ct_t *ct, scan_t *s, size_t *deleted) {
     /* One budget for the whole flush, not per dump. */
     const int64_t deadline = now_ms(ct) + FIRC_CT_FLUSH_BUDGET_MS;
     firc_err_t err = FIRC_OK;
@@ -668,6 +686,15 @@ static firc_err_t flush(firc_ct_t *ct, scan_t *s, size_t *deleted) {
         FIRC_DEBUG("conntrack flush: %zu entries matched, %zu deleted", found, gone);
     }
     free(s->v);
+    return err;
+}
+
+static firc_err_t flush(firc_ct_t *ct, scan_t *s, size_t *deleted) {
+    if (deleted != NULL) { *deleted = 0; }
+    if (ct == NULL) { return FIRC_ERR_INVAL; }
+    pthread_mutex_lock(&ct->mu);
+    firc_err_t err = flush_locked(ct, s, deleted);
+    pthread_mutex_unlock(&ct->mu);
     return err;
 }
 

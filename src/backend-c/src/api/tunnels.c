@@ -1187,7 +1187,11 @@ static void handle_state(firc_http_req_t *req, firc_http_res_t *res, void *ud)
         return;
     }
     const firc_tunnels_t *cur = firc_tunrun_config(ctx->run);
-    firc_tun_state_t st[FIRC_TUN_MAX];
+    firc_tun_state_t *st = calloc(FIRC_TUN_MAX, sizeof(*st));
+    if (st == NULL) {
+        firc_http_res_write_error(res, 500, "out of memory");
+        return;
+    }
     size_t n = firc_tunrun_states(ctx->run, st, FIRC_TUN_MAX);
     cJSON *o = cJSON_CreateObject();
     cJSON *a = cJSON_CreateArray();
@@ -1199,6 +1203,7 @@ static void handle_state(firc_http_req_t *req, firc_http_res_t *res, void *ud)
             cJSON_Delete(t);
         }
     }
+    free(st);
     if (ok) {
         ok = put_item(o, "tunnels", a);
         a = NULL;

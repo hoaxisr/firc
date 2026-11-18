@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,7 @@
 
 static int g_refuse_threads;
 
+#if defined(__GLIBC__)
 int pthread_attr_setstacksize(pthread_attr_t *a, size_t s) {
     static int (*real)(pthread_attr_t *, size_t);
     if (!real) real = (int (*)(pthread_attr_t *, size_t))dlsym(RTLD_NEXT,
@@ -54,6 +56,16 @@ int pthread_attr_setstacksize(pthread_attr_t *a, size_t s) {
     if (g_refuse_threads) s = SIZE_MAX & ~(size_t)0xffff;
     return real(a, s);
 }
+#else
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start)(void *), void *arg) {
+    static int (*real)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    if (g_refuse_threads) return EAGAIN;
+    if (!real) real = (int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *))
+        dlsym(RTLD_NEXT, "pthread_create");
+    return real ? real(thread, attr, start, arg) : EAGAIN;
+}
+#endif
 
 /* ---- sleeps of connq_release --------------------------------------------------- */
 
@@ -211,6 +223,12 @@ int transport_read_zc(struct transport *c, unsigned char *buf, size_t cap,
     *got = g_recv_n;
     g_recv_n = 0;
     return 0;
+}
+int transport_read(struct transport *c, unsigned char *buf, size_t cap, size_t *got) {
+    const unsigned char *data = NULL;
+    int rc = transport_read_zc(c, buf, cap, &data, got);
+    if (rc == 0 && *got > 0 && data && data != buf) memcpy(buf, data, *got);
+    return rc;
 }
 static int g_held_on;
 int transport_has_data(const struct transport *c) { (void)c; return g_held_on && g_recv_n > 0; }

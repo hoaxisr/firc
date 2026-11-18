@@ -27,6 +27,8 @@ ensure_initdir() {
 LOOPPID="$INITDIR/startup_loop.pid"
 # Left by `stop`: a start already under way must not spawn the boot loop behind it.
 STOPPED="$INITDIR/.stopped"
+# Explicit manager disable survives reboot and is only removed by user enable.
+DISABLED=/opt/etc/firc/.awgm-disabled
 # /opt may mount late, so the boot window also counts from this script's first run.
 FIRSTRUN="$INITDIR/.first-run"
 # Seconds from launch to answering on the socket; a younger daemon without one is still starting.
@@ -176,6 +178,7 @@ start_lines() {
 
 # Detached from the caller's descriptors, or `$(S99firc start)` would wait for the daemon to exit.
 launch() {
+  [ -e "$DISABLED" ] && return 8
   load_tun
   KEEP=/dev/null
   ensure_initdir && rm -f "$LASTOUT" "$CHECKED" && KEEP="$LASTOUT"
@@ -228,6 +231,10 @@ startup_loop() {
   BACKOFF=$STEP
   ATTEMPT=0
   while :; do
+    if [ -e "$DISABLED" ]; then
+      [ "`loop_pid`" = "$SELF" ] && rm -f "$LOOPPID"
+      return 0
+    fi
     if ! in_boot_window; then
       [ "`loop_pid`" = "$SELF" ] || return 0
       break
@@ -302,6 +309,7 @@ spawn_loop() {
 }
 
 start() {
+  [ -e "$DISABLED" ] && { echo "$DESC disabled by user"; return 8; }
   [ "$ENABLED" != "yes" ] && return 8
   echo -e -n "$ansi_white Starting $DESC... $ansi_std"
   rm -f "$STOPPED"

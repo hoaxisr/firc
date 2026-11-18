@@ -5185,19 +5185,35 @@ TEST health_counts_by_id_across_generations(void) {
     atomic_store(&lv.b.hold, 1);
     int c1 = ask_send(lv.proxy_port, 0xda01);
     int c2 = ask_send(lv.proxy_port, 0xda02);
-    ASSERT(c1 >= 0 && c2 >= 0);
-    ASSERT(await_received(&lv.b, 1));
+    if (c1 < 0 || c2 < 0) {
+        if (c1 >= 0) { close(c1); }
+        if (c2 >= 0) { close(c2); }
+        live_stop(&lv);
+        FAIL();
+    }
+    bool both_routed = await_received(&lv.b, 1);
+    for (int i = 0; both_routed && i < 400 && atomic_load(&g_rec.sends) < 2; i++) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    both_routed = both_routed && atomic_load(&g_rec.sends) >= 2;
     g_troute.gen = 2;
     g_troute.ports[0] = lv.c.port;
-    ASSERT_EQ(3, ask(lv.proxy_port, 0xda10));
+    atomic_thread_fence(memory_order_seq_cst);
+    int r3 = both_routed ? ask(lv.proxy_port, 0xda10) : -1;
     atomic_store(&lv.b.go, 1);
-    ASSERT_EQ(2, ask_read(c1));
-    ASSERT_EQ(2, ask_read(c2));
+    int r1 = ask_read(c1);
+    int r2 = ask_read(c2);
     firc_dnsproxy_health_t h;
-    ASSERT(live_health(&lv, 2, &h));
+    bool ok_h = live_health(&lv, 2, &h);
+    live_stop(&lv);
+    ASSERT(both_routed);
+    ASSERT_EQ(3, r3);
+    ASSERT_EQ(2, r1);
+    ASSERT_EQ(2, r2);
+    ASSERT(ok_h);
     ASSERT_EQ(3u, h.total);
     ASSERT_EQ(0u, h.fallbacks);
-    live_stop(&lv);
     PASS();
 }
 

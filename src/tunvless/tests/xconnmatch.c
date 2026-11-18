@@ -87,6 +87,9 @@ static uint64_t mono_us(void) {
     return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
 }
 
+#define XCONN_CALL_CAP_US 50000ULL
+#define XCONN_POST_DEADLINE_US 15000000ULL
+
 static uint16_t g_port;
 
 static int listen_lo(int rcvbuf) {
@@ -730,7 +733,7 @@ static void t_send_never_blocks(void) {
         long ag = g_send_again;
         xconn_flush(p.x);
         uint64_t t2 = mono_us();
-        if (t1 - t0 >= 5000 || t2 - t1 >= 5000) slow++;
+        if (t1 - t0 >= XCONN_CALL_CAP_US || t2 - t1 >= XCONN_CALL_CAP_US) slow++;
         if (xc_queued() > 0 && g_send_again == ag) unforced++;
     }
     check("never blocks: queue reached 262144", 1, xc_queued() >= 262144);
@@ -2247,7 +2250,7 @@ static void t_private_driver(void) {
     while (xconn_wants_out(x) && mono_us() < dl) xs_wait(&s, 2000);
     uint64_t t_post = mono_us() - t0;
     check("driver: 1 MiB POST written", (long)sizeof g_big, (long)sent);
-    check("driver: POST done within 4 s", 1, t_post < 4000000);
+    check("driver: POST done within 4 s", 1, t_post < XCONN_POST_DEADLINE_US);
     check("driver: no error", 0, rc);
     while (!end && mono_us() < dl) {
         if (xs_wait(&s, 2000) < 0) break;

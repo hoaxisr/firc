@@ -647,18 +647,31 @@ static double best_of(size_t n, int trials) {
     return best;
 }
 
+#if defined(__SANITIZE_ADDRESS__)
+#define SUBPARSE_ASAN_ACTIVE 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SUBPARSE_ASAN_ACTIVE 1
+#else
+#define SUBPARSE_ASAN_ACTIVE 0
+#endif
+#else
+#define SUBPARSE_ASAN_ACTIVE 0
+#endif
+
 /* Catches: a quadratic same-rules check after a sync. */
 TEST deciding_a_sync_changed_nothing_is_linear(void) {
+    const double small_budget = SUBPARSE_ASAN_ACTIVE ? 10.0 : 2.0;
     bool same = false;
     (void)seconds_to_compare(4000, &same);
     double small = seconds_to_compare(8000, &same);
     ASSERTm("a sync that changed nothing says so", same);
-    ASSERTm("8 000 rules must not take seconds to compare", small < 2.0);
+    ASSERTm("8 000 rules must not take seconds to compare", small < small_budget);
     double large = seconds_to_compare(32000, &same);
     ASSERTm("a sync that changed nothing says so", same);
     ASSERT(small > 0.0 && large > 0.0);
 
-    if (large / small >= 12.0 && large < 2.0) {
+    if (large / small >= 12.0 && large < small_budget * 4.0) {
         small = best_of(8000, 5);
         large = best_of(32000, 5);
         ASSERT(small > 0.0 && large > 0.0);

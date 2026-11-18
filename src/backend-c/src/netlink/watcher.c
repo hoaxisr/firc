@@ -192,7 +192,7 @@ static void on_readable(firc_loop_t *loop, int fd, uint32_t events, void *ud) {
     (void)fd;
     (void)events;
     firc_nl_watcher_t *w = ud;
-    uint8_t buf[FIRC_NL_WATCHER_RECVBUF];
+    _Alignas(struct nlmsghdr) uint8_t buf[FIRC_NL_WATCHER_RECVBUF];
 
     for (;;) {
         ssize_t ret = mnl_socket_recvfrom(w->nl, buf, sizeof(buf));
