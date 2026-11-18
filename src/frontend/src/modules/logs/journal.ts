@@ -3,6 +3,7 @@ import type {
   DnsEvent,
   DnsResolverSource,
   JournalEvent,
+  LogEvent,
   LogLevel,
 } from "../../data/events.svelte";
 
@@ -97,11 +98,14 @@ export function matchesQuery(
   e: JournalEvent,
   query: string,
   names: Map<string, string> = new Map(),
+  shown?: (e: LogEvent) => string,
 ): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
   if (e.kind === "log") {
-    return e.message.toLowerCase().includes(q) || e.source.toLowerCase().includes(q);
+    if (e.message.toLowerCase().includes(q) || e.source.toLowerCase().includes(q)) return true;
+    const text = shown?.(e);
+    return text !== undefined && text !== e.message && text.toLowerCase().includes(q);
   }
   const device = names.get(e.client.toLowerCase()) ?? "";
   return (
@@ -220,4 +224,40 @@ export function describeBypassTail(
   const how = e.how === "addr" ? t("by address") : t("by SNI");
   const times = e.repeats > 0 ? ` (×${e.repeats})` : "";
   return `→ ${e.dst}${port}/${e.proto} · ${group}${how} · ${describeBypassLast(e, t, stamp)}${times}`;
+}
+
+const RESOLVER_PREFIX = 'group resolver: group "';
+const RESOLVER_GROUP = String.raw`^group resolver: group "(?<name>.*)" \((?<id>[0-9a-f]{8})\): `;
+
+const RESOLVER_LINES: [RegExp, (t: (s: string) => string) => string][] = [
+  [
+    new RegExp(
+      String.raw`${RESOLVER_GROUP}(?<n>\d+) consecutive failures, the group's names go to the common upstream until one query every (?<s>\d+) s finds it answering$`,
+    ),
+    (t) =>
+      t(
+        "the group's DNS is not answering (failures in a row: {n}), the common upstream answers. firc checks it every {s} s.",
+      ),
+  ],
+  [
+    new RegExp(String.raw`${RESOLVER_GROUP}the probe failed; resting another (?<s>\d+) s$`),
+    (t) => t("the group's DNS failed the check, it rests another {s} s"),
+  ],
+  [
+    new RegExp(
+      String.raw`${RESOLVER_GROUP}answering again; the group's names go through its tunnel$`,
+    ),
+    (t) => t("the group's DNS answers again, the group's names go through it"),
+  ],
+];
+
+export function describeLog(e: LogEvent, t: (s: string) => string, names?: GroupNames): string {
+  if (!e.message.startsWith(RESOLVER_PREFIX)) return e.message;
+  for (const [re, text] of RESOLVER_LINES) {
+    const m = re.exec(e.message)?.groups;
+    if (!m) continue;
+    const group = names?.get(m.id) ?? (m.name || m.id);
+    return `${group} · ${text(t).replace(/\{(\w)\}/g, (_, k: string) => m[k] ?? "")}`;
+  }
+  return e.message;
 }

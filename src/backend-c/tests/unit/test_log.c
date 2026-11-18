@@ -226,6 +226,23 @@ TEST line_format_has_timestamp_and_tag(void)
     PASS();
 }
 
+/* Catches: a control character in a logged value, such as a group name with a newline, splitting or garbling the line. */
+TEST control_characters_never_reach_a_line(void)
+{
+    firc_event_reset_for_test();
+    firc_log_set_output_floor(FIRC_LOG_DEBUG);
+    char out[256];
+    ASSERT(capture(FIRC_LOG_INFO, "group \"a\nb\tc\rd\x7f\x1b[0m\" \xd0\x96", out, sizeof(out)) > 0);
+    firc_log_set_output_floor(FIRC_LOG_INFO);
+    ASSERT(strstr(out, " INF group \"a?b?c?d??[0m\" \xd0\x96\n") != NULL);
+    ASSERT_EQ(strchr(out, '\n'), out + strlen(out) - 1);
+    firc_event_t ev[2];
+    uint64_t next = 0, dropped = 0;
+    ASSERT_EQ_FMT((size_t)1, firc_event_read(0, ev, 2, &next, &dropped), "%zu");
+    ASSERT_STR_EQ("group \"a?b?c?d??[0m\" \xd0\x96", ev[0].u.log.text);
+    PASS();
+}
+
 /* Catches: a level name dropped or mapped to the wrong level, or a removed name still accepted by the output floor. */
 TEST exactly_four_level_names_parse(void)
 {
@@ -340,6 +357,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_line_longer_than_the_ring_holds_is_cut_not_dropped);
     RUN_TEST(level_filtering);
     RUN_TEST(line_format_has_timestamp_and_tag);
+    RUN_TEST(control_characters_never_reach_a_line);
     RUN_TEST(exactly_four_level_names_parse);
     RUN_TEST(debug_is_the_lowest_level);
     RUN_TEST(the_only_rate_limiting_is_the_level);

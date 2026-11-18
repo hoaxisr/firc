@@ -13,6 +13,7 @@
     pollEvents,
     type DnsEvent,
     type JournalEvent,
+    type LogEvent,
     type LogLevel,
   } from "../../data/events.svelte";
   import { fetchHosts, hosts } from "../../data/hosts.svelte";
@@ -32,6 +33,7 @@
     DEFAULT_LEVELS,
     describeBypassTail,
     describeDnsTail,
+    describeLog,
     deviceNames,
     filtersHiding,
     groupFilterOptions,
@@ -94,9 +96,14 @@
   );
   const lost = $derived(journal.dropped - (sinceClear?.dropped ?? 0));
   const counts = $derived(sourceCounts(frozen ?? held));
-  const shown = $derived(held.filter((e) => matches(e, filter) && matchesQuery(e, query, names)));
+  const shownLog = (e: LogEvent) => describeLog(e, t, groupNames);
+  const shown = $derived(
+    held.filter((e) => matches(e, filter) && matchesQuery(e, query, names, shownLog)),
+  );
   const rendered = $derived(
-    frozen ? frozen.filter((e) => matches(e, filter) && matchesQuery(e, query, names)) : shown,
+    frozen
+      ? frozen.filter((e) => matches(e, filter) && matchesQuery(e, query, names, shownLog))
+      : shown,
   );
   const newCount = $derived(
     frozen ? shown.filter((e) => journal.boot !== frozenBoot || e.seq > frozenSeq).length : 0,
@@ -277,7 +284,7 @@
           {e.source}
         </button>
       {/if}
-      <span class="msg">{e.message}</span>
+      <span class="msg">{describeLog(e, t, groupNames)}</span>
     </div>
   {:else if e.kind === "dns"}
     <div class="row {decisionClass(e)}">

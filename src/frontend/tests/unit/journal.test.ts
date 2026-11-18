@@ -3,6 +3,7 @@ import { describe, it } from "jsr:@std/testing@1.0.19/bdd";
 
 import type { BypassEvent, DnsEvent, LogEvent } from "../../src/data/events.svelte";
 
+import ru from "../../src/locales/ru.json" with { type: "json" };
 import {
   blockedPart,
   compactCount,
@@ -10,6 +11,7 @@ import {
   describeBypassTail,
   describeDns,
   describeDnsTail,
+  describeLog,
   deviceNames,
   filtersHiding,
   groupFilterOptions,
@@ -512,5 +514,122 @@ describe("the group's current name", () => {
     // catches: a deleted group's bypass row losing its name
     const e = bypass({ group: { id: "gone", name: "old" } });
     assert.ok(describeBypassTail(e, id, stamp, names).includes(" · old · by address"));
+  });
+});
+
+describe("the group resolver's lines", () => {
+  const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
+  const names = new Map([["e61a8095", "Instagram & FB [Сейчас работает]"]]);
+  const line = (message: string) => log({ level: "warn", message });
+  const closed = line(
+    'group resolver: group "Instagram & FB" (e61a8095): 3 consecutive failures, the group\'s names go to the common upstream until one query every 30 s finds it answering',
+  );
+  const probe = line(
+    'group resolver: group "Instagram & FB" (e61a8095): the probe failed; resting another 30 s',
+  );
+  const opened = line(
+    'group resolver: group "Instagram & FB" (e61a8095): answering again; the group\'s names go through its tunnel',
+  );
+  it("puts the closing line in Russian under the group's current name", () => {
+    // catches: the closing line left in English, by id, or with its two numbers swapped
+    assert.strictEqual(
+      describeLog(closed, tr, names),
+      "Instagram & FB [Сейчас работает] · DNS группы не отвечает (сбоев подряд: 3), на запросы отвечает общий upstream. firc проверяет его раз в 30 с.",
+    );
+  });
+  it("puts the probe and the opening lines in Russian under the group's current name", () => {
+    // catches: a twin line left as the daemon wrote it
+    assert.strictEqual(
+      describeLog(probe, tr, names),
+      "Instagram & FB [Сейчас работает] · DNS группы не прошёл проверку, отдыхает ещё 30 с",
+    );
+    assert.strictEqual(
+      describeLog(opened, tr, names),
+      "Instagram & FB [Сейчас работает] · DNS группы снова отвечает, имена группы снова идут через него",
+    );
+  });
+  it("names the group by its current name in English too", () => {
+    // catches: English shown raw, so a renamed group keeps its old name
+    assert.strictEqual(
+      describeLog(closed, id, names),
+      "Instagram & FB [Сейчас работает] · the group's DNS is not answering (failures in a row: 3), the common upstream answers. firc checks it every 30 s.",
+    );
+    assert.strictEqual(
+      describeLog(probe, id, names),
+      "Instagram & FB [Сейчас работает] · the group's DNS failed the check, it rests another 30 s",
+    );
+    assert.strictEqual(
+      describeLog(opened, id, names),
+      "Instagram & FB [Сейчас работает] · the group's DNS answers again, the group's names go through it",
+    );
+  });
+  it("keeps the name the line carries for a deleted group, else its id", () => {
+    // catches: a deleted group shown by id though the line names it, or an unnamed one shown blank
+    assert.ok(describeLog(closed, tr, new Map()).startsWith("Instagram & FB · DNS группы"));
+    const unnamed = line(
+      'group resolver: group "" (e61a8095): the probe failed; resting another 30 s',
+    );
+    assert.strictEqual(
+      describeLog(unnamed, tr),
+      "e61a8095 · DNS группы не прошёл проверку, отдыхает ещё 30 с",
+    );
+  });
+  it("keeps any other line as the daemon wrote it", () => {
+    // catches: a pattern loose enough to rewrite a line it was not written for
+    const other = line(
+      "group resolver: SO_MARK refused (Operation not permitted); the group's names go to the common upstream",
+    );
+    assert.strictEqual(describeLog(other, tr, names), other.message);
+    const reworded = line(
+      'group resolver: group "x" (e61a8095): 3 consecutive failures, the group\'s names go elsewhere',
+    );
+    assert.strictEqual(describeLog(reworded, tr, names), reworded.message);
+  });
+});
+
+describe("the group resolver's lines with a quoted name", () => {
+  const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
+  const probeOf = (name: string) =>
+    log({
+      level: "debug",
+      message: `group resolver: group "${name}" (0badc0de): the probe failed; resting another 30 s`,
+    });
+  const tail = " · DNS группы не прошёл проверку, отдыхает ещё 30 с";
+  const cut = 'Instagram & FB [Сейчас работает через "nfqws2';
+  const parens = 'a" (b) "c';
+  const fakeId = 'x" (12345678): y';
+  it("shows a deleted group's quoted name as the line carries it", () => {
+    // catches: a name pattern that stops at a quote or a parenthesis, leaving the line raw or the name cut
+    assert.strictEqual(describeLog(probeOf(cut), tr, new Map()), `${cut}${tail}`);
+    assert.strictEqual(describeLog(probeOf(parens), tr, new Map()), `${parens}${tail}`);
+    assert.strictEqual(describeLog(probeOf(fakeId), tr, new Map()), `${fakeId}${tail}`);
+  });
+  it("shows a live group's current name whatever quotes the line's name holds", () => {
+    // catches: the id read from inside the name instead of the one the daemon put after it
+    const names = new Map([["0badc0de", "Now"]]);
+    for (const n of [cut, parens, fakeId]) {
+      assert.strictEqual(describeLog(probeOf(n), tr, names), `Now${tail}`);
+    }
+  });
+});
+
+describe("the search over the group resolver's lines", () => {
+  const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
+  const groupNames = new Map([["e61a8095", "Instagram & FB [Сейчас работает]"]]);
+  const shown = (e: LogEvent) => describeLog(e, tr, groupNames);
+  const e = log({
+    level: "warn",
+    message:
+      'group resolver: group "Instagram & FB" (e61a8095): 3 consecutive failures, the group\'s names go to the common upstream until one query every 30 s finds it answering',
+  });
+  it("finds the row by what it shows and by what the daemon wrote", () => {
+    // catches: a search over the raw English only, so the Russian text or the current name finds nothing
+    for (const q of ["сбоев подряд", "Сейчас работает", "consecutive failures", "e61a8095"]) {
+      assert.strictEqual(matchesQuery(e, q, new Map(), shown), true, q);
+    }
+  });
+  it("finds no row for a word in neither", () => {
+    // catches: a search that matches every resolver row
+    assert.strictEqual(matchesQuery(e, "tunvless", new Map(), shown), false);
   });
 });

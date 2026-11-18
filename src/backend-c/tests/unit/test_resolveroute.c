@@ -493,7 +493,7 @@ static bool decide(decide_fx_t *fx, const char *name, uint16_t qtype, const char
     return got;
 }
 
-/* Catches: the mark, server or port not copied, or the route read from a replaced table. */
+/* Catches: the mark, server, port or group name not copied, or the route read from a replaced table. */
 TEST the_owner_of_a_covered_query_is_routed_by_value(void)
 {
     decide_fx_t fx;
@@ -508,6 +508,7 @@ TEST the_owner_of_a_covered_query_is_routed_by_value(void)
     ASSERT_EQ(htonl(0x09090909u), s4->sin_addr.s_addr);
     ASSERT_EQ((socklen_t)sizeof(struct sockaddr_in), r.server_lens[0]);
     ASSERT(firc_id_equal(fx.cfg.groups[0]->id, r.group_id));
+    ASSERT_STR_EQ("nl", r.group_name);
     ASSERT(r.gen != 0);
     ASSERT_FALSE(r.blocked);
 

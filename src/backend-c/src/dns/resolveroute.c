@@ -285,6 +285,7 @@ bool firc_resolve_router_decide(void *ud, const firc_dns_msg_t *query, const fir
     memset(out, 0, sizeof(*out));
     out->owner = owner->id;
     out->group_id = rt->group_id;
+    snprintf(out->group_name, sizeof(out->group_name), "%s", rt->group_name);
     out->mark = rt->mark;
     out->gen = rt->gen;
     out->n_servers = rt->n_servers;

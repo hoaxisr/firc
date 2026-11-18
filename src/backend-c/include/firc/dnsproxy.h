@@ -103,6 +103,7 @@ void firc_dnsproxy_forget_group(firc_dnsproxy_t *p, firc_id_t group_id);
 /* Copied by value: the route table it came from is freed on the next publish. */
 typedef struct firc_dnsproxy_route {
     firc_id_t group_id;
+    char group_name[64];
     uint32_t mark;
     uint64_t gen;
     size_t n_servers;

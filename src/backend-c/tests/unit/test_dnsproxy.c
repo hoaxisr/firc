@@ -349,6 +349,7 @@ typedef struct {
     _Atomic int asked;
     _Atomic int saw_client;
     const firc_resolve_route_t *own;
+    const char *name;
 } troute_t;
 
 static troute_t g_troute;
@@ -363,9 +364,11 @@ static bool test_route(void *ud, const firc_dns_msg_t *q, const firc_ip_t *clien
     if (!t->take) { return false; }
     memset(out, 0, sizeof(*out));
     out->group_id.b[3] = t->group ? t->group : 7;
+    snprintf(out->group_name, sizeof(out->group_name), "%s", t->name != NULL ? t->name : "");
     out->mark = t->mark;
     out->gen = t->gen != 0 ? t->gen : 1;
     if (t->own != NULL) {
+        snprintf(out->group_name, sizeof(out->group_name), "%s", t->own->group_name);
         out->n_servers = t->own->n_servers;
         for (size_t i = 0; i < t->own->n_servers; i++) {
             firc_resolver_addr_sockaddr(&t->own->servers[i], &out->servers[i], &out->server_lens[i]);
@@ -2502,6 +2505,17 @@ static int journal_at(firc_log_level_t level, const char *needle) {
         if (ev[i].kind == FIRC_EVENT_LOG && ev[i].u.log.level == level && strstr(ev[i].u.log.text, needle) != NULL) {
             c++;
         }
+    }
+    return c;
+}
+
+static int journal_exact(firc_log_level_t level, const char *text) {
+    firc_event_t ev[256];
+    uint64_t next = 0, dropped = 0;
+    size_t n = firc_event_read(0, ev, 256, &next, &dropped);
+    int c = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (ev[i].kind == FIRC_EVENT_LOG && ev[i].u.log.level == level && strcmp(ev[i].u.log.text, text) == 0) { c++; }
     }
     return c;
 }
@@ -5122,6 +5136,64 @@ TEST health_last_follows_its_bucket(void) {
     PASS();
 }
 
+/* Catches: a resolver line naming the group by id alone, or the probe and recovery lines naming no group. */
+TEST health_lines_name_the_group(void) {
+    live_t lv;
+    firc_event_reset_for_test();
+    ASSERT(health_start(&lv, 1000000, false));
+    g_troute.name = "Instagram & FB";
+    g_troute.ports[0] = closed_udp_port();
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask(lv.proxy_port, (uint16_t)(0xda00 + i))); }
+    health_at(1031000);
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xda10));
+    health_at(1062000);
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xda20));
+    live_stop(&lv);
+    ASSERT_EQ(1, journal_exact(FIRC_LOG_WARN,
+                               "group resolver: group \"Instagram & FB\" (00000007): 3 consecutive failures, the "
+                               "group's names go to the common upstream until one query every 30 s finds it answering"));
+    ASSERT_EQ(1, journal_exact(FIRC_LOG_DEBUG,
+                               "group resolver: group \"Instagram & FB\" (00000007): the probe failed; resting another 30 s"));
+    ASSERT_EQ(1, journal_exact(FIRC_LOG_INFO,
+                               "group resolver: group \"Instagram & FB\" (00000007): answering again; the group's names "
+                               "go through its tunnel"));
+    PASS();
+}
+
+/* Catches: a long name cut inside a character or past its closing quote, or the id lost after it. */
+TEST a_long_quoted_name_is_cut_on_a_character_inside_its_quotes(void) {
+    live_t lv;
+    firc_event_reset_for_test();
+    tunnel_setup(0);
+    g_live_ops = &TESTNET_OPS;
+    ASSERT(live_start(&lv));
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    firc_strset(&g->name, "Instagram & \"FB\": [Сейчас работает через обход (nfqws2)]");
+    firc_strset(&g->iface, "nwg0");
+    char server[32];
+    snprintf(server, sizeof(server), "192.0.2.1:%u", (unsigned)closed_udp_port());
+    ASSERT_EQ(FIRC_OK, firc_strset(&g->resolve.server, server));
+    firc_resolve_input_t in = {.group = g, .mark = 0x40010000u};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ((size_t)1, t.items[0].n_servers);
+    ASSERT_STR_EQ("Instagram & \"FB\": [Сейчас работает через о", t.items[0].group_name);
+    g_troute.own = &t.items[0];
+    for (int i = 0; i < 3; i++) { ASSERT_EQ(1, ask(lv.proxy_port, (uint16_t)(0xdb00 + i))); }
+    ASSERT_EQ(3, atomic_load(&g_rec.marks));
+    live_stop(&lv);
+    g_troute.own = NULL;
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    ASSERT_EQ(1, journal_exact(FIRC_LOG_WARN,
+                               "group resolver: group \"Instagram & \"FB\": [Сейчас работает через о\" (00000007): 3 "
+                               "consecutive failures, the group's names go to the common upstream until one query "
+                               "every 30 s finds it answering"));
+    PASS();
+}
+
 /* Catches: resting read as the gate's condition, a failed probe restarting the run, or a good probe not ending it. */
 TEST health_resting_until_probe_answers(void) {
     live_t lv;
@@ -5884,6 +5956,8 @@ int main(int argc, char **argv)
     RUN_TEST(health_last_leaves_with_window);
     RUN_TEST(health_last_follows_its_bucket);
     RUN_TEST(health_resting_until_probe_answers);
+    RUN_TEST(health_lines_name_the_group);
+    RUN_TEST(a_long_quoted_name_is_cut_on_a_character_inside_its_quotes);
     RUN_TEST(health_old_generation_not_resting);
     RUN_TEST(health_counts_by_id_across_generations);
     RUN_TEST(a_port_another_socket_holds_is_named_with_its_reason);

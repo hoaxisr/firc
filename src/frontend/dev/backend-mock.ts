@@ -373,6 +373,21 @@ const LOG_SAMPLES: [string, string, string][] = [
   ["warn", "tunvless0", "Frankfurt-2 does not answer (timeout)"],
   ["error", "tunvless1", "no usable VLESS node"],
   ["debug", "tunvless0", "tun: rx 40"],
+  [
+    "warn",
+    "fircd",
+    `group resolver: group "Bad Services" (a1b2c3d4): 3 consecutive failures, the group's names go to the common upstream until one query every 30 s finds it answering`,
+  ],
+  [
+    "debug",
+    "fircd",
+    'group resolver: group "Bad Services" (a1b2c3d4): the probe failed; resting another 30 s',
+  ],
+  [
+    "info",
+    "fircd",
+    `group resolver: group "Old Group" (deadbeef): answering again; the group's names go through its tunnel`,
+  ],
 ];
 function pushEvent(e: Fresh<Event>) {
   if (e.kind === "dns") tally(e.name, e.client, e.group?.id ?? "", e.decision === "blocked");

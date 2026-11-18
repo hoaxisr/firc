@@ -468,14 +468,15 @@ static void health_failure(firc_dnsproxy_t *p, exchange_t *ex)
     h->preferred = (ex->server + 1) % ex->route.n_servers;
     h->fails++;
     if (probe || h->fails >= p->health_fails) {
+        /* By hand: firc_id_format is not linked into firc-dnstool. */
+        const uint8_t *g = ex->route.group_id.b;
         if (probe) {
-            FIRC_DEBUG("group resolver: the probe failed; resting another %u s", (unsigned)(p->health_rest_ms / 1000u));
+            FIRC_DEBUG("group resolver: group \"%s\" (%02x%02x%02x%02x): the probe failed; resting another %u s",
+                       ex->route.group_name, g[0], g[1], g[2], g[3], (unsigned)(p->health_rest_ms / 1000u));
         } else if (h->rest_until_ms == 0) {
-            /* By hand: firc_id_format is not linked into firc-dnstool. */
-            const uint8_t *g = ex->route.group_id.b;
-            FIRC_WARN("group resolver: group %02x%02x%02x%02x: %u consecutive failures, the group's names go "
-                      "to the common upstream until one query every %u s finds it answering",
-                      g[0], g[1], g[2], g[3], h->fails, (unsigned)(p->health_rest_ms / 1000u));
+            FIRC_WARN("group resolver: group \"%s\" (%02x%02x%02x%02x): %u consecutive failures, the group's names "
+                      "go to the common upstream until one query every %u s finds it answering",
+                      ex->route.group_name, g[0], g[1], g[2], g[3], h->fails, (unsigned)(p->health_rest_ms / 1000u));
         }
         uint64_t now = health_now(p);
         if (h->rest_until_ms == 0) { h->rest_start_ms = now; }
@@ -494,7 +495,12 @@ static bool health_success(firc_dnsproxy_t *p, exchange_t *ex)
     h->rest_until_ms = 0;
     h->rest_start_ms = 0;
     h->probing = false;
-    if (was_resting) { FIRC_INFO("group resolver: answering again; the group's names go through its tunnel"); }
+    if (was_resting) {
+        const uint8_t *g = ex->route.group_id.b;
+        FIRC_INFO("group resolver: group \"%s\" (%02x%02x%02x%02x): answering again; the group's names go "
+                  "through its tunnel",
+                  ex->route.group_name, g[0], g[1], g[2], g[3]);
+    }
     return true;
 }
 

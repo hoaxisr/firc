@@ -102,6 +102,10 @@ FIRC_PRINTF(3, 0) static void vlog(firc_log_level_t level, const char *source, c
     if (len >= sizeof(buf)) {
         len = sizeof(buf) - 1;
     }
+    for (size_t i = (size_t)off; i < len; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c < 0x20 || c == 0x7f) { buf[i] = '?'; }
+    }
     /* Before the write, text only: the UI renders its own timestamp and level. */
     firc_event_put_log(level, (int64_t)ts.tv_sec, source, buf + off);
     if ((int)level < atomic_load_explicit(&g_output_floor, memory_order_relaxed)) {
