@@ -30,7 +30,7 @@ firc_err_t firc_kn_policy_map_add_segment(firc_kn_policy_map_t *m, const char *p
 /* Adds each binding in seg whose interface has an IPv4 address and mask in interfaces_json; others are skipped. */
 firc_err_t firc_kn_policy_map_add_segments(firc_kn_policy_map_t *m, const firc_kn_segment_t *seg, size_t n,
                                            const char *interfaces_json);
-/* Whether client is in the policy (name or description): the host's own policy, else its segment's. */
+/* Whether client is in the policy (name or description): its rc entry's, none for a bare one, else own, else segment's. */
 bool firc_kn_policy_map_has(const firc_kn_policy_map_t *m, const char *policy, const firc_ip_t *client);
 /* The other addresses of the host at client, at most cap; 0 when the table does not list it. */
 size_t firc_kn_policy_map_device(const firc_kn_policy_map_t *m, const firc_ip_t *client, firc_ip_t *out,

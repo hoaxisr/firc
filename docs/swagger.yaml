@@ -37,14 +37,18 @@ definitions:
         type: string
       policy:
         description: >-
-          The internal name of the device's policy: its own, else the policy
-          of the segment its address falls in; empty if neither
+          The internal name of the device's policy: the one its firmware
+          entry names; empty when the entry sets the default policy;
+          otherwise its own, else the policy of the segment its address
+          falls in; empty if neither
         example: Policy0
         type: string
       policyFromSegment:
         description: >-
-          policy is the segment's, not the device's own: the device has none
-          of its own and its address falls in a segment bound to a policy
+          policy is the segment's, not the device's own: an address of the
+          device falls in a segment bound to a policy, and its entry follows
+          the segment's policy, or it has no entry and the firmware gives it
+          no policy or that segment's
         example: false
         type: boolean
       registered:

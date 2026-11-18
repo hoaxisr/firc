@@ -1879,6 +1879,8 @@ typedef struct {
     const char *marks;
     const char *policies;
     const char *hotspot;
+    const char *rc;
+    const char *ifaces;
 } rci_fake_t;
 
 static firc_err_t fake_get(void *ud, const char *path, char **body) {
@@ -1888,7 +1890,8 @@ static firc_err_t fake_get(void *ud, const char *path, char **body) {
     const char *doc = strcmp(path, "/rci/show/ip/hotspot") == 0      ? (r->hotspot != NULL ? r->hotspot : HOTSPOT)
                       : strcmp(path, "/rci/show/rc/ip/policy") == 0  ? (r->policies != NULL ? r->policies : POLICIES)
                       : strcmp(path, "/rci/show/ip/policy") == 0     ? (r->marks != NULL ? r->marks : MARKS)
-                      : strcmp(path, "/rci/show/rc/ip/hotspot") == 0 ? "{\"policy\":[]}"
+                      : strcmp(path, "/rci/show/rc/ip/hotspot") == 0 ? (r->rc != NULL ? r->rc : "{\"policy\":[]}")
+                      : strcmp(path, "/rci/show/interface") == 0     ? r->ifaces
                                                                      : NULL;
     if (doc == NULL) { return FIRC_ERR_NOENT; }
     *body = strdup(doc);
@@ -1909,7 +1912,7 @@ static size_t count_hosts(const firc_kn_policy_map_t *m, const char *policy) {
 
 /* Catches: a failed or unparseable marks read failing the whole round, or keeping a mark. */
 TEST a_refresh_whose_marks_cannot_be_read_keeps_its_hosts(void) {
-    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL};
+    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL, NULL, NULL};
     firc_kn_policy_map_t *m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_fetch_for_test(fake_get, &ok, &m));
     uint32_t mark = 0;
@@ -1917,7 +1920,7 @@ TEST a_refresh_whose_marks_cannot_be_read_keeps_its_hosts(void) {
     ASSERT_EQ_FMT(0x0ffffaabu, mark, "0x%x");
     firc_kn_policy_map_free(m);
 
-    rci_fake_t bad = {"/rci/show/ip/policy", 0, NULL, NULL, NULL};
+    rci_fake_t bad = {"/rci/show/ip/policy", 0, NULL, NULL, NULL, NULL, NULL};
     m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_fetch_for_test(fake_get, &bad, &m));
     ASSERT_EQm("the failing read was asked for", 1, bad.asked_marks);
@@ -1928,7 +1931,7 @@ TEST a_refresh_whose_marks_cannot_be_read_keeps_its_hosts(void) {
     ASSERT_FALSEm("no marks", has_mark);
     ASSERT_EQ_FMTm("the hosts stay", (size_t)2, hosts, "%zu");
 
-    rci_fake_t garbled = {NULL, 0, "not json", NULL, NULL};
+    rci_fake_t garbled = {NULL, 0, "not json", NULL, NULL, NULL, NULL};
     m = NULL;
     ASSERT_EQ(FIRC_OK, firc_kn_policy_map_fetch_for_test(fake_get, &garbled, &m));
     ASSERT(m != NULL);
@@ -1938,10 +1941,387 @@ TEST a_refresh_whose_marks_cannot_be_read_keeps_its_hosts(void) {
     ASSERT_FALSEm("no marks from a garbled document", has_mark);
     ASSERT_EQ_FMTm("the hosts stay", (size_t)2, hosts, "%zu");
 
-    rci_fake_t no_table = {"/rci/show/ip/hotspot", 0, NULL, NULL, NULL};
+    rci_fake_t no_table = {"/rci/show/ip/hotspot", 0, NULL, NULL, NULL, NULL, NULL};
     m = NULL;
     ASSERT_EQ(FIRC_ERR_IO, firc_kn_policy_map_fetch_for_test(fake_get, &no_table, &m));
     ASSERT_EQm("the rest is all or nothing", NULL, m);
+    PASS();
+}
+
+#define SH_CONFORM "{\"mac\":\"02:00:00:00:00:01\",\"ip\":\"192.0.2.11\",\"policy\":\"Policy0\",\"active\":true,\"registered\":true}"
+#define SH_DEFAULT "{\"mac\":\"02:00:00:00:00:02\",\"ip\":\"192.0.2.12\",\"policy\":\"\",\"active\":true,\"registered\":true}"
+#define SH_NAMED "{\"mac\":\"02:00:00:00:00:03\",\"ip\":\"192.0.2.13\",\"policy\":\"Policy1\",\"active\":true,\"registered\":true}"
+#define SH_GUEST "{\"mac\":\"02:00:00:00:00:04\",\"ip\":\"192.0.2.14\",\"policy\":\"\",\"active\":true,\"registered\":false}"
+#define SH_CONFORM_BARE "{\"mac\":\"02:00:00:00:00:05\",\"ip\":\"192.0.2.15\",\"policy\":\"\",\"active\":false,\"registered\":true}"
+#define SH_UNLISTED "{\"mac\":\"02:00:00:00:00:06\",\"ip\":\"192.0.2.16\",\"policy\":\"\",\"active\":true,\"registered\":true}"
+#define SH_GUEST_DEFAULT "{\"mac\":\"02:00:00:00:00:07\",\"ip\":\"192.0.2.17\",\"policy\":\"\",\"active\":true,\"registered\":false}"
+#define SH_NAMED_BARE "{\"mac\":\"02:00:00:00:00:08\",\"ip\":\"192.0.2.18\",\"policy\":\"\",\"active\":false,\"registered\":true}"
+#define RC_BINDING "\"policy\":[{\"interface\":\"Bridge0\",\"policy\":\"Policy0\"}]"
+#define RC_CONFORM "{\"mac\":\"02:00:00:00:00:01\",\"access\":\"permit\",\"permit\":true,\"conform\":true}"
+#define RC_DEFAULT "{\"mac\":\"02:00:00:00:00:02\",\"access\":\"permit\",\"permit\":true}"
+#define RC_NAMED "{\"mac\":\"02:00:00:00:00:03\",\"access\":\"permit\",\"permit\":true,\"policy\":\"Policy1\"}"
+#define RC_CONFORM_BARE "{\"mac\":\"02:00:00:00:00:05\",\"access\":\"permit\",\"permit\":true,\"conform\":true}"
+#define RC_GUEST_DEFAULT "{\"mac\":\"02:00:00:00:00:07\",\"access\":\"permit\",\"permit\":true}"
+#define RC_NAMED_BARE "{\"mac\":\"02:00:00:00:00:08\",\"access\":\"permit\",\"permit\":true,\"policy\":\"Policy1\"}"
+
+static const char BENCH_SHOW[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "," SH_NAMED "," SH_GUEST "," SH_CONFORM_BARE
+                                 "," SH_UNLISTED "," SH_GUEST_DEFAULT "," SH_NAMED_BARE "]}";
+static const char BENCH_RC[] = "{" RC_BINDING ",\"host\":[" RC_CONFORM "," RC_DEFAULT "," RC_NAMED "," RC_CONFORM_BARE
+                               "," RC_GUEST_DEFAULT "," RC_NAMED_BARE "],\"auto-register\":{\"disable\":false}}";
+static const char BENCH_IFACES[] = "{\"Bridge0\":{\"address\":\"192.0.2.1\",\"mask\":\"255.255.255.0\"}}";
+
+static firc_kn_policy_map_t *bench_map(const char *show, const char *rc) {
+    rci_fake_t r = {.hotspot = show, .rc = rc, .ifaces = BENCH_IFACES};
+    firc_kn_policy_map_t *m = NULL;
+    return firc_kn_policy_map_fetch_for_test(fake_get, &r, &m) == FIRC_OK ? m : NULL;
+}
+
+static bool host_flag(const cJSON *arr, const char *mac, const char *key) {
+    const cJSON *h = NULL;
+    cJSON_ArrayForEach(h, arr) {
+        if (strcmp(str_of(h, "mac"), mac) == 0) { return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(h, key)); }
+    }
+    return false;
+}
+
+/* Catches: a client on the explicit default policy put in its segment's policy, or a named or conform one lost. */
+TEST a_client_on_the_explicit_default_is_in_no_policy(void) {
+    firc_kn_policy_map_t *m = bench_map(BENCH_SHOW, BENCH_RC);
+    ASSERT(m != NULL);
+    firc_ip_t conform = v4(192, 0, 2, 11), dflt = v4(192, 0, 2, 12), named = v4(192, 0, 2, 13),
+              guest = v4(192, 0, 2, 14), unlisted = v4(192, 0, 2, 16), guest_dflt = v4(192, 0, 2, 17),
+              peer = v4(192, 0, 2, 20);
+    bool in_dflt = firc_kn_policy_map_has(m, "Policy0", &dflt);
+    bool in_conform = firc_kn_policy_map_has(m, "Policy0", &conform);
+    bool in_guest = firc_kn_policy_map_has(m, "Kids", &guest);
+    bool in_unlisted = firc_kn_policy_map_has(m, "Policy0", &unlisted);
+    bool in_guest_dflt = firc_kn_policy_map_has(m, "Policy0", &guest_dflt);
+    bool in_peer = firc_kn_policy_map_has(m, "Policy0", &peer);
+    bool named_own = firc_kn_policy_map_has(m, "Policy1", &named);
+    bool named_seg = firc_kn_policy_map_has(m, "Policy0", &named);
+    firc_kn_policy_map_free(m);
+    ASSERT_FALSEm("explicit default: no policy, whatever the segment's", in_dflt);
+    ASSERTm("conform: the segment's", in_conform);
+    ASSERTm("unregistered, no rc entry: the segment's, by description", in_guest);
+    ASSERTm("registered with no rc entry: the segment's", in_unlisted);
+    ASSERT_FALSEm("an explicit default holds without registration", in_guest_dflt);
+    ASSERTm("no host entry at all: the segment's", in_peer);
+    ASSERTm("named: its own", named_own);
+    ASSERT_FALSEm("named: not the segment's", named_seg);
+    PASS();
+}
+
+/* Catches: a conform host with an empty show policy left outside its segment's policy. */
+TEST a_conform_host_with_no_show_policy_takes_its_segment_s(void) {
+    firc_kn_policy_map_t *m = bench_map(BENCH_SHOW, BENCH_RC);
+    ASSERT(m != NULL);
+    firc_ip_t c = v4(192, 0, 2, 15);
+    bool in = firc_kn_policy_map_has(m, "Policy0", &c);
+    firc_kn_policy_map_free(m);
+    ASSERT(in);
+    PASS();
+}
+
+/* Catches: the rc entry's policy losing to an empty show policy for a named host. */
+TEST a_named_host_is_in_the_rc_entry_s_policy(void) {
+    firc_kn_policy_map_t *m = bench_map(BENCH_SHOW, BENCH_RC);
+    ASSERT(m != NULL);
+    firc_ip_t c = v4(192, 0, 2, 18);
+    bool own = firc_kn_policy_map_has(m, "Work VPN", &c);
+    bool seg = firc_kn_policy_map_has(m, "Policy0", &c);
+    firc_kn_policy_map_free(m);
+    ASSERT(own);
+    ASSERT_FALSE(seg);
+    PASS();
+}
+
+/* Catches: the host list telling a policy apart from its source by the show policy alone. */
+TEST the_host_list_says_each_client_s_policy_and_where_it_came_from(void) {
+    firc_kn_policy_map_t *m = bench_map(BENCH_SHOW, BENCH_RC);
+    ASSERT(m != NULL);
+    cJSON *arr = firc_kn_policy_map_hosts_json(m);
+    firc_kn_policy_map_free(m);
+    ASSERT(arr != NULL);
+    struct {
+        const char *mac, *policy;
+        bool from_segment;
+    } want[] = {
+        {"02:00:00:00:00:01", "Policy0", true},  {"02:00:00:00:00:02", "", false},
+        {"02:00:00:00:00:03", "Policy1", false}, {"02:00:00:00:00:04", "Policy0", true},
+        {"02:00:00:00:00:05", "Policy0", true},  {"02:00:00:00:00:06", "Policy0", true},
+        {"02:00:00:00:00:07", "", false},        {"02:00:00:00:00:08", "Policy1", false},
+    };
+    char got_policy[8][16], why[8][32];
+    bool got_from[8];
+    for (size_t i = 0; i < 8; i++) {
+        snprintf(got_policy[i], sizeof(got_policy[i]), "%s", host_policy(arr, want[i].mac));
+        got_from[i] = host_flag(arr, want[i].mac, "policyFromSegment");
+        snprintf(why[i], sizeof(why[i]), "%s", want[i].mac);
+    }
+    cJSON_Delete(arr);
+    for (size_t i = 0; i < 8; i++) {
+        ASSERT_STR_EQm(why[i], want[i].policy, got_policy[i]);
+        ASSERT_EQm(why[i], want[i].from_segment, got_from[i]);
+    }
+    PASS();
+}
+
+/* Catches: the count or the policy's host list taking in an explicit-default client. */
+TEST the_count_and_the_host_list_leave_out_the_explicit_default(void) {
+    firc_kn_policy_map_t *m = bench_map(BENCH_SHOW, BENCH_RC);
+    ASSERT(m != NULL);
+    size_t n0 = firc_kn_policy_map_count(m, "Policy0"), n1 = firc_kn_policy_map_count(m, "Work VPN");
+    addrs_t x = {.n = 0};
+    firc_err_t err = firc_kn_policy_map_policy_hosts(m, "Policy0", false, collect_addr, &x);
+    firc_kn_policy_map_free(m);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMTm("conform, conform with no show policy, unregistered, registered without rc", (size_t)4, n0, "%zu");
+    ASSERT_EQ_FMTm("named in show and named in rc only", (size_t)2, n1, "%zu");
+    ASSERT_EQ_FMT((size_t)4, x.n, "%zu");
+    firc_ip_t in[] = {v4(192, 0, 2, 11), v4(192, 0, 2, 14), v4(192, 0, 2, 15), v4(192, 0, 2, 16)};
+    for (size_t i = 0; i < 4; i++) { ASSERT(addrs_have(&x, &in[i])); }
+    PASS();
+}
+
+/* Catches: a segment written whole for its policy while an explicit-default client sits on it. */
+TEST a_segment_with_an_explicit_default_client_is_not_the_policy_s_alone(void) {
+    static const char SHOW_WITH[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "," SH_GUEST "]}";
+    static const char RC_WITH[] = "{" RC_BINDING ",\"host\":[" RC_CONFORM "," RC_DEFAULT "]}";
+    static const char SHOW_WITHOUT[] = "{\"host\":[" SH_CONFORM "," SH_GUEST "]}";
+    static const char RC_WITHOUT[] = "{" RC_BINDING ",\"host\":[" RC_CONFORM "]}";
+    firc_ip_t net = v4(192, 0, 2, 0);
+    nets_t allow = {.n = 0}, deny = {.n = 0}, allow2 = {.n = 0}, deny2 = {.n = 0};
+    firc_kn_policy_map_t *m = bench_map(SHOW_WITH, RC_WITH);
+    ASSERT(m != NULL);
+    (void)firc_kn_policy_map_policy_nets(m, "Policy0", false, collect_net, &allow);
+    (void)firc_kn_policy_map_policy_nets(m, "Policy0", true, collect_net, &deny);
+    firc_kn_policy_map_free(m);
+    m = bench_map(SHOW_WITHOUT, RC_WITHOUT);
+    ASSERT(m != NULL);
+    (void)firc_kn_policy_map_policy_nets(m, "Policy0", false, collect_net, &allow2);
+    (void)firc_kn_policy_map_policy_nets(m, "Policy0", true, collect_net, &deny2);
+    firc_kn_policy_map_free(m);
+    ASSERT_EQ_FMTm("allow, explicit default on it", (size_t)0, allow.n, "%zu");
+    ASSERT_EQ_FMTm("deny, explicit default on it", (size_t)0, deny.n, "%zu");
+    ASSERT_EQ_FMTm("allow, without it", (size_t)1, allow2.n, "%zu");
+    ASSERT(nets_have(&allow2, &net, 24));
+    ASSERT_EQ_FMTm("deny, without it", (size_t)1, deny2.n, "%zu");
+    ASSERT(nets_have(&deny2, &net, 24));
+    PASS();
+}
+
+/* Catches: a quiet refresh blind to a host's conform flag or its rc policy. */
+TEST a_changed_rc_entry_is_a_change(void) {
+    static const char SHOW[] = "{\"host\":[" SH_CONFORM "]}";
+    static const char *rcs[] = {
+        "{" RC_BINDING ",\"host\":[" RC_CONFORM "]}",
+        "{" RC_BINDING ",\"host\":[" RC_CONFORM "]}",
+        "{" RC_BINDING ",\"host\":[{\"mac\":\"02:00:00:00:00:01\",\"access\":\"permit\",\"permit\":true}]}",
+        "{" RC_BINDING ",\"host\":[{\"mac\":\"02:00:00:00:00:01\",\"access\":\"permit\",\"policy\":\"Policy1\"}]}",
+        "{" RC_BINDING ",\"host\":[{\"mac\":\"02:00:00:00:00:01\",\"access\":\"permit\",\"policy\":\"Policy9\"}]}",
+    };
+    g_changes = 0;
+    firc_kn_policies_t *p = firc_kn_policies_start_notify(NULL, 0, count_changes, NULL);
+    ASSERT(p != NULL);
+    rci_fake_t r = {.hotspot = SHOW, .ifaces = BENCH_IFACES};
+    int seen[5];
+    firc_err_t err = FIRC_OK;
+    for (size_t i = 0; i < 5 && err == FIRC_OK; i++) {
+        r.rc = rcs[i];
+        err = firc_kn_policies_round_for_test(p, fake_get, &r);
+        seen[i] = g_changes;
+    }
+    firc_kn_policies_stop(p);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQm("the first map", 1, seen[0]);
+    ASSERT_EQm("the same rc entry", 1, seen[1]);
+    ASSERT_EQm("conform dropped", 2, seen[2]);
+    ASSERT_EQm("a policy named", 3, seen[3]);
+    ASSERT_EQm("another policy named", 4, seen[4]);
+    PASS();
+}
+
+/* Catches: an rc host list that is not a list read as none, or a failed round replacing the map. */
+TEST an_rc_host_list_of_the_wrong_shape_fails_the_round(void) {
+    static const char SHOW[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "]}";
+    static const char RC_OBJECT[] = "{" RC_BINDING ",\"host\":{\"mac\":\"02:00:00:00:00:02\"}}";
+    const char *refused[] = {RC_OBJECT, "[1]", "\"hotspot\""};
+    for (size_t i = 0; i < 3; i++) {
+        rci_fake_t f = {.hotspot = SHOW, .rc = refused[i], .ifaces = BENCH_IFACES};
+        firc_kn_policy_map_t *m = NULL;
+        firc_err_t e = firc_kn_policy_map_fetch_for_test(fake_get, &f, &m);
+        firc_kn_policy_map_free(m);
+        ASSERT_EQm(refused[i], FIRC_ERR_PROTO, e);
+    }
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    rci_fake_t r = {.hotspot = SHOW, .rc = "{" RC_BINDING ",\"host\":[" RC_CONFORM "," RC_DEFAULT "]}",
+                    .ifaces = BENCH_IFACES};
+    firc_err_t e1 = firc_kn_policies_round_for_test(p, fake_get, &r);
+    const firc_kn_policy_map_t *good = firc_kn_policies_live_for_test(p);
+    r.rc = RC_OBJECT;
+    firc_err_t e2 = firc_kn_policies_round_for_test(p, fake_get, &r);
+    const firc_kn_policy_map_t *after = firc_kn_policies_live_for_test(p);
+    firc_ip_t dflt = v4(192, 0, 2, 12);
+    bool in = firc_kn_policy_map_has(after, "Policy0", &dflt);
+    firc_kn_policies_stop(p);
+    ASSERT_EQ(FIRC_OK, e1);
+    ASSERT_EQ(FIRC_ERR_PROTO, e2);
+    ASSERT(good != NULL);
+    ASSERT_EQm("the last good map stays", good, after);
+    ASSERT_FALSE(in);
+    PASS();
+}
+
+/* Catches: an rc document with no host list at all refused, which would stop every refresh on a router with none. */
+TEST an_rc_document_without_a_host_list_is_no_entries(void) {
+    static const char SHOW[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "]}";
+    firc_kn_policy_map_t *m = bench_map(SHOW, "{" RC_BINDING "}");
+    ASSERT(m != NULL);
+    firc_ip_t dflt = v4(192, 0, 2, 12);
+    bool in = firc_kn_policy_map_has(m, "Policy0", &dflt);
+    firc_kn_policy_map_free(m);
+    ASSERTm("no rc entry: the segment's", in);
+    PASS();
+}
+
+/* Catches: an empty rc document refused, so a router with no hotspot section never gets a map. */
+TEST an_empty_rc_document_is_no_segments_and_no_entries(void) {
+    static const char SHOW[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "]}";
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    rci_fake_t r = {.hotspot = SHOW, .rc = "[]", .ifaces = BENCH_IFACES};
+    firc_err_t err = firc_kn_policies_round_for_test(p, fake_get, &r);
+    const firc_kn_policy_map_t *m = firc_kn_policies_live_for_test(p);
+    firc_ip_t conform = v4(192, 0, 2, 11), dflt = v4(192, 0, 2, 12), peer = v4(192, 0, 2, 20);
+    bool own = firc_kn_policy_map_has(m, "Policy0", &conform);
+    bool none = firc_kn_policy_map_has(m, "Policy0", &dflt);
+    bool seg = firc_kn_policy_map_has(m, "Policy0", &peer);
+    firc_kn_policies_stop(p);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERTm("the show policy stands", own);
+    ASSERT_FALSEm("no segment to inherit", none);
+    ASSERT_FALSEm("no segment for a peer", seg);
+    PASS();
+}
+
+/* Catches: the show policy read before the rc entry, so a bare or named entry loses to it. */
+TEST the_rc_entry_beats_the_show_policy(void) {
+    static const char SHOW[] =
+        "{\"host\":[{\"mac\":\"02:00:00:00:00:09\",\"ip\":\"192.0.2.19\",\"policy\":\"Policy0\",\"active\":true,"
+        "\"registered\":true},"
+        "{\"mac\":\"02:00:00:00:00:0a\",\"ip\":\"192.0.2.21\",\"policy\":\"Policy0\",\"active\":true,"
+        "\"registered\":true}]}";
+    static const char RC[] = "{" RC_BINDING ",\"host\":["
+                             "{\"mac\":\"02:00:00:00:00:09\",\"access\":\"permit\",\"permit\":true},"
+                             "{\"mac\":\"02:00:00:00:00:0a\",\"access\":\"permit\",\"policy\":\"Policy1\"}]}";
+    firc_kn_policy_map_t *m = bench_map(SHOW, RC);
+    ASSERT(m != NULL);
+    firc_ip_t bare = v4(192, 0, 2, 19), named = v4(192, 0, 2, 21);
+    bool bare_in = firc_kn_policy_map_has(m, "Policy0", &bare);
+    bool named_own = firc_kn_policy_map_has(m, "Policy1", &named);
+    bool named_show = firc_kn_policy_map_has(m, "Policy0", &named);
+    cJSON *arr = firc_kn_policy_map_hosts_json(m);
+    firc_kn_policy_map_free(m);
+    ASSERT(arr != NULL);
+    char bare_policy[16], named_policy[16];
+    snprintf(bare_policy, sizeof(bare_policy), "%s", host_policy(arr, "02:00:00:00:00:09"));
+    snprintf(named_policy, sizeof(named_policy), "%s", host_policy(arr, "02:00:00:00:00:0a"));
+    bool bare_from = host_flag(arr, "02:00:00:00:00:09", "policyFromSegment");
+    bool named_from = host_flag(arr, "02:00:00:00:00:0a", "policyFromSegment");
+    cJSON_Delete(arr);
+    ASSERT_FALSEm("bare entry, show Policy0: in no policy", bare_in);
+    ASSERT_STR_EQ("", bare_policy);
+    ASSERT_FALSE(bare_from);
+    ASSERTm("rc names Policy1, show Policy0: Policy1", named_own);
+    ASSERT_FALSE(named_show);
+    ASSERT_STR_EQ("Policy1", named_policy);
+    ASSERT_FALSE(named_from);
+    PASS();
+}
+
+/* Catches: a conform host with no address in any segment said to have its policy from one, so no segment is named. */
+TEST a_conform_host_outside_every_segment_is_not_said_to_be_from_one(void) {
+    static const char SHOW[] =
+        "{\"host\":[{\"mac\":\"02:00:00:00:00:0b\",\"ip\":\"\",\"policy\":\"Policy0\",\"active\":false,"
+        "\"registered\":true},"
+        "{\"mac\":\"02:00:00:00:00:0c\",\"ip\":\"198.51.100.5\",\"policy\":\"Policy0\",\"active\":true,"
+        "\"registered\":true}]}";
+    static const char RC[] = "{" RC_BINDING ",\"host\":["
+                             "{\"mac\":\"02:00:00:00:00:0b\",\"access\":\"permit\",\"conform\":true},"
+                             "{\"mac\":\"02:00:00:00:00:0c\",\"access\":\"permit\",\"conform\":true}]}";
+    firc_kn_policy_map_t *m = bench_map(SHOW, RC);
+    ASSERT(m != NULL);
+    cJSON *arr = firc_kn_policy_map_hosts_json(m);
+    firc_kn_policy_map_free(m);
+    ASSERT(arr != NULL);
+    char offline[16], outside[16];
+    snprintf(offline, sizeof(offline), "%s", host_policy(arr, "02:00:00:00:00:0b"));
+    snprintf(outside, sizeof(outside), "%s", host_policy(arr, "02:00:00:00:00:0c"));
+    bool offline_from = host_flag(arr, "02:00:00:00:00:0b", "policyFromSegment");
+    bool outside_from = host_flag(arr, "02:00:00:00:00:0c", "policyFromSegment");
+    cJSON_Delete(arr);
+    ASSERT_STR_EQm("no address: the show policy", "Policy0", offline);
+    ASSERT_FALSEm("no address: no segment to name", offline_from);
+    ASSERT_STR_EQm("outside Bridge0: the show policy", "Policy0", outside);
+    ASSERT_FALSEm("outside Bridge0: no segment to name", outside_from);
+    PASS();
+}
+
+/* Catches: a show policy resolved from the client's own segment reported as not from it, or one from elsewhere as from it. */
+TEST a_resolved_show_policy_of_the_host_s_segment_is_from_the_segment(void) {
+    static const char SHOW[] =
+        "{\"host\":[{\"mac\":\"02:00:00:00:00:0d\",\"ip\":\"192.0.2.22\",\"policy\":\"Policy0\",\"active\":true,"
+        "\"registered\":false},"
+        "{\"mac\":\"02:00:00:00:00:0e\",\"ip\":\"192.0.2.23\",\"policy\":\"Policy1\",\"active\":true,"
+        "\"registered\":false},"
+        "{\"mac\":\"02:00:00:00:00:0f\",\"ip\":\"198.51.100.6\",\"policy\":\"Policy0\",\"active\":true,"
+        "\"registered\":false}]}";
+    firc_kn_policy_map_t *m = bench_map(SHOW, "{" RC_BINDING "}");
+    ASSERT(m != NULL);
+    cJSON *arr = firc_kn_policy_map_hosts_json(m);
+    firc_kn_policy_map_free(m);
+    ASSERT(arr != NULL);
+    char same[16], other[16], none[16];
+    snprintf(same, sizeof(same), "%s", host_policy(arr, "02:00:00:00:00:0d"));
+    snprintf(other, sizeof(other), "%s", host_policy(arr, "02:00:00:00:00:0e"));
+    snprintf(none, sizeof(none), "%s", host_policy(arr, "02:00:00:00:00:0f"));
+    bool same_from = host_flag(arr, "02:00:00:00:00:0d", "policyFromSegment");
+    bool other_from = host_flag(arr, "02:00:00:00:00:0e", "policyFromSegment");
+    bool none_from = host_flag(arr, "02:00:00:00:00:0f", "policyFromSegment");
+    cJSON_Delete(arr);
+    ASSERT_STR_EQ("Policy0", same);
+    ASSERTm("on Bridge0, bound to Policy0: from the segment", same_from);
+    ASSERT_STR_EQ("Policy1", other);
+    ASSERT_FALSEm("on Bridge0, bound to another policy: not from it", other_from);
+    ASSERT_STR_EQ("Policy0", none);
+    ASSERT_FALSEm("on no segment: not from one", none_from);
+    PASS();
+}
+
+/* Catches: a segment skipped for a client in no policy warned as if that client were in another one. */
+TEST a_segment_skipped_for_a_client_in_no_policy_is_said_truly(void) {
+    static const char SHOW[] = "{\"host\":[" SH_CONFORM "," SH_DEFAULT "]}";
+    static const char RC[] = "{" RC_BINDING ",\"host\":[" RC_CONFORM "," RC_DEFAULT "]}";
+    firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
+    ASSERT(p != NULL);
+    firc_kn_policy_map_t *m = bench_map(SHOW, RC);
+    if (m == NULL) { firc_kn_policies_stop(p); }
+    ASSERT(m != NULL);
+    firc_kn_policies_swap(p, m);
+    int fd = log_file();
+    if (fd < 0) { firc_kn_policies_stop(p); }
+    ASSERT(fd >= 0);
+    firc_log_set_fd(fd);
+    nets_t x = {.n = 0};
+    firc_err_t err = firc_kn_policies_policy_nets("Policy0", false, collect_net, &x, p);
+    char *log = log_back(fd);
+    firc_kn_policies_stop(p);
+    size_t said = log != NULL ? count_of(log, "in another policy or in none") : 99;
+    free(log);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)0, x.n, "%zu");
+    ASSERT_EQ_FMT((size_t)1, said, "%zu");
     PASS();
 }
 
@@ -1950,8 +2330,8 @@ TEST a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried(void)
     g_changes = 0;
     firc_kn_policies_t *p = firc_kn_policies_start_notify(NULL, 0, count_changes, NULL);
     ASSERT(p != NULL);
-    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL};
-    rci_fake_t ok_spaced = {NULL, 0, NULL, POLICIES_SPACED, NULL}, bad_plain = {"/rci/show/ip/policy", 0, NULL, NULL, NULL};
+    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL, NULL, NULL};
+    rci_fake_t ok_spaced = {NULL, 0, NULL, POLICIES_SPACED, NULL, NULL, NULL}, bad_plain = {"/rci/show/ip/policy", 0, NULL, NULL, NULL, NULL, NULL};
     int fd = log_file();
     if (fd < 0) { firc_kn_policies_stop(p); }
     ASSERT(fd >= 0);
@@ -1985,7 +2365,7 @@ TEST a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried(void)
 TEST the_marks_are_read_only_when_the_policy_list_changes(void) {
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
-    rci_fake_t r = {NULL, 0, NULL, NULL, NULL};
+    rci_fake_t r = {NULL, 0, NULL, NULL, NULL, NULL, NULL};
     int asked[4];
     uint32_t mark[4] = {0};
     const char *lists[4] = {NULL, NULL, POLICIES_SPACED, POLICIES_SPACED};
@@ -2010,7 +2390,7 @@ TEST the_marks_are_read_only_when_the_policy_list_changes(void) {
 TEST a_marks_document_without_marks_is_read_again(void) {
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
-    rci_fake_t r = {NULL, 0, "{\"Policy9\":{\"description\":\"Guests\"}}", NULL, NULL};
+    rci_fake_t r = {NULL, 0, "{\"Policy9\":{\"description\":\"Guests\"}}", NULL, NULL, NULL, NULL};
     firc_err_t e1 = firc_kn_policies_round_for_test(p, fake_get, &r);
     r.marks = NULL;
     firc_err_t e2 = firc_kn_policies_round_for_test(p, fake_get, &r);
@@ -2030,9 +2410,9 @@ TEST a_clash_carried_across_a_failed_marks_read_is_said_once(void) {
     static const char CLASH[] = "{\"Policy0\":{\"mark\":\"ffffaab\"},\"Policy1\":{\"mark\":\"f01faab\"}}";
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
-    rci_fake_t first = {NULL, 0, CLASH, NULL, NULL};
-    rci_fake_t moved = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, QUIET_1};
-    rci_fake_t back = {NULL, 0, CLASH, NULL, QUIET_OFF};
+    rci_fake_t first = {NULL, 0, CLASH, NULL, NULL, NULL, NULL};
+    rci_fake_t moved = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, QUIET_1, NULL, NULL};
+    rci_fake_t back = {NULL, 0, CLASH, NULL, QUIET_OFF, NULL, NULL};
     int fd = log_file();
     if (fd < 0) { firc_kn_policies_stop(p); }
     ASSERT(fd >= 0);
@@ -2077,8 +2457,8 @@ TEST a_deny_policy_keeps_its_mark_across_a_failed_marks_read(void) {
     static const char WITHOUT_KIDS[] = "{\"Policy1\":{\"description\":\"Work VPN\"}}";
     firc_kn_policies_t *p = firc_kn_policies_start(NULL, 0);
     ASSERT(p != NULL);
-    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL};
-    rci_fake_t gone = {"/rci/show/ip/policy", 0, NULL, WITHOUT_KIDS, NULL};
+    rci_fake_t ok = {NULL, 0, NULL, NULL, NULL, NULL, NULL}, bad = {"/rci/show/ip/policy", 0, NULL, POLICIES_SPACED, NULL, NULL, NULL};
+    rci_fake_t gone = {"/rci/show/ip/policy", 0, NULL, WITHOUT_KIDS, NULL, NULL, NULL};
     firc_log_set_output_floor(FIRC_LOG_ERROR);
     firc_err_t e1 = firc_kn_policies_round_for_test(p, fake_get, &ok);
     bool read = deny_kids_has_mark(p);
@@ -2193,7 +2573,7 @@ static firc_err_t gate_get(void *ud, const char *path, char **body) {
         pthread_mutex_unlock(&g->mu);
         if (fail) { return FIRC_ERR_IO; }
     }
-    rci_fake_t r = {NULL, 0, NULL, NULL, NULL};
+    rci_fake_t r = {NULL, 0, NULL, NULL, NULL, NULL, NULL};
     return fake_get(&r, path, body);
 }
 
@@ -2393,6 +2773,27 @@ TEST a_stop_with_a_wake_pending_joins(void) {
     PASS();
 }
 
+/* Catches: a refused round said only as "protocol error", without the document that was refused. */
+TEST a_refused_rc_document_is_named_in_the_log(void) {
+    rci_fake_t r = {.hotspot = "{\"host\":[" SH_CONFORM "]}",
+                    .rc = "{" RC_BINDING ",\"host\":{\"mac\":\"02:00:00:00:00:01\"}}",
+                    .ifaces = BENCH_IFACES};
+    int fd = log_file();
+    ASSERT(fd >= 0);
+    firc_log_set_fd(fd);
+    firc_kn_policies_t *p = firc_kn_policies_start_for_test(fake_get, &r, 3600);
+    bool ran = p != NULL && rounds_reach(p, 1, 2000);
+    firc_kn_policies_stop(p);
+    char *log = log_back(fd);
+    size_t named = log != NULL ? count_of(log, "/rci/show/rc/ip/hotspot") : 0;
+    size_t failed = log != NULL ? count_of(log, "refresh failed") : 0;
+    free(log);
+    ASSERT(ran);
+    ASSERT_EQ_FMT((size_t)1, failed, "%zu");
+    ASSERT_EQ_FMT((size_t)1, named, "%zu");
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2443,6 +2844,20 @@ int main(int argc, char **argv) {
     RUN_TEST(every_changed_map_is_announced);
     RUN_TEST(a_lost_announcement_is_made_again_at_the_next_refresh);
     RUN_TEST(a_refresh_whose_marks_cannot_be_read_keeps_its_hosts);
+    RUN_TEST(a_client_on_the_explicit_default_is_in_no_policy);
+    RUN_TEST(a_conform_host_with_no_show_policy_takes_its_segment_s);
+    RUN_TEST(a_named_host_is_in_the_rc_entry_s_policy);
+    RUN_TEST(the_host_list_says_each_client_s_policy_and_where_it_came_from);
+    RUN_TEST(the_count_and_the_host_list_leave_out_the_explicit_default);
+    RUN_TEST(a_segment_with_an_explicit_default_client_is_not_the_policy_s_alone);
+    RUN_TEST(a_changed_rc_entry_is_a_change);
+    RUN_TEST(an_rc_host_list_of_the_wrong_shape_fails_the_round);
+    RUN_TEST(an_rc_document_without_a_host_list_is_no_entries);
+    RUN_TEST(an_empty_rc_document_is_no_segments_and_no_entries);
+    RUN_TEST(the_rc_entry_beats_the_show_policy);
+    RUN_TEST(a_conform_host_outside_every_segment_is_not_said_to_be_from_one);
+    RUN_TEST(a_resolved_show_policy_of_the_host_s_segment_is_from_the_segment);
+    RUN_TEST(a_segment_skipped_for_a_client_in_no_policy_is_said_truly);
     RUN_TEST(a_missing_mark_document_is_said_once_per_streak_and_its_marks_carried);
     RUN_TEST(a_deny_policy_keeps_its_mark_across_a_failed_marks_read);
     RUN_TEST(a_clash_carried_across_a_failed_marks_read_is_said_once);
@@ -2471,5 +2886,6 @@ int main(int argc, char **argv) {
     RUN_TEST(a_wake_during_a_round_waits_for_the_next);
     RUN_TEST(a_wake_during_a_fresh_round_is_served_by_it);
     RUN_TEST(a_stop_with_a_wake_pending_joins);
+    RUN_TEST(a_refused_rc_document_is_named_in_the_log);
     GREATEST_MAIN_END();
 }

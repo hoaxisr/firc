@@ -39,12 +39,16 @@ typedef struct {
     uint32_t mark;
 } mark_t;
 
+typedef enum { RC_NONE, RC_DEFAULT, RC_CONFORM, RC_NAMED } rc_entry_t;
+
 typedef struct {
     firc_mac_t mac;
     char *name;
     char *policy;
     char *ip;
     bool active, registered;
+    rc_entry_t rc;
+    char *rc_policy;
     size_t first, n_addrs;
 } host_t;
 
@@ -315,6 +319,7 @@ void firc_kn_policy_map_free(firc_kn_policy_map_t *m) {
         free(m->hosts[i].name);
         free(m->hosts[i].policy);
         free(m->hosts[i].ip);
+        free(m->hosts[i].rc_policy);
     }
     free(m->hosts);
     free(m->index);
@@ -324,8 +329,7 @@ void firc_kn_policy_map_free(firc_kn_policy_map_t *m) {
     free(m);
 }
 
-size_t firc_kn_hotspot_segments_parse(const char *rc_hotspot_json, firc_kn_segment_t *out, size_t cap) {
-    cJSON *root = rc_hotspot_json != NULL ? cJSON_Parse(rc_hotspot_json) : NULL;
+static size_t segments_of(const cJSON *root, firc_kn_segment_t *out, size_t cap) {
     const cJSON *list = cJSON_IsObject(root) ? cJSON_GetObjectItemCaseSensitive(root, "policy") : NULL;
     size_t n = 0;
     const cJSON *e = NULL;
@@ -344,6 +348,12 @@ size_t firc_kn_hotspot_segments_parse(const char *rc_hotspot_json, firc_kn_segme
             n++;
         }
     }
+    return n;
+}
+
+size_t firc_kn_hotspot_segments_parse(const char *rc_hotspot_json, firc_kn_segment_t *out, size_t cap) {
+    cJSON *root = rc_hotspot_json != NULL ? cJSON_Parse(rc_hotspot_json) : NULL;
+    size_t n = segments_of(root, out, cap);
     cJSON_Delete(root);
     return n;
 }
@@ -529,14 +539,22 @@ bool firc_kn_policy_map_mac(const firc_kn_policy_map_t *m, const firc_ip_t *clie
     return true;
 }
 
-/* Own policy, else the segment's: the one rule has, count and the host list share. */
-static const char *host_effective_policy(const firc_kn_policy_map_t *m, const host_t *h) {
-    if (h->policy[0] != '\0') { return h->policy; }
-    for (size_t i = h->first; i < h->first + h->n_addrs; i++) {
-        const char *seg = segment_policy(m, &m->members[i].addr);
-        if (seg[0] != '\0') { return seg; }
+static const char *host_effective_policy(const firc_kn_policy_map_t *m, const host_t *h, bool *from_segment) {
+    bool unused = false;
+    if (from_segment == NULL) { from_segment = &unused; }
+    *from_segment = false;
+    if (h->rc == RC_NAMED) { return h->rc_policy; }
+    if (h->rc == RC_DEFAULT) { return ""; }
+    const char *seg = "";
+    for (size_t i = h->first; i < h->first + h->n_addrs && seg[0] == '\0'; i++) {
+        seg = segment_policy(m, &m->members[i].addr);
     }
-    return "";
+    if (h->policy[0] != '\0') {
+        *from_segment = seg[0] != '\0' && (h->rc == RC_CONFORM || strcmp(seg, h->policy) == 0);
+        return h->policy;
+    }
+    *from_segment = seg[0] != '\0';
+    return seg;
 }
 
 /* Skips addresses another host holds now; an allow stays within the device window (in_window). */
@@ -586,7 +604,7 @@ firc_err_t firc_kn_policy_map_policy_hosts(const firc_kn_policy_map_t *m, const 
     const char *name = internal_name(m, policy);
     for (size_t i = 0; i < m->n_hosts; i++) {
         const host_t *h = &m->hosts[i];
-        if (h->n_addrs == 0 || strcmp(host_effective_policy(m, h), name) != 0) { continue; }
+        if (h->n_addrs == 0 || strcmp(host_effective_policy(m, h, NULL), name) != 0) { continue; }
         emit_host(m, h, deny, fn, ud);
     }
     return FIRC_OK;
@@ -608,7 +626,7 @@ static bool segment_is_policy_s_alone(const firc_kn_policy_map_t *m, size_t i, c
         uint32_t v = (uint32_t)a->b[0] << 24 | (uint32_t)a->b[1] << 16 | (uint32_t)a->b[2] << 8 | a->b[3];
         if ((v & s->mask) != s->net) { continue; }
         const host_t *h = host_at(m, a);
-        if (h == NULL || strcmp(host_effective_policy(m, h), name) != 0) { return false; }
+        if (h == NULL || strcmp(host_effective_policy(m, h, NULL), name) != 0) { return false; }
     }
     return true;
 }
@@ -660,11 +678,12 @@ static bool host_json_fill(cJSON *o, const firc_kn_policy_map_t *m, size_t idx) 
             return false;
         }
     }
+    bool from_segment = false;
+    const char *policy = host_effective_policy(m, h, &from_segment);
     return cJSON_AddBoolToObject(o, "active", h->active) != NULL &&
            cJSON_AddBoolToObject(o, "registered", h->registered) != NULL &&
-           cJSON_AddStringToObject(o, "policy", host_effective_policy(m, h)) != NULL &&
-           cJSON_AddBoolToObject(o, "policyFromSegment", h->policy[0] == '\0' && host_effective_policy(m, h)[0] != '\0') !=
-               NULL;
+           cJSON_AddStringToObject(o, "policy", policy) != NULL &&
+           cJSON_AddBoolToObject(o, "policyFromSegment", from_segment) != NULL;
 }
 
 cJSON *firc_kn_policy_map_hosts_json(const firc_kn_policy_map_t *m) {
@@ -701,7 +720,7 @@ bool firc_kn_policy_map_has(const firc_kn_policy_map_t *m, const char *policy, c
     if (m == NULL || policy == NULL || policy[0] == '\0' || client == NULL || client->len == 0) { return false; }
     const char *name = internal_name(m, policy);
     const host_t *h = host_at(m, client);
-    const char *eff = h != NULL ? host_effective_policy(m, h) : segment_policy(m, client);
+    const char *eff = h != NULL ? host_effective_policy(m, h, NULL) : segment_policy(m, client);
     return eff[0] != '\0' && strcmp(eff, name) == 0;
 }
 
@@ -709,15 +728,10 @@ size_t firc_kn_policy_map_count(const firc_kn_policy_map_t *m, const char *polic
     if (m == NULL || policy == NULL) { return 0; }
     const char *name = internal_name(m, policy);
     if (name[0] == '\0') { return 0; }
-    size_t n = 0, counted = 0;
-    for (size_t i = 0; i < m->n_members; i++) {
-        if (m->members[i].host == counted) { continue; }
-        const char *eff = m->members[i].policy[0] != '\0' ? m->members[i].policy
-                                                           : segment_policy(m, &m->members[i].addr);
-        if (strcmp(eff, name) == 0) {
-            n++;
-            counted = m->members[i].host;
-        }
+    size_t n = 0;
+    for (size_t i = 0; i < m->n_hosts; i++) {
+        const host_t *h = &m->hosts[i];
+        if (h->n_addrs > 0 && strcmp(host_effective_policy(m, h, NULL), name) == 0) { n++; }
     }
     return n;
 }
@@ -756,7 +770,9 @@ static bool map_same(const firc_kn_policy_map_t *a, const firc_kn_policy_map_t *
     for (size_t i = 0; i < a->n_hosts; i++) {
         const host_t *x = &a->hosts[i], *y = &b->hosts[i];
         if (memcmp(x->mac.b, y->mac.b, sizeof(x->mac.b)) != 0 || x->active != y->active ||
-            x->registered != y->registered || x->first != y->first || x->n_addrs != y->n_addrs ||
+            x->registered != y->registered || x->rc != y->rc ||
+            (x->rc == RC_NAMED && !str_same(x->rc_policy, y->rc_policy)) || x->first != y->first ||
+            x->n_addrs != y->n_addrs ||
             !str_same(x->name, y->name) || !str_same(x->policy, y->policy) || !str_same(x->ip, y->ip)) {
             return false;
         }
@@ -855,17 +871,51 @@ static firc_err_t rci_get(void *ud, const char *path, char **body) {
     return firc_kn_rci_get(((const rci_t *)ud)->base_url, path, body);
 }
 
-static firc_err_t fetch_segments(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_map_t *m) {
+static firc_err_t add_rc_hosts(firc_kn_policy_map_t *m, const cJSON *root) {
+    const cJSON *list = cJSON_IsObject(root) ? cJSON_GetObjectItemCaseSensitive(root, "host") : NULL;
+    bool empty = cJSON_IsArray(root) && cJSON_GetArraySize(root) == 0;
+    if (m == NULL || (!cJSON_IsObject(root) && !empty) || (list != NULL && !cJSON_IsArray(list))) {
+        return FIRC_ERR_PROTO;
+    }
+    firc_err_t err = FIRC_OK;
+    const cJSON *e = NULL;
+    cJSON_ArrayForEach(e, list) {
+        const cJSON *mac_j = cJSON_GetObjectItemCaseSensitive(e, "mac");
+        firc_mac_t mac;
+        if (!cJSON_IsString(mac_j) || !firc_mac_parse(mac_j->valuestring, &mac)) { continue; }
+        const char *policy = string_or(e, "policy", "");
+        rc_entry_t kind = policy[0] != '\0'                                              ? RC_NAMED
+                          : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(e, "conform")) ? RC_CONFORM
+                                                                                         : RC_DEFAULT;
+        for (size_t i = 0; i < m->n_hosts && err == FIRC_OK; i++) {
+            host_t *h = &m->hosts[i];
+            if (memcmp(h->mac.b, mac.b, sizeof(mac.b)) != 0) { continue; }
+            h->rc = kind;
+            free(h->rc_policy);
+            h->rc_policy = kind == RC_NAMED ? strdup(policy) : NULL;
+            if (kind == RC_NAMED && h->rc_policy == NULL) { err = FIRC_ERR_NOMEM; }
+        }
+        if (err != FIRC_OK) { break; }
+    }
+    return err;
+}
+
+static firc_err_t fetch_segments(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_map_t *m, const char **at) {
     char *rc = NULL;
-    firc_err_t err = get(ud, "/rci/show/rc/ip/hotspot", &rc);
+    *at = "/rci/show/rc/ip/hotspot";
+    firc_err_t err = get(ud, *at, &rc);
     if (err != FIRC_OK) { return err; }
-    firc_kn_segment_t seg[32];
-    size_t n = firc_kn_hotspot_segments_parse(rc, seg, 32);
+    cJSON *root = cJSON_Parse(rc);
     free(rc);
-    if (n == 0) { return FIRC_OK; }
+    err = add_rc_hosts(m, root);
+    firc_kn_segment_t seg[32];
+    size_t n = err == FIRC_OK ? segments_of(root, seg, 32) : 0;
+    cJSON_Delete(root);
+    if (err != FIRC_OK || n == 0) { return err; }
     /* One read of every interface, looked up by id: an id can hold a '/'. */
     char *body = NULL;
-    err = get(ud, "/rci/show/interface", &body);
+    *at = "/rci/show/interface";
+    err = get(ud, *at, &body);
     if (err != FIRC_OK) { return err; }
     err = firc_kn_policy_map_add_segments(m, seg, n, body);
     free(body);
@@ -873,26 +923,36 @@ static firc_err_t fetch_segments(firc_kn_rci_get_fn get, void *ud, firc_kn_polic
 }
 
 static firc_err_t fetch_with(firc_kn_rci_get_fn get, void *ud, const char *known, firc_kn_policy_map_t **out,
-                             firc_err_t *marks_err, bool *asked, char **list) {
+                             firc_err_t *marks_err, bool *asked, char **list, const char **at) {
     *out = NULL;
     if (marks_err != NULL) { *marks_err = FIRC_OK; }
     char *hosts = NULL, *policies = NULL, *marks = NULL;
-    firc_err_t err = get(ud, "/rci/show/ip/hotspot", &hosts);
+    *at = "/rci/show/ip/hotspot";
+    firc_err_t err = get(ud, *at, &hosts);
     /* Hosts, policy list and segments are all-or-nothing: a partial map would misroute whole sets of clients. */
-    if (err == FIRC_OK) { err = get(ud, "/rci/show/rc/ip/policy", &policies); }
+    if (err == FIRC_OK) {
+        *at = "/rci/show/rc/ip/policy";
+        err = get(ud, *at, &policies);
+    }
     bool ask = err == FIRC_OK && (known == NULL || strcmp(known, policies) != 0);
     /* Marks are not all-or-nothing: without them the round still refreshes hosts and segments. */
     firc_err_t merr = ask ? get(ud, "/rci/show/ip/policy", &marks) : FIRC_OK;
-    if (err == FIRC_OK) { err = firc_kn_policy_map_parse(hosts, policies, out); }
+    if (err == FIRC_OK) {
+        *at = "/rci/show/ip/hotspot and /rci/show/rc/ip/policy";
+        err = firc_kn_policy_map_parse(hosts, policies, out);
+    }
     if (err == FIRC_OK && ask && merr == FIRC_OK) {
         merr = firc_kn_policy_map_add_marks(*out, marks);
-        if (merr == FIRC_ERR_NOMEM) { err = merr; }
+        if (merr == FIRC_ERR_NOMEM) {
+            *at = "/rci/show/ip/policy";
+            err = merr;
+        }
     }
     if (marks_err != NULL) { *marks_err = merr; }
     if (asked != NULL) { *asked = ask; }
     free(hosts);
     free(marks);
-    if (err == FIRC_OK) { err = fetch_segments(get, ud, *out); }
+    if (err == FIRC_OK) { err = fetch_segments(get, ud, *out, at); }
     if (err == FIRC_OK && list != NULL) {
         *list = policies;
         policies = NULL;
@@ -906,7 +966,8 @@ static firc_err_t fetch_with(firc_kn_rci_get_fn get, void *ud, const char *known
 }
 
 firc_err_t firc_kn_policy_map_fetch_for_test(firc_kn_rci_get_fn get, void *ud, firc_kn_policy_map_t **out) {
-    return fetch_with(get, ud, NULL, out, NULL, NULL, NULL);
+    const char *at = "";
+    return fetch_with(get, ud, NULL, out, NULL, NULL, NULL, &at);
 }
 
 static void marks_free(mark_t *v, size_t n) {
@@ -952,13 +1013,13 @@ static firc_err_t carry_marks(const firc_kn_policies_t *p, firc_kn_policy_map_t 
     return FIRC_OK;
 }
 
-static firc_err_t refresh_round(firc_kn_policies_t *p, firc_kn_rci_get_fn get, void *ud) {
+static firc_err_t refresh_round(firc_kn_policies_t *p, firc_kn_rci_get_fn get, void *ud, const char **at) {
     firc_kn_policy_map_t *m = NULL;
     firc_err_t merr = FIRC_OK;
     bool asked = false;
     char *list = NULL;
     /* ndm walks every route of both families to answer the marks document, so it is read only for a new list. */
-    firc_err_t err = fetch_with(get, ud, p->marks_list, &m, &merr, &asked, &list);
+    firc_err_t err = fetch_with(get, ud, p->marks_list, &m, &merr, &asked, &list, at);
     if (err != FIRC_OK) { return err; }
     bool held = asked && merr == FIRC_OK && keep_marks(p, m);
     if (asked) {
@@ -987,7 +1048,8 @@ static firc_err_t refresh_round(firc_kn_policies_t *p, firc_kn_rci_get_fn get, v
 }
 
 firc_err_t firc_kn_policies_round_for_test(firc_kn_policies_t *p, firc_kn_rci_get_fn get, void *ud) {
-    return refresh_round(p, get, ud);
+    const char *at = "";
+    return refresh_round(p, get, ud, &at);
 }
 
 static uint64_t mono_ms(void) {
@@ -1008,7 +1070,9 @@ static void *refresher(void *ud) {
         pthread_mutex_unlock(&p->mu);
         rci_t rci = {p->base_url};
         /* RCI bytes change on every read, so map_same compares parsed maps; an equal map is freed without a swap. */
-        firc_err_t err = p->get != NULL ? refresh_round(p, p->get, p->get_ud) : refresh_round(p, rci_get, &rci);
+        const char *at = "";
+        firc_err_t err =
+            p->get != NULL ? refresh_round(p, p->get, p->get_ud, &at) : refresh_round(p, rci_get, &rci, &at);
         unsigned wait;
         if (err == FIRC_OK) {
             (void)firc_logrep_ok(&failing, NULL, "keenetic policies: RCI");
@@ -1016,7 +1080,8 @@ static void *refresher(void *ud) {
             wait = p->refresh_secs;
         } else {
             /* Keep the last good map across a failure; before the first map retry fast (ndm may still be starting). */
-            firc_logrep_fail(&failing, FIRC_LOG_WARN, NULL, "keenetic policies: refresh failed: %s", firc_err_str(err));
+            firc_logrep_fail(&failing, FIRC_LOG_WARN, NULL, "keenetic policies: refresh failed (%s): %s", at,
+                             firc_err_str(err));
             wait = retry < p->refresh_secs ? retry : p->refresh_secs;
             if (retry < p->refresh_secs) { retry *= 2; }
         }
@@ -1314,8 +1379,8 @@ firc_err_t firc_kn_policies_policy_nets(const char *policy, bool deny, firc_devs
     if (skipped > 0 && claim_name(p->segment_warned, sizeof(p->segment_warned) / sizeof(p->segment_warned[0]),
                                   &p->n_segment_warned, policy, &last)) {
         FIRC_WARN("keenetic policies: %zu segment%s bound to policy \"%s\" %s not written for an allow entry: "
-                  "the answer puts a client there in another policy, so a client the table does not list is matched by "
-                  "the firmware's mark alone",
+                  "the answer puts a client there in another policy or in none, so a client the table does not "
+                  "list is matched by the firmware's mark alone",
                   skipped, skipped == 1 ? "" : "s", policy, skipped == 1 ? "is" : "are");
     }
     return FIRC_OK;
