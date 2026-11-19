@@ -94,17 +94,6 @@
     {#if look.dot}<span class="dot {look.dot}"></span>{/if}{look.text}
   </div>
   <div class="lat">
-    {#if !row.skipReason}
-      <Tooltip value={t("Check this node")}>
-        <Button small class="check" inactive={!canCheck} onclick={onCheck}>
-          {#if checking}
-            <span class="spin"><LoaderCircle size={14} /></span>
-          {:else}
-            <Activity size={14} />
-          {/if}
-        </Button>
-      </Tooltip>
-    {/if}
     <div class="vals">
       {#if latency !== null}
         <span class="fb">{latency} {t("ms")}</span>
@@ -125,6 +114,17 @@
         <Tooltip value={probe.why || t("did not answer")}><span class="fail">—</span></Tooltip>
       {/if}
     </div>
+    {#if !row.skipReason}
+      <Tooltip value={t("Check this node")}>
+        <Button small class="check" inactive={!canCheck} onclick={onCheck}>
+          {#if checking}
+            <span class="spin"><LoaderCircle size={14} /></span>
+          {:else}
+            <Activity size={14} />
+          {/if}
+        </Button>
+      </Tooltip>
+    {/if}
   </div>
   <div class="on">
     <Tooltip value={t(excluded ? "Include the node" : "Exclude the node")}>

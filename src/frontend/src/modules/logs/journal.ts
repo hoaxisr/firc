@@ -251,8 +251,85 @@ const RESOLVER_LINES: [RegExp, (t: (s: string) => string) => string][] = [
   ],
 ];
 
+type Fill = Record<string, string>;
+
+const LOG_LINES: [RegExp, (t: (s: string) => string) => string][] = [
+  [
+    /^the interface check cannot run: the check's host (?<h>\S+) does not resolve through (?<u>\S+): (?<e>.+)$/,
+    (t) =>
+      t("the interface check cannot run: the check's host {h} does not resolve through {u}: {e}"),
+  ],
+  [/^the interface check cannot run: (?<e>.+)$/, (t) => t("the interface check cannot run: {e}")],
+  [
+    /^the interface check fails, even through the WAN: (?<e>.+)$/,
+    (t) => t("the interface check fails, even through the WAN: {e}"),
+  ],
+  [/^cannot check (?<n>.+?): (?<e>.+)$/, (t) => t("cannot check {n}: {e}")],
+  [/^interface (?<i>\S+) is dead: (?<e>.+)$/, (t) => t("interface {i} is dead: {e}")],
+  [/^interface (?<i>\S+) is alive$/, (t) => t("interface {i} is alive")],
+  [
+    /^interface (?<i>\S+) cannot be checked: its check route: (?<e>.+)$/,
+    (t) => t("interface {i} cannot be checked: its check route: {e}"),
+  ],
+  [
+    /^group (?<g>.+) moved back from (?<a>\S+) to (?<b>\S+)$/,
+    (t) => t("group {g} moved back from {a} to {b}"),
+  ],
+  [
+    /^group (?<g>.+) moved from (?<a>\S+) to (?<b>\S+): (?<e>.+)$/,
+    (t) => t("group {g} moved from {a} to {b}: {e}"),
+  ],
+  [/^group (?<g>.+) is back on (?<a>\S+)$/, (t) => t("group {g} is back on {a}")],
+  [
+    /^group (?<g>.+): the move to (?<a>\S+) failed: (?<e>.+)$/,
+    (t) => t("group {g}: the move to {a} failed: {e}"),
+  ],
+  [
+    /^the interface check: recovered after (?<n>\d+) failures? over (?<d>\d+ (?:s|min))$/,
+    (t) => t("the interface check: recovered after {n} failures over {d}"),
+  ],
+  [
+    /^interface (?<i>\S+): recovered after (?<n>\d+) failures? over (?<d>\d+ (?:s|min))$/,
+    (t) => t("interface {i}: recovered after {n} failures over {d}"),
+  ],
+];
+
+const REPEATS: [RegExp, (t: (s: string) => string) => string][] = [
+  [
+    / \(still failing, (?<n>\d+) times for (?<d>\d+ (?:s|min))\)$/,
+    (t) => t("(still failing, {n} times for {d})"),
+  ],
+  [/ \((?<n>\d+) more since the last\)$/, (t) => t("({n} more since the last)")],
+];
+
+function fill(text: string, m: Fill, t: (s: string) => string): string {
+  return text.replace(/\{(\w)\}/g, (_, k: string) => {
+    const v = m[k] ?? "";
+    if (k === "e" && v === "timeout") return t("timeout");
+    if (k === "d") return v.replace(/ min$/, ` ${t("min")}`).replace(/ s$/, ` ${t("s")}`);
+    return v;
+  });
+}
+
+function describePlain(message: string, t: (s: string) => string): string {
+  let body = message;
+  let tail = "";
+  for (const [re, text] of REPEATS) {
+    const m = re.exec(body);
+    if (!m) continue;
+    body = body.slice(0, m.index);
+    tail = ` ${fill(text(t), m.groups ?? {}, t)}`;
+    break;
+  }
+  for (const [re, text] of LOG_LINES) {
+    const m = re.exec(body)?.groups;
+    if (m) return fill(text(t), m, t) + tail;
+  }
+  return message;
+}
+
 export function describeLog(e: LogEvent, t: (s: string) => string, names?: GroupNames): string {
-  if (!e.message.startsWith(RESOLVER_PREFIX)) return e.message;
+  if (!e.message.startsWith(RESOLVER_PREFIX)) return describePlain(e.message, t);
   for (const [re, text] of RESOLVER_LINES) {
     const m = re.exec(e.message)?.groups;
     if (!m) continue;

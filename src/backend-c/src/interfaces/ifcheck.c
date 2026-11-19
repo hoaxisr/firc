@@ -214,6 +214,7 @@ firc_err_t firc_ifcheck_resolve(const char *server, uint16_t port, const char *u
             ssize_t got = recv(fd, a, sizeof(a), 0);
             if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && ++waited < timeout_s &&
                 (stop == NULL || !atomic_load(stop))) {
+                (void)send(fd, q, at, 0);
                 tries--;
                 continue;
             }

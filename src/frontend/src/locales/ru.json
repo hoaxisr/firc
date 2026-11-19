@@ -1002,5 +1002,22 @@
   "The dedup table filled at {n} pairs: past that, a bypass is reported every time rather than once a minute.": "Таблица повторов заполнилась (пар: {n}): дальше об утечке сообщается каждый раз, а не раз в минуту.",
   "There was no memory to remember some pairs by: those are reported every time rather than once a minute.": "Не хватило памяти, чтобы запомнить некоторые пары: о них сообщается каждый раз, а не раз в минуту.",
   "{n} datagrams came from another process on this machine and were ignored: the capture reads what the kernel sends it and nothing else.": "Датаграмм от другого процесса на роутере, оставленных без внимания: {n}. Захват читает только то, что ему присылает ядро.",
-  "API": "API"
+  "API": "API",
+  "the interface check cannot run: the check's host {h} does not resolve through {u}: {e}": "проверка интерфейсов не может выполниться: имя {h} из адреса проверки не резолвится через {u}: {e}",
+  "the interface check cannot run: {e}": "проверка интерфейсов не может выполниться: {e}",
+  "the interface check fails, even through the WAN: {e}": "проверка интерфейсов не проходит даже через WAN: {e}",
+  "cannot check {n}: {e}": "не удаётся проверить {n}: {e}",
+  "interface {i} is dead: {e}": "интерфейс {i} не работает: {e}",
+  "interface {i} is alive": "интерфейс {i} снова работает",
+  "interface {i} cannot be checked: its check route: {e}": "интерфейс {i} нельзя проверить: маршрут проверки: {e}",
+  "group {g} moved back from {a} to {b}": "группа {g} вернулась с {a} на {b}",
+  "group {g} moved from {a} to {b}: {e}": "группа {g} переехала с {a} на {b}: {e}",
+  "group {g} is back on {a}": "группа {g} снова на {a}",
+  "group {g}: the move to {a} failed: {e}": "группа {g}: не удалось переехать на {a}: {e}",
+  "the interface check: recovered after {n} failures over {d}": "проверка интерфейсов: снова работает (сбоев было: {n}, за {d})",
+  "interface {i}: recovered after {n} failures over {d}": "интерфейс {i}: снова работает (сбоев было: {n}, за {d})",
+  "(still failing, {n} times for {d})": "(всё ещё сбой: {n} раз за {d})",
+  "({n} more since the last)": "(ещё {n} с прошлого раза)",
+  "timeout": "таймаут",
+  "min": "мин"
 }

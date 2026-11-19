@@ -342,6 +342,24 @@ test.describe("Tunnel editor", () => {
     expect(daemon.probes[1]).toEqual({ id: "a", keys: ["0000000a:C"] });
   });
 
+  // Catches the node's check button moving sideways when a result appears beside it.
+  test("a node's check button stays put when its result appears", async ({ page }) => {
+    const { daemon, tunnels } = await saved(page);
+    daemon.probeAnswer = (_body, route) =>
+      route.fulfill({
+        json: {
+          nodes: [{ key: "0000000a:A", ok: true, handshakeMs: 1180, firstByteMs: 2430, why: "" }],
+        },
+      });
+    const row = tunnels.nodeRows("a").nth(0);
+    const button = row.getByRole("button", { name: "Check this node" });
+    const before = await button.boundingBox();
+    await button.click();
+    await expect(row.locator(".vals")).toHaveText(/^3610 ms/);
+    const after = await button.boundingBox();
+    expect(after?.x).toBe(before?.x);
+  });
+
   // Catches an edited card probed as the saved tunnel, so the edit goes unmeasured.
   test("Check nodes on an edited card sends the draft", async ({ page }) => {
     const { daemon, tunnels } = await saved(page);

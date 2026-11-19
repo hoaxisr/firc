@@ -633,3 +633,57 @@ describe("the search over the group resolver's lines", () => {
     assert.strictEqual(matchesQuery(e, "tunvless", new Map(), shown), false);
   });
 });
+
+describe("the interface check's lines", () => {
+  const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
+  const line = (message: string) => log({ level: "warn", message });
+  const unresolved = line(
+    "the interface check cannot run: the check's host api.browser.yandex.ru does not resolve through 127.0.0.1: timeout",
+  );
+  it("puts the unresolved host line in Russian with its host, upstream and reason", () => {
+    // catches: the line left in English, a placeholder left unfilled, or the reason not translated
+    assert.strictEqual(
+      describeLog(unresolved, tr),
+      "проверка интерфейсов не может выполниться: имя api.browser.yandex.ru из адреса проверки не резолвится через 127.0.0.1: таймаут",
+    );
+  });
+  it("keeps the daemon's English as it is", () => {
+    // catches: the English text reworded or a field lost on the way through the pattern
+    assert.strictEqual(describeLog(unresolved, id), unresolved.message);
+  });
+  it("translates a repeated line with its count and duration", () => {
+    // catches: a repeat suffix that hides the line from its pattern, or a duration unit left in English
+    assert.strictEqual(
+      describeLog(line(`${unresolved.message} (still failing, 4 times for 2 min)`), tr),
+      "проверка интерфейсов не может выполниться: имя api.browser.yandex.ru из адреса проверки не резолвится через 127.0.0.1: таймаут (всё ещё сбой: 4 раз за 2 мин)",
+    );
+  });
+  it("translates the interface and group lines", () => {
+    // catches: a twin line of the check left as the daemon wrote it, or its fields swapped
+    assert.strictEqual(
+      describeLog(line("interface Wireguard0 is dead: HTTP 503"), tr),
+      "интерфейс Wireguard0 не работает: HTTP 503",
+    );
+    assert.strictEqual(
+      describeLog(line("interface Wireguard0 is alive"), tr),
+      "интерфейс Wireguard0 снова работает",
+    );
+    assert.strictEqual(
+      describeLog(line("group Youtube moved from nwg0 to tunvless0: nwg0 is dead"), tr),
+      "группа Youtube переехала с nwg0 на tunvless0: nwg0 is dead",
+    );
+    assert.strictEqual(
+      describeLog(line("group Youtube moved back from tunvless0 to nwg0"), tr),
+      "группа Youtube вернулась с tunvless0 на nwg0",
+    );
+    assert.strictEqual(
+      describeLog(line("the interface check: recovered after 3 failures over 45 s"), tr),
+      "проверка интерфейсов: снова работает (сбоев было: 3, за 45 с)",
+    );
+  });
+  it("leaves a line it does not know alone", () => {
+    // catches: a pattern loose enough to rewrite another module's line
+    const other = line("list Ads: fetch failed: timeout");
+    assert.strictEqual(describeLog(other, tr), other.message);
+  });
+});

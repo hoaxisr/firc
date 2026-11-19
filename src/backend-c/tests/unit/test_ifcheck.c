@@ -399,6 +399,7 @@ typedef struct {
     _Atomic bool quit;
     _Atomic int queries;
     bool answer;
+    int skip;
     pthread_t thread;
 } stub_t;
 
@@ -414,7 +415,7 @@ static void *stub_run(void *ud) {
         socklen_t fl = sizeof(from);
         ssize_t n = recvfrom(s->fd, b, 512, 0, (struct sockaddr *)&from, &fl);
         if (n < 12) { continue; }
-        atomic_fetch_add(&s->queries, 1);
+        if (atomic_fetch_add(&s->queries, 1) < s->skip) { continue; }
         if (!s->answer || b[n - 4] != 0 || b[n - 3] != 1) { continue; }
         b[2] = 0x81;
         b[3] = 0x80;
@@ -426,11 +427,12 @@ static void *stub_run(void *ud) {
     return NULL;
 }
 
-static bool stub_start(stub_t *s, uint16_t port, bool answer) {
+static bool stub_start(stub_t *s, uint16_t port, bool answer, int skip) {
     memset(s, 0, sizeof(*s));
     atomic_init(&s->quit, false);
     atomic_init(&s->queries, 0);
     s->answer = answer;
+    s->skip = skip;
     s->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
@@ -444,9 +446,21 @@ static void stub_stop(stub_t *s) {
     close(s->fd);
 }
 
+/* catches: a single query whose loss fails the whole timeout instead of being asked again */
+TEST resolve_asks_again_while_the_upstream_stays_silent(void) {
+    stub_t s;
+    ASSERT(stub_start(&s, 15399, true, 2));
+    char a[64] = "";
+    ASSERT_EQ(FIRC_OK, firc_ifcheck_resolve("127.0.0.1", 15399, "http://check.test/204", 5, a, sizeof a, NULL));
+    ASSERT_STR_EQ("127.0.0.1", a);
+    ASSERT_EQ_FMT(3, atomic_load(&s.queries), "%d");
+    stub_stop(&s);
+    PASS();
+}
+
 TEST resolve_asks_the_upstream_for_an_a_record(void) {
     stub_t s;
-    ASSERT(stub_start(&s, 15399, true));
+    ASSERT(stub_start(&s, 15399, true, 0));
     char a[64] = "";
     ASSERT_EQ(FIRC_OK, firc_ifcheck_resolve("127.0.0.1", 15399, "http://check.test/204", 1, a, sizeof a, NULL));
     ASSERT_STR_EQ("127.0.0.1", a);
@@ -456,7 +470,7 @@ TEST resolve_asks_the_upstream_for_an_a_record(void) {
     stub_stop(&s);
 
     stub_t mute;
-    ASSERT(stub_start(&mute, 15399, false));
+    ASSERT(stub_start(&mute, 15399, false, 0));
     _Atomic bool flag;
     atomic_init(&flag, false);
     raiser_t r = {&flag, 300};
@@ -488,7 +502,7 @@ TEST a_round_resolves_each_host_once(void) {
     harness_t h;
     ASSERT(start(&h));
     stub_t dns;
-    ASSERT(stub_start(&dns, 15401, true));
+    ASSERT(stub_start(&dns, 15401, true, 0));
     ASSERT_EQ(2, queries_for(&dns, "http://a.test:18110/200", "http://b.test:18110/204"));
     ASSERT_EQ(1, queries_for(&dns, "http://a.test:18110/200", "http://a.test:18110/204"));
     ASSERT_EQ(1, queries_for(&dns, "http://a.test:18110/200", ""));
@@ -760,7 +774,7 @@ TEST an_empty_wan_url_changes_nothing(void) {
     harness_t h;
     ASSERT(start(&h));
     stub_t dns;
-    ASSERT(stub_start(&dns, 15401, true));
+    ASSERT(stub_start(&dns, 15401, true, 0));
     wan_script_t script = {.err = {FIRC_OK, FIRC_OK}, .wan = {true, true}};
     firc_ifcheck_set_wan_fn_for_test(scripted_wan, &script);
     static const char *const wan_urls[] = {"", "http://check.test:18110/200"};
@@ -978,6 +992,7 @@ int main(int argc, char **argv) {
     RUN_TEST(an_unresolvable_wan_host_guards_every_failure);
     RUN_TEST(an_unresolvable_check_host_guards_only_its_jobs);
     RUN_TEST(resolve_asks_the_upstream_for_an_a_record);
+    RUN_TEST(resolve_asks_again_while_the_upstream_stays_silent);
     RUN_TEST(a_round_resolves_each_host_once);
     RUN_TEST(the_settings_check_and_the_fetch_agree_on_every_url);
     RUN_TEST(the_thread_posts_a_round_to_the_loop);
