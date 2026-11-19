@@ -477,6 +477,15 @@ describe("the card's numbers", () => {
   });
 
   // Catches a down node's age in raw seconds or a negative age from a skewed clock.
+  // Catches By latency ranking by the reply alone, which puts a slow-to-connect node first.
+  it("ranks by connect plus reply", () => {
+    const probes = {
+      slow: { key: "slow", ok: true, why: "", handshakeMs: 300, firstByteMs: 50 },
+      fast: { key: "fast", ok: true, why: "", handshakeMs: 20, firstByteMs: 100 },
+    };
+    assert.deepStrictEqual(orderByLatency(["slow", "fast"], probes), ["fast", "slow"]);
+  });
+
   it("says how long ago in the largest whole unit", () => {
     assert.strictEqual(agoText(1000, 1000 - 42, t), "42 s");
     assert.strictEqual(agoText(1000, 1000 - 150, t), "2 min");
@@ -485,11 +494,11 @@ describe("the card's numbers", () => {
     assert.strictEqual(agoText(1000, 1100, t), "0 s");
   });
 
-  // Catches the latency column showing the handshake to the node instead of the whole path.
-  it("shows the first byte as the latency and nothing for a failed node", () => {
+  // Catches the latency column showing one part of the wait instead of connect plus reply.
+  it("shows connect plus reply as the latency and nothing for a failed node", () => {
     assert.strictEqual(
       latencyOf({ key: "a", ok: true, why: "", handshakeMs: 18, firstByteMs: 1400 }),
-      1400,
+      1418,
     );
     assert.strictEqual(latencyOf(probe("a", null)), null);
     assert.strictEqual(latencyOf(undefined), null);

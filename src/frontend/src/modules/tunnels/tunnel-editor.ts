@@ -49,7 +49,9 @@ export function keepHidden(newVisible: string[], order: string[]): string[] {
 }
 
 export function latencyOf(row: TunnelProbeRow | undefined): number | null {
-  return row && row.ok && row.firstByteMs !== null ? row.firstByteMs : null;
+  return row && row.ok && row.firstByteMs !== null
+    ? (row.handshakeMs ?? 0) + row.firstByteMs
+    : null;
 }
 
 export function orderByLatency(

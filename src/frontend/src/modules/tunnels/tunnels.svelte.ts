@@ -240,17 +240,45 @@ export class TunnelsStore {
     });
   }
 
-  async probe(tunnel: Tunnel): Promise<TunnelProbeRow[] | null> {
+  async probe(
+    tunnel: Tunnel,
+    {
+      keys,
+      onRows,
+      everyMs = 1000,
+    }: {
+      keys?: string[];
+      onRows?: (rows: TunnelProbeRow[], total: number) => void;
+      everyMs?: number;
+    } = {},
+  ): Promise<TunnelProbeRow[] | null> {
+    let running = true;
+    const poll = async () => {
+      while (running) {
+        await new Promise((r) => setTimeout(r, everyMs));
+        if (!running) break;
+        const got = await fetcher
+          .get<{ total?: number; nodes?: TunnelProbeRow[] }>("/tunnels/probe", { quiet: true })
+          .catch(() => null);
+        if (running && got?.total) onRows?.(got.nodes ?? [], got.total);
+      }
+    };
+    if (onRows) void poll();
     try {
       const answer = await fetcher.post<{ nodes?: TunnelProbeRow[] }>(
         "/tunnels/probe",
-        this.#asSaved(tunnel) ? { id: tunnel.id } : { tunnel: plain([tunnel])[0] },
+        {
+          ...(this.#asSaved(tunnel) ? { id: tunnel.id } : { tunnel: plain([tunnel])[0] }),
+          ...(keys ? { keys } : {}),
+        },
         { quiet: true },
       );
       return answer?.nodes ?? [];
     } catch (error) {
       toast.error(probeRefusal(error, t));
       return null;
+    } finally {
+      running = false;
     }
   }
 

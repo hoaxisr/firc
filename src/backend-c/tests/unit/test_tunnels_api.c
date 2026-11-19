@@ -163,11 +163,13 @@ static void bring_down(hx_t *h)
     firc_tunrun_free(h->run);
 }
 
+static const char *g_sub_body = SUB_BODY;
+
 static void h_sub(firc_http_req_t *req, firc_http_res_t *res, void *ud)
 {
     (void)req;
     (void)ud;
-    firc_http_res_write(res, 200, "text/plain", (const uint8_t *)SUB_BODY, strlen(SUB_BODY));
+    firc_http_res_write(res, 200, "text/plain", (const uint8_t *)g_sub_body, strlen(g_sub_body));
 }
 
 static void write_file(const char *path, const char *text)
@@ -330,6 +332,7 @@ static void teardown(void *ud)
     g_wan_name = NULL;
     unsetenv("FAKE_AFTER");
     unsetenv("FAKE_STDIN_DIR");
+    g_sub_body = SUB_BODY;
     if (g_wake_dir[0] != 0) {
         char cmd[128];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_wake_dir);
@@ -1168,7 +1171,7 @@ TEST probe_answers_per_node_key_without_links(void)
     cJSON_Delete(ans);
     char argv[256];
     slurp(g_hx->argv, argv, sizeof argv);
-    ASSERT_STR_EQ("--probe\n-t\n3\n-\n", argv);
+    ASSERT_STR_EQ("--probe\n-t\n3\n-j\n8\n-\n", argv);
     ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe",
                             "{\"tunnel\":{\"id\":\"new\",\"device\":\"tunvless5\",\"sources\":[{\"id\":\"0000000f\","
                             "\"kind\":\"link\",\"link\":\"" LINK_B "\"}]}}",
@@ -1177,6 +1180,89 @@ TEST probe_answers_per_node_key_without_links(void)
                           "\"why\":\"\"}]}"));
     cJSON_Delete(ans);
     ASSERT_EQ(404, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"zz\"}", NULL));
+    PASS();
+}
+
+/* catches: nodes past the 256-node cap left out of the probe */
+TEST a_probe_measures_nodes_past_the_node_cap(void)
+{
+    static char body[65536];
+    size_t len = 0;
+    for (int i = 0; i < 258; i++) {
+        len += (size_t)snprintf(body + len, sizeof body - len, "vless://" U "@n%d.example.invalid:443?security=none#N%d\n",
+                               i, i);
+    }
+    g_sub_body = body;
+    ASSERT(hx_start(SUB_TUN, 0) != NULL);
+    ASSERT(wait_for_cached(5000));
+    setenv("FAKE_MODE", "probe", 1);
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"s\"}", &ans));
+    const cJSON *nodes = at(ans, "nodes");
+    ASSERT_EQ(258, cJSON_GetArraySize(nodes));
+    ASSERT(same_json(cJSON_GetArrayItem(nodes, 257),
+                     "{\"key\":\"0000000b:N257\",\"ok\":true,\"handshakeMs\":267,\"firstByteMs\":277,\"why\":\"\"}"));
+    cJSON_Delete(ans);
+    PASS();
+}
+
+/* catches: rows already measured hidden until the whole probe ends, or rows of a finished probe still shown */
+TEST a_running_probe_shows_the_rows_it_has(void)
+{
+    ASSERT(hx_start("tunnels:\n  - id: a\n    device: tunvless0\n    sources:\n"
+                    "      - id: 0000000a\n        link: \"" LINK_A "\"\n"
+                    "      - id: 0000000d\n        link: \"" LINK_B "\"\n",
+                    0) != NULL);
+    ASSERT(wait_for_status("a", "up", 3000));
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/probe", NULL, &ans));
+    ASSERT(same_json(ans, "{\"total\":0,\"nodes\":[]}"));
+    cJSON_Delete(ans);
+    setenv("FAKE_MODE", "probeslow", 1);
+    int fd = send_request("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\"}", true);
+    ASSERT(fd >= 0);
+    bool seen = false;
+    for (int64_t end = now_ms() + 3000; !seen && now_ms() < end;) {
+        ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/probe", NULL, &ans));
+        seen = cJSON_GetArraySize(at(ans, "nodes")) > 0;
+        if (seen) {
+            ASSERT(same_json(ans, "{\"total\":2,\"nodes\":[{\"key\":\"0000000a:A\",\"ok\":true,"
+                                  "\"handshakeMs\":10,\"firstByteMs\":20,\"why\":\"\"}]}"));
+        }
+        cJSON_Delete(ans);
+        sleep_ms(20);
+    }
+    ASSERT(seen);
+    close(fd);
+    for (int64_t end = now_ms() + 3000; now_ms() < end;) {
+        ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels/probe", NULL, &ans));
+        seen = cJSON_GetArraySize(at(ans, "nodes")) > 0;
+        cJSON_Delete(ans);
+        if (!seen) {
+            break;
+        }
+        sleep_ms(20);
+    }
+    ASSERT(!seen);
+    PASS();
+}
+
+/* catches: a probe of chosen keys checking every node, the wrong node, or keys of the wrong type accepted */
+TEST a_probe_of_chosen_keys_checks_only_those(void)
+{
+    ASSERT(hx_start("tunnels:\n  - id: a\n    device: tunvless0\n    sources:\n"
+                    "      - id: 0000000a\n        link: \"" LINK_A "\"\n"
+                    "      - id: 0000000d\n        link: \"" LINK_B "\"\n",
+                    0) != NULL);
+    ASSERT(wait_for_status("a", "up", 3000));
+    setenv("FAKE_MODE", "probe", 1);
+    cJSON *ans = NULL;
+    ASSERT_EQ(200, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\",\"keys\":[\"0000000d:B\"]}", &ans));
+    ASSERT(same_json(ans, "{\"nodes\":[{\"key\":\"0000000d:B\",\"ok\":true,\"handshakeMs\":10,"
+                          "\"firstByteMs\":20,\"why\":\"\"}]}"));
+    cJSON_Delete(ans);
+    ASSERT_EQ(400, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\",\"keys\":\"0000000d:B\"}", NULL));
+    ASSERT_EQ(400, call_api("POST", "/api/v1/tunnels/probe", "{\"id\":\"a\",\"keys\":[1]}", NULL));
     PASS();
 }
 
@@ -1193,7 +1279,7 @@ TEST a_probe_carries_the_tunnels_fingerprint(void)
     cJSON_Delete(ans);
     char argv[256];
     slurp(g_hx->argv, argv, sizeof argv);
-    ASSERT_STR_EQ("--probe\n-t\n3\n--fp\nfirefox\n-\n", argv);
+    ASSERT_STR_EQ("--probe\n-t\n3\n-j\n8\n--fp\nfirefox\n-\n", argv);
     PASS();
 }
 
@@ -1272,7 +1358,7 @@ TEST the_routes_need_a_session(void)
         {"GET", "/api/v1/tunnels"},          {"PUT", "/api/v1/tunnels"},
         {"GET", "/api/v1/tunnels/state"},    {"GET", "/api/v1/tunnels/headers"},
         {"POST", "/api/v1/tunnels/preview"},
-        {"POST", "/api/v1/tunnels/probe"},   {"POST", "/api/v1/tunnels/a/refresh"},
+        {"POST", "/api/v1/tunnels/probe"},   {"GET", "/api/v1/tunnels/probe"},   {"POST", "/api/v1/tunnels/a/refresh"},
         {"POST", "/api/v1/tunnels/a/restart"},
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
@@ -2149,6 +2235,9 @@ SUITE(tunnels_api)
     RUN_TEST(refresh_and_restart_answer_202_or_404);
     RUN_TEST(probe_answers_per_node_key_without_links);
     RUN_TEST(a_probe_carries_the_tunnels_fingerprint);
+    RUN_TEST(a_probe_measures_nodes_past_the_node_cap);
+    RUN_TEST(a_running_probe_shows_the_rows_it_has);
+    RUN_TEST(a_probe_of_chosen_keys_checks_only_those);
     RUN_TEST(a_saved_probe_clears_down_only_for_the_nodes_that_answered);
     RUN_TEST(a_saved_probe_wakes_the_child_with_the_answered_links);
     RUN_TEST(a_second_probe_is_refused_while_one_runs);

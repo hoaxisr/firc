@@ -71,6 +71,7 @@ export type Daemon = {
   puts: Json[];
   previews: Json[];
   probes: Json[];
+  probeProgress: Json;
   polls: number;
   interfaceFetches: number;
   putAnswer: ((body: Json, route: Route) => Promise<void> | void) | null;
@@ -93,6 +94,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     puts: [],
     previews: [],
     probes: [],
+    probeProgress: { total: 0, nodes: [] },
     polls: 0,
     interfaceFetches: 0,
     putAnswer: null,
@@ -188,6 +190,7 @@ export async function stubDaemon(page: Page, init: Partial<Daemon> = {}): Promis
     });
   });
   await page.route("**/tunnels/probe", async (route) => {
+    if (route.request().method() === "GET") return route.fulfill({ json: daemon.probeProgress });
     const body = route.request().postDataJSON();
     daemon.probes.push(body);
     if (daemon.probeAnswer) return daemon.probeAnswer(body, route);

@@ -1210,18 +1210,29 @@ app.post(`${API_BASE}/tunnels/preview`, async (c) => {
   });
 });
 
+const probeRow = (row: any, k: number) =>
+  k % 3 === 2
+    ? { key: row.key, ok: false, why: "timeout", handshakeMs: null, firstByteMs: null }
+    : { key: row.key, ok: true, why: "", handshakeMs: 40 + k, firstByteMs: 60 + k };
+let probeRun: { rows: any[]; started: number } | null = null;
+const PROBE_STEP_MS = 400;
+
+app.get(`${API_BASE}/tunnels/probe`, (c) => {
+  if (!probeRun) return c.json({ total: 0, nodes: [] });
+  const done = Math.floor((Date.now() - probeRun.started) / PROBE_STEP_MS);
+  return c.json({ total: probeRun.rows.length, nodes: probeRun.rows.slice(0, done) });
+});
+
 app.post(`${API_BASE}/tunnels/probe`, async (c) => {
   const body = await c.req.json();
   const target = body?.id ? TUNNELS.find((tn: any) => tn.id === body.id) : body?.tunnel;
   if (!target) return c.json({ error: "no tunnel with this id" }, 404);
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  return c.json({
-    nodes: tunnelNodes(target).map((row: any, k: number) =>
-      k % 3 === 2
-        ? { key: row.key, ok: false, why: "timeout", handshakeMs: null, firstByteMs: null }
-        : { key: row.key, ok: true, why: "", handshakeMs: 40 + k, firstByteMs: 60 + k },
-    ),
-  });
+  if (probeRun) return c.json({ error: "a probe is already running" }, 409);
+  const rows = tunnelNodes(target).map(probeRow);
+  probeRun = { rows, started: Date.now() };
+  await new Promise((resolve) => setTimeout(resolve, Math.max(500, rows.length * PROBE_STEP_MS)));
+  probeRun = null;
+  return c.json({ nodes: rows });
 });
 
 app.post(`${API_BASE}/tunnels/:id/refresh`, (c) => {

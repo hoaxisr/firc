@@ -1,9 +1,10 @@
 <script lang="ts">
+  import Button from "../../../components/ui/Button.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { t } from "../../../data/locale.svelte";
 
-  import { Grip } from "../../../components/ui/icons";
+  import { Activity, Grip, LoaderCircle } from "../../../components/ui/icons";
   import { draggable, droppable } from "../../../lib/dnd";
   import type { TunnelNodeState, TunnelPreviewRow, TunnelProbeRow } from "../../../types";
   import { agoText, latencyOf, type NodeDnD } from "../tunnel-editor";
@@ -16,11 +17,27 @@
     probe: TunnelProbeRow | undefined;
     now: number;
     ports: number[];
+    checking: boolean;
+    canCheck: boolean;
+    onCheck: () => void;
     onToggle: () => void;
     onDrop: (source: NodeDnD, target: NodeDnD) => void;
   };
 
-  let { row, scope, excluded, live, probe, now, ports, onToggle, onDrop }: Props = $props();
+  let {
+    row,
+    scope,
+    excluded,
+    live,
+    probe,
+    now,
+    ports,
+    checking,
+    canCheck,
+    onCheck,
+    onToggle,
+    onDrop,
+  }: Props = $props();
 
   const latency = $derived(latencyOf(probe));
 
@@ -77,22 +94,37 @@
     {#if look.dot}<span class="dot {look.dot}"></span>{/if}{look.text}
   </div>
   <div class="lat">
-    {#if latency !== null}
-      <span class="fb">{latency} {t("ms")}</span>
-      {#if probe?.handshakeMs != null}
-        <Tooltip
-          value={t(
-            "The first number is the time to the first byte through the node: the whole path. “To the node” is DNS, TCP and the TLS/REALITY handshake to the node’s own address only; a much smaller number means that address is a nearby relay",
-          )}
-        >
-          <span class="hs">
-            {t("to the node {n} ms").replace("{n}", String(probe.handshakeMs))}
-          </span>
-        </Tooltip>
-      {/if}
-    {:else if probe}
-      <Tooltip value={probe.why || t("did not answer")}><span class="fail">—</span></Tooltip>
+    {#if !row.skipReason}
+      <Tooltip value={t("Check this node")}>
+        <Button small class="check" inactive={!canCheck} onclick={onCheck}>
+          {#if checking}
+            <span class="spin"><LoaderCircle size={14} /></span>
+          {:else}
+            <Activity size={14} />
+          {/if}
+        </Button>
+      </Tooltip>
     {/if}
+    <div class="vals">
+      {#if latency !== null}
+        <span class="fb">{latency} {t("ms")}</span>
+        {#if probe?.handshakeMs != null}
+          <Tooltip
+            value={t(
+              "The first number is how long a new connection waits for its first answer through the node: connect plus reply.\n“Connect” is DNS, TCP and the TLS/REALITY handshake to the node’s own address; “reply” is the request through the node until the first byte comes back",
+            )}
+          >
+            <span class="hs">
+              {t("connect {c} · reply {r} ms")
+                .replace("{c}", String(probe.handshakeMs))
+                .replace("{r}", String(probe.firstByteMs))}
+            </span>
+          </Tooltip>
+        {/if}
+      {:else if probe}
+        <Tooltip value={probe.why || t("did not answer")}><span class="fail">—</span></Tooltip>
+      {/if}
+    </div>
   </div>
   <div class="on">
     <Tooltip value={t(excluded ? "Include the node" : "Exclude the node")}>
@@ -108,7 +140,7 @@
 <style>
   .node {
     display: grid;
-    grid-template-columns: 1.5rem minmax(0, 3fr) minmax(0, 1.4fr) minmax(0, 2fr) 7.5rem 4rem;
+    grid-template-columns: 1.5rem minmax(0, 3fr) minmax(0, 1.4fr) minmax(0, 2fr) 13rem 4rem;
     align-items: center;
     gap: 0.5rem;
     padding: 0.35rem 0.6rem;
@@ -187,8 +219,26 @@
     text-align: right;
     white-space: nowrap;
     display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
+  .vals {
+    display: flex;
     flex-direction: column;
     align-items: flex-end;
+  }
+  .lat :global(.check) {
+    padding: 0.2rem;
+  }
+  .spin {
+    display: inline-flex;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .fb {
     color: var(--text);
@@ -245,6 +295,10 @@
     }
     .lat {
       grid-area: lat;
+    }
+    .hs {
+      white-space: normal;
+      max-width: 6.5rem;
     }
     .on {
       grid-area: on;

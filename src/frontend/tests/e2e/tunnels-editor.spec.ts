@@ -272,10 +272,8 @@ test.describe("Tunnel editor", () => {
     expect(daemon.puts[0].tunnels[0].order).toEqual(["0000000a:B", "0000000a:A", "0000000a:C"]);
   });
 
-  // Catches the column or "By latency" reading the handshake, which ranks a near relay first.
-  test("checking nodes shows first byte and to the node, and By latency sorts by first byte", async ({
-    page,
-  }) => {
+  // Catches the column or "By latency" reading one part of the wait instead of connect plus reply.
+  test("checking nodes shows connect plus reply, and By latency sorts by it", async ({ page }) => {
     const { daemon, tunnels } = await saved(page);
     daemon.probeAnswer = (_body, route) =>
       route.fulfill({
@@ -289,11 +287,11 @@ test.describe("Tunnel editor", () => {
       });
     const card = tunnels.card("a");
     await card.locator("button", { hasText: "Check nodes" }).click();
-    await expect(tunnels.nodeRows("a").nth(0).locator(".lat")).toHaveText(
-      /^1400 ms\s*to the node 18 ms$/,
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText(
+      /^1418 ms\s*connect 18 · reply 1400 ms$/,
     );
-    await expect(tunnels.nodeRows("a").nth(2).locator(".lat")).toHaveText(
-      /^300 ms\s*to the node 113 ms$/,
+    await expect(tunnels.nodeRows("a").nth(2).locator(".vals")).toHaveText(
+      /^413 ms\s*connect 113 · reply 300 ms$/,
     );
     expect(daemon.probes[0]).toEqual({ id: "a" });
 
@@ -302,6 +300,46 @@ test.describe("Tunnel editor", () => {
     await tunnels.save.click();
     await expect(page.getByText("Saved")).toBeVisible();
     expect(daemon.puts[0].tunnels[0].order).toEqual(["0000000a:C", "0000000a:A", "0000000a:B"]);
+  });
+
+  // Catches a running check with no count on its button or no latency until it ends.
+  test("a running check counts on its button and fills the column as it goes", async ({ page }) => {
+    const { daemon, tunnels } = await saved(page);
+    daemon.probeProgress = {
+      total: 3,
+      nodes: [{ key: "0000000a:A", ok: true, handshakeMs: 18, firstByteMs: 40, why: "" }],
+    };
+    let release = () => {};
+    daemon.probeAnswer = (_body, route) =>
+      new Promise<void>((done) => {
+        release = () => void route.fulfill({ json: { nodes: [] } }).then(done);
+      });
+    const button = tunnels.card("a").locator("button", { hasText: "Check nodes" });
+    await button.click();
+    await expect(button).toHaveText(/1\/3/);
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText(/^58 ms/);
+    release();
+    await expect(button).not.toHaveText(/\//);
+  });
+
+  // Catches a node's own check probing every node, or wiping the latencies already shown.
+  test("a node's own check sends its key and keeps the other rows", async ({ page }) => {
+    const { daemon, tunnels } = await saved(page);
+    daemon.probeAnswer = (body, route) =>
+      route.fulfill({
+        json: {
+          nodes: body.keys
+            ? [{ key: "0000000a:C", ok: true, handshakeMs: 10, firstByteMs: 20, why: "" }]
+            : [{ key: "0000000a:A", ok: true, handshakeMs: 18, firstByteMs: 40, why: "" }],
+        },
+      });
+    const card = tunnels.card("a");
+    await card.locator("button", { hasText: "Check nodes" }).click();
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText(/^58 ms/);
+    await tunnels.nodeRows("a").nth(2).getByRole("button", { name: "Check this node" }).click();
+    await expect(tunnels.nodeRows("a").nth(2).locator(".vals")).toHaveText(/^30 ms/);
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText(/^58 ms/);
+    expect(daemon.probes[1]).toEqual({ id: "a", keys: ["0000000a:C"] });
   });
 
   // Catches an edited card probed as the saved tunnel, so the edit goes unmeasured.
@@ -314,8 +352,8 @@ test.describe("Tunnel editor", () => {
     expect(daemon.probes[0].tunnel.filter).toBe("B");
   });
 
-  // Catches the second number shown without the words that tell it from the first, at any width.
-  test("the to-the-node number explains both numbers on a phone too", async ({ page }) => {
+  // Catches the second line shown without the words that tell it from the first, at any width.
+  test("the connect and reply line explains both numbers on a phone too", async ({ page }) => {
     const { daemon, tunnels } = await saved(page);
     await page.setViewportSize({ width: 390, height: 844 });
     daemon.probeAnswer = (_body, route) =>
@@ -325,13 +363,13 @@ test.describe("Tunnel editor", () => {
         },
       });
     await tunnels.card("a").locator("button", { hasText: "Check nodes" }).click();
-    const number = tunnels.nodeRows("a").nth(0).getByText("to the node 18 ms");
+    const number = tunnels.nodeRows("a").nth(0).getByText("connect 18 · reply 1400 ms");
     await number.scrollIntoViewIfNeeded();
     await number.hover();
     const bubble = page.locator("#global-tooltip");
     await expect(bubble).toBeVisible();
-    await expect(bubble).toContainText("first byte through the node");
-    await expect(bubble).toContainText("nearby relay");
+    await expect(bubble).toContainText("first answer through the node");
+    await expect(bubble).toContainText("connect plus reply");
   });
 
   // Catches the reset leaving the saved order in the save, or the rows in the sorted order.
@@ -390,7 +428,7 @@ test.describe("Tunnel editor", () => {
       });
     const card = tunnels.card("a");
     await card.locator("button", { hasText: "Check nodes" }).click();
-    await expect(tunnels.nodeRows("a").nth(2).locator(".lat")).toContainText("100 ms");
+    await expect(tunnels.nodeRows("a").nth(2).locator(".vals")).toHaveText(/^120 ms/);
     await card.locator("button", { hasText: "By latency" }).click();
     await expect(tunnels.nodeNames("a")).toHaveText(["B", "A", "C"]);
   });
@@ -488,7 +526,7 @@ test.describe("Tunnel editor", () => {
       });
     const card = tunnels.card("a");
     await card.locator("button", { hasText: "Check nodes" }).click();
-    await expect(tunnels.nodeRows("a").nth(2).locator(".lat")).not.toHaveText("");
+    await expect(tunnels.nodeRows("a").nth(2).locator(".vals")).toHaveText(/^110 ms/);
     await card.locator("button", { hasText: "By latency" }).click();
     await tunnels.save.click();
     await expect(page.getByText("Saved")).toBeVisible();
@@ -511,8 +549,8 @@ test.describe("Tunnel editor", () => {
       });
     const card = tunnels.card("a");
     await card.locator("button", { hasText: "Check nodes" }).click();
-    await expect(tunnels.nodeRows("a").nth(0).locator(".lat")).toHaveText(
-      /^120 ms\s*to the node 90 ms$/,
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText(
+      /^210 ms\s*connect 90 · reply 120 ms$/,
     );
 
     await card
@@ -522,7 +560,7 @@ test.describe("Tunnel editor", () => {
       .click();
     await answerConfirm(page, true);
     await expect(card.getByText("Solo")).toHaveCount(0);
-    await expect(tunnels.nodeRows("a").nth(0).locator(".lat")).toHaveText("");
+    await expect(tunnels.nodeRows("a").nth(0).locator(".vals")).toHaveText("");
     await expect(card.locator("button", { hasText: "By latency" })).toHaveClass(/inactive/);
   });
 
@@ -814,7 +852,7 @@ test.describe("Tunnel editor", () => {
       });
     await tunnels.card("a").locator("button", { hasText: "Check nodes" }).click();
     const row = tunnels.nodeRows("a").nth(0);
-    await expect(row.locator(".lat")).toContainText("60 ms");
+    await expect(row.locator(".vals")).toHaveText(/^100 ms/);
     const name = row.locator(".name");
     const width = await name.evaluate((el) => ({ client: el.clientWidth, scroll: el.scrollWidth }));
     expect(width.client).toBeGreaterThan(0);

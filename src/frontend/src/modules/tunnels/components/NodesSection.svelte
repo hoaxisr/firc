@@ -40,6 +40,8 @@
   let previewError = $state("");
   let filterRefused = $state(false);
   let probes = $state<Record<string, TunnelProbeRow>>({});
+  let progress = $state<{ done: number; total: number } | null>(null);
+  let probingKey = $state<string | null>(null);
   let probing = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
 
@@ -135,13 +137,41 @@
     probing = true;
     try {
       const shape = sourcesShape;
-      const answer = await store.probe(JSON.parse(draft) as Tunnel);
+      const answer = await store.probe(JSON.parse(draft) as Tunnel, {
+        onRows: (rows, total) => {
+          if (shape !== sourcesShape) return;
+          probedSources = shape;
+          probes = Object.fromEntries(rows.map((row) => [row.key, row]));
+          progress = { done: rows.length, total };
+        },
+      });
       if (answer && shape === sourcesShape) {
         probedSources = shape;
         probes = Object.fromEntries(answer.map((row) => [row.key, row]));
       }
     } finally {
       probing = false;
+      progress = null;
+    }
+  }
+
+  async function probeOne(key: string) {
+    if (probing || !saved) return;
+    probing = true;
+    probingKey = key;
+    try {
+      const shape = sourcesShape;
+      const answer = await store.probe(JSON.parse(draft) as Tunnel, { keys: [key] });
+      if (answer && shape === sourcesShape) {
+        probes = {
+          ...(probedSources === shape ? probes : {}),
+          ...Object.fromEntries(answer.map((row) => [row.key, row])),
+        };
+        probedSources = shape;
+      }
+    } finally {
+      probing = false;
+      probingKey = null;
     }
   }
 </script>
@@ -172,6 +202,7 @@
               <Activity size={15} />
             {/if}
             {t("Check nodes")}
+            {#if progress}<span class="count">{progress.done}/{progress.total}</span>{/if}
           </Button>
         </Tooltip>
         <Tooltip value={t(measured ? "Sort by the measured latency" : "Check the nodes first")}>
@@ -286,6 +317,9 @@
             excluded={tunnel.exclude.includes(row.key)}
             live={live?.nodes.find((n) => n.key === row.key)}
             probe={probes[row.key]}
+            checking={probingKey === row.key}
+            canCheck={saved && !probing}
+            onCheck={() => void probeOne(row.key)}
             {now}
             ports={ports.get(row.key) ?? []}
             onToggle={() => (tunnel.exclude = toggleExclude(tunnel.exclude, row.key))}
@@ -306,6 +340,10 @@
 </section>
 
 <style>
+  .count {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.75;
+  }
   .sec-h {
     display: flex;
     flex-wrap: wrap;
@@ -396,7 +434,7 @@
   }
   .head {
     display: grid;
-    grid-template-columns: 1.5rem minmax(0, 3fr) minmax(0, 1.4fr) minmax(0, 2fr) 7.5rem 4rem;
+    grid-template-columns: 1.5rem minmax(0, 3fr) minmax(0, 1.4fr) minmax(0, 2fr) 13rem 4rem;
     gap: 0.5rem;
     padding: 0.35rem 0.6rem;
     color: var(--text-2);

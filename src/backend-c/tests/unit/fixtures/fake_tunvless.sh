@@ -8,7 +8,7 @@ noread) exec sleep 3600 ;;
 closein) exec sleep 3600 <&- ;;
 stubborn) trap '' TERM; exec sleep 3600 ;;
 fds) ls -l /proc/self/fd > "${FAKE_FDS_OUT:-/dev/null}"; exec sleep 3600 ;;
-probe)
+probe | probeslow)
     i=0
     while IFS= read -r l; do
         [ -z "$l" ] && break
@@ -18,6 +18,7 @@ probe)
         *fail*) printf '%d\t%s\tfailed\tconnection refused\n' "$i" "$n" ;;
         *) printf '%d\t%s\tok\thandshake %d ms, first byte %d ms\n' "$i" "$n" $((10 + i)) $((20 + i)) ;;
         esac
+        [ "$FAKE_MODE" = probeslow ] && [ "$i" = 0 ] && exec sleep 3600
         i=$((i + 1))
     done
     exit 0 ;;

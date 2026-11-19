@@ -40,7 +40,7 @@ def keys_in(text: str):
                 lit = STRING.match(text, i)
                 if lit is None:
                     break
-                yield lit.group(1)
+                yield json.loads(f'"{lit.group(1)}"')
                 i = lit.end()
                 continue
             i += 1

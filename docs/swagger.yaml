@@ -2281,6 +2281,11 @@ definitions:
         type: string
       tunnel:
         $ref: '#/definitions/types.Tunnel'
+      keys:
+        description: 'Probe only the nodes with these keys; every node when absent'
+        items:
+          type: string
+        type: array
     type: object
   types.TunnelProbeRow:
     properties:
@@ -2304,6 +2309,17 @@ definitions:
     type: object
   types.TunnelProbeRes:
     properties:
+      nodes:
+        items:
+          $ref: '#/definitions/types.TunnelProbeRow'
+        type: array
+    type: object
+  types.TunnelProbeProgressRes:
+    properties:
+      total:
+        description: 'Nodes the running probe checks; 0 when none runs'
+        example: 565
+        type: integer
       nodes:
         items:
           $ref: '#/definitions/types.TunnelProbeRow'
@@ -3982,7 +3998,8 @@ paths:
       - application/json
       description: >-
         Checks every node a saved tunnel ({"id"}) or a draft ({"tunnel"})
-        would use, excluded nodes included, one tunvless --probe at a time,
+        would use, excluded nodes and nodes past the 256-node cap included,
+        one tunvless --probe at a time checking 8 nodes at once,
         3 s per node; answers once
         it is done. A tunnel that leaves by an interface or another tunnel is
         probed only through the uplink of the saved tunnel with that id while
@@ -4003,7 +4020,7 @@ paths:
           schema:
             $ref: '#/definitions/types.TunnelProbeRes'
         "400":
-          description: Bad Request
+          description: 'Bad Request -- a bad draft, or keys not an array of strings'
           schema:
             $ref: '#/definitions/types.TunnelErrorRes'
         "404":
@@ -4019,6 +4036,18 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Probe a tunnel''s nodes'
+      tags:
+      - tunnels
+    get:
+      description: 'The rows the running probe has so far, in its order; total 0 and no rows when none runs'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.TunnelProbeProgressRes'
+      summary: 'Progress of the running probe'
       tags:
       - tunnels
   /api/v1/tunnels/{id}/refresh:

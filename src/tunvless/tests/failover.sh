@@ -201,6 +201,17 @@ node_up A 1
 sleep 1
 check "--probe -n 1,0 checks in the given order" "1 nodeB ok
 0 nodeA ok" "$(HX "$BIN" --probe -n 1,0 -t 3 "$W/sub.txt" 2>/dev/null | cut -f1-3 | tr '\t' ' ')"
+{ echo "$LINK_A"; for d in 9 10 11 12; do echo "vless://$UUID@10.73.0.$d:$PORT?security=none&type=tcp#deaf$d"; done
+  echo "$LINK_B"; } > "$W/deaf.txt"
+t0=$(date +%s)
+check "--probe -j 8 reports every node" "0 ok
+1 failed
+2 failed
+3 failed
+4 failed
+5 ok" "$(HX "$BIN" --probe -j 8 -t 3 "$W/deaf.txt" 2>/dev/null | cut -f1,3 | sort -n | tr '\t' ' ')"
+check "  with the silent ones checked at once, not one after another" "yes" \
+    "$([ $(($(date +%s) - t0)) -lt 9 ] && echo yes || echo no)"
 up "$W/sub.txt" -d vl -r default -n 1,0 -t 3
 check "--node 1,0: B is preferred" "1" "$(grep -c 'chose nodeB' "$W/tun.log")"
 check "  and carries the downloads" "$MB2" "$(fetch p)"

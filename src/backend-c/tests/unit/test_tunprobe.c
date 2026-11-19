@@ -175,17 +175,18 @@ TEST each_link_gets_the_row_the_child_printed_for_its_index(void)
     PASS();
 }
 
-/* catches: a mark, --insecure or --ca missing from the probe, or given when not asked for */
+/* catches: a mark, --insecure, --ca or -j missing from the probe, or given when not asked for */
 TEST the_command_line_carries_mark_insecure_and_ca_only_when_set(void)
 {
     char *links[] = {"vless://" U "@a.example.invalid:443?security=none#A"};
     firc_tunprobe_opts_t o = opts(0x2a0000, true, "/etc/ca.pem", 5000);
+    o.jobs = 8;
     firc_tunprobe_t *p = NULL;
     ASSERT_EQ(FIRC_OK, firc_tunprobe_start(g_fx.loop, &o, links, 1, on_done, NULL, &p));
     run_until(5000, answered);
     char buf[512];
     slurp(g_fx.argv, buf, sizeof buf);
-    ASSERT_STR_EQ("--probe\n-t\n3\n-m\n0x2a0000\n--insecure\n--ca\n/etc/ca.pem\n-\n", buf);
+    ASSERT_STR_EQ("--probe\n-t\n3\n-j\n8\n-m\n0x2a0000\n--insecure\n--ca\n/etc/ca.pem\n-\n", buf);
     g_fx.calls = 0;
     o = opts(0, false, "", 5000);
     ASSERT_EQ(FIRC_OK, firc_tunprobe_start(g_fx.loop, &o, links, 1, on_done, NULL, &p));
@@ -343,11 +344,16 @@ TEST the_child_gets_only_fds_0_to_2(void)
     PASS();
 }
 
-TEST the_deadline_is_six_seconds_a_link_plus_five(void)
+/* catches: a deadline counted per link when links run in parallel waves, or a partial wave left out */
+TEST the_deadline_is_six_seconds_a_wave_plus_five(void)
 {
-    ASSERT_EQ(11000, firc_tunprobe_deadline_ms(1));
-    ASSERT_EQ(29000, firc_tunprobe_deadline_ms(4));
-    ASSERT_EQ(1541000, firc_tunprobe_deadline_ms(256));
+    ASSERT_EQ(11000, firc_tunprobe_deadline_ms(1, 1));
+    ASSERT_EQ(29000, firc_tunprobe_deadline_ms(4, 1));
+    ASSERT_EQ(1541000, firc_tunprobe_deadline_ms(256, 1));
+    ASSERT_EQ(11000, firc_tunprobe_deadline_ms(1, 8));
+    ASSERT_EQ(197000, firc_tunprobe_deadline_ms(256, 8));
+    ASSERT_EQ(203000, firc_tunprobe_deadline_ms(257, 8));
+    ASSERT_EQ(29000, firc_tunprobe_deadline_ms(4, 0));
     PASS();
 }
 
@@ -355,7 +361,7 @@ TEST nodes_answering_only_on_the_short_hello_retry_finish_before_the_deadline(vo
 {
     for (size_t n = 1; n <= 256; n++) {
         int64_t both_tries = (int64_t)n * 2 * 3000;
-        ASSERT(firc_tunprobe_deadline_ms(n) > both_tries);
+        ASSERT(firc_tunprobe_deadline_ms(n, 1) > both_tries);
     }
     PASS();
 }
@@ -371,7 +377,7 @@ SUITE(tunprobe)
     RUN_TEST(a_hung_child_is_killed_at_the_deadline);
     RUN_TEST(a_cancel_kills_the_child_and_never_answers);
     RUN_TEST(the_child_gets_only_fds_0_to_2);
-    RUN_TEST(the_deadline_is_six_seconds_a_link_plus_five);
+    RUN_TEST(the_deadline_is_six_seconds_a_wave_plus_five);
     RUN_TEST(nodes_answering_only_on_the_short_hello_retry_finish_before_the_deadline);
 }
 

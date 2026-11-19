@@ -700,6 +700,37 @@ describe("TunnelsStore editor actions", () => {
     assert.strictEqual(events.at(-1)?.detail.content, "A check is already running");
   });
 
+  // Catches rows hidden until the whole check ends, polling left running after it, or chosen keys not sent.
+  it("hands over the rows of a running probe and stops asking when it ends", async () => {
+    const row = { key: "s:A", ok: true, why: "", handshakeMs: 10, firstByteMs: 20 };
+    let release: (v: unknown) => void = () => {};
+    const s = stub({
+      "/tunnels": { tunnels: [tunnel("a")] },
+      "/tunnels/probe": (body: unknown) =>
+        body === undefined ? { total: 2, nodes: [row] } : new Promise((r) => (release = r)),
+    });
+    const store = new TunnelsStore();
+    await store.load();
+    const seen: { rows: unknown[]; total: number }[] = [];
+    const done = store.probe(store.data[0], {
+      keys: ["s:A"],
+      onRows: (rows, total) => seen.push({ rows, total }),
+      everyMs: 5,
+    });
+    while (seen.length === 0) await new Promise((r) => setTimeout(r, 5));
+    assert.deepStrictEqual(seen[0], { rows: [row], total: 2 });
+    release({ nodes: [row, { ...row, key: "s:B" }] });
+    assert.strictEqual((await done)?.length, 2);
+    assert.deepStrictEqual(s.requests.find((r) => r.path === "/tunnels/probe" && r.body)?.body, {
+      id: "a",
+      keys: ["s:A"],
+    });
+    const asked = () => s.requests.filter((r) => r.path === "/tunnels/probe" && !r.body).length;
+    const after = asked();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(asked(), after);
+  });
+
   // Catches "save first" read as a busy probe, telling the user to wait for something that never ends.
   it("tells a save-first refusal from a busy probe", () => {
     const t = (key: string) => key;
