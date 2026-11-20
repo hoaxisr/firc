@@ -1519,6 +1519,68 @@ static firc_dns_msg_t *plain_answer(const char *const *labels, size_t n, uint8_t
 }
 
 static const char *const k_ntc[] = {"ntc", "example", "com"};
+
+static const char *const k_shop[] = {"shop", "example", "com"};
+
+static void set_rdata(firc_dns_rr_t *rr, const uint8_t *b, uint16_t len) {
+    free(rr->rdata);
+    rr->rdata = malloc(len);
+    memcpy(rr->rdata, b, len);
+    rr->rdata_len = len;
+}
+
+/* Catches: an owned name a blocker answered 0.0.0.0 still handed a fake address. */
+TEST an_owned_name_answered_0_0_0_0_passes_without_a_fake(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = plain_answer(k_shop, 3, 0);
+    static const uint8_t zero4[4] = {0};
+    set_rdata(&msg->answers[0], zero4, 4);
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_MEM_EQ(zero4, msg->answers[0].rdata, 4);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: the sink test applied to A answers only. */
+TEST an_owned_name_answered_unspecified_v6_passes_without_a_fake(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = aaaa_answer("example");
+    static const uint8_t zero6[16] = {0};
+    set_rdata(&msg->answers[0], zero6, 16);
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_MEM_EQ(zero6, msg->answers[0].rdata, 16);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: one sink among real addresses taking the whole answer out of routing. */
+TEST an_answer_with_a_real_address_beside_0_0_0_0_still_gets_a_fake(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = plain_answer(k_shop, 3, 0);
+    msg->answers = realloc(msg->answers, 2 * sizeof(msg->answers[0]));
+    msg->answers[1] = msg->answers[0];
+    msg->answers[1].rdata = NULL;
+    static const uint8_t zero4[4] = {0};
+    set_rdata(&msg->answers[1], zero4, 4);
+    msg->n_answers = 2;
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    static const uint8_t first_issued[4] = {198, 18, 0, 1};
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_MEM_EQ(first_issued, msg->answers[0].rdata, 4);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
 static const uint8_t k_ntc_v6[16] = {0x2a, 0x02, 0x0e, 0x00, 0xff, 0xec, 0x04, 0xb8, 0, 0, 0, 0, 0, 0, 0, 1};
 
 static firc_dns_msg_t *empty_a(void) {
@@ -2694,6 +2756,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_rule_on_the_chains_target_does_not_capture_the_query);
     RUN_TEST(a_matched_name_gets_an_address_of_its_own_and_waits_for_its_rule);
     RUN_TEST(a_repeat_answer_for_a_committed_pair_is_not_held);
+    RUN_TEST(an_owned_name_answered_0_0_0_0_passes_without_a_fake);
+    RUN_TEST(an_owned_name_answered_unspecified_v6_passes_without_a_fake);
+    RUN_TEST(an_answer_with_a_real_address_beside_0_0_0_0_still_gets_a_fake);
     RUN_TEST(an_unmatched_name_passes_untouched);
     RUN_TEST(an_unmatched_answer_is_told_with_its_chain_s_address);
     RUN_TEST(an_unmatched_answer_is_clamped_to_unmatched_ttl);
