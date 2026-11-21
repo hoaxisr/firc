@@ -145,6 +145,7 @@ export const GroupSchema = object({
   list: optional(nullable(GroupListSchema)),
   resolve: fallback(GroupResolveSchema, DEFAULT_RESOLVE),
   resolver: optional(GroupResolverSchema),
+  cloudflare: fallback(boolean(), false),
   block: optional(fallback(picklist(BLOCK_ANSWERS), "null")),
 });
 export type Group = InferOutput<typeof GroupSchema>;

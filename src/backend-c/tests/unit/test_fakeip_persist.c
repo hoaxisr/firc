@@ -1377,6 +1377,128 @@ TEST a_restored_pool_names_the_same_addresses(void) {
     PASS();
 }
 
+typedef struct {
+    firc_ip_t fake[8];
+    unsigned kind[8];
+    size_t n;
+} kinds_t;
+
+static void kinds_record(void *ud, const char *group_id, unsigned family, const firc_ip_t *fake,
+                         const firc_ip_t *real, unsigned kind) {
+    (void)group_id;
+    (void)family;
+    (void)real;
+    kinds_t *k = ud;
+    if (k->n == 8) { return; }
+    k->fake[k->n] = *fake;
+    k->kind[k->n] = kind;
+    k->n++;
+}
+
+static int kind_at(const kinds_t *k, const firc_ip_t *fake) {
+    for (size_t i = 0; i < k->n; i++) {
+        if (same_ip(&k->fake[i], fake)) { return (int)k->kind[i]; }
+    }
+    return -1;
+}
+
+TEST a_cf_mapping_survives_a_restart_as_cf(void) {
+    firc_fakeip_t *f = fresh(64);
+    firc_ip_t c4, c6, p4, p6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "c.example.com", "g1", 1000, FIRC_FAKEIP_KIND_CF, &c4, &c6));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "p.example.com", "g1", 1000, &p4, &p6));
+    const firc_ip_t real4 = {{104, 16, 1, 1}, 4};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "c.example.com", "g1", &real4, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "p.example.com", "g1", &real4, 1));
+
+    size_t restored = 0;
+    firc_err_t err = FIRC_ERR_IO;
+    firc_fakeip_t *g = reloaded(f, 2000, &restored, &err);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)2, restored, "%zu");
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(g);
+    kinds_t k = {{{{0}, 0}}, {0}, 0};
+    firc_fakeip_snapshot_walk_kind(s, kinds_record, &k);
+    firc_fakeip_snapshot_free(s);
+    ASSERT_EQ_FMT((size_t)4, k.n, "%zu");
+    ASSERT_EQ(1, kind_at(&k, &c4));
+    ASSERT_EQ(1, kind_at(&k, &c6));
+    ASSERT_EQ(0, kind_at(&k, &p4));
+    ASSERT_EQ(0, kind_at(&k, &p6));
+
+    firc_ip_t x4, x6, q4, q6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(g, "x.example.com", "g1", 2001, FIRC_FAKEIP_KIND_CF, &x4, &x6));
+    ASSERTm("the next cf name lands in the restored cf chunk", x4.b[2] == 0 && x4.b[3] == 2);
+    ASSERT(x6.b[7] == 0 && x6.b[15] == 2);
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(g, "q.example.com", "g1", 2001, &q4, &q6));
+    ASSERTm("exact: the plain chunk goes on at its mark", q4.b[2] == 1 && q4.b[3] == 2);
+    firc_fakeip_free(f);
+    firc_fakeip_free(g);
+    PASS();
+}
+
+TEST a_base_claimed_as_cf_and_as_plain_is_refused(void) {
+    size_t restored = 0;
+    firc_fakeip_t *g = loaded_from_text(
+        "cfchunk g1 v4 198.18.0.0\n"
+        "cfchunk g1 v6 fd37:9a00::\n"
+        "map b.example.com g2 198.18.0.2 - fd37:9a00:0:1::2 - 5\n"
+        "map p.example.com g1 198.18.1.1 - fd37:9a00:0:2::1 - 5\n"
+        "clean 1\nend\n", 64, &restored);
+    ASSERT_EQ_FMT((size_t)1, restored, "%zu");
+    firc_ip_t q4;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(g, "q.example.com", "g1", 2001, &q4, NULL));
+    ASSERTm("not exact: the plain chunk is abandoned", q4.b[2] != 1);
+    const firc_ip_t b4 = {{198, 18, 0, 2}, 4};
+    ASSERT_EQ(NULL, firc_fakeip_name_of(g, &b4));
+    for (int i = 0; i < 5; i++) {
+        firc_ip_t n4;
+        char name[32];
+        snprintf(name, sizeof(name), "n%d.example.com", i);
+        ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(g, name, "g1", 2001, FIRC_FAKEIP_KIND_CF, &n4, NULL));
+        ASSERTm("not exact: the refused line's address is not issued", n4.b[2] != 0);
+    }
+    firc_fakeip_free(g);
+    PASS();
+}
+
+TEST a_cf_chunk_is_abandoned_after_a_crash(void) {
+    firc_fakeip_t *f = fresh(64);
+    firc_ip_t c4, c6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "c.example.com", "g1", 1000, FIRC_FAKEIP_KIND_CF, &c4, &c6));
+    size_t restored = 0;
+    firc_err_t err = FIRC_ERR_IO;
+    firc_fakeip_t *g = reloaded_as(f, false, 2000, &restored, &err);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT_EQ_FMT((size_t)1, restored, "%zu");
+    firc_ip_t x4, x6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(g, "x.example.com", "g1", 2001, FIRC_FAKEIP_KIND_CF, &x4, &x6));
+    ASSERTm("v4: past the cf chunk the crash may have handed out", x4.b[2] != 0);
+    ASSERTm("v6: the cf mark jumps past the unsaved", x6.b[7] == 0 && x6.b[11] == 1 && x6.b[15] == 2);
+    firc_fakeip_free(f);
+    firc_fakeip_free(g);
+    PASS();
+}
+
+TEST the_cf_mark_names_the_current_cf_chunk_whatever_its_index(void) {
+    size_t restored = 0;
+    firc_fakeip_t *g = loaded_from_text(
+        "cfchunk g1 v4 198.18.0.0\n"
+        "cfchunk g1 v6 fd37:9a00::\n"
+        "cfchunk g1 v6 fd37:9a00:0:1::\n"
+        "map a.example.com g1 198.18.0.3 - fd37:9a00::3 - 5\n"
+        "map b.example.com g1 198.18.0.5 - fd37:9a00:0:1::5 - 5\n"
+        "cfmark g1 v4 198.18.0.0 6\n"
+        "cfmark g1 v6 fd37:9a00:: 10\n"
+        "clean 1\nend\n", 64, &restored);
+    ASSERT_EQ_FMT((size_t)2, restored, "%zu");
+    firc_ip_t n4, n6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(g, "n.example.com", "g1", 2001, FIRC_FAKEIP_KIND_CF, &n4, &n6));
+    ASSERTm("v6 goes on at the mark, not after the highest mapping", n6.b[7] == 0 && n6.b[15] == 10);
+    firc_fakeip_free(g);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -1426,5 +1548,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_restored_pool_names_the_same_addresses);
     RUN_TEST(a_saved_v4_fake_with_a_v6_real_restores_its_pair);
     RUN_TEST(a_state_that_cannot_be_saved_is_an_error_until_a_save_works);
+    RUN_TEST(a_cf_mapping_survives_a_restart_as_cf);
+    RUN_TEST(a_base_claimed_as_cf_and_as_plain_is_refused);
+    RUN_TEST(a_cf_chunk_is_abandoned_after_a_crash);
+    RUN_TEST(the_cf_mark_names_the_current_cf_chunk_whatever_its_index);
     GREATEST_MAIN_END();
 }

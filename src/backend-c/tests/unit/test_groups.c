@@ -2908,6 +2908,56 @@ TEST a_rule_write_without_save_leaves_the_file_alone(void) {
     PASS();
 }
 
+TEST cloudflare_is_stored_shown_and_kept_by_a_put_without_the_key(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"g\",\"interface\":\"nwg0\"}", &out));
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(out, "cloudflare")));
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/groups/%s", jstr(out, "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"g\",\"interface\":\"nwg0\",\"cloudflare\":true}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", path, NULL, &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(out, "cloudflare")));
+    cJSON_Delete(out);
+    ASSERT(firc_ruleset_group(only_group(h))->cloudflare);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"renamed\",\"interface\":\"nwg0\"}", &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(out, "cloudflare")));
+    cJSON_Delete(out);
+    ASSERT(firc_ruleset_group(only_group(h))->cloudflare);
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"renamed\",\"interface\":\"nwg0\",\"cloudflare\":false}", &out));
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(out, "cloudflare")));
+    cJSON_Delete(out);
+    ASSERT_FALSE(firc_ruleset_group(only_group(h))->cloudflare);
+    harness_stop(h);
+    PASS();
+}
+
+TEST cloudflare_of_the_wrong_type_is_a_400(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups", "{\"name\":\"g\",\"interface\":\"nwg0\",\"cloudflare\":\"yes\"}", &out));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST cloudflare_on_a_block_group_is_a_400_naming_block(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups", "{\"name\":\"b\",\"interface\":\"block\",\"cloudflare\":true}", &out));
+    ASSERT_STR_EQ("cloudflare", jstr(out, "field"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"name\":\"b\",\"interface\":\"block\",\"cloudflare\":false}", &out));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -2920,6 +2970,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_block_groups_answer_round_trips_and_is_shown);
     RUN_TEST(an_update_keeps_the_answer);
     RUN_TEST(a_block_key_on_a_routing_group_is_ignored_by_the_api);
+    RUN_TEST(cloudflare_is_stored_shown_and_kept_by_a_put_without_the_key);
+    RUN_TEST(cloudflare_of_the_wrong_type_is_a_400);
+    RUN_TEST(cloudflare_on_a_block_group_is_a_400_naming_block);
     RUN_TEST(the_api_refuses_a_bad_block_answer_and_block_in_a_list);
     RUN_TEST(a_list_group_answers_its_active_entry_and_entry_states);
     RUN_TEST(a_group_moved_to_its_second_entry_answers_it_as_active);

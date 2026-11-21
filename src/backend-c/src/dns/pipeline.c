@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "firc/cfrange.h"
 #include "firc/dnsrewrite.h"
 #include "firc/events.h"
 #include "firc/log.h"
@@ -307,6 +308,15 @@ static void chain_reals(const firc_dns_msg_t *msg, const chain_t *chain, uint32_
     }
 }
 
+static bool all_cloudflare(const reals_t *r)
+{
+    if (r->n == 0) { return false; }
+    for (size_t i = 0; i < r->n; i++) {
+        if (!firc_cf_contains(&r->v[i])) { return false; }
+    }
+    return true;
+}
+
 static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *msg, int64_t now,
                                        const firc_group_snapshot_t *owner, const char *qname, const reals_t *r,
                                        bool cross, bool *pool_changed, firc_event_t *ev)
@@ -316,7 +326,8 @@ static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *m
 
     uint64_t gen_before = firc_fakeip_gen(p->pool);
     firc_ip_t fake4 = {{0}, 0}, fake6 = {{0}, 0};
-    firc_err_t issue = firc_fakeip_get(p->pool, qname, group_id, now, &fake4, &fake6);
+    unsigned kind = owner->cloudflare && !cross && all_cloudflare(r) ? FIRC_FAKEIP_KIND_CF : FIRC_FAKEIP_KIND_PLAIN;
+    firc_err_t issue = firc_fakeip_get_in(p->pool, qname, group_id, now, kind, &fake4, &fake6);
     if (issue == FIRC_ERR_INVAL) {
         firc_lograte_say(&p->said_refused, 60000, FIRC_LOG_WARN, NULL, "pool refused to issue for %s: caller bug", qname);
         return FIRC_DNS_DROP; /* never the real answer in place of a rewrite */

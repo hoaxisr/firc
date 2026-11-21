@@ -249,6 +249,7 @@ function groupRes({ list, rules: handRules, block, ...group }: any, withRules = 
   const withResolve = {
     ...group,
     resolve: group.resolve ?? { tunnel: true, server: "" },
+    cloudflare: group.interface !== "block" && group.cloudflare === true,
     ...(group.interface === "block" ? { block: block ?? "null" } : {}),
   };
   const out: any = withRules ? { ...withResolve, rules: handRules } : { ...withResolve };

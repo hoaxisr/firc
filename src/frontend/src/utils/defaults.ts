@@ -12,6 +12,7 @@ export function defaultGroup(): Group {
     interface: interfaces.list.at(0)?.id ?? "",
     name: "",
     devices: { allow: [], deny: [] },
+    cloudflare: false,
     resolve: DEFAULT_RESOLVE(),
     rules: [],
   };

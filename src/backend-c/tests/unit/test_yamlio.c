@@ -2250,6 +2250,48 @@ TEST block_cannot_be_one_of_several(void)
     PASS();
 }
 
+TEST cloudflare_round_trips_and_is_written_only_when_true(void)
+{
+    static const char doc[] = "groups:\n  - id: 0000ae01\n    name: A\n    interface: nwg0\n    cloudflare: true\n"
+                              "  - id: 0000ae02\n    name: B\n    interface: nwg0\n"
+                              "  - id: 0000ae03\n    name: C\n    interface: nwg0\n    cloudflare: false\n";
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
+    ASSERT(cfg.groups[0]->cloudflare);
+    ASSERT_FALSE(cfg.groups[1]->cloudflare);
+    ASSERT_FALSE(cfg.groups[2]->cloudflare);
+    char *out = save_groups(&cfg);
+    ASSERT(out != NULL);
+    const char *first = strstr(out, "cloudflare: true\n");
+    ASSERT(first != NULL);
+    ASSERT_EQ(NULL, strstr(first + 1, "cloudflare"));
+    free(out);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+TEST cloudflare_on_a_block_group_fails_to_load(void)
+{
+    static const char doc[] = "groups:\n  - id: 0000ae04\n    name: B\n    interface: block\n    cloudflare: true\n";
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT(load_str(&cfg, doc) != FIRC_OK);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+TEST cloudflare_false_on_a_block_group_loads(void)
+{
+    static const char doc[] = "groups:\n  - id: 0000ae05\n    name: B\n    interface: block\n    cloudflare: false\n";
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
+    ASSERT_FALSE(cfg.groups[0]->cloudflare);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2263,6 +2305,9 @@ int main(int argc, char **argv)
     RUN_TEST(a_bad_interface_list_is_refused);
     RUN_TEST(a_string_interface_still_loads_as_before);
     RUN_TEST(a_block_group_round_trips_its_answer);
+    RUN_TEST(cloudflare_round_trips_and_is_written_only_when_true);
+    RUN_TEST(cloudflare_on_a_block_group_fails_to_load);
+    RUN_TEST(cloudflare_false_on_a_block_group_loads);
     RUN_TEST(a_block_key_on_a_routing_group_fails_the_load);
     RUN_TEST(an_unknown_block_answer_fails_the_load);
     RUN_TEST(block_cannot_be_one_of_several);

@@ -62,6 +62,7 @@
 
   let dnsMode = $state<DnsMode>("auto");
   let dnsServer = $state("");
+  let cloudflare = $state(false);
   let serverErrorShown = $state<string | null>(null); /* the daemon's, until the field is edited */
 
   let devicesDialogOpen = $state(false);
@@ -182,6 +183,7 @@
     catalogActive = -1;
     dnsMode = modeOf(group?.resolve);
     dnsServer = group?.resolve?.server ?? "";
+    cloudflare = group?.cloudflare ?? false;
     serverErrorShown = serverError;
     void fetchResolvers();
     seededFor = key;
@@ -281,6 +283,7 @@
       devices: devicesTarget.devices,
       list: listEnabled ? { url: normalizeListUrl(url), interval } : null,
       resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer),
+      cloudflare: selectedInterface !== BLOCK && cloudflare,
     };
     dispatch("submit", payload);
     handleClose();
@@ -377,6 +380,18 @@
         </div>
       {/if}
     </div>
+
+    {#if selectedInterface !== BLOCK}
+      <div class="list-toggle">
+        <Switch bind:checked={cloudflare} aria-label={t("One Cloudflare address")} />
+        <span class="list-toggle-label">{t("One Cloudflare address")}</span>
+        <span class="list-toggle-hint"
+          >{t(
+            "This group's web traffic to Cloudflare sites goes through one checked Cloudflare address.",
+          )}</span
+        >
+      </div>
+    {/if}
 
     <div class="list-block">
       <div class="list-toggle">

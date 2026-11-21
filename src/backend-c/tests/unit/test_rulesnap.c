@@ -597,6 +597,25 @@ TEST the_snapshot_carries_a_block_groups_answer(void)
     PASS();
 }
 
+TEST the_snapshot_carries_the_cloudflare_switch(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *a = make_group((firc_id_t){{1, 0, 0, 0}}, "a", true);
+    firc_strset(&a->iface, "nwg0");
+    a->cloudflare = true;
+    firc_group_t *b = make_group((firc_id_t){{2, 0, 0, 0}}, "b", true);
+    firc_strset(&b->iface, "nwg0");
+    firc_config_add_group(&cfg, a);
+    firc_config_add_group(&cfg, b);
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT(snap != NULL);
+    ASSERT(snap->groups[0]->cloudflare);
+    ASSERT_FALSE(snap->groups[1]->cloudflare);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -623,6 +642,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_disabled_rule_or_group_is_skipped);
     RUN_TEST(a_policy_entry_is_resolved_by_the_callers_resolver);
     RUN_TEST(the_snapshot_carries_a_block_groups_answer);
+    RUN_TEST(the_snapshot_carries_the_cloudflare_switch);
     RUN_TEST(only_an_enabled_group_with_a_selector_needs_the_device_map);
     RUN_TEST(an_allow_entry_needs_the_device_map);
     GREATEST_MAIN_END();

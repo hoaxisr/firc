@@ -147,6 +147,44 @@ test.describe("Group dialog: adding a group", () => {
   });
 });
 
+test.describe("Group dialog: Cloudflare switch", () => {
+  test("the cloudflare switch saves and reloads", async ({ page }) => {
+    await signedIn(page);
+    await page.route("**/interfaces", (route) => route.fulfill({ json: { interfaces: ["eth0"] } }));
+    await page.route("**/groups?with_rules=true", (route) =>
+      route.fulfill({ json: { groups: [] } }),
+    );
+    let savedBody: any = null;
+    await page.route(/\/groups(\?.*)?$/, async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.fallback();
+        return;
+      }
+      savedBody = route.request().postDataJSON();
+      await route.fulfill({ json: { status: "ok" } });
+    });
+    await page.goto("/");
+
+    await page.locator('[data-value="Add Group"] button').click();
+    const dialog = page.getByRole("dialog");
+    await dialog.locator("#gd-name").fill("CF");
+    const toggle = dialog.locator('[aria-label="One Cloudflare address"]');
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await toggle.click();
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+
+    await page.locator("#save-changes").click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(savedBody?.groups[0].cloudflare).toBe(true);
+
+    await page.getByRole("button", { name: "Group Settings" }).first().click();
+    await expect(
+      page.getByRole("dialog").locator('[aria-label="One Cloudflare address"]'),
+    ).toHaveAttribute("aria-checked", "true");
+  });
+});
+
 test.describe("Group dialog on a phone", () => {
   async function tallDialog(page: Page, width = 400) {
     await page.setViewportSize({ width, height: 700 });

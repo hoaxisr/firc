@@ -10629,6 +10629,540 @@ TEST a_kernel_without_ip_set_arms_no_retry(void) {
     PASS();
 }
 
+static const firc_ip_t k_cf_a = {{104, 16, 0, 10}, 4};
+static const firc_ip_t k_cf_b = {{104, 16, 0, 11}, 4};
+static const firc_ip_t k_cf_c = {{104, 16, 0, 12}, 4};
+static const firc_ip_t k_cf_d = {{104, 16, 0, 13}, 4};
+
+static _Atomic int g_cf_calls;
+static _Atomic int g_cf_a_calls;
+static _Atomic bool g_cf_hold;
+static _Atomic bool g_cf_fail;
+
+static bool cf_fast_probe(void *ud, const char *host, const firc_ip_t *addr, uint32_t mark, double *secs) {
+    (void)ud;
+    (void)addr;
+    (void)mark;
+    atomic_fetch_add(&g_cf_calls, 1);
+    if (host[0] == 'a') { atomic_fetch_add(&g_cf_a_calls, 1); }
+    *secs = 0.05;
+    return !atomic_load(&g_cf_fail);
+}
+
+static bool cf_held_probe(void *ud, const char *host, const firc_ip_t *addr, uint32_t mark, double *secs) {
+    for (int i = 0; i < 5000 && atomic_load(&g_cf_hold); i++) { sleep_ms(1); }
+    return cf_fast_probe(ud, host, addr, mark, secs);
+}
+
+static void cf_reset(void) {
+    atomic_store(&g_cf_calls, 0);
+    atomic_store(&g_cf_a_calls, 0);
+    atomic_store(&g_cf_fail, false);
+}
+
+static bool cf_range_rule_there(locked_app_t *l) {
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    bool found = false;
+    if (firc_fake_ipt_get_rules(l->fake, "nat", "FIRC_DNAT", &rules, &n)) {
+        for (size_t i = 0; i < n && !found; i++) {
+            char *text = firc_ipt_rule_string(rules[i]);
+            found = text != NULL && strstr(text, "80,443") != NULL;
+            free(text);
+        }
+    }
+    return found;
+}
+
+static firc_group_t *cf_group(firc_group_t *g) {
+    g->cloudflare = true;
+    return g;
+}
+
+static bool issue_cf_at(locked_app_t *l, const char *name, uint8_t tag, const firc_ip_t *real, int64_t when,
+                        firc_ip_t *fake) {
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format((firc_id_t){{tag, tag, tag, tag}}, gid);
+    firc_app_nf_enter(l->app);
+    bool ok = firc_fakeip_get_in(l->pool, name, gid, when, FIRC_FAKEIP_KIND_CF, fake, NULL) == FIRC_OK &&
+              firc_fakeip_set_reals(l->pool, name, gid, real, 1) == FIRC_OK;
+    if (ok) { firc_app_pool_changed(l->app); }
+    firc_app_nf_leave(l->app);
+    return ok;
+}
+
+static bool issue_cf(locked_app_t *l, const char *name, uint8_t tag, const firc_ip_t *real, firc_ip_t *fake) {
+    return issue_cf_at(l, name, tag, real, (int64_t)time(NULL), fake);
+}
+
+static bool cf_rereal_waits(locked_app_t *l, const char *name, uint8_t tag, const firc_ip_t *real,
+                            const firc_ip_t *fake) {
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format((firc_id_t){{tag, tag, tag, tag}}, gid);
+    bool ok = firc_fakeip_set_reals(l->pool, name, gid, real, 1) == FIRC_OK;
+    bool waits = firc_fakeip_needs_commit(l->pool, fake);
+    firc_app_pool_changed(l->app);
+    return ok && waits;
+}
+
+static bool cf_target(locked_app_t *l, uint8_t tag, unsigned fam, firc_ip_t *out) {
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format((firc_id_t){{tag, tag, tag, tag}}, gid);
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(l->pool);
+    firc_ip_t got = {{0}, 0};
+    bool has = s != NULL && firc_fakeip_snapshot_cf_target(s, gid, fam, &got);
+    firc_fakeip_snapshot_free(s);
+    if (out != NULL) { *out = got; }
+    return has;
+}
+
+static bool cf_settled(locked_app_t *l, firc_loop_t *loop) {
+    for (int i = 0; i < 300; i++) {
+        bool busy = false;
+        for (uint8_t tag = 1; tag <= 3 && !busy; tag++) {
+            firc_id_t id = {{tag, tag, tag, tag}};
+            busy = firc_app_cf_busy_for_test(l->app, id, FIRC_FAM_V4) ||
+                   firc_app_cf_busy_for_test(l->app, id, FIRC_FAM_V6);
+        }
+        if (!busy) { return true; }
+        if (!run_loop_for(loop, 10)) { return false; }
+    }
+    return false;
+}
+
+static bool cf_written_after(locked_app_t *l, firc_loop_t *loop, uint64_t started) {
+    return wait_written_after(l, started) && run_loop_for(loop, 20);
+}
+
+static bool cf_written_from_now(locked_app_t *l, firc_loop_t *loop) {
+    return cf_written_after(l, loop, firc_app_nf_passes_for_test(l->app));
+}
+
+static bool cf_has(locked_app_t *l, uint8_t tag) {
+    firc_app_nf_enter(l->app);
+    bool has = cf_target(l, tag, FIRC_FAM_V4, NULL);
+    firc_app_nf_leave(l->app);
+    return has;
+}
+
+static bool cf_has_soon(locked_app_t *l, firc_loop_t *loop, uint8_t tag) {
+    for (int i = 0; i < 300; i++) {
+        if (cf_has(l, tag)) { return true; }
+        if (!run_loop_for(loop, 10)) { return false; }
+    }
+    return false;
+}
+
+static bool cf_ready(locked_app_t *l, firc_loop_t *loop, uint8_t tag, const char *name, firc_ip_t *fake) {
+    uint64_t started = firc_app_nf_passes_for_test(l->app);
+    if (!issue_cf(l, name, tag, &k_cf_a, fake) || !cf_written_after(l, loop, started)) { return false; }
+    firc_app_cf_tick(l->app);
+    if (!cf_settled(l, loop)) { return false; }
+    return cf_has(l, tag) && cf_written_from_now(l, loop);
+}
+
+static bool cf_live(locked_app_t *l, firc_loop_t *loop, uint8_t tag) {
+    for (int i = 0; i < 300; i++) {
+        if (strcmp(live_reason(l, tag), "live") == 0) { return true; }
+        if (!run_loop_for(loop, 10)) { return false; }
+    }
+    return false;
+}
+
+TEST switching_cloudflare_off_holds_the_next_cf_answer_before_any_pass(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    firc_ip_t fa = {{0}, 0};
+    ASSERT(cf_ready(&l, loop, 1, "a.example", &fa));
+    firc_app_nf_enter(l.app);
+    bool fixture_waits = cf_rereal_waits(&l, "a.example", 1, &k_cf_b, &fa);
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSEm("fixture: a committed target lets a covered answer through", fixture_waits);
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, (firc_id_t){{1, 1, 1, 1}},
+                                             activation_group(1, "a.example", NULL, NULL)));
+    bool has = cf_target(&l, 1, FIRC_FAM_V4, NULL);
+    bool waits = cf_rereal_waits(&l, "a.example", 1, &k_cf_c, &fa);
+    uint64_t passes = firc_app_nf_passes_for_test(l.app);
+    firc_app_nf_leave(l.app);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    ASSERT_EQ_FMT((unsigned long long)started, (unsigned long long)passes, "%llu");
+    ASSERT_FALSE(has);
+    ASSERT(waits);
+    PASS();
+}
+
+TEST a_moved_group_holds_cf_answers_until_a_new_target(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_rtnl_set_nametoindex_for_test(up_links);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(listed_group(1, "a.example"))));
+    ASSERT(first_pass_done(&l));
+    firc_ip_t fa = {{0}, 0};
+    ASSERT(cf_ready(&l, loop, 1, "a.example", &fa));
+
+    firc_app_nf_enter(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_move_group(l.app, k_g1, 1, false));
+    bool has = cf_target(&l, 1, FIRC_FAM_V4, NULL);
+    bool waits = cf_rereal_waits(&l, "a.example", 1, &k_cf_b, &fa);
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSE(has);
+    ASSERT(waits);
+
+    int calls = atomic_load(&g_cf_calls);
+    ASSERTm("checked again at once, not at the next tick", cf_has_soon(&l, loop, 1));
+    ASSERT(atomic_load(&g_cf_calls) > calls);
+    ASSERT(cf_settled(&l, loop));
+    ASSERT(cf_written_from_now(&l, loop));
+    firc_app_nf_enter(l.app);
+    waits = cf_rereal_waits(&l, "a.example", 1, &k_cf_c, &fa);
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSE(waits);
+    listed_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_ktcp_group_gets_no_target(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    uint16_t ports[FIRC_KTCP_DEVICES] = {0};
+    ports[3] = 3603;
+    set_ports(l.app, ports);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(tunnel_group(1, "a.example", "tunvless3"))));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(2, "b.example", NULL, NULL))));
+    ASSERT(cf_live(&l, loop, 1));
+    firc_ip_t fa = {{0}, 0}, fb = {{0}, 0};
+    ASSERT(issue_cf(&l, "a.example", 1, &k_cf_a, &fa));
+    ASSERT(cf_ready(&l, loop, 2, "b.example", &fb));
+    ASSERT_EQ(0, atomic_load(&g_cf_a_calls));
+    ASSERT_FALSE(cf_has(&l, 1));
+    firc_app_nf_enter(l.app);
+    bool range = cf_range_rule_there(&l);
+    firc_app_nf_leave(l.app);
+    ASSERTm("fixture: the target is written", range);
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    uint16_t lo_ports[FIRC_KTCP_DEVICES] = {0};
+    lo_ports[0] = 3600;
+    lo_ports[3] = 3603;
+    char names[FIRC_KTCP_DEVICES][FIRC_KTCP_NAME_CAP] = {{0}};
+    snprintf(names[0], sizeof names[0], "lo");
+    snprintf(names[3], sizeof names[3], "tunvless3");
+    firc_app_set_tunnels(l.app, lo_ports, (const char(*)[FIRC_KTCP_NAME_CAP])names);
+    bool b_has = cf_target(&l, 2, FIRC_FAM_V4, NULL);
+    firc_app_cf_tick(l.app);
+    bool b_again = cf_target(&l, 2, FIRC_FAM_V4, NULL);
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSEm("its tunnel redirected now: withdrawn at once", b_has);
+    ASSERT_FALSE(b_again);
+    ASSERT(cf_written_after(&l, loop, started));
+    ASSERT(cf_settled(&l, loop));
+    firc_app_nf_enter(l.app);
+    range = cf_range_rule_there(&l);
+    firc_app_nf_leave(l.app);
+    ASSERT_FALSEm("the next pass writes no range rule", range);
+    ASSERT_EQ(0, atomic_load(&g_cf_a_calls));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_result_for_a_deleted_group_sets_nothing(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    atomic_store(&g_cf_hold, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_held_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(2, "b.example", NULL, NULL))));
+    firc_ip_t fa = {{0}, 0}, fb = {{0}, 0};
+    ASSERT(issue_cf(&l, "a.example", 1, &k_cf_a, &fa));
+    ASSERT(issue_cf(&l, "b.example", 2, &k_cf_d, &fb));
+    firc_app_cf_tick(l.app);
+    ASSERT(firc_app_cf_busy_for_test(l.app, (firc_id_t){{1, 1, 1, 1}}, FIRC_FAM_V4));
+    ASSERT(firc_app_cf_busy_for_test(l.app, (firc_id_t){{2, 2, 2, 2}}, FIRC_FAM_V4));
+    ASSERT(firc_app_remove_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}}));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    ASSERT(issue_cf(&l, "a.example", 1, &k_cf_a, &fa));
+    firc_app_cf_tick(l.app);
+    atomic_store(&g_cf_hold, false);
+    ASSERT(run_loop_for(loop, 1000));
+    int calls = atomic_load(&g_cf_calls);
+    bool busy1 = firc_app_cf_busy_for_test(l.app, (firc_id_t){{1, 1, 1, 1}}, FIRC_FAM_V4);
+    bool busy2 = firc_app_cf_busy_for_test(l.app, (firc_id_t){{2, 2, 2, 2}}, FIRC_FAM_V4);
+    bool a_has = cf_target(&l, 1, FIRC_FAM_V4, NULL);
+    firc_ip_t got = {{0}, 0};
+    bool b_has = cf_target(&l, 2, FIRC_FAM_V4, &got);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    ASSERT_FALSE(busy1);
+    ASSERT_FALSE(busy2);
+    ASSERT_FALSEm("the result of the deleted group's check is dropped", a_has);
+    ASSERTm("fixture: the other group's result lands", b_has);
+    ASSERT_EQ(13, got.b[3]);
+    ASSERT_EQ_FMTm("one check per group and family in flight", 2 * FIRC_CFPROBE_TRIES, calls, "%d");
+    PASS();
+}
+
+TEST a_check_started_before_a_move_sets_nothing(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_rtnl_set_nametoindex_for_test(up_links);
+    firc_app_set_running(l.app, true);
+    atomic_store(&g_cf_hold, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_held_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(listed_group(1, "a.example"))));
+    firc_ip_t fa = {{0}, 0};
+    ASSERT(issue_cf(&l, "a.example", 1, &k_cf_a, &fa));
+    firc_app_cf_tick(l.app);
+    ASSERT(firc_app_cf_busy_for_test(l.app, k_g1, FIRC_FAM_V4));
+    ASSERT_EQ(FIRC_OK, firc_app_move_group(l.app, k_g1, 1, false));
+    ASSERT(run_loop_for(loop, 50));
+    ASSERT(firc_app_cf_busy_for_test(l.app, k_g1, FIRC_FAM_V4));
+    atomic_store(&g_cf_hold, false);
+    ASSERT(run_loop_for(loop, 1000));
+    bool busy = firc_app_cf_busy_for_test(l.app, k_g1, FIRC_FAM_V4);
+    bool has = cf_target(&l, 1, FIRC_FAM_V4, NULL);
+    listed_down(&l);
+    firc_loop_destroy(loop);
+    ASSERT_FALSE(busy);
+    ASSERT_FALSEm("measured on the entry it left", has);
+    PASS();
+}
+
+TEST a_tick_with_nothing_due_takes_no_lock(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    ASSERT(first_pass_done(&l));
+    uint64_t before = firc_app_nf_enters_for_test(l.app);
+    firc_app_cf_tick(l.app);
+    ASSERT_EQ_FMTm("no group checks Cloudflare", (unsigned long long)before,
+                   (unsigned long long)firc_app_nf_enters_for_test(l.app), "%llu");
+
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(2, "b.example", NULL, NULL))));
+    firc_ip_t fb = {{0}, 0};
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT(issue_cf(&l, "b.example", 2, &k_cf_a, &fb));
+    ASSERT(cf_written_after(&l, loop, started));
+    before = firc_app_nf_enters_for_test(l.app);
+    firc_app_cf_tick(l.app);
+    ASSERTm("fixture: a due check takes the lock", firc_app_nf_enters_for_test(l.app) > before);
+    ASSERT(cf_settled(&l, loop));
+    ASSERT(cf_has(&l, 2));
+    before = firc_app_nf_enters_for_test(l.app);
+    firc_app_cf_tick(l.app);
+    ASSERT_EQ_FMTm("the target is fresh: nothing due", (unsigned long long)before,
+                   (unsigned long long)firc_app_nf_enters_for_test(l.app), "%llu");
+    ASSERT_EQ(FIRC_CFPROBE_TRIES, atomic_load(&g_cf_calls));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+static bool cf_tick_takes_lock(locked_app_t *l, firc_loop_t *loop) {
+    uint64_t before = firc_app_nf_enters_for_test(l->app);
+    firc_app_cf_tick(l->app);
+    bool took = firc_app_nf_enters_for_test(l->app) > before;
+    return cf_settled(l, loop) && took;
+}
+
+TEST a_group_that_left_cloudflare_costs_a_tick_no_lock(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(2, "b.example", NULL, NULL))));
+    firc_ip_t fa = {{0}, 0}, fb = {{0}, 0};
+    ASSERT(issue_cf(&l, "b.example", 2, &k_cf_d, &fb));
+    ASSERT(cf_ready(&l, loop, 1, "a.example", &fa));
+    ASSERTm("fixture: both groups hold a target", cf_has(&l, 1) && cf_has(&l, 2));
+
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, (firc_id_t){{1, 1, 1, 1}},
+                                             activation_group(1, "a.example", NULL, NULL)));
+    firc_group_t *off = cf_group(activation_group(2, "b.example", NULL, NULL));
+    off->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, (firc_id_t){{2, 2, 2, 2}}, off));
+    ASSERT_FALSE(cf_has(&l, 1) || cf_has(&l, 2));
+    (void)cf_tick_takes_lock(&l, loop);
+    ASSERT_FALSEm("withdrawn and out: a tick takes no lock", cf_tick_takes_lock(&l, loop));
+
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, (firc_id_t){{2, 2, 2, 2}},
+                                             cf_group(activation_group(2, "b.example", NULL, NULL))));
+    ASSERTm("routed again: checked at the next tick", cf_tick_takes_lock(&l, loop));
+    ASSERT(cf_has(&l, 2));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST a_dead_target_no_longer_among_the_candidates_is_dropped(void) {
+    g_now_ms = 1000000;
+    g_app_mono = test_clock;
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    firc_ip_t fake = {{0}, 0};
+    int64_t now = (int64_t)time(NULL);
+    ASSERT(issue_cf_at(&l, "a.example", 1, &k_cf_a, now - 100, &fake));
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    firc_ip_t got = {{0}, 0};
+    firc_app_nf_enter(l.app);
+    bool has = cf_target(&l, 1, FIRC_FAM_V4, &got);
+    firc_app_nf_leave(l.app);
+    ASSERTm("fixture: the only candidate is the target", has && got.b[3] == 10);
+
+    static const firc_ip_t k_cf_e = {{104, 16, 0, 14}, 4};
+    const firc_ip_t *newer[] = {&k_cf_b, &k_cf_c, &k_cf_d, &k_cf_e};
+    for (int i = 0; i < 4; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "b%d.example", i);
+        ASSERT(issue_cf_at(&l, name, 1, newer[i], now, &fake));
+    }
+    atomic_store(&g_cf_fail, true);
+    atomic_store(&g_cf_a_calls, 0);
+    g_now_ms += 600 * 1000;
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    bool after_one = cf_has(&l, 1);
+    g_now_ms += 30 * 1000;
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    bool after_two = cf_has(&l, 1);
+    int a_calls = atomic_load(&g_cf_a_calls);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    ASSERT_EQ_FMTm("the target is checked by its own name", 2 * FIRC_CFPROBE_TRIES, a_calls, "%d");
+    ASSERTm("one failed check keeps it", after_one);
+    ASSERT_FALSEm("the second failed check drops it", after_two);
+    PASS();
+}
+
+TEST a_dead_target_with_no_names_left_is_dropped(void) {
+    g_now_ms = 1000000;
+    g_app_mono = test_clock;
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    firc_ip_t fake = {{0}, 0};
+    int64_t now = (int64_t)time(NULL);
+    ASSERT(issue_cf_at(&l, "a.example", 1, &k_cf_a, now, &fake));
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    ASSERTm("fixture: the only candidate is the target", cf_has(&l, 1));
+
+    firc_app_nf_enter(l.app);
+    firc_fakeip_reclaim(l.pool, now + 2 * 86400);
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format(k_g1, gid);
+    firc_fakeip_cf_cand_t c[1];
+    size_t left = firc_fakeip_cf_candidates(l.pool, gid, FIRC_FAM_V4, c, 1);
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ_FMTm("fixture: no name is left", (size_t)0, left, "%zu");
+    atomic_store(&g_cf_fail, true);
+    g_now_ms += 600 * 1000;
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    g_now_ms += 30 * 1000;
+    firc_app_cf_tick(l.app);
+    ASSERT(cf_settled(&l, loop));
+    bool has = cf_has(&l, 1);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    ASSERT_FALSE(has);
+    PASS();
+}
+
+TEST a_group_routed_again_under_its_entry_gets_its_target_back_at_once(void) {
+    firc_loop_t *loop = NULL;
+    ASSERT_EQ(FIRC_OK, firc_loop_create(&loop));
+    locked_app_t l;
+    ASSERT(locked_app_up_with_loop(&l, loop));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    cf_reset();
+    firc_app_set_cfprobe_for_test(l.app, cf_fast_probe, NULL);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, cf_group(activation_group(1, "a.example", NULL, NULL))));
+    firc_ip_t fa = {{0}, 0};
+    ASSERT(cf_ready(&l, loop, 1, "a.example", &fa));
+
+    firc_app_nf_enter(l.app);
+    firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, k_g1);
+    bool down = rs != NULL && firc_ruleset_disable(rs) == FIRC_OK && !firc_ruleset_routed(rs);
+    firc_err_t err = firc_app_update_group(l.app, k_g1, cf_group(activation_group(1, "a.example", NULL, NULL)));
+    bool routed = rs != NULL && firc_ruleset_routed(rs);
+    bool has = cf_target(&l, 1, FIRC_FAM_V4, NULL);
+    firc_app_nf_leave(l.app);
+    ASSERTm("fixture: unrouted with no reconcile in between", down);
+    ASSERT_EQ(FIRC_OK, err);
+    ASSERT(routed);
+    ASSERT_FALSEm("fixture: newly routed, the target waits", has);
+    int calls = atomic_load(&g_cf_calls);
+    bool back = cf_has_soon(&l, loop, 1);
+    ASSERT(cf_settled(&l, loop));
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    ASSERTm("checked again at once, not after ten minutes", back);
+    ASSERT(atomic_load(&g_cf_calls) > calls);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -10951,5 +11485,15 @@ int main(int argc, char **argv) {
     RUN_TEST(a_pass_whose_tables_fail_after_a_set_write_does_not_sweep);
     RUN_TEST(the_set_retry_doubles_to_a_minute_and_starts_over_after_a_success);
     RUN_TEST(a_kernel_without_ip_set_arms_no_retry);
+    RUN_TEST(switching_cloudflare_off_holds_the_next_cf_answer_before_any_pass);
+    RUN_TEST(a_moved_group_holds_cf_answers_until_a_new_target);
+    RUN_TEST(a_ktcp_group_gets_no_target);
+    RUN_TEST(a_result_for_a_deleted_group_sets_nothing);
+    RUN_TEST(a_check_started_before_a_move_sets_nothing);
+    RUN_TEST(a_tick_with_nothing_due_takes_no_lock);
+    RUN_TEST(a_group_that_left_cloudflare_costs_a_tick_no_lock);
+    RUN_TEST(a_dead_target_no_longer_among_the_candidates_is_dropped);
+    RUN_TEST(a_dead_target_with_no_names_left_is_dropped);
+    RUN_TEST(a_group_routed_again_under_its_entry_gets_its_target_back_at_once);
     GREATEST_MAIN_END();
 }

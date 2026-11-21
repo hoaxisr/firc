@@ -2745,6 +2745,196 @@ TEST the_pipeline_says_who_is_covered(void) {
     PASS();
 }
 
+static firc_dns_msg_t *addrs_answer(const char *host, uint16_t qtype, const uint8_t *flat, size_t each, size_t count) {
+    uint8_t buf[512];
+    const char *q[] = {host, "example", "com"};
+    size_t len = build_response(buf, q, 3, NULL, 0);
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(buf, len, &msg) != FIRC_OK) { abort(); }
+    msg->questions[0].qtype = qtype;
+    msg->answers = realloc(msg->answers, count * sizeof(msg->answers[0]));
+    for (size_t i = 0; i < count; i++) {
+        if (i > 0) {
+            msg->answers[i] = msg->answers[0];
+            msg->answers[i].rdata = NULL;
+        }
+        msg->answers[i].rtype = qtype;
+        set_rdata(&msg->answers[i], flat + i * each, (uint16_t)each);
+    }
+    msg->n_answers = count;
+    return msg;
+}
+
+typedef struct {
+    firc_ip_t fake;
+    int kind;
+} kind_probe_t;
+
+static void probe_kind(void *ud, const char *group_id, unsigned family, const firc_ip_t *fake,
+                       const firc_ip_t *real, unsigned kind) {
+    kind_probe_t *k = ud;
+    (void)group_id; (void)family; (void)real;
+    if (fake->len == k->fake.len && memcmp(fake->b, k->fake.b, fake->len) == 0) { k->kind = (int)kind; }
+}
+
+static int kind_of(firc_fakeip_t *pool, const firc_ip_t *fake) {
+    kind_probe_t k = {*fake, -1};
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(pool);
+    firc_fakeip_snapshot_walk_kind(s, probe_kind, &k);
+    firc_fakeip_snapshot_free(s);
+    return k.kind;
+}
+
+static firc_ip_t fake_of(rw_fixture_t *f, const char *name, bool v6) {
+    firc_ip_t v4 = {{0}, 0}, a6 = {{0}, 0};
+    char gid[FIRC_ID_STR_LEN];
+    firc_id_format(f->cfg.groups[0]->id, gid);
+    if (firc_fakeip_get(f->pool, name, gid, 1000, &v4, &a6) != FIRC_OK) { abort(); }
+    return v6 ? a6 : v4;
+}
+
+static void rw_up_cf(rw_fixture_t *f, bool cloudflare) {
+    firc_config_t cfg = make_cfg();
+    add_group(&cfg, 1, "g", FIRC_RULE_NAMESPACE, "example.com");
+    cfg.groups[0]->cloudflare = cloudflare;
+    rw_up_cfg(f, cfg, 64);
+}
+
+static const char *gid_of(rw_fixture_t *f) {
+    static char gid[FIRC_ID_STR_LEN];
+    firc_id_format(f->cfg.groups[0]->id, gid);
+    return gid;
+}
+
+static void commit_all(firc_fakeip_t *pool) {
+    firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(pool);
+    firc_fakeip_mark_committed(pool, firc_fakeip_snapshot_gen(s));
+    firc_fakeip_snapshot_free(s);
+}
+
+static const uint8_t k_cf_two[8] = {104, 16, 0, 1, 172, 64, 0, 1};
+static const uint8_t k_cf_and_other[8] = {104, 16, 0, 1, 93, 184, 216, 34};
+static const uint8_t k_cf_one[4] = {104, 16, 0, 1};
+static const uint8_t k_cf_v6[16] = {0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+static const uint8_t k_other_v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+
+TEST a_cloudflare_answer_in_a_cloudflare_group_is_issued_from_the_cf_chunk(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_msg_t *msg = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_two, 4, 2);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_ip_t fake = fake_of(&f, "shop.example.com", false);
+    ASSERT_EQ_FMT(1, kind_of(f.pool, &fake), "%d");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST one_address_outside_cloudflare_makes_the_name_plain(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_msg_t *msg = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_and_other, 4, 2);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_ip_t fake = fake_of(&f, "shop.example.com", false);
+    ASSERT_EQ_FMT(0, kind_of(f.pool, &fake), "%d");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST the_switch_off_keeps_cloudflare_names_plain(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, false);
+    firc_dns_msg_t *msg = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_two, 4, 2);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    firc_ip_t fake = fake_of(&f, "shop.example.com", false);
+    ASSERT_EQ_FMT(0, kind_of(f.pool, &fake), "%d");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_cross_answer_is_plain(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    free(msg->answers[0].rdata);
+    msg->answers[0].rdata = NULL;
+    msg->n_answers = 0;
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL));
+    firc_dns_msg_t *aaaa = addrs_answer("shop", FIRC_DNS_TYPE_AAAA, k_cf_v6, 16, 1);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, &client,
+                                                                      FIRC_DNS_RESOLVER_GROUP, NULL));
+    firc_ip_t fake = fake_of(&f, "shop.example.com", false);
+    ASSERT_EQ_FMT(0, kind_of(f.pool, &fake), "%d");
+    firc_dns_msg_free(aaaa);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST two_cloudflare_names_get_two_fakes(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_msg_t *a = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    firc_dns_msg_t *b = addrs_answer("shop2", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    firc_dns_pipeline_handle_message(f.p, a, 1000, NULL, NULL);
+    firc_dns_pipeline_handle_message(f.p, b, 1001, NULL, NULL);
+    firc_ip_t f1 = fake_of(&f, "shop.example.com", false);
+    firc_ip_t f2 = fake_of(&f, "shop2.example.com", false);
+    ASSERT_FALSE(memcmp(f1.b, f2.b, 4) == 0);
+    ASSERT_EQ_FMT(1, kind_of(f.pool, &f1), "%d");
+    ASSERT_EQ_FMT(1, kind_of(f.pool, &f2), "%d");
+    firc_dns_msg_free(a);
+    firc_dns_msg_free(b);
+    rw_down(&f);
+    PASS();
+}
+
+TEST an_aaaa_outside_cloudflare_leaves_that_family_uncovered(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_msg_t *a = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, a, 1000, NULL, NULL));
+    firc_ip_t fake4 = fake_of(&f, "shop.example.com", false);
+    ASSERT_EQ_FMT(1, kind_of(f.pool, &fake4), "%d");
+    static const uint8_t t4[4] = {104, 16, 0, 9};
+    firc_ip_t target4 = {{0}, 4};
+    memcpy(target4.b, t4, 4);
+    firc_ip_t target6 = {{0}, 16};
+    memcpy(target6.b, k_cf_v6, 16);
+    firc_fakeip_set_cf_target(f.pool, gid_of(&f), FIRC_FAM_V4, &target4);
+    firc_fakeip_set_cf_target(f.pool, gid_of(&f), FIRC_FAM_V6, &target6);
+    commit_all(f.pool);
+    firc_dns_msg_t *b = addrs_answer("shop", FIRC_DNS_TYPE_AAAA, k_other_v6, 16, 1);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, b, 1001, NULL, NULL));
+    firc_ip_t fake6 = fake_of(&f, "shop.example.com", true);
+    ASSERT(firc_fakeip_needs_commit(f.pool, &fake6));
+    ASSERT_FALSE(firc_fakeip_needs_commit(f.pool, &fake4));
+    firc_dns_msg_free(a);
+    firc_dns_msg_free(b);
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_covered_cloudflare_answer_is_not_held(void) {
+    rw_fixture_t f;
+    rw_up_cf(&f, true);
+    firc_dns_msg_t *a = addrs_answer("shop", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, a, 1000, NULL, NULL));
+    firc_ip_t target4 = {{104, 16, 0, 9}, 4};
+    firc_fakeip_set_cf_target(f.pool, gid_of(&f), FIRC_FAM_V4, &target4);
+    commit_all(f.pool);
+    firc_dns_msg_t *b = addrs_answer("shop2", FIRC_DNS_TYPE_A, k_cf_one, 4, 1);
+    ASSERT_EQ((int)FIRC_DNS_REWRITTEN, (int)firc_dns_pipeline_handle_message(f.p, b, 1001, NULL, NULL));
+    firc_dns_msg_free(a);
+    firc_dns_msg_free(b);
+    rw_down(&f);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2831,5 +3021,12 @@ int main(int argc, char **argv)
     RUN_TEST(each_address_answer_is_recalled_under_its_family_and_nothing_else_is);
     RUN_TEST(an_unowned_name_and_a_non_address_question_are_not_recalled);
     RUN_TEST(the_pipeline_says_who_is_covered);
+    RUN_TEST(a_cloudflare_answer_in_a_cloudflare_group_is_issued_from_the_cf_chunk);
+    RUN_TEST(one_address_outside_cloudflare_makes_the_name_plain);
+    RUN_TEST(the_switch_off_keeps_cloudflare_names_plain);
+    RUN_TEST(a_cross_answer_is_plain);
+    RUN_TEST(two_cloudflare_names_get_two_fakes);
+    RUN_TEST(an_aaaa_outside_cloudflare_leaves_that_family_uncovered);
+    RUN_TEST(a_covered_cloudflare_answer_is_not_held);
     GREATEST_MAIN_END();
 }

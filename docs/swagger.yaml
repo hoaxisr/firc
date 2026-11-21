@@ -943,6 +943,10 @@ definitions:
     type: object
   types.GroupReq:
     properties:
+      cloudflare:
+        default: false
+        description: 'Cloudflare names of this group share one DNAT target. Absent on PUT keeps the current value; anything but a boolean is a 400 with field cloudflare; true on a group whose interface is block is a 400 with field cloudflare.'
+        type: boolean
       block:
         description: 'Only for a group whose interface is block: how its names are answered. Absent on PUT keeps the current answer; null or "null" is the default; anything but null, nxdomain and refused is a 400 with field block. Ignored on any other group.'
         enum:
@@ -981,6 +985,10 @@ definitions:
     type: object
   types.GroupRes:
     properties:
+      cloudflare:
+        default: false
+        description: Whether the group's Cloudflare names share one DNAT target.
+        type: boolean
       block:
         description: 'Present only on a group whose interface is block: how its names are answered.'
         enum:

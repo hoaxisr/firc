@@ -65,6 +65,7 @@ typedef struct firc_group {
     firc_devsel_spec_t devices;
     firc_group_resolve_t resolve;
     firc_block_answer_t block;
+    bool cloudflare;
     firc_group_list_t *list; /* NULL: a manual group */
 } firc_group_t;
 

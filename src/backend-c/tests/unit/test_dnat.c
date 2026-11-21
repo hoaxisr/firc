@@ -462,6 +462,253 @@ TEST the_dns_remap_asks_for_no_mark(void) {
     PASS();
 }
 
+static ssize_t rule_index(firc_fake_ipt_t *f, const char *chain, const char *const *want, size_t n_want) {
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    if (!firc_fake_ipt_get_rules(f, "nat", chain, &rules, &n)) { return -1; }
+    for (size_t i = 0; i < n; i++) {
+        if (rules[i]->n_parts != n_want) { continue; }
+        size_t j = 0;
+        for (; j < n_want; j++) {
+            if (strcmp(rules[i]->parts[j], want[j]) != 0) { break; }
+        }
+        if (j == n_want) { return (ssize_t)i; }
+    }
+    return -1;
+}
+
+static bool any_rule_has(firc_fake_ipt_t *f, const char *chain, const char *part) {
+    firc_ipt_rule_t *const *rules = NULL;
+    size_t n = 0;
+    if (!firc_fake_ipt_get_rules(f, "nat", chain, &rules, &n)) { return false; }
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < rules[i]->n_parts; j++) {
+            if (strcmp(rules[i]->parts[j], part) == 0) { return true; }
+        }
+    }
+    return false;
+}
+
+static firc_fake_ipt_t *commit_pool(firc_fakeip_t *pool, firc_ipt_proto_t proto, firc_dnat_routed_fn routed,
+                                    firc_ipt_t **ipt_out) {
+    firc_fake_ipt_t *f = firc_fake_ipt_new(proto);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(f), "FIRC_");
+    firc_netfilter_register_base_chains(ipt, NULL);
+    firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
+    if (snap == NULL || firc_dnat_build_rules(ipt, "FIRC_", snap, routed, NULL) != FIRC_OK ||
+        mark_group(ipt, snap, "g1", 1) != FIRC_OK || mark_group(ipt, snap, "g2", 2) != FIRC_OK ||
+        firc_ipt_commit(ipt) != FIRC_OK) {
+        firc_ipt_free(ipt);
+        firc_fake_ipt_free(f);
+        firc_fakeip_snapshot_free(snap);
+        return NULL;
+    }
+    firc_fakeip_snapshot_free(snap);
+    *ipt_out = ipt;
+    return f;
+}
+
+static firc_err_t cf_name(firc_fakeip_t *pool, const char *name, const char *gid, int64_t now,
+                          const firc_ip_t *real) {
+    firc_ip_t a, b;
+    firc_err_t err = firc_fakeip_get_in(pool, name, gid, now, FIRC_FAKEIP_KIND_CF, &a, &b);
+    return err != FIRC_OK ? err : firc_fakeip_set_real(pool, name, gid, real);
+}
+
+#define TCP_RANGE(cidr, to) {"-d", cidr, "-p", "tcp", "-m", "multiport", "--dports", "80,443", "-m", "mark", \
+                             "--mark", "0x40000000/0x40000000", "-j", "DNAT", "--to-destination", to}
+#define UDP_RANGE(cidr, to) {"-d", cidr, "-p", "udp", "-m", "udp", "--dport", "443", "-m", "mark", "--mark", \
+                             "0x40000000/0x40000000", "-j", "DNAT", "--to-destination", to}
+#define HOST_RULE(fake, to) {"-d", fake, "-m", "mark", "--mark", "0x40000000/0x40000000", "-j", "DNAT", \
+                             "--to-destination", to}
+
+TEST a_cf_chunk_with_a_target_gets_two_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t real = v4(104, 16, 0, 1), target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "a.example.com", "g1", 1000, &real));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *tcp[] = TCP_RANGE("198.18.0.0/24", "104.16.9.9");
+    static const char *udp[] = UDP_RANGE("198.18.0.0/24", "104.16.9.9");
+    static const char *host[] = HOST_RULE("198.18.0.1/32", "104.16.0.1");
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", tcp, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", udp, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", host, 10));
+    ASSERT_EQ_FMT((size_t)3, rule_count(f, "nat", "FIRC_DNAT"), "%zu");
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST two_cf_chunks_get_two_pairs_of_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    c.v4.chunk_cidr = 28;
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t real = v4(104, 16, 0, 1), target = v4(104, 16, 9, 9);
+    char name[32];
+    for (int i = 0; i < 20; i++) {
+        snprintf(name, sizeof(name), "n%d.example.com", i);
+        ASSERT_EQ(FIRC_OK, cf_name(pool, name, "g1", 1000, &real));
+    }
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *t0[] = TCP_RANGE("198.18.0.0/28", "104.16.9.9");
+    static const char *u0[] = UDP_RANGE("198.18.0.0/28", "104.16.9.9");
+    static const char *t1[] = TCP_RANGE("198.18.0.16/28", "104.16.9.9");
+    static const char *u1[] = UDP_RANGE("198.18.0.16/28", "104.16.9.9");
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", t0, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", u0, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", t1, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", u1, 16));
+    ASSERT_EQ_FMT((size_t)24, rule_count(f, "nat", "FIRC_DNAT"), "%zu");
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST no_target_keeps_only_host_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t cover = v4(104, 16, 0, 1), other = v4(93, 184, 216, 34);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "c.example.com", "g1", 1000, &cover));
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "x.example.com", "g1", 1000, &other));
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *covered[] = HOST_RULE("198.18.0.1/32", "104.16.0.1");
+    static const char *exception[] = HOST_RULE("198.18.0.2/32", "93.184.216.34");
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", covered, 10));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", exception, 10));
+    ASSERT_FALSE(any_rule_has(f, "FIRC_DNAT", "multiport"));
+    ASSERT_FALSE(any_rule_has(f, "FIRC_DNAT", "--dport"));
+    ASSERT_EQ_FMT((size_t)2, rule_count(f, "nat", "FIRC_DNAT"), "%zu");
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST an_unrouted_group_gets_neither_range_nor_host_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t real = v4(104, 16, 0, 1), target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "a.example.com", "g1", 1000, &real));
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "b.example.com", "g2", 1000, &real));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_fakeip_set_cf_target(pool, "g2", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, only_g1, &ipt);
+    ASSERT(f != NULL);
+    static const char *host[] = HOST_RULE("198.18.0.1/32", "104.16.0.1");
+    static const char *tcp[] = TCP_RANGE("198.18.0.0/24", "104.16.9.9");
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", host, 10));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", tcp, 16));
+    ASSERT_FALSE(any_rule_has(f, "FIRC_DNAT", "198.18.1.0/24"));
+    ASSERT_FALSE(any_rule_has(f, "FIRC_DNAT", "198.18.1.1/32"));
+    ASSERT_EQ_FMT((size_t)3, rule_count(f, "nat", "FIRC_DNAT"), "%zu");
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST an_exception_comes_before_the_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t cover = v4(104, 16, 0, 1), other = v4(93, 184, 216, 34), target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "x.example.com", "g1", 1000, &other));
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "c.example.com", "g1", 1000, &cover));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *exception[] = HOST_RULE("198.18.0.1/32", "93.184.216.34");
+    static const char *tcp[] = TCP_RANGE("198.18.0.0/24", "104.16.9.9");
+    ssize_t e = rule_index(f, "FIRC_DNAT", exception, 10), t = rule_index(f, "FIRC_DNAT", tcp, 16);
+    ASSERT(e >= 0 && t >= 0);
+    ASSERT(e < t);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST a_parked_exception_comes_before_the_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t cover = v4(104, 16, 0, 1), other = v4(93, 184, 216, 34), target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "x.example.com", "g1", 1000, &other));
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "c.example.com", "g1", 1000 + 86400 - 1, &cover));
+    firc_fakeip_reclaim(pool, 1000 + 86400);
+    firc_ip_t parked = v4(198, 18, 0, 1);
+    ASSERT_EQm("x is parked, not live", NULL, firc_fakeip_name_of(pool, &parked));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *exception[] = HOST_RULE("198.18.0.1/32", "93.184.216.34");
+    static const char *tcp[] = TCP_RANGE("198.18.0.0/24", "104.16.9.9");
+    ssize_t e = rule_index(f, "FIRC_DNAT", exception, 10), t = rule_index(f, "FIRC_DNAT", tcp, 16);
+    ASSERT(e >= 0 && t >= 0);
+    ASSERT(e < t);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST a_covered_cf_pair_comes_after_the_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t cover = v4(104, 16, 0, 1), target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "c.example.com", "g1", 1000, &cover));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV4, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *host[] = HOST_RULE("198.18.0.1/32", "104.16.0.1");
+    static const char *tcp[] = TCP_RANGE("198.18.0.0/24", "104.16.9.9");
+    static const char *udp[] = UDP_RANGE("198.18.0.0/24", "104.16.9.9");
+    ssize_t h = rule_index(f, "FIRC_DNAT", host, 10), t = rule_index(f, "FIRC_DNAT", tcp, 16),
+            u = rule_index(f, "FIRC_DNAT", udp, 16);
+    ASSERT(h >= 0 && t >= 0 && u >= 0);
+    ASSERT(t < u && u < h);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
+TEST the_v6_table_gets_v6_range_rules(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t real = {{0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16};
+    firc_ip_t target = {{0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9}, 16};
+    firc_ip_t v4target = v4(104, 16, 9, 9);
+    ASSERT_EQ(FIRC_OK, cf_name(pool, "a.example.com", "g1", 1000, &real));
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V6, &target);
+    firc_fakeip_set_cf_target(pool, "g1", FIRC_FAM_V4, &v4target);
+    firc_ipt_t *ipt = NULL;
+    firc_fake_ipt_t *f = commit_pool(pool, FIRC_IPT_PROTO_IPV6, NULL, &ipt);
+    ASSERT(f != NULL);
+    static const char *tcp[] = TCP_RANGE("fd37:9a00::/64", "2606:4700::9");
+    static const char *udp[] = UDP_RANGE("fd37:9a00::/64", "2606:4700::9");
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", tcp, 16));
+    ASSERT(has_rule(f, "nat", "FIRC_DNAT", udp, 16));
+    ASSERT_FALSE(any_rule_has(f, "FIRC_DNAT", "104.16.9.9"));
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -479,5 +726,13 @@ int main(int argc, char **argv)
     RUN_TEST(the_dns_remap_registers_its_own_base_chain);
     RUN_TEST(a_wiped_mangle_leaves_only_conditional_dnat);
     RUN_TEST(the_dns_remap_asks_for_no_mark);
+    RUN_TEST(a_cf_chunk_with_a_target_gets_two_range_rules);
+    RUN_TEST(two_cf_chunks_get_two_pairs_of_range_rules);
+    RUN_TEST(no_target_keeps_only_host_rules);
+    RUN_TEST(an_unrouted_group_gets_neither_range_nor_host_rules);
+    RUN_TEST(an_exception_comes_before_the_range_rules);
+    RUN_TEST(a_parked_exception_comes_before_the_range_rules);
+    RUN_TEST(a_covered_cf_pair_comes_after_the_range_rules);
+    RUN_TEST(the_v6_table_gets_v6_range_rules);
     GREATEST_MAIN_END();
 }

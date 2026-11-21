@@ -131,6 +131,7 @@ export type GroupDialogPayload = {
   devices: DeviceSelector;
   list?: { url: string; interval: number } | null;
   resolve: GroupResolve;
+  cloudflare: boolean;
 };
 
 export type VisibleGroup = {
@@ -1761,6 +1762,7 @@ export class GroupsStore {
       enable: true,
       devices: payload.devices,
       resolve: { ...payload.resolve },
+      cloudflare: payload.cloudflare,
       rules: [],
       list: payload.list
         ? {
@@ -1794,6 +1796,7 @@ export class GroupsStore {
       enable: true,
       devices: { allow: [...devices.allow], deny: [...devices.deny] },
       resolve: DEFAULT_RESOLVE(),
+      cloudflare: false,
       rules: [],
     };
     this.data.unshift(group);
@@ -1836,6 +1839,10 @@ export class GroupsStore {
     }
     if (!resolveEqual(group.resolve, payload.resolve)) {
       group.resolve = { ...payload.resolve };
+      changed = true;
+    }
+    if (group.cloudflare !== payload.cloudflare) {
+      group.cloudflare = payload.cloudflare;
       changed = true;
     }
 

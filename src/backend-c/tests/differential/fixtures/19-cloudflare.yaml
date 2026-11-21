@@ -1,0 +1,13 @@
+configVersion: 0.7.0
+groups:
+  - id: 0000af01
+    name: Through Cloudflare
+    interface: nwg0
+    cloudflare: true
+    enable: true
+    rules: []
+  - id: 0000af02
+    name: Plain
+    interface: nwg0
+    enable: true
+    rules: []

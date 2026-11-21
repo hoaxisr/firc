@@ -182,6 +182,8 @@
   "List already exists": "Такой список уже добавлен",
   "List by URL": "Список по URL",
   "Name": "Название",
+  "One Cloudflare address": "Один адрес Cloudflare",
+  "This group's web traffic to Cloudflare sites goes through one checked Cloudflare address.": "Веб-трафик группы к сайтам на Cloudflare идёт через один проверенный адрес Cloudflare.",
   "Names without a protocol limit": "Имена без ограничения протокола",
   "Never updated": "ещё не обновлялся",
   "New Group": "Новая группа",

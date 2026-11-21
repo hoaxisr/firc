@@ -14,15 +14,15 @@
 #include "firc/autolistcand.h"
 #include "firc/autolistcheck.h"
 
-static const firc_sub_fetch_info_t k_none = {false, false, false, false, false, false};
-static const firc_sub_fetch_info_t k_none_timed_out = {false, false, false, true, false, false};
-static const firc_sub_fetch_info_t k_tcp = {true, false, false, false, false, false};
-static const firc_sub_fetch_info_t k_tcp_reset = {true, false, true, false, false, false};
-static const firc_sub_fetch_info_t k_tcp_timed_out = {true, false, false, true, false, false};
-static const firc_sub_fetch_info_t k_tls = {true, true, false, false, false, false};
-static const firc_sub_fetch_info_t k_tls_reset = {true, true, true, false, false, false};
-static const firc_sub_fetch_info_t k_tls_timed_out = {true, true, false, true, false, false};
-static const firc_sub_fetch_info_t k_refused = {false, false, false, false, true, false};
+static const firc_sub_fetch_info_t k_none = {false, false, false, false, false, false, 0};
+static const firc_sub_fetch_info_t k_none_timed_out = {false, false, false, true, false, false, 0};
+static const firc_sub_fetch_info_t k_tcp = {true, false, false, false, false, false, 0};
+static const firc_sub_fetch_info_t k_tcp_reset = {true, false, true, false, false, false, 0};
+static const firc_sub_fetch_info_t k_tcp_timed_out = {true, false, false, true, false, false, 0};
+static const firc_sub_fetch_info_t k_tls = {true, true, false, false, false, false, 0};
+static const firc_sub_fetch_info_t k_tls_reset = {true, true, true, false, false, false, 0};
+static const firc_sub_fetch_info_t k_tls_timed_out = {true, true, false, true, false, false, 0};
+static const firc_sub_fetch_info_t k_refused = {false, false, false, false, true, false, 0};
 
 static firc_autolist_result_t classify(const firc_sub_fetch_info_t *info, uint32_t bytes, bool stalled, bool complete) {
     firc_autolist_result_t r;
@@ -123,7 +123,7 @@ TEST timeout_after_tls_without_body_is_unknown(void) {
 }
 
 TEST reset_wins_over_timeout_before_tls(void) {
-    const firc_sub_fetch_info_t both = {true, false, true, true, false, false};
+    const firc_sub_fetch_info_t both = {true, false, true, true, false, false, 0};
     firc_autolist_result_t r = classify(&both, 0, false, false);
     ASSERT_EQ(FIRC_AUTOLIST_BLOCKED, r.verdict);
     ASSERT_EQ(FIRC_AL_WHY_RESET, r.why);

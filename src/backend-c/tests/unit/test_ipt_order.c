@@ -262,6 +262,30 @@ TEST a_rewrite_is_covered_only_by_a_mark_as_wide(void) {
     PASS();
 }
 
+#define RANGE_TCP "-d 198.18.0.0/24 -p tcp -m multiport --dports 80,443 -m mark --mark 0x40000000/0x40000000 " \
+                  "-j DNAT --to-destination 104.16.9.9"
+#define RANGE_UDP "-d 198.18.0.0/24 -p udp -m udp --dport 443 -m mark --mark 0x40000000/0x40000000 " \
+                  "-j DNAT --to-destination 104.16.9.9"
+
+TEST a_range_rewrite_needs_its_chunks_mark_rule(void) {
+    static const struct {
+        const char *mark, *dnat;
+        firc_err_t want;
+    } k[] = {
+        {"198.18.0.0/24", RANGE_TCP, FIRC_OK},
+        {"198.18.0.0/24", RANGE_UDP, FIRC_OK},
+        {"198.18.1.0/24", RANGE_TCP, FIRC_ERR_INVAL},
+        {"198.18.1.0/24", RANGE_UDP, FIRC_ERR_INVAL},
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        firc_fake_ipt_t *f;
+        firc_ipt_t *ipt = engine(&f);
+        ASSERT_EQ_FMTm(k[i].dnat, k[i].want, one_rewrite(ipt, k[i].mark, k[i].dnat), "%d");
+        firc_ipt_free(ipt);
+    }
+    PASS();
+}
+
 /* Catches: a group chain PREROUTING does not jump to unconditionally counted as the mark a rewrite rests on. */
 TEST an_unjumped_group_chain_covers_nothing(void) {
     firc_fake_ipt_t *f;
@@ -570,6 +594,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_refused_last_nat_part_leaves_every_rewrite_marked);
     RUN_TEST(a_refused_first_nat_part_writes_nothing_else);
     RUN_TEST(a_rewrite_is_covered_only_by_a_mark_as_wide);
+    RUN_TEST(a_range_rewrite_needs_its_chunks_mark_rule);
     RUN_TEST(an_unjumped_group_chain_covers_nothing);
     RUN_TEST(a_nat_staging_outside_the_marks_is_refused);
     RUN_TEST(a_refused_mangle_after_the_first_nat_part_leaves_no_rewrite);
