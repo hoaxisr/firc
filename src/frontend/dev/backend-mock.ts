@@ -13,6 +13,7 @@ const INTERFACES: Interfaces = {
   interfaces: [
     { id: "blackhole" },
     { id: "block" },
+    { id: "dns" },
     { id: "nwg0", name: "WARP", ndmsName: "Wireguard0", role: "tunnel" },
     { id: "nwg1", name: "AmneziaWG NL", ndmsName: "Wireguard1", role: "tunnel" },
     { id: "nwg2", ndmsName: "Wireguard2", role: "tunnel" },
@@ -45,6 +46,9 @@ function resolverOf(group: any, active: string) {
   const resolve = group.resolve ?? { tunnel: true, server: "" };
   const health = FLAKY[group.id] ?? CALM;
   const live = (servers: string[]) => (group.enable === false ? [] : servers);
+  if (group.interface === "dns") {
+    return { source: "group", servers: live(serverEntries(resolve.server)), health };
+  }
   if (!resolve.tunnel) return { source: "off", servers: [], health: CALM };
   if (active === "blackhole" || active === "block") {
     return { source: "none", servers: [], health: CALM };
@@ -63,7 +67,19 @@ function serverEntries(server: string): string[] {
 
 function resolveRefusal(group: any): { error: string; field: string; group: string } | null {
   const value: string = group?.resolve?.server ?? "";
-  if (!value) return null;
+  const isDns = group?.interface === "dns";
+  if (group?.resolve?.fallback === false && !isDns) {
+    return {
+      error: "resolve.fallback can be off only on a dns group",
+      field: "resolve.fallback",
+      group: group.id,
+    };
+  }
+  if (!value) {
+    return isDns
+      ? { error: "a dns group needs resolve.server", field: "resolve.server", group: group.id }
+      : null;
+  }
   const refuse = (why: string) => ({
     error: `resolve.server "${value}" ${why}`,
     field: "resolve.server",
@@ -83,6 +99,15 @@ function resolveRefusal(group: any): { error: string; field: string; group: stri
 }
 
 function entryRefusal(server: string, id: string) {
+  if (server.includes("://")) {
+    return /^https:\/\/[^\s/?#@]+\/[^\s?#]*$/i.test(server) && server.length <= 255
+      ? null
+      : {
+          error: `resolve.server "${server}" is not a DoH URL (https://host[:port]/path)`,
+          field: "resolve.server",
+          group: id,
+        };
+  }
   const host = server.startsWith("[")
     ? server.slice(1, server.indexOf("]"))
     : server.split(":").length === 2
@@ -234,6 +259,7 @@ const ACTIVE: Record<string, number> = {};
 function liveOf(group: any, active: string): { live: boolean; liveReason?: string } {
   if (group.enable === false) return { live: false, liveReason: "disabled" };
   if (DNS_HOLDER !== undefined) return { live: false, liveReason: "dns-down" };
+  if (group.interface === "dns") return { live: true };
   const forced = LIVE_REASONS[group.id];
   if (forced && forced !== "not-written") return { live: false, liveReason: forced };
   const tunnel = TUNNELS.find((tn) => tn.device === active);
@@ -246,9 +272,13 @@ function liveOf(group: any, active: string): { live: boolean; liveReason?: strin
 }
 
 function groupRes({ list, rules: handRules, block, ...group }: any, withRules = false) {
+  const isDns = group.interface === "dns";
+  const baseResolve = group.resolve ?? { tunnel: true, server: "" };
   const withResolve = {
     ...group,
-    resolve: group.resolve ?? { tunnel: true, server: "" },
+    resolve: isDns
+      ? { server: baseResolve.server, fallback: baseResolve.fallback !== false }
+      : { ...baseResolve, fallback: true },
     cloudflare: group.interface !== "block" && group.cloudflare === true,
     ...(group.interface === "block" ? { block: block ?? "null" } : {}),
   };
@@ -698,6 +728,7 @@ app.put(`${API_BASE}/groups`, async (c) => {
     const { list, startSync } = applyListFromReq(existing, group);
     const merged: any = { ...rest };
     if (rest.interface !== "block") delete merged.block;
+    if (rest.interface !== "dns" && merged.resolve) delete merged.resolve.fallback;
     else if (rest.block === undefined) merged.block = existing?.block ?? "null";
     else if (rest.block === null) merged.block = "null";
     if (list !== undefined) merged.list = list;

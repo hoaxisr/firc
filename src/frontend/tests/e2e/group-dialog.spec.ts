@@ -473,3 +473,139 @@ test.describe("Group dialog: finding a list by name", () => {
     await expect(dialog.locator(".catalog-panel")).toContainText("ничего не найдено");
   });
 });
+
+test.describe("Group dialog: DNS only", () => {
+  const IFACES = [
+    { id: "blackhole" },
+    { id: "block" },
+    { id: "dns" },
+    { id: "nwg0", role: "tunnel" },
+  ];
+  const URL_ONE = "https://dns.comss.one/dns-query";
+
+  async function setup(page: Page, groups: unknown[] = []) {
+    await signedIn(page);
+    await page.route("**/interfaces", (route) => route.fulfill({ json: { interfaces: IFACES } }));
+    await page.route("**/system/resolvers", (route) => route.fulfill({ json: { resolvers: [] } }));
+    let live = groups;
+    await page.route("**/groups?with_rules=true", (route) =>
+      route.fulfill({ json: { groups: live } }),
+    );
+    const saved: any[] = [];
+    await page.route(/\/groups(\?.*)?$/, async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.fallback();
+        return;
+      }
+      const body = route.request().postDataJSON();
+      saved.push(body);
+      live = body.groups;
+      await route.fulfill({ json: { groups: body.groups } });
+    });
+    await page.route("**/system/config/save", (route) => route.fulfill({ json: {} }));
+    await page.goto("/");
+    return saved;
+  }
+
+  async function pickDns(page: Page) {
+    const dialog = page.getByRole("dialog");
+    await dialog.locator(".interface-select [data-select-trigger]").click();
+    await page.locator('[data-select-item][data-value="dns"]').click();
+    return dialog;
+  }
+
+  test("a dns group without a server shows the error and is not created", async ({ page }) => {
+    const saved = await setup(page);
+    await page.locator('[data-value="Add Group"] button').click();
+    const dialog = await pickDns(page);
+    await dialog.locator("#gd-name").fill("Comss");
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await expect(dialog.locator(".dns-server-error")).toHaveText("A DNS only group needs a server");
+    await expect(dialog).toBeVisible();
+    expect(saved).toHaveLength(0);
+    await dialog.locator("#gd-dns-server").fill(URL_ONE);
+    await expect(dialog.locator(".dns-server-error")).toHaveCount(0);
+  });
+
+  test("a DoH link and the fallback switch go to the PUT and come back on reopen", async ({
+    page,
+  }) => {
+    const saved = await setup(page);
+    await page.locator('[data-value="Add Group"] button').click();
+    const dialog = await pickDns(page);
+    await dialog.locator("#gd-name").fill("Comss");
+    await expect(dialog.locator("#gd-dns [data-select-trigger]")).toHaveCount(0);
+    await dialog.locator("#gd-dns-server").fill(URL_ONE);
+    const fallback = dialog.getByRole("switch", { name: "Fall back to the common DNS" });
+    await expect(fallback).toHaveAttribute("aria-checked", "true");
+    await fallback.click();
+    await expect(fallback).toHaveAttribute("aria-checked", "false");
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await page.locator("#save-changes").click();
+    await expect.poll(() => saved.length).toBe(1);
+    const sent = saved[0].groups[0];
+    expect(sent.interface).toBe("dns");
+    expect(sent.resolve.server).toBe(URL_ONE);
+    expect(sent.resolve.fallback).toBe(false);
+
+    await page.getByRole("button", { name: "Group Settings" }).first().click();
+    const again = page.getByRole("dialog");
+    await expect(again.locator("#gd-dns-server")).toHaveValue(URL_ONE);
+    await expect(
+      again.getByRole("switch", { name: "Fall back to the common DNS" }),
+    ).toHaveAttribute("aria-checked", "false");
+  });
+
+  test("a group moved off dns sends no fallback key", async ({ page }) => {
+    const saved = await setup(page, [
+      {
+        id: "0a000001",
+        name: "Comss",
+        interface: "dns",
+        enable: true,
+        devices: { allow: [], deny: [] },
+        resolve: { tunnel: true, server: URL_ONE, fallback: false },
+        rules: [],
+        live: true,
+      },
+    ]);
+    await page.locator(".group .iface-select [data-select-trigger]").first().click();
+    await page.locator('[data-select-item][data-value="nwg0"]').click();
+    await page.locator("#save-changes").click();
+    await expect.poll(() => saved.length).toBe(1);
+    expect(saved[0].groups[0].interface).toBe("nwg0");
+    expect("fallback" in saved[0].groups[0].resolve).toBe(false);
+  });
+
+  test("toggling only the fallback of an existing dns group reaches the PUT both ways", async ({
+    page,
+  }) => {
+    const saved = await setup(page, [
+      {
+        id: "0a000001",
+        name: "Comss",
+        interface: "dns",
+        enable: true,
+        devices: { allow: [], deny: [] },
+        resolve: { server: URL_ONE, fallback: true },
+        rules: [],
+        live: true,
+      },
+    ]);
+    const toggle = async () => {
+      await page.getByRole("button", { name: "Group Settings" }).first().click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByRole("switch", { name: "Fall back to the common DNS" }).click();
+      await dialog.getByRole("button", { name: "Save", exact: true }).click();
+      await dialog.waitFor({ state: "hidden" });
+      await page.locator("#save-changes").click();
+    };
+    await toggle();
+    await expect.poll(() => saved.length).toBe(1);
+    expect(saved[0].groups[0].resolve.fallback).toBe(false);
+    await toggle();
+    await expect.poll(() => saved.length).toBe(2);
+    expect(saved[1].groups[0].resolve.fallback).not.toBe(false);
+  });
+});

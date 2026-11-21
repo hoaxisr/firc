@@ -120,4 +120,14 @@ describe("Groups data API", () => {
     assert.strictEqual("block" in payload.groups[1], false);
     assert.strictEqual(moved.block, "refused");
   });
+
+  it("sends resolve.fallback only for a group on dns", () => {
+    const resolve = { tunnel: true, server: "9.9.9.9", fallback: false };
+    const only = { ...makeGroup("g1", []), interface: "dns", resolve };
+    const moved = { ...makeGroup("g2", []), interface: "nwg0", resolve };
+    const payload = toConfigPayload([only, moved]);
+    assert.deepStrictEqual(payload.groups[0].resolve, resolve);
+    assert.deepStrictEqual(payload.groups[1].resolve, { tunnel: true, server: "9.9.9.9" });
+    assert.strictEqual(moved.resolve.fallback, false);
+  });
 });

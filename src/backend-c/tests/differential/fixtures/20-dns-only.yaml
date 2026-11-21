@@ -1,0 +1,22 @@
+configVersion: 0.8.2
+groups:
+  - id: 0000af01
+    name: Plain DNS
+    interface: dns
+    enable: true
+    resolve:
+      server: 9.9.9.9
+    rules:
+      - id: 0000af11
+        rule: example.com
+        type: namespace
+        enable: true
+  - id: 0000af02
+    name: Strict DNS
+    interface: dns
+    enable: true
+    resolve:
+      tunnel: false
+      server: 1.1.1.1, 9.9.9.9
+      fallback: false
+    rules: []

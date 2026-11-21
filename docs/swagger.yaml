@@ -531,11 +531,12 @@ definitions:
         - pool-refused
         - passed
         - blocked
+        - dns-only
         type: string
       resolver:
         description: >-
           Where the answer came from (present only when kind=dns): upstream --
-          the common upstream; group -- the group's DNS through its tunnel;
+          the common upstream; group -- the group's DNS (through its tunnel on a routed group, without a mark on a dns group);
           fallback_* -- the group's DNS failed and the common upstream
           answered (unreachable -- the tunnel is down, timeout -- no answer in
           time, servfail/refused -- it answered SERVFAIL/REFUSED or garbage,
@@ -543,8 +544,9 @@ definitions:
           pool); health_skip -- the group's DNS is resting after three
           failures in a row and the common upstream was asked; cache -- the
           group's DNS answered this name earlier and that answer was still
-          valid; local -- firc answered itself, because the name's owner is a
-          block group (decision=blocked).
+          valid; local -- firc answered itself: the name's owner is a block group
+          (decision=blocked), or a dns group without fallback got no answer
+          and firc answered SERVFAIL.
         enum:
         - upstream
         - group
@@ -612,6 +614,7 @@ definitions:
             - pool-refused
             - passed
             - blocked
+            - dns-only
             type: string
           at:
             description: 'Unix time of that answer, seconds'
@@ -945,7 +948,7 @@ definitions:
     properties:
       cloudflare:
         default: false
-        description: 'Cloudflare names of this group share one DNAT target. Absent on PUT keeps the current value; anything but a boolean is a 400 with field cloudflare; true on a group whose interface is block is a 400 with field cloudflare.'
+        description: 'Cloudflare names of this group share one DNAT target. Absent on PUT keeps the current value; anything but a boolean is a 400 with field cloudflare; true on a group whose interface is block or dns is a 400 with field cloudflare.'
         type: boolean
       block:
         description: 'Only for a group whose interface is block: how its names are answered. Absent on PUT keeps the current answer; null or "null" is the default; anything but null, nxdomain and refused is a 400 with field block. Ignored on any other group.'
@@ -964,7 +967,7 @@ definitions:
         example: 0a1b2c3d
         type: string
       interface:
-        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole and block only alone. block routes nothing and answers the group''s names locally. A list of one is saved and answered as a string.'
+        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole, block and dns only alone. block routes nothing and answers the group''s names locally. dns routes nothing and answers them from the group''s own resolve.server (required; no subnet rules). A list of one is saved and answered as a string.'
         example: nwg0
       list:
         $ref: '#/definitions/types.GroupList'
@@ -1009,7 +1012,7 @@ definitions:
         example: 0a1b2c3d
         type: string
       interface:
-        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole and block only alone. block routes nothing and answers the group''s names locally. A list of one is saved and answered as a string.'
+        description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole, block and dns only alone. block routes nothing and answers the group''s names locally. dns routes nothing and answers them from the group''s own resolve.server (required; no subnet rules). A list of one is saved and answered as a string.'
         example: nwg0
       interfaces:
         description: 'Only for a list of two or more: each entry and its check state, in list order.'
@@ -1047,20 +1050,34 @@ definitions:
     type: object
   types.GroupResolve:
     properties:
+      fallback:
+        default: true
+        description: >-
+          Only a dns group may set it false: the common upstream then never
+          answers in the group's place. Absent keeps the group's own value on a
+          PUT; true on any other group; false on a group that is not dns is a
+          400 with field resolve.fallback. A PUT that moves a group off dns
+          without the key resets it to true.
+        example: true
+        type: boolean
       server:
         description: >-
           The group's own DNS -- one to four servers separated by commas,
-          each address[:port] (IPv6 with a port in brackets), blanks around
-          each ignored, none twice; kept in the written order (preferred
-          first), IPv4 first.
+          each address[:port] (IPv6 with a port in brackets) or a DoH URL
+          https://host[:port]/path (at most 255 bytes, http:// refused),
+          blanks around each ignored, none twice, at most four entries in
+          all; kept in the written order (preferred first), IPv4 first.
           Empty -- the DNS servers the firmware bound to the group's
-          interface. Not 0.0.0.0, ::, 127.0.0.0/8, ::1, or an address from
-          firc's pool. The query goes through the group's tunnel, so a DNS
-          server on the local network will not work this way.
+          interface; a dns group needs a server, empty is a 400. Not
+          0.0.0.0, ::, 127.0.0.0/8, ::1, or an address from firc's pool.
+          On a routed group the query goes through the group's tunnel, so a
+          DNS server on the local network will not work this way. On a dns
+          group the servers are asked without a mark, through the router's
+          own routing.
         example: 9.9.9.9
         type: string
       tunnel:
-        description: 'Resolve the group''s names through its tunnel; true by default'
+        description: 'Resolve the group''s names through its tunnel; true by default. Ignored on a dns group and not answered for one.'
         example: true
         type: boolean
     type: object
@@ -1070,11 +1087,13 @@ definitions:
         $ref: '#/definitions/types.GroupResolverHealth'
       servers:
         description: >-
-          The group's DNS servers, in query order (IPv4 first). An empty list
+          The group's DNS servers, in query order: IPv4 addresses, IPv6
+          addresses, then DoH URLs (an entry may be a URL). An empty list
           with source "group" or "firmware" does not mean the group has no
           DNS: it means none is usable right now (the group is off or not yet
           in the kernel, or the group has only an IPv6 address and no IPv6
-          route), and its names go to the common upstream.
+          route). Its names then go to the common upstream; on a dns group
+          without fallback they are answered SERVFAIL instead.
         items:
           type: string
         type: array
@@ -1097,7 +1116,7 @@ definitions:
       when source is "off" or servers is empty.
     properties:
       fallbacks:
-        description: 'Queries in the window that went to the common upstream instead of the group''s DNS'
+        description: 'Queries in the window that went to the common upstream instead of the group''s DNS. On a dns group without fallback nothing goes to the common upstream: it counts the exchanges that failed (no answer in time, transport failure, no usable server) and were answered SERVFAIL'
         example: 4
         type: integer
       last:
@@ -1167,7 +1186,7 @@ definitions:
         example: Wireguard2
         type: string
       role:
-        description: 'tunnel (a tunvless device, or point-to-point and not external), wan (external by its Keenetic role), lan (a br<N> segment) or other; absent on blackhole and block'
+        description: 'tunnel (a tunvless device, or point-to-point and not external), wan (external by its Keenetic role), lan (a br<N> segment) or other; absent on blackhole, block and dns'
         enum:
         - tunnel
         - wan
@@ -3866,7 +3885,7 @@ paths:
       - system
   /api/v1/system/interfaces:
     get:
-      description: 'Returns blackhole and block, then the router''s interfaces but lo, ezcfg0 and the Wi-Fi radios ra<N>/rai<N> and their sub-interfaces; on Keenetic only tunnels and interfaces NDMS knows (all of the rest when NDMS gives no data)'
+      description: 'Returns blackhole, block and dns, then the router''s interfaces but lo, ezcfg0 and the Wi-Fi radios ra<N>/rai<N> and their sub-interfaces; on Keenetic only tunnels and interfaces NDMS knows (all of the rest when NDMS gives no data)'
       produces:
       - application/json
       responses:

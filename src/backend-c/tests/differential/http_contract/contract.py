@@ -217,13 +217,14 @@ def _normalize_host_interfaces(obj):
     interfaces = obj["interfaces"]
     if (
         not isinstance(interfaces, list)
-        or len(interfaces) < 2
+        or len(interfaces) < 3
         or interfaces[0] != {"id": "blackhole"}
         or interfaces[1] != {"id": "block"}
-        or not all(_host_interface_ok(item) for item in interfaces[2:])
+        or interfaces[2] != {"id": "dns"}
+        or not all(_host_interface_ok(item) for item in interfaces[3:])
     ):
         return obj
-    return {"interfaces": [{"id": "blackhole"}, {"id": "block"}, {"id": "<HOST-INTERFACES>"}]}
+    return {"interfaces": [{"id": "blackhole"}, {"id": "block"}, {"id": "dns"}, {"id": "<HOST-INTERFACES>"}]}
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):

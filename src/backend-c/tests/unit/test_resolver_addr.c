@@ -294,6 +294,166 @@ TEST a_server_inside_the_pool_is_refused_at_startup(void)
     PASS();
 }
 
+TEST a_doh_url_is_an_entry(void)
+{
+    firc_resolver_list_t l;
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse("  https://dns.comss.one/dns-query ", &l, NULL, 0));
+    ASSERT_EQ((size_t)1, l.n);
+    ASSERT(l.servers[0].doh);
+    ASSERT_STR_EQ("https://dns.comss.one/dns-query", l.urls[0]);
+    ASSERT_EQ(0, l.servers[0].ip.len);
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse("HTTPS://[2606:4700::1111]:8443/q", &l, NULL, 0));
+    ASSERT_STR_EQ("HTTPS://[2606:4700::1111]:8443/q", l.urls[0]);
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse("https://1.1.1.1/", &l, NULL, 0));
+    ASSERT(l.servers[0].doh);
+    PASS();
+}
+
+TEST literals_and_urls_mix_up_to_four(void)
+{
+    firc_resolver_list_t l;
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK,
+              firc_resolver_list_parse("1.1.1.1, https://a.example/dns, [2620:fe::fe]:853,https://b.example:444/x", &l,
+                                       NULL, 0));
+    ASSERT_EQ((size_t)4, l.n);
+    ASSERT_FALSE(l.servers[0].doh);
+    ASSERT(l.servers[1].doh);
+    ASSERT_FALSE(l.servers[2].doh);
+    ASSERT(l.servers[3].doh);
+    ASSERT_STR_EQ("https://a.example/dns", l.urls[1]);
+    ASSERT_STR_EQ("https://b.example:444/x", l.urls[3]);
+    ASSERT_EQ(4, l.servers[0].ip.len);
+    ASSERT_EQ(853, l.servers[2].port);
+    PASS();
+}
+
+TEST a_fifth_entry_is_refused_whatever_its_kind(void)
+{
+    firc_resolver_list_t l;
+    ASSERT_EQ(FIRC_RESOLVER_LIST_TOO_MANY,
+              firc_resolver_list_parse("1.1.1.1,9.9.9.9,https://a.example/d,https://b.example/d,https://c.example/d",
+                                       &l, NULL, 0));
+    ASSERT_EQ(FIRC_RESOLVER_LIST_TOO_MANY,
+              firc_resolver_list_parse("https://a.example/d,https://b.example/d,https://c.example/d,"
+                                       "https://d.example/d,1.1.1.1",
+                                       &l, NULL, 0));
+    PASS();
+}
+
+TEST a_url_that_is_not_https_or_not_well_formed_is_refused(void)
+{
+    const char *bad[] = {
+        "http://dns.example/dns-query",
+        "ftp://dns.example/x",
+        "https:///dns-query",
+        "https://:443/dns-query",
+        "https://dns.example",
+        "https://dns.example:443",
+        "https://user@dns.example/dns-query",
+        "https://dns.example/dns-query?x=1",
+        "https://dns.example/dns-query#f",
+        "https://dns.example/dns query",
+        "https://dns.example:0/x",
+        "https://dns.example:65536/x",
+        "https://dns.example:44x/x",
+        "https://[2606:4700::1111/x",
+        "https://[]/x",
+        "https://[abc]/x",
+        "https://[1.1.1.1]/x",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        firc_resolver_list_t l;
+        ASSERT_EQm(bad[i], FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse(bad[i], &l, NULL, 0));
+        ASSERT_EQm(bad[i], (size_t)0, l.n);
+    }
+    PASS();
+}
+
+TEST http_is_refused(void)
+{
+    firc_resolver_list_t l;
+    char why[256];
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse("1.1.1.1, http://dns.example/dns-query", &l, why, sizeof(why)));
+    ASSERT(strstr(why, "https") != NULL);
+    PASS();
+}
+
+TEST a_url_twin_is_refused(void)
+{
+    firc_resolver_list_t l;
+    char why[256];
+    ASSERT_EQ(FIRC_RESOLVER_LIST_DUPLICATE,
+              firc_resolver_list_parse("https://a.example/d, 1.1.1.1, https://a.example/d", &l, why, sizeof(why)));
+    ASSERT_STR_EQ("\"https://a.example/d, 1.1.1.1, https://a.example/d\" names \"https://a.example/d\" twice", why);
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse("https://a.example/d, https://a.example/D", &l, NULL, 0));
+    ASSERT_EQ((size_t)2, l.n);
+    PASS();
+}
+
+TEST a_url_without_a_host_is_refused(void)
+{
+    firc_resolver_list_t l;
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse("https:///", &l, NULL, 0));
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse("https://", &l, NULL, 0));
+    PASS();
+}
+
+TEST a_256_byte_url_is_refused(void)
+{
+    char url[300];
+    firc_resolver_list_t l;
+    size_t pre = strlen("https://a.example/");
+    memcpy(url, "https://a.example/", pre);
+    memset(url + pre, 'x', 255 - pre);
+    url[255] = '\0';
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse(url, &l, NULL, 0));
+    ASSERT_EQ((size_t)255, strlen(l.urls[0]));
+    memset(url + pre, 'x', 256 - pre);
+    url[256] = '\0';
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse(url, &l, NULL, 0));
+    PASS();
+}
+
+TEST the_why_names_the_bad_url(void)
+{
+    firc_resolver_list_t l;
+    char why[256];
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL,
+              firc_resolver_list_parse("1.1.1.1, https://a.example", &l, why, sizeof(why)));
+    ASSERT(strncmp(why, "\"https://a.example\" ", 20) == 0);
+    ASSERT(strstr(why, "https://host[:port]/path") != NULL);
+    char tiny[8];
+    ASSERT_EQ(FIRC_RESOLVER_LIST_URL, firc_resolver_list_parse("https://a.example", &l, tiny, sizeof(tiny)));
+    ASSERT_STR_EQ("\"https:", tiny);
+    PASS();
+}
+
+TEST the_pool_check_skips_a_url_but_not_a_literal_host_inside_the_pool(void)
+{
+    firc_fakeip_t *pool = pool_for_test();
+    ASSERT(pool != NULL);
+    char hit[FIRC_RESOLVER_ADDR_STRLEN];
+    ASSERT_FALSE(firc_resolve_server_in_pool("https://dns.example/q, 1.1.1.1", pool, hit, sizeof(hit)));
+    ASSERT_FALSE(firc_resolve_server_in_pool("https://198.20.0.1/q", pool, NULL, 0));
+    ASSERT(firc_resolve_server_in_pool("https://dns.example/q,https://198.18.0.9:8443/q", pool, hit, sizeof(hit)));
+    ASSERT_STR_EQ("198.18.0.9", hit);
+    ASSERT(firc_resolve_server_in_pool("https://[fd00:1234::53]/q", pool, NULL, 0));
+    ASSERT_FALSE(firc_resolve_server_in_pool("https://[fd00:1235::53]/q", pool, NULL, 0));
+    firc_fakeip_free(pool);
+    unlink(g_ula);
+    PASS();
+}
+
+TEST a_doh_entry_formats_as_its_url(void)
+{
+    firc_resolver_list_t l;
+    char buf[300];
+    ASSERT_EQ(FIRC_RESOLVER_LIST_OK, firc_resolver_list_parse("https://a.example/d", &l, NULL, 0));
+    ASSERT_EQ((size_t)0, firc_resolver_addr_format(&l.servers[0], buf, sizeof(buf)));
+    ASSERT_STR_EQ("", buf);
+    PASS();
+}
+
 /* Catches: firc_group_new not defaulting to the tunnel. */
 TEST a_new_group_resolves_through_its_tunnel(void)
 {
@@ -319,6 +479,17 @@ int main(int argc, char **argv)
     RUN_TEST(a_list_of_servers_splits_in_order);
     RUN_TEST(a_bad_list_is_refused_naming_what_is_wrong);
     RUN_TEST(a_server_inside_the_pool_is_refused_at_startup);
+    RUN_TEST(a_doh_url_is_an_entry);
+    RUN_TEST(literals_and_urls_mix_up_to_four);
+    RUN_TEST(a_fifth_entry_is_refused_whatever_its_kind);
+    RUN_TEST(a_url_that_is_not_https_or_not_well_formed_is_refused);
+    RUN_TEST(http_is_refused);
+    RUN_TEST(a_url_twin_is_refused);
+    RUN_TEST(a_url_without_a_host_is_refused);
+    RUN_TEST(a_256_byte_url_is_refused);
+    RUN_TEST(the_why_names_the_bad_url);
+    RUN_TEST(the_pool_check_skips_a_url_but_not_a_literal_host_inside_the_pool);
+    RUN_TEST(a_doh_entry_formats_as_its_url);
     RUN_TEST(a_new_group_resolves_through_its_tunnel);
     GREATEST_MAIN_END();
 }

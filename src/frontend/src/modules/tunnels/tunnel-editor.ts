@@ -1,6 +1,6 @@
 import {
   ifaceTitle,
-  isSink,
+  isSynthetic,
   isTunnelDevice,
   moreText,
   splitDevice,
@@ -126,7 +126,7 @@ export function uplinkOptions(
   t: T,
   more: { opened?: boolean | null; onToggle?: () => void; locale?: string } = {},
 ): UplinkOption[] {
-  const usable = ifaces.filter((i) => !isSink(i.id) && !isTunnelDevice(i.id, tunnels));
+  const usable = ifaces.filter((i) => !isSynthetic(i.id) && !isTunnelDevice(i.id, tunnels));
   const head = usable.filter((i) => i.role === "wan" || i.role === "tunnel");
   const rest = usable.filter((i) => i.role !== "wan" && i.role !== "tunnel");
   const expanded =

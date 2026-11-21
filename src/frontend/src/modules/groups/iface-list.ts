@@ -1,4 +1,4 @@
-import { isSink } from "../../data/iface-choices";
+import { isSynthetic } from "../../data/iface-choices";
 import type { GroupLive } from "./live-state";
 
 export type IfaceState = {
@@ -29,7 +29,7 @@ export function sharedChain(groups: readonly { interface: string | string[] }[])
 }
 
 export function canBackup(list: string[], name: string): boolean {
-  if (isSink(name) || list.some(isSink)) return false;
+  if (isSynthetic(name) || list.some(isSynthetic)) return false;
   return list.includes(name) || list.length < IFACES_MAX;
 }
 

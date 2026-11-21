@@ -18,7 +18,8 @@ export type DnsDecision =
   | "no-match"
   | "pool-refused"
   | "passed"
-  | "blocked";
+  | "blocked"
+  | "dns-only";
 
 export type DnsResolverSource =
   | "upstream"

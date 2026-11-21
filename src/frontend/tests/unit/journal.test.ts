@@ -587,6 +587,50 @@ describe("the group resolver's lines", () => {
   });
 });
 
+describe("a dns only group's journal", () => {
+  const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
+  const only = (o: Partial<DnsEvent> = {}) =>
+    dns({
+      decision: "dns-only",
+      resolver: "group",
+      group: { id: "g9", name: "Comss" },
+      fake: undefined,
+      reals: [],
+      ...o,
+    });
+  it("says dns only, in Russian too, and the resolver that answered", () => {
+    assert.strictEqual(describeDnsTail(only(), id), "A → Comss · dns only · via the group's DNS");
+    assert.strictEqual(describeDnsTail(only(), tr), "A → Comss · только DNS · через DNS группы");
+  });
+  it("names a refused answer's rcode", () => {
+    assert.strictEqual(
+      describeDnsTail(only({ rcode: "SERVFAIL", resolver: "local" }), id),
+      "A → Comss · dns only, SERVFAIL · answered by firc",
+    );
+  });
+  it("puts the no-fallback closing line and the resolver opening line in Russian", () => {
+    const names = new Map([["e61a8095", "Comss"]]);
+    const closed = log({
+      level: "warn",
+      message:
+        'group resolver: group "Comss" (e61a8095): 3 consecutive failures, the group\'s names are answered SERVFAIL until one query every 30 s finds its resolver answering',
+    });
+    const opened = log({
+      level: "info",
+      message:
+        'group resolver: group "Comss" (e61a8095): answering again; the group\'s names go to its resolver',
+    });
+    assert.strictEqual(
+      describeLog(closed, tr, names),
+      "Comss · DNS группы не отвечает (сбоев подряд: 3), имена группы получают SERVFAIL. firc проверяет его раз в 30 с.",
+    );
+    assert.strictEqual(
+      describeLog(opened, tr, names),
+      "Comss · DNS группы снова отвечает, имена группы снова идут через него",
+    );
+  });
+});
+
 describe("the group resolver's lines with a quoted name", () => {
   const tr = (key: string) => (ru as Record<string, string>)[key] ?? key;
   const probeOf = (name: string) =>

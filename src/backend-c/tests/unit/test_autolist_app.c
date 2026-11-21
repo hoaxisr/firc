@@ -1382,6 +1382,23 @@ TEST block_group_is_not_running(void) {
     PASS();
 }
 
+TEST autolist_never_targets_a_dns_group(void) {
+    rig_t r;
+    setup_t su = {.iface = "dns", .group_extra = "    resolve: {server: 9.9.9.9}\n"};
+    ASSERT(rig_up_with(&r, &su));
+    cJSON *st = status();
+    ASSERT(st != NULL);
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(st, "running")));
+    ASSERT_STR_EQ("the group only answers DNS: nothing to route its names into", str_of(st, "whyOff"));
+    cJSON_Delete(st);
+    ASSERT_EQ(409, probe_host("x.example"));
+    ASSERT_EQ(409, request_body("POST", "/api/v1/system/autolist/addresses/203.0.113.7/dismiss",
+                                "{\"proto\":\"tcp\",\"port\":443}", g_buf, sizeof(g_buf)));
+    rig_stop_loop(&r);
+    rig_down(&r);
+    PASS();
+}
+
 TEST add_mode_logs_the_write(void) {
     int fds[2];
     ASSERT_EQ(0, pipe(fds));
@@ -2358,6 +2375,41 @@ TEST a_block_or_uncovering_group_does_not_count(void) {
     PASS();
 }
 
+static const char WATCH_DNS_GROUPS[] =
+    "groups:\n"
+    "  - id: 0d0d0d0d\n"
+    "    name: Answers\n"
+    "    interface: dns\n"
+    "    enable: true\n"
+    "    resolve: {server: 9.9.9.9}\n"
+    "    rules:\n"
+    "      - {id: 00000014, type: namespace, rule: answers.test, enable: true}\n"
+    "  - id: 0a0b0c0d\n"
+    "    name: Autolist\n"
+    "    interface: nwg9\n"
+    "    enable: true\n"
+    "    rules:\n"
+    "      - {id: 00000013, type: namespace, rule: example.com, enable: true}\n";
+
+TEST a_dns_group_does_not_count(void) {
+    rig_t r;
+    uint16_t up = 0;
+    int fd = udp_upstream(&up);
+    ASSERT(fd >= 0);
+    static char more[128];
+    snprintf(more, sizeof(more), "  dnsProxy: {upstream: {address: 127.0.0.1, port: %u}}\n", (unsigned)up);
+    setup_t su = {.app_more = more, .groups = WATCH_DNS_GROUPS};
+    ASSERT(rig_up_with(&r, &su));
+    ASSERT(recall(&r, addr4(23), "cdn.answers.test", "0d0d0d0d"));
+    ASSERT(recall(&r, addr4(22), "www.example.com", "0a0b0c0d"));
+    ASSERT(flow_to(&r, CLIENT, addr4(23), 17, 40000, 443));
+    ASSERT_EQ(0, bypass_rows(&r, NULL, NULL));
+    ASSERT(flow_to(&r, CLIENT, addr4(22), 17, 40000, 443));
+    ASSERT_EQ(1, bypass_rows(&r, NULL, NULL));
+    watch_down(&r, fd);
+    PASS();
+}
+
 TEST an_sni_of_a_group_name_is_a_bypass_by_sni(void) {
     rig_t r;
     int fd = -1;
@@ -2656,6 +2708,7 @@ int main(int argc, char **argv) {
     RUN_TEST(recheck_goes_through_the_budget);
     RUN_TEST(list_group_takes_the_rule);
     RUN_TEST(block_group_is_not_running);
+    RUN_TEST(autolist_never_targets_a_dns_group);
     RUN_TEST(add_mode_logs_the_write);
     RUN_TEST(open_probe_clears_a_checking_candidate);
     RUN_TEST(a_check_while_the_list_is_off_is_refused);
@@ -2687,6 +2740,7 @@ int main(int argc, char **argv) {
     RUN_TEST(an_sni_with_another_hinted_name_is_still_a_bypass);
     RUN_TEST(a_tcp_443_syn_sends_no_ptr);
     RUN_TEST(a_block_or_uncovering_group_does_not_count);
+    RUN_TEST(a_dns_group_does_not_count);
     RUN_TEST(an_sni_of_a_group_name_is_a_bypass_by_sni);
     RUN_TEST(a_ptr_name_of_a_group_is_a_bypass_by_ptr);
     RUN_TEST(ptr_lookups_stop_at_30_a_minute);

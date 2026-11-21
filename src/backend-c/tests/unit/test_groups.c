@@ -40,6 +40,7 @@ typedef struct harness {
     firc_groups_ctx_t ctx;
     firc_resolve_router_t *router;
     firc_dnsproxy_t *proxy;
+    firc_doh_t *doh;
     pthread_t thread;
     firc_fake_ipt_t *fipt;
     firc_ipt_t *ipt;
@@ -92,8 +93,10 @@ static harness_t *harness_start_with_kernels(bool kernels) {
                                    .upstream_addr = "127.0.0.1", .upstream_port = 53,
                                    .timeout_ms = 1000, .max_concurrent = 4, .max_idle_conns = 2};
     if (firc_dnsproxy_create(&pcfg, h->loop, pass_hook, NULL, &h->proxy) != FIRC_OK) { return NULL; }
+    h->doh = firc_doh_new(h->loop);
+    if (h->doh == NULL) { return NULL; }
     firc_app_deps_t deps = {.cfg = &h->cfg, .pipeline = h->pipeline, .pool = h->pool, .router = h->router,
-                            .proxy = h->proxy, .wall_s = fixed_wall_s};
+                            .proxy = h->proxy, .doh = h->doh, .wall_s = fixed_wall_s};
     if (kernels) {
         h->fipt = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
         h->ipt = firc_ipt_new(firc_fake_ipt_as_xt(h->fipt), "FIRC_");
@@ -129,6 +132,7 @@ static void harness_stop(harness_t *h) {
     firc_httpd_destroy(h->tcp);
     firc_app_destroy(h->app);
     firc_dnsproxy_destroy(h->proxy);
+    firc_doh_free(h->doh);
     firc_loop_destroy(h->loop);
     firc_resolve_router_free(h->router);
     if (h->ct) { firc_ct_close(h->ct); }
@@ -1827,6 +1831,47 @@ TEST a_disabled_groups_resolver_lists_no_servers(void) {
     PASS();
 }
 
+TEST a_dns_group_with_its_server_list_shows_it_as_its_resolver(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups",
+                              "{\"id\":\"0a1b2c3f\",\"name\":\"d\",\"interface\":\"dns\",\"enable\":true,"
+                              "\"resolve\":{\"server\":\"9.9.9.9, [2620:fe::fe]:5353\"}}",
+                              &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/0a1b2c3f", NULL, &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(out, "live")));
+    cJSON *rv = cJSON_GetObjectItemCaseSensitive(out, "resolver");
+    ASSERT_STR_EQ("group", cJSON_GetObjectItemCaseSensitive(rv, "source")->valuestring);
+    cJSON *servers = cJSON_GetObjectItemCaseSensitive(rv, "servers");
+    ASSERT_EQ(2, cJSON_GetArraySize(servers));
+    ASSERT_STR_EQ("9.9.9.9", cJSON_GetArrayItem(servers, 0)->valuestring);
+    ASSERT_STR_EQ("[2620:fe::fe]:5353", cJSON_GetArrayItem(servers, 1)->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_doh_resolver_is_listed_as_its_url(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups",
+                              "{\"id\":\"0a1b2c40\",\"name\":\"d\",\"interface\":\"dns\",\"enable\":true,"
+                              "\"resolve\":{\"server\":\"https://dns.example/dns-query, 9.9.9.9\"}}",
+                              &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/0a1b2c40", NULL, &out));
+    cJSON *servers = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolver"), "servers");
+    ASSERT_EQ(2, cJSON_GetArraySize(servers));
+    ASSERT_STR_EQ("9.9.9.9", cJSON_GetArrayItem(servers, 0)->valuestring);
+    ASSERT_STR_EQ("https://dns.example/dns-query", cJSON_GetArrayItem(servers, 1)->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
 /* Catches: `resolve` not answered, defaulted wrongly, dropped by a PUT, or its resolver block wrong. */
 TEST a_groups_resolve_round_trips_and_its_resolver_is_shown(void) {
     harness_t *h = harness_start();
@@ -1918,6 +1963,113 @@ TEST a_resolve_server_list_is_kept_verbatim_and_a_bad_one_refused(void) {
     ASSERT_EQ(200, do_request("GET", "/api/v1/groups/0a1b2c3d", NULL, &out));
     ASSERT_STR_EQm("the refused PUTs changed nothing", "1.1.1.1, 9.9.9.9",
                    cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "server")->valuestring);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+static const char *dns_group_body(const char *extra) {
+    static char body[512];
+    snprintf(body, sizeof(body),
+             "{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"dns\"%s}", extra);
+    return body;
+}
+
+TEST a_dns_group_is_refused_without_its_requirements(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    struct { const char *body; const char *field; } bad[] = {
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":[\"dns\",\"nwg0\"]}", "interface"},
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"dns\"}", "resolve.server"},
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"dns\",\"resolve\":{\"server\":\"9.9.9.9\"},"
+         "\"rules\":[{\"rule\":\"10.0.0.0/8\",\"type\":\"subnet\",\"enable\":true}]}", "rules"},
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"dns\",\"resolve\":{\"server\":\"9.9.9.9\"},"
+         "\"rules\":[{\"rule\":\"2001:db8::/32\",\"type\":\"subnet6\",\"enable\":true}]}", "rules"},
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"nwg0\",\"resolve\":{\"fallback\":false}}",
+         "resolve.fallback"},
+        {"{\"id\":\"0a1b2c3d\",\"name\":\"d\",\"interface\":\"dns\",\"resolve\":{\"server\":\"9.9.9.9\"},"
+         "\"cloudflare\":true}", "cloudflare"},
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        cJSON *out = NULL;
+        ASSERT_EQm(bad[i].field, 400, do_request("POST", "/api/v1/groups", bad[i].body, &out));
+        ASSERT_STR_EQm(bad[i].field, bad[i].field, jstr(out, "field"));
+        cJSON_Delete(out);
+    }
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups", NULL, &out));
+    ASSERT_EQm("a refused group is never stored", 0,
+               cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(out, "groups")));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_subnet_rule_cannot_be_added_to_a_dns_group(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", dns_group_body(",\"resolve\":{\"server\":\"9.9.9.9\"}"), &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/0a1b2c3d/rules",
+                              "{\"rule\":\"10.0.0.0/8\",\"type\":\"subnet\",\"enable\":true}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(400, do_request("PUT", "/api/v1/groups/0a1b2c3d/rules",
+                              "{\"rules\":[{\"rule\":\"10.0.0.0/8\",\"type\":\"subnet\",\"enable\":true}]}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups/0a1b2c3d/rules",
+                              "{\"rule\":\"example.com\",\"type\":\"namespace\",\"enable\":true}", &out));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_dns_groups_fallback_round_trips_and_resets_off_dns(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups",
+                              dns_group_body(",\"resolve\":{\"server\":\"9.9.9.9\",\"fallback\":false}"), &out));
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(out, "resolve");
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(res, "fallback")));
+    ASSERT_EQm("a dns group does not carry tunnel", NULL, cJSON_GetObjectItemCaseSensitive(res, "tunnel"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"name\":\"renamed\",\"interface\":\"dns\"}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/0a1b2c3d", NULL, &out));
+    ASSERTm("a PUT without the key keeps it",
+            cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "fallback")));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"interface\":\"dns\",\"resolve\":{\"server\":\"1.1.1.1\"}}", &out));
+    ASSERT(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "fallback")));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"interface\":\"dns\",\"resolve\":{\"server\":\"1.1.1.1\",\"fallback\":true}}", &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "fallback")));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"interface\":\"dns\",\"resolve\":{\"server\":\"1.1.1.1\",\"fallback\":false}}", &out));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"interface\":\"nwg0\",\"resolve\":{\"server\":\"1.1.1.1\"}}", &out));
+    res = cJSON_GetObjectItemCaseSensitive(out, "resolve");
+    ASSERTm("moving off dns resets fallback", cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "fallback")));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(res, "tunnel")));
+    cJSON_Delete(out);
+    ASSERT_EQ(400, do_request("PUT", "/api/v1/groups/0a1b2c3d", "{\"interface\":\"nwg0\",\"resolve\":{\"fallback\":false}}", &out));
+    ASSERT_STR_EQ("resolve.fallback", jstr(out, "field"));
+    ASSERT_STR_EQ("resolve.fallback can be off only on a dns group", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/0a1b2c3d", NULL, &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "fallback")));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_group_without_the_fallback_key_answers_true(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", "{\"id\":\"0a1b2c3d\",\"name\":\"nl\",\"interface\":\"nwg0\"}", &out));
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(out, "resolve"), "fallback")));
     cJSON_Delete(out);
     harness_stop(h);
     PASS();
@@ -3028,8 +3180,14 @@ int main(int argc, char **argv) {
     RUN_TEST(a_rule_write_without_save_leaves_the_file_alone);
     RUN_TEST(a_groups_resolve_round_trips_and_its_resolver_is_shown);
     RUN_TEST(a_disabled_groups_resolver_lists_no_servers);
+    RUN_TEST(a_dns_group_with_its_server_list_shows_it_as_its_resolver);
+    RUN_TEST(a_doh_resolver_is_listed_as_its_url);
     RUN_TEST(a_resolve_server_list_is_kept_verbatim_and_a_bad_one_refused);
     RUN_TEST(a_bad_resolve_server_is_refused_naming_the_field_and_the_group);
+    RUN_TEST(a_dns_group_is_refused_without_its_requirements);
+    RUN_TEST(a_subnet_rule_cannot_be_added_to_a_dns_group);
+    RUN_TEST(a_dns_groups_fallback_round_trips_and_resets_off_dns);
+    RUN_TEST(a_group_without_the_fallback_key_answers_true);
     RUN_TEST(a_post_with_no_id_names_no_group_in_its_refusal);
     RUN_TEST(a_put_group_keeps_its_route_marked);
     RUN_TEST(group_json_health_zeros_when_off);

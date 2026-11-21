@@ -12,7 +12,8 @@ const {
   backupText,
   sharedChain,
 } = await import("../../src/modules/groups/iface-list");
-const { lanChoices } = await import("../../src/data/iface-choices");
+const { lanChoices, groupChoices, isSynthetic, isSink, DNS } =
+  await import("../../src/data/iface-choices");
 const { uplinkOptions } = await import("../../src/modules/tunnels/tunnel-editor");
 
 describe("a group's interface list", () => {
@@ -81,6 +82,54 @@ describe("canBackup", () => {
     assert.strictEqual(canBackup(["wg0"], "block"), false);
     assert.strictEqual(canBackup(["block"], "wg0"), false);
     assert.deepStrictEqual(toggleEntry(["wg0"], "block"), ["wg0"]);
+  });
+});
+
+describe("the dns interface", () => {
+  const list = [
+    { id: "blackhole" },
+    { id: "block" },
+    { id: "dns" },
+    { id: "nwg0", role: "tunnel" as const },
+    { id: "ppp0", role: "wan" as const },
+    { id: "br0", role: "lan" as const },
+  ];
+  it("is a synthetic choice after block and not a sink", () => {
+    assert.strictEqual(DNS, "dns");
+    assert.strictEqual(isSynthetic("dns"), true);
+    assert.strictEqual(isSynthetic("block"), true);
+    assert.strictEqual(isSynthetic("blackhole"), true);
+    assert.strictEqual(isSynthetic("nwg0"), false);
+    assert.strictEqual(isSink("dns"), false);
+    const choices = groupChoices(list, ["nwg0"]);
+    assert.strictEqual(choices.dns?.id, "dns");
+    assert.deepStrictEqual(
+      choices.rest.map((i) => i.id),
+      ["ppp0", "br0"],
+    );
+    assert.deepStrictEqual(
+      choices.head.map((i) => i.id),
+      ["nwg0"],
+    );
+  });
+  it("offers no circle for dns, nor on a dns group", () => {
+    assert.strictEqual(canBackup(["wg0"], "dns"), false);
+    assert.strictEqual(canBackup(["dns"], "wg0"), false);
+    assert.deepStrictEqual(toggleEntry(["wg0"], "dns"), ["wg0"]);
+  });
+  it("is no LAN and no tunnel uplink", () => {
+    assert.deepStrictEqual(
+      lanChoices(list, "dns", []).map((i) => i.id),
+      [],
+    );
+    const values = uplinkOptions(
+      { uplink: { kind: "auto", ref: "" } } as any,
+      [],
+      list,
+      (k: string) => k,
+      { opened: true },
+    ).map((o) => o.value);
+    assert.strictEqual(values.includes("iface:dns"), false);
   });
 });
 

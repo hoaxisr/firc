@@ -5,7 +5,7 @@
   import { fetchInterfaces, interfaces } from "../../data/interfaces.svelte";
   import { t } from "../../data/locale.svelte";
 
-  import { ifaceTitle, isSink } from "../../data/iface-choices";
+  import { ifaceTitle, isSynthetic } from "../../data/iface-choices";
   import { toast } from "../../utils/events";
   import { fetcher } from "../../utils/fetcher";
   import { hasGroupNamed } from "./settings";
@@ -54,11 +54,11 @@
     if (interfaces.list.length === 0) void fetchInterfaces();
   });
 
-  const offered = $derived(groups.filter((g) => g.interface !== "block"));
+  const offered = $derived(groups.filter((g) => g.interface !== "block" && g.interface !== "dns"));
   const current = $derived(groups.find((g) => g.id === value));
   const tunnels = $derived([
     ...interfaces.list.filter((i) => i.role === "tunnel"),
-    ...interfaces.list.filter((i) => i.role !== "tunnel" && i.role !== "lan" && !isSink(i.id)),
+    ...interfaces.list.filter((i) => i.role !== "tunnel" && i.role !== "lan" && !isSynthetic(i.id)),
   ]);
 
   const haveOwn = $derived(hasGroupNamed(offered, ["Autolist", AUTOLIST_NAME]));

@@ -37,7 +37,7 @@
     SortDesc,
     SortNeutral,
   } from "../../../components/ui/icons";
-  import { BLOCK } from "../../../data/iface-choices";
+  import { BLOCK, DNS } from "../../../data/iface-choices";
   import { dnd_state, draggable, droppable, type Chip } from "../../../lib/dnd";
   import { type Rule } from "../../../types";
   import { defaultRule } from "../../../utils/defaults";
@@ -95,7 +95,11 @@
   let resolverTagText = $derived(resolverTag(group, t));
   let isBlock = $derived(group?.interface === BLOCK);
   let dnsHealth = $derived(
-    healthTag((group && store.liveOf(group.id)?.resolver) ?? group?.resolver, t),
+    healthTag(
+      (group && store.liveOf(group.id)?.resolver) ?? group?.resolver,
+      t,
+      group?.interface === DNS && group.resolve.fallback === false,
+    ),
   );
   let listSaved = $derived(group ? store.listSaved(group.id) : false);
   let ownRulesCount = $derived(group?.rules.length ?? 0);
@@ -883,10 +887,11 @@
 
   .resolver-badge,
   .health-badge {
-    display: inline-flex;
-    align-items: center;
+    display: inline-block;
+    line-height: 1.35rem;
     flex-shrink: 0;
-    max-width: 22rem;
+    max-width: min(22rem, 100%);
+    box-sizing: border-box;
     height: 1.35rem;
     padding: 0 0.5rem;
     border-radius: 0.7rem;

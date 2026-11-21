@@ -12,6 +12,7 @@
   import { t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
 
+  import { DNS } from "../../../data/iface-choices";
   import { type Group } from "../../../types";
   import { ifaceList } from "../iface-list";
   import {
@@ -50,7 +51,10 @@
       ? liveTooltip(
           kind,
           {
-            iface: store.liveOf(group.id)?.active ?? ifaceList(group)[0],
+            iface:
+              ifaceList(group)[0] === DNS
+                ? DNS
+                : (store.liveOf(group.id)?.active ?? ifaceList(group)[0]),
             netfilter: store.netfilter,
             silentFor: now - store.checkedAt,
           },

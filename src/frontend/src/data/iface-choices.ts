@@ -5,7 +5,9 @@ export type IfaceItem = Interfaces["interfaces"][number];
 
 export const BLACKHOLE = "blackhole";
 export const BLOCK = "block";
+export const DNS = "dns";
 export const isSink = (id: string) => id === BLACKHOLE || id === BLOCK;
+export const isSynthetic = (id: string) => isSink(id) || id === DNS;
 export const DEVICE_PREFIXES = ["tunvless", "opkgtun"] as const;
 
 export const isTunnelDevice = (id: string, tunnels: readonly { device: string }[]) =>
@@ -27,11 +29,12 @@ export function groupChoices(list: IfaceItem[], chosen: string[]) {
   const head = [...list.filter((i) => i.role === "tunnel"), ...missing];
   const blackhole = list.find((i) => i.id === BLACKHOLE);
   const block = list.find((i) => i.id === BLOCK);
+  const dns = list.find((i) => i.id === DNS);
   const rest = list
-    .filter((i) => !isSink(i.id) && i.role !== "tunnel")
+    .filter((i) => !isSynthetic(i.id) && i.role !== "tunnel")
     .sort((a, b) => (REST_ORDER[a.role ?? ""] ?? 2) - (REST_ORDER[b.role ?? ""] ?? 2));
   const expanded = chosen.some((id) => rest.some((r) => r.id === id));
-  return { head, blackhole, block, rest, expanded };
+  return { head, blackhole, block, dns, rest, expanded };
 }
 
 export function lanChoices<T extends IfaceItem>(
@@ -40,7 +43,7 @@ export function lanChoices<T extends IfaceItem>(
   tunnels: readonly { device: string }[],
 ): T[] {
   const q = query.trim().toLowerCase();
-  const usable = list.filter((i) => !isSink(i.id) && !isTunnelDevice(i.id, tunnels));
+  const usable = list.filter((i) => !isSynthetic(i.id) && !isTunnelDevice(i.id, tunnels));
   if (q === "") return usable.filter((i) => i.role === "lan");
   return usable.filter((i) =>
     [i.id, i.name, i.ndmsName].some((s) => s !== undefined && s.toLowerCase().includes(q)),

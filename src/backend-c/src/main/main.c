@@ -86,6 +86,7 @@
 struct daemon {
     firc_loop_t *loop;
     firc_dnsproxy_t *proxy;
+    firc_doh_t *doh;
     firc_logrep_t pool_said;
     firc_dns_pipeline_t *pipeline;
     firc_kn_policies_t *policies;
@@ -384,6 +385,8 @@ static void daemon_teardown(struct daemon *d)
     firc_stable_fields_release(&d->fields);
     firc_dnsproxy_destroy(d->proxy);
     d->proxy = NULL;
+    firc_doh_free(d->doh);
+    d->doh = NULL;
     firc_resolve_router_free(d->router);
     d->router = NULL;
     firc_dns_pipeline_destroy(d->pipeline);
@@ -1487,6 +1490,14 @@ int main(int argc, char **argv)
         firc_config_clear(&cfg);
         return 1;
     }
+    d.doh = firc_doh_new(d.loop);
+    if (d.doh == NULL || firc_doh_start(d.doh) != FIRC_OK) {
+        FIRC_WARN("DoH client not started: DoH entries in resolve.server are left out");
+        firc_doh_free(d.doh);
+        d.doh = NULL;
+    } else {
+        firc_dnsproxy_set_doh(d.proxy, firc_doh_ops(d.doh));
+    }
     {
         /* a group resolver answering with one of firc's own addresses is a sink */
         firc_ip_t b4, b6;
@@ -1588,6 +1599,7 @@ int main(int argc, char **argv)
         .pool = d.pool,
         .loop = d.loop,
         .proxy = d.proxy,
+        .doh = d.doh,
         .router = d.router,
         .resolvers = d.resolvers,
         .start_idx = cfg.app.netfilter.start_mark_table_index,

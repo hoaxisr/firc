@@ -97,6 +97,7 @@ export const DEFAULT_RESOLVE = (): GroupResolve => ({ tunnel: true, server: "" }
 export const GroupResolveSchema = object({
   tunnel: fallback(boolean(), true),
   server: fallback(string(), ""),
+  fallback: optional(boolean()),
 });
 export type GroupResolve = InferOutput<typeof GroupResolveSchema>;
 

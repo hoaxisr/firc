@@ -9,6 +9,7 @@
   import {
     BLACKHOLE,
     BLOCK,
+    DNS,
     groupChoices,
     ifaceTitle,
     moreText,
@@ -96,6 +97,16 @@
           }),
         ]
       : []),
+    ...(choices.dns
+      ? [
+          option(choices.dns, {
+            label: t("DNS only"),
+            description: undefined,
+            subline: t("resolve through the group's DNS, route nothing"),
+            separator: !choices.blackhole && !choices.block,
+          }),
+        ]
+      : []),
     ...(choices.rest.length > 0
       ? [
           {
@@ -117,7 +128,9 @@
   let anyCircle = $derived(options.some((o) => o.value !== MORE && canBackup(list, o.value)));
   let chain = $derived(closed === "chain" && list.length > 1);
   let note = $derived(closed === "active" && !unsaved ? backupNote(list, live) : null);
-  let shown = $derived(closed === "active" && !unsaved ? (live?.active ?? list[0]) : list[0]);
+  let shown = $derived(
+    closed === "active" && !unsaved && list[0] !== DNS ? (live?.active ?? list[0]) : list[0],
+  );
 
   function toggle(id: string) {
     value = ifaceValue(toggleEntry(list, id));
@@ -154,6 +167,8 @@
     <span class="iface-ring"></span>
   {:else if option.value === BLOCK}
     <span class="iface-ring square"></span>
+  {:else if option.value === DNS}
+    <span class="iface-ring dns"></span>
   {:else}
     <span class="iface-dot" data-state={stateOf(option.value)}></span>
   {/if}
@@ -243,6 +258,12 @@
   .iface-ring.square {
     border-radius: 1px;
     border-color: var(--orange);
+  }
+
+  .iface-ring.dns {
+    border-radius: 50%;
+    border-color: var(--text-2);
+    border-style: dashed;
   }
 
   .iface-foot {

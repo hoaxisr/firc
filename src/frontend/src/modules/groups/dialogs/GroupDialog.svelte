@@ -15,7 +15,7 @@
   import { isValidListUrl, normalizeListUrl, type GroupDialogPayload } from "../groups.svelte";
 
   import { Globe, Link, LoaderCircle, Type } from "../../../components/ui/icons";
-  import { BLOCK, isSink } from "../../../data/iface-choices";
+  import { BLOCK, DNS, isSink } from "../../../data/iface-choices";
   import { RULE_TYPES, type DeviceSelector, type Group, type ListRule } from "../../../types";
   import { coverageLabel } from "../../../utils/device-picker";
   import { fetcher, HttpError } from "../../../utils/fetcher";
@@ -63,6 +63,7 @@
   let dnsMode = $state<DnsMode>("auto");
   let dnsServer = $state("");
   let cloudflare = $state(false);
+  let fallbackOn = $state(true);
   let serverErrorShown = $state<string | null>(null); /* the daemon's, until the field is edited */
 
   let devicesDialogOpen = $state(false);
@@ -184,6 +185,7 @@
     dnsMode = modeOf(group?.resolve);
     dnsServer = group?.resolve?.server ?? "";
     cloudflare = group?.cloudflare ?? false;
+    fallbackOn = group?.resolve?.fallback !== false;
     serverErrorShown = serverError;
     void fetchResolvers();
     seededFor = key;
@@ -195,6 +197,7 @@
 
   let isUrlValid = $derived(!listEnabled || isValidListUrl(url));
   let isSinkChoice = $derived(isSink(selectedInterface));
+  let isDnsChoice = $derived(selectedInterface === DNS);
   let firmwareServers = $derived(firmwareServersFor(resolvers.list, selectedInterface));
   let isEditingSavedAuto = $derived(isSavedAutoUnchanged(group, mode, selectedInterface, dnsMode));
   let autoServers = $derived(
@@ -205,7 +208,13 @@
     }),
   );
   let serverCheck = $derived(
-    dnsMode === "own" && !isSinkChoice ? resolverListProblem(dnsServer.trim()) : null,
+    isDnsChoice
+      ? dnsServer.trim() === ""
+        ? null
+        : resolverListProblem(dnsServer.trim())
+      : dnsMode === "own" && !isSinkChoice
+        ? resolverListProblem(dnsServer.trim())
+        : null,
   );
   let serverProblem = $derived(serverCheck?.problem ?? null);
   let problemText = $derived(serverProblemText(serverCheck, dnsServer, t));
@@ -277,18 +286,59 @@
 
   function handleSubmit() {
     if (!canSubmit) return;
+    if (isDnsChoice && dnsServer.trim() === "") {
+      serverErrorShown = t("A DNS only group needs a server");
+      return;
+    }
     const payload: GroupDialogPayload = {
       name: name.trim(),
       interface: ifaceValue(ifaceList(draft)),
       devices: devicesTarget.devices,
       list: listEnabled ? { url: normalizeListUrl(url), interval } : null,
-      resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer),
-      cloudflare: selectedInterface !== BLOCK && cloudflare,
+      resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer, fallbackOn),
+      cloudflare: selectedInterface !== BLOCK && selectedInterface !== DNS && cloudflare,
     };
     dispatch("submit", payload);
     handleClose();
   }
 </script>
+
+{#snippet serverField(dns: boolean)}
+  <div class="field">
+    <label for="gd-dns-server">{t("Server")}</label>
+    <div class="group-dialog-input-wrapper">
+      <span class="icon"><Globe size={18} /></span>
+      <input
+        id="gd-dns-server"
+        type="text"
+        list="gd-dns-servers"
+        placeholder={dns ? "https://dns.comss.one/dns-query, 9.9.9.9" : "9.9.9.9, 1.1.1.1"}
+        bind:value={dnsServer}
+        oninput={() => (serverErrorShown = null)}
+        class:invalid={dnsServerHasError}
+        aria-invalid={dnsServerHasError}
+        aria-describedby={dnsServerHasError ? "gd-dns-server-error gd-dns-hint" : "gd-dns-hint"}
+      />
+      <datalist id="gd-dns-servers">
+        {#each serverSuggestions(resolvers.list) as s}
+          <option value={s}></option>
+        {/each}
+      </datalist>
+    </div>
+    {#if serverErrorShown}
+      <span id="gd-dns-server-error" class="field-error dns-server-error">{serverErrorShown}</span>
+    {:else if dnsServer !== "" && serverProblem !== null}
+      <span id="gd-dns-server-error" class="field-error dns-server-error">{problemText}</span>
+    {/if}
+    <span id="gd-dns-hint" class="dns-hint">
+      {dns
+        ? t("The router asks these servers itself, not through a tunnel.")
+        : t(
+            "The server is asked through the tunnel, so a DNS server on the local network will not work.",
+          )}
+    </span>
+  </div>
+{/snippet}
 
 <GenericDialog
   {open}
@@ -321,15 +371,26 @@
 
     <div class="dns-block" id="gd-dns">
       <span class="lbl">{t("DNS")}</span>
-      <Select
-        options={dnsOptions}
-        selected={dnsMode}
-        onValueChange={(v: string) => (dnsMode = v as DnsMode)}
-        disabled={isSinkChoice}
-        ariaLabel={t("DNS")}
-        class="dns-select"
-      />
-      {#if selectedInterface === BLOCK}
+      {#if !isDnsChoice}
+        <Select
+          options={dnsOptions}
+          selected={dnsMode}
+          onValueChange={(v: string) => (dnsMode = v as DnsMode)}
+          disabled={isSinkChoice}
+          ariaLabel={t("DNS")}
+          class="dns-select"
+        />
+      {/if}
+      {#if isDnsChoice}
+        {@render serverField(true)}
+        <div class="list-toggle">
+          <Switch bind:checked={fallbackOn} aria-label={t("Fall back to the common DNS")} />
+          <span class="list-toggle-label">{t("Fall back to the common DNS")}</span>
+          <span class="list-toggle-hint"
+            >{t("if the group's DNS does not answer, the common DNS answers")}</span
+          >
+        </div>
+      {:else if selectedInterface === BLOCK}
         <span class="dns-blackhole-hint">{t("the daemon answers the group's names")}</span>
       {:else if isSinkChoice}
         <span class="dns-blackhole-hint">
@@ -342,46 +403,11 @@
             : t("the firmware has no DNS for this interface — common upstream")}
         </span>
       {:else if dnsMode === "own"}
-        <div class="field">
-          <label for="gd-dns-server">{t("Server")}</label>
-          <div class="group-dialog-input-wrapper">
-            <span class="icon"><Globe size={18} /></span>
-            <input
-              id="gd-dns-server"
-              type="text"
-              list="gd-dns-servers"
-              placeholder="9.9.9.9, 1.1.1.1"
-              bind:value={dnsServer}
-              oninput={() => (serverErrorShown = null)}
-              class:invalid={dnsServerHasError}
-              aria-invalid={dnsServerHasError}
-              aria-describedby={dnsServerHasError
-                ? "gd-dns-server-error gd-dns-hint"
-                : "gd-dns-hint"}
-            />
-            <datalist id="gd-dns-servers">
-              {#each serverSuggestions(resolvers.list) as s}
-                <option value={s}></option>
-              {/each}
-            </datalist>
-          </div>
-          {#if serverErrorShown}
-            <span id="gd-dns-server-error" class="field-error dns-server-error"
-              >{serverErrorShown}</span
-            >
-          {:else if dnsServer !== "" && serverProblem !== null}
-            <span id="gd-dns-server-error" class="field-error dns-server-error">{problemText}</span>
-          {/if}
-          <span id="gd-dns-hint" class="dns-hint">
-            {t(
-              "The server is asked through the tunnel, so a DNS server on the local network will not work.",
-            )}
-          </span>
-        </div>
+        {@render serverField(false)}
       {/if}
     </div>
 
-    {#if selectedInterface !== BLOCK}
+    {#if selectedInterface !== BLOCK && !isDnsChoice}
       <div class="list-toggle">
         <Switch bind:checked={cloudflare} aria-label={t("One Cloudflare address")} />
         <span class="list-toggle-label">{t("One Cloudflare address")}</span>
@@ -703,6 +729,10 @@
     align-items: center;
     gap: 0.6rem;
     flex-wrap: wrap;
+  }
+
+  .dns-block .list-toggle {
+    margin-top: 0.5rem;
   }
 
   .list-toggle-label {

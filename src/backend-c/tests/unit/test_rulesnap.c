@@ -597,6 +597,30 @@ TEST the_snapshot_carries_a_block_groups_answer(void)
     PASS();
 }
 
+TEST the_snapshot_marks_a_dns_group(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *d = make_group((firc_id_t){{1, 0, 0, 0}}, "d", true);
+    firc_strset(&d->iface, FIRC_IFACE_DNS);
+    firc_group_t *b = make_group((firc_id_t){{2, 0, 0, 0}}, "b", true);
+    firc_strset(&b->iface, FIRC_IFACE_BLOCK);
+    firc_group_t *r = make_group((firc_id_t){{3, 0, 0, 0}}, "r", true);
+    firc_strset(&r->iface, "nwg0");
+    firc_config_add_group(&cfg, d);
+    firc_config_add_group(&cfg, b);
+    firc_config_add_group(&cfg, r);
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT(snap != NULL);
+    ASSERT_EQ(3u, (unsigned)snap->n_groups);
+    ASSERT(snap->groups[0]->dns_only);
+    ASSERT_FALSE(snap->groups[1]->dns_only);
+    ASSERT_FALSE(snap->groups[2]->dns_only);
+    ASSERT_EQ(-1, (int)snap->groups[0]->block);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 TEST the_snapshot_carries_the_cloudflare_switch(void)
 {
     firc_config_t cfg = make_cfg();
@@ -642,6 +666,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_disabled_rule_or_group_is_skipped);
     RUN_TEST(a_policy_entry_is_resolved_by_the_callers_resolver);
     RUN_TEST(the_snapshot_carries_a_block_groups_answer);
+    RUN_TEST(the_snapshot_marks_a_dns_group);
     RUN_TEST(the_snapshot_carries_the_cloudflare_switch);
     RUN_TEST(only_an_enabled_group_with_a_selector_needs_the_device_map);
     RUN_TEST(an_allow_entry_needs_the_device_map);

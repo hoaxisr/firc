@@ -131,3 +131,46 @@ describe("resolverListProblem", () => {
     });
   });
 });
+
+describe("a DoH entry", () => {
+  it("is accepted as https://host[:port]/path alone or among addresses", () => {
+    for (const ok of [
+      "https://dns.comss.one/dns-query",
+      "https://dns.google:8443/dns-query",
+      "https://[2620:fe::fe]/dns-query",
+      "https://1.1.1.1/dns-query",
+      "HTTPS://dns.google/dns-query",
+      "9.9.9.9, https://dns.comss.one/dns-query",
+    ]) {
+      assert.strictEqual(resolverListProblem(ok), null, ok);
+    }
+  });
+  it("is refused over http, without a path, with a user, query or fragment, or past 255 bytes", () => {
+    for (const bad of [
+      "http://dns.google/dns-query",
+      "ftp://dns.google/dns-query",
+      "https://dns.google",
+      "https://user@dns.google/dns-query",
+      "https://dns.google/dns-query?x=1",
+      "https://dns.google/dns-query#x",
+      "https://dns.google:0/dns-query",
+      "https://dns.google:99999/dns-query",
+      "https:///dns-query",
+      `https://dns.google/${"a".repeat(240)}`,
+    ]) {
+      assert.deepStrictEqual(resolverListProblem(bad), { problem: "url", entry: bad }, bad);
+    }
+  });
+  it("counts toward the four and refuses a twin", () => {
+    assert.deepStrictEqual(
+      resolverListProblem(
+        "https://a.example/q, https://b.example/q, https://c.example/q, https://d.example/q, 9.9.9.9",
+      ),
+      { problem: "too-many", entry: "" },
+    );
+    assert.deepStrictEqual(resolverListProblem("https://a.example/q, https://a.example/q"), {
+      problem: "duplicate",
+      entry: "https://a.example/q",
+    });
+  });
+});

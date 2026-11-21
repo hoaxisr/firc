@@ -6,7 +6,7 @@ import { ChangeTracker } from "../../utils/change-tracker.svelte";
 import { ask } from "../../utils/confirm.svelte";
 import { ListsController } from "./lists.svelte";
 
-import { isSink } from "../../data/iface-choices";
+import { DNS, isSink } from "../../data/iface-choices";
 import {
   DEFAULT_RESOLVE,
   ruleTakesPorts,
@@ -31,7 +31,7 @@ import {
   restoreGroupRulesOrder as restoreGroupRulesOrderData,
   sortGroupRules as sortGroupRulesData,
   toConfigPayload as toConfigPayloadData,
-  withoutStaleBlock,
+  withoutStale,
 } from "./groups-data";
 import { ifaceList, ifaceValue, sharedChain } from "./iface-list";
 import { liveOfRecord, type GroupLive, type NetfilterState } from "./live-state";
@@ -109,7 +109,9 @@ function deviceSelectorsEqual(a: DeviceSelector, b: DeviceSelector): boolean {
 export function resolveEqual(a: GroupResolve | undefined, b: GroupResolve | undefined): boolean {
   const x = a ?? DEFAULT_RESOLVE();
   const y = b ?? DEFAULT_RESOLVE();
-  return x.tunnel === y.tunnel && x.server === y.server;
+  return (
+    x.tunnel === y.tunnel && x.server === y.server && (x.fallback ?? true) === (y.fallback ?? true)
+  );
 }
 
 export type GroupFieldError = { group: string; field: string; error: string };
@@ -256,7 +258,7 @@ function mergeById<T extends { id: string }>(
 function bodyShape(group: any): Group {
   const { list, resolver: _resolver, ...rest } = stripLive(group) as any;
   return {
-    ...withoutStaleBlock(rest),
+    ...withoutStale(rest),
     list: list ? { url: list.url, interval: list.interval } : null,
   } as Group;
 }
@@ -463,6 +465,10 @@ export class GroupsStore {
   setSelectedResolve(r: GroupResolve) {
     this.#editSelected((group) => {
       if (ifaceList(group).some(isSink) || resolveEqual(group.resolve, r)) return;
+      if (group.interface === DNS) {
+        if (r.server !== "") group.resolve = { ...group.resolve, server: r.server };
+        return;
+      }
       group.resolve = { tunnel: r.tunnel, server: r.server };
     });
   }

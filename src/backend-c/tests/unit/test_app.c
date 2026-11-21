@@ -296,6 +296,31 @@ void __wrap_firc_dnsproxy_forget_group(firc_dnsproxy_t *p, firc_id_t group_id) {
     __real_firc_dnsproxy_forget_group(p, group_id);
 }
 
+static char g_doh_sentinel_byte;
+#define DOH_SENTINEL ((firc_doh_t *)(void *)&g_doh_sentinel_byte)
+static firc_doh_t *g_app_doh;
+static uint32_t g_forgot_marks[32];
+static size_t g_n_forgot_marks;
+
+static size_t forgot_mark_count(uint32_t mark) {
+    size_t c = 0;
+    for (size_t i = 0; i < g_n_forgot_marks; i++) { c += g_forgot_marks[i] == mark ? 1u : 0u; }
+    return c;
+}
+
+void __real_firc_doh_forget_mark(firc_doh_t *d, uint32_t mark);
+void __wrap_firc_doh_forget_mark(firc_doh_t *d, uint32_t mark);
+
+void __wrap_firc_doh_forget_mark(firc_doh_t *d, uint32_t mark) {
+    if (d == DOH_SENTINEL) {
+        if (g_n_forgot_marks < sizeof(g_forgot_marks) / sizeof(g_forgot_marks[0])) {
+            g_forgot_marks[g_n_forgot_marks++] = mark;
+        }
+        return;
+    }
+    __real_firc_doh_forget_mark(d, mark);
+}
+
 static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
                              firc_nflog_t *(*nflog_open)(uint16_t, uint16_t), bool committer);
 static bool locked_app_up_full(locked_app_t *l, firc_loop_t *loop,
@@ -353,6 +378,7 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
                             .pipeline = l->pipeline,
                             .router = l->router,
                             .proxy = g_app_proxy,
+                            .doh = g_app_doh,
                             .resolvers = g_app_resolvers,
                             .pool = l->pool,
                             .loop = loop,
@@ -362,6 +388,7 @@ static bool locked_app_up_ex(locked_app_t *l, firc_loop_t *loop,
                             .mono_ms = g_app_mono};
     g_capture_seconds = 0;
     g_app_proxy = NULL;
+    g_app_doh = NULL;
     g_app_resolvers = NULL;
     g_app_mono = NULL;
     g_app_no_sets = false;
@@ -394,6 +421,7 @@ static void locked_app_down_rest(locked_app_t *l) {
     g_iface_there = -1;
     g_capture_seconds = 0;
     g_app_proxy = NULL;
+    g_app_doh = NULL;
     g_app_resolvers = NULL;
     g_app_mono = NULL;
     g_app_no_sets = false;
@@ -5696,6 +5724,208 @@ TEST a_group_moved_to_block_flushes_its_flows(void) {
     firc_app_nf_leave(l.app);
     ASSERT(wait_written_after(&l, started));
     ASSERT_EQ_FMT((size_t)1, fake_ct_deletes(l.ctk), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+static firc_group_t *dns_group(uint8_t tag, const char *hand_rule, const char *server) {
+    firc_group_t *g = activation_group(tag, hand_rule, NULL, NULL);
+    free(g->iface);
+    g->iface = strdup("dns");
+    firc_strset(&g->resolve.server, server);
+    return g;
+}
+
+typedef struct {
+    const char *owner;
+    size_t hits;
+} owner_hits_t;
+
+static void count_owner(void *ud, const firc_rtnl_field_t *v, size_t n) {
+    owner_hits_t *h = ud;
+    for (size_t i = 0; i < n; i++) { h->hits += strcmp(v[i].owner, h->owner) == 0 ? 1u : 0u; }
+}
+
+static size_t fields_held(locked_app_t *l, uint8_t tag) {
+    char id[FIRC_ID_STR_LEN];
+    firc_id_format((firc_id_t){{tag, tag, tag, tag}}, id);
+    owner_hits_t h = {id, 0};
+    firc_app_nf_enter(l->app);
+    firc_rtnl_fields_now(l->rtnl, count_owner, &h);
+    firc_app_nf_leave(l->app);
+    return h.hits;
+}
+
+static int group_in_v6_kernel(locked_app_t *l, firc_id_t gid) {
+    firc_app_nf_enter(l->app);
+    int n = group_in_fake_of(l, l->fake6, gid);
+    firc_app_nf_leave(l->app);
+    return n;
+}
+
+static bool fields_settle(locked_app_t *l, uint8_t tag, size_t want) {
+    for (int i = 0; i < 200; i++) {
+        if (fields_held(l, tag) == want) { return true; }
+        sleep_ms(10);
+    }
+    return false;
+}
+
+TEST a_dns_group_takes_no_mark_field(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    size_t rules = fake_rtnl_count(l.kernel, RTM_NEWRULE, 0);
+    size_t routes = fake_rtnl_count(l.kernel, RTM_NEWROUTE, 0);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, dns_group(1, "a.example", "9.9.9.9")));
+    ASSERT(first_pass_done(&l));
+    ASSERTm("the group is in the DNS view", view_owner(&l, "a.example") != NULL);
+    ASSERT_EQ_FMT(0u, field_of(&l, 1), "%u");
+    ASSERT_EQ_FMT((size_t)0, fields_held(&l, 1), "%zu");
+    ASSERT_EQ_FMT(rules, fake_rtnl_count(l.kernel, RTM_NEWRULE, 0), "%zu");
+    ASSERT_EQ_FMT(routes, fake_rtnl_count(l.kernel, RTM_NEWROUTE, 0), "%zu");
+    ASSERT_EQ_FMT(0, group_in_kernel(&l, gid), "%d");
+    ASSERT_EQ_FMT(0, group_in_v6_kernel(&l, gid), "%d");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_dns_group_is_live_without_a_link(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up_no_committer(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x10);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, dns_group(1, "a.example", "9.9.9.9")));
+    ASSERT_EQ(FIRC_OK, firc_app_start_groups(l.app, NULL));
+    ASSERT_EQ(FIRC_OK, firc_app_start_netfilter_committer(l.app));
+    firc_app_nf_enter(l.app);
+    firc_app_pool_changed(l.app);
+    const char *before = live_reason(&l, 1);
+    firc_app_nf_leave(l.app);
+    ASSERT_STR_EQm("live before its first pass", "live", before);
+    ASSERT(wait_written_after(&l, 0));
+    ASSERT_FALSE(group_routed(&l, 1));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    firc_group_t *off = dns_group(1, "a.example", "9.9.9.9");
+    off->enable = false;
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, (firc_id_t){{1, 1, 1, 1}}, off));
+    ASSERT_STR_EQ("disabled", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_moved_from_a_tunnel_to_dns_loses_its_netfilter_state(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(1, "a.example", NULL, NULL)));
+    ASSERT(first_pass_done(&l));
+    ASSERTm("fixture: routed", group_fully_in(&l, gid));
+    ASSERTm("fixture: holds a field", field_of(&l, 1) != 0);
+    ASSERT_EQ_FMTm("fixture: its field is kept", (size_t)1, fields_held(&l, 1), "%zu");
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, dns_group(1, "a.example", "9.9.9.9")));
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(group_fully_out(&l, gid));
+    ASSERT_EQ_FMT(0, group_in_v6_kernel(&l, gid), "%d");
+    ASSERT_EQ_FMT(0u, field_of(&l, 1), "%u");
+    ASSERTm("its field is given back", fields_settle(&l, 1, 0));
+    ASSERT_STR_EQ("live", live_reason(&l, 1));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_group_moved_from_dns_to_a_tunnel_gets_it(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, dns_group(1, "a.example", "9.9.9.9")));
+    ASSERT(first_pass_done(&l));
+    ASSERTm("fixture: nothing in the kernel", group_fully_out(&l, gid));
+
+    firc_app_nf_enter(l.app);
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, activation_group(1, "a.example", NULL, NULL)));
+    firc_app_nf_leave(l.app);
+    ASSERT(wait_written_after(&l, started));
+    ASSERT(group_fully_in(&l, gid));
+    ASSERT(group_routed(&l, 1));
+    ASSERT(field_of(&l, 1) != 0);
+    ASSERT_EQ_FMT((size_t)1, fields_held(&l, 1), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_route_change_forgets_the_old_marks_doh_connections(void) {
+    g_app_doh = DOH_SENTINEL;
+    g_n_forgot_marks = 0;
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_id_t gid = {{1, 1, 1, 1}};
+    firc_group_t *g = activation_group(1, "a.example", NULL, NULL);
+    firc_strset(&g->resolve.server, "9.9.9.9");
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT(first_pass_done(&l));
+    uint32_t mark = field_of(&l, 1) | FIRC_MARK_HANDLED;
+    ASSERTm("fixture: a mark", mark != FIRC_MARK_HANDLED);
+    size_t at_start = forgot_mark_count(mark);
+
+    firc_app_nf_enter(l.app);
+    firc_app_republish_resolve_routes(l.app);
+    firc_app_nf_leave(l.app);
+    ASSERT_EQ_FMTm("an unchanged route keeps them", at_start, forgot_mark_count(mark), "%zu");
+
+    firc_group_t *other = activation_group(1, "a.example", NULL, NULL);
+    firc_strset(&other->resolve.server, "1.1.1.1");
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, other));
+    ASSERT_EQ_FMTm("a new server list is a new route", at_start + 1, forgot_mark_count(mark), "%zu");
+
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, dns_group(1, "a.example", "1.1.1.1")));
+    ASSERT_EQ_FMTm("a move to dns leaves the mark", at_start + 2, forgot_mark_count(mark), "%zu");
+
+    ASSERT_EQ(FIRC_OK, firc_app_update_group(l.app, gid, dns_group(1, "a.example", "9.9.9.9")));
+    ASSERT_EQ_FMTm("the unmarked connections are shared by every dns group", (size_t)0, forgot_mark_count(0), "%zu");
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST a_dns_groups_list_subnets_stage_nothing(void) {
+    locked_app_t l;
+    ASSERT(locked_app_up(&l));
+    fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
+    firc_app_set_running(l.app, true);
+    firc_group_t *g = dns_group(1, NULL, "9.9.9.9");
+    g->list = firc_group_list_new();
+    firc_strset(&g->list->url, "http://127.0.0.1:1/list");
+    g->list->has_body_hash = true;
+    firc_sub_rules_push(&g->list->rules, "10.9.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
+    firc_sub_rules_push(&g->list->rules, "2001:db8::/32", FIRC_RULE_SUBNET6, true, test_random_id());
+    firc_sub_rules_push(&g->list->rules, "example.com", FIRC_RULE_NAMESPACE, true, test_random_id());
+    firc_id_t gid = g->id;
+    size_t rules = fake_rtnl_count(l.kernel, RTM_NEWRULE, 0);
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
+    ASSERT(first_pass_done(&l));
+    sleep_ms(300);
+    ASSERTm("the list's names are served", view_owner(&l, "example.com") != NULL);
+    char id[FIRC_ID_STR_LEN], s4[64], s6[64];
+    firc_id_format(gid, id);
+    snprintf(s4, sizeof(s4), "FIRC_%sS4", id);
+    snprintf(s6, sizeof(s6), "FIRC_%sS6", id);
+    ASSERT_EQ_FMT((size_t)0, fake_setnl_count(l.setk, s4), "%zu");
+    ASSERT_EQ_FMT((size_t)0, fake_setnl_count(l.setk, s6), "%zu");
+    ASSERT_EQ_FMT(0, group_in_kernel(&l, gid), "%d");
+    ASSERT_EQ_FMT(0, group_in_v6_kernel(&l, gid), "%d");
+    ASSERT_EQ_FMT(rules, fake_rtnl_count(l.kernel, RTM_NEWRULE, 0), "%zu");
     locked_app_down(&l);
     PASS();
 }
@@ -11257,6 +11487,12 @@ int main(int argc, char **argv) {
     RUN_TEST(live_reason_is_checked_in_its_order);
     RUN_TEST(a_block_group_is_live_without_a_link);
     RUN_TEST(a_group_moved_to_block_flushes_its_flows);
+    RUN_TEST(a_dns_group_takes_no_mark_field);
+    RUN_TEST(a_dns_group_is_live_without_a_link);
+    RUN_TEST(a_group_moved_from_a_tunnel_to_dns_loses_its_netfilter_state);
+    RUN_TEST(a_group_moved_from_dns_to_a_tunnel_gets_it);
+    RUN_TEST(a_route_change_forgets_the_old_marks_doh_connections);
+    RUN_TEST(a_dns_groups_list_subnets_stage_nothing);
     RUN_TEST(a_group_moved_to_blackhole_flushes_its_flows);
     RUN_TEST(live_follows_the_interface_link);
     RUN_TEST(live_reads_the_tunnel_behind_the_interface);

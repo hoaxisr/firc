@@ -2,9 +2,19 @@ import { parseV4, parseV6 } from "./device-validators";
 
 export type ResolverAddrProblem = "syntax" | "port" | "sink" | "mapped";
 
-export type ResolverListProblem = ResolverAddrProblem | "empty" | "too-many" | "duplicate";
+export type ResolverListProblem = ResolverAddrProblem | "url" | "empty" | "too-many" | "duplicate";
 
 export const MAX_RESOLVERS = 4;
+const MAX_URL_BYTES = 255;
+
+function dohKey(text: string): { key: string } | { problem: "url" } {
+  const m = /^https:\/\/(\[[0-9a-fA-F:.]+\]|[^\s/:@[\]?#]+)(?::([0-9]+))?(\/[^\s?#]*)$/i.exec(text);
+  if (m === null || new TextEncoder().encode(text).length > MAX_URL_BYTES)
+    return { problem: "url" };
+  if (m[2] !== undefined && (Number(m[2]) < 1 || Number(m[2]) > 65535)) return { problem: "url" };
+  if (m[1].startsWith("[") && parseV6(m[1].slice(1, -1)) === null) return { problem: "url" };
+  return { key: text };
+}
 
 function parseResolver(text: string): { key: string } | { problem: ResolverAddrProblem } {
   if (text === "") return { problem: "syntax" };
@@ -62,7 +72,7 @@ export function resolverListProblem(
   for (const [i, entry] of entries.entries()) {
     if (entry === "") return { problem: "empty", entry: "" };
     if (i === MAX_RESOLVERS) return { problem: "too-many", entry: "" };
-    const r = parseResolver(entry);
+    const r = entry.includes("://") ? dohKey(entry) : parseResolver(entry);
     if ("problem" in r) return { problem: r.problem, entry };
     if (seen.includes(r.key)) return { problem: "duplicate", entry };
     seen.push(r.key);

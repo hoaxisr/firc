@@ -169,6 +169,26 @@ TEST a_groups_own_servers_are_all_routed_in_order(void)
     PASS();
 }
 
+TEST a_doh_entry_adds_no_server_to_the_route(void)
+{
+    firc_group_t *g = group("g", "nwg0", 1);
+    firc_strset(&g->resolve.server, "https://a.example/d, 9.9.9.9, https://b.example/d");
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .v6_route = true};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ(FIRC_RESOLVE_SOURCE_GROUP, t.items[0].source);
+    ASSERT_EQ((size_t)1, t.items[0].n_servers);
+    ASSERT_EQ(9, t.items[0].servers[0].ip.b[0]);
+    ASSERT_FALSE(t.items[0].servers[0].doh);
+    firc_resolve_table_free(&t);
+    firc_strset(&g->resolve.server, "https://a.example/d");
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ((size_t)0, t.items[0].n_servers);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
 /* Catches: an own IPv6 server kept without an IPv6 route, or put ahead of an IPv4 one. */
 TEST an_own_v6_server_needs_a_v6_route(void)
 {
@@ -839,6 +859,386 @@ TEST a_route_names_the_active_entry_not_the_first(void)
     PASS();
 }
 
+static const char *interned_urls[8];
+
+static uint16_t fake_intern(void *ud, const char *url)
+{
+    (void)ud;
+    for (uint16_t i = 0; i < 8 && interned_urls[i] != NULL; i++) {
+        if (strcmp(interned_urls[i], url) == 0) { return (uint16_t)(i + 1); }
+    }
+    return 0;
+}
+
+static void intern_reset(const char *a, const char *b)
+{
+    memset(interned_urls, 0, sizeof(interned_urls));
+    interned_urls[0] = a;
+    interned_urls[1] = b;
+}
+
+TEST a_dns_group_is_usable_without_a_mark(void)
+{
+    firc_group_t *g = group("d", "dns", 1);
+    firc_strset(&g->resolve.server, "9.9.9.9");
+    firc_resolve_input_t in = {.group = g, .mark = 0};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT(t.items[0].dns_only);
+    ASSERT_EQ((uint32_t)0, t.items[0].mark);
+    ASSERT_EQ(FIRC_RESOLVE_SOURCE_GROUP, t.items[0].source);
+    ASSERT_EQ((size_t)1, t.items[0].n_servers);
+    ASSERT(firc_resolve_route_usable(&t.items[0]));
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_routed_group_without_a_mark_stays_unusable_with_doh(void)
+{
+    intern_reset("https://a.example/d", NULL);
+    firc_group_t *g = group("g", "nwg0", 1);
+    firc_strset(&g->resolve.server, "https://a.example/d");
+    firc_resolve_input_t in = {.group = g, .mark = 0, .intern = fake_intern};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ((size_t)1, t.items[0].n_servers);
+    ASSERT_FALSE(t.items[0].dns_only);
+    ASSERT_FALSE(firc_resolve_route_usable(&t.items[0]));
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_dns_group_never_takes_the_firmwares_resolvers(void)
+{
+    firc_group_t *g = group("d", "dns", 1);
+    firc_resolver_addr_t fw[1] = {addr("1.1.1.1")};
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .firmware = fw, .n_firmware = 1};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ(FIRC_RESOLVE_SOURCE_GROUP, t.items[0].source);
+    ASSERT_EQ((size_t)0, t.items[0].n_servers);
+    ASSERT_EQ((uint32_t)0, t.items[0].mark);
+    ASSERT_FALSE(firc_resolve_route_usable(&t.items[0]));
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_dns_route_carries_no_fallback(void)
+{
+    firc_group_t *g = group("d", "dns", 1);
+    firc_strset(&g->resolve.server, "9.9.9.9");
+    firc_resolve_input_t in = {.group = g};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_FALSE(t.items[0].no_fallback);
+    firc_resolve_table_free(&t);
+    g->resolve.fallback = false;
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT(t.items[0].no_fallback);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_doh_entry_reaches_the_route_as_a_url_id(void)
+{
+    intern_reset("https://a.example/d", "https://b.example/q");
+    firc_group_t *g = group("g", "nwg0", 1);
+    firc_strset(&g->resolve.server, "https://b.example/q, 9.9.9.9, https://a.example/d");
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .intern = fake_intern};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    const firc_resolve_route_t *r = &t.items[0];
+    ASSERT_EQ((size_t)3, r->n_servers);
+    ASSERT_FALSE(r->servers[0].doh);
+    ASSERT_EQ((uint16_t)0, r->url_ids[0]);
+    ASSERT(r->servers[1].doh);
+    ASSERT_EQ((uint16_t)2, r->url_ids[1]);
+    ASSERT(r->servers[2].doh);
+    ASSERT_EQ((uint16_t)1, r->url_ids[2]);
+    ASSERT_EQ(MARK1, r->mark);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_doh_entry_is_dropped_when_the_intern_refuses_it(void)
+{
+    intern_reset(NULL, NULL);
+    firc_group_t *g = group("g", "nwg0", 1);
+    firc_strset(&g->resolve.server, "https://a.example/d, 9.9.9.9");
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .intern = fake_intern};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ((size_t)1, t.items[0].n_servers);
+    ASSERT_FALSE(t.items[0].servers[0].doh);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_change_of_url_is_a_new_generation(void)
+{
+    intern_reset("https://a.example/d", "https://b.example/d");
+    firc_group_t *g = group("d", "dns", 1);
+    firc_strset(&g->resolve.server, "https://a.example/d");
+    firc_resolve_input_t in = {.group = g, .intern = fake_intern};
+    firc_resolve_table_t t1 = {0}, t2 = {0}, t3 = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t1));
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, &t1, &t2));
+    ASSERT_EQ(t1.items[0].gen, t2.items[0].gen);
+    firc_strset(&g->resolve.server, "https://b.example/d");
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, &t2, &t3));
+    ASSERT(t3.items[0].gen != t2.items[0].gen);
+    firc_resolve_table_free(&t1);
+    firc_resolve_table_free(&t2);
+    firc_resolve_table_free(&t3);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_dns_route_says_where_its_names_go(void)
+{
+    intern_reset("https://dns.example:8443/dns-query", NULL);
+    firc_group_t *g = group("d", "dns", 1);
+    firc_strset(&g->resolve.server, "9.9.9.9, https://dns.example:8443/dns-query");
+    firc_resolve_input_t in = {.group = g, .intern = fake_intern};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    char buf[512];
+    ASSERT(firc_resolve_route_describe(&t.items[0], buf, sizeof(buf)) > 0);
+    ASSERT_STR_EQ("answers its names from resolve.server: 9.9.9.9, https://dns.example:8443/dns-query,"
+                  " the common upstream answers when they fail", buf);
+    firc_resolve_table_free(&t);
+    g->resolve.fallback = false;
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT(firc_resolve_route_describe(&t.items[0], buf, sizeof(buf)) > 0);
+    ASSERT_STR_EQ("answers its names from resolve.server: 9.9.9.9, https://dns.example:8443/dns-query,"
+                  " never the common upstream", buf);
+    firc_resolve_table_free(&t);
+    firc_strset(&g->resolve.server, "https://gone.example/d");
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT(firc_resolve_route_describe(&t.items[0], buf, sizeof(buf)) > 0);
+    ASSERT_STR_EQ("answers its names from resolve.server: no usable server, never the common upstream", buf);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_dns_group_with_tunnel_off_still_has_its_route(void)
+{
+    firc_group_t *g = group("d", "dns", 1);
+    firc_strset(&g->resolve.server, "9.9.9.9");
+    g->resolve.tunnel = false;
+    firc_resolve_input_t in = {.group = g};
+    firc_resolve_table_t t = {0};
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    ASSERT_EQ(FIRC_RESOLVE_SOURCE_GROUP, t.items[0].source);
+    ASSERT(firc_resolve_route_usable(&t.items[0]));
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+typedef struct {
+    firc_config_t cfg;
+    firc_dns_pipeline_t *pl;
+    firc_resolve_router_t *router;
+} dns_fx_t;
+
+static void dns_fx_up(dns_fx_t *fx, const char *server, bool fallback, bool publish)
+{
+    memset(fx, 0, sizeof(*fx));
+    firc_config_init_defaults(&fx->cfg);
+    firc_group_t *g = group("d", "dns", 1);
+    add_namespace_rule(g, "dns.test");
+    if (server != NULL) { firc_strset(&g->resolve.server, server); }
+    g->resolve.fallback = fallback;
+    firc_config_add_group(&fx->cfg, g);
+    fx->pl = firc_dns_pipeline_create();
+    fx->router = firc_resolve_router_new(fx->pl);
+    firc_dns_pipeline_set_snapshot(fx->pl, firc_ruleset_snapshot_build(&fx->cfg));
+    if (publish) {
+        firc_resolve_input_t in = {.group = g, .intern = fake_intern};
+        firc_resolve_table_t t;
+        firc_resolve_table_build(&in, 1, NULL, &t);
+        firc_resolve_router_publish(fx->router, &t);
+    }
+}
+
+static void dns_fx_down(dns_fx_t *fx)
+{
+    firc_resolve_router_free(fx->router);
+    firc_dns_pipeline_destroy(fx->pl);
+    firc_config_clear(&fx->cfg);
+}
+
+static bool dns_decide(dns_fx_t *fx, firc_dnsproxy_route_t *out)
+{
+    firc_ip_t c = {{192, 168, 1, 5}, 4};
+    firc_dns_msg_t *q = query("a.dns.test", 1);
+    bool got = firc_resolve_router_decide(fx->router, q, &c, out);
+    firc_dns_msg_free(q);
+    return got;
+}
+
+TEST a_dns_owner_is_claimed_with_its_servers_and_doh_ids(void)
+{
+    intern_reset("https://a.example/d", NULL);
+    dns_fx_t fx;
+    dns_fx_up(&fx, "9.9.9.9, https://a.example/d", false, true);
+    firc_dnsproxy_route_t r;
+    ASSERT(dns_decide(&fx, &r));
+    ASSERT(r.dns_only);
+    ASSERT(r.no_fallback);
+    ASSERT_EQ((uint32_t)0, r.mark);
+    ASSERT_EQ((size_t)2, r.n_servers);
+    ASSERT_EQ((socklen_t)sizeof(struct sockaddr_in), r.server_lens[0]);
+    ASSERT_EQ((uint16_t)0, r.url_ids[0]);
+    ASSERT_EQ((socklen_t)0, r.server_lens[1]);
+    ASSERT_EQ((uint16_t)1, r.url_ids[1]);
+    ASSERT(firc_id_equal(fx.cfg.groups[0]->id, r.group_id));
+    ASSERT_STR_EQ("d", r.group_name);
+    ASSERT(r.gen != 0);
+    dns_fx_down(&fx);
+    PASS();
+}
+
+TEST a_dns_owner_with_fallback_is_claimed_with_fallback(void)
+{
+    dns_fx_t fx;
+    dns_fx_up(&fx, "9.9.9.9", true, true);
+    firc_dnsproxy_route_t r;
+    ASSERT(dns_decide(&fx, &r));
+    ASSERT(r.dns_only);
+    ASSERT_FALSE(r.no_fallback);
+    dns_fx_down(&fx);
+    PASS();
+}
+
+TEST a_refused_doh_url_is_warned_with_its_group_once_per_build(void)
+{
+    intern_reset("https://ok.example/d", NULL);
+    firc_group_t *g = group("g", "nwg0", 1);
+    firc_strset(&g->resolve.server, "https://a.example/d, https://ok.example/d");
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .intern = fake_intern};
+    firc_resolve_table_t t = {0};
+    int fds[2];
+    ASSERT_EQ(0, pipe(fds));
+    firc_log_set_output_floor(FIRC_LOG_INFO);
+    firc_log_set_fd(fds[1]);
+    ASSERT_EQ(FIRC_OK, firc_resolve_table_build(&in, 1, NULL, &t));
+    firc_log_set_fd(STDOUT_FILENO);
+    close(fds[1]);
+    char log[1024];
+    ssize_t n = read(fds[0], log, sizeof(log) - 1);
+    close(fds[0]);
+    ASSERT(n > 0);
+    log[n] = '\0';
+    ASSERTm(log, strstr(log, "https://a.example/d") != NULL);
+    ASSERTm(log, strstr(log, "\"g\"") != NULL);
+    ASSERTm(log, strstr(log, "https://ok.example/d") == NULL);
+    const char *first = strstr(log, "https://a.example/d");
+    ASSERTm(log, strstr(first + 1, "https://a.example/d") == NULL);
+    firc_resolve_table_free(&t);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST a_dns_owner_without_a_usable_server_is_still_claimed(void)
+{
+    intern_reset(NULL, NULL);
+    dns_fx_t fx;
+    dns_fx_up(&fx, "https://gone.example/d", false, true);
+    firc_dnsproxy_route_t r;
+    ASSERT(dns_decide(&fx, &r));
+    ASSERT(r.dns_only);
+    ASSERT(r.no_fallback);
+    ASSERT_EQ((size_t)0, r.n_servers);
+    ASSERT_EQ((uint32_t)0, r.mark);
+    dns_fx_down(&fx);
+    PASS();
+}
+
+TEST a_dns_owner_before_the_table_is_published_is_still_claimed(void)
+{
+    dns_fx_t fx;
+    dns_fx_up(&fx, "9.9.9.9", false, false);
+    firc_dnsproxy_route_t r;
+    ASSERT(dns_decide(&fx, &r));
+    ASSERT(r.dns_only);
+    ASSERT(r.no_fallback);
+    ASSERT_EQ((size_t)0, r.n_servers);
+    ASSERT(firc_id_equal(fx.cfg.groups[0]->id, r.group_id));
+    dns_fx_down(&fx);
+    dns_fx_up(&fx, "9.9.9.9", true, false);
+    ASSERT(dns_decide(&fx, &r));
+    ASSERT_FALSE(r.no_fallback);
+    dns_fx_down(&fx);
+    PASS();
+}
+
+TEST a_routed_owner_carries_its_doh_id_and_its_mark(void)
+{
+    intern_reset("https://a.example/d", NULL);
+    firc_config_t cfg;
+    firc_config_init_defaults(&cfg);
+    firc_group_t *g = group("g", "nwg0", 1);
+    add_namespace_rule(g, "dns.test");
+    firc_strset(&g->resolve.server, "https://a.example/d");
+    firc_config_add_group(&cfg, g);
+    firc_dns_pipeline_t *pl = firc_dns_pipeline_create();
+    firc_resolve_router_t *router = firc_resolve_router_new(pl);
+    firc_dns_pipeline_set_snapshot(pl, firc_ruleset_snapshot_build(&cfg));
+    firc_resolve_input_t in = {.group = g, .mark = MARK1, .intern = fake_intern};
+    firc_resolve_table_t t;
+    firc_resolve_table_build(&in, 1, NULL, &t);
+    firc_resolve_router_publish(router, &t);
+    firc_ip_t c = {{192, 168, 1, 5}, 4};
+    firc_dns_msg_t *q = query("a.dns.test", 1);
+    firc_dnsproxy_route_t r;
+    ASSERT(firc_resolve_router_decide(router, q, &c, &r));
+    firc_dns_msg_free(q);
+    ASSERT_FALSE(r.dns_only);
+    ASSERT_EQ(MARK1, r.mark);
+    ASSERT_EQ((size_t)1, r.n_servers);
+    ASSERT_EQ((socklen_t)0, r.server_lens[0]);
+    ASSERT_EQ((uint16_t)1, r.url_ids[0]);
+    firc_resolve_router_free(router);
+    firc_dns_pipeline_destroy(pl);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+TEST a_routed_owner_without_a_usable_route_is_still_declined(void)
+{
+    firc_config_t cfg;
+    firc_config_init_defaults(&cfg);
+    firc_group_t *g = group("g", "nwg0", 1);
+    add_namespace_rule(g, "dns.test");
+    firc_strset(&g->resolve.server, "9.9.9.9");
+    firc_config_add_group(&cfg, g);
+    firc_dns_pipeline_t *pl = firc_dns_pipeline_create();
+    firc_resolve_router_t *router = firc_resolve_router_new(pl);
+    firc_dns_pipeline_set_snapshot(pl, firc_ruleset_snapshot_build(&cfg));
+    firc_resolve_input_t in = {.group = g, .mark = 0};
+    firc_resolve_table_t t;
+    firc_resolve_table_build(&in, 1, NULL, &t);
+    firc_resolve_router_publish(router, &t);
+    firc_ip_t c = {{192, 168, 1, 5}, 4};
+    firc_dns_msg_t *q = query("a.dns.test", 1);
+    firc_dnsproxy_route_t r;
+    ASSERT_FALSE(firc_resolve_router_decide(router, q, &c, &r));
+    firc_dns_msg_free(q);
+    firc_resolve_router_free(router);
+    firc_dns_pipeline_destroy(pl);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -849,6 +1249,7 @@ int main(int argc, char **argv)
     RUN_TEST(a_group_with_no_mark_is_not_usable);
     RUN_TEST(v4_first_and_v6_only_with_a_v6_route);
     RUN_TEST(a_groups_own_servers_are_all_routed_in_order);
+    RUN_TEST(a_doh_entry_adds_no_server_to_the_route);
     RUN_TEST(an_own_v6_server_needs_a_v6_route);
     RUN_TEST(the_generation_moves_only_on_a_real_change);
     RUN_TEST(each_route_is_described_for_the_log);
@@ -865,5 +1266,21 @@ int main(int argc, char **argv)
     RUN_TEST(cross_v6_needs_both_v6_and_kernel_tcp);
     RUN_TEST(a_block_owner_is_claimed_without_a_route);
     RUN_TEST(the_owner_is_reported_when_the_route_is_declined);
+    RUN_TEST(a_dns_group_is_usable_without_a_mark);
+    RUN_TEST(a_routed_group_without_a_mark_stays_unusable_with_doh);
+    RUN_TEST(a_dns_group_never_takes_the_firmwares_resolvers);
+    RUN_TEST(a_dns_route_carries_no_fallback);
+    RUN_TEST(a_doh_entry_reaches_the_route_as_a_url_id);
+    RUN_TEST(a_doh_entry_is_dropped_when_the_intern_refuses_it);
+    RUN_TEST(a_change_of_url_is_a_new_generation);
+    RUN_TEST(a_dns_route_says_where_its_names_go);
+    RUN_TEST(a_dns_group_with_tunnel_off_still_has_its_route);
+    RUN_TEST(a_dns_owner_is_claimed_with_its_servers_and_doh_ids);
+    RUN_TEST(a_dns_owner_with_fallback_is_claimed_with_fallback);
+    RUN_TEST(a_refused_doh_url_is_warned_with_its_group_once_per_build);
+    RUN_TEST(a_dns_owner_without_a_usable_server_is_still_claimed);
+    RUN_TEST(a_dns_owner_before_the_table_is_published_is_still_claimed);
+    RUN_TEST(a_routed_owner_carries_its_doh_id_and_its_mark);
+    RUN_TEST(a_routed_owner_without_a_usable_route_is_still_declined);
     GREATEST_MAIN_END();
 }

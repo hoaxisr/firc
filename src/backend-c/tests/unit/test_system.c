@@ -1090,7 +1090,7 @@ TEST the_interfaces_route_answers_role_description_and_ndms_name(void) {
 
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/system/interfaces", NULL, &out));
-    ASSERT_EQ(4, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(out, "interfaces")));
+    ASSERT_EQ(5, cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(out, "interfaces")));
     const cJSON *eth3 = iface_item(out, "eth3");
     ASSERT(eth3 != NULL);
     ASSERT_STR_EQ("wan", cJSON_GetObjectItemCaseSensitive(eth3, "role")->valuestring);
@@ -1102,6 +1102,8 @@ TEST the_interfaces_route_answers_role_description_and_ndms_name(void) {
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(br0, "ndmsName"));
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "blackhole"), "role"));
     ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "block"), "role"));
+    ASSERT(iface_item(out, "dns") != NULL);
+    ASSERT_EQ(NULL, cJSON_GetObjectItemCaseSensitive(iface_item(out, "dns"), "role"));
     ASSERT_EQ(NULL, iface_item(out, "lo"));
     cJSON_Delete(out);
 

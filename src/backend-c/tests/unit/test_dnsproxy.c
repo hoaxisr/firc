@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "firc/dnsproxy.h"
+#include "firc/doh.h"
 #include "firc/anscache.h"
 #include "firc/events.h"
 #include "firc/dnswire.h"
@@ -272,6 +273,7 @@ typedef struct {
     _Atomic int fail_open, fail_open_next, fail_mark, fail_connect, fail_send;
     _Atomic int marked_fd;
     _Atomic int connects_marked;
+    _Atomic int stream_opens;
 } rec_t;
 
 static rec_t g_rec;
@@ -284,6 +286,7 @@ static void rec_reset(void) {
 static int rec_open(void *ud, int family, int type) {
     rec_t *r = ud;
     atomic_fetch_add(&r->opens, 1);
+    if ((type & 0xf) == SOCK_STREAM) { atomic_fetch_add(&r->stream_opens, 1); }
     int e = atomic_exchange(&r->fail_open_next, 0);
     if (e == 0) { e = atomic_load(&r->fail_open); }
     if (e != 0) {
@@ -350,6 +353,9 @@ typedef struct {
     _Atomic int saw_client;
     const firc_resolve_route_t *own;
     const char *name;
+    uint16_t url_ids[4];
+    bool dns_only;
+    bool no_fallback;
 } troute_t;
 
 static troute_t g_troute;
@@ -382,7 +388,14 @@ static bool test_route(void *ud, const firc_dns_msg_t *q, const firc_ip_t *clien
         s4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         s4->sin_port = htons(t->ports[i]);
         out->server_lens[i] = sizeof(*s4);
+        if (t->url_ids[i] != 0) {
+            memset(&out->servers[i], 0, sizeof(out->servers[i]));
+            out->server_lens[i] = 0;
+            out->url_ids[i] = t->url_ids[i];
+        }
     }
+    out->dns_only = t->dns_only;
+    out->no_fallback = t->no_fallback;
     return true;
 }
 
@@ -589,6 +602,8 @@ typedef struct {
     bool ptr_no_rd;
     const firc_fakeip_t *pool;
     uint32_t pool_ttl;
+    bool dns_route;
+    bool no_fallback;
 } xopts_t;
 
 /* Waits until the proxy holds at least `n` answers, or two seconds. */
@@ -692,6 +707,11 @@ static int run_exchange(const xopts_t *o, reply_t *out, int *hook_calls) {
         g_troute.mark = 0x40010000u;
         g_troute.n = 1;
         g_troute.ports[0] = up_port;
+        if (o->dns_route) {
+            g_troute.mark = 0;
+            g_troute.dns_only = true;
+            g_troute.no_fallback = o->no_fallback;
+        }
         firc_dnsproxy_set_sock_ops(proxy, &REC_OPS);
         firc_dnsproxy_set_router(proxy, test_route, &g_troute);
         atomic_store(&g_rec.fail_connect, o->tunnel_fail_connect);
@@ -1102,6 +1122,116 @@ typedef struct {
     pthread_t th;
 } live_t;
 
+enum { DOH_GOOD = 0, DOH_SERVFAIL, DOH_SINK, DOH_FAIL, DOH_SILENT, DOH_BIG, DOH_REFUSE };
+
+#define DOH_ANSWER_OCTET 9
+#define DOH_CALLS 32
+
+struct fdoh;
+
+typedef struct {
+    struct fdoh *d;
+    uint64_t ticket;
+    bool live;
+    firc_doh_done_fn fn;
+    void *ud;
+    uint8_t q[512];
+    size_t qlen;
+    int mode;
+} fdoh_call_t;
+
+typedef struct fdoh {
+    firc_loop_t *loop;
+    _Atomic int mode;
+    _Atomic int queries, cancels, delivered;
+    _Atomic int last_url, last_id, last_len;
+    _Atomic uint32_t last_mark, last_timeout;
+    _Atomic uint64_t last_ticket, last_cancelled;
+    uint64_t next;
+    fdoh_call_t calls[DOH_CALLS];
+} fdoh_t;
+
+static fdoh_t g_fdoh;
+static bool g_live_doh;
+
+static void fdoh_fire(fdoh_call_t *c) {
+    if (!c->live) { return; }
+    c->live = false;
+    atomic_fetch_add(&c->d->delivered, 1);
+    if (c->mode == DOH_FAIL) {
+        c->fn(c->ud, NULL, 0, false);
+        return;
+    }
+    uint8_t a[STUB_BUF];
+    unsigned big = g_big_a;
+    if (c->mode == DOH_BIG) { g_big_a = BIG_A_OVER_512; }
+    size_t n = build_answer(c->q, c->qlen, a);
+    g_big_a = big;
+    if (c->mode != DOH_BIG) { a[STUB_A_LAST_OCTET] = DOH_ANSWER_OCTET; }
+    if (c->mode == DOH_SERVFAIL) { a[3] = (uint8_t)((a[3] & 0xf0) | 2); }
+    if (c->mode == DOH_SINK) { memset(a + STUB_A_LAST_OCTET - 3, 0, 4); }
+    c->fn(c->ud, a, n, true);
+}
+
+static void fdoh_on_timer(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    fdoh_fire(ud);
+}
+
+static void fdoh_flush(firc_loop_t *loop, void *ud) {
+    (void)loop;
+    fdoh_t *d = ud;
+    for (size_t i = 0; i < DOH_CALLS; i++) {
+        if (d->calls[i].live) {
+            d->calls[i].mode = DOH_GOOD;
+            fdoh_fire(&d->calls[i]);
+        }
+    }
+}
+
+static firc_err_t fdoh_query(void *ud, uint16_t url_id, uint32_t mark, const uint8_t *q, size_t len,
+                             uint32_t timeout_ms, firc_doh_done_fn fn, void *fn_ud, uint64_t *ticket) {
+    fdoh_t *d = ud;
+    atomic_fetch_add(&d->queries, 1);
+    atomic_store(&d->last_url, url_id);
+    atomic_store(&d->last_mark, mark);
+    atomic_store(&d->last_timeout, timeout_ms);
+    atomic_store(&d->last_len, (int)len);
+    atomic_store(&d->last_id, len >= 2 ? (int)((unsigned)q[0] << 8 | q[1]) : -1);
+    int mode = atomic_load(&d->mode);
+    if (mode == DOH_REFUSE || len > sizeof(d->calls[0].q)) { return FIRC_ERR_NOMEM; }
+    fdoh_call_t *c = &d->calls[d->next % DOH_CALLS];
+    d->next++;
+    c->d = d;
+    c->ticket = d->next;
+    c->live = true;
+    c->fn = fn;
+    c->ud = fn_ud;
+    memcpy(c->q, q, len);
+    c->qlen = len;
+    c->mode = mode;
+    *ticket = c->ticket;
+    atomic_store(&d->last_ticket, c->ticket);
+    int tid = 0;
+    if (mode != DOH_SILENT) { (void)firc_loop_add_timer(d->loop, 0, 0, fdoh_on_timer, c, &tid); }
+    return FIRC_OK;
+}
+
+static void fdoh_cancel(void *ud, uint64_t ticket) {
+    fdoh_t *d = ud;
+    atomic_fetch_add(&d->cancels, 1);
+    atomic_store(&d->last_cancelled, ticket);
+    for (size_t i = 0; i < DOH_CALLS; i++) {
+        if (d->calls[i].live && d->calls[i].ticket == ticket) { d->calls[i].live = false; }
+    }
+}
+
+static void fdoh_setup(int mode) {
+    memset(&g_fdoh, 0, sizeof(g_fdoh));
+    atomic_store(&g_fdoh.mode, mode);
+    g_live_doh = true;
+}
+
 static bool g_live_hold;
 static bool g_live_cache;
 static _Atomic uint64_t g_cache_skew_ms;
@@ -1233,6 +1363,10 @@ static bool live_start(live_t *lv) {
     firc_ip_t v6 = {.b = {0xfd, 0x00, 0x12, 0x34}, .len = 16};
     firc_dnsproxy_set_pool_prefixes(lv->proxy, &v4, 15, &v6, 48);
     if (g_live_rest_ms != 0) { firc_dnsproxy_set_health(lv->proxy, 0, g_live_rest_ms); }
+    if (g_live_doh) {
+        g_fdoh.loop = lv->loop;
+        firc_dnsproxy_set_doh(lv->proxy, (firc_doh_ops_t){.query = fdoh_query, .cancel = fdoh_cancel, .ud = &g_fdoh});
+    }
     if (g_live_health_clock) { firc_dnsproxy_set_health_clock_for_test(lv->proxy, health_clock); }
     if (firc_dnsproxy_start(lv->proxy) != FIRC_OK) {
         firc_dnsproxy_destroy(lv->proxy);
@@ -1267,6 +1401,7 @@ static void live_stop(live_t *lv) {
     g_live_cache = false;
     g_live_health_clock = false;
     g_live_cross = false;
+    g_live_doh = false;
     atomic_store(&g_cache_skew_ms, 0);
 }
 
@@ -5813,6 +5948,469 @@ TEST a_common_follow_up_that_servfails_sends_the_first_nodata(void) {
     PASS();
 }
 
+typedef struct {
+    int rcode;
+    int last;
+    bool tc;
+} got_t;
+
+static bool got_parse(const uint8_t *r, size_t n, got_t *g) {
+    firc_dns_msg_t *msg = NULL;
+    if (firc_dns_msg_parse(r, n, &msg) != FIRC_OK) { return false; }
+    g->rcode = (int)(msg->flags & 0x0fu);
+    g->tc = (msg->flags & FIRC_DNS_FLAG_TC) != 0;
+    g->last = -1;
+    for (size_t i = 0; i < msg->n_answers; i++) {
+        if (msg->answers[i].rtype == FIRC_DNS_TYPE_A && msg->answers[i].rdata_len == 4) {
+            g->last = msg->answers[i].rdata[3];
+        }
+    }
+    firc_dns_msg_free(msg);
+    return true;
+}
+
+static bool ask_got(uint16_t port, uint16_t id, got_t *g) {
+    int c = ask_send(port, id);
+    if (c < 0) { return false; }
+    uint8_t r[4096];
+    ssize_t n = recv(c, r, sizeof(r), 0);
+    close(c);
+    return n > 0 && got_parse(r, (size_t)n, g);
+}
+
+static bool ask_tcp_got(uint16_t port, uint16_t id, got_t *g) {
+    int c = tcp_open(port);
+    if (c < 0) { return false; }
+    uint8_t q[512];
+    size_t qlen = build_query(q, id, 0);
+    uint8_t framed[514];
+    framed[0] = (uint8_t)(qlen >> 8);
+    framed[1] = (uint8_t)qlen;
+    memcpy(framed + 2, q, qlen);
+    uint8_t hdr[2];
+    if (send(c, framed, qlen + 2, MSG_NOSIGNAL) != (ssize_t)(qlen + 2) || recv(c, hdr, 2, MSG_WAITALL) != 2) {
+        close(c);
+        return false;
+    }
+    size_t want = ((size_t)hdr[0] << 8) | hdr[1];
+    uint8_t r[4096];
+    ssize_t n = want <= sizeof(r) ? recv(c, r, want, MSG_WAITALL) : -1;
+    close(c);
+    return n == (ssize_t)want && got_parse(r, want, g);
+}
+
+static void doh_setup(int mode, uint32_t mark, bool dns_only, bool no_fallback) {
+    tunnel_setup(0);
+    fdoh_setup(mode);
+    g_troute.mark = mark;
+    g_troute.dns_only = dns_only;
+    g_troute.no_fallback = no_fallback;
+}
+
+#define DOH_URL 5
+#define DOH_MARK 0x40010000u
+
+TEST a_doh_server_answers_as_a_leg(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, DOH_MARK, false, false);
+    g_troute.url_ids[0] = DOH_URL;
+    ASSERT(live_start(&lv));
+    ASSERT_EQ(DOH_ANSWER_OCTET, ask(lv.proxy_port, 0xd101));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+    ASSERT_EQ(DOH_URL, atomic_load(&g_fdoh.last_url));
+    ASSERT_EQ(DOH_MARK, atomic_load(&g_fdoh.last_mark));
+    ASSERT_EQ(0xd101, atomic_load(&g_fdoh.last_id));
+    ASSERT(atomic_load(&g_fdoh.last_timeout) > 0);
+    ASSERT(atomic_load(&g_fdoh.last_timeout) <= FIRC_DNSPROXY_TUNNEL_TIMEOUT_MS);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0, atomic_load(&g_rec.opens));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST a_doh_leg_losing_the_race_is_cancelled(void) {
+    live_t lv;
+    doh_setup(DOH_SILENT, DOH_MARK, false, false);
+    g_troute.n = 2;
+    g_troute.url_ids[1] = DOH_URL;
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xd201));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.cancels));
+    ASSERT_EQ(atomic_load(&g_fdoh.last_ticket), atomic_load(&g_fdoh.last_cancelled));
+    ASSERT_EQ(FIRC_OK, firc_loop_post(lv.loop, fdoh_flush, &g_fdoh));
+    pause_ms(50);
+    ASSERT_EQ(0, atomic_load(&g_fdoh.delivered));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST a_dns_route_sets_no_mark(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_troute.mark = 0;
+    g_troute.dns_only = true;
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = lv.b.port;
+    ASSERT_EQ(2, ask(lv.proxy_port, 0xd301));
+    ASSERT_EQ(1, atomic_load(&g_rec.opens));
+    ASSERT_EQ(0, atomic_load(&g_rec.marks));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    xopts_t o;
+    memset(&o, 0, sizeof(o));
+    o.over_tcp = true;
+    o.tunnel = true;
+    o.dns_route = true;
+    reply_t out;
+    memset(&out, 0, sizeof(out));
+    int hook_calls = 0;
+    int rc = run_exchange(&o, &out, &hook_calls);
+    if (rc == -2) { SKIPm("could not bind the harness's ports"); }
+    ASSERT_EQ(0, rc);
+    ASSERT(out.saw_a);
+    ASSERT_EQ(1, atomic_load(&g_rec.stream_opens));
+    ASSERT_EQ(0, atomic_load(&g_rec.marks));
+    PASS();
+}
+
+TEST a_dns_routes_aaaa_is_stripped_when_drop_aaaa_is_on(void) {
+    xopts_t o;
+    memset(&o, 0, sizeof(o));
+    o.tunnel = true;
+    o.dns_route = true;
+    o.disable_drop_aaaa = false;
+    reply_t out;
+    memset(&out, 0, sizeof(out));
+    int hook_calls = 0;
+    int rc = run_exchange(&o, &out, &hook_calls);
+    if (rc == -2) { SKIPm("could not bind the harness's ports"); }
+    ASSERT_EQ(0, rc);
+    ASSERT(out.saw_a);
+    ASSERT_FALSE(out.saw_aaaa);
+    PASS();
+}
+
+TEST a_dns_routes_aaaa_passes_when_drop_aaaa_is_off(void) {
+    xopts_t o;
+    memset(&o, 0, sizeof(o));
+    o.tunnel = true;
+    o.dns_route = true;
+    o.disable_drop_aaaa = true;
+    reply_t out;
+    memset(&out, 0, sizeof(out));
+    int hook_calls = 0;
+    int rc = run_exchange(&o, &out, &hook_calls);
+    if (rc == -2) { SKIPm("could not bind the harness's ports"); }
+    ASSERT_EQ(0, rc);
+    ASSERT(out.saw_a);
+    ASSERT(out.saw_aaaa);
+    PASS();
+}
+
+TEST without_fallback_a_servfail_reaches_the_client(void) {
+    for (int beside = 0; beside < 2; beside++) {
+        live_t lv;
+        doh_setup(DOH_SILENT, 0, true, true);
+        g_troute.n = beside ? 2u : 1u;
+        g_troute.url_ids[1] = DOH_URL;
+        ASSERT(live_start(&lv));
+        g_troute.ports[0] = lv.b.port;
+        atomic_store(&lv.b.rcode, 2);
+        got_t g;
+        ASSERTm(beside ? "beside a silent leg" : "alone", ask_got(lv.proxy_port, 0xd401, &g));
+        ASSERT_EQ(2, g.rcode);
+        ASSERT_EQ(2, g.last);
+        ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+        ASSERT_EQ(0, atomic_load(&lv.a.received));
+        ASSERT_EQ(beside, atomic_load(&g_fdoh.cancels));
+        live_stop(&lv);
+    }
+    PASS();
+}
+
+TEST without_fallback_a_sink_answer_reaches_the_client(void) {
+    live_t lv;
+    doh_setup(DOH_SINK, 0, true, true);
+    g_troute.url_ids[0] = DOH_URL;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xd501, &g));
+    ASSERT_EQ(0, g.rcode);
+    ASSERT_EQ(0, g.last);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_GROUP, atomic_load(&g_live_resolver));
+    ASSERT(ask_got(lv.proxy_port, 0xd502, &g));
+    ASSERT_EQ(0, g.last);
+    ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0u, live_fallbacks(&lv));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST without_fallback_every_leg_timing_out_is_servfail(void) {
+    live_t lv;
+    doh_setup(DOH_SILENT, 0, true, true);
+    g_troute.n = 2;
+    g_troute.url_ids[1] = DOH_URL;
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.hold, 1);
+    long t0 = ms_now();
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xd601, &g));
+    ASSERT_GTE(ms_now() - t0, (long)FIRC_DNSPROXY_TUNNEL_TIMEOUT_MS - 50);
+    ASSERT_EQ(2, g.rcode);
+    ASSERT_EQ(-1, g.last);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_LOCAL, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.cancels));
+    atomic_store(&lv.b.go, 1);
+    live_stop(&lv);
+    PASS();
+}
+
+static void rest_dns_group(live_t *lv) {
+    for (int i = 0; i < (int)FIRC_RESOLVE_HEALTH_FAILS; i++) {
+        got_t g;
+        g.rcode = -1;
+        (void)ask_got(lv->proxy_port, (uint16_t)(0xd700 + i), &g);
+    }
+}
+
+TEST without_fallback_a_resting_group_answers_servfail_at_once(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, 0, true, true);
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = closed_udp_port();
+    ASSERT(g_troute.ports[0] != 0);
+    log_capture_start();
+    rest_dns_group(&lv);
+    ASSERT_EQ((int)FIRC_RESOLVE_HEALTH_FAILS, atomic_load(&g_rec.opens));
+    long t0 = ms_now();
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xd711, &g));
+    ASSERT_LT(ms_now() - t0, 100);
+    ASSERT_EQ(2, g.rcode);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_LOCAL, atomic_load(&g_live_resolver));
+    ASSERT_EQm("resting: no leg opened", (int)FIRC_RESOLVE_HEALTH_FAILS, atomic_load(&g_rec.opens));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    firc_dnsproxy_health_t h;
+    ASSERT(live_health(&lv, 1, &h));
+    ASSERT(h.resting);
+    live_stop(&lv);
+    int servfail = 0, upstream = 0;
+    log_capture_counts("the group's names are answered SERVFAIL", &servfail, "common upstream", &upstream);
+    ASSERT_EQ(1, servfail);
+    ASSERT_EQ(0, upstream);
+    PASS();
+}
+
+TEST without_fallback_a_due_probe_still_asks(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, 0, true, true);
+    g_live_rest_ms = 300;
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = closed_udp_port();
+    ASSERT(g_troute.ports[0] != 0);
+    rest_dns_group(&lv);
+    g_troute.ports[0] = lv.b.port;
+    pause_ms(350);
+    log_capture_start();
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xd801, &g));
+    ASSERT_EQ(0, g.rcode);
+    ASSERT_EQ(2, g.last);
+    ASSERT_EQ(1, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    int resolver = 0, tunnel = 0;
+    log_capture_counts("answering again; the group's names go to its resolver", &resolver, "tunnel", &tunnel);
+    ASSERT_EQ(1, resolver);
+    ASSERT_EQ(0, tunnel);
+    PASS();
+}
+
+TEST with_fallback_a_dns_route_falls_back_as_any_group(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, 0, true, false);
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = closed_udp_port();
+    ASSERT(g_troute.ports[0] != 0);
+    ASSERT_EQ(1, ask(lv.proxy_port, 0xd901));
+    ASSERT_EQ(1, atomic_load(&lv.a.received));
+    ASSERT_EQ(0, atomic_load(&g_rec.marks));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_FALLBACK_UNREACHABLE, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST a_tcp_client_is_answered_over_doh(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, DOH_MARK, false, false);
+    g_troute.n = 2;
+    g_troute.url_ids[0] = DOH_URL;
+    g_troute.url_ids[1] = DOH_URL + 1;
+    ASSERT(live_start(&lv));
+    uint8_t q[512];
+    size_t qlen = build_query(q, 0xda01, 0);
+    ASSERT_EQ(DOH_ANSWER_OCTET, ask_tcp(lv.proxy_port, 0xda01));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+    ASSERT_EQ(DOH_URL, atomic_load(&g_fdoh.last_url));
+    ASSERT_EQ((int)qlen, atomic_load(&g_fdoh.last_len));
+    ASSERT_EQ(0xda01, atomic_load(&g_fdoh.last_id));
+    ASSERT_EQ(0, atomic_load(&g_rec.stream_opens));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST a_doh_answer_is_cached(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, DOH_MARK, false, false);
+    g_troute.url_ids[0] = DOH_URL;
+    g_live_cache = true;
+    ASSERT(live_start(&lv));
+    ASSERT_EQ(DOH_ANSWER_OCTET, ask(lv.proxy_port, 0xdb01));
+    ASSERT_EQ(DOH_ANSWER_OCTET, ask(lv.proxy_port, 0xdb02));
+    ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+    ASSERT_EQ(FIRC_DNS_RESOLVER_CACHE, atomic_load(&g_live_resolver));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST an_oversized_doh_answer_is_truncated_for_udp(void) {
+    live_t lv;
+    doh_setup(DOH_BIG, DOH_MARK, false, false);
+    g_troute.url_ids[0] = DOH_URL;
+    ASSERT(live_start(&lv));
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xdc01, &g));
+    ASSERT(g.tc);
+    ASSERT_EQ(-1, g.last);
+    live_stop(&lv);
+    PASS();
+}
+
+TEST without_fallback_servfails_from_the_server_do_not_rest_the_group(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, 0, true, true);
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = lv.b.port;
+    atomic_store(&lv.b.rcode, 2);
+    for (int i = 0; i < 4; i++) {
+        got_t g;
+        ASSERT(ask_got(lv.proxy_port, (uint16_t)(0xdd01 + i), &g));
+        ASSERT_EQ(2, g.rcode);
+    }
+    ASSERT_EQ(4, atomic_load(&lv.b.received));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    firc_dnsproxy_health_t h;
+    ASSERT(live_health(&lv, 1, &h));
+    ASSERT_FALSE(h.resting);
+    ASSERT_EQ(0u, h.fallbacks);
+    live_stop(&lv);
+    PASS();
+}
+
+TEST without_fallback_no_server_is_servfail_not_upstream(void) {
+    live_t lv;
+    doh_setup(DOH_GOOD, 0, true, true);
+    g_troute.n = 0;
+    ASSERT(live_start(&lv));
+    got_t g;
+    ASSERT(ask_got(lv.proxy_port, 0xde01, &g));
+    ASSERT_EQ(2, g.rcode);
+    ASSERT_EQ(FIRC_DNS_RESOLVER_LOCAL, atomic_load(&g_live_resolver));
+    ASSERT_EQ(0, atomic_load(&lv.a.received));
+    ASSERT_EQ(0, atomic_load(&g_rec.opens));
+    live_stop(&lv);
+    PASS();
+}
+
+TEST without_fallback_tcp_never_reaches_upstream(void) {
+    int modes[2] = {DOH_FAIL, DOH_REFUSE};
+    for (int m = 0; m < 2; m++) {
+        live_t lv;
+        doh_setup(modes[m], 0, true, true);
+        g_troute.url_ids[0] = DOH_URL;
+        ASSERT(live_start(&lv));
+        got_t g;
+        long t0 = ms_now();
+        ASSERTm(m == 0 ? "failed transfer" : "refused submit", ask_tcp_got(lv.proxy_port, 0xdf01, &g));
+        ASSERT_LT(ms_now() - t0, 500);
+        ASSERT_EQ(2, g.rcode);
+        ASSERT_EQ(FIRC_DNS_RESOLVER_LOCAL, atomic_load(&g_live_resolver));
+        ASSERT_EQ(1, atomic_load(&g_fdoh.queries));
+        ASSERT_EQ(0, atomic_load(&g_rec.stream_opens));
+        live_stop(&lv);
+    }
+    xopts_t o;
+    memset(&o, 0, sizeof(o));
+    o.over_tcp = true;
+    o.tunnel = true;
+    o.dns_route = true;
+    o.no_fallback = true;
+    o.tunnel_sink_a = true;
+    reply_t out;
+    memset(&out, 0, sizeof(out));
+    int hook_calls = 0;
+    int rc = run_exchange(&o, &out, &hook_calls);
+    if (rc == -2) { SKIPm("could not bind the harness's ports"); }
+    ASSERT_EQ(0, rc);
+    ASSERT(out.saw_a);
+    ASSERT_EQ(0, out.a[3]);
+    ASSERT_EQ(1, atomic_load(&g_rec.connects));
+    PASS();
+}
+
+static void dns_owner_batch(live_t *lv, int drop, uint16_t id) {
+    int fds[8];
+    atomic_store(&lv->a.drop, drop);
+    for (int i = 0; i < 8; i++) { fds[i] = ask_send_for(lv->proxy_port, (uint16_t)(id + i), 0, (char)('c' + i)); }
+    pause_ms(700);
+    for (int i = 0; i < 8; i++) {
+        if (fds[i] >= 0) { close(fds[i]); }
+    }
+}
+
+TEST a_dns_owner_is_never_counted_by_the_upstream_outage_detector(void) {
+    live_t lv;
+    tunnel_setup(0);
+    g_troute.mark = 0;
+    g_troute.dns_only = true;
+    g_live_timeout_ms = 100;
+    atomic_store(&g_rep_ms, 1000);
+    firc_logrep_set_clock_for_test(rep_clock);
+    firc_event_reset_for_test();
+    ASSERT(live_start(&lv));
+    g_troute.ports[0] = closed_udp_port();
+    ASSERT(g_troute.ports[0] != 0);
+    dns_owner_batch(&lv, 8, 0x6a00);
+    int dns_missed = journal_at(FIRC_LOG_WARN, "the common upstream does not answer");
+    g_troute.take = false;
+    dns_owner_batch(&lv, 8, 0x6a10);
+    int warned = journal_at(FIRC_LOG_WARN, "the common upstream does not answer");
+    g_troute.take = true;
+    ASSERT_EQ(1, ask(lv.proxy_port, 0x6a20));
+    int dns_recovered = journal_at(FIRC_LOG_INFO, "the common upstream: recovered");
+    g_troute.take = false;
+    ASSERT_EQ(1, ask(lv.proxy_port, 0x6a21));
+    int recovered = journal_at(FIRC_LOG_INFO, "the common upstream: recovered");
+    live_stop(&lv);
+    firc_logrep_set_clock_for_test(NULL);
+    ASSERT_EQ_FMT(0, dns_missed, "%d");
+    ASSERT_EQ_FMT(1, warned, "%d");
+    ASSERT_EQ_FMT(0, dns_recovered, "%d");
+    ASSERT_EQ_FMT(1, recovered, "%d");
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
@@ -5825,6 +6423,8 @@ int main(int argc, char **argv)
     RUN_TEST(a_rewritten_answer_reaches_the_client_when_stripping_too);
     RUN_TEST(a_retimed_answer_is_still_stripped_by_the_aaaa_default);
     RUN_TEST(a_retimed_answer_keeps_its_aaaa_and_ttl_when_stripping_is_off);
+    RUN_TEST(a_dns_routes_aaaa_is_stripped_when_drop_aaaa_is_on);
+    RUN_TEST(a_dns_routes_aaaa_passes_when_drop_aaaa_is_off);
     RUN_TEST(an_untouched_answer_is_forwarded_as_it_arrived);
     RUN_TEST(an_unreported_change_is_not_forwarded);
     RUN_TEST(a_rewritten_answer_reaches_a_tcp_client);
@@ -5976,5 +6576,21 @@ int main(int argc, char **argv)
     RUN_TEST(a_tcp_follow_up_refresh_is_sent_unframed);
     RUN_TEST(a_fallen_back_a_asks_aaaa_of_the_common_upstream);
     RUN_TEST(a_common_follow_up_that_servfails_sends_the_first_nodata);
+    RUN_TEST(a_doh_server_answers_as_a_leg);
+    RUN_TEST(a_doh_leg_losing_the_race_is_cancelled);
+    RUN_TEST(a_dns_route_sets_no_mark);
+    RUN_TEST(without_fallback_a_servfail_reaches_the_client);
+    RUN_TEST(without_fallback_a_sink_answer_reaches_the_client);
+    RUN_TEST(without_fallback_every_leg_timing_out_is_servfail);
+    RUN_TEST(without_fallback_a_resting_group_answers_servfail_at_once);
+    RUN_TEST(without_fallback_a_due_probe_still_asks);
+    RUN_TEST(with_fallback_a_dns_route_falls_back_as_any_group);
+    RUN_TEST(a_tcp_client_is_answered_over_doh);
+    RUN_TEST(a_doh_answer_is_cached);
+    RUN_TEST(an_oversized_doh_answer_is_truncated_for_udp);
+    RUN_TEST(without_fallback_servfails_from_the_server_do_not_rest_the_group);
+    RUN_TEST(without_fallback_no_server_is_servfail_not_upstream);
+    RUN_TEST(without_fallback_tcp_never_reaches_upstream);
+    RUN_TEST(a_dns_owner_is_never_counted_by_the_upstream_outage_detector);
     GREATEST_MAIN_END();
 }

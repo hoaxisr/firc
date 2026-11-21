@@ -198,6 +198,22 @@ TEST an_sni_a_group_matches_is_a_bypass(void) {
     PASS();
 }
 
+TEST a_flow_to_a_dns_groups_name_is_no_bypass(void) {
+    static const gspec_t GEO[] = {{1, "geo", "example.com", NULL}};
+    rig_t r;
+    ASSERT(rig_up(&r, GEO, 1));
+    r.ctx.snap->groups[0]->dns_only = true;
+    firc_ip_t real = v4(104, 21, 0, 5), client = v4(192, 168, 1, 42);
+    firc_recall_real(r.recall, &real, "video.example.com", "01000000", 100);
+    firc_tap_find_t f;
+    ASSERT_FALSE(firc_tap_judge_addr(&r.ctx, &client, &real, &f));
+    ASSERT_EQ(NULL, f.group);
+    ASSERT_FALSE(firc_tap_judge_sni(&r.ctx, &client, &real, "video.example.com", &f));
+    ASSERT_EQ(NULL, f.group);
+    rig_down(&r);
+    PASS();
+}
+
 TEST an_sni_no_group_matches_is_not(void) {
     rig_t r;
     ASSERT(rig_up(&r, MEDIA_LAN, 1));
@@ -274,6 +290,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_recalled_name_no_group_owns_any_more_is_not_a_bypass);
     RUN_TEST(an_sni_a_group_matches_is_a_bypass);
     RUN_TEST(an_sni_no_group_matches_is_not);
+    RUN_TEST(a_flow_to_a_dns_groups_name_is_no_bypass);
     RUN_TEST(a_policy_in_the_selector_is_resolved_by_the_callers_resolver);
     RUN_TEST(nothing_is_judged_without_a_snapshot);
     GREATEST_MAIN_END();

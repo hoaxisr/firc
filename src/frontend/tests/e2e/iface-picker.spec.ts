@@ -237,3 +237,37 @@ test("at 360 a long name in the rest keeps its id whole", async ({ page }) => {
   });
   expect(m).toEqual({ subCut: false, title: "Broadband connection" });
 });
+
+test("Only DNS sits after Block by DNS, says what it does and offers no backup circle", async ({
+  page,
+}) => {
+  await setup(
+    page,
+    [group("0a000001", "YouTube", "nwg0"), group("0a000002", "Comss", "dns")],
+    "ru",
+    [...IFACES.slice(0, 2), { id: "dns" }, ...IFACES.slice(2)],
+  );
+  const second = page.locator(".group .iface-select [data-select-trigger]").nth(1);
+  await expect(second.locator(".selected-value")).toHaveText("Только DNS");
+  await expect(second.locator(".selected-description")).toHaveCount(0);
+  await openPicker(page);
+  expect(await shown(page)).toEqual([
+    "nwg0",
+    "nwg2",
+    "tunvless0",
+    "blackhole",
+    "block",
+    "dns",
+    "__more__",
+  ]);
+  const only = page.locator('[data-select-item][data-value="dns"]');
+  await expect(only.locator(".option-label")).toHaveText("Только DNS");
+  await expect(only.locator(".option-subline")).toHaveText(
+    "резолвить через DNS группы, ничего не маршрутизировать",
+  );
+  await expect(only.locator("[data-circle]")).toHaveCount(0);
+  await only.click();
+  await expect(
+    page.locator(".group .iface-select [data-select-trigger]").first().locator(".selected-value"),
+  ).toHaveText("Только DNS");
+});

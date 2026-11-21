@@ -183,6 +183,77 @@ describe("the panel's resolver tag", () => {
   });
 });
 
+describe("a dns group's badge", () => {
+  const none = { source: "group" as const, servers: [], health: CALM };
+  it("names its servers, DoH links included", () => {
+    assert.strictEqual(
+      resolverTag(
+        {
+          interface: "dns",
+          resolver: {
+            source: "group",
+            servers: ["https://dns.comss.one/dns-query", "9.9.9.9"],
+            health: CALM,
+          },
+        },
+        id,
+      ),
+      "DNS https://dns.comss.one/dns-query, 9.9.9.9",
+    );
+  });
+  it("falls back to the saved server text and never says common upstream", () => {
+    assert.strictEqual(
+      resolverTag(
+        { interface: "dns", resolve: { tunnel: true, server: "9.9.9.9" }, resolver: none },
+        id,
+      ),
+      "DNS 9.9.9.9",
+    );
+    assert.strictEqual(resolverTag({ interface: "dns", resolver: none }, id), null);
+  });
+  it("submits the typed server, the fallback and tunnel on", () => {
+    assert.deepStrictEqual(
+      submittedResolve("dns", { tunnel: true, server: "" }, "auto", " https://a.example/q ", false),
+      { tunnel: true, server: "https://a.example/q", fallback: false },
+    );
+    assert.deepStrictEqual(submittedResolve("dns", undefined, "off", "9.9.9.9", true), {
+      tunnel: true,
+      server: "9.9.9.9",
+      fallback: true,
+    });
+    assert.deepStrictEqual(submittedResolve("nwg0", undefined, "own", "9.9.9.9", false), {
+      tunnel: true,
+      server: "9.9.9.9",
+    });
+  });
+});
+
+describe("the health tag of a dns group without fallback", () => {
+  it("never names the common upstream when resting", () => {
+    const tag = healthTag(firmware({ resting: true, since: at(9, 5) }), toRu, true);
+    assert.strictEqual(tag?.kind, "red");
+    assert.strictEqual(tag?.text, "DNS группы не отвечает");
+    assert.strictEqual(
+      tag?.tip,
+      "С 09:05 DNS группы не отвечает, имена группы получают SERVFAIL. firc проверяет его раз в 30 с. Нажмите, чтобы открыть журнал группы.",
+    );
+  });
+  it("names the failure without saying the common upstream answered", () => {
+    const tag = healthTag(
+      firmware({ total: 10, fallbacks: 3, last: at(14, 32), reason: "fallback_timeout" }),
+      toRu,
+      true,
+    );
+    assert.strictEqual(tag?.kind, "amber");
+    assert.strictEqual(tag?.text, "DNS группы сбоит: 3 из 10 за 10 мин");
+    assert.strictEqual(
+      tag?.tip,
+      "Последний сбой в 14:32: DNS группы не ответил вовремя. Нажмите, чтобы открыть журнал группы.",
+    );
+    assert.strictEqual(tag?.tip.includes("upstream"), false);
+  });
+});
+
 describe("the card's DNS health tag", () => {
   // Catches a tag shown for no resolver, a calm window, or a group not asked through the tunnel.
   it("shows nothing without a resolver, without failures, or with the resolver off", () => {

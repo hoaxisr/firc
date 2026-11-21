@@ -5,7 +5,7 @@
   import { fetchInterfaces, interfaces } from "../../data/interfaces.svelte";
   import { t } from "../../data/locale.svelte";
 
-  import { ifaceTitle, isSink } from "../../data/iface-choices";
+  import { ifaceTitle, isSynthetic } from "../../data/iface-choices";
   import { fetcher } from "../../utils/fetcher";
   import { groupInterfaces } from "./settings";
 
@@ -49,7 +49,7 @@
 
   const offered = $derived([
     ...interfaces.list.filter((i) => i.role === "wan"),
-    ...interfaces.list.filter((i) => i.role !== "wan" && i.role !== "lan" && !isSink(i.id)),
+    ...interfaces.list.filter((i) => i.role !== "wan" && i.role !== "lan" && !isSynthetic(i.id)),
   ]);
   const options = $derived([
     { value: DEFAULT, label: t("Default route") },

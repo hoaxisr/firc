@@ -1,6 +1,6 @@
 import type { DnsResolverSource } from "../../data/events.svelte";
 
-import { BLOCK, isSink } from "../../data/iface-choices";
+import { BLOCK, DNS, isSink } from "../../data/iface-choices";
 import {
   DEFAULT_RESOLVE,
   type BlockAnswer,
@@ -9,7 +9,7 @@ import {
   type SystemResolvers,
 } from "../../types";
 import type { ResolverListProblem } from "../../utils/resolver-validators";
-import { resolverNote } from "../logs/journal";
+import { failureNote, resolverNote } from "../logs/journal";
 import { ifaceList } from "./iface-list";
 import { clockMinutes } from "./live-state";
 
@@ -52,12 +52,16 @@ export function serverProblemText(
   if (problem === "sink")
     return named(t("This address cannot be a DNS server (0.0.0.0, 127.x, ::, ::1)"));
   if (problem === "mapped") return named(t("Write the IPv4 address itself"));
+  if (problem === "url")
+    return named(t("A link must look like https://host/path, without a query"));
   if (problem === "duplicate") return t("{entry} is written twice").replace("{entry}", entry);
   if (problem === "too-many") return t("At most four servers");
   if (problem === "syntax" && entry.includes(" "))
     return named(t("Separate the servers with commas"));
   if (problem === "syntax" || problem === "empty")
-    return t("One to four addresses separated by commas: address, address:port or [IPv6]:port");
+    return t(
+      "One to four servers separated by commas: address, address:port, [IPv6]:port or https://host/path",
+    );
   return "";
 }
 
@@ -100,7 +104,9 @@ export function submittedResolve(
   original: GroupResolve | undefined,
   mode: DnsMode,
   server: string,
+  fallbackOn = true,
 ): GroupResolve {
+  if (iface === DNS) return { tunnel: true, server: server.trim(), fallback: fallbackOn };
   if (isSink(iface)) return original ?? DEFAULT_RESOLVE();
   return resolveOf(mode, server);
 }
@@ -117,7 +123,12 @@ export function blockCode(answer: BlockAnswer | undefined): string {
 
 export function resolverTag(
   group:
-    | { interface: string | string[]; block?: BlockAnswer; resolver?: GroupResolver }
+    | {
+        interface: string | string[];
+        block?: BlockAnswer;
+        resolve?: GroupResolve;
+        resolver?: GroupResolver;
+      }
     | undefined,
   t: (s: string) => string,
 ): string | null {
@@ -125,6 +136,10 @@ export function resolverTag(
     return t("DNS: blocking · {code}").replace("{code}", blockCode(group.block));
   }
   const r = group?.resolver;
+  if (group?.interface === DNS) {
+    const servers = r?.servers.length ? r.servers.join(", ") : (group.resolve?.server ?? "");
+    return servers === "" ? null : `${t("DNS")} ${servers}`;
+  }
   if (!r) return null;
   if (r.source === "off") return t("DNS: not through the tunnel");
   if (r.servers.length === 0) return t("DNS: common upstream");
@@ -136,19 +151,29 @@ export type HealthTag = { kind: "amber" | "red"; text: string; tip: string };
 export function healthTag(
   r: GroupResolver | undefined,
   t: (s: string) => string,
+  withoutFallback = false,
 ): HealthTag | null {
   if (!r || r.source === "off") return null;
   const h = r.health;
   const open = t("Click to open the group's journal.");
   if (h.resting) {
+    const since = withoutFallback
+      ? t(
+          "Since {time} the group's DNS is not answering, the group's names get SERVFAIL. firc checks it every 30 s.",
+        )
+      : t(
+          "Since {time} the group's DNS is not answering, the common upstream answers. firc checks it every 30 s.",
+        );
     return {
       kind: "red",
       text: t("The group's DNS is not answering"),
-      tip: `${t("Since {time} the group's DNS is not answering, the common upstream answers. firc checks it every 30 s.").replace("{time}", clockMinutes(h.since))} ${open}`,
+      tip: `${since.replace("{time}", clockMinutes(h.since))} ${open}`,
     };
   }
   if (h.fallbacks <= 0) return null;
-  const note = resolverNote(h.reason as DnsResolverSource, t);
+  const note = withoutFallback
+    ? failureNote(h.reason as DnsResolverSource, t)
+    : resolverNote(h.reason as DnsResolverSource, t);
   return {
     kind: "amber",
     text: t("The group's DNS is failing: {fallbacks} of {total} in {minutes} min")

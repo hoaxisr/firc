@@ -28,6 +28,7 @@
     groupChoices,
     ifaceTitle,
     isSink,
+    isSynthetic,
     moreText,
     type IfaceItem,
   } from "../../../data/iface-choices";
@@ -507,7 +508,7 @@
   >
     {#if canBackup(base ?? [], item.id)}
       <IfaceCircle id={item.id} n={entryNumber(base ?? [], item.id)} ontoggle={toggleBackup} />
-    {:else if !(base ?? []).some(isSink)}
+    {:else if !(base ?? []).some(isSynthetic)}
       <span class="iface-gap"></span>
     {/if}
     <span class="bulk-menu-label">{label.title}</span>

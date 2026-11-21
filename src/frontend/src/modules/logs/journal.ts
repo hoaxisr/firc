@@ -150,6 +150,25 @@ export function resolverNote(r: DnsResolverSource | undefined, t: (s: string) =>
   }
 }
 
+export function failureNote(r: DnsResolverSource | undefined, t: (s: string) => string): string {
+  switch (r) {
+    case "fallback_unreachable":
+      return t("the group's DNS could not be reached");
+    case "fallback_timeout":
+      return t("the group's DNS did not answer in time");
+    case "fallback_servfail":
+      return t("the group's DNS answered SERVFAIL");
+    case "fallback_refused":
+      return t("the group's DNS refused");
+    case "fallback_sink":
+      return t("the group's DNS answered a sink address");
+    case "health_skip":
+      return t("the group's DNS is resting after failures");
+    default:
+      return resolverNote(r, t);
+  }
+}
+
 export function describeDnsTail(e: DnsEvent, t: (s: string) => string, names?: GroupNames): string {
   const note = e.decision === "blocked" ? "" : resolverNote(e.resolver, t);
   const tail = decisionTail(e, t, names);
@@ -193,6 +212,9 @@ function decisionTail(e: DnsEvent, t: (s: string) => string, names?: GroupNames)
       return `${head} ${group}${t("passed, no address in the answer")}`;
     case "blocked":
       return `${head} ${group}${blockedPart(e, t)}`;
+    case "dns-only":
+      if (e.rcode !== "NOERROR") return `${head} ${group}${t("dns only")}, ${e.rcode}`;
+      return `${head} ${group}${t("dns only")}`;
   }
 }
 
@@ -240,12 +262,21 @@ const RESOLVER_LINES: [RegExp, (t: (s: string) => string) => string][] = [
       ),
   ],
   [
+    new RegExp(
+      String.raw`${RESOLVER_GROUP}(?<n>\d+) consecutive failures, the group's names are answered SERVFAIL until one query every (?<s>\d+) s finds its resolver answering$`,
+    ),
+    (t) =>
+      t(
+        "the group's DNS is not answering (failures in a row: {n}), the group's names get SERVFAIL. firc checks it every {s} s.",
+      ),
+  ],
+  [
     new RegExp(String.raw`${RESOLVER_GROUP}the probe failed; resting another (?<s>\d+) s$`),
     (t) => t("the group's DNS failed the check, it rests another {s} s"),
   ],
   [
     new RegExp(
-      String.raw`${RESOLVER_GROUP}answering again; the group's names go through its tunnel$`,
+      String.raw`${RESOLVER_GROUP}answering again; the group's names go (?:through its tunnel|to its resolver)$`,
     ),
     (t) => t("the group's DNS answers again, the group's names go through it"),
   ],

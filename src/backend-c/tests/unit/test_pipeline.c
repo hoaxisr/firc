@@ -2937,6 +2937,181 @@ TEST a_covered_cloudflare_answer_is_not_held(void) {
 
 GREATEST_MAIN_DEFS();
 
+static void dns_group(firc_config_t *cfg, uint8_t id, const char *name) {
+    add_group(cfg, id, name, FIRC_RULE_NAMESPACE, "example.com");
+    firc_group_t *g = cfg->groups[cfg->n_groups - 1];
+    firc_strset(&g->iface, FIRC_IFACE_DNS);
+    firc_strset(&g->resolve.server, "1.1.1.1");
+}
+
+static firc_dns_msg_t *plain_answer_ttl(const char *const *labels, size_t n, uint32_t ttl) {
+    firc_dns_msg_t *msg = plain_answer(labels, n, 0);
+    msg->answers[0].ttl = ttl;
+    return msg;
+}
+
+TEST a_dns_owners_answer_passes_untouched(void) {
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = chain_answer();
+    uint8_t *before = NULL, *after = NULL;
+    size_t nb = 0, na = 0;
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &before, &nb));
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message_from(f.p, msg, 1000, &client,
+                                                                              FIRC_DNS_RESOLVER_GROUP, &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_pack(msg, &after, &na));
+    ASSERT_EQ_FMT(nb, na, "%zu");
+    ASSERT_MEM_EQ(before, after, nb);
+    seen_t seen;
+    seen_from(f.pool, &seen);
+    ASSERT_EQ_FMTm("no mapping exists", (size_t)0, seen.n, "%zu");
+    free(before);
+    free(after);
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_dns_owners_answer_is_journalled_dns_only(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = plain_answer(k_ntc, 3, 0);
+    (void)firc_dns_pipeline_handle_message_from(f.p, msg, (int64_t)time(NULL), &client,
+                                                FIRC_DNS_RESOLVER_FALLBACK_TIMEOUT, NULL);
+    firc_dns_msg_free(msg);
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    const firc_event_dns_t *d = &ev[0].u.dns;
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_DNS_ONLY, (unsigned)d->decision, "%u");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_RESOLVER_FALLBACK_TIMEOUT, (unsigned)d->resolver, "%u");
+    ASSERT_STR_EQ("dns", d->group_name);
+    ASSERT_EQ_FMT(0u, (unsigned)d->fake.len, "%u");
+    firc_recall_answer_t last;
+    ASSERT(firc_recall_last_answer(firc_dns_pipeline_recall(f.p), &client, "ntc.example.com", FIRC_RECALL_V4,
+                                   (int64_t)time(NULL), &last));
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_DNS_ONLY, (unsigned)last.decision, "%u");
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_dns_owners_ttl_is_not_clamped(void) {
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = plain_answer_ttl(k_ntc, 3, 3000);
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &client, NULL));
+    ASSERT_EQ_FMT(3000u, msg->answers[0].ttl, "%u");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_device_outside_the_dns_groups_selector_gets_the_next_owner(void) {
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    firc_group_t *g = cfg.groups[0];
+    g->devices.allow = calloc(1, sizeof(char *));
+    g->devices.allow[0] = strdup("192.168.1.5");
+    g->devices.n_allow = 1;
+    add_group(&cfg, 6, "routed", FIRC_RULE_NAMESPACE, "example.com");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    const firc_ip_t member = {{192, 168, 1, 5}, 4}, other = {{192, 168, 1, 9}, 4};
+    firc_dns_msg_t *msg = chain_answer();
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &member, NULL));
+    ASSERT_MEM_EQ("\x5d\xb8\xd8\x22", msg->answers[1].rdata, 4);
+    firc_dns_msg_free(msg);
+    msg = chain_answer();
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, &other, NULL));
+    ASSERT_EQ_FMT(4u, (unsigned)msg->answers[0].rdata_len, "%u");
+    ASSERT_EQ_FMT(198u, (unsigned)msg->answers[0].rdata[0], "%u");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_dns_owners_nxdomain_is_journalled_dns_only(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = plain_answer(k_ntc, 3, 3);
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_handle_message_from(f.p, msg, 1000, &client,
+                                                                              FIRC_DNS_RESOLVER_GROUP, NULL));
+    ASSERT_EQ(3u, msg->flags & 0x000fu);
+    firc_dns_msg_free(msg);
+    firc_event_t all[8], ev[8];
+    ASSERT_EQ_FMT((size_t)1, dns_events(all, journal(all, 8), ev), "%zu");
+    ASSERT_EQ_FMT((unsigned)FIRC_DNS_DNS_ONLY, (unsigned)ev[0].u.dns.decision, "%u");
+    ASSERT_EQ_FMT(3u, (unsigned)ev[0].u.dns.rcode, "%u");
+    rw_down(&f);
+    PASS();
+}
+
+TEST a_cross_answer_for_a_dns_owner_issues_no_fake(void) {
+    firc_event_reset_for_test();
+    firc_config_t cfg = make_cfg();
+    dns_group(&cfg, 5, "dns");
+    rw_fixture_t f;
+    rw_up_cfg(&f, cfg, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *msg = empty_a();
+    firc_dns_msg_t *aaaa = follow_up(k_ntc_v6, 600);
+    bool changed = true;
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, msg, aaaa, 1000, &client,
+                                                                      FIRC_DNS_RESOLVER_GROUP, &changed));
+    ASSERT_FALSE(changed);
+    ASSERT_EQ_FMT((size_t)0, msg->n_answers, "%zu");
+    seen_t seen;
+    seen_from(f.pool, &seen);
+    ASSERT_EQ_FMT((size_t)0, seen.n, "%zu");
+    firc_dns_msg_free(msg);
+    firc_dns_msg_free(aaaa);
+    rw_down(&f);
+    PASS();
+}
+
+TEST servfails_for_a_dns_owner_never_count_as_an_upstream_outage(void) {
+    static char out[4096];
+    for (int dns = 0; dns < 2; dns++) {
+        firc_config_t cfg = make_cfg();
+        if (dns) {
+            dns_group(&cfg, 5, "dns");
+        } else {
+            add_group(&cfg, 5, "plain", FIRC_RULE_NAMESPACE, "example.com");
+        }
+        rw_fixture_t f;
+        rw_up_cfg(&f, cfg, 64);
+        g_rep_ms = 1000;
+        firc_logrep_set_clock_for_test(rep_clock);
+        firc_event_reset_for_test();
+        (void)answers_from(&f, 2, 40, FIRC_DNS_RESOLVER_LOCAL, out, sizeof(out));
+        firc_logrep_set_clock_for_test(NULL);
+        size_t lines = journal_lines(FIRC_LOG_WARN, "upstream is answering rcode=");
+        if (dns) {
+            ASSERT_EQ_FMT((size_t)0, lines, "%zu");
+        } else {
+            ASSERTm("the detector still counts other owners", lines > 0);
+        }
+        rw_down(&f);
+    }
+    PASS();
+}
+
 int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
@@ -3003,6 +3178,13 @@ int main(int argc, char **argv)
     RUN_TEST(a_failed_answer_is_journalled_with_its_rcode);
     RUN_TEST(a_long_group_name_is_cut_on_a_character_in_the_event);
     RUN_TEST(a_blocked_answer_is_journalled_with_its_rcode);
+    RUN_TEST(a_dns_owners_answer_passes_untouched);
+    RUN_TEST(a_dns_owners_answer_is_journalled_dns_only);
+    RUN_TEST(a_dns_owners_ttl_is_not_clamped);
+    RUN_TEST(a_device_outside_the_dns_groups_selector_gets_the_next_owner);
+    RUN_TEST(a_dns_owners_nxdomain_is_journalled_dns_only);
+    RUN_TEST(a_cross_answer_for_a_dns_owner_issues_no_fake);
+    RUN_TEST(servfails_for_a_dns_owner_never_count_as_an_upstream_outage);
     RUN_TEST(an_upstream_answer_for_a_block_owner_is_blocked_not_issued);
     RUN_TEST(a_notify_for_a_block_owner_is_not_blocked);
     RUN_TEST(an_answer_is_journalled_as_its_event_only);

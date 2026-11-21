@@ -1,4 +1,4 @@
-import { BLOCK } from "../../data/iface-choices";
+import { BLOCK, DNS } from "../../data/iface-choices";
 import type { GroupResolver } from "../../types";
 import type { IfaceState } from "./iface-list";
 
@@ -128,6 +128,15 @@ export function liveTooltip(
         return {
           title: t("Working"),
           lines: [t("The daemon answers the group's names itself; nothing is routed.")],
+          footer: true,
+        };
+      }
+      if (ctx.iface === DNS) {
+        return {
+          title: t("Working"),
+          lines: [
+            t("The daemon resolves the group's names through its own DNS; nothing is routed."),
+          ],
           footer: true,
         };
       }

@@ -117,6 +117,25 @@ TEST a_gone_owner_s_flows_are_flushed_and_its_field_is_free(void) {
     PASS();
 }
 
+TEST a_dns_group_s_entry_is_freed_at_the_start(void) {
+    fx_t f;
+    ASSERT(up(&f, "0000000a", true));
+    f.g->iface = strdup("dns");
+    const uint8_t s1[4] = {192, 168, 1, 10}, d1[4] = {10, 1, 2, 3};
+    fake_ct_add(f.ctk, AF_INET, s1, d1, d1, 0x40010000u);
+    firc_fields_entry_t map[1] = {{"0000000a", 1}};
+    size_t n = 1;
+
+    firc_stable_fields_adoption_t r = firc_stable_fields_adopt(f.rtnl, f.ct, &f.cfg, true, map, &n);
+    ASSERT_EQ_FMT((size_t)0, r.kept, "%zu");
+    ASSERT_EQ_FMT((size_t)1, r.freed, "%zu");
+    ASSERT_EQ_FMT((size_t)0, n, "%zu");
+    ASSERT(fake_ct_deleted(f.ctk, d1, 4));
+    ASSERT_EQ_FMT(1u, alloc(&f, "0000000c"), "%u");
+    down(&f);
+    PASS();
+}
+
 /* Catches: a tunnel uplink's entry taken for a deleted group: its field flushed, freed and handed to a group. */
 TEST a_tunnel_entry_is_seeded_unflushed_and_no_group_takes_it(void) {
     fx_t f;
@@ -317,6 +336,7 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(a_gone_owner_s_flows_are_flushed_and_its_field_is_free);
     RUN_TEST(a_tunnel_entry_is_seeded_unflushed_and_no_group_takes_it);
+    RUN_TEST(a_dns_group_s_entry_is_freed_at_the_start);
     RUN_TEST(a_disabled_group_s_entry_is_seeded_not_flushed);
     RUN_TEST(without_conntrack_a_dead_entry_is_still_dropped);
     RUN_TEST(a_gone_owner_whose_flush_fails_keeps_its_field_reserved);

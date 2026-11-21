@@ -1,4 +1,4 @@
-import { BLOCK } from "../../data/iface-choices";
+import { BLOCK, DNS } from "../../data/iface-choices";
 import { configFrom, DEFAULT_RESOLVE, syncIdle, type Group, type Rule } from "../../types";
 import { randomId } from "../../utils/random-id";
 import { cleanComment } from "../../utils/rule-comment";
@@ -166,6 +166,20 @@ export function withoutStaleBlock<T extends { interface: string | string[]; bloc
   return rest as T;
 }
 
+export function withoutStaleFallback<T extends { interface: string | string[]; resolve?: object }>(
+  group: T,
+): T {
+  if (group.interface === DNS || group.resolve === undefined) return group;
+  const { fallback: _fallback, ...resolve } = group.resolve as { fallback?: unknown };
+  return { ...group, resolve };
+}
+
+export function withoutStale<
+  T extends { interface: string | string[]; block?: unknown; resolve?: object },
+>(group: T): T {
+  return withoutStaleFallback(withoutStaleBlock(group));
+}
+
 export function toConfigPayload(groups: Group[]) {
-  return { groups: structuredClone(groups).map(withoutStaleBlock) };
+  return { groups: structuredClone(groups).map(withoutStale) };
 }

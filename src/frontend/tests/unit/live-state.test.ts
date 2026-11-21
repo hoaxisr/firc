@@ -91,6 +91,13 @@ describe("a group's live state", () => {
     ]);
   });
 
+  it("says a working dns group resolves through its own DNS and routes nothing", () => {
+    const live = liveTooltip("live", { iface: "dns" }, t, clock);
+    assert.deepStrictEqual(live.lines, [
+      "The daemon resolves the group's names through its own DNS; nothing is routed.",
+    ]);
+  });
+
   // Catches the interface not named where the sentence names it.
   it("names the group's interface when live and when waiting for one", () => {
     const live = liveTooltip("live", { iface: "wg0" }, t, clock);
