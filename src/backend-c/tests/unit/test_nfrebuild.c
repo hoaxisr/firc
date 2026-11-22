@@ -1,5 +1,7 @@
 #include "greatest.h"
 
+#define TNOW INT64_C(1000)
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -250,7 +252,7 @@ TEST a_pass_writes_the_dnat_chain_and_commits_the_pool(void) {
     const firc_ip_t real = {{93, 184, 216, 34}, 4};
     const firc_ip_t real6 = {{0x26, 0x06, 0x28, 0, 0x02, 0x20, 0, 1, 0x02, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19, 0x46}, 16};
     firc_ip_t both[] = {real, real6};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", TNOW, both, 2, NULL));
     ASSERT(firc_fakeip_needs_commit(pool, &fake4));
     ASSERT_EQ(FIRC_OK, firc_app_refresh_pool_snapshot(app));
 
@@ -268,7 +270,7 @@ TEST a_pass_writes_the_dnat_chain_and_commits_the_pool(void) {
                   firc_fakeip_needs_commit(pool, &fake4));
 
     const firc_ip_t moved = {{93, 184, 216, 35}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", &moved, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_real(pool, "a.example.com", "g1", &moved));
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter(app, NULL));
     ASSERTm("a pass over an older snapshot does not commit a newer pair",
             firc_fakeip_needs_commit(pool, &fake4));
@@ -787,7 +789,7 @@ TEST destroying_the_app_takes_the_dnat_chain_back(void) {
     firc_ip_t fake4 = {{0}, 0};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(pool, "a.example.com", "g1", 1000, &fake4, NULL));
     const firc_ip_t real = {{93, 184, 216, 34}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", &real, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", TNOW, &real, 1, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_refresh_pool_snapshot(app));
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter(app, NULL));
     static const char *jump[] = {"-d", "198.18.0.0/15", "-j", "FIRC_DNAT"};
@@ -1553,7 +1555,7 @@ static bool add_tun_group(tun_rig_t *r, uint8_t tag, const char *iface, const ch
     firc_id_format(tag_id(tag), gid);
     const firc_ip_t real = {{93, 184, 216, tag}, 4};
     return firc_fakeip_get(r->pool, name, gid, (int64_t)time(NULL), fake, NULL) == FIRC_OK &&
-           firc_fakeip_set_reals(r->pool, name, gid, &real, 1) == FIRC_OK &&
+           firc_fakeip_set_reals(r->pool, name, gid, TNOW, &real, 1, NULL) == FIRC_OK &&
            firc_app_refresh_pool_snapshot(r->app) == FIRC_OK;
 }
 

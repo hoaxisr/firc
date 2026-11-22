@@ -57,6 +57,7 @@ typedef struct mapping {
     uint64_t pair_gen[N_FAM]; /* f->gen when this family's (fake, real) last changed */
     uint64_t cov_gen[N_FAM];
     int64_t last_seen;
+    int64_t seen[N_FAM];
     group_t *owner;
     bool cf;
     struct mapping *next;
@@ -132,6 +133,7 @@ struct firc_fakeip {
     size_t n_names;
     size_t max_names;
     int64_t idle_secs;
+    int64_t clamp_secs;
     int64_t quarantine_secs;
     uint64_t gen; /* advances on every change a completed pass must commit */
     uint64_t committed_gen;
@@ -277,6 +279,7 @@ firc_err_t firc_fakeip_new(const firc_fakeip_cfg_t *cfg, firc_fakeip_t **out) {
 
     f->max_names = (cfg->max_names == 0) ? FIRC_FAKEIP_DEFAULT_MAX_NAMES : cfg->max_names;
     f->idle_secs = cfg->idle_secs;
+    f->clamp_secs = cfg->clamp_secs;
     int64_t derived = cfg->clamp_secs * QUARANTINE_MULTIPLE;
     f->quarantine_secs = (derived > QUARANTINE_FLOOR) ? derived : QUARANTINE_FLOOR;
 
@@ -563,32 +566,14 @@ firc_err_t firc_fakeip_get(firc_fakeip_t *f, const char *qname, const char *grou
     return firc_fakeip_get_in(f, qname, group_id, now, FIRC_FAKEIP_KIND_PLAIN, v4_out, v6_out);
 }
 
-firc_err_t firc_fakeip_get_in(firc_fakeip_t *f, const char *qname, const char *group_id, int64_t now,
-                              unsigned kind, firc_ip_t *v4_out, firc_ip_t *v6_out) {
-    if (f == NULL || qname == NULL || group_id == NULL) { return FIRC_ERR_INVAL; }
+static void chunk_hook_fire(firc_fakeip_t *f) {
+    if (!f->chunk_taken) { return; }
+    f->chunk_taken = false;
+    if (f->on_chunk != NULL) { f->on_chunk(f->on_chunk_ud, f); }
+}
 
-    uint64_t h = fnv1a(qname) % MAP_BUCKETS;
-    for (mapping_t *m = f->buckets[h]; m != NULL; m = m->next) {
-        if (!name_eq(m->qname, qname) || strcmp(m->owner->id, group_id) != 0) { continue; }
-        m->last_seen = now;
-        f->dirty = true;
-        if (v4_out != NULL) { *v4_out = m->addr[FAM_V4]; }
-        if (v6_out != NULL) { *v6_out = m->addr[FAM_V6]; }
-        return FIRC_OK;
-    }
-
-    /* At capacity, refuse like an exhausted pool; mappings already held were served above. */
-    if (f->n_names >= f->max_names) {
-        write_blackholes(f, v4_out, v6_out);
-        return FIRC_ERR_LIMIT;
-    }
-
-    group_t *g = group_find_or_add(f, group_id);
-    if (g == NULL) {
-        write_blackholes(f, v4_out, v6_out);
-        return FIRC_ERR_NOMEM;
-    }
-
+static firc_err_t mapping_make(firc_fakeip_t *f, group_t *g, const char *qname, unsigned kind, int64_t now,
+                               mapping_t **out) {
     bool cf = kind == FIRC_FAKEIP_KIND_CF;
     /* Both or neither: one family alone would route over whichever interface Happy Eyeballs picked. */
     firc_ip_t issued[N_FAM];
@@ -618,11 +603,6 @@ firc_err_t firc_fakeip_get_in(firc_fakeip_t *f, const char *qname, const char *g
         for (unsigned i = 0; i < done; i++) {
             quarantine_put(f, list_of(g, kind, i), &issued[i], NULL, now, qname);
         }
-        write_blackholes(f, v4_out, v6_out);
-        if (f->chunk_taken) {
-            f->chunk_taken = false;
-            if (f->on_chunk != NULL) { f->on_chunk(f->on_chunk_ud, f); }
-        }
         return err;
     }
 
@@ -633,21 +613,60 @@ firc_err_t firc_fakeip_get_in(firc_fakeip_t *f, const char *qname, const char *g
         m->addr[i] = issued[i];
         if (cf && recycled[i]) { m->cov_gen[i] = ++f->gen; }
         chunk_count(f, mapping_list(m, i), &issued[i], +1, 0);
+        m->seen[i] = now;
     }
     m->last_seen = now;
     f->dirty = true;
+    uint64_t h = fnv1a(qname) % MAP_BUCKETS;
     m->next = f->buckets[h];
     f->buckets[h] = m;
     rindex_add(f, m);
     f->n_names++;
+    *out = m;
+    return FIRC_OK;
+}
 
-    if (v4_out != NULL) { *v4_out = issued[FAM_V4]; }
-    if (v6_out != NULL) { *v6_out = issued[FAM_V6]; }
-    /* After the mapping is in, so a chunk-take save holds the name that took it. */
-    if (f->chunk_taken) {
-        f->chunk_taken = false;
-        if (f->on_chunk != NULL) { f->on_chunk(f->on_chunk_ud, f); }
+firc_err_t firc_fakeip_get_in(firc_fakeip_t *f, const char *qname, const char *group_id, int64_t now,
+                              unsigned kind, firc_ip_t *v4_out, firc_ip_t *v6_out) {
+    if (f == NULL || qname == NULL || group_id == NULL) { return FIRC_ERR_INVAL; }
+
+    uint64_t h = fnv1a(qname) % MAP_BUCKETS;
+    mapping_t *fresh = NULL;
+    for (mapping_t *m = f->buckets[h]; m != NULL; m = m->next) {
+        if (!name_eq(m->qname, qname) || strcmp(m->owner->id, group_id) != 0) { continue; }
+        if (fresh == NULL || m->last_seen > fresh->last_seen) { fresh = m; }
     }
+    if (fresh != NULL) {
+        if (now > fresh->last_seen) { fresh->last_seen = now; }
+        f->dirty = true;
+        if (v4_out != NULL) { *v4_out = fresh->addr[FAM_V4]; }
+        if (v6_out != NULL) { *v6_out = fresh->addr[FAM_V6]; }
+        return FIRC_OK;
+    }
+
+    /* At capacity, refuse like an exhausted pool; mappings already held were served above. */
+    if (f->n_names >= f->max_names) {
+        write_blackholes(f, v4_out, v6_out);
+        return FIRC_ERR_LIMIT;
+    }
+
+    group_t *g = group_find_or_add(f, group_id);
+    if (g == NULL) {
+        write_blackholes(f, v4_out, v6_out);
+        return FIRC_ERR_NOMEM;
+    }
+
+    mapping_t *m = NULL;
+    firc_err_t err = mapping_make(f, g, qname, kind, now, &m);
+    if (err != FIRC_OK) {
+        write_blackholes(f, v4_out, v6_out);
+        chunk_hook_fire(f);
+        return err;
+    }
+    if (v4_out != NULL) { *v4_out = m->addr[FAM_V4]; }
+    if (v6_out != NULL) { *v6_out = m->addr[FAM_V6]; }
+    /* After the mapping is in, so a chunk-take save holds the name that took it. */
+    chunk_hook_fire(f);
     return FIRC_OK;
 }
 
@@ -706,12 +725,14 @@ void firc_fakeip_clear_real(firc_fakeip_t *f, const char *qname, const char *gro
     if (f == NULL || qname == NULL || group_id == NULL) { return; }
     unsigned fi = len == 4 ? FAM_V4 : len == 16 ? FAM_V6 : N_FAM;
     if (fi == N_FAM) { return; }
-    mapping_t *m = mapping_find(f, qname, group_id);
-    if (m == NULL || !m->has_real[fi]) { return; }
-    m->has_real[fi] = false;
-    m->pair_gen[fi] = ++f->gen;
-    if (m->cf && !firc_cf_contains(&m->real[fi])) { m->cov_gen[fi] = m->pair_gen[fi]; }
-    f->dirty = true;
+    uint64_t h = fnv1a(qname) % MAP_BUCKETS;
+    for (mapping_t *m = f->buckets[h]; m != NULL; m = m->next) {
+        if (!name_eq(m->qname, qname) || strcmp(m->owner->id, group_id) != 0 || !m->has_real[fi]) { continue; }
+        m->has_real[fi] = false;
+        m->pair_gen[fi] = ++f->gen;
+        if (m->cf && !firc_cf_contains(&m->real[fi])) { m->cov_gen[fi] = m->pair_gen[fi]; }
+        f->dirty = true;
+    }
 }
 
 bool firc_fakeip_overlaps(const firc_fakeip_t *f, const firc_ip_t *addr, uint8_t prefix_len) {
@@ -752,31 +773,113 @@ firc_err_t firc_fakeip_set_real(firc_fakeip_t *f, const char *qname, const char 
     return FIRC_OK;
 }
 
-firc_err_t firc_fakeip_set_reals(firc_fakeip_t *f, const char *qname, const char *group_id,
-                                 const firc_ip_t *reals, size_t n) {
-    if (f == NULL || qname == NULL || group_id == NULL || (reals == NULL && n > 0)) { return FIRC_ERR_INVAL; }
-    mapping_t *m = mapping_find(f, qname, group_id);
-    if (m == NULL) { return FIRC_ERR_NOENT; }
+static unsigned real_family(const firc_ip_t *r) { return r->len == 4 ? FAM_V4 : r->len == 16 ? FAM_V6 : N_FAM; }
 
-    /* Per family: keep the stored address while still offered, else the first offered. */
-    const firc_ip_t *first[N_FAM] = {NULL, NULL};
-    bool still_there[N_FAM] = {false, false};
-    for (size_t i = 0; i < n; i++) {
-        unsigned fi;
-        if (reals[i].len == 4) {
-            fi = FAM_V4;
-        } else if (reals[i].len == 16) {
-            fi = FAM_V6;
-        } else {
-            return FIRC_ERR_INVAL;
-        }
-        if (first[fi] == NULL) { first[fi] = &reals[i]; }
-        if (m->has_real[fi] && ip_equal(&m->real[fi], &reals[i])) { still_there[fi] = true; }
+static bool hit_has(const firc_fakeip_hits_t *out, const firc_ip_t *fake, unsigned fi) {
+    for (size_t i = 0; i < out->n; i++) {
+        if (out->hit[i].family == fi && ip_equal(&out->hit[i].fake[fi], fake)) { return true; }
     }
-    for (unsigned fi = 0; fi < N_FAM; fi++) {
-        if (first[fi] == NULL || still_there[fi]) { continue; }
-        real_put(f, m, fi, first[fi]);
+    return false;
+}
+
+#define SET_REALS_MAX 64
+
+static bool entry_in(mapping_t *const *set, size_t n, const mapping_t *m) {
+    for (size_t i = 0; i < n; i++) {
+        if (set[i] == m) { return true; }
+    }
+    return false;
+}
+
+firc_err_t firc_fakeip_set_reals(firc_fakeip_t *f, const char *qname, const char *group_id, int64_t now,
+                                 const firc_ip_t *reals, size_t n, firc_fakeip_hits_t *out) {
+    if (f == NULL || qname == NULL || group_id == NULL || (reals == NULL && n > 0)) { return FIRC_ERR_INVAL; }
+    firc_fakeip_hits_t local = {0};
+    if (out == NULL) { out = &local; }
+    out->n = 0;
+    out->capped = false;
+    if (n > SET_REALS_MAX) { n = SET_REALS_MAX; }
+    for (size_t i = 0; i < n; i++) {
+        if (real_family(&reals[i]) == N_FAM) { return FIRC_ERR_INVAL; }
+    }
+    mapping_t *entries[FIRC_FAKEIP_MAX_ENTRIES];
+    size_t ne = 0;
+    uint64_t h = fnv1a(qname) % MAP_BUCKETS;
+    for (mapping_t *m = f->buckets[h]; m != NULL && ne < FIRC_FAKEIP_MAX_ENTRIES; m = m->next) {
+        if (name_eq(m->qname, qname) && strcmp(m->owner->id, group_id) == 0) { entries[ne++] = m; }
+    }
+    if (ne == 0) { return FIRC_ERR_NOENT; }
+    const bool single = entries[0]->cf;
+
+    mapping_t *pick[SET_REALS_MAX] = {0};
+    bool skip[SET_REALS_MAX] = {false};
+    mapping_t *touched[N_FAM][FIRC_FAKEIP_MAX_ENTRIES];
+    size_t nt[N_FAM] = {0, 0};
+    size_t used[N_FAM] = {0, 0};
+
+    for (size_t i = 0; i < n; i++) {
+        unsigned fi = real_family(&reals[i]);
+        for (size_t j = 0; j < i; j++) { skip[i] = skip[i] || ip_equal(&reals[j], &reals[i]); }
+        if (skip[i]) { continue; }
+        for (size_t k = 0; k < ne && pick[i] == NULL; k++) {
+            if (ip_equal(&entries[k]->real[fi], &reals[i])) { pick[i] = entries[k]; }
+        }
+        if (pick[i] != NULL) {
+            if (!pick[i]->has_real[fi]) { real_put(f, pick[i], fi, &reals[i]); }
+            touched[fi][nt[fi]++] = pick[i];
+            used[fi]++;
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (skip[i] || pick[i] != NULL) { continue; }
+        unsigned fi = real_family(&reals[i]);
+        if (single && used[fi] > 0) { continue; }
+        mapping_t *e = NULL;
+        for (size_t k = 0; k < ne && e == NULL; k++) {
+            if (entries[k]->real[fi].len == 0) { e = entries[k]; }
+        }
+        if (e == NULL && single) { e = entries[0]; }
+        if (e == NULL && ne < FIRC_FAKEIP_MAX_ENTRIES && f->n_names < f->max_names) {
+            mapping_t *fresh = NULL;
+            if (mapping_make(f, entries[0]->owner, qname, FIRC_FAKEIP_KIND_PLAIN, now, &fresh) == FIRC_OK && fresh != NULL) {
+                entries[ne++] = fresh;
+                e = fresh;
+            }
+            chunk_hook_fire(f);
+        }
+        for (size_t k = 0; k < ne && e == NULL; k++) {
+            if (!entries[k]->has_real[fi]) { e = entries[k]; }
+        }
+        if (e == NULL) {
+            for (size_t k = 0; k < ne; k++) {
+                if (entry_in(touched[fi], nt[fi], entries[k]) || now - entries[k]->seen[fi] <= f->clamp_secs) { continue; }
+                if (e == NULL || entries[k]->seen[fi] < e->seen[fi]) { e = entries[k]; }
+            }
+        }
+        if (e == NULL) {
+            out->capped = true;
+            continue;
+        }
+        real_put(f, e, fi, &reals[i]);
+        pick[i] = e;
+        touched[fi][nt[fi]++] = e;
+        used[fi]++;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        mapping_t *e = pick[i];
+        if (e == NULL) { continue; }
+        unsigned fi = real_family(&reals[i]);
+        e->seen[fi] = now;
+        if (now > e->last_seen) { e->last_seen = now; }
         f->dirty = true;
+        if (!hit_has(out, &e->addr[fi], fi)) {
+            firc_fakeip_hit_t *hit = &out->hit[out->n++];
+            hit->fake[FAM_V4] = e->addr[FAM_V4];
+            hit->fake[FAM_V6] = e->addr[FAM_V6];
+            hit->family = fi;
+        }
     }
     return FIRC_OK;
 }
@@ -1521,7 +1624,21 @@ static bool restore_line(firc_fakeip_t *f, char *line, int64_t now) {
     char *end = NULL;
     long long seen = strtoll(seen_s, &end, 10);
     if (end == seen_s || *end != '\0') { return false; }
-    if (f->n_names >= f->max_names || mapping_find(f, qname, gid) != NULL) { return false; }
+    if (f->n_names >= f->max_names) { return false; }
+    const mapping_t *first = NULL;
+    {
+        size_t have = 0;
+        uint64_t qh = fnv1a(qname) % MAP_BUCKETS;
+        for (const mapping_t *x = f->buckets[qh]; x != NULL; x = x->next) {
+            if (!name_eq(x->qname, qname) || strcmp(x->owner->id, gid) != 0) { continue; }
+            have++;
+            first = x;
+        }
+        if (have >= FIRC_FAKEIP_MAX_ENTRIES || (first != NULL && first->cf)) { return false; }
+    }
+    for (unsigned fi = 0; fi < N_FAM; fi++) {
+        if (firc_fakeip_name_of(f, &addr[fi]) != NULL) { return false; }
+    }
 
     group_t *g = group_find_or_add(f, gid);
     if (g == NULL) { return false; }
@@ -1532,6 +1649,7 @@ static bool restore_line(firc_fakeip_t *f, char *line, int64_t now) {
     bool cf = gf_holds_chunk(&g->cf[FAM_V4], &base[FAM_V4]);
     if (cf != gf_holds_chunk(&g->cf[FAM_V6], &base[FAM_V6])) { return false; }
     unsigned kind = cf ? FIRC_FAKEIP_KIND_CF : FIRC_FAKEIP_KIND_PLAIN;
+    if (first != NULL && first->cf != cf) { return false; }
     mapping_t *m = calloc(1, sizeof(*m));
     if (m == NULL) { return false; }
     m->qname = strdup(qname);
@@ -1569,6 +1687,7 @@ static bool restore_line(firc_fakeip_t *f, char *line, int64_t now) {
         }
     }
     m->last_seen = (int64_t)seen;
+    m->seen[FAM_V4] = m->seen[FAM_V6] = (int64_t)seen;
     m->owner = g;
     m->cf = cf;
     for (unsigned fi = 0; fi < N_FAM; fi++) { chunk_count(f, mapping_list(m, fi), &m->addr[fi], +1, 0); }

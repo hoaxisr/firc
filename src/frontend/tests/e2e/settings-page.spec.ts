@@ -59,7 +59,7 @@ test("a class the daemon changes moves the row", async ({ page }) => {
 test("edits are counted and bordered, and Reset puts every one back", async ({ page }) => {
   await openSettings(page, (r) => r.fulfill({ json: answer() }));
   const upstream = page.getByRole("textbox", { name: "Upstream DNS", exact: true });
-  const names = page.getByRole("spinbutton", { name: "Domains in the pool, at most" });
+  const names = page.getByRole("spinbutton", { name: "Address entries in the pool, at most" });
   await expect(upstream).not.toHaveClass(/changed/);
   await upstream.fill("1.1.1.1");
   await expect(page.getByTestId("settings-counter")).toHaveText("1 setting changed");
@@ -104,9 +104,9 @@ test("switching back to Settings reloads, so a change made while away is seen", 
   await page.getByRole("tab", { name: "Groups" }).click();
   served = answer({ "app.addressPool.maxNames": 4096 }, ["app.addressPool.maxNames"]);
   await page.getByRole("tab", { name: "Settings" }).click();
-  await expect(page.getByRole("spinbutton", { name: "Domains in the pool, at most" })).toHaveValue(
-    "4096",
-  );
+  await expect(
+    page.getByRole("spinbutton", { name: "Address entries in the pool, at most" }),
+  ).toHaveValue("4096");
   await expect(page.getByTestId("settings-banner")).toContainText("1 setting waits for a restart");
 });
 
@@ -171,7 +171,7 @@ test("a key saved elsewhere arrives under an edit, and only the edit counts", as
   await page.getByRole("tab", { name: "Groups" }).click();
   await page.getByRole("tab", { name: "Settings" }).click();
   const upstream = page.getByRole("textbox", { name: "Upstream DNS", exact: true });
-  const names = page.getByRole("spinbutton", { name: "Domains in the pool, at most" });
+  const names = page.getByRole("spinbutton", { name: "Address entries in the pool, at most" });
   await upstream.fill("1.1.1.1");
   releaseSecond();
   await expect(page.getByTestId("settings-banner")).toContainText("1 setting waits for a restart");

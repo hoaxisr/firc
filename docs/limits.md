@@ -9,7 +9,7 @@ At the shipped defaults these bite in table order; a group takes another chunk w
 | what | where | value | when it is reached |
 |---|---|---|---|
 | groups with a chunk | `FIRC_MARK_MAX_GROUPS`, `mark.h` | 255 | the mark field is eight bits: enabling another group fails with `FIRC_ERR_LIMIT`, and it stays out of the kernel |
-| live names | `maxNames`, config | 65 536 | the name is answered with the blackhole address, never with the real one |
+| live entries (a name holds up to 8, one per real address) | `maxNames`, config | 65 536 | a new name is answered with the blackhole address, never with the real one; an extra entry of a known name is left out of the answer |
 | addresses | pool and chunk size, config | 129 794 (v4 `198.18.0.0/15` in 511 usable `/24` chunks of 254) | the group's chunks are full and no chunk is free: same as above |
 | a name's idle life | derived: twice `ttlClamp`, at least 1 h | 1 h | the mapping is reclaimed and its address can be reused |
 | TTL handed to clients | `ttlClamp`, config | 5 min | longer TTLs are clamped to it |

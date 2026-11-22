@@ -34,7 +34,7 @@ struct firc_dns_pipeline {
     bool outage_said;
     uint64_t last_healthy_ms;
     firc_logrep_t outage;
-    firc_lograte_t said_reals, said_collapse, said_refused;
+    firc_lograte_t said_reals, said_collapse, said_refused, said_capped;
     bool someone_covers_all;
     firc_recall_t *recall;
     firc_dns_unmatched_fn unmatched_fn;
@@ -340,27 +340,57 @@ static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *m
         ev->u.dns.n_reals = (uint8_t)k;
     }
     if (issue == FIRC_OK && cross) { firc_fakeip_clear_real(p->pool, qname, group_id, 4); }
+    const bool v6_routed = cross || p->v6_fn == NULL || p->v6_fn(p->v6_ud, owner->id);
+    firc_ip_t fakes4[FIRC_FAKEIP_MAX_ENTRIES], fakes6[FIRC_FAKEIP_MAX_ENTRIES];
+    size_t n4 = 0, n6 = 0;
+    bool capped = false;
     if (issue == FIRC_OK && r->n > 0) {
-        firc_err_t e = firc_fakeip_set_reals(p->pool, qname, group_id, r->v, r->n);
+        firc_fakeip_hits_t hits;
+        firc_ip_t live[sizeof(r->v) / sizeof(r->v[0])];
+        size_t n_live = 0;
+        for (size_t i = 0; i < r->n && !(cross && n_live > 0); i++) {
+            if (firc_resolver_ip_is_sink(&r->v[i]) || (r->v[i].len == 16 && !v6_routed)) { continue; }
+            live[n_live++] = r->v[i];
+        }
+        firc_err_t e = firc_fakeip_set_reals(p->pool, qname, group_id, now, live, n_live, &hits);
         if (e != FIRC_OK) {
             firc_lograte_say(&p->said_reals, 60000, FIRC_LOG_WARN, NULL, "recording real addresses for %s: %s", qname,
                              firc_err_str(e));
+        } else {
+            capped = hits.capped;
+            for (size_t i = 0; i < hits.n; i++) {
+                const firc_fakeip_hit_t *h = &hits.hit[i];
+                if (cross) {
+                    if (n4 == 0) { fakes4[n4++] = h->fake[FIRC_FAM_V4]; }
+                } else if (h->family == FIRC_FAM_V4) {
+                    fakes4[n4++] = h->fake[FIRC_FAM_V4];
+                } else {
+                    fakes6[n6++] = h->fake[FIRC_FAM_V6];
+                }
+            }
         }
         /* Every real address, not only the event's four. */
         for (size_t i = 0; i < r->n; i++) {
             firc_recall_real(p->recall, &r->v[i], qname, group_id, now);
         }
     }
+    if (capped) {
+        firc_lograte_say(&p->said_capped, 60000, FIRC_LOG_INFO, NULL, "%s: no free entry for some addresses of the answer (at most %d per family), left out",
+                         qname, FIRC_FAKEIP_MAX_ENTRIES);
+    }
+    if (n4 == 0) { fakes4[n4++] = fake4; }
+    if (n6 == 0) { fakes6[n6++] = fake6; }
 
     /* Set whatever happens to the answer below: the pool has already changed. */
     if (pool_changed != NULL) { *pool_changed = firc_fakeip_gen(p->pool) != gen_before; }
 
     bool want4 = r->had4 || cross, want6 = r->had6 && !cross;
-    if (!cross && p->v6_fn != NULL && !p->v6_fn(p->v6_ud, owner->id)) {
+    if (!v6_routed) {
         want6 = false;
         (void)firc_dns_msg_strip_aaaa(msg);
     }
-    firc_err_t e = firc_dns_msg_collapse(msg, want4 ? &fake4 : NULL, want6 ? &fake6 : NULL, r->ttl);
+    firc_err_t e = firc_dns_msg_collapse(msg, want4 ? fakes4 : NULL, want4 ? n4 : 0, want6 ? fakes6 : NULL,
+                                         want6 ? n6 : 0, r->ttl);
     if (e != FIRC_OK) {
         /* Neither the real answer nor a broken one may go out. */
         firc_lograte_say(&p->said_collapse, 60000, FIRC_LOG_WARN, NULL, "collapsing the answer for %s: %s", qname,
@@ -369,14 +399,14 @@ static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *m
     }
     if (ev != NULL) {
         uint16_t qt = msg->questions[0].qtype;
-        if (qt == FIRC_DNS_TYPE_A && want4) { ev->u.dns.fake = fake4; }
-        if (qt == FIRC_DNS_TYPE_AAAA && want6) { ev->u.dns.fake = fake6; }
+        if (qt == FIRC_DNS_TYPE_A && want4) { ev->u.dns.fake = fakes4[0]; }
+        if (qt == FIRC_DNS_TYPE_AAAA && want6) { ev->u.dns.fake = fakes6[0]; }
     }
     journal_put(p, ev, issue == FIRC_OK ? FIRC_DNS_ISSUED : FIRC_DNS_POOL_REFUSED);
 
-    bool waits = issue == FIRC_OK &&
-                 ((want4 && firc_fakeip_needs_commit(p->pool, &fake4)) ||
-                  (want6 && firc_fakeip_needs_commit(p->pool, &fake6)));
+    bool waits = false;
+    for (size_t i = 0; issue == FIRC_OK && i < n4 && want4; i++) { waits = waits || firc_fakeip_needs_commit(p->pool, &fakes4[i]); }
+    for (size_t i = 0; issue == FIRC_OK && i < n6 && want6; i++) { waits = waits || firc_fakeip_needs_commit(p->pool, &fakes6[i]); }
     return waits ? FIRC_DNS_HOLD : FIRC_DNS_REWRITTEN;
 }
 
@@ -598,7 +628,7 @@ firc_dns_verdict_t firc_dns_pipeline_handle_message_from(firc_dns_pipeline_t *p,
         return rewrite(p, msg, now, owner, qname, &chain, pool_changed, ev);
     case 64: /* SVCB */
     case 65: /* HTTPS */
-        if (firc_dns_msg_collapse(msg, NULL, NULL, 0) != FIRC_OK) { return FIRC_DNS_DROP; }
+        if (firc_dns_msg_collapse(msg, NULL, 0, NULL, 0, 0) != FIRC_OK) { return FIRC_DNS_DROP; }
         journal_put(p, ev, FIRC_DNS_PASSED);
         return FIRC_DNS_REWRITTEN;
     default:

@@ -50,7 +50,7 @@ typedef struct firc_fakeip_cfg {
 firc_err_t firc_fakeip_new(const firc_fakeip_cfg_t *cfg, firc_fakeip_t **out);
 void firc_fakeip_free(firc_fakeip_t *f);
 
-/* Allocates/returns qname's address pair in group_id (one mapping per name and group); LIMIT/NOMEM still write the blackhole address, INVAL none. */
+/* Allocates/returns qname's address pair in group_id (up to FIRC_FAKEIP_MAX_ENTRIES mappings per name and group); LIMIT/NOMEM still write the blackhole address, INVAL none. */
 firc_err_t firc_fakeip_get(firc_fakeip_t *f, const char *qname, const char *group_id, int64_t now,
                            firc_ip_t *v4_out, firc_ip_t *v6_out);
 
@@ -80,9 +80,23 @@ bool firc_fakeip_pool_prefix(const firc_fakeip_t *f, unsigned family, firc_ip_t 
 /* Records the real address behind qname's mapping in group_id (DNAT side); FIRC_ERR_NOENT if there is none. */
 firc_err_t firc_fakeip_set_real(firc_fakeip_t *f, const char *qname, const char *group_id, const firc_ip_t *real);
 
-/* Same, from a whole answer; per family keeps the stored address while still offered, else the first offered. */
-firc_err_t firc_fakeip_set_reals(firc_fakeip_t *f, const char *qname, const char *group_id,
-                                 const firc_ip_t *reals, size_t n);
+#define FIRC_FAKEIP_MAX_ENTRIES 8
+
+typedef struct {
+    firc_ip_t fake[2]; /* the entry's v4 and v6 fakes */
+    unsigned family;   /* family of the real that selected the entry */
+} firc_fakeip_hit_t;
+
+typedef struct {
+    firc_fakeip_hit_t hit[FIRC_FAKEIP_MAX_ENTRIES * 2];
+    size_t n;
+    bool capped; /* some real of the answer got no entry */
+} firc_fakeip_hits_t;
+
+/* Records a whole answer: each real keeps or takes an entry of the name (up to FIRC_FAKEIP_MAX_ENTRIES per family;
+   a slot unseen for over the clamp may be retaken); out lists the entries in answer order. FIRC_ERR_NOENT if none. */
+firc_err_t firc_fakeip_set_reals(firc_fakeip_t *f, const char *qname, const char *group_id, int64_t now,
+                                 const firc_ip_t *reals, size_t n, firc_fakeip_hits_t *out);
 
 /* True when the mapping holding fake has an uncommitted real address in fake's family;
    false for a covered cf fake once its target, chunk and coverage are committed. */

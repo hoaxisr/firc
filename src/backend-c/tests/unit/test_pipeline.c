@@ -1581,6 +1581,133 @@ TEST an_answer_with_a_real_address_beside_0_0_0_0_still_gets_a_fake(void) {
     rw_down(&f);
     PASS();
 }
+static firc_dns_msg_t *a_answer_of(size_t n) {
+    firc_dns_msg_t *msg = plain_answer(k_shop, 3, 0);
+    msg->answers = realloc(msg->answers, n * sizeof(msg->answers[0]));
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0) {
+            msg->answers[i] = msg->answers[0];
+            msg->answers[i].rdata = NULL;
+        }
+        const uint8_t addr[4] = {203, 0, 113, (uint8_t)(i + 1)};
+        set_rdata(&msg->answers[i], addr, 4);
+    }
+    msg->n_answers = n;
+    return msg;
+}
+
+/* Catches: a multi-A answer collapsing to one fake, or a fake pointing at another real. */
+TEST four_reals_give_four_fakes_each_behind_its_own_real(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = a_answer_of(4);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    ASSERT_EQ_FMT((size_t)4, msg->n_answers, "%zu");
+    for (size_t i = 0; i < 4; i++) {
+        firc_ip_t fake = {{0}, 4};
+        memcpy(fake.b, msg->answers[i].rdata, 4);
+        const char *gid = NULL;
+        firc_ip_t real = {{0}, 0};
+        ASSERT(firc_fakeip_pair_of(f.pool, &fake, &gid, &real));
+        ASSERT(real.len == 4 && real.b[3] == (uint8_t)(i + 1));
+    }
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: no cap on the answer, so one CDN could take the group's chunk. */
+TEST twelve_reals_leave_eight_records(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *msg = a_answer_of(12);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL));
+    ASSERT_EQ_FMT((size_t)8, msg->n_answers, "%zu");
+    for (size_t i = 0; i < 8; i++) {
+        firc_ip_t fake = {{0}, 4};
+        memcpy(fake.b, msg->answers[i].rdata, 4);
+        const char *gid = NULL;
+        firc_ip_t real = {{0}, 0};
+        ASSERT(firc_fakeip_pair_of(f.pool, &fake, &gid, &real));
+        ASSERT_EQ_FMTm("the first eight of the answer are kept, in order", (unsigned)(i + 1), (unsigned)real.b[3], "%u");
+    }
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+/* Catches: HOLD decided by the first fake only, the last only, or none of the later ones. */
+TEST the_answer_waits_while_any_one_of_its_fakes_has_no_rule(void) {
+    for (int newest_first = 0; newest_first < 2; newest_first++) {
+        rw_fixture_t f;
+        rw_up(&f, 64);
+        firc_dns_msg_t *seed = a_answer_of(1);
+        ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, seed, 1000, NULL, NULL));
+        firc_fakeip_mark_committed(f.pool, firc_fakeip_gen(f.pool));
+        firc_dns_msg_free(seed);
+        firc_dns_msg_t *msg = a_answer_of(3);
+        if (newest_first) {
+            const uint8_t one[4] = {203, 0, 113, 1}, nine[4] = {203, 0, 113, 9};
+            set_rdata(&msg->answers[0], nine, 4);
+            set_rdata(&msg->answers[2], one, 4);
+        }
+        ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, msg, 1001, NULL, NULL));
+        firc_dns_msg_free(msg);
+        rw_down(&f);
+    }
+    PASS();
+}
+
+/* Catches: an answer whose reals all found no entry going out empty or with a real address. */
+TEST an_answer_of_only_unplaceable_reals_still_carries_one_fake_of_the_name(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_msg_t *first = a_answer_of(8);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, first, 1000, NULL, NULL));
+    firc_dns_msg_free(first);
+    firc_dns_msg_t *msg = a_answer_of(1);
+    const uint8_t fresh[4] = {203, 0, 113, 99};
+    set_rdata(&msg->answers[0], fresh, 4);
+    firc_dns_pipeline_handle_message(f.p, msg, 1001, NULL, NULL);
+    ASSERT_EQ_FMT((size_t)1, msg->n_answers, "%zu");
+    ASSERT_EQ_FMT(198u, (unsigned)msg->answers[0].rdata[0], "%u");
+    ASSERT_EQ_FMT(18u, (unsigned)msg->answers[0].rdata[1], "%u");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
+static void count_pool_walk(void *ud, const char *qname, const char *group_id, const firc_ip_t *fake, const firc_ip_t *real) {
+    (void)qname; (void)group_id; (void)fake; (void)real;
+    (*(size_t *)ud)++;
+}
+
+/* Catches: entries made for a family the answer will not carry, which costs pool and max_names for nothing. */
+TEST addresses_of_a_family_that_is_not_answered_make_no_entries(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_v6_fn(f.p, no_group_routes_v6, NULL);
+    firc_dns_msg_t *msg = a_answer_of(1);
+    msg->answers = realloc(msg->answers, 5 * sizeof(msg->answers[0]));
+    for (size_t i = 1; i < 5; i++) {
+        msg->answers[i] = msg->answers[0];
+        msg->answers[i].rdata = NULL;
+        msg->answers[i].rtype = FIRC_DNS_TYPE_AAAA;
+        uint8_t v6[16];
+        memset(v6, 0x26, 16);
+        v6[15] = (uint8_t)i;
+        set_rdata(&msg->answers[i], v6, 16);
+    }
+    msg->n_answers = 5;
+    firc_dns_pipeline_handle_message(f.p, msg, 1000, NULL, NULL);
+    size_t callbacks = 0;
+    firc_fakeip_walk(f.pool, count_pool_walk, &callbacks);
+    ASSERT_EQ_FMTm("one entry, its v4 and v6 fake", (size_t)2, callbacks, "%zu");
+    firc_dns_msg_free(msg);
+    rw_down(&f);
+    PASS();
+}
+
 static const uint8_t k_ntc_v6[16] = {0x2a, 0x02, 0x0e, 0x00, 0xff, 0xec, 0x04, 0xb8, 0, 0, 0, 0, 0, 0, 0, 1};
 
 static firc_dns_msg_t *empty_a(void) {
@@ -1686,6 +1813,38 @@ TEST no_follow_up_without_kernel_tcp_or_v6(void) {
     firc_dns_msg_free(ref);
     rw_down(&f);
     rw_down(&today);
+    PASS();
+}
+
+/* Catches: addresses that return after a transient A-NODATA landing behind other fakes than the ones clients cached. */
+TEST addresses_back_after_a_nodata_keep_their_fakes(void) {
+    rw_fixture_t f;
+    rw_up(&f, 64);
+    firc_dns_pipeline_set_cross_fn(f.p, cross_for, &f.cfg.groups[0]->id);
+    firc_ip_t client = {{192, 168, 1, 42}, 4};
+    firc_dns_msg_t *first = a_answer_of(3);
+    ASSERT_EQ((int)FIRC_DNS_HOLD, (int)firc_dns_pipeline_handle_message(f.p, first, 1000, &client, NULL));
+    ASSERT_EQ_FMT((size_t)3, first->n_answers, "%zu");
+    firc_dns_msg_t *empty = plain_answer(k_shop, 3, 0);
+    free(empty->answers[0].rdata);
+    empty->n_answers = 0;
+    ASSERT_EQ((int)FIRC_DNS_ASK_AAAA, (int)firc_dns_pipeline_handle_message(f.p, empty, 1001, &client, NULL));
+    ASSERT_EQ((int)FIRC_DNS_PASS, (int)firc_dns_pipeline_cross_answer(f.p, empty, NULL, 1001, &client,
+                                                                      FIRC_DNS_RESOLVER_GROUP, NULL));
+    firc_dns_msg_t *again = a_answer_of(3);
+    const uint8_t r3[4] = {203, 0, 113, 3}, r1[4] = {203, 0, 113, 1}, r2[4] = {203, 0, 113, 2};
+    set_rdata(&again->answers[0], r3, 4);
+    set_rdata(&again->answers[1], r1, 4);
+    set_rdata(&again->answers[2], r2, 4);
+    firc_dns_pipeline_handle_message(f.p, again, 1002, &client, NULL);
+    ASSERT_EQ_FMT((size_t)3, again->n_answers, "%zu");
+    ASSERT_MEM_EQ(first->answers[2].rdata, again->answers[0].rdata, 4);
+    ASSERT_MEM_EQ(first->answers[0].rdata, again->answers[1].rdata, 4);
+    ASSERT_MEM_EQ(first->answers[1].rdata, again->answers[2].rdata, 4);
+    firc_dns_msg_free(first);
+    firc_dns_msg_free(empty);
+    firc_dns_msg_free(again);
+    rw_down(&f);
     PASS();
 }
 
@@ -3124,6 +3283,12 @@ int main(int argc, char **argv)
     RUN_TEST(an_owned_name_answered_0_0_0_0_passes_without_a_fake);
     RUN_TEST(an_owned_name_answered_unspecified_v6_passes_without_a_fake);
     RUN_TEST(an_answer_with_a_real_address_beside_0_0_0_0_still_gets_a_fake);
+    RUN_TEST(four_reals_give_four_fakes_each_behind_its_own_real);
+    RUN_TEST(twelve_reals_leave_eight_records);
+    RUN_TEST(the_answer_waits_while_any_one_of_its_fakes_has_no_rule);
+    RUN_TEST(an_answer_of_only_unplaceable_reals_still_carries_one_fake_of_the_name);
+    RUN_TEST(addresses_of_a_family_that_is_not_answered_make_no_entries);
+    RUN_TEST(addresses_back_after_a_nodata_keep_their_fakes);
     RUN_TEST(an_unmatched_name_passes_untouched);
     RUN_TEST(an_unmatched_answer_is_told_with_its_chain_s_address);
     RUN_TEST(an_unmatched_answer_is_clamped_to_unmatched_ttl);

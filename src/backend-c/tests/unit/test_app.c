@@ -1,4 +1,6 @@
 #include "greatest.h"
+
+#define TNOW INT64_C(1000)
 #include "test_ids.h"
 
 #include <arpa/inet.h>
@@ -2541,12 +2543,12 @@ TEST a_held_answer_waits_only_for_the_families_it_carries(void) {
     firc_ip_t v6 = {{0}, 0};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(pool, "a.example.com", "g1", 1000, &v4, &v6));
     const firc_ip_t real4 = {{93, 184, 216, 34}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", &real4, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", TNOW, &real4, 1, NULL));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(pool);
     firc_app_pass_committed(app, firc_fakeip_snapshot_gen(s));
     firc_fakeip_snapshot_free(s);
     const firc_ip_t real6 = {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", &real6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", TNOW, &real6, 1, NULL));
 
     static const uint8_t name[] = {1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0};
     firc_dns_msg_t m = {0};
@@ -4683,7 +4685,7 @@ static bool issue(locked_app_t *l, const char *name, uint8_t tag, firc_ip_t *fak
     const firc_ip_t real = {{93, 184, 216, 34}, 4};
     firc_app_nf_enter(l->app);
     bool ok = firc_fakeip_get(l->pool, name, gid, (int64_t)time(NULL), fake, NULL) == FIRC_OK &&
-              firc_fakeip_set_reals(l->pool, name, gid, &real, 1) == FIRC_OK;
+              firc_fakeip_set_reals(l->pool, name, gid, TNOW, &real, 1, NULL) == FIRC_OK;
     if (ok) { firc_app_pool_changed(l->app); }
     firc_app_nf_leave(l->app);
     return ok;
@@ -4761,7 +4763,7 @@ static bool issue_unwritten(locked_app_t *l, const char *name, uint8_t tag, firc
     const firc_ip_t real = {{93, 184, 216, 34}, 4};
     firc_app_nf_enter(l->app);
     bool ok = firc_fakeip_get(l->pool, name, gid, (int64_t)time(NULL), fake, NULL) == FIRC_OK &&
-              firc_fakeip_set_reals(l->pool, name, gid, &real, 1) == FIRC_OK &&
+              firc_fakeip_set_reals(l->pool, name, gid, TNOW, &real, 1, NULL) == FIRC_OK &&
               firc_app_refresh_pool_snapshot(l->app) == FIRC_OK;
     firc_app_nf_leave(l->app);
     return ok;
@@ -7347,7 +7349,7 @@ static firc_id_t routed_group_with_a_mapping(locked_app_t *l, firc_ip_t *fake) {
     firc_ip_t v6;
     if (firc_fakeip_get(l->pool, "a.dnsleaktest.com", id, 1000, fake, &v6) != FIRC_OK) { abort(); }
     const firc_ip_t real = {{93, 184, 216, 34}, 4};
-    if (firc_fakeip_set_reals(l->pool, "a.dnsleaktest.com", id, &real, 1) != FIRC_OK) { abort(); }
+    if (firc_fakeip_set_reals(l->pool, "a.dnsleaktest.com", id, TNOW, &real, 1, NULL) != FIRC_OK) { abort(); }
     if (firc_app_refresh_pool_snapshot(l->app) != FIRC_OK) { abort(); }
     if (firc_app_rebuild_netfilter_kind(l->app, NULL, false) != FIRC_OK) { abort(); }
     return gid;
@@ -7579,7 +7581,7 @@ TEST the_image_holds_only_redirect_groups_pairs(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(l.pool, "a.example", gid, (int64_t)time(NULL), &v4, &a6));
     const firc_ip_t both[] = {{{93, 184, 216, 34}, 4},
                               {{0x26, 0x06, 0x28, 0, 2, 0x20, 0, 1, 2, 0x48, 0x18, 0x93, 0x25, 0xc8, 0x19, 0x46}, 16}};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "a.example", gid, both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "a.example", gid, TNOW, both, 2, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_refresh_pool_snapshot(l.app));
     ASSERT_EQ(16, a6.len);
     ASSERT_EQ(FIRC_OK, firc_app_rebuild_netfilter_kind(l.app, NULL, false));
@@ -7604,9 +7606,9 @@ TEST the_image_pairs_a_v4_fake_with_its_v6_real(void) {
     const firc_ip_t r6 = {{0x2a, 0x02, 0x0e, 0x00, 0xff, 0xec, 0x04, 0xb8, [15] = 1}, 16};
     firc_app_nf_enter(l.app);
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(l.pool, "x.example", g1, (int64_t)time(NULL), &x4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "x.example", g1, &r6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "x.example", g1, TNOW, &r6, 1, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(l.pool, "y.example", g3, (int64_t)time(NULL), &y4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "y.example", g3, &r6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(l.pool, "y.example", g3, TNOW, &r6, 1, NULL));
     ASSERT_EQ(FIRC_OK, firc_app_refresh_pool_snapshot(l.app));
     firc_app_nf_leave(l.app);
     ASSERT_EQ(4, x4.len);
@@ -10915,7 +10917,7 @@ static bool issue_cf_at(locked_app_t *l, const char *name, uint8_t tag, const fi
     firc_id_format((firc_id_t){{tag, tag, tag, tag}}, gid);
     firc_app_nf_enter(l->app);
     bool ok = firc_fakeip_get_in(l->pool, name, gid, when, FIRC_FAKEIP_KIND_CF, fake, NULL) == FIRC_OK &&
-              firc_fakeip_set_reals(l->pool, name, gid, real, 1) == FIRC_OK;
+              firc_fakeip_set_reals(l->pool, name, gid, TNOW, real, 1, NULL) == FIRC_OK;
     if (ok) { firc_app_pool_changed(l->app); }
     firc_app_nf_leave(l->app);
     return ok;
@@ -10929,7 +10931,7 @@ static bool cf_rereal_waits(locked_app_t *l, const char *name, uint8_t tag, cons
                             const firc_ip_t *fake) {
     char gid[FIRC_ID_STR_LEN];
     firc_id_format((firc_id_t){{tag, tag, tag, tag}}, gid);
-    bool ok = firc_fakeip_set_reals(l->pool, name, gid, real, 1) == FIRC_OK;
+    bool ok = firc_fakeip_set_reals(l->pool, name, gid, TNOW, real, 1, NULL) == FIRC_OK;
     bool waits = firc_fakeip_needs_commit(l->pool, fake);
     firc_app_pool_changed(l->app);
     return ok && waits;

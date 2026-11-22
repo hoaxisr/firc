@@ -1288,7 +1288,7 @@ static firc_dns_verdict_t live_cross(firc_dns_msg_t *a_msg, const firc_dns_msg_t
         const firc_dns_rr_t *rr = &aaaa_msg->answers[i];
         if (rr->rtype == FIRC_DNS_TYPE_AAAA && rr->rdata_len == 16) {
             firc_ip_t fake4 = {.b = {198, 18, 0, (uint8_t)(rr->rdata[15] + 100)}, .len = 4};
-            return firc_dns_msg_collapse(a_msg, &fake4, NULL, 60) == FIRC_OK ? FIRC_DNS_REWRITTEN : FIRC_DNS_DROP;
+            return firc_dns_msg_collapse(a_msg, &fake4, 1, NULL, 0, 60) == FIRC_OK ? FIRC_DNS_REWRITTEN : FIRC_DNS_DROP;
         }
     }
     return FIRC_DNS_PASS;

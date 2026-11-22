@@ -182,7 +182,7 @@ test("apply without restart saves, and the banner appears", async ({ page }) => 
     },
   );
   await page.getByRole("textbox", { name: "Upstream DNS", exact: true }).fill("1.1.1.1");
-  await page.getByRole("spinbutton", { name: "Domains in the pool, at most" }).fill("4096");
+  await page.getByRole("spinbutton", { name: "Address entries in the pool, at most" }).fill("4096");
   await page.getByRole("button", { name: "Save", exact: true }).click();
 
   const dialog = page.getByRole("dialog");
@@ -241,7 +241,7 @@ test("save and restart follows the restart until the daemon is back", async ({ p
       },
     },
   );
-  await page.getByRole("spinbutton", { name: "Domains in the pool, at most" }).fill("4096");
+  await page.getByRole("spinbutton", { name: "Address entries in the pool, at most" }).fill("4096");
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Save and restart" }).click();
 
@@ -249,9 +249,9 @@ test("save and restart follows the restart until the daemon is back", async ({ p
   await expect(page.getByTestId("restart-overlay")).toHaveCount(0, { timeout: 10_000 });
   await expect(page.getByTestId("settings-banner")).toHaveCount(0);
   expect(order).toEqual(["PUT", "RESTART"]);
-  await expect(page.getByRole("spinbutton", { name: "Domains in the pool, at most" })).toHaveValue(
-    "4096",
-  );
+  await expect(
+    page.getByRole("spinbutton", { name: "Address entries in the pool, at most" }),
+  ).toHaveValue("4096");
 });
 
 test("a restart settles only on an answer with another boot", async ({ page }) => {

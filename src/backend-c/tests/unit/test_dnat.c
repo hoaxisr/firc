@@ -304,6 +304,46 @@ static bool only_g1(const char *group_id, void *ud) {
     return strcmp(group_id, "g1") == 0;
 }
 
+/* Catches: entries of one name sharing a rule or losing theirs, or a v6-only entry's v4 fake getting a rule. */
+TEST every_entry_of_a_name_gets_its_own_rule_and_a_v6_only_entry_none(void) {
+    firc_fakeip_cfg_t c = cfg();
+    firc_fakeip_t *pool = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &pool));
+    firc_ip_t f1 = {{0}, 0};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(pool, "a.example.com", "g1", 1000, &f1, NULL));
+    firc_ip_t reals[] = {v4(93, 184, 216, 1), v4(93, 184, 216, 2), v4(93, 184, 216, 3),
+                         {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16},
+                         {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, 16},
+                         {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}, 16},
+                         {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4}, 16}};
+    firc_fakeip_hits_t hits;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(pool, "a.example.com", "g1", 1000, reals, 7, &hits));
+    ASSERT_EQ_FMT((size_t)7, hits.n, "%zu");
+
+    firc_fake_ipt_t *f = firc_fake_ipt_new(FIRC_IPT_PROTO_IPV4);
+    firc_ipt_t *ipt = firc_ipt_new(firc_fake_ipt_as_xt(f), "FIRC_");
+    firc_netfilter_register_base_chains(ipt, NULL);
+    firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(pool);
+    ASSERT(snap != NULL);
+    ASSERT_EQ(FIRC_OK, firc_dnat_build_rules(ipt, "FIRC_", snap, NULL, NULL));
+    ASSERT_EQ(FIRC_OK, mark_group(ipt, snap, "g1", 1));
+    ASSERT_EQ(FIRC_OK, firc_ipt_commit(ipt));
+    ASSERT_EQ_FMTm("three v4 reals, three rules; the entries holding only a v6 real have none",
+                   (size_t)3, rule_count(f, "nat", "FIRC_DNAT"), "%zu");
+    for (unsigned i = 0; i < 3; i++) {
+        char d[24], t[20];
+        const firc_ip_t *fk = &hits.hit[i].fake[FIRC_FAM_V4];
+        snprintf(d, sizeof(d), "%u.%u.%u.%u/32", fk->b[0], fk->b[1], fk->b[2], fk->b[3]);
+        snprintf(t, sizeof(t), "93.184.216.%u", i + 1);
+        const char *want[] = {"-d", d, "-m", "mark", "--mark", "0x40000000/0x40000000", "-j", "DNAT", "--to-destination", t};
+        ASSERT(has_rule(f, "nat", "FIRC_DNAT", want, 10));
+    }
+    firc_fakeip_snapshot_free(snap);
+    firc_ipt_free(ipt);
+    firc_fakeip_free(pool);
+    PASS();
+}
+
 /* Catches: DNAT rules for an unrouted group, the wrong group, or NULL not meaning every group. */
 TEST only_a_routed_groups_mappings_are_rewritten(void) {
     firc_fakeip_cfg_t c = cfg();
@@ -718,6 +758,7 @@ int main(int argc, char **argv)
     RUN_TEST(an_unresolved_mapping_contributes_no_rule);
     RUN_TEST(each_family_gets_only_its_own_rules);
     RUN_TEST(every_resolved_mapping_gets_its_own_rule);
+    RUN_TEST(every_entry_of_a_name_gets_its_own_rule_and_a_v6_only_entry_none);
     RUN_TEST(a_reclaimed_pair_keeps_its_rule_beside_the_other_groups_pair);
     RUN_TEST(without_a_pool_only_the_chain_is_staged);
     RUN_TEST(only_a_routed_groups_mappings_are_rewritten);

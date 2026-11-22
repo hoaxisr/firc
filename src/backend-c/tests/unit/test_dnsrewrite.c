@@ -78,7 +78,7 @@ TEST the_chain_is_collapsed_onto_the_queried_name(void) {
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
     const firc_ip_t f6 = {{0xfd, 0x37, 0x9a, 0x5c, 0xbe, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7}, 16};
 
-    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, &f6, 300));
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, 1, &f6, 1, 300));
 
     ASSERT_EQ_FMTm("no CNAME survives", (size_t)0, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_CNAME), "%zu");
     ASSERT_EQ_FMT((size_t)1, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_A), "%zu");
@@ -108,7 +108,7 @@ TEST the_chain_is_collapsed_onto_the_queried_name(void) {
 TEST a_family_not_offered_gets_no_record(void) {
     firc_dns_msg_t *m = typical_answer();
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
-    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, NULL, 300));
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, 1, NULL, 0, 300));
     ASSERT_EQ_FMT((size_t)1, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_A), "%zu");
     ASSERT_EQ_FMTm("the upstream's AAAA went with the chain and nothing replaced it: NODATA for v6",
                    (size_t)0, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_AAAA), "%zu");
@@ -119,7 +119,7 @@ TEST a_family_not_offered_gets_no_record(void) {
 TEST https_records_are_stripped_from_every_section_and_the_opt_stays(void) {
     firc_dns_msg_t *m = typical_answer();
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
-    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, NULL, 300));
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, 1, NULL, 0, 300));
     ASSERT_EQ_FMT((size_t)0, count_type(m->answers, m->n_answers, 65), "%zu");
     ASSERT_EQ_FMT((size_t)0, count_type(m->additional, m->n_additional, 65), "%zu");
     ASSERT_EQ_FMTm("SVCB is the same side door under another number", (size_t)0,
@@ -137,7 +137,7 @@ TEST a_collapsed_answer_packs_and_parses_back(void) {
     firc_dns_msg_t *m = typical_answer();
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
     const firc_ip_t f6 = {{0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7}, 16};
-    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, &f6, 300));
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, &f4, 1, &f6, 1, 300));
 
     uint8_t *wire = NULL;
     size_t len = 0;
@@ -158,12 +158,12 @@ TEST a_message_with_no_question_is_refused(void) {
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
     firc_dns_msg_t *m = typical_answer();
     m->n_questions = 0;
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f4, NULL, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f4, 1, NULL, 0, 300));
     ASSERT_EQ_FMTm("untouched", (size_t)5, m->n_answers, "%zu");
     m->n_questions = 1;
     firc_dns_question_t *q = m->questions;
     m->questions = NULL;
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f4, NULL, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f4, 1, NULL, 0, 300));
     ASSERT_EQ_FMT((size_t)5, m->n_answers, "%zu");
     m->questions = q;
     firc_dns_msg_free(m);
@@ -175,10 +175,10 @@ TEST a_wrong_family_or_no_address_is_refused(void) {
     const firc_ip_t f4 = {{198, 18, 0, 7}, 4};
     const firc_ip_t f6 = {{0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7}, 16};
     firc_dns_msg_t *m = typical_answer();
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f6, &f4, 300));
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f6, NULL, 300));
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, NULL, &f4, 300));
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, NULL, NULL, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f6, 1, &f4, 1, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, &f6, 1, NULL, 0, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, NULL, 0, &f4, 1, 300));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, NULL, 0, NULL, 0, 300));
     ASSERT_EQ_FMTm("untouched", (size_t)5, m->n_answers, "%zu");
     ASSERT_EQ_FMT((size_t)2, m->n_additional, "%zu");
     firc_dns_msg_free(m);
@@ -191,10 +191,43 @@ TEST no_address_for_an_answer_that_had_none_is_nodata(void) {
     for (size_t i = 1; i < 4; i++) { free(m->answers[i].rdata); }
     m->answers[1] = m->answers[4];
     m->n_answers = 2;
-    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, NULL, NULL, 300));
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, NULL, 0, NULL, 0, 300));
     ASSERT_EQ_FMT((size_t)0, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_CNAME), "%zu");
     ASSERT_EQ_FMT((size_t)0, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_AAAA), "%zu");
     ASSERT_EQ_FMTm("the TXT stays", (size_t)1, m->n_answers, "%zu");
+    firc_dns_msg_free(m);
+    PASS();
+}
+
+/* Catches: a multi-address answer collapsed to one record per family, or records out of the given order. */
+TEST several_fakes_per_family_become_that_many_records_in_order(void) {
+    firc_dns_msg_t *m = typical_answer();
+    const firc_ip_t f4[3] = {{{198, 18, 0, 9}, 4}, {{198, 18, 0, 7}, 4}, {{198, 18, 0, 8}, 4}};
+    const firc_ip_t f6[2] = {{{0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, 16},
+                             {{0xfd, 0x37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16}};
+    ASSERT_EQ(FIRC_OK, firc_dns_msg_collapse(m, f4, 3, f6, 2, 60));
+    ASSERT_EQ_FMT((size_t)3, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_A), "%zu");
+    ASSERT_EQ_FMT((size_t)2, count_type(m->answers, m->n_answers, FIRC_DNS_TYPE_AAAA), "%zu");
+    size_t seen4 = 0, seen6 = 0;
+    for (size_t i = 0; i < m->n_answers; i++) {
+        const firc_dns_rr_t *rr = &m->answers[i];
+        if (rr->rtype == FIRC_DNS_TYPE_A) { ASSERT_MEM_EQ(f4[seen4++].b, rr->rdata, 4); }
+        if (rr->rtype == FIRC_DNS_TYPE_AAAA) { ASSERT_MEM_EQ(f6[seen6++].b, rr->rdata, 16); }
+        if (rr->rtype == FIRC_DNS_TYPE_A || rr->rtype == FIRC_DNS_TYPE_AAAA) {
+            ASSERT_MEM_EQ(k_q, rr->name, sizeof(k_q));
+            ASSERT_EQ_FMT(60u, rr->ttl, "%u");
+        }
+    }
+    firc_dns_msg_free(m);
+    PASS();
+}
+
+/* Catches: a wrong-length address in a later slot written into a smaller buffer. */
+TEST a_wrong_length_address_in_a_later_slot_is_refused(void) {
+    firc_dns_msg_t *m = typical_answer();
+    const firc_ip_t f4[2] = {{{198, 18, 0, 9}, 4}, {{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16}};
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_dns_msg_collapse(m, f4, 2, NULL, 0, 60));
+    ASSERT_EQ_FMTm("untouched", (size_t)5, m->n_answers, "%zu");
     firc_dns_msg_free(m);
     PASS();
 }
@@ -207,6 +240,8 @@ SUITE(rewrite) {
     RUN_TEST(a_message_with_no_question_is_refused);
     RUN_TEST(a_wrong_family_or_no_address_is_refused);
     RUN_TEST(no_address_for_an_answer_that_had_none_is_nodata);
+    RUN_TEST(several_fakes_per_family_become_that_many_records_in_order);
+    RUN_TEST(a_wrong_length_address_in_a_later_slot_is_refused);
 }
 
 GREATEST_MAIN_DEFS();

@@ -1397,7 +1397,7 @@ int main(int argc, char **argv)
         /* the file must know every chunk in use, whatever it held */
         firc_fakeip_set_on_chunk(d.pool, on_chunk_taken, &d);
         if (lerr == FIRC_OK) {
-            FIRC_INFO("pool: %zu names restored from %s", restored, FIRC_POOL_STATE_PATH);
+            FIRC_INFO("pool: %zu entries restored from %s", restored, FIRC_POOL_STATE_PATH);
             forget_groups_not_in_config(d.pool, &cfg, now_unix());
             d.pool_restored = restored;
             d.pool_file_ok = true;

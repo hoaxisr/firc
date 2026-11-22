@@ -168,12 +168,15 @@ export const SECTIONS: Section[] = [
         ],
       ),
       row(
-        () => t("Domains in the pool, at most"),
-        () => t("Past the limit a blackhole address is issued"),
+        () => t("Address entries in the pool, at most"),
+        () =>
+          t(
+            "A domain takes an entry per address of one family, up to 8. A new domain past the limit gets a blackhole address",
+          ),
         [
           {
             key: "app.addressPool.maxNames",
-            label: () => t("Domains in the pool, at most"),
+            label: () => t("Address entries in the pool, at most"),
             control: { kind: "number" },
           },
         ],

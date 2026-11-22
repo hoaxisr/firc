@@ -373,13 +373,13 @@ TEST each_groups_mapping_of_one_name_keeps_its_own_real_and_commit(void) {
     char s[16];
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &a4, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g2", T0, &b4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &x, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &x, 1, NULL));
     ASSERTm("g1's pair waits", firc_fakeip_needs_commit(f, &a4));
     ASSERT_FALSEm("g2's pair has no real yet", firc_fakeip_needs_commit(f, &b4));
     firc_fakeip_snapshot_t *snap = firc_fakeip_snapshot_take(f);
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(snap));
     firc_fakeip_snapshot_free(snap);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g2", &y, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g2", T0, &y, 1, NULL));
     ASSERTm("g2's new pair waits", firc_fakeip_needs_commit(f, &b4));
     ASSERT_FALSEm("g1's committed pair does not", firc_fakeip_needs_commit(f, &a4));
     ASSERT(firc_fakeip_pair_of(f, &a4, &gid, &got));
@@ -388,7 +388,7 @@ TEST each_groups_mapping_of_one_name_keeps_its_own_real_and_commit(void) {
     ASSERT(firc_fakeip_pair_of(f, &b4, &gid, &got));
     ASSERT_STR_EQ("g2", gid);
     ASSERT_STR_EQ("1.2.3.4", s4(&got, s));
-    ASSERT_EQ(FIRC_ERR_NOENT, firc_fakeip_set_reals(f, "a.example.com", "g3", &x, 1));
+    ASSERT_EQ(FIRC_ERR_NOENT, firc_fakeip_set_reals(f, "a.example.com", "g3", T0, &x, 1, NULL));
     ASSERT_FALSEm("an address the pool never issued waits for nothing", firc_fakeip_needs_commit(f, &never));
     firc_fakeip_free(f);
     PASS();
@@ -906,7 +906,7 @@ TEST setting_the_real_address_again_replaces_it(void) {
 }
 
 /* Catches: the real address replaced on every rotation, or never, instead of when it leaves the answer. */
-TEST a_real_address_still_in_the_answer_is_kept_and_a_vanished_one_replaced(void) {
+TEST a_real_address_still_in_the_answer_is_kept_and_a_new_one_takes_an_entry(void) {
     firc_fakeip_cfg_t c = base_cfg();
     firc_fakeip_t *f = NULL;
     ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
@@ -920,10 +920,10 @@ TEST a_real_address_still_in_the_answer_is_kept_and_a_vanished_one_replaced(void
     const firc_ip_t y6 = {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}, 16};
 
     firc_ip_t first[] = {a, x6};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", first, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, first, 2, NULL));
 
     firc_ip_t rotated[] = {b, a};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", rotated, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, rotated, 2, NULL));
     walk_log_t w = {0};
     firc_fakeip_walk(f, log_entry, &w);
     int i4 = find_fake(&w, "198.18.0.1");
@@ -931,25 +931,31 @@ TEST a_real_address_still_in_the_answer_is_kept_and_a_vanished_one_replaced(void
     ASSERT_STR_EQm("still present, so kept", "93.184.216.34", w.real[i4]);
 
     firc_ip_t gone[] = {cc, b};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", gone, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, gone, 2, NULL));
     walk_log_t w2 = {0};
     firc_fakeip_walk(f, log_entry, &w2);
     i4 = find_fake(&w2, "198.18.0.1");
     ASSERT(i4 >= 0);
-    ASSERT_STR_EQm("vanished, so replaced by the first offered", "5.6.7.8", w2.real[i4]);
+    ASSERT_STR_EQm("vanished but not yet stale: kept, the new address takes an entry of its own",
+                   "93.184.216.34", w2.real[i4]);
     int i6 = find_fake(&w2, "fd37:9a5c:be10:0000:0000:0000:0000:0001");
     ASSERT(i6 >= 0);
     ASSERT_STR_EQm("a v4-only answer leaves the v6 address alone",
                    "2606:0000:0000:0000:0000:0000:0000:0001", w2.real[i6]);
 
     firc_ip_t only6[] = {y6};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", only6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, only6, 1, NULL));
     walk_log_t w3 = {0};
     firc_fakeip_walk(f, log_entry, &w3);
     i6 = find_fake(&w3, "fd37:9a5c:be10:0000:0000:0000:0000:0001");
-    ASSERT_STR_EQ("2606:0000:0000:0000:0000:0000:0000:0002", w3.real[i6]);
+    ASSERT_STR_EQm("the stored v6 address is still offered by no one but is not stale", "2606:0000:0000:0000:0000:0000:0000:0001", w3.real[i6]);
     i4 = find_fake(&w3, "198.18.0.1");
-    ASSERT_STR_EQ("5.6.7.8", w3.real[i4]);
+    ASSERT_STR_EQ("93.184.216.34", w3.real[i4]);
+    bool y_has_entry = false;
+    for (size_t k = 0; k < w3.n; k++) {
+        y_has_entry = y_has_entry || (w3.has_real[k] && strcmp(w3.real[k], "2606:0000:0000:0000:0000:0000:0000:0002") == 0);
+    }
+    ASSERTm("the new v6 address took a free slot of another entry", y_has_entry);
 
     firc_fakeip_free(f);
     PASS();
@@ -967,7 +973,7 @@ TEST a_pair_needs_a_commit_until_a_snapshot_taken_after_it_completes(void) {
                   firc_fakeip_needs_commit(f, &v4));
 
     const firc_ip_t a = {{93, 184, 216, 34}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &a, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &a, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     ASSERT_FALSEm("the v6 half has no real address (a v4-only name)",
                   firc_fakeip_needs_commit(f, &v6));
@@ -977,7 +983,7 @@ TEST a_pair_needs_a_commit_until_a_snapshot_taken_after_it_completes(void) {
     ASSERTm("taken, not yet written", firc_fakeip_needs_commit(f, &v4));
 
     const firc_ip_t b = {{1, 2, 3, 4}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &b, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_real(f, "a.example.com", "g1", &b));
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s1));
     ASSERTm("the pass that completed carried the OLD pair", 
             firc_fakeip_needs_commit(f, &v4));
@@ -987,7 +993,7 @@ TEST a_pair_needs_a_commit_until_a_snapshot_taken_after_it_completes(void) {
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
 
     firc_ip_t rotated[] = {a, b};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", rotated, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, rotated, 2, NULL));
     ASSERT_FALSEm("the stored address is still in the answer; no new pair",
                   firc_fakeip_needs_commit(f, &v4));
 
@@ -1051,7 +1057,7 @@ TEST the_generation_is_per_pair_and_the_mark_is_monotonic(void) {
     firc_fakeip_snapshot_free(s1b);
 
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "b.example.com", "g1", T0, &b4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", &y, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, &y, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &b4));
     ASSERT_FALSEm("an unrelated name's change is not this name's", firc_fakeip_needs_commit(f, &a4));
 
@@ -1061,14 +1067,14 @@ TEST the_generation_is_per_pair_and_the_mark_is_monotonic(void) {
     ASSERT_FALSEm("the mark never moves backwards", firc_fakeip_needs_commit(f, &b4));
 
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g2", T0, &other, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g2", &x, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g2", T0, &x, 1, NULL));
     ASSERTm("the name's pair in another group is its own pair, even with the same real address",
             firc_fakeip_needs_commit(f, &other));
     ASSERT_FALSEm("and the first group's pair stays committed", firc_fakeip_needs_commit(f, &a4));
 
     firc_ip_t bad = {{1, 2, 3, 4, 5}, 5};
-    ASSERT_EQ(FIRC_ERR_INVAL, firc_fakeip_set_reals(f, "a.example.com", "g2", &bad, 1));
-    ASSERT_EQ(FIRC_ERR_NOENT, firc_fakeip_set_reals(f, "nobody.example.com", "g1", &x, 1));
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_fakeip_set_reals(f, "a.example.com", "g2", T0, &bad, 1, NULL));
+    ASSERT_EQ(FIRC_ERR_NOENT, firc_fakeip_set_reals(f, "nobody.example.com", "g1", T0, &x, 1, NULL));
 
     firc_fakeip_snapshot_free(s1);
     firc_fakeip_snapshot_free(s2);
@@ -1086,7 +1092,7 @@ TEST a_reclaimed_pair_stays_in_the_snapshot_beside_the_other_groups_mapping(void
     const firc_ip_t x6 = {{0x26, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 16};
     firc_ip_t both[] = {x, x6};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, both, 2, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g2", T0 + DAY - 1, &v4, NULL));
     firc_fakeip_reclaim(f, T0 + DAY);
 
@@ -1139,7 +1145,7 @@ TEST an_expired_parked_address_leaves_at_the_sweep(void) {
     firc_ip_t v4 = {{0}, 0};
     const firc_ip_t x = {{93, 184, 216, 34}, 4};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, NULL));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &x, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &x, 1, NULL));
     firc_fakeip_reclaim(f, T0 + DAY);
 
     uint64_t gen = firc_fakeip_gen(f);
@@ -1739,8 +1745,8 @@ TEST uncommitting_a_group_makes_its_resolved_pairs_wait_again(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "b.example.com", "g2", T0, &b4, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "c.example.com", "g1", T0, &c4, NULL));
     const firc_ip_t ra = {{93, 184, 216, 34}, 4}, rb = {{1, 2, 3, 4}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &ra, 1));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g2", &rb, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &ra, 1, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g2", T0, &rb, 1, NULL));
     firc_fakeip_snapshot_t *s1 = firc_fakeip_snapshot_take(f);
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s1));
     firc_fakeip_snapshot_free(s1);
@@ -1785,7 +1791,7 @@ TEST uncommitting_a_group_with_nothing_resolved_marks_nothing(void) {
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &a6));
 
     const firc_ip_t ra = {{93, 184, 216, 34}, 4};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g3", &ra, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g3", T0, &ra, 1, NULL));
     firc_fakeip_snapshot_t *s1 = firc_fakeip_snapshot_take(f);
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s1));
     firc_fakeip_snapshot_free(s1);
@@ -1972,7 +1978,7 @@ TEST a_v6_real_pairs_with_the_v4_fake_when_no_v4_real(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &R6A, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &R6A, 1, NULL));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     ASSERT(s != NULL);
     cross_log_t w = {0};
@@ -2005,7 +2011,7 @@ TEST a_v4_real_beats_the_v6_one_for_the_v4_fake(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
     firc_ip_t both[] = {R6A, R4A};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, both, 2, NULL));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     cross_log_t w = {0};
     firc_fakeip_snapshot_cross_walk(s, cross_entry, &w);
@@ -2041,7 +2047,7 @@ TEST a_v6_real_for_the_v4_fake_needs_a_commit(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &R6A, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &R6A, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s));
@@ -2059,7 +2065,7 @@ TEST a_cleared_v4_real_lets_the_v6_pair(void) {
     firc_ip_t v4, v6, got = {{0}, 0};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
     firc_ip_t both[] = {R6A, R4A};
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, both, 2, NULL));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     firc_fakeip_mark_committed(f, firc_fakeip_snapshot_gen(s));
     firc_fakeip_snapshot_free(s);
@@ -2103,7 +2109,7 @@ TEST pair_of_finds_parked_mappings(void) {
 
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
     ASSERT_FALSEm("no real address yet", firc_fakeip_pair_of(f, &v4, &gid, &got));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", both, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, both, 2, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "b.example.com", "g1", T0, &b4, NULL));
 
     ASSERT(firc_fakeip_pair_of(f, &v4, &gid, &got));
@@ -2275,9 +2281,9 @@ TEST a_parked_cf_pair_keeps_its_kind_in_the_snapshot(void) {
     firc_ip_t v4, v6;
     const firc_ip_t reals[2] = {{{104, 16, 1, 1}, 4}, {{0x26, 0x06, [15] = 1}, 16}};
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", reals, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 2, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "b.example.com", "g1", T0, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", reals, 2));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, reals, 2, NULL));
 
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     kindseen_t live = {{{0}}, {0}, {false}, 0};
@@ -2383,13 +2389,13 @@ TEST a_covered_cf_fake_needs_no_commit(void) {
     ASSERT(f != NULL);
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFB, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFB, 1, NULL));
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "b.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", &CFC, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, &CFC, 1, NULL));
     ASSERT_FALSEm("a new name on a fresh offset", firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_free(f);
     PASS();
@@ -2402,11 +2408,11 @@ TEST a_covered_cf_v6_fake_needs_no_commit_with_a_v6_target(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CF6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CF6, 1, NULL));
     ASSERTm("a v4 target says nothing of v6", firc_fakeip_needs_commit(f, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V6, &TGT6);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CF6B, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CF6B, 1, NULL));
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v6));
     firc_fakeip_free(f);
     PASS();
@@ -2417,10 +2423,10 @@ TEST a_cf_fake_whose_real_left_cloudflare_waits(void) {
     ASSERT(f != NULL);
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &OFFCF, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &OFFCF, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
@@ -2434,11 +2440,11 @@ TEST a_real_back_on_cloudflare_waits_for_its_exception_to_go(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &OFFCF, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &OFFCF, 1, NULL));
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
@@ -2468,10 +2474,10 @@ TEST a_cleared_off_cloudflare_real_waits_when_cloudflare_comes_back(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &OFFCF, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &OFFCF, 1, NULL));
     commit_all(f);
     firc_fakeip_clear_real(f, "a.example.com", "g1", 4);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
@@ -2485,10 +2491,10 @@ TEST a_cf_fake_whose_real_was_cleared_waits_for_the_cross_pair(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     commit_all(f);
     firc_fakeip_clear_real(f, "a.example.com", "g1", 4);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CF6, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CF6, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_free(f);
     PASS();
@@ -2497,10 +2503,10 @@ TEST a_cf_fake_whose_real_was_cleared_waits_for_the_cross_pair(void) {
 static void park_off_cf_then_keep(firc_fakeip_t *f, firc_ip_t *a4) {
     firc_ip_t v6;
     firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, a4, &v6);
-    firc_fakeip_set_reals(f, "a.example.com", "g1", &OFFCF, 1);
+    firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &OFFCF, 1, NULL);
     firc_ip_t k4;
     firc_fakeip_get_in(f, "keep.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &k4, &v6);
-    firc_fakeip_set_reals(f, "keep.example.com", "g1", &CFE, 1);
+    firc_fakeip_set_reals(f, "keep.example.com", "g1", T0, &CFE, 1, NULL);
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
     firc_fakeip_get_in(f, "keep.example.com", "g1", T0 + DAY, FIRC_FAKEIP_KIND_CF, &k4, &v6);
@@ -2519,7 +2525,7 @@ TEST a_recycled_cf_offset_waits(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "b.example.com", "g1", T0 + DAY + QUAR + 1, FIRC_FAKEIP_KIND_CF,
                                           &b4, &v6));
     ASSERT_MEM_EQm("b took a's freed offset", a4.b, b4.b, 4);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", &CFB, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, &CFB, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &b4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &b4));
@@ -2535,7 +2541,7 @@ TEST a_cf_offset_taken_from_an_expired_park_waits(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "b.example.com", "g1", T0 + DAY + QUAR + 1, FIRC_FAKEIP_KIND_CF,
                                           &b4, &v6));
     ASSERT_MEM_EQm("b took a's expired park", a4.b, b4.b, 4);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", &CFB, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, &CFB, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &b4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &b4));
@@ -2551,7 +2557,7 @@ TEST a_parked_cf_fake_taken_back_waits(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0 + DAY + 1, FIRC_FAKEIP_KIND_CF, &back4,
                                           &v6));
     ASSERT_MEM_EQm("a got its parked fake back", a4.b, back4.b, 4);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &back4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &back4));
@@ -2565,17 +2571,17 @@ TEST no_target_means_wait(void) {
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERTm("never set", firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFB, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFB, 1, NULL));
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, NULL);
     ASSERTm("cleared, no commit between", firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERTm("cleared and committed", firc_fakeip_needs_commit(f, &v4) == false);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERTm("a new pair with no target", firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_free(f);
     PASS();
@@ -2586,15 +2592,15 @@ TEST a_target_not_yet_committed_means_wait(void) {
     ASSERT(f != NULL);
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     commit_all(f);
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFB, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFB, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &CFD);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERTm("a changed target", firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_free(f);
     PASS();
@@ -2628,7 +2634,7 @@ TEST a_cf_fake_in_an_uncommitted_chunk_waits(void) {
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     commit_all(f);
     ASSERT_FALSE(firc_fakeip_needs_commit(f, &v4));
@@ -2644,7 +2650,7 @@ TEST a_plain_fake_ignores_the_target(void) {
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     commit_all(f);
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_free(f);
     PASS();
@@ -2655,7 +2661,7 @@ TEST uncommitting_a_group_drops_its_cf_targets(void) {
     ASSERT(f != NULL);
     firc_ip_t v4, v6, got;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", &CFA, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, &CFA, 1, NULL));
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "a.example.com", "g2", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V4, &TGT);
     firc_fakeip_set_cf_target(f, "g1", FIRC_FAM_V6, &TGT6);
@@ -2666,7 +2672,7 @@ TEST uncommitting_a_group_drops_its_cf_targets(void) {
     ASSERT(firc_fakeip_gen(f) > gen);
     commit_all(f);
     ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "b.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", &CFC, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "b.example.com", "g1", T0, &CFC, 1, NULL));
     ASSERT(firc_fakeip_needs_commit(f, &v4));
     firc_fakeip_snapshot_t *s = firc_fakeip_snapshot_take(f);
     ASSERT(s != NULL);
@@ -2718,7 +2724,360 @@ static bool cand_is(const firc_fakeip_cf_cand_t *c, const firc_ip_t *addr, const
 static void cf_seen(firc_fakeip_t *f, const char *name, const char *gid, int64_t t, const firc_ip_t *real) {
     firc_ip_t v4, v6;
     firc_fakeip_get_in(f, name, gid, t, FIRC_FAKEIP_KIND_CF, &v4, &v6);
-    firc_fakeip_set_reals(f, name, gid, real, 1);
+    firc_fakeip_set_reals(f, name, gid, t, real, 1, NULL);
+}
+
+static firc_ip_t v4r(unsigned last) { firc_ip_t r = {{203, 0, 113, (uint8_t)last}, 4}; return r; }
+static firc_ip_t v6r(unsigned last) { firc_ip_t r = {{0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (uint8_t)last}, 16}; return r; }
+
+/* Catches: a multi-address answer collapsing onto one fake, or fakes not following the upstream's order. */
+TEST every_real_of_an_answer_gets_a_fake_in_answer_order(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(3), v4r(1), v4r(2)};
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 3, &h));
+    ASSERT_EQ_FMT((size_t)3, h.n, "%zu");
+    ASSERT_FALSE(h.capped);
+    for (size_t i = 0; i < 3; i++) {
+        const char *g = NULL;
+        firc_ip_t real;
+        ASSERT(firc_fakeip_pair_of(f, &h.hit[i].fake[FIRC_FAM_V4], &g, &real));
+        ASSERT(real.len == 4 && real.b[3] == reals[i].b[3]);
+        ASSERT(names(f, &h.hit[i].fake[FIRC_FAM_V4], "a.example.com"));
+        for (size_t j = 0; j < i; j++) { ASSERT(memcmp(h.hit[i].fake[FIRC_FAM_V4].b, h.hit[j].fake[FIRC_FAM_V4].b, 4) != 0); }
+    }
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a rotated answer moving a real under a fake a client already holds. */
+TEST a_rotated_answer_keeps_each_real_behind_its_fake(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t one[] = {v4r(1), v4r(2), v4r(3)};
+    firc_fakeip_hits_t a, b;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, one, 3, &a));
+    firc_ip_t two[] = {v4r(3), v4r(1), v4r(2)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 1, two, 3, &b));
+    ASSERT_EQ_FMT((size_t)3, b.n, "%zu");
+    ASSERT(memcmp(b.hit[0].fake[FIRC_FAM_V4].b, a.hit[2].fake[FIRC_FAM_V4].b, 4) == 0);
+    ASSERT(memcmp(b.hit[1].fake[FIRC_FAM_V4].b, a.hit[0].fake[FIRC_FAM_V4].b, 4) == 0);
+    ASSERT(memcmp(b.hit[2].fake[FIRC_FAM_V4].b, a.hit[1].fake[FIRC_FAM_V4].b, 4) == 0);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+static void count_walk(void *ud, const char *qname, const char *group_id, const firc_ip_t *fake, const firc_ip_t *real) {
+    (void)qname; (void)group_id; (void)fake; (void)real;
+    (*(size_t *)ud)++;
+}
+
+/* Catches: a v4 and a v6 real each taking an entry of their own instead of sharing a slot pair. */
+TEST six_a_and_six_aaaa_use_six_entries(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[12];
+    for (unsigned i = 0; i < 6; i++) {
+        reals[i] = v4r(i + 1);
+        reals[6 + i] = v6r(i + 1);
+    }
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 12, &h));
+    ASSERT_EQ_FMT((size_t)12, h.n, "%zu");
+    size_t pairs = 0;
+    firc_fakeip_walk(f, count_walk, &pairs);
+    ASSERT_EQ_FMTm("six entries, each with its v4 and its v6 fake", (size_t)12, pairs, "%zu");
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a missing cap, or a capped answer not reported. */
+TEST twelve_reals_give_eight_fakes_and_a_capped_flag(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[12];
+    for (unsigned i = 0; i < 12; i++) { reals[i] = v4r(i + 1); }
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 12, &h));
+    ASSERT_EQ_FMT((size_t)8, h.n, "%zu");
+    ASSERT(h.capped);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a full name taking a new real at once (churn) or never (a slot dead for good). */
+TEST a_full_name_retakes_a_slot_only_after_the_clamp(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[8];
+    for (unsigned i = 0; i < 8; i++) { reals[i] = v4r(i + 1); }
+    firc_fakeip_hits_t first;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 8, &first));
+    ASSERT_EQ_FMT((size_t)8, first.n, "%zu");
+
+    firc_ip_t fresh = v4r(99);
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + CLAMP, &fresh, 1, &h));
+    ASSERT_EQ_FMTm("all eight seen less than a clamp ago: the new real is dropped", (size_t)0, h.n, "%zu");
+    ASSERT(h.capped);
+
+    firc_ip_t keep[] = {v4r(2), v4r(3), v4r(4), v4r(5), v4r(6), v4r(7), v4r(8)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + CLAMP, keep, 7, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + CLAMP + 1, &fresh, 1, &h));
+    ASSERT_EQ_FMTm("only the first real went unseen for over a clamp: its slot is retaken", (size_t)1, h.n, "%zu");
+    ASSERT_FALSE(h.capped);
+    ASSERT(memcmp(h.hit[0].fake[FIRC_FAM_V4].b, first.hit[0].fake[FIRC_FAM_V4].b, 4) == 0);
+    const char *g = NULL;
+    firc_ip_t real;
+    ASSERT(firc_fakeip_pair_of(f, &h.hit[0].fake[FIRC_FAM_V4], &g, &real));
+    ASSERT(real.b[3] == 99);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a Cloudflare name growing entries, which it has no use for. */
+TEST a_cf_name_keeps_one_entry_whatever_the_answer(void) {
+    firc_fakeip_t *f = cf_pool();
+    ASSERT(f != NULL);
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "cf.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
+    firc_ip_t reals[] = {CFA, CFB, CFC};
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "cf.example.com", "g1", T0, reals, 3, &h));
+    ASSERT_EQ_FMT((size_t)1, h.n, "%zu");
+    ASSERT_FALSE(h.capped);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a rotated answer re-pointing a Cloudflare name's one fake, which makes every held answer wait again. */
+TEST a_cf_name_keeps_its_real_while_the_answer_still_offers_it(void) {
+    firc_fakeip_t *f = cf_pool();
+    ASSERT(f != NULL);
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get_in(f, "cf.example.com", "g1", T0, FIRC_FAKEIP_KIND_CF, &v4, &v6));
+    firc_ip_t one[] = {CFA, CFB};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "cf.example.com", "g1", T0, one, 2, NULL));
+    uint64_t gen = firc_fakeip_gen(f);
+    firc_ip_t two[] = {CFB, CFA};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "cf.example.com", "g1", T0 + 1, two, 2, NULL));
+    ASSERT_EQ_FMTm("nothing moved", (unsigned long long)gen, (unsigned long long)firc_fakeip_gen(f), "%llu");
+    const char *g = NULL;
+    firc_ip_t real;
+    ASSERT(firc_fakeip_pair_of(f, &v4, &g, &real));
+    ASSERT_MEM_EQ(CFA.b, real.b, 4);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a retake taking the slot of a real that comes later in the same answer. */
+TEST a_retake_never_takes_a_slot_a_later_real_of_the_answer_holds(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[8];
+    for (unsigned i = 0; i < 8; i++) { reals[i] = v4r(i + 1); }
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 8, NULL));
+    firc_ip_t later[] = {v4r(99), v4r(1), v4r(2), v4r(3), v4r(4), v4r(5), v4r(6), v4r(7), v4r(8)};
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 10 * CLAMP, later, 9, &h));
+    ASSERT_EQ_FMT((size_t)8, h.n, "%zu");
+    ASSERT(h.capped);
+    for (size_t i = 0; i < 8; i++) {
+        const char *g = NULL;
+        firc_ip_t real;
+        ASSERT(firc_fakeip_pair_of(f, &h.hit[i].fake[FIRC_FAM_V4], &g, &real));
+        ASSERT_EQ_FMT((unsigned)(i + 1), (unsigned)real.b[3], "%u");
+    }
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: the retake taking the newest unseen slot instead of the one unseen longest. */
+TEST the_slot_unseen_longest_is_the_one_retaken(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[8];
+    for (unsigned i = 0; i < 8; i++) { reals[i] = v4r(i + 1); }
+    firc_fakeip_hits_t first;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 8, &first));
+    firc_ip_t keep[] = {v4r(1), v4r(3), v4r(4), v4r(5), v4r(6), v4r(7), v4r(8)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 100, keep, 7, NULL));
+    firc_ip_t keep2[] = {v4r(1), v4r(4), v4r(5), v4r(6), v4r(7), v4r(8)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 200, keep2, 6, NULL));
+    firc_ip_t fresh = v4r(99);
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 200 + CLAMP, &fresh, 1, &h));
+    ASSERT_EQ_FMT((size_t)1, h.n, "%zu");
+    ASSERT_MEM_EQ(h.hit[0].fake[FIRC_FAM_V4].b, first.hit[1].fake[FIRC_FAM_V4].b, 4);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a retake taking the entry holding a real the same answer still offers. */
+TEST a_retake_skips_the_entry_whose_real_is_in_the_answer(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[8];
+    for (unsigned i = 0; i < 8; i++) { reals[i] = v4r(i + 1); }
+    firc_fakeip_hits_t first;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 8, &first));
+    firc_ip_t rest[] = {v4r(2), v4r(3), v4r(4), v4r(5), v4r(6), v4r(7), v4r(8)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 100, rest, 7, NULL));
+    firc_ip_t answer[] = {v4r(99), v4r(1)};
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 10 * CLAMP, answer, 2, &h));
+    ASSERT_EQ_FMT((size_t)2, h.n, "%zu");
+    const char *g = NULL;
+    firc_ip_t real;
+    ASSERT(firc_fakeip_pair_of(f, &h.hit[1].fake[FIRC_FAM_V4], &g, &real));
+    ASSERT_EQ_FMTm("real 1 keeps the entry it had", 1u, (unsigned)real.b[3], "%u");
+    ASSERT(firc_fakeip_pair_of(f, &h.hit[0].fake[FIRC_FAM_V4], &g, &real));
+    ASSERT_EQ_FMT(99u, (unsigned)real.b[3], "%u");
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: an extra entry blackholing the answer or blowing past max_names. */
+TEST an_extra_entry_the_pool_cannot_take_is_dropped_not_blackholed(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    c.max_names = 2;
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(1), v4r(2), v4r(3)};
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 3, &h));
+    ASSERT_EQ_FMT((size_t)2, h.n, "%zu");
+    ASSERT(h.capped);
+    size_t entries = 0;
+    firc_fakeip_walk(f, count_walk, &entries);
+    ASSERT_EQ_FMT((size_t)4, entries, "%zu");
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a reclaim sweeping a whole name when only one entry went idle. */
+TEST an_entry_ages_out_alone_while_another_keeps_being_seen(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(1), v4r(2)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 2, NULL));
+    firc_ip_t only[] = {v4r(2)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + DAY, only, 1, NULL));
+    firc_fakeip_reclaim(f, T0 + DAY + 1);
+    size_t entries = 0;
+    firc_fakeip_walk(f, count_walk, &entries);
+    ASSERT_EQ_FMT((size_t)2, entries, "%zu");
+    const char *g = NULL;
+    firc_ip_t real;
+    firc_fakeip_hits_t h;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + DAY + 2, only, 1, &h));
+    ASSERT(firc_fakeip_pair_of(f, &h.hit[0].fake[FIRC_FAM_V4], &g, &real));
+    ASSERT_EQ_FMT(2u, (unsigned)real.b[3], "%u");
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a lookup keeping alive the entry made last, which restart reverses, instead of the freshest one. */
+TEST a_lookup_keeps_the_freshest_entry_alive(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(1), v4r(2), v4r(3)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 3, NULL));
+    firc_ip_t middle[] = {v4r(2)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 50, middle, 1, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0 + 60, &v4, &v6));
+    firc_fakeip_reclaim(f, T0 + DAY + 30);
+    size_t entries = 0;
+    firc_fakeip_walk(f, count_walk, &entries);
+    ASSERT_EQ_FMTm("only the entry of real 2 is left", (size_t)2, entries, "%zu");
+    const char *g = NULL;
+    firc_ip_t real;
+    ASSERT(firc_fakeip_pair_of(f, &v4, &g, &real));
+    ASSERT_EQ_FMT(2u, (unsigned)real.b[3], "%u");
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: reals that come back after a v4 clear taking other entries, so a client's cached fakes point elsewhere. */
+TEST reals_back_after_a_clear_return_to_their_own_fakes(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(1), v4r(2), v4r(3)};
+    firc_fakeip_hits_t first, again;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 3, &first));
+    firc_fakeip_clear_real(f, "a.example.com", "g1", 4);
+    firc_fakeip_mark_committed(f, firc_fakeip_gen(f));
+    firc_ip_t shuffled[] = {v4r(3), v4r(1), v4r(2)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 1, shuffled, 3, &again));
+    ASSERT_EQ_FMT((size_t)3, again.n, "%zu");
+    for (size_t k = 0; k < 3; k++) {
+        const char *g = NULL;
+        firc_ip_t real;
+        ASSERTm("the real is armed again behind its fake", firc_fakeip_pair_of(f, &again.hit[k].fake[FIRC_FAM_V4], &g, &real));
+        ASSERT_EQ_FMT((unsigned)shuffled[k].b[3], (unsigned)real.b[3], "%u");
+        ASSERTm("and its rule is written again", firc_fakeip_needs_commit(f, &again.hit[k].fake[FIRC_FAM_V4]));
+    }
+    ASSERT_MEM_EQ(again.hit[0].fake[FIRC_FAM_V4].b, first.hit[2].fake[FIRC_FAM_V4].b, 4);
+    ASSERT_MEM_EQ(again.hit[1].fake[FIRC_FAM_V4].b, first.hit[0].fake[FIRC_FAM_V4].b, 4);
+    ASSERT_MEM_EQ(again.hit[2].fake[FIRC_FAM_V4].b, first.hit[1].fake[FIRC_FAM_V4].b, 4);
+    firc_fakeip_free(f);
+    PASS();
+}
+
+/* Catches: a new real overwriting a cleared entry's saved real while fewer than eight entries exist. */
+TEST a_new_real_makes_an_entry_before_it_takes_a_cleared_one(void) {
+    firc_fakeip_cfg_t c = base_cfg();
+    firc_fakeip_t *f = NULL;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_new(&c, &f));
+    firc_ip_t v4, v6;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "a.example.com", "g1", T0, &v4, &v6));
+    firc_ip_t reals[] = {v4r(1), v4r(2), v4r(3)};
+    firc_fakeip_hits_t first, back;
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0, reals, 3, &first));
+    firc_fakeip_clear_real(f, "a.example.com", "g1", 4);
+    firc_ip_t with_new[] = {v4r(2), v4r(3), v4r(9)};
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 1, with_new, 3, NULL));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "a.example.com", "g1", T0 + 2, reals, 3, &back));
+    ASSERT_EQ_FMT((size_t)3, back.n, "%zu");
+    for (size_t k = 0; k < 3; k++) { ASSERT_MEM_EQ(back.hit[k].fake[FIRC_FAM_V4].b, first.hit[k].fake[FIRC_FAM_V4].b, 4); }
+    firc_fakeip_free(f);
+    PASS();
 }
 
 TEST candidates_are_distinct_covered_reals_newest_first(void) {
@@ -2738,7 +3097,7 @@ TEST candidates_are_distinct_covered_reals_newest_first(void) {
     cf_seen(f, "other.example.com", "g2", T0 + 70, &CFE);
     firc_ip_t v4, v6;
     ASSERT_EQ(FIRC_OK, firc_fakeip_get(f, "plain.example.com", "g1", T0 + 80, &v4, &v6));
-    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "plain.example.com", "g1", &CFE, 1));
+    ASSERT_EQ(FIRC_OK, firc_fakeip_set_reals(f, "plain.example.com", "g1", T0, &CFE, 1, NULL));
     cf_seen(f, "six.example.com", "g1", T0 + 90, &CF6);
 
     firc_fakeip_cf_cand_t out[8];
@@ -2818,7 +3177,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_refused_issue_hands_back_the_half_that_succeeded);
     RUN_TEST(the_real_address_a_fake_one_stands_for_is_recorded_per_family);
     RUN_TEST(setting_the_real_address_again_replaces_it);
-    RUN_TEST(a_real_address_still_in_the_answer_is_kept_and_a_vanished_one_replaced);
+    RUN_TEST(a_real_address_still_in_the_answer_is_kept_and_a_new_one_takes_an_entry);
     RUN_TEST(a_pair_needs_a_commit_until_a_snapshot_taken_after_it_completes);
     RUN_TEST(the_generation_is_per_pair_and_the_mark_is_monotonic);
     RUN_TEST(a_reclaimed_pair_stays_in_the_snapshot_beside_the_other_groups_mapping);
@@ -2872,6 +3231,21 @@ int main(int argc, char **argv) {
     RUN_TEST(a_plain_fake_ignores_the_target);
     RUN_TEST(the_snapshot_carries_the_target);
     RUN_TEST(uncommitting_a_group_drops_its_cf_targets);
+    RUN_TEST(every_real_of_an_answer_gets_a_fake_in_answer_order);
+    RUN_TEST(a_rotated_answer_keeps_each_real_behind_its_fake);
+    RUN_TEST(six_a_and_six_aaaa_use_six_entries);
+    RUN_TEST(twelve_reals_give_eight_fakes_and_a_capped_flag);
+    RUN_TEST(a_full_name_retakes_a_slot_only_after_the_clamp);
+    RUN_TEST(a_cf_name_keeps_one_entry_whatever_the_answer);
+    RUN_TEST(a_cf_name_keeps_its_real_while_the_answer_still_offers_it);
+    RUN_TEST(a_retake_never_takes_a_slot_a_later_real_of_the_answer_holds);
+    RUN_TEST(the_slot_unseen_longest_is_the_one_retaken);
+    RUN_TEST(a_retake_skips_the_entry_whose_real_is_in_the_answer);
+    RUN_TEST(an_extra_entry_the_pool_cannot_take_is_dropped_not_blackholed);
+    RUN_TEST(an_entry_ages_out_alone_while_another_keeps_being_seen);
+    RUN_TEST(a_lookup_keeps_the_freshest_entry_alive);
+    RUN_TEST(reals_back_after_a_clear_return_to_their_own_fakes);
+    RUN_TEST(a_new_real_makes_an_entry_before_it_takes_a_cleared_one);
     RUN_TEST(candidates_are_distinct_covered_reals_newest_first);
     RUN_TEST(a_candidate_name_of_253_bytes_is_taken);
     GREATEST_MAIN_END();
