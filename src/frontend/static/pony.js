@@ -1411,6 +1411,45 @@
         [1, {}],
       ]),
     },
+    eat: {
+      duration: 1.4,
+      speed: 0,
+      loop: false,
+      keys: at(1.4, [
+        [0, SNIFF],
+        [0.2, GRAZE],
+        [0.4, { ...GRAZE, head: -1 }],
+        [0.55, GRAZE],
+        [0.72, { ...GRAZE, neck: -40, head: -1 }],
+        [0.85, { head: 5, tail: -16 }],
+        [1, {}],
+      ]),
+    },
+    sneeze: {
+      duration: 0.65,
+      speed: 0,
+      loop: false,
+      keys: at(0.65, [
+        [0, {}],
+        [0.3, { neck: 12, head: -12 }],
+        [0.44, { body: -4, neck: -24, head: -15, mane: 18 }],
+        [0.65, { neck: -10, head: 8, mane: -8 }],
+        [1, {}],
+      ]),
+    },
+    shake: {
+      duration: 0.75,
+      speed: 0,
+      loop: false,
+      keys: at(0.75, [
+        [0, {}],
+        ...[0.15, 0.3, 0.45, 0.6, 0.75].map((t, i) => {
+          const a = (i % 2 ? -1 : 1) * (1 - t);
+          return [t, { neck: 12 * a, head: 18 * a, mane: -30 * a }];
+        }),
+        [1, {}],
+      ]),
+    },
   };
   const ACTION_NAMES = Object.keys(ACTIONS);
   function localTime(a, time) {
@@ -1949,6 +1988,22 @@
       },
     };
   }
+  function createApple(size) {
+    const fruit = el("svg", {
+      "data-pony-apple": "",
+      viewBox: "0 0 16 16",
+      width: 0.2 * size,
+      height: 0.2 * size,
+    });
+    fruit.style.cssText =
+      "position:absolute;left:0;bottom:0;pointer-events:none;transform-origin:50% 100%";
+    fruit.append(
+      el("path", { fill: "#df3c44", d: "M8 6C0 1 0 11 4 14Q6 16 8 14Q10 16 12 14C16 11 16 1 8 6" }),
+      el("path", { fill: "#65a64b", d: "M8 6Q8 0 14 1Q13 6 8 6" }),
+      el("path", { d: "M8 6Q8 3 6 2", fill: "none", stroke: "#895431" }),
+    );
+    return fruit;
+  }
   const TURN_TIME = 0.45;
   const MIN_WIDTH = 0.5;
   const YAW = 24;
@@ -2079,7 +2134,8 @@
       tabs: "[data-tabs-trigger]",
       switches: "[data-switch-root]",
       search: 'input[type="search"]',
-      dialog: '[data-dialog-content][data-state="open"]',
+      dialog:
+        '[data-dialog-content][data-state="open"], [data-alert-dialog-content][data-state="open"]',
       reading: 2,
     },
   };
@@ -2186,6 +2242,11 @@
   const TURN_REAR = 0.3;
   const HOP_ENTER = 0.12;
   const HOP_EXIT = 0.15;
+  const RUNNING = new Set(["run", "gallop"]);
+  const APPLE_TARGETS =
+    "button, a, input, textarea, select, label, summary, [contenteditable], [draggable=true], " +
+    "[role=button], [role=link], [role=checkbox], [role=switch], [role=tab], [role=option], " +
+    "[role^=menuitem], [data-dialog-content], [data-alert-dialog-content], .group-grip, .grip";
   const AUTO_PLATFORMS = (document.currentScript && document.currentScript.dataset.platforms) || "";
   const AUTO_WATCH = (document.currentScript && document.currentScript.dataset.watch) || "";
   const AUTO_TOGGLE =
@@ -2281,6 +2342,15 @@
     let pressed = false;
     let facing = null;
     let turn = null;
+    let reaction = null;
+    let fruit = null;
+    let ponyBox = null;
+    let cursorAt = -Infinity;
+    let wasRunning = false;
+    let shownAction = null;
+    let shownReaction = null;
+    let dialogOpen = false;
+    let peeking = false;
     function findPlatform(groundLine) {
       if (!selector) return null;
       const rects = [];
@@ -2299,6 +2369,40 @@
     let groundLine = 0;
     let pageWidth = 0;
     let candidate = null;
+    const width = WIDTH_PER_SIZE * size;
+    const surfaceAt = (x) =>
+      candidate && x >= candidate.left && x <= candidate.right ? groundLine - candidate.top : 0;
+    const positionAt = (x) => clamp(x, 0, Math.max(0, pageWidth - width));
+    function nearestCover(x, y) {
+      let best = null;
+      let distance = Infinity;
+      for (const card of all(selector)) {
+        const r = card.getBoundingClientRect();
+        if (
+          r.right <= 0 ||
+          r.left >= pageWidth ||
+          r.bottom <= 0 ||
+          r.top >= groundLine ||
+          r.right <= r.left ||
+          r.bottom <= r.top
+        )
+          continue;
+        const dx = Math.max(r.left - x, 0, x - r.right);
+        const dy = Math.max(r.top - y, 0, y - r.bottom);
+        const d = Math.hypot(dx, dy);
+        if (d < distance) {
+          distance = d;
+          best = card;
+        }
+      }
+      return best;
+    }
+    function approach(s, x) {
+      if (Math.abs(x - s.x) <= 0.06 * size) return true;
+      director.hold("walk");
+      director.face(Math.sign(x - s.x));
+      return false;
+    }
     const markLayout = () => {
       layoutDirty = true;
     };
@@ -2310,7 +2414,8 @@
       const dt = last === null || !Number.isFinite(now) ? 0 : (now - last) / 1000;
       last = Number.isFinite(now) ? now : last;
       const d = Math.min(FRAME_CAP, dt);
-      if (layoutDirty || now - layoutAt >= LAYOUT_EVERY || !Number.isFinite(now)) {
+      const checkLayout = layoutDirty || now - layoutAt >= LAYOUT_EVERY || !Number.isFinite(now);
+      if (checkLayout) {
         layoutAt = Number.isFinite(now) ? now : 0;
         layoutDirty = false;
         groundLine = layer.getBoundingClientRect().bottom;
@@ -2319,7 +2424,7 @@
       }
       director.setWidth(pageWidth);
       const s = director.step(dt);
-      const mid = s.x + 0.5 * WIDTH_PER_SIZE * size;
+      const mid = s.x + 0.5 * width;
       const found = candidate;
       const next = found && mid >= found.left && mid <= found.right ? found : null;
       if ((next && next.el) !== (plat && plat.el)) hop = { t: 0, from: base, h: 0 };
@@ -2350,28 +2455,157 @@
         }
       }
       const bottom = groundLine - y;
+      const box = { left: s.x, right: s.x + width, top: bottom - size, bottom };
+      const pageState = page ? page.poll() : undefined;
       const cmd = mood({
         dt: d,
         size,
         cursor,
-        box: { left: s.x, right: s.x + WIDTH_PER_SIZE * size, top: bottom - size, bottom },
+        box,
         dir: s.dir,
         action: s.action,
         idle: (performance.now() - lastInput) / 1000,
         pressed,
         returned,
         toast,
-        page: page ? page.poll() : undefined,
+        page: pageState,
       });
       returned = 0;
       toast = null;
-      if (cmd.face) director.face(cmd.face);
-      if (cmd.play) director.play(cmd.play);
-      else if (cmd.hold) director.hold(cmd.hold);
-      else if (cmd.flee) director.flee(cmd.flee);
-      else if (cmd.follow !== null) director.follow(cmd.follow);
-      if (cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
+      const running = RUNNING.has(s.action);
+      if (pageState?.dialog) {
+        if (!dialogOpen || (checkLayout && reaction?.type !== "dialog")) {
+          const card = nearestCover(mid, bottom);
+          reaction = card ? { type: "dialog", card } : null;
+        }
+      } else if (reaction?.type === "dialog") {
+        if (peeking) hop = { t: 0, from: reaction.y, h: 0 };
+        reaction = null;
+      }
+      if (dialogOpen !== !!pageState?.dialog) {
+        dialogOpen = !!pageState?.dialog;
+        layer.style.zIndex = dialogOpen ? "14" : "2147483000";
+      }
+      if (!reaction && !pageState?.dialog && !hop) {
+        const ahead = cursor && (cursor.x - mid) * s.dir - 0.5 * width;
+        const room = s.dir === 1 ? pageWidth - box.right : box.left;
+        if (
+          running &&
+          cursor &&
+          now - cursorAt >= 180 &&
+          ahead >= 0 &&
+          ahead <= 0.65 * size &&
+          cursor.y >= bottom - 0.4 * size &&
+          cursor.y <= bottom + 0.15 * size &&
+          room >= travelOf("jump") * (size / 80)
+        ) {
+          reaction = { type: "cursor", action: "jump", resume: s.action, dir: s.dir };
+        } else if (wasRunning && !ACTIONS[s.action].speed && dust.particles.length) {
+          reaction = { type: "dust", action: "sneeze" };
+        }
+      }
+      wasRunning = running && !hop;
+      let cover = null;
+      if (reaction?.type === "dialog") {
+        const r = reaction.card.getBoundingClientRect();
+        const left = Math.max(0, r.left);
+        const right = Math.min(pageWidth, r.right);
+        const overTop = r.top >= 0.25 * size && r.top < groundLine;
+        const side =
+          left < 0.4 * width ||
+          (pageWidth - right >= 0.4 * width && Math.abs(right - mid) < Math.abs(left - mid))
+            ? 1
+            : -1;
+        const inset = Math.min(0.5 * width, (right - left) / 2);
+        const x = positionAt(
+          overTop
+            ? clamp(mid, left + inset, right - inset) - 0.5 * width
+            : side === -1
+              ? left - 0.37 * width
+              : right - 0.63 * width,
+        );
+        if (!reaction.card.isConnected || right <= left || r.bottom <= 0 || r.top >= groundLine) {
+          reaction = null;
+        } else if (approach(s, x)) {
+          director.hold("rest");
+          if (!hop) {
+            if (reaction.peekAt === undefined) {
+              reaction.peekAt = now;
+              reaction.from = y;
+            }
+            if (!overTop) director.face(side);
+            const feet = overTop ? r.top + 0.62 * size : clamp(bottom, r.top + size, r.bottom);
+            const lift = Math.max(0, groundLine - feet);
+            y =
+              reaction.from +
+              (lift - reaction.from) * easeInOut(clamp((now - reaction.peekAt) / 350, 0, 1));
+            reaction.y = y;
+            cover = r;
+          }
+        } else {
+          reaction.peekAt = undefined;
+        }
+      } else if (reaction?.type === "apple" && !reaction.action) {
+        if (approach(s, reaction.x)) {
+          if (hop) director.hold("rest");
+          else {
+            director.face(reaction.dir);
+            reaction.action = "sniff";
+          }
+        }
+      }
+      if (reaction?.action) {
+        const { action, type } = reaction;
+        if (s.action === action && s.time >= ACTIONS[action].duration) {
+          if (action === "sniff") reaction.action = "eat";
+          else if (action === "sneeze") reaction.action = "shake";
+          else {
+            director.play(type === "cursor" ? reaction.resume : "rest");
+            if (type === "cursor") director.face(reaction.dir);
+            reaction = null;
+          }
+        }
+        if (reaction) director.hold(reaction.action);
+      } else if (!reaction) {
+        if (cmd.face) director.face(cmd.face);
+        if (cmd.play) director.play(cmd.play);
+        else if (cmd.hold) director.hold(cmd.hold);
+        else if (cmd.flee) director.flee(cmd.flee);
+        else if (cmd.follow !== null) director.follow(cmd.follow);
+      }
+      if (!reaction && cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
         pose = { ...pose, head: (pose.head || 0) + cmd.gaze };
+      if (cover) {
+        const { left, top, right, bottom } = cover;
+        layer.style.clipPath = `path(evenodd, "M0 0H${pageWidth}V${-groundLine}H0Z M${left} ${top - groundLine}H${right}V${bottom - groundLine}H${left}Z")`;
+        if (!peeking) layer.setAttribute("data-pony-peek", "");
+      } else if (peeking) {
+        layer.style.clipPath = "";
+        layer.removeAttribute("data-pony-peek");
+      }
+      peeking = !!cover;
+      ponyBox = { ...box, top: groundLine - y - size, bottom: groundLine - y };
+      if (shownAction !== s.action) {
+        shownAction = s.action;
+        layer.setAttribute("data-pony-action", shownAction);
+      }
+      const type = reaction?.type || null;
+      if (shownReaction !== type) {
+        shownReaction = type;
+        if (type) layer.setAttribute("data-pony-reaction", type);
+        else layer.removeAttribute("data-pony-reaction");
+      }
+      if (fruit) {
+        if (type === "apple") {
+          const eaten = s.action === "eat" ? ramp(s.time, [0.28, 0.76]) : 0;
+          const fall = 1 - clamp((now - reaction.droppedAt) / 240, 0, 1) ** 2;
+          fruit.style.bottom = `${surfaceAt(reaction.x + 0.5 * width) + fall * 0.25 * size}px`;
+          fruit.style.transform = `scale(${1 - eaten})`;
+        } else {
+          fruit.remove();
+          fruit = null;
+        }
+      }
       const want = s.dir === 1 ? -1 : 1;
       if (facing === null) facing = want;
       if (turn) {
@@ -2403,6 +2637,13 @@
       const strength = hop ? 0 : DUST_GAIT[s.action] || 0;
       const rear = s.x + (s.dir === 1 ? 0.15 : 0.85) * WIDTH_PER_SIZE * size;
       if (strength) dust.trail(rear, base, s.dir, strength);
+      if (s.action === "sneeze" && s.time - d < 0.28 && s.time >= 0.28) {
+        const [mx, my] = place(pose, ["head", "neck", "body"], [52, 89]);
+        dust.burst(
+          s.x + ((s.dir === 1 ? VB_W - mx : mx) * size) / VB_H,
+          y + (1 - my / VB_H) * size,
+        );
+      }
       if (landed || (wasJump && s.action !== "jump" && !hop))
         dust.burst(s.x + 0.5 * WIDTH_PER_SIZE * size, base);
       landed = false;
@@ -2439,7 +2680,26 @@
     };
     const onMove = (e) => {
       lastInput = performance.now();
-      if (e.pointerType === "mouse") cursor = { x: e.clientX, y: e.clientY };
+      if (e.pointerType === "mouse" && (cursor?.x !== e.clientX || cursor?.y !== e.clientY)) {
+        cursorAt = lastInput;
+        cursor = { x: e.clientX, y: e.clientY };
+      }
+    };
+    const onDoubleClick = (e) => {
+      if (!ponyBox || reaction || dialogOpen || e.button !== 0 || closest(e.target, APPLE_TARGETS))
+        return;
+      const { left, right, top, bottom } = ponyBox;
+      const dx = Math.max(left - e.clientX, 0, e.clientX - right);
+      const dy = Math.max(top - e.clientY, 0, e.clientY - bottom);
+      if (Math.hypot(dx, dy) > NEAR * size) return;
+      const dir = e.clientX >= (left + right) / 2 ? 1 : -1;
+      const muzzle = (dir === 1 ? 0.83 : 0.42) * size;
+      const x = positionAt(e.clientX - muzzle);
+      reaction = { type: "apple", x, dir, droppedAt: performance.now() };
+      fruit = createApple(size);
+      fruit.style.left = `${x + muzzle - 0.1 * size}px`;
+      fruit.style.bottom = `${surfaceAt(x + 0.5 * width) + 0.25 * size}px`;
+      layer.prepend(fruit);
     };
     const onDown = (e) => {
       lastInput = performance.now();
@@ -2460,6 +2720,7 @@
     };
     document.addEventListener("visibilitychange", onVisibility);
     document.addEventListener("pointermove", onMove, { passive: true });
+    document.addEventListener("dblclick", onDoubleClick, { passive: true, capture: true });
     document.addEventListener("mouseout", onOut);
     document.addEventListener("pointerdown", onDown, true);
     document.addEventListener("pointerup", onUp, true);
@@ -2474,6 +2735,7 @@
     rt.cleanup.push(
       () => document.removeEventListener("visibilitychange", onVisibility),
       () => document.removeEventListener("pointermove", onMove),
+      () => document.removeEventListener("dblclick", onDoubleClick, true),
       () => document.removeEventListener("mouseout", onOut),
       () => document.removeEventListener("pointerdown", onDown, true),
       () => document.removeEventListener("pointerup", onUp, true),
