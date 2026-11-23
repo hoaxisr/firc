@@ -17,6 +17,7 @@ tunnels:
   by: "connection"
   interval: 60s
   silence: 20s
+  failback: true
   advanced:
     timeout: 8s
     insecure: false

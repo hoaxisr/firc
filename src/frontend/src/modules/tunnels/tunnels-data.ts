@@ -42,6 +42,7 @@ export function normalizeTunnel(raw: Partial<Tunnel>): Tunnel {
     by: raw.by ?? "connection",
     interval: raw.interval ?? 60,
     silence: raw.silence ?? 20,
+    failback: raw.failback ?? true,
     filter: raw.filter ?? "",
     order: [...(raw.order ?? [])],
     exclude: [...(raw.exclude ?? [])],

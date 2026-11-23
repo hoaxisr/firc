@@ -72,7 +72,7 @@ static struct {
     const char *bind_dev;
     uint32_t mark;
     uint32_t table;
-    int silence_s, timeout_s;
+    int silence_s, timeout_s, failback;
     struct tun_cfg tc;
     struct route routes[ROUTES_MAX];
     int routes_n;
@@ -146,6 +146,8 @@ static void usage(FILE *f) {
 "  -t, --timeout S        probe timeout at startup and for --probe, seconds (default 8)\n"
 "      --silence S        reset a connection whose server stays silent for S seconds\n"
 "                         (default 20, 0 — never)\n"
+"      --failback         move a connection back to a higher node of the order once it\n"
+"                         answers again\n"
 "      --no-retry         exit when no candidate resolves or none answers at startup,\n"
 "                         instead of retrying\n"
 "  -V, --version\n"
@@ -214,7 +216,7 @@ static void raise_nofile(void) {
 }
 
 enum { OPT_NO_PROBE = 256, OPT_INSECURE, OPT_CA, OPT_SILENCE, OPT_NO_RETRY, OPT_BY, OPT_INTERVAL, OPT_CONTROL,
-       OPT_TCP_PORT, OPT_TCP_POOL, OPT_FP };
+       OPT_TCP_PORT, OPT_TCP_POOL, OPT_FP, OPT_FAILBACK };
 
 static int parse_args(int argc, char **argv) {
     static const struct option opts[] = {
@@ -234,6 +236,7 @@ static int parse_args(int argc, char **argv) {
         { "bind-dev", required_argument, NULL, 'b' },
         { "timeout",  required_argument, NULL, 't' },
         { "silence",  required_argument, NULL, OPT_SILENCE },
+        { "failback", no_argument,       NULL, OPT_FAILBACK },
         { "no-retry", no_argument,       NULL, OPT_NO_RETRY },
         { "active",   required_argument, NULL, 'A' },
         { "by",       required_argument, NULL, OPT_BY },
@@ -290,6 +293,7 @@ static int parse_args(int argc, char **argv) {
             if (parse_uint(optarg, &v) != 0 || v > 3600) goto bad;
             g.silence_s = (int)v;
             break;
+        case OPT_FAILBACK: g.failback = 1; break;
         case OPT_NO_RETRY: g.no_retry = 1; break;
         case 'A':
             if (parse_uint(optarg, &v) != 0 || v == 0 || v > ACTIVE_MAX) goto bad;
@@ -950,6 +954,7 @@ int main(int argc, char **argv) {
         .by = g.by,
         .interval_s = g.interval_s,
         .silence_s = g.silence_s,
+        .failback = g.failback,
         .v6_changed = on_v6,
     };
     rc = vless_tunnel_run(&g.tc, &pc, on_ready, NULL);

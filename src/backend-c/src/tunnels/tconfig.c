@@ -677,6 +677,7 @@ static void tunnel_defaults(firc_tunnel_t *t)
     strcpy(t->by, "connection");
     t->interval_s = 60;
     t->silence_s = 20;
+    t->failback = true;
     t->timeout_s = 8;
 }
 
@@ -762,6 +763,10 @@ static firc_err_t parse_tunnel(ctx_t *c, node_t *m, size_t ti, firc_tunnel_t *t)
         } else if (strcmp(key, "silence") == 0) {
             if (!parse_secs(v, &t->silence_s, 0, 3600)) {
                 return fail(c, "whole seconds, 0s..1h", "tunnels[%zu].silence", ti);
+            }
+        } else if (strcmp(key, "failback") == 0) {
+            if (!parse_bool(v, &t->failback)) {
+                return fail(c, "must be true or false", "tunnels[%zu].failback", ti);
             }
         } else if (strcmp(key, "advanced") == 0) {
             r = parse_advanced(c, v, ti, t);
@@ -1239,6 +1244,7 @@ static void emit_tunnel(em_t *e, const firc_tunnel_t *t)
     kv(e, "by", t->by, true);
     kv_secs(e, "interval", t->interval_s);
     kv_secs(e, "silence", t->silence_s);
+    kv(e, "failback", t->failback ? "true" : "false", false);
     str(e, "advanced", false);
     map_start(e);
     kv_secs(e, "timeout", t->timeout_s);
@@ -1324,6 +1330,7 @@ bool firc_tunnel_same_argv(const firc_tunnel_t *a, const firc_tunnel_t *b)
     return strcmp(a->id, b->id) == 0 && strcmp(a->device, b->device) == 0 && a->enable == b->enable &&
            a->uplink == b->uplink && strcmp(a->uplink_ref, b->uplink_ref) == 0 && a->active == b->active &&
            strcmp(a->by, b->by) == 0 && a->interval_s == b->interval_s && a->silence_s == b->silence_s &&
+           a->failback == b->failback &&
            a->timeout_s == b->timeout_s && a->insecure == b->insecure && strcmp(a->ca, b->ca) == 0 &&
            strcmp(a->fingerprint, b->fingerprint) == 0 &&
            a->kernel_tcp == b->kernel_tcp;

@@ -137,6 +137,17 @@
         <span class="unit">{t("s")}</span>
       </div>
     </div>
+    <div class="row">
+      <div class="label">
+        <div class="name">{t("Return to the first nodes")}</div>
+        <div class="hint">
+          {t("When a node higher in the list answers again, new connections go through it")}
+        </div>
+      </div>
+      <div class="controls">
+        <Switch aria-label={t("Return to the first nodes")} bind:checked={tunnel.failback} />
+      </div>
+    </div>
 
     <div class="row">
       <div class="label">

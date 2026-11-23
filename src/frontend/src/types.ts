@@ -226,6 +226,7 @@ export type Tunnel = {
   by: "connection" | "site" | "site-client";
   interval: number;
   silence: number;
+  failback: boolean;
   filter: string;
   order: string[];
   exclude: string[];

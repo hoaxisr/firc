@@ -47,6 +47,7 @@ struct pool_cfg {
     int by;                 /* enum pool_by */
     int interval_s;         /* health check period of each active node */
     int silence_s;          /* stall threshold on live connections (struct dialer), 0 — none */
+    int failback;
     int (*v6_changed)(int on);   /* nonzero — not applied, called again at the next publish while on */
 };
 

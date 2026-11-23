@@ -179,7 +179,8 @@ static cJSON *tunnel_json(const firc_tunnel_t *t)
          put_item(o, "inbounds", inbounds_json(t)) && cJSON_AddNumberToObject(o, "active", t->active) != NULL &&
          cJSON_AddStringToObject(o, "by", t->by) != NULL &&
          cJSON_AddNumberToObject(o, "interval", t->interval_s) != NULL &&
-         cJSON_AddNumberToObject(o, "silence", t->silence_s) != NULL;
+         cJSON_AddNumberToObject(o, "silence", t->silence_s) != NULL &&
+         cJSON_AddBoolToObject(o, "failback", t->failback) != NULL;
     if (ok) {
         ok = put_item(o, "advanced", adv);
         adv = NULL;
@@ -468,7 +469,7 @@ typedef struct {
 static const jkey_t TUNNEL_KEYS[] = {
     {"id", T_STR},     {"device", T_STR},  {"enable", T_BOOL},  {"uplink", T_OBJ},
     {"sources", T_ARR}, {"filter", T_STR},  {"order", T_ARR},    {"exclude", T_ARR},
-    {"active", T_NUM}, {"by", T_STR},      {"interval", T_NUM}, {"silence", T_NUM},
+    {"active", T_NUM}, {"by", T_STR},      {"interval", T_NUM}, {"silence", T_NUM}, {"failback", T_BOOL},
     {"advanced", T_OBJ}, {"description", T_STR}, {"inbounds", T_ARR}, {"routerPolicies", T_BOOL},
 };
 static const jkey_t INBOUND_KEYS[] = {

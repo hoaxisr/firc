@@ -515,6 +515,31 @@ TEST ok_child_up_links_on_stdin(void)
     PASS();
 }
 
+/* catches: --failback sent when off, or missing when on */
+TEST argv_failback_only_when_on(void)
+{
+    env_setup("ok");
+    char *lk[] = {"vless://secret@h1:443#one"};
+    firc_tunnel_t ft;
+    tun_init(&ft, "a", 3, lk, 1);
+    ft.failback = true;
+    firc_tunnels_t fset = {.t = &ft, .n = 1};
+    uint32_t fm[] = {0x1a};
+    static rec_t fr;
+    rec_open(&fr);
+    ASSERT_EQ(FIRC_OK, firc_tunsup_apply(fr.s, &fset, fm));
+    run_ms(&fr, 700);
+    char fb[512];
+    read_file(g_argv, fb, sizeof fb);
+    ASSERT_STR_EQ("--control\n-d\ntunvless3\n-a\n203.0.113.4/32\n-A\n1\n--by\nlatency\n--interval\n30\n"
+                  "--silence\n10\n--failback\n-t\n5\n-m\n0x1a\n",
+                  fb);
+    rec_close(&fr);
+    ASSERT(no_children());
+    env_teardown();
+    PASS();
+}
+
 TEST argv_full_and_no_link(void)
 {
     /* catches: a wrong flag, address or mark format, --fp missing, or a link on the command line */
@@ -4282,6 +4307,7 @@ int main(int argc, char **argv)
     GREATEST_SET_TEARDOWN_CB(teardown, NULL);
     RUN_TEST(ok_child_up_links_on_stdin);
     RUN_TEST(reap_hook_names_each_child_once_reaped);
+    RUN_TEST(argv_failback_only_when_on);
     RUN_TEST(argv_full_and_no_link);
     RUN_TEST(argv_with_every_option_set);
     RUN_TEST(argv_minimal_without_options);

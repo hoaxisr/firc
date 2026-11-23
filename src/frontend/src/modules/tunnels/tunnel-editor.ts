@@ -172,6 +172,7 @@ const RUN_FIELDS = [
   "by",
   "interval",
   "silence",
+  "failback",
   "uplink",
   "advanced",
 ] as const;

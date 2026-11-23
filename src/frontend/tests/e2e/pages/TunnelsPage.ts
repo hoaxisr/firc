@@ -14,6 +14,7 @@ export const tunnel = (id: string, device: string, extra: Json = {}): Json => ({
   by: "connection",
   interval: 60,
   silence: 20,
+  failback: true,
   filter: "",
   order: [],
   exclude: [],

@@ -9,6 +9,11 @@ FPRC=$?
 if [ "$FPRC" = 2 ] && [ "$FPERR" = "tunvless[error]: --fp is chrome or firefox" ]; then echo "ok   --fp safari: exits 2 with an error line"; else
     printf 'FAIL --fp safari: exits 2 with an error line\n  actual: %s %s\n' "$FPRC" "$FPERR"; exit 1
 fi
+FBERR="$("$BIN" --failback --control -d tvc0 < /dev/null 2>&1 >/dev/null)"
+# catches: --failback unknown to the option table, so a fircd that passes it never starts the tunnel
+if [ "$FBERR" = "tunvless[error]: no usable node" ]; then echo "ok   --failback: accepted"; else
+    printf 'FAIL --failback: accepted\n  actual: %s\n' "$FBERR"; exit 1
+fi
 [ "$(id -u)" = 0 ] || { echo "control: needs root — skipped"; exit 0; }
 for t in ip python3 wget curl; do
     command -v $t >/dev/null 2>&1 || { echo "control: no $t — skipped"; exit 0; }

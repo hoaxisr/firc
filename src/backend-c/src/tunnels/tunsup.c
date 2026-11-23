@@ -1064,6 +1064,9 @@ static void spawn_past(slot_t *sl, bool open)
     argv[a++] = interval;
     argv[a++] = "--silence";
     argv[a++] = silence;
+    if (t->failback) {
+        argv[a++] = "--failback";
+    }
     argv[a++] = "-t";
     argv[a++] = timeout;
     if (sl->mark != 0) {

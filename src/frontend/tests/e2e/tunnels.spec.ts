@@ -32,7 +32,31 @@ test.describe("Tunnels page", () => {
     await expect.poll(() => restarts).toBe(1);
   });
 
-  // Catches a link or subscription address, which carry the account secret, shown before it is asked for.
+  // Catches the failback switch missing, not showing the tunnel's on value, or its off state not sent in the save and shown after a reload.
+  test("the failback switch shows the tunnel's value and an off value survives save and reload", async ({
+    page,
+  }) => {
+    const daemon = await stubDaemon(page, {
+      tunnels: [tunnel("a", "tunvless0")],
+      states: [state("a", "tunvless0")],
+    });
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.expand("a");
+    const sw = tunnels.card("a").getByRole("switch", { name: "Return to the first nodes" });
+    await expect(sw).toBeChecked();
+    await sw.click();
+    await expect(sw).not.toBeChecked();
+    await tunnels.save.click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(daemon.puts[0].tunnels[0].failback).toBe(false);
+    await tunnels.open();
+    await tunnels.expand("a");
+    await expect(
+      tunnels.card("a").getByRole("switch", { name: "Return to the first nodes" }),
+    ).not.toBeChecked();
+  });
+
   // Catches the failover settings without a fold, a fold the next visit forgets, or «More» left between the rows.
   test("the failover settings fold, stay folded when the page is opened again, and end with More", async ({
     page,
@@ -85,6 +109,7 @@ test.describe("Tunnels page", () => {
     expect(nan).toEqual([]);
   });
 
+  // Catches a link or subscription address, which carry the account secret, shown before it is asked for.
   test("source addresses stay hidden until shown", async ({ page }) => {
     await stubDaemon(page, {});
     const tunnels = new TunnelsPage(page);
@@ -147,6 +172,7 @@ test.describe("Tunnels page", () => {
             by: "connection",
             interval: 60,
             silence: 20,
+            failback: true,
             filter: "",
             order: [],
             exclude: [],

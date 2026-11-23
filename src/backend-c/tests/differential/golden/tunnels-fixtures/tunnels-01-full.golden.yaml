@@ -24,6 +24,7 @@ tunnels:
   by: "site-client"
   interval: 120s
   silence: 0s
+  failback: true
   advanced:
     timeout: 10s
     insecure: false
@@ -39,6 +40,7 @@ tunnels:
   by: "connection"
   interval: 60s
   silence: 20s
+  failback: true
   advanced:
     timeout: 8s
     insecure: false

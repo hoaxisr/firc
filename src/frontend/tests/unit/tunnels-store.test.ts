@@ -86,6 +86,7 @@ const tunnel = (id: string, extra: Record<string, unknown> = {}) => ({
   by: "connection",
   interval: 60,
   silence: 20,
+  failback: true,
   filter: "",
   order: [],
   exclude: [],

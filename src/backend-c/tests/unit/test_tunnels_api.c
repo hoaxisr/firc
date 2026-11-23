@@ -545,12 +545,12 @@ TEST get_answers_every_tunnel_in_the_agreed_shape(void)
                      "{\"id\":\"0000000b\",\"kind\":\"subscription\",\"name\":\"P\",\"url\":\"" SUB_URL "\","
                      "\"interval\":3600}],"
                      "\"filter\":\"^(A|B)$\",\"order\":[\"0000000b:B\"],\"exclude\":[\"0000000b:C\"],\"inbounds\":[],"
-                     "\"active\":2,\"by\":\"site\",\"interval\":30,\"silence\":10,"
+                     "\"active\":2,\"by\":\"site\",\"interval\":30,\"silence\":10,\"failback\":true,"
                      "\"advanced\":{\"timeout\":5,\"insecure\":true,\"ca\":\"/etc/ca.pem\",\"fingerprint\":\"\",\"kernelTcp\":false}},"
                      "{\"id\":\"b\",\"device\":\"tunvless1\",\"description\":\"\",\"enable\":false,\"routerPolicies\":false,"
                      "\"uplink\":{\"kind\":\"iface\",\"ref\":\"eth9\"},\"sources\":[],"
                      "\"filter\":\"\",\"order\":[],\"exclude\":[],\"inbounds\":[],"
-                     "\"active\":1,\"by\":\"connection\",\"interval\":60,\"silence\":20,"
+                     "\"active\":1,\"by\":\"connection\",\"interval\":60,\"silence\":20,\"failback\":true,"
                      "\"advanced\":{\"timeout\":8,\"insecure\":false,\"ca\":\"\",\"fingerprint\":\"\",\"kernelTcp\":false}}]}"));
     cJSON_Delete(ans);
     PASS();
@@ -1463,6 +1463,28 @@ TEST get_put_get_keeps_kernel_tcp(void)
     PASS();
 }
 
+/* catches: failback dropped on the way from a PUT to the file, or a non-bool accepted */
+TEST put_failback_round_trips_and_must_be_a_bool(void)
+{
+    ASSERT(hx_start(NULL, 0) != NULL);
+    cJSON *ans = NULL;
+    ASSERT_EQ(400, put_field_error("{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"failback\":\"true\"}", &ans));
+    ASSERT(same_json(ans, "{\"error\":\"must be true or false\",\"field\":\"failback\",\"tunnel\":\"a\"}"));
+    cJSON_Delete(ans);
+    ASSERT_EQ(200, call_api("PUT", "/api/v1/tunnels",
+                            "{\"tunnels\":[{\"id\":\"a\",\"device\":\"tunvless0\",\"enable\":false,\"failback\":false}]}", &ans));
+    ASSERT(cJSON_IsFalse(at(tunnel_named(ans, "a"), "failback")));
+    cJSON_Delete(ans);
+    firc_tunnels_t saved = {0};
+    ASSERT_EQ(FIRC_OK, firc_tunnels_load_file(&saved, g_hx->path, NULL));
+    ASSERT(!saved.t[0].failback);
+    firc_tunnels_free(&saved);
+    ASSERT_EQ(200, call_api("GET", "/api/v1/tunnels", NULL, &ans));
+    ASSERT(cJSON_IsFalse(at(tunnel_named(ans, "a"), "failback")));
+    cJSON_Delete(ans);
+    PASS();
+}
+
 /* catches: a fingerprint dropped on the way from a PUT to the file, or missing from the GET answer */
 TEST put_fingerprint_round_trips(void)
 {
@@ -2249,6 +2271,7 @@ SUITE(tunnels_api)
     RUN_TEST(a_description_edit_is_saved_and_restarts_nothing);
     RUN_TEST(kernel_tcp_must_be_a_bool);
     RUN_TEST(get_put_get_keeps_kernel_tcp);
+    RUN_TEST(put_failback_round_trips_and_must_be_a_bool);
     RUN_TEST(put_fingerprint_round_trips);
     RUN_TEST(put_fingerprint_safari_is_400);
     RUN_TEST(state_reports_tcp_port);

@@ -990,6 +990,35 @@ TEST kernel_tcp_is_argv_affecting(void) {
     PASS();
 }
 
+/* catches: failback off by default, a non-bool coerced, or save dropping the key */
+TEST failback_defaults_on_loads_saves_and_refuses_a_non_bool(void) {
+    static const char off[] = "tunnels:\n  - id: a1\n    device: tunvless0\n    failback: false\n    sources:\n" LINK;
+    static const char on[] = "tunnels:\n  - id: a1\n    device: tunvless0\n    failback: true\n    sources:\n" LINK;
+    firc_tunnels_t b = {0};
+    char file[4096];
+    ASSERT(save_and_reload(ONE, &b, file, sizeof file));
+    ASSERT(b.t[0].failback);
+    ASSERT(strstr(file, "\n  failback: true\n") != NULL);
+    firc_tunnels_free(&b);
+    ASSERT(save_and_reload(off, &b, file, sizeof file));
+    ASSERT(!b.t[0].failback);
+    ASSERT(strstr(file, "\n  failback: false\n") != NULL);
+    firc_tunnels_free(&b);
+    ASSERT(save_and_reload(on, &b, file, sizeof file));
+    ASSERT(b.t[0].failback);
+    firc_tunnels_free(&b);
+    ASSERT(with_extra("    failback: yes\n", "tunnels[0].failback", "true or false"));
+    ASSERT(with_extra("    failback: 1\n", "tunnels[0].failback", "true or false"));
+    PASS();
+}
+
+/* catches: same_argv ignoring failback, so a toggle does not restart the child */
+TEST failback_is_argv_affecting(void) {
+    ASSERT_EQ(2, same_after("active: 1", "active: 1\n    failback: false"));
+    ASSERT_EQ(3, same_after("active: 1", "active: 1\n    failback: true"));
+    PASS();
+}
+
 /* catches: a fingerprint read into the wrong member, dropped by save, or a non-empty default */
 TEST fingerprint_loads_saves_and_defaults_empty(void) {
     static const char ff[] = "tunnels:\n  - id: a1\n    device: tunvless0\n    sources:\n" LINK
@@ -1411,6 +1440,8 @@ int main(int argc, char **argv) {
     RUN_TEST(an_enabled_tunnel_without_sources_is_refused);
     RUN_TEST(kernel_tcp_loads_saves_and_refuses_a_non_bool);
     RUN_TEST(kernel_tcp_is_argv_affecting);
+    RUN_TEST(failback_defaults_on_loads_saves_and_refuses_a_non_bool);
+    RUN_TEST(failback_is_argv_affecting);
     RUN_TEST(fingerprint_loads_saves_and_defaults_empty);
     RUN_TEST(fingerprint_safari_is_refused);
     RUN_TEST(a_fingerprint_change_restarts);

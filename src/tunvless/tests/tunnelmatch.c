@@ -2443,12 +2443,19 @@ static void pm_sweep(void) {
 static int g_probes[FN_N];              /* probes per node */
 static int g_hook_node = -1;
 static const int *g_hook_sel;
+static int g_pool_fb;
 static size_t g_hook_n;
 static int g_hook_wake_node = -1;
 static int g_hook_wake_idx[1];
+static int g_hook_slow_node = -1;
+static uint64_t g_hook_slow_ms;
 static int f_probe(const void *node, int t, char *why, size_t n) {
     (void)t;
     g_probes[(const struct fnode *)node - g_fn]++;
+    if ((const struct fnode *)node - g_fn == g_hook_slow_node) {
+        g_hook_slow_node = -1;
+        g_pl_clock_ms += g_hook_slow_ms;
+    }
     if ((const struct fnode *)node - g_fn == g_hook_node) {
         g_hook_node = -1;
         pool_select(g_hook_sel, g_hook_n);
@@ -2482,7 +2489,7 @@ static void pool_build(int active, int by, int ncand, int checked) {
     struct pool_cfg pc = {
         .proto = g_pproto, .node = f_at, .sel = g_cand,
         .sel_n = (size_t)ncand, .first = 0, .checked = checked, .active = active, .by = by,
-        .interval_s = 60, .silence_s = 20,
+        .interval_s = 60, .silence_s = 20, .failback = g_pool_fb,
     };
     const struct dialer *d = pool_setup(&pc);
     g_spare_want = 0;
@@ -2496,6 +2503,7 @@ static void pool_new_ex(int active, int by, int ncand, int checked) {
     free(g_pl.cand);
     g_pl.cand = NULL;
     g_pl.cand_n = 0;
+    g_pl.down_n = 0;
     g_pl_clock_ms = 0;
     pool_build(active, by, ncand, checked);
 }
@@ -3262,8 +3270,9 @@ static void t_pool_swap_events(void) {
     pl_publish();
     g_fn[3].alive = 0;
     pool_select(g_sel_3, 1);
+    int cand = -1;
     pthread_mutex_lock(&g_pl.mu);
-    int next = pl_next();
+    int next = pl_next(&cand);
     pthread_mutex_unlock(&g_pl.mu);
     /* catches: a drain the pool thread does not publish */
     check(next == -1, "a drain asks the pool thread to publish the active set");
@@ -4282,8 +4291,9 @@ static void t_pool_wake_mid_round(void) {
 static int g_next_got = -2;
 static void *next_thread(void *arg) {
     (void)arg;
+    int cand = -1;
     pthread_mutex_lock(&g_pl.mu);
-    int i = pl_next();
+    int i = pl_next(&cand);
     pthread_mutex_unlock(&g_pl.mu);
     __atomic_store_n(&g_next_got, i, __ATOMIC_RELEASE);
     return NULL;
@@ -4318,6 +4328,809 @@ static void t_pool_wake_signals(void) {
     check(got == 1 && took < 100, "wake: the health thread takes the woken slot at once");
 }
 
+static int fb_pick(uint64_t *when) {
+    pthread_mutex_lock(&g_pl.mu);
+    int c = pl_fb_pick(pl_now_ms(), when);
+    pthread_mutex_unlock(&g_pl.mu);
+    return c;
+}
+
+static void fb_mark_down(int c) {
+    pthread_mutex_lock(&g_pl.mu);
+    pl_mark_down(c);
+    pthread_mutex_unlock(&g_pl.mu);
+}
+
+static int fb_is_down(int c) {
+    pthread_mutex_lock(&g_pl.mu);
+    int d = pl_down_has(c);
+    pthread_mutex_unlock(&g_pl.mu);
+    return d;
+}
+
+static void fb_probe0(void *arg) {
+    (void)arg;
+    pl_fb_probe(0);
+}
+
+static void fb_node0_replaced(uint64_t b) {
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl_clock_ms = b;
+    g_fn[0].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[0].alive = 1;
+}
+
+static void t_pool_fb_down_probed(void) {
+    /* catches: a down node never probed while every slot is up, or a passing one left marked down */
+    uint64_t b = CT;
+    fb_node0_replaced(b);
+    check(g_pl.slot[0].up && g_pl.slot[0].node == 1 && fb_is_down(0) && g_pl.cand[0].next == b + 300000,
+          "fb: node 0 dies, node 1 takes the slot, node 0 is down and backs off 5 min");
+    g_pl_clock_ms = b + 300000;
+    memset(g_probes, 0, sizeof g_probes);
+    uint64_t when = 0;
+    int c = fb_pick(&when);
+    check(c == 0, "fb: every slot up, the down node's backoff over: it is the candidate");
+    check(stdout_has(fb_probe0, NULL, "{\"type\":\"node_up\",\"node\":\"n0\",\"index\":0}"),
+          "fb: the down node passes and node_up names it");
+    check(g_probes[0] == 1 && g_probes[1] == 0 && !fb_is_down(0) && g_pl.cand[0].fails == 0 &&
+              g_pl.slot[0].node == 1 && g_pl.slot[0].up,
+          "fb: probed once, unmarked, its record cleared, the slot stays where it is");
+    check(fb_pick(&when) == -1, "fb: failback off, a healed node leaves the set after one pass");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_fb_down_log(void) {
+    /* catches: the background pass not logging that the node answers again */
+    fb_node0_replaced(CT);
+    g_pl_clock_ms = CT + 300000;
+    check(stderr_has(fb_probe0, NULL, "node n0 answers again"), "fb: a healed down node is logged");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_fb_down_waits(void) {
+    /* catches: a down node probed before its backoff ends, compared with > instead of >=, or a wake time other than its next */
+    uint64_t b = CT;
+    fb_node0_replaced(b);
+    g_pl_clock_ms = b + 299999;
+    uint64_t when = 0;
+    check(fb_pick(&when) == -1 && when == b + 300000,
+          "fb: the down node's backoff not over: no candidate, the wake time is its next");
+    g_pl_clock_ms = b + 300000;
+    check(fb_pick(&when) == 0, "fb: at its next the down node is the candidate");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_fb_failed_stays_down(void) {
+    /* catches: a failed background probe not noted, so the down node is probed back to back */
+    uint64_t b = CT;
+    fb_node0_replaced(b);
+    g_fn[0].alive = 0;
+    g_pl_clock_ms = b + 300000;
+    memset(g_probes, 0, sizeof g_probes);
+    pl_fb_probe(0);
+    uint64_t when = 0;
+    check(g_probes[0] == 1 && fb_is_down(0) && g_pl.cand[0].fails == 2 && fb_pick(&when) == -1 &&
+              when == b + 300000 + 600000,
+          "fb: a down node that fails again stays down and waits 10 min");
+    g_pl_clock_ms = 0;
+    all_alive();
+}
+
+static void t_pool_fb_lower_not_picked(void) {
+    /* catches: a rank comparison that takes nodes below the worst live slot, or a down node not ahead of them */
+    all_alive();
+    g_pool_fb = 1;
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl_clock_ms = CT;
+    fb_mark_down(2);
+    pl_note(2, 0, CT);
+    g_pl_clock_ms = CT + 300000;
+    uint64_t when = 0;
+    check(fb_pick(&when) == 2, "fb: a due down node below the slot's node is the candidate, not the healthy node 1");
+    pl_fb_probe(2);
+    check(!fb_is_down(2) && g_pl.fb_cand == -1 && fb_pick(&when) == -1 && when == UINT64_MAX,
+          "fb: once node 2 is back, nodes below the slot's are never candidates, nothing pending");
+    g_pl_clock_ms = CT + 303000;
+    check(fb_pick(&when) == -1 && g_pl.slot[0].node == 0, "fb: 3 s later still none, the slot stays on node 0");
+    g_pl.slot[0].node = 1;
+    check(fb_pick(&when) == 0, "fb: with the slot on node 1, node 0 above it is the candidate");
+    pl_fb_probe(0);
+    g_pl_clock_ms = CT + 306000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0, "fb: and the slot moves to it");
+    g_pool_fb = 0;
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_fb_one_slot(void) {
+    /* catches: a down node left out when it ranks below the slot's node */
+    all_alive();
+    g_pool_fb = 1;
+    pool_new(1, POOL_BY_CONNECTION, 2);
+    uint64_t when = 0;
+    check(fb_pick(&when) == -1 && when == UINT64_MAX, "fb: -A 1 on node 0, node 1 healthy: no candidate, nothing to wake for");
+    fb_mark_down(1);
+    check(fb_pick(&when) == 1, "fb: -A 1 on node 0, node 1 down with no record: the candidate at once");
+    g_pool_fb = 0;
+}
+
+static void t_pool_fb_doubt(void) {
+    /* catches: candidates probed while a slot is dead, empty, failing, streaking or stalled (a WAN loss noted against every node) */
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 4);
+    pl_check(1);
+    fb_mark_down(3);
+    uint64_t when = 0;
+    check(g_pl.slot[1].up && g_pl.slot[1].node == 1 && fb_pick(&when) == 3, "fb doubt: both slots up, node 3 down: candidate");
+    g_pl.slot[1].streak = 1;
+    check(fb_pick(&when) == -1, "fb doubt: a slot with failed connects in a row: none");
+    g_pl.slot[1].streak = 0;
+    g_pl.slot[0].fails = 1;
+    check(fb_pick(&when) == -1, "fb doubt: a slot with a failed check: none");
+    g_pl.slot[0].fails = 0;
+    g_pl.slot[1].lost = 1;
+    check(fb_pick(&when) == -1, "fb doubt: a slot whose connection was cut for silence: none");
+    g_pl.slot[1].lost = 0;
+    g_pl.slot[1].up = 0;
+    check(fb_pick(&when) == -1, "fb doubt: a dead slot: none");
+    g_pl.slot[1].up = 1;
+    g_pl.slot[1].node = -1;
+    check(fb_pick(&when) == -1, "fb doubt: an empty slot: none");
+    g_pl.slot[1].node = 1;
+    check(fb_pick(&when) == 3, "fb doubt: doubt gone, node 3 is the candidate again");
+}
+
+static void t_pool_fb_higher(void) {
+    /* catches: higher nodes probed with failback off, never with it on, the bar ignored, or the backoff ignored */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl.slot[0].node = 1;
+    g_pl_clock_ms = CT;
+    uint64_t when = 0;
+    check(fb_pick(&when) == -1, "fb off: a healthy node above the slot's is no candidate");
+    fb_mark_down(0);
+    check(fb_pick(&when) == 0, "fb off: the same node down is the candidate");
+    pthread_mutex_lock(&g_pl.mu);
+    pl_unmark_down(0);
+    pthread_mutex_unlock(&g_pl.mu);
+    g_pl.cf.failback = 1;
+    check(fb_pick(&when) == 0, "fb on: a healthy node above the slot's is the candidate");
+    pl_rec(0)->bar_until = CT + 1000;
+    check(fb_pick(&when) == -1 && when == CT + 1000, "fb on: a barred higher node waits for its bar");
+    g_pl_clock_ms = CT + 1000;
+    check(fb_pick(&when) == 0, "fb on: at the end of its bar it is the candidate");
+    pl_note(0, 0, CT + 1000);
+    check(fb_pick(&when) == -1 && when == CT + 1000 + 300000, "fb on: a higher node in backoff waits for its next");
+    pl_rec(0)->bar_until = CT + 1000 + 400000;
+    check(fb_pick(&when) == -1 && when == CT + 1000 + 400000, "fb on: barred past its next, it wakes at the bar, not before");
+    fb_mark_down(0);
+    check(fb_pick(&when) == -1 && when == CT + 1000 + 300000, "fb on: a down node ignores the bar, waits for its next");
+    g_pl_clock_ms = 0;
+}
+
+static void t_pool_fb_higher_pass_quiet(void) {
+    /* catches: a passing node that was never down announced as answering again */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl.slot[0].node = 1;
+    g_pl.cf.failback = 1;
+    memset(g_probes, 0, sizeof g_probes);
+    check(!stdout_has(fb_probe0, NULL, "node_up") && g_probes[0] == 1,
+          "fb on: a healthy higher node is probed and no node_up is sent for it");
+}
+
+static void t_pool_fb_worst_slot(void) {
+    /* catches: the rank taken from the best live slot instead of the worst */
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 3);
+    g_pl.slot[1].node = 2;
+    g_pl.slot[1].up = 1;
+    g_pl.cf.failback = 1;
+    uint64_t when = 0;
+    check(fb_pick(&when) == 1, "fb on: slots on nodes 0 and 2, node 1 ranks above the worst: candidate");
+    g_pl.slot[1].node = 1;
+    check(fb_pick(&when) == -1, "fb on: slots on nodes 0 and 1, node 2 ranks below both: none");
+}
+
+static void t_pool_fb_next(void) {
+    /* catches: a candidate code that reads as publish, a candidate ahead of a due or kicked slot, or a publish behind a candidate */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl.slot[0].node = 1;
+    fb_mark_down(0);
+    uint64_t now = pl_now_ms();
+    g_pl.slot[0].due = now + 300;
+    int c = -5;
+    pthread_mutex_lock(&g_pl.mu);
+    int a = pl_next(&c);
+    g_pl.slot[0].due = now;
+    int s = pl_next(&c);
+    g_pl.slot[0].due = now + 300;
+    g_pl.slot[0].kick = 1;
+    int k = pl_next(&c);
+    g_pl.slot[0].kick = 0;
+    g_pl.pub = 1;
+    int p = pl_next(&c);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(a == PL_NEXT_FB, "fb next: no slot due, a due candidate: the candidate code");
+    check(s == 0, "fb next: a due slot wins over the candidate");
+    check(k == 0, "fb next: a kicked slot wins over the candidate");
+    check(p == -1, "fb next: a publish request wins over the candidate");
+}
+
+static void t_pool_fb_next_cand(void) {
+    /* catches: a candidate code without the candidate's index */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl.slot[0].node = 2;
+    fb_mark_down(1);
+    g_pl.slot[0].due = pl_now_ms() + 300;
+    int c = -5;
+    pthread_mutex_lock(&g_pl.mu);
+    int r = pl_next(&c);
+    pthread_mutex_unlock(&g_pl.mu);
+    check(r == PL_NEXT_FB && c == 1, "fb next: the candidate code names node 1");
+}
+
+static int g_fb_got = -9, g_fb_cand = -9;
+static void *fb_next_thread(void *arg) {
+    (void)arg;
+    int c = -9;
+    pthread_mutex_lock(&g_pl.mu);
+    int i = pl_next(&c);
+    pthread_mutex_unlock(&g_pl.mu);
+    __atomic_store_n(&g_fb_cand, c, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_fb_got, i, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void t_pool_fb_next_wakes(void) {
+    /* catches: the pool thread sleeping to the slot's due when a candidate's backoff ends first */
+    all_alive();
+    pool_new(1, POOL_BY_CONNECTION, 3);
+    g_pl.slot[0].node = 1;
+    fb_mark_down(0);
+    uint64_t now = pl_now_ms();
+    pthread_mutex_lock(&g_pl.mu);
+    pl_note(0, 0, now);
+    g_pl.cand[0].next = now + 200;
+    g_pl.slot[0].due = now + 600000;
+    pthread_mutex_unlock(&g_pl.mu);
+    g_fb_got = -9;
+    pthread_t t;
+    pthread_create(&t, NULL, fb_next_thread, NULL);
+    uint64_t t0 = pl_now_ms();
+    while (__atomic_load_n(&g_fb_got, __ATOMIC_ACQUIRE) == -9 && pl_now_ms() - t0 < 2000) {
+        struct timespec s = { 0, 5000000 };
+        nanosleep(&s, NULL);
+    }
+    int got = __atomic_load_n(&g_fb_got, __ATOMIC_ACQUIRE);
+    if (got == -9) {
+        pthread_mutex_lock(&g_pl.mu);
+        g_pl.slot[0].due = 0;
+        pthread_cond_signal(&g_pl.cv);
+        pthread_mutex_unlock(&g_pl.mu);
+    }
+    pthread_join(t, NULL);
+    check(got == PL_NEXT_FB && __atomic_load_n(&g_fb_cand, __ATOMIC_RELAXED) == 0,
+          "fb next: the pool thread wakes when the candidate's backoff ends");
+}
+
+static void t_pool_fb_prepass(void) {
+    /* catches: a background probe without the TCP pre-pass, or a pre-pass failure not noted */
+    memset(g_reach_ok, 1, sizeof g_reach_ok);
+    g_pproto = &fr_proto;
+    uint64_t b = CT;
+    fb_node0_replaced(b);
+    g_reach_ok[0] = 0;
+    g_pl_clock_ms = b + 300000;
+    memset(g_probes, 0, sizeof g_probes);
+    g_reach_calls = 0;
+    pl_fb_probe(0);
+    static const int r0[1] = { 0 };
+    check(g_reach_calls == 1 && reach_at_are(r0, 1) && g_probes[0] == 0 && fb_is_down(0) &&
+              g_pl.cand[0].fails == 2 && g_pl.cand[0].last == b + 300000,
+          "fb pre-pass: the node does not connect: no handshake, noted failed");
+    g_reach_ok[0] = 1;
+    g_pl_clock_ms = b + 300000 + 600000;
+    pl_fb_probe(0);
+    check(g_reach_calls == 2 && g_probes[0] == 1 && !fb_is_down(0), "fb pre-pass: it connects: probed and unmarked");
+    g_pl_clock_ms = 0;
+    g_pproto = &f_proto;
+}
+
+static uint64_t fb_first_pass(uint64_t b) {
+    g_pool_fb = 1;
+    fb_node0_replaced(b);
+    g_pl_clock_ms = b + 300000;
+    pl_fb_probe(0);
+    return b + 300000;
+}
+
+static void fb_done(void) {
+    g_pool_fb = 0;
+    g_pl_clock_ms = 0;
+    all_alive();
+}
+
+static int fb_drained_has(const struct pl_slot *sl, unsigned v) {
+    for (int k = 0; k < PL_DRAINED; k++)
+        if (sl->drained[k] == v) return 1;
+    return 0;
+}
+
+static void t_pool_fb_move_waits(void) {
+    /* catches: a passing higher node probed again at once instead of at the end of its 3-s confirmation */
+    uint64_t t = fb_first_pass(CT);
+    uint64_t when = 0;
+    check(g_pl.slot[0].node == 1 && !fb_is_down(0) && fb_pick(&when) == -1 && when == t + 3000,
+          "fb move: after a first pass the slot stays, node 0 waits 3 s");
+    g_pl_clock_ms = t + 2999;
+    check(fb_pick(&when) == -1, "fb move: not a millisecond before the confirmation");
+    g_pl_clock_ms = t + 3000;
+    check(fb_pick(&when) == 0, "fb move: at the confirmation time node 0 is picked again");
+    fb_done();
+}
+
+static void t_pool_fb_move_waits_slow(void) {
+    /* catches: the confirmation timed from before a slow first probe, so it runs back to back */
+    g_pool_fb = 1;
+    fb_node0_replaced(CT);
+    g_pl_clock_ms = CT + 300000;
+    g_hook_slow_node = 0;
+    g_hook_slow_ms = 4000;
+    pl_fb_probe(0);
+    uint64_t when = 0;
+    check(g_pl_clock_ms == CT + 304000 && g_pl.fb_cand == 0 && fb_pick(&when) == -1 && when == CT + 307000,
+          "fb move: a first probe ending 4 s late: node 0 waits 3 s from its end");
+    g_pl_clock_ms = CT + 306999;
+    check(fb_pick(&when) == -1, "fb move: not a millisecond before 3 s after the slow probe");
+    g_pl_clock_ms = CT + 307000;
+    check(fb_pick(&when) == 0, "fb move: 3 s after the slow probe node 0 is picked again");
+    fb_done();
+}
+
+static const int g_sel_102[] = { 1, 0, 2 };
+
+static void t_pool_fb_swap_pending(void) {
+    /* catches: a selection swap that keeps the pending candidate, so it is picked under the new order */
+    uint64_t t = fb_first_pass(CT);
+    g_pl_clock_ms = t + 3000;
+    uint64_t when = 0;
+    check(g_pl.fb_cand == 0 && fb_pick(&when) == 0, "fb swap pending: without a swap node 0 is picked at its time");
+    fb_done();
+    t = fb_first_pass(CT);
+    pool_select(g_sel_102, 3);
+    g_pl_clock_ms = t + 3000;
+    check(g_pl.slot[0].node == 1 && g_pl.fb_cand == -1 && fb_pick(&when) == -1 && when == UINT64_MAX,
+          "fb swap pending: node 0 moved below node 1: the swap drops it, never picked");
+    fb_done();
+}
+
+static void t_pool_fb_move(void) {
+    /* catches: no move on the second pass, a double generation bump, no drained entry, no take time, the stack not told, or the move not logged */
+    uint64_t t = fb_first_pass(CT);
+    unsigned g = g_pl.slot[0].gen;
+    unsigned ep = __atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE);
+    g_pl_clock_ms = t + 3000;
+    memset(g_probes, 0, sizeof g_probes);
+    check(stderr_has(fb_probe0, NULL, "node n0 answers again — new connections go through it instead of n1"),
+          "fb move: the move is logged with both nodes");
+    const struct pl_slot *sl = &g_pl.slot[0];
+    check(sl->node == 0 && sl->up && sl->gen == g + 1 && fb_drained_has(sl, g + 1) && g_probes[0] == 1 &&
+              g_probes[1] == 0,
+          "fb move: the second pass moves the slot to node 0, one generation, the old one drained");
+    check(__atomic_load_n(&g_nodes_epoch, __ATOMIC_ACQUIRE) != ep, "fb move: the stack is told the nodes changed");
+    check(sl->by_move && sl->took_at == t + 3000 && sl->due == t + 3000 + 60000 && !sl->fails && !sl->streak &&
+              !sl->unproven,
+          "fb move: the slot took node 0 by a move at the move's time, the slot's next check a full interval later");
+    uint64_t when = 0;
+    check(fb_pick(&when) == -1 && when == UINT64_MAX, "fb move: after the move nothing is picked again");
+    fb_done();
+}
+
+static void t_pool_fb_move_flows(void) {
+    /* catches: a move that resets the old node's connections, keeps them on the slot, or sends new ones to the old node */
+    g_pool_fb = 1;
+    fb_node0_replaced(CT);
+    struct conn *a = pm_open(52300, 0x0b0b0b0cu);
+    check(a && ((const struct pl_sess *)SESS(a))->node == &g_fn[1], "fb flows fixture: a connection on node 1");
+    if (!a) { fb_done(); return; }
+    struct flow_key ka = a->key;
+    static unsigned char spare[PL_HDR + sizeof(struct fsess)];
+    static unsigned char dst[PL_HDR + sizeof(struct fsess)];
+    pl_clear(spare);
+    pl_clear(dst);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_bind((struct pl_sess *)spare, 0);
+    pthread_mutex_unlock(&g_pl.mu);
+    g_pl_clock_ms = CT + 300000;
+    pl_fb_probe(0);
+    g_pl_clock_ms = CT + 303000;
+    pl_fb_probe(0);
+    pm_sweep();
+    struct conn *c = conn_find(&ka);
+    check(c != NULL, "fb flows: the old node's connection is not reset");
+    const struct pl_sess *ps = c ? SESS(c) : NULL;
+    check(ps && ps->slot == -1 && ps->node == &g_fn[1], "fb flows: it keeps node 1 and leaves the slot");
+    check(pl_match(&g_pl, dst, spare) == -1, "fb flows: a spare to the old node is not handed out");
+    struct conn *n = pm_open(52301, 0x0b0b0b0cu);
+    check(n && ((const struct pl_sess *)SESS(n))->node == &g_fn[0] && ((const struct pl_sess *)SESS(n))->slot == 0,
+          "fb flows: a new connection takes node 0");
+    if (n) conn_reset(n, &g_tun);
+    if (c) conn_reset(c, &g_tun);
+    pm_drain(NULL, NULL);
+    fb_done();
+}
+
+static void t_pool_fb_second_fails(void) {
+    /* catches: a failed second probe that moves anyway, is not noted, or leaves the node due at once */
+    uint64_t t = fb_first_pass(CT);
+    unsigned g = g_pl.slot[0].gen;
+    g_fn[0].alive = 0;
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    uint64_t when = 0;
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].gen == g && g_pl.cand[0].fails == 1 &&
+              g_pl.cand[0].next == t + 3000 + 300000 && fb_pick(&when) == -1 && when == t + 3000 + 300000,
+          "fb second fails: the slot stays, node 0 waits 5 min");
+    g_fn[0].alive = 1;
+    g_pl_clock_ms = t + 3000 + 300000;
+    check(fb_pick(&when) == 0, "fb second fails: after its backoff node 0 is picked");
+    pl_fb_probe(0);
+    g_pl_clock_ms = t + 3000 + 303000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g + 1, "fb second fails: two passes later it moves");
+    fb_done();
+}
+
+static void t_pool_fb_swap_between(void) {
+    /* catches: a move after the selection changed between the passes, or a pending candidate left behind */
+    uint64_t t = fb_first_pass(CT);
+    pool_select(g_sel_012, 3);
+    unsigned g = g_pl.slot[0].gen;
+    check(g_pl.fb_cand == -1, "fb swap: a new selection between the passes drops the candidate");
+    g_pl_clock_ms = t + 3000;
+    uint64_t when = 0;
+    check(fb_pick(&when) == 0, "fb swap: node 0 starts over under the new selection");
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].gen == g && g_pl.fb_cand == 0,
+          "fb swap: its probe after the swap is a first pass: no move");
+    g_pl_clock_ms = t + 6000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g + 1, "fb swap: under one selection it moves");
+    fb_done();
+}
+
+static void t_pool_fb_swap_in_move(void) {
+    /* catches: a move after the selection changed during the confirming probe */
+    uint64_t t = fb_first_pass(CT);
+    unsigned g = g_pl.slot[0].gen;
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g + 1, "fb swap in move: without a swap the second probe moves");
+    fb_done();
+    t = fb_first_pass(CT);
+    g = g_pl.slot[0].gen;
+    g_hook_node = 0;
+    g_hook_sel = g_sel_012;
+    g_hook_n = 3;
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    check(g_hook_node == -1 && g_pl.slot[0].node == 1 && g_pl.slot[0].gen == g && g_pl.fb_cand == -1,
+          "fb swap in move: a swap during the second probe: no move, the candidate dropped");
+    fb_done();
+}
+
+static void t_pool_fb_dead_between(void) {
+    /* catches: a move onto a slot that died between the passes, or a second hand-over of a slot that refilled */
+    uint64_t t = fb_first_pass(CT);
+    unsigned g = g_pl.slot[0].gen;
+    g_pl.slot[0].up = 0;
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 1 && !g_pl.slot[0].up && g_pl.slot[0].gen == g && g_pl.fb_cand == -1,
+          "fb dead: a slot down at the second pass: no move, the candidate dropped");
+    g_pl.slot[0].up = 1;
+    pl_fb_probe(0);
+    g_pl_clock_ms = t + 6000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].up && g_pl.slot[0].gen == g + 1,
+          "fb dead: the same slot up: it moves");
+    t = fb_first_pass(CT);
+    g_fn[1].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g = g_pl.slot[0].gen;
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].up, "fb dead: node 1 dies, the slot refills with node 0");
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g && g_pl.fb_cand == -1,
+          "fb dead: the second pass finds node 0 taken and the generation moved: nothing changes");
+    fb_done();
+}
+
+static void t_pool_fb_gen_between(void) {
+    /* catches: a move onto a slot whose node died and came back between the passes */
+    uint64_t t = fb_first_pass(CT);
+    unsigned g = g_pl.slot[0].gen;
+    g_fn[0].alive = g_fn[1].alive = g_fn[2].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[1].alive = 1;
+    pl_check(0);
+    g_fn[0].alive = g_fn[2].alive = 1;
+    unsigned g2 = g_pl.slot[0].gen;
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].up && g2 != g, "fb gen fixture: node 1 died and holds the slot again");
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].gen == g2 && g_pl.fb_cand == -1,
+          "fb gen: another generation at the second pass: no move, the candidate dropped");
+    fb_done();
+}
+
+static void t_pool_fb_taken_between(void) {
+    /* catches: a move onto a candidate another slot took between the passes */
+    g_pool_fb = 1;
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 4);
+    g_pl_clock_ms = CT;
+    pl_check(1);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[0].alive = 1;
+    g_pl_clock_ms = CT + 300000;
+    pl_fb_probe(0);
+    unsigned g0 = g_pl.slot[0].gen;
+    g_fn[1].alive = 0;
+    pl_check(1);
+    pl_check(1);
+    g_fn[1].alive = 1;
+    check(g_pl.slot[0].node == 2 && g_pl.slot[0].gen == g0 && g_pl.slot[1].node == 0,
+          "fb taken fixture: the other slot took node 0, the slot on node 2 unchanged");
+    g_pl_clock_ms = CT + 303000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 2 && g_pl.slot[0].gen == g0 && g_pl.slot[1].node == 0 && g_pl.fb_cand == -1,
+          "fb taken: the second pass finds node 0 taken: no move");
+    fb_done();
+}
+
+static void t_pool_fb_worst_moves(void) {
+    /* catches: the move taken by the first slot or the best one instead of the worst */
+    g_pool_fb = 1;
+    all_alive();
+    pool_new(2, POOL_BY_CONNECTION, 4);
+    g_pl_clock_ms = CT;
+    pl_check(1);
+    g_fn[0].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[0].alive = 1;
+    check(g_pl.slot[0].node == 2 && g_pl.slot[1].node == 1, "fb -A 2 fixture: slots on nodes 2 and 1");
+    unsigned g0 = g_pl.slot[0].gen, g1 = g_pl.slot[1].gen;
+    g_pl_clock_ms = CT + 300000;
+    uint64_t when = 0;
+    check(fb_pick(&when) == 0, "fb -A 2: node 0 is the candidate");
+    pl_fb_probe(0);
+    g_pl_clock_ms = CT + 303000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g0 + 1 && g_pl.slot[1].node == 1 && g_pl.slot[1].gen == g1,
+          "fb -A 2: the slot on node 2 moves to node 0, the slot on node 1 stays");
+    fb_done();
+}
+
+static int fb_v6_move(int ok0) {
+    g_pool_fb = 1;
+    all_alive();
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    g_v6ok[0] = ok0;
+    g_v6ok[1] = 1;
+    pool_new6(1, POOL_BY_CONNECTION, 2, 1);
+    g_pl_clock_ms = CT;
+    g_fn[0].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[0].alive = 1;
+    int fixture = g_pl.slot[0].node == 1 && g_pl.slot[0].v6;
+    memset(g_probes6, 0, sizeof g_probes6);
+    g_v6cb_last = -1;
+    g_pl_clock_ms = CT + 300000;
+    pl_fb_probe(0);
+    g_pl_clock_ms = CT + 303000;
+    pl_fb_probe(0);
+    int r = fixture && g_pl.slot[0].node == 0 && g_probes6[0] == 1 && g_pl.slot[0].v6 == ok0 &&
+            g_pl.slot[0].skip6 == PL_GAP6 - 1 && g_v6cb_last == (ok0 ? -1 : 0);
+    memset(g_v6ok, 0, sizeof g_v6ok);
+    fb_done();
+    return r;
+}
+
+static void t_pool_fb_move_v6(void) {
+    /* catches: a moved slot keeping the old node's IPv6 flag, or the candidate's IPv6 not probed in the confirmation */
+    check(fb_v6_move(0), "fb v6: a candidate without IPv6: the moved slot carries none");
+    check(fb_v6_move(1), "fb v6: a candidate with IPv6: the moved slot carries it");
+}
+
+static uint64_t fb_moved(void) {
+    uint64_t t = fb_first_pass(CT);
+    g_pl_clock_ms = t + 3000;
+    pl_fb_probe(0);
+    return t + 3000;
+}
+
+static void fb_kill_at(uint64_t at, int unproven) {
+    g_pl_clock_ms = at;
+    if (unproven) {
+        g_pl.slot[0].kick = 1;
+        g_pl.slot[0].unproven = 1;
+        pl_check(0);
+        return;
+    }
+    g_fn[0].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[0].alive = 1;
+}
+
+static uint32_t fb_strikes_after(uint64_t off, int unproven, uint64_t *bar) {
+    uint64_t m = fb_moved();
+    fb_kill_at(m + off, unproven);
+    uint32_t s = g_pl.slot[0].node == 1 ? g_pl.cand[0].strikes : 99;
+    *bar = g_pl.cand[0].bar_until - (m + off);
+    fb_done();
+    return s;
+}
+
+static void t_pool_fb_strike_window(void) {
+    /* catches: a strike outside 1800 s of a move, none inside it, or the unproven path left without strikes */
+    uint64_t bar = 0;
+    check(fb_strikes_after(600000, 0, &bar) == 1 && bar == 300000, "fb strike: death 10 min after a move bars 5 min");
+    check(fb_strikes_after(1799999, 0, &bar) == 1, "fb strike: death just inside 30 min strikes");
+    check(fb_strikes_after(1800000, 0, &bar) == 0, "fb strike: death at 30 min after the move does not");
+    check(fb_strikes_after(600000, 1, &bar) == 1 && bar == 300000, "fb strike: unproven 10 min after a move bars 5 min");
+    check(fb_strikes_after(1800000, 1, &bar) == 0, "fb strike: unproven 30 min after the move does not");
+}
+
+static void t_pool_fb_strike_second(void) {
+    /* catches: a second strike not doubling the bar, a down node moved onto through its bar, or the bar never ending */
+    uint64_t m1 = fb_moved();
+    uint64_t d1 = m1 + 600000;
+    fb_kill_at(d1, 0);
+    g_pl_clock_ms = d1 + 300000;
+    uint64_t when = 0;
+    check(fb_pick(&when) == 0, "fb strike 2: node 0 down, its backoff over: picked");
+    pl_fb_probe(0);
+    g_pl_clock_ms = d1 + 303000;
+    pl_fb_probe(0);
+    uint64_t m2 = d1 + 303000;
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].took_at == m2, "fb strike 2: the bar of 5 min over, it moves again");
+    uint64_t d2 = m2 + 600000;
+    fb_kill_at(d2, 0);
+    check(g_pl.cand[0].strikes == 2 && g_pl.cand[0].bar_until == d2 + 600000, "fb strike 2: a second death bars 10 min");
+    g_pl_clock_ms = d2 + 300000;
+    check(fb_pick(&when) == 0, "fb strike 2: down, its backoff over: probed despite the bar");
+    pl_fb_probe(0);
+    check(!fb_is_down(0) && g_pl.fb_cand == -1 && g_pl.slot[0].node == 1 && fb_pick(&when) == -1 &&
+              when == d2 + 600000,
+          "fb strike 2: it answers, is unmarked, but no move until the bar ends");
+    g_pl_clock_ms = d2 + 600000;
+    check(fb_pick(&when) == 0, "fb strike 2: at the end of the bar it is the candidate");
+    pl_fb_probe(0);
+    g_pl_clock_ms = d2 + 603000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0, "fb strike 2: and it moves");
+    fb_done();
+}
+
+static void t_pool_fb_strike_clear(void) {
+    /* catches: strikes cleared by a plain pass, by a live check before 30 min held, or never */
+    uint64_t m1 = fb_moved();
+    uint64_t d1 = m1 + 600000;
+    fb_kill_at(d1, 0);
+    uint64_t bar = g_pl.cand[0].bar_until;
+    g_pl_clock_ms = d1 + 300000;
+    pl_fb_probe(0);
+    check(g_pl.cand[0].strikes == 1 && g_pl.cand[0].bar_until == bar && g_pl.cand[0].fails == 0,
+          "fb clear: a plain pass leaves the strikes and the bar");
+    g_pl_clock_ms = d1 + 303000;
+    pl_fb_probe(0);
+    uint64_t m2 = d1 + 303000;
+    g_pl_clock_ms = m2 + 1799999;
+    pl_check(0);
+    check(g_pl.slot[0].node == 0 && g_pl.cand[0].strikes == 1, "fb clear: a live check before 30 min keeps them");
+    g_pl_clock_ms = m2 + 1800000;
+    pl_check(0);
+    check(g_pl.slot[0].node == 0 && g_pl.cand[0].strikes == 0, "fb clear: a live check at 30 min held clears them");
+    fb_done();
+}
+
+static uint64_t fb_refill_take(void) {
+    uint64_t m = fb_moved();
+    fb_kill_at(m + 1000, 0);
+    int fixture = g_pl.slot[0].node == 1 && g_pl.cand[0].strikes == 1;
+    uint64_t r = m + 2000;
+    g_pl_clock_ms = r;
+    g_fn[1].alive = g_fn[2].alive = 0;
+    pl_check(0);
+    pl_check(0);
+    g_fn[1].alive = g_fn[2].alive = 1;
+    return fixture && g_pl.slot[0].node == 0 && g_pl.slot[0].up ? r : 0;
+}
+
+static void t_pool_fb_strike_refill(void) {
+    /* catches: a strike for a death on a node the slot took back by a refill, keyed on the last move */
+    uint64_t r = fb_refill_take();
+    check(r != 0, "fb refill fixture: node 0 struck once, then a refill puts it back on the slot");
+    fb_kill_at(r + 600000, 0);
+    check(g_pl.slot[0].node != 0 && g_pl.cand[0].strikes == 1,
+          "fb refill: it dies 10 min after the refill took it: no strike");
+    fb_done();
+}
+
+static void t_pool_fb_clear_refill(void) {
+    /* catches: strikes cleared by the time since the last move instead of since the slot took the node */
+    uint64_t r = fb_refill_take();
+    g_pl_clock_ms = r + 1799999;
+    pl_check(0);
+    check(r && g_pl.slot[0].node == 0 && g_pl.cand[0].strikes == 1, "fb refill: held 1799999 ms since the refill: strikes kept");
+    g_pl_clock_ms = r + 1800000;
+    pl_check(0);
+    check(r && g_pl.slot[0].node == 0 && g_pl.cand[0].strikes == 0, "fb refill: held 1800 s since the refill: strikes cleared");
+    fb_done();
+}
+
+static void fb_wake0(void) {
+    static const int w0[1] = { 0 };
+    pool_wake(w0, 1);
+}
+
+static void fb_backoff_higher(void) {
+    g_pool_fb = 1;
+    fb_node0_replaced(CT);
+    pthread_mutex_lock(&g_pl.mu);
+    pl_unmark_down(0);
+    pthread_mutex_unlock(&g_pl.mu);
+    g_pl_clock_ms = CT + 1000;
+}
+
+static void t_pool_fb_wake(void) {
+    /* catches: a wake that does not clear a higher node's backoff, touches a live slot, or leads to no move */
+    fb_backoff_higher();
+    uint64_t when = 0;
+    check(g_pl.slot[0].node == 1 && fb_pick(&when) == -1 && when == CT + 300000,
+          "fb wake fixture: node 0 above the slot's node waits for its backoff");
+    unsigned g = g_pl.slot[0].gen;
+    uint64_t due = g_pl.slot[0].due;
+    fb_wake0();
+    check(fb_pick(&when) == 0, "fb wake: a hand check makes node 0 the candidate at once");
+    check(g_pl.slot[0].node == 1 && g_pl.slot[0].up && g_pl.slot[0].gen == g && g_pl.slot[0].due == due,
+          "fb wake: the live slot is left as it was");
+    pl_fb_probe(0);
+    g_pl_clock_ms = CT + 4000;
+    pl_fb_probe(0);
+    check(g_pl.slot[0].node == 0 && g_pl.slot[0].gen == g + 1, "fb wake: 3 s later the slot moves to node 0");
+    fb_done();
+}
+
+static void t_pool_fb_wake_barred(void) {
+    /* catches: a wake that clears the strikes or lets a barred node through */
+    fb_backoff_higher();
+    pl_rec(0)->strikes = 1;
+    pl_rec(0)->bar_until = CT + 1000 + 300000;
+    fb_wake0();
+    uint64_t when = 0;
+    check(fb_pick(&when) == -1 && when == CT + 1000 + 300000 && g_pl.cand[0].strikes == 1,
+          "fb wake: a barred node waits for its bar, its strikes kept");
+    g_pl_clock_ms = CT + 1000 + 300000;
+    check(fb_pick(&when) == 0, "fb wake: at the end of the bar it is the candidate");
+    fb_done();
+}
+
 static void pool_part(void) {
     t_pool_setup();
     t_pool_cand_backoff();
@@ -4343,6 +5156,40 @@ static void pool_part(void) {
     t_pool_wake_down_first();
     t_pool_wake_mid_round();
     t_pool_wake_signals();
+    t_pool_fb_down_probed();
+    t_pool_fb_down_log();
+    t_pool_fb_down_waits();
+    t_pool_fb_failed_stays_down();
+    t_pool_fb_lower_not_picked();
+    t_pool_fb_one_slot();
+    t_pool_fb_doubt();
+    t_pool_fb_higher();
+    t_pool_fb_higher_pass_quiet();
+    t_pool_fb_worst_slot();
+    t_pool_fb_next();
+    t_pool_fb_next_cand();
+    t_pool_fb_next_wakes();
+    t_pool_fb_prepass();
+    t_pool_fb_move_waits();
+    t_pool_fb_move_waits_slow();
+    t_pool_fb_swap_pending();
+    t_pool_fb_move();
+    t_pool_fb_move_flows();
+    t_pool_fb_second_fails();
+    t_pool_fb_swap_between();
+    t_pool_fb_swap_in_move();
+    t_pool_fb_dead_between();
+    t_pool_fb_gen_between();
+    t_pool_fb_taken_between();
+    t_pool_fb_worst_moves();
+    t_pool_fb_move_v6();
+    t_pool_fb_strike_window();
+    t_pool_fb_strike_second();
+    t_pool_fb_strike_clear();
+    t_pool_fb_strike_refill();
+    t_pool_fb_clear_refill();
+    t_pool_fb_wake();
+    t_pool_fb_wake_barred();
     t_pool_dead_slot_refuses();
     t_pool_up_write();
     t_connq_full_cause();

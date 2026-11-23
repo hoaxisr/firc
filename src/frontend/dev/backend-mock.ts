@@ -921,6 +921,7 @@ let TUNNELS: any[] = [
     by: "connection",
     interval: 60,
     silence: 20,
+    failback: true,
     filter: "",
     order: [],
     exclude: [],
@@ -970,6 +971,7 @@ let TUNNELS: any[] = [
     by: "connection",
     interval: 60,
     silence: 20,
+    failback: true,
     filter: "",
     order: [],
     exclude: [],
@@ -1165,6 +1167,7 @@ app.put(`${API_BASE}/tunnels`, async (c) => {
       tn.by,
       tn.interval,
       tn.silence,
+      tn.failback,
       tn.uplink,
       tn.advanced,
     ]);

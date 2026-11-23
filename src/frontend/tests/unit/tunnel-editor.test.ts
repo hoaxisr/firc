@@ -34,7 +34,7 @@ import type { Tunnel } from "../../src/types.ts";
 import { installSvelteRunesMocks } from "../mocks/setup-svelte-runes.ts";
 
 installSvelteRunesMocks();
-const { freeDevice } = await import("../../src/modules/tunnels/tunnels-data.ts");
+const { freeDevice, normalizeTunnel } = await import("../../src/modules/tunnels/tunnels-data.ts");
 
 const t = (key: string) => key;
 
@@ -46,6 +46,7 @@ const tn = (id: string, device: string, extra: Partial<Tunnel> = {}): Tunnel => 
   by: "connection",
   interval: 60,
   silence: 20,
+  failback: true,
   filter: "",
   order: [],
   exclude: [],
@@ -322,6 +323,7 @@ describe("which tunnels a save restarts", () => {
       (x) => (x.by = "site"),
       (x) => (x.interval = 30),
       (x) => (x.silence = 5),
+      (x) => (x.failback = false),
       (x) => (x.advanced.timeout = 3),
       (x) => (x.advanced.insecure = true),
       (x) => (x.advanced.ca = "/opt/ca.pem"),
@@ -697,6 +699,17 @@ describe("router policies", () => {
     assert.deepStrictEqual(
       restartingDevices([tn("t", "opkgtun3")], [tn("t", "opkgtun3", { routerPolicies: true })]),
       [],
+    );
+  });
+});
+
+describe("the failback switch", () => {
+  // Catches a tunnel without failback read as off, or an off value read back as on.
+  it("a tunnel without failback reads as on, an off one stays off", () => {
+    assert.strictEqual(normalizeTunnel({ id: "a", device: "tunvless0" }).failback, true);
+    assert.strictEqual(
+      normalizeTunnel({ id: "a", device: "tunvless0", failback: false }).failback,
+      false,
     );
   });
 });

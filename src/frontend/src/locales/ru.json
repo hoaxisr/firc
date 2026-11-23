@@ -491,6 +491,8 @@
   "Save the tunnel first": "Сначала сохраните туннель",
   "description...": "описание...",
   "Silence": "Тишина",
+  "Return to the first nodes": "Возвращаться на первые узлы",
+  "When a node higher in the list answers again, new connections go through it": "Когда узел выше по списку снова отвечает, новые соединения идут через него",
   "Sort by the measured latency": "Упорядочить по измеренной задержке",
   "Source": "Источник",
   "Sources": "Источники",

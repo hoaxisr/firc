@@ -67,6 +67,7 @@ typedef struct {
     int interval_s, silence_s, timeout_s;
     bool insecure;
     bool kernel_tcp;
+    bool failback;
     char ca[256];
     char fingerprint[8];
     firc_tun_inbound_t inb[FIRC_TUN_MAX_INBOUNDS];

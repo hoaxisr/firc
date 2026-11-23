@@ -68,7 +68,7 @@ s.loader.exec_module(m)
 m.Server.request_queue_size = 128
 m.main()'
 srv() {
-    ip netns exec $N python3 -c "$FV" --port "$2" --uuid "$3" --mb 1 --bind $A > "$W/srv-$1.log" 2>&1 &
+    ip netns exec $N python3 -c "$FV" --port "$2" --uuid "$3" --mb "${4:-1}" --kbps "${5:-0}" --bind $A > "$W/srv-$1.log" 2>&1 &
     eval SRV_$1=\$!
 }
 srv_stop() {
@@ -263,6 +263,77 @@ echo "     g active again $(sub "$tg" "$TG") s after it came back"
 # catches: a dead slot's own node re-probed at the 300-s pause, not 15/30 s
 check "own back: g taken again within 35 s" yes "$(le "$(sub "$tg" "$TG")" 35)"
 down
+
+ev_after() {
+    i=0
+    while [ $i -lt $(($3 * 5)) ]; do
+        t=$(awk -v t="$2" -v p="$1" '$1 >= t && index($0, p) { print $1; exit }' "$W/ev")
+        [ -n "$t" ] && { echo "$t"; return 0; }
+        sleep 0.2; i=$((i + 1))
+    done
+    return 1
+}
+fetch() { HX wget -q --tries=1 -O "$W/dl2" -T 10 "http://203.0.113.7/$1" && wc -c < "$W/dl2" || echo 0; }
+MB1=$((1024 * 1024)) MB2=$((2 * 1024 * 1024)) MB4=$((4 * 1024 * 1024))
+fb_start() {
+    srv_stop G; srv_stop Q
+    mb=$1 kb=$2; shift 2
+    { echo "$LG"; echo "$LQ"; echo; } > "$W/nodes"
+    srv G $PG $U 1
+    srv Q $PQ $U "$mb" "$kb"
+    listening $PG; listening $PQ
+    up -A 1 --interval 5 -r default "$@"
+    ev_at '"type":"active","nodes":["g"]' 20 > /dev/null
+    check "$FB: g active" 0 "$?"
+    srv_stop G
+    TD=$(now)
+    ev_after '"type":"active","nodes":["q"]' "$TD" 40 > /dev/null
+    check "$FB: q takes the slot" 0 "$?"
+}
+fb_back() {
+    srv G $PG $U 1
+    listening $PG
+    TW=$(now)
+    printf 'wake\n%s\n\n' "$LG" >&8
+}
+
+FB="failback"
+fb_start 4 150 --failback
+HX wget -q --tries=1 -O "$W/dl" -T 10 http://203.0.113.9/big & DL=$!
+sleep 2
+fb_back
+tg=$(ev_after '"type":"active","nodes":["g"]' "$TW" 15)
+echo "     g active $(sub "$tg" "$TW") s after the wake"
+# catches: a wake that does not bring the slot back to g within the second probe's delay
+check "$FB: the slot is on g within 8 s of the wake" yes "$(le "$(sub "$tg" "$TW")" 8)"
+# catches: a move made silently, or logged without the node it leaves
+wait_log "node g answers again — new connections go through it instead of q" 5
+check "$FB: the move is logged" 0 "$?"
+# catches: a move that resets the connections of the node it leaves
+check "$FB: the download on q is still running at the move" yes "$(kill -0 $DL 2>/dev/null && echo yes || echo no)"
+# catches: a move that leaves new connections on q
+check "$FB: a new connection goes through g" "$MB1" "$(fetch n1)"
+i=0
+while kill -0 $DL 2>/dev/null && [ $i -lt 400 ]; do sleep 0.2; i=$((i + 1)); done
+kill $DL 2>/dev/null; wait $DL 2>/dev/null
+# catches: a drained download cut short or not finished intact
+check "$FB: the download started on q finishes whole" "$MB4" "$(wc -c < "$W/dl")"
+down
+srv_stop G; srv_stop Q
+
+FB="no failback"
+fb_start 2 0
+fb_back
+# catches: a wake that leaves g marked down when failback is off
+wait_log "node g answers again" 15
+check "$FB: the wake clears g's down status" 0 "$?"
+sleep 8
+# catches: a move made without --failback
+check "$FB: no move to g follows" 0 "$(grep -c 'instead of' "$W/tun.log")"
+# catches: new connections sent to g without --failback
+check "$FB: the slot stays on q" "$MB2" "$(fetch n2)"
+down
+srv_stop Q
 
 { rs 1 20; echo "$LG"; } > "$W/start.txt"
 b=$(conns)

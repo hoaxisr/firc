@@ -1927,6 +1927,10 @@ definitions:
         items:
           type: string
         type: array
+      failback:
+        description: 'Move a slot back to a higher node of the order once that node answers again, default true'
+        example: true
+        type: boolean
       filter:
         description: 'POSIX extended regular expression on subscription node names, case-insensitive; empty keeps all'
         example: ^NL-
