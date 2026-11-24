@@ -364,6 +364,13 @@ $(BUILDDIR)/tests/test_autolist_app: tests/unit/test_autolist_app.c $(LIB_OBJS) 
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(AUTOLIST_APP_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
+DOH_WRAP := -Wl,--wrap=curl_easy_setopt,--wrap=curl_multi_poll
+
+$(BUILDDIR)/tests/test_doh: tests/unit/test_doh.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(DOH_WRAP) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
 UPDATE_WRAP := -Wl,--wrap=calloc
 
 $(BUILDDIR)/tests/test_update: tests/unit/test_update.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)

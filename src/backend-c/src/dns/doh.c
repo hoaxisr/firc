@@ -1,5 +1,6 @@
 #include "firc/doh.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
 
 #define DOH_MIN_MSG 12u
 #define DOH_MAX_MSG 65535u
-#define DOH_IDLE_WAIT_MS 1000
+#define DOH_BUSY_WAIT_MS 1000
 #define DOH_REPOST_WAIT_MS 50
 #define DOH_CTYPE "application/dns-message"
 
@@ -57,6 +58,7 @@ typedef struct cmd {
 typedef struct share {
     struct share *next;
     uint32_t mark;
+    const char *url;
     CURLSH *sh;
     size_t users;
     bool retired;
@@ -225,10 +227,10 @@ static void share_destroy(firc_doh_t *d, share_t *s)
     free(s);
 }
 
-static share_t *share_for(firc_doh_t *d, uint32_t mark)
+static share_t *share_for(firc_doh_t *d, uint32_t mark, const char *url)
 {
     for (share_t *s = d->shares; s != NULL; s = s->next) {
-        if (s->mark == mark && !s->retired) {
+        if (s->mark == mark && s->url == url && !s->retired) {
             return s;
         }
     }
@@ -243,6 +245,7 @@ static share_t *share_for(firc_doh_t *d, uint32_t mark)
         return NULL;
     }
     s->mark = mark;
+    s->url = url;
     s->next = d->shares;
     d->shares = s;
     return s;
@@ -326,7 +329,7 @@ static bool start_xfer(firc_doh_t *d, cmd_t *c, uint64_t now)
         d->xfers->prev = x;
     }
     d->xfers = x;
-    x->share = share_for(d, c->mark);
+    x->share = share_for(d, c->mark, c->url);
     if (x->share != NULL) {
         x->share->users++;
     }
@@ -377,6 +380,10 @@ static bool answer_ok(xfer_t *x, CURLcode rc)
 
 static void finish(firc_doh_t *d, xfer_t *x, CURLcode rc)
 {
+    /* libcurl keeps an HTTP/2 connection whose stream timed out */
+    if (rc == CURLE_OPERATION_TIMEDOUT) {
+        x->share->retired = true;
+    }
     if (!x->reported) {
         if (answer_ok(x, rc)) {
             x->buf[0] = x->cmd->id[0];
@@ -407,7 +414,7 @@ static void harvest(firc_doh_t *d)
 
 static int expire(firc_doh_t *d, uint64_t now)
 {
-    uint64_t wait = DOH_IDLE_WAIT_MS;
+    uint64_t wait = d->xfers != NULL ? DOH_BUSY_WAIT_MS : INT_MAX;
     for (xfer_t *x = d->xfers; x != NULL; x = x->next) {
         if (x->reported) {
             continue;

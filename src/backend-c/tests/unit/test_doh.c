@@ -2,9 +2,11 @@
 #include "greatest.h"
 
 #include <arpa/inet.h>
+#include <curl/curl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,9 +34,11 @@ typedef struct srv {
     _Atomic bool stop;
     _Atomic int accepts;
     _Atomic int replies;
+    _Atomic bool h2;
+    _Atomic int swallow;
     int status;
     const char *ctype;
-    int delay_ms;
+    _Atomic int delay_ms;
     int accept_delay_ms;
     uint8_t reply[64];
     size_t reply_len;
@@ -107,10 +111,74 @@ static bool read_some(srv_t *s, int fd, char *buf, size_t *len, size_t cap)
     return false;
 }
 
+static bool read_upto(srv_t *s, int fd, char *buf, size_t *len, size_t cap, size_t need)
+{
+    while (*len < need) {
+        if (need > cap || !read_some(s, fd, buf, len, cap)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool send_frame(int fd, uint8_t type, uint8_t flags, const uint8_t stream[4], const void *body, size_t n)
+{
+    uint8_t f[256] = {0, 0, (uint8_t)n, type, flags};
+    memcpy(f + 5, stream, 4);
+    if (n > 0) {
+        memcpy(f + 9, body, n);
+    }
+    return send(fd, f, 9 + n, MSG_NOSIGNAL) == (ssize_t)(9 + n);
+}
+
+static void h2_serve(srv_t *s, int fd)
+{
+    static const uint8_t zero[4] = {0};
+    static const uint8_t hdrs[] = "\x88\x0f\x10\x17"
+                                  "application/dns-message";
+    char buf[4096];
+    size_t len = 0;
+    if (!read_upto(s, fd, buf, &len, sizeof buf, 24)) {
+        return;
+    }
+    memmove(buf, buf + 24, len -= 24);
+    if (!send_frame(fd, 4, 0, zero, NULL, 0)) {
+        return;
+    }
+    while (read_upto(s, fd, buf, &len, sizeof buf, 9)) {
+        size_t need = 9 + (size_t)((uint8_t)buf[1] << 8 | (uint8_t)buf[2]);
+        if (!read_upto(s, fd, buf, &len, sizeof buf, need)) {
+            return;
+        }
+        uint8_t type = (uint8_t)buf[3], flags = (uint8_t)buf[4], stream[4];
+        memcpy(stream, buf + 5, 4);
+        memmove(buf, buf + need, len -= need);
+        if (type == 4 && (flags & 1) == 0 && !send_frame(fd, 4, 1, zero, NULL, 0)) {
+            return;
+        }
+        if (type > 1 || (flags & 1) == 0) {
+            continue;
+        }
+        if (atomic_load(&s->swallow) > 0) {
+            atomic_fetch_sub(&s->swallow, 1);
+            continue;
+        }
+        if (!nap_unless_stop(s, s->delay_ms) || !send_frame(fd, 1, 4, stream, hdrs, sizeof hdrs - 1) ||
+            !send_frame(fd, 0, 1, stream, s->reply, s->reply_len)) {
+            return;
+        }
+        atomic_fetch_add(&s->replies, 1);
+    }
+}
+
 static void *conn_main(void *ud)
 {
     conn_t *c = ud;
     srv_t *s = c->s;
+    if (s->h2) {
+        h2_serve(s, c->fd);
+        return NULL;
+    }
     char buf[4096];
     size_t len = 0;
     for (;;) {
@@ -307,6 +375,42 @@ static bool wait_replied(srv_t *s, int ms)
     return false;
 }
 
+CURLcode __real_curl_easy_setopt(CURL *e, CURLoption opt, ...);
+CURLcode __wrap_curl_easy_setopt(CURL *e, CURLoption opt, ...);
+CURLMcode __real_curl_multi_poll(CURLM *m, struct curl_waitfd fds[], unsigned n, int ms, int *ret);
+CURLMcode __wrap_curl_multi_poll(CURLM *m, struct curl_waitfd fds[], unsigned n, int ms, int *ret);
+
+static _Atomic bool g_h2c;
+static _Atomic long g_cap_ms;
+static _Atomic int g_poll_ms;
+
+CURLcode __wrap_curl_easy_setopt(CURL *e, CURLoption opt, ...)
+{
+    va_list ap;
+    va_start(ap, opt);
+    CURLcode rc;
+    if (opt >= CURLOPTTYPE_OFF_T) {
+        rc = __real_curl_easy_setopt(e, opt, va_arg(ap, curl_off_t));
+    } else if (opt >= CURLOPTTYPE_OBJECTPOINT) {
+        rc = __real_curl_easy_setopt(e, opt, va_arg(ap, void *));
+    } else {
+        long v = va_arg(ap, long);
+        long cap = atomic_load(&g_cap_ms);
+        rc = __real_curl_easy_setopt(e, opt, opt == CURLOPT_TIMEOUT_MS && cap > 0 ? cap : v);
+    }
+    va_end(ap);
+    if (opt == CURLOPT_URL && atomic_load(&g_h2c)) {
+        (void)__real_curl_easy_setopt(e, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+    }
+    return rc;
+}
+
+CURLMcode __wrap_curl_multi_poll(CURLM *m, struct curl_waitfd fds[], unsigned n, int ms, int *ret)
+{
+    atomic_store(&g_poll_ms, ms);
+    return __real_curl_multi_poll(m, fds, n, ms, ret);
+}
+
 typedef struct env {
     srv_t s;
     firc_loop_t *loop;
@@ -317,6 +421,8 @@ typedef struct env {
 static bool env_up(env_t *e, int status, const char *ctype, int delay_ms, int accept_delay_ms)
 {
     memset(e, 0, sizeof *e);
+    atomic_store(&g_h2c, false);
+    atomic_store(&g_cap_ms, 0);
     if (!srv_start(&e->s, status, ctype, delay_ms, accept_delay_ms) || firc_loop_create(&e->loop) != FIRC_OK) {
         return false;
     }
@@ -575,6 +681,140 @@ TEST a_mark_forgotten_mid_transfer_drops_its_share_after(void)
     PASS();
 }
 
+TEST a_forgotten_mark_drops_every_server_of_it(void)
+{
+    firc_sub_fetch_set_setsockopt_for_test(record_mark);
+    env_t e;
+    srv_t other;
+    ASSERT(srv_start(&other, 200, "application/dns-message", 0, 0));
+    ASSERT(env_up(&e, 200, "application/dns-message", 0, 0));
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%u/dns-query", other.port);
+    uint16_t ids[2] = {e.id, firc_doh_intern(e.d, url)};
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 2; i++) {
+            got_t g = {0};
+            e.id = ids[i];
+            ASSERT_EQ(FIRC_OK, ask(&e, 7, 2000, &g, NULL));
+            ASSERT(run_until(e.loop, called, &g, 5000));
+            ASSERT(g.ok);
+        }
+        firc_doh_forget_mark(e.d, 7);
+    }
+    ASSERT_EQ(2, atomic_load(&e.s.accepts));
+    ASSERT_EQ(2, atomic_load(&other.accepts));
+    env_down(&e);
+    srv_stop(&other);
+    firc_sub_fetch_set_setsockopt_for_test(NULL);
+    PASS();
+}
+
+static bool h2_up(env_t *e)
+{
+    bool up = env_up(e, 200, "application/dns-message", 0, 0);
+    atomic_store(&g_h2c, true);
+    atomic_store(&e->s.h2, true);
+    return up;
+}
+
+TEST a_silent_connection_is_left_after_a_timeout(void)
+{
+    env_t e;
+    ASSERT(h2_up(&e));
+    got_t a = {0}, b = {0}, c = {0};
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &a, NULL));
+    ASSERT(run_until(e.loop, called, &a, 5000));
+    ASSERT(a.ok);
+    atomic_store(&e.s.swallow, 1);
+    atomic_store(&g_cap_ms, 300);
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &b, NULL));
+    ASSERT(run_until(e.loop, called, &b, 5000));
+    ASSERT_FALSE(b.ok);
+    ASSERT_EQ(1, atomic_load(&e.s.accepts));
+    atomic_store(&g_cap_ms, 0);
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &c, NULL));
+    ASSERT(run_until(e.loop, called, &c, 5000));
+    ASSERT(c.ok);
+    ASSERT_EQ(2, atomic_load(&e.s.accepts));
+    env_down(&e);
+    PASS();
+}
+
+TEST a_timeout_leaves_another_server_its_connection(void)
+{
+    env_t e;
+    srv_t other;
+    ASSERT(srv_start(&other, 200, "application/dns-message", 0, 0));
+    atomic_store(&other.h2, true);
+    ASSERT(h2_up(&e));
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%u/dns-query", other.port);
+    uint16_t id = e.id, other_id = firc_doh_intern(e.d, url);
+    got_t a = {0}, b = {0}, c = {0};
+    e.id = other_id;
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &a, NULL));
+    ASSERT(run_until(e.loop, called, &a, 5000));
+    ASSERT(a.ok);
+    atomic_store(&e.s.swallow, 1);
+    atomic_store(&g_cap_ms, 300);
+    e.id = id;
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &b, NULL));
+    ASSERT(run_until(e.loop, called, &b, 5000));
+    ASSERT_FALSE(b.ok);
+    atomic_store(&g_cap_ms, 0);
+    e.id = other_id;
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &c, NULL));
+    ASSERT(run_until(e.loop, called, &c, 5000));
+    ASSERT(c.ok);
+    ASSERT_EQ(1, atomic_load(&other.accepts));
+    env_down(&e);
+    srv_stop(&other);
+    PASS();
+}
+
+static bool swallowed(void *ud) { return atomic_load(&((srv_t *)ud)->swallow) == 0; }
+
+TEST a_query_beside_a_timed_out_one_is_still_answered(void)
+{
+    env_t e;
+    ASSERT(h2_up(&e));
+    got_t a = {0}, b = {0}, c = {0}, d = {0};
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &a, NULL));
+    ASSERT(run_until(e.loop, called, &a, 5000));
+    atomic_store(&e.s.swallow, 1);
+    atomic_store(&e.s.delay_ms, 1500);
+    atomic_store(&g_cap_ms, 1000);
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &b, NULL));
+    ASSERT(run_until(e.loop, swallowed, &e.s, 900));
+    atomic_store(&g_cap_ms, 0);
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &c, NULL));
+    ASSERT(run_until(e.loop, called, &b, 5000));
+    ASSERT_FALSE(b.ok);
+    ASSERT_EQ(0, c.calls);
+    ASSERT(run_until(e.loop, called, &c, 5000));
+    ASSERT(c.ok);
+    ASSERT_EQ(1, atomic_load(&e.s.accepts));
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 3000, &d, NULL));
+    ASSERT(run_until(e.loop, called, &d, 5000));
+    ASSERT(d.ok);
+    ASSERT_EQ(2, atomic_load(&e.s.accepts));
+    env_down(&e);
+    PASS();
+}
+
+TEST an_idle_client_does_not_wake(void)
+{
+    env_t e;
+    ASSERT(env_up(&e, 200, "application/dns-message", 0, 0));
+    got_t g = {0};
+    ASSERT_EQ(FIRC_OK, ask(&e, 0, 2000, &g, NULL));
+    ASSERT(run_until(e.loop, called, &g, 5000));
+    run_for(e.loop, 200);
+    ASSERT(atomic_load(&g_poll_ms) > 60000);
+    env_down(&e);
+    PASS();
+}
+
 static void noop_post(firc_loop_t *loop, void *ud)
 {
     (void)loop;
@@ -713,6 +953,11 @@ SUITE(doh)
     RUN_TEST(different_marks_never_share_a_connection);
     RUN_TEST(a_forgotten_mark_opens_a_new_connection);
     RUN_TEST(a_mark_forgotten_mid_transfer_drops_its_share_after);
+    RUN_TEST(a_forgotten_mark_drops_every_server_of_it);
+    RUN_TEST(a_silent_connection_is_left_after_a_timeout);
+    RUN_TEST(a_timeout_leaves_another_server_its_connection);
+    RUN_TEST(a_query_beside_a_timed_out_one_is_still_answered);
+    RUN_TEST(an_idle_client_does_not_wake);
     RUN_TEST(a_full_loop_queue_delays_the_answer_not_loses_it);
     RUN_TEST(the_same_url_interns_to_one_id);
     RUN_TEST(free_with_a_query_in_flight_calls_nothing);
