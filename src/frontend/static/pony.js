@@ -1477,10 +1477,14 @@
     const a = ACTIONS[name];
     return a.speed * a.duration * (a.lift ? JUMP_AIR[1] - JUMP_AIR[0] : 1);
   }
-  function speedAt(name, time) {
+  function distanceAt(name, time, dt) {
     const a = ACTIONS[name];
-    if (!a.lift) return a.speed;
-    return heightAt(name, time) > 0 ? a.speed : 0;
+    if (!a.lift) return a.speed * dt;
+    const [start, end] = JUMP_AIR;
+    return (
+      a.speed *
+      Math.max(0, Math.min(time, end * a.duration) - Math.max(time - dt, start * a.duration))
+    );
   }
   const shift =
     ([ox, oy]) =>
@@ -1608,7 +1612,7 @@
       if (ahead < travelOf(action) * scale) dir = maxX - x >= x ? 1 : -1;
     }
     begin(null);
-    function step(dt) {
+    function step(dt, strideEnd) {
       const d = Number.isFinite(dt) ? Math.min(MAX_DT, Math.max(0, dt)) : 0;
       time += d;
       clock += d;
@@ -1619,9 +1623,10 @@
       if (maxX <= 0) {
         x = 0;
       } else {
-        const speed = speedAt(action, time);
-        const turn = speed > 0 && ACTIONS[action].loop;
-        x += dir * speed * scale * d;
+        const turn = ACTIONS[action].speed > 0 && ACTIONS[action].loop;
+        const distance = distanceAt(action, time, d) * scale;
+        const room = (strideEnd - x) * dir;
+        x = room >= 0 && distance >= room ? strideEnd : x + dir * distance;
         if (x >= maxX) {
           x = maxX;
           if (turn) dir = -1;
@@ -1682,6 +1687,9 @@
       if (action !== name) play(name);
       else runLength = Math.max(runLength, time + FLEE_HOLD);
     }
+    function release(name) {
+      if (action === name) runLength = ACTIONS[name].duration;
+    }
     function follow(cx) {
       if (BUSY.has(action) || maxX <= 0) return;
       const w = WIDTH_PER_SIZE * sz;
@@ -1707,7 +1715,7 @@
     function face(way) {
       if (way === 1 || way === -1) dir = way;
     }
-    return { step, setWidth, play, flee, hold, follow, face };
+    return { step, setWidth, play, flee, hold, release, follow, face };
   }
   const HOP_TIME = 0.55;
   function pickPlatform(rects, viewH, minTop, slack = 24) {
@@ -2004,6 +2012,93 @@
     );
     return fruit;
   }
+  function createHurdle(size, x) {
+    const hurdle = el("svg", {
+      "data-pony-hurdle": "",
+      "data-pony-hurdle-phase": "revealing",
+      viewBox: "0 0 32 20",
+      width: 0.3 * size,
+      height: 0.18 * size,
+    });
+    hurdle.style.cssText =
+      `position:absolute;left:${x - 0.15 * size}px;bottom:0;pointer-events:none;` +
+      "transform-origin:50% 100%;transform:scaleY(0)";
+    hurdle.append(
+      el("path", { d: "M2 4h28v5H2zM2 12h28v4H2z", fill: "#fcf0d7", stroke: "#542d36" }),
+      el("path", { d: "M2 4h7v5H2zM23 4h7v5h-7z", fill: "#d54b52" }),
+      el("path", { d: "M4 2v17m24 0V2", stroke: "#542d36", "stroke-width": 3 }),
+    );
+    return hurdle;
+  }
+  function createButterfly(size) {
+    const butterfly = el("svg", {
+      viewBox: "-12 -18 24 18",
+      width: 0.24 * size,
+      height: 0.18 * size,
+    });
+    butterfly.style.cssText =
+      "position:absolute;left:0;bottom:0;overflow:visible;pointer-events:none";
+    const wings = el("g");
+    wings.append(
+      el("path", { d: "M0-5C-17-5-15-22-4-15L0-10L4-15C15-22 17-5 0-5Z", fill: "#d282ec" }),
+      el("path", { d: "M0-5C-10 1-13-9-6-10L0-7L6-10C13-9 10 1 0-5Z", fill: "#9f5bc7" }),
+    );
+    butterfly.append(
+      wings,
+      el("path", { d: "M0 0v-11m0 0-3-3m3 3 3-3", fill: "none", stroke: "#64377c" }),
+    );
+    return { butterfly, wings };
+  }
+  function createPuddle(size, x) {
+    const puddle = el("svg", {
+      viewBox: "-112 -48 224 56",
+      width: 2.24 * size,
+      height: 0.56 * size,
+    });
+    puddle.style.cssText = `position:absolute;left:${x - 1.12 * size}px;bottom:0;pointer-events:none`;
+    const ripple = el("ellipse", { cy: 2, rx: 12, ry: 2, fill: "none", stroke: "#dcf7ff" });
+    const splash = el("g", { opacity: 0, fill: "#8cdcff", stroke: "#e0f7ff" });
+    splash.append(
+      el("path", {
+        d: "M-30 2Q-20-2-29-22Q-15-17-9-5Q0-12 4-25Q11-17 11-5Q20-8 29-17Q26-4 34 2Z",
+      }),
+      el("circle", { cx: -40, cy: -26, r: 3 }),
+      el("circle", { cx: 8, cy: -35, r: 4 }),
+      el("circle", { cx: 38, cy: -22, r: 3 }),
+    );
+    puddle.append(
+      el("ellipse", { cy: 2, rx: 112, ry: 6, fill: "#488fbd" }),
+      el("ellipse", { cy: 1, rx: 103, ry: 4, fill: "#82cde8" }),
+      ripple,
+      splash,
+    );
+    return { puddle, ripple, splash };
+  }
+  function createRainbow(size) {
+    const rainbow = el("svg", {
+      "data-pony-rainbow": "",
+      viewBox: "0 -58 100 58",
+      width: size,
+      height: 0.58 * size,
+    });
+    rainbow.style.cssText =
+      "position:absolute;left:0;bottom:0;overflow:visible;pointer-events:none;transform-origin:0 100%";
+    const colors = ["#fa6383", "#ff9d53", "#ffdc62", "#6fdb8c", "#6ab6ff", "#bb87f3"];
+    colors.forEach((color, i) => {
+      const y = 3 * i;
+      rainbow.append(
+        el("path", {
+          d: `M0 0C26 ${-64 + y} ${67 - y} ${-64 + y} ${90 - y} ${10 + 0.5 * y}`,
+          fill: "none",
+          stroke: color,
+          "stroke-width": 3.5,
+          "stroke-linecap": "round",
+        }),
+        el("circle", { cx: 46 + 10 * i, cy: -54 + 2 * i * i, r: 1.5 + (i % 2), fill: color }),
+      );
+    });
+    return rainbow;
+  }
   const TURN_TIME = 0.45;
   const MIN_WIDTH = 0.5;
   const YAW = 24;
@@ -2243,6 +2338,29 @@
   const HOP_ENTER = 0.12;
   const HOP_EXIT = 0.15;
   const RUNNING = new Set(["run", "gallop"]);
+  const HURDLE_RUNUP = 0.25;
+  const HURDLE_FIRST = 8000;
+  const HURDLE_INTERVAL = 20000;
+  const HURDLE_ANIMATION = 240;
+  const BUTTERFLY_FIRST = 6200;
+  const BUTTERFLY_INTERVAL = 32000;
+  const EDGE_FIRST = 14500;
+  const EDGE_INTERVAL = 45000;
+  const RAINBOW_FIRST = 26000;
+  const RAINBOW_DURATION = 1650;
+  const PUDDLE_FIRST = 39000;
+  const PUDDLE_INTERVAL = 48000;
+  const PUDDLE_TAP = 800;
+  const PUDDLE_SPLASH = 900;
+  const RAINBOW_CROUCH = {
+    body: 8,
+    neck: -8,
+    tail: -42,
+    legBL1: 32,
+    legBL2: -65,
+    legBR1: 28,
+    legBR2: -59,
+  };
   const APPLE_TARGETS =
     "button, a, input, textarea, select, label, summary, [contenteditable], [draggable=true], " +
     "[role=button], [role=link], [role=checkbox], [role=switch], [role=tab], [role=option], " +
@@ -2294,7 +2412,7 @@
       applyPose(parts, STAND);
       return;
     }
-    const director = createDirector({ width: viewportWidth(), size });
+    const director = createDirector({ width: viewportWidth(), size, rand: () => Math.random() });
     rt.director = director;
     const dust = createDust(size);
     const dustSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -2351,6 +2469,57 @@
     let shownReaction = null;
     let dialogOpen = false;
     let peeking = false;
+    const firstHurdleAt = lastInput + HURDLE_FIRST;
+    let nextHurdleCheck = -Infinity;
+    let hurdleRunup = null;
+    const hurdleAnimations = new Map();
+    let nextButterflyAt = lastInput + BUTTERFLY_FIRST;
+    let nextEdgeAt = lastInput + EDGE_FIRST;
+    let nextRainbowAt = lastInput + RAINBOW_FIRST;
+    let nextPuddleAt = lastInput + PUDDLE_FIRST;
+    const motion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    const sceneActive = () =>
+      reaction?.type === "butterfly" ||
+      reaction?.type === "edge" ||
+      reaction?.type === "rainbow" ||
+      reaction?.type === "puddle";
+    const edgeAnchor = (dir) => (dir === -1 ? 0.05 * size : pageWidth - width - 0.05 * size);
+    function scenePhase(phase, now) {
+      reaction.phase = phase;
+      reaction.since = now;
+      if (reaction.type === "edge") layer.setAttribute("data-pony-edge", phase);
+      else if (reaction.type === "puddle") reaction.puddle.dataset.ponyPuddle = phase;
+      else reaction.butterfly.setAttribute("data-pony-butterfly", phase);
+    }
+    function clearScene() {
+      if (!sceneActive()) return;
+      if (reaction.action === "jump") director.release("jump");
+      if (reaction.type === "edge") {
+        layer.style.clipPath = "";
+        layer.removeAttribute("data-pony-edge");
+      } else if (reaction.type === "rainbow") {
+        reaction.rainbow.remove();
+        director.play(reaction.resume);
+      } else if (reaction.type === "puddle") reaction.puddle.remove();
+      else reaction.butterfly.remove();
+      reaction = null;
+    }
+    rt.clearScene = clearScene;
+    function retractHurdle(hurdle, now) {
+      const animation = hurdleAnimations.get(hurdle);
+      if (animation?.to === 0) return;
+      const height = animation?.height ?? 1;
+      hurdle.dataset.ponyHurdlePhase = "retracting";
+      hurdleAnimations.set(hurdle, { since: now, from: height, to: 0, height });
+    }
+    function clearHurdles(now = performance.now()) {
+      hurdleRunup = null;
+      if (reaction?.type !== "hurdle") return;
+      if (reaction.action) director.release(reaction.action);
+      for (const hurdle of reaction.hurdles.slice(reaction.next)) retractHurdle(hurdle, now);
+      reaction = null;
+    }
+    rt.clearHurdles = clearHurdles;
     function findPlatform(groundLine) {
       if (!selector) return null;
       const rects = [];
@@ -2370,6 +2539,30 @@
     let pageWidth = 0;
     let candidate = null;
     const width = WIDTH_PER_SIZE * size;
+    const halfJump = 0.5 * travelOf("jump") * (size / 80);
+    const hurdleGap = 3.25 * size;
+    const hurdleLead = 0.46 * size;
+    const hurdleSpan = (count) => width + 1.15 * size + (count - 1) * hurdleGap + 2 * halfJump;
+    const hurdleRoom = hurdleSpan(2) + 0.1 * size;
+    const lane = (platform) => ({
+      left: Math.max(0, platform?.left ?? 0),
+      right: Math.min(pageWidth, platform?.right ?? pageWidth),
+    });
+    const laneContains = (bounds, from, to) =>
+      Math.min(from, to) >= bounds.left && Math.max(from, to) <= bounds.right;
+    const platformFits = (platform, from, to) =>
+      candidate?.el === platform && platform.isConnected && laneContains(lane(candidate), from, to);
+    const hurdleLaneClear = (from, to, platform, foreground) => {
+      if (platform) return platformFits(platform, from, to);
+      const left = Math.min(from, to);
+      const right = Math.max(from, to);
+      return (
+        left >= 0 &&
+        right <= pageWidth &&
+        groundLine >= 1.5 * size &&
+        (foreground || !candidate || candidate.right < left || candidate.left > right)
+      );
+    };
     const surfaceAt = (x) =>
       candidate && x >= candidate.left && x <= candidate.right ? groundLine - candidate.top : 0;
     const positionAt = (x) => clamp(x, 0, Math.max(0, pageWidth - width));
@@ -2422,10 +2615,37 @@
         pageWidth = viewportWidth();
         candidate = findPlatform(groundLine);
       }
-      director.setWidth(pageWidth);
-      const s = director.step(dt);
+      const edge = reaction?.type === "edge" ? reaction : null;
+      const edgeX = edge && pageWidth === edge.pageWidth ? edgeAnchor(edge.dir) : undefined;
+      if (
+        hurdleRunup?.platform &&
+        !platformFits(hurdleRunup.platform, hurdleRunup.left, hurdleRunup.right)
+      )
+        hurdleRunup = null;
+      if (reaction?.platform && !platformFits(reaction.platform, reaction.left, reaction.right)) {
+        if (reaction.type === "hurdle") {
+          const hurdles = reaction.hurdles;
+          clearHurdles(now);
+          for (const hurdle of hurdles) {
+            hurdle.remove();
+            hurdleAnimations.delete(hurdle);
+          }
+        } else clearScene();
+      }
+      director.setWidth(pageWidth, edge && edge.phase !== "sneak" ? edgeX : undefined);
+      const takeoff =
+        reaction?.type === "hurdle" && !reaction.action && reaction.next < reaction.hurdles.length
+          ? reaction.x - reaction.dir * hurdleLead - 0.5 * width
+          : undefined;
+      const s = director.step(dt, takeoff ?? (hurdleRunup?.platform ? hurdleRunup.x : edgeX));
       const mid = s.x + 0.5 * width;
-      const found = candidate;
+      const found =
+        (hurdleRunup && !hurdleRunup.platform) ||
+        (reaction?.foreground && !reaction.platform) ||
+        edge ||
+        (!reaction?.platform && (reaction?.type === "butterfly" || reaction?.type === "puddle"))
+          ? null
+          : candidate;
       const next = found && mid >= found.left && mid <= found.right ? found : null;
       if ((next && next.el) !== (plat && plat.el)) hop = { t: 0, from: base, h: 0 };
       plat = next;
@@ -2457,10 +2677,22 @@
       const bottom = groundLine - y;
       const box = { left: s.x, right: s.x + width, top: bottom - size, bottom };
       const pageState = page ? page.poll() : undefined;
+      const pageBusy = pageState?.dialog || pageState?.reading || pageState?.typing;
+      const platform = plat?.el;
+      const bounds = lane(plat);
+      const autoHurdle =
+        !document.hidden &&
+        !pageBusy &&
+        !pressed &&
+        bounds.right - bounds.left >= hurdleRoom &&
+        groundLine >= 1.5 * size &&
+        (hurdleRunup ||
+          reaction?.foreground ||
+          (!reaction && now >= Math.max(firstHurdleAt, nextHurdleCheck)));
       const cmd = mood({
         dt: d,
         size,
-        cursor,
+        cursor: autoHurdle && now - cursorAt >= 1000 ? null : cursor,
         box,
         dir: s.dir,
         action: s.action,
@@ -2473,6 +2705,67 @@
       returned = 0;
       toast = null;
       const running = RUNNING.has(s.action);
+      const room = s.dir === 1 ? pageWidth - box.right : box.left;
+      if (reaction?.platform && reaction.type === "puddle")
+        reaction.puddle.style.bottom = `${base}px`;
+      if (reaction?.platform && reaction.type === "hurdle") {
+        for (const hurdle of reaction.hurdles) hurdle.style.bottom = `${base}px`;
+      }
+      const ahead = cursor && (cursor.x - mid) * s.dir - 0.5 * width;
+      const cursorJump =
+        running &&
+        cursor &&
+        now - cursorAt >= 180 &&
+        ahead >= 0 &&
+        ahead <= 0.65 * size &&
+        cursor.y >= bottom - 0.4 * size &&
+        cursor.y <= bottom + 0.15 * size &&
+        room >= 2 * halfJump;
+      const moodAction =
+        cmd.play ||
+        cmd.flee ||
+        cmd.follow !== null ||
+        cmd.face ||
+        (cmd.hold && !(autoHurdle && cmd.hold === "lie"));
+      const sceneBlocked =
+        document.hidden ||
+        motion?.matches ||
+        pageBusy ||
+        pressed ||
+        moodAction ||
+        cursorJump ||
+        now - cursorAt < 1000;
+      const rainbowBlocked = sceneBlocked || hop || now - lastInput < 1000;
+      if (sceneActive()) {
+        if (pageBusy || document.hidden || motion?.matches || pageWidth !== reaction.pageWidth) {
+          clearScene();
+        } else if (sceneBlocked && reaction.type === "edge" && ponyBox) {
+          if (reaction.phase !== "return") {
+            reaction.returnOffset = ponyBox.left - s.x;
+            reaction.returnY = groundLine - ponyBox.bottom;
+            reaction.returnTime = 420;
+            scenePhase("return", now);
+          }
+        } else if (sceneBlocked || (reaction.type === "rainbow" && rainbowBlocked)) clearScene();
+        else if (hop) reaction.since += d * 1000;
+      }
+      if (!autoHurdle || moodAction || cursorJump) hurdleRunup = null;
+      if (
+        reaction?.type === "hurdle" &&
+        (pageBusy ||
+          pressed ||
+          hop ||
+          cursorJump ||
+          moodAction ||
+          s.dir !== reaction.dir ||
+          !hurdleLaneClear(
+            mid - s.dir * 0.5 * width,
+            reaction.end,
+            reaction.platform,
+            reaction.foreground,
+          ))
+      )
+        clearHurdles(now);
       if (pageState?.dialog) {
         if (!dialogOpen || (checkLayout && reaction?.type !== "dialog")) {
           const card = nearestCover(mid, bottom);
@@ -2487,25 +2780,148 @@
         layer.style.zIndex = dialogOpen ? "14" : "2147483000";
       }
       if (!reaction && !pageState?.dialog && !hop) {
-        const ahead = cursor && (cursor.x - mid) * s.dir - 0.5 * width;
-        const room = s.dir === 1 ? pageWidth - box.right : box.left;
-        if (
-          running &&
-          cursor &&
-          now - cursorAt >= 180 &&
-          ahead >= 0 &&
-          ahead <= 0.65 * size &&
-          cursor.y >= bottom - 0.4 * size &&
-          cursor.y <= bottom + 0.15 * size &&
-          room >= travelOf("jump") * (size / 80)
-        ) {
+        if (cursorJump) {
           reaction = { type: "cursor", action: "jump", resume: s.action, dir: s.dir };
         } else if (wasRunning && !ACTIONS[s.action].speed && dust.particles.length) {
           reaction = { type: "dust", action: "sneeze" };
+        } else if (
+          !sceneBlocked &&
+          !autoHurdle &&
+          !turn &&
+          !BUSY.has(s.action) &&
+          groundLine >= 1.5 * size &&
+          pageWidth >= width + size
+        ) {
+          const jumpRoom = 2 * halfJump + 0.6 * size;
+          const aheadOnLane = (dir) =>
+            dir === 1 ? bounds.right - box.right : box.left - bounds.left;
+          const dir = aheadOnLane(s.dir) >= jumpRoom ? s.dir : -s.dir;
+          const left = box.left - (dir === -1 ? jumpRoom : 0);
+          const right = box.right + (dir === 1 ? jumpRoom : 0);
+          const jumpFits = laneContains(bounds, left, right);
+          if (now >= nextButterflyAt && jumpFits) {
+            nextButterflyAt = now + BUTTERFLY_INTERVAL;
+            reaction = {
+              type: "butterfly",
+              dir,
+              pageWidth,
+              platform,
+              left,
+              right,
+              ...createButterfly(size),
+            };
+            layer.append(reaction.butterfly);
+            scenePhase("stalk", now);
+          } else if (now >= nextEdgeAt) {
+            nextEdgeAt = now + EDGE_INTERVAL;
+            reaction = { type: "edge", dir: mid <= pageWidth / 2 ? -1 : 1, pageWidth };
+            scenePhase("sneak", now);
+          } else if (
+            now >= nextRainbowAt &&
+            !rainbowBlocked &&
+            pageWidth - width - room >= 0.8 * size
+          ) {
+            reaction = {
+              type: "rainbow",
+              since: now,
+              pageWidth,
+              resume: s.action,
+              rainbow: createRainbow(size),
+            };
+          } else if (now >= nextPuddleAt && jumpFits) {
+            nextPuddleAt = now + PUDDLE_INTERVAL;
+            reaction = {
+              type: "puddle",
+              dir,
+              pageWidth,
+              platform,
+              left,
+              right,
+              ...createPuddle(size, mid + dir * 2 * halfJump),
+            };
+            reaction.puddle.style.bottom = `${base}px`;
+            layer.insertBefore(reaction.puddle, svg);
+            scenePhase("tap", now);
+          }
+        }
+        if (!reaction && !pageBusy && !pressed && !moodAction) {
+          let ready = running && !turn && s.time >= HURDLE_RUNUP && now >= nextHurdleCheck;
+          if (hurdleRunup) {
+            const { dir } = hurdleRunup;
+            const x = hurdleRunup.platform
+              ? hurdleRunup.x
+              : dir === 1
+                ? Math.min(s.x, pageWidth - hurdleRoom)
+                : Math.max(s.x, hurdleRoom - width);
+            const inPosition = approach(s, x);
+            ready = inPosition && !turn && facing === -dir && s.dir === dir;
+            if (inPosition && !ready) {
+              director.hold("rest");
+              director.face(dir);
+            }
+          }
+          if (ready) {
+            const from = mid - s.dir * 0.5 * width;
+            const endTwo = from + s.dir * hurdleSpan(2);
+            if (hurdleLaneClear(from, endTwo, platform, hurdleRunup)) {
+              nextHurdleCheck = now + HURDLE_INTERVAL;
+              const start = mid + s.dir * (hurdleLead + 0.9 * size);
+              const endThree = from + s.dir * hurdleSpan(3);
+              const three =
+                Math.random() < 0.5 && hurdleLaneClear(from, endThree, platform, hurdleRunup);
+              const end = three ? endThree : endTwo;
+              const hurdles = Array.from({ length: three ? 3 : 2 }, (_, i) => {
+                const hurdle = createHurdle(size, start + s.dir * i * hurdleGap);
+                hurdle.style.bottom = `${base}px`;
+                layer.insertBefore(hurdle, svg);
+                hurdleAnimations.set(hurdle, { since: now, from: 0, to: 1, height: 0 });
+                return hurdle;
+              });
+              reaction = {
+                type: "hurdle",
+                hurdles,
+                next: 0,
+                x: start,
+                end,
+                platform,
+                left: Math.min(from, end),
+                right: Math.max(from, end),
+                resume: hurdleRunup ? "run" : s.action,
+                dir: s.dir,
+                foreground: !!hurdleRunup,
+                miss: Math.random() > 0.9,
+              };
+              hurdleRunup = null;
+            }
+          }
+          if (
+            !reaction &&
+            autoHurdle &&
+            !hurdleRunup &&
+            laneContains(bounds, box.left, box.right)
+          ) {
+            const dir = mid <= 0.5 * (bounds.left + bounds.right) ? 1 : -1;
+            const x =
+              dir === 1
+                ? Math.min(s.x, bounds.right - hurdleRoom)
+                : Math.max(s.x, bounds.left + hurdleRoom - width);
+            hurdleRunup = {
+              x,
+              dir,
+              platform,
+              left: Math.min(box.left, dir === 1 ? x : x + width - hurdleRoom),
+              right: Math.max(box.right, dir === 1 ? x + hurdleRoom : x + width),
+            };
+            if (platform && approach(s, x)) {
+              director.hold("rest");
+              director.face(dir);
+            }
+          }
         }
       }
       wasRunning = running && !hop;
       let cover = null;
+      let renderX = s.x;
       if (reaction?.type === "dialog") {
         const r = reaction.card.getBoundingClientRect();
         const left = Math.max(0, r.left);
@@ -2553,20 +2969,154 @@
             reaction.action = "sniff";
           }
         }
+      } else if (reaction?.type === "hurdle" && !reaction.action) {
+        if (reaction.next === reaction.hurdles.length) clearHurdles(now);
+        else if (s.x === takeoff) reaction.action = "jump";
+        else director.hold(reaction.resume);
+      } else if (reaction?.type === "puddle" && !reaction.action && !hop) {
+        const { dir, phase, puddle, ripple, splash } = reaction;
+        director.hold("rest");
+        if (phase === "tap") {
+          director.face(dir);
+          if (turn || facing !== -dir) reaction.since = now;
+          const u = clamp((now - reaction.since) / PUDDLE_TAP, 0, 1);
+          const paw = ramp(u, [0.08, 0.28]) * (1 - ramp(u, [0.28, 0.53]));
+          const reach = ramp(u, [0.08, 0.5]) * (1 - ramp(u, [0.68, 0.94]));
+          const look = Math.sin(Math.PI * u);
+          pose = {
+            ...pose,
+            neck: pose.neck - 16 * look,
+            head: pose.head - 8 * look,
+            legFL1: pose.legFL1 + 24 * paw + 20 * reach,
+            legFL2: pose.legFL2 - 56 * paw - 20 * reach,
+          };
+          ripple.setAttribute("transform", `translate(${-99 * dir} 0) scale(${0.25 + u} 1)`);
+          ripple.setAttribute("opacity", ramp(u, [0.5, 0.57]) * (1 - ramp(u, [0.65, 1])));
+          if (u === 1) {
+            reaction.action = "jump";
+            scenePhase("jump", now);
+          }
+        } else {
+          const u = clamp((now - reaction.since) / PUDDLE_SPLASH, 0, 1);
+          const spray = Math.sin(Math.PI * ramp(u, [0, 0.8]));
+          splash.setAttribute("transform", `scale(${0.7 + u}, ${spray})`);
+          splash.setAttribute("opacity", 1 - ramp(u, [0.45, 0.8]));
+          puddle.style.opacity = 1 - ramp(u, [0.65, 1]);
+          if (u === 1) clearScene();
+        }
+      } else if (reaction?.type === "butterfly" && !reaction.action && !hop) {
+        if (reaction.phase === "stalk") {
+          director.face(reaction.dir);
+          if (now - reaction.since >= 1000) {
+            reaction.action = "jump";
+            scenePhase("jump", now);
+          } else {
+            director.hold("walk");
+            pose = { ...pose, neck: pose.neck + 9, head: pose.head - 12 };
+          }
+        } else if (now - reaction.since >= 900) {
+          clearScene();
+        }
+      } else if (reaction?.type === "rainbow") {
+        const elapsed = now - reaction.since;
+        if (elapsed >= RAINBOW_DURATION) clearScene();
+        else {
+          director.hold("rest");
+          const crouch = easeInOut(elapsed / 240) * (1 - easeInOut((elapsed - 620) / 340));
+          pose = lerpPose(pose, RAINBOW_CROUCH, crouch);
+          y = Math.max(y, groundLift(pose) * size);
+          y -= 0.07 * size * crouch;
+        }
+      } else if (reaction?.type === "edge" && !hop) {
+        const { dir, phase, since } = reaction;
+        const boundary = edgeAnchor(dir);
+        const elapsed = now - since;
+        const offscreen = width + 0.15 * size;
+        const peek = 0.84 * size;
+        if (phase === "sneak") {
+          director.hold(Math.abs(boundary - s.x) > 1.5 * size ? "trot" : "walk");
+          director.face(dir);
+          if (s.x === boundary) {
+            reaction.slipAt ??= now;
+            const slip = easeInOut((now - reaction.slipAt) / 720);
+            renderX += dir * slip * offscreen;
+            if (slip === 1) {
+              director.hold("rest");
+              director.face(-dir);
+              scenePhase("hidden", now);
+            }
+          }
+        } else if (phase === "hidden") {
+          renderX += dir * offscreen;
+          if (elapsed >= 550) scenePhase("ears", now);
+        } else if (phase === "ears") {
+          renderX += dir * (offscreen + (peek - offscreen) * easeInOut(elapsed / 400));
+          y = -0.74 * size;
+          pose = STAND;
+          if (elapsed >= 720) scenePhase("head", now);
+        } else if (phase === "head") {
+          renderX += dir * peek;
+          y = -0.74 * size * (1 - easeInOut(elapsed / 500));
+          pose = STAND;
+          if (elapsed >= 600) {
+            director.hold("walk");
+            scenePhase("return", now);
+          }
+        } else {
+          const duration = reaction.returnTime ?? 1100;
+          const remaining = 1 - easeInOut(elapsed / duration);
+          renderX += (reaction.returnOffset ?? dir * peek) * remaining;
+          if (reaction.returnY !== undefined) y += (reaction.returnY - y) * remaining;
+          director.hold("walk");
+          if (elapsed >= duration) clearScene();
+        }
+        if (reaction?.type === "edge")
+          layer.style.clipPath = `path("M0 0H${pageWidth}V${-groundLine}H0Z")`;
       }
       if (reaction?.action) {
         const { action, type } = reaction;
+        if (type === "hurdle" && reaction.miss && action === "jump" && s.action === action) {
+          const hurdle = reaction.hurdles[reaction.next];
+          const stumble = ramp(s.time, [0.3, 0.46]) * (1 - ramp(s.time, [0.54, 0.8]));
+          pose = lerpPose(pose, poseAt("jump", 0.8), stumble);
+          y = base + Math.max(groundLift(pose) * size, (y - base) * (1 - 0.92 * stumble));
+          if (s.time >= 0.46 && hurdle.dataset.ponyHurdlePhase !== "fallen") {
+            hurdle.dataset.ponyHurdlePhase = "fallen";
+            hurdleAnimations.set(hurdle, { since: now, tip: reaction.dir, to: 0 });
+          }
+        } else if (type === "hurdle" && action === "snort" && s.action === action) {
+          const look = (1 - ramp(s.time, [0.12, 0.35])) * ramp(s.time, [0, 0.1]);
+          pose = lerpPose(pose, { ...pose, ...SNIFF }, look * 0.65);
+        }
         if (s.action === action && s.time >= ACTIONS[action].duration) {
           if (action === "sniff") reaction.action = "eat";
           else if (action === "sneeze") reaction.action = "shake";
-          else {
+          else if (type === "butterfly") {
+            director.play("rest");
+            reaction.action = null;
+            scenePhase("nose", now);
+          } else if (type === "puddle") {
+            director.play("rest");
+            reaction.action = null;
+            scenePhase("splash", now);
+          } else if (type === "hurdle" && reaction.miss && action === "jump") {
+            reaction.action = "snort";
+          } else if (type === "hurdle") {
+            director.play(reaction.resume);
+            director.face(reaction.dir);
+            if (!reaction.miss) retractHurdle(reaction.hurdles[reaction.next], now);
+            reaction.miss = false;
+            reaction.next += 1;
+            reaction.x += reaction.dir * hurdleGap;
+            reaction.action = null;
+          } else {
             director.play(type === "cursor" ? reaction.resume : "rest");
             if (type === "cursor") director.face(reaction.dir);
             reaction = null;
           }
         }
-        if (reaction) director.hold(reaction.action);
-      } else if (!reaction) {
+        if (reaction?.action) director.hold(reaction.action);
+      } else if (!reaction && !hurdleRunup) {
         if (cmd.face) director.face(cmd.face);
         if (cmd.play) director.play(cmd.play);
         else if (cmd.hold) director.hold(cmd.hold);
@@ -2584,7 +3134,12 @@
         layer.removeAttribute("data-pony-peek");
       }
       peeking = !!cover;
-      ponyBox = { ...box, top: groundLine - y - size, bottom: groundLine - y };
+      ponyBox = {
+        left: renderX,
+        right: renderX + width,
+        top: groundLine - y - size,
+        bottom: groundLine - y,
+      };
       if (shownAction !== s.action) {
         shownAction = s.action;
         layer.setAttribute("data-pony-action", shownAction);
@@ -2626,8 +3181,47 @@
         }
         pose = lerpPose(pose, TURN_POSE, TURN_REAR * rise);
       }
-      svg.style.transform = `translate(${s.x}px, ${-y - 0.05 * size * rise}px) scaleX(${sx})${yaw ? ` perspective(${6 * size}px) rotateY(${yaw.toFixed(1)}deg)` : ""}`;
+      svg.style.transform = `translate(${renderX}px, ${-y - 0.05 * size * rise}px) scaleX(${sx})${yaw ? ` perspective(${6 * size}px) rotateY(${yaw.toFixed(1)}deg)` : ""}`;
       applyPose(parts, pose);
+      if (type === "butterfly") {
+        const { butterfly, wings, phase, since, dir } = reaction;
+        const [mx, my] = place(pose, ["head", "neck", "body"], [52, 89]);
+        const elapsed = now - since;
+        const flight = phase === "stalk" ? 1 : 0;
+        const flutter = elapsed / 80;
+        const noseX = mid + (mx / VB_W - 0.5) * width * sx;
+        const noseY = -y - (1 - my / VB_H) * size;
+        let x = noseX + dir * flight * size * (0.55 + 0.08 * Math.sin(flutter));
+        let flyY = noseY - flight * size * (0.16 + 0.07 * Math.sin(0.7 * flutter));
+        if (phase === "jump") {
+          const u = clamp(elapsed / 1000, 0, 1);
+          const approach = easeInOut((u - 0.7) / 0.3);
+          const arcX = reaction.flightX + dir * 2 * halfJump * u;
+          const arcY = reaction.flightY - 0.2 * size * Math.sin(Math.PI * u);
+          x = arcX + (noseX - arcX) * approach;
+          flyY = arcY + (noseY - arcY) * approach;
+        } else if (phase === "stalk") {
+          reaction.flightX = x;
+          reaction.flightY = flyY;
+        }
+        butterfly.style.transform = `translate(${x - 0.12 * size}px, ${flyY}px)`;
+        wings.setAttribute("transform", `scale(${0.4 + 0.6 * Math.abs(Math.cos(flutter))} 1)`);
+      } else if (type === "rainbow") {
+        const { rainbow, since } = reaction;
+        const elapsed = now - since;
+        if (elapsed >= 240) {
+          const [rx, ry] = place(pose, ["body"], [218, 117]);
+          const x = mid + (rx / VB_W - 0.5) * width * sx;
+          const rearY = -y - (1 - ry / VB_H) * size;
+          const spread = 0.1 + 0.9 * easeInOut((elapsed - 240) / 380);
+          rainbow.style.transform = `translate(${x}px, ${rearY}px) scale(${sx * spread}, ${spread})`;
+          rainbow.style.opacity = 1 - easeInOut((elapsed - 800) / (RAINBOW_DURATION - 800));
+          if (!rainbow.isConnected) {
+            layer.insertBefore(rainbow, svg);
+            nextRainbowAt = now + 55000 + 20000 * unit(Math.random());
+          }
+        }
+      }
       if (fr || shownFront) {
         shownFront = fr;
         front.style.opacity = fr;
@@ -2644,13 +3238,42 @@
           y + (1 - my / VB_H) * size,
         );
       }
-      if (landed || (wasJump && s.action !== "jump" && !hop))
+      if (type !== "puddle" && (landed || (wasJump && s.action !== "jump" && !hop)))
         dust.burst(s.x + 0.5 * WIDTH_PER_SIZE * size, base);
       landed = false;
       wasJump = s.action === "jump";
       const grazing =
         s.action === "graze" && !hop ? { time: s.time, duration: ACTIONS.graze.duration } : null;
       grass.update(d, grazing, s.x + (s.dir === 1 ? 0.8 : 0.2) * WIDTH_PER_SIZE * size, base);
+      for (const [hurdle, animation] of hurdleAnimations) {
+        if (animation.to === 0 && checkLayout) {
+          const { left, right } = hurdle.getBoundingClientRect();
+          if (left < 0 || right > pageWidth) {
+            hurdle.remove();
+            hurdleAnimations.delete(hurdle);
+            continue;
+          }
+        }
+        if (animation.tip) {
+          const elapsed = now - animation.since;
+          const tip = easeInOut(elapsed / HURDLE_ANIMATION);
+          hurdle.style.transform = `rotate(${animation.tip * tip * 32}deg) scaleY(${1 - 0.84 * tip})`;
+          hurdle.style.opacity = 1 - easeInOut((elapsed - 1050) / HURDLE_ANIMATION);
+          if (elapsed >= 1050 + HURDLE_ANIMATION) {
+            hurdle.remove();
+            hurdleAnimations.delete(hurdle);
+          }
+          continue;
+        }
+        const progress = (now - animation.since) / HURDLE_ANIMATION;
+        animation.height = animation.from + (animation.to - animation.from) * easeInOut(progress);
+        hurdle.style.transform = `scaleY(${animation.height})`;
+        if (progress >= 1) {
+          if (animation.to === 0) hurdle.remove();
+          else hurdle.dataset.ponyHurdlePhase = "visible";
+          hurdleAnimations.delete(hurdle);
+        }
+      }
       dust.update(d);
       const ps = dust.particles;
       for (let i = 0; i < ps.length; i++) {
@@ -2667,6 +3290,10 @@
     }
     const onVisibility = () => {
       if (document.hidden) {
+        clearHurdles();
+        for (const hurdle of hurdleAnimations.keys()) hurdle.remove();
+        hurdleAnimations.clear();
+        clearScene();
         hiddenAt = performance.now();
         return;
       }
@@ -2686,7 +3313,13 @@
       }
     };
     const onDoubleClick = (e) => {
-      if (!ponyBox || reaction || dialogOpen || e.button !== 0 || closest(e.target, APPLE_TARGETS))
+      if (
+        !ponyBox ||
+        (reaction && reaction.type !== "hurdle" && !sceneActive()) ||
+        dialogOpen ||
+        e.button !== 0 ||
+        closest(e.target, APPLE_TARGETS)
+      )
         return;
       const { left, right, top, bottom } = ponyBox;
       const dx = Math.max(left - e.clientX, 0, e.clientX - right);
@@ -2695,6 +3328,8 @@
       const dir = e.clientX >= (left + right) / 2 ? 1 : -1;
       const muzzle = (dir === 1 ? 0.83 : 0.42) * size;
       const x = positionAt(e.clientX - muzzle);
+      clearHurdles();
+      clearScene();
       reaction = { type: "apple", x, dir, droppedAt: performance.now() };
       fruit = createApple(size);
       fruit.style.left = `${x + muzzle - 0.1 * size}px`;
@@ -2756,7 +3391,10 @@
     rt.layer.remove();
   }
   function playAction(name) {
-    if (runtime && runtime.director) runtime.director.play(name);
+    if (!runtime?.director || !Object.hasOwn(ACTIONS, name)) return;
+    runtime.clearHurdles();
+    runtime.clearScene();
+    runtime.director.play(name);
   }
   if (!window.UnicornPony) {
     window.UnicornPony = { start: startPony, stop: stopPony, play: playAction };
