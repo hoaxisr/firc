@@ -201,7 +201,8 @@ void firc_group_free(firc_group_t *g)
     free(g->rules);
     firc_devsel_spec_clear(&g->devices);
     free(g->resolve.server);
-    firc_group_list_free(g->list);
+    for (size_t i = 0; i < g->n_lists; i++) { firc_group_list_free(g->lists[i]); }
+    free(g->lists);
     free(g->name);
     free(g->iface);
     for (size_t i = 0; i < g->n_iface_rest; i++) { free(g->iface_rest[i]); }
@@ -345,6 +346,41 @@ const char *firc_sub_sync_state_name(firc_sub_sync_state_t s)
     }
     return "idle";
 }
+
+firc_err_t firc_group_add_list(firc_group_t *g, firc_group_list_t *l)
+{
+    if (firc_id_is_zero(l->id)) { return FIRC_ERR_INVAL; }
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (firc_id_equal(g->lists[i]->id, l->id) || strcmp(g->lists[i]->url, l->url) == 0) { return FIRC_ERR_INVAL; }
+    }
+    if (g->n_lists >= FIRC_GROUP_LISTS_MAX) { return FIRC_ERR_LIMIT; }
+    firc_group_list_t **grown = realloc(g->lists, (g->n_lists + 1) * sizeof(*grown));
+    if (grown == NULL) { return FIRC_ERR_NOMEM; }
+    g->lists = grown;
+    g->lists[g->n_lists++] = l;
+    return FIRC_OK;
+}
+
+firc_group_list_t *firc_group_find_list(const firc_group_t *g, firc_id_t id)
+{
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (firc_id_equal(g->lists[i]->id, id)) { return g->lists[i]; }
+    }
+    return NULL;
+}
+
+void firc_group_remove_list(firc_group_t *g, size_t i)
+{
+    firc_group_list_free(g->lists[i]);
+    memmove(&g->lists[i], &g->lists[i + 1], (g->n_lists - i - 1) * sizeof(*g->lists));
+    g->n_lists--;
+    if (g->n_lists == 0) {
+        free(g->lists);
+        g->lists = NULL;
+    }
+}
+
+bool firc_group_list_untried(const firc_group_list_t *l) { return !l->has_body_hash && l->failed_fetches == 0; }
 
 firc_group_list_t *firc_group_list_new(void)
 {

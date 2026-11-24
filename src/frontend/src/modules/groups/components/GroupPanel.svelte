@@ -6,6 +6,7 @@
   import Pagination from "../../../components/Pagination.svelte";
   import Button from "../../../components/ui/Button.svelte";
   import DropdownMenu from "../../../components/ui/DropdownMenu.svelte";
+  import Select from "../../../components/ui/Select.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { hosts } from "../../../data/hosts.svelte";
@@ -13,6 +14,7 @@
   import { locale, t } from "../../../data/locale.svelte";
   import { policies } from "../../../data/policies.svelte";
   import { GROUPS_STORE_CONTEXT, type GroupsStore } from "../groups.svelte";
+  import { listKey } from "../lists.svelte";
   import BlockAnswer from "./BlockAnswer.svelte";
   import GroupDuplicateMenu from "./GroupDuplicateMenu.svelte";
   import IfacePicker from "./IfacePicker.svelte";
@@ -44,6 +46,8 @@
   import { coverageLabel } from "../../../utils/device-picker";
   import { counted } from "../../../utils/plural";
   import { type SortDirection } from "../../../utils/rule-sorter";
+  import { intervalOptionsFor, parseIntervalSeconds } from "../intervals";
+  import { listName } from "../list-name";
   import { healthTag, resolverTag } from "../resolve-choice";
 
   type Props = {
@@ -91,7 +95,7 @@
 
   let ifaceUnsaved = $derived(group ? store.tracker.isFieldDirty(group, "interface") : false);
 
-  let hasList = $derived(Boolean(group?.list));
+  let hasList = $derived(Boolean(group?.lists?.length));
   let resolverTagText = $derived(resolverTag(group, t));
   let isBlock = $derived(group?.interface === BLOCK);
   let dnsHealth = $derived(
@@ -101,28 +105,26 @@
       group?.interface === DNS && group.resolve.fallback === false,
     ),
   );
-  let listSaved = $derived(group ? store.listSaved(group.id) : false);
+  let listSaved = $derived(
+    group ? (group.lists ?? []).every((list) => store.listSaved(group.id, list.id)) : false,
+  );
   let ownRulesCount = $derived(group?.rules.length ?? 0);
+  let listCount = $derived(group?.lists?.length ?? 0);
+  let interval = $derived(group?.lists?.[0]?.interval ?? 86400);
 
-  let anyList = $derived(store.data.some((g) => Boolean(g.list)));
-  let listPage = $derived(group ? store.lists.pageState[group.id] : undefined);
+  let anyList = $derived(store.data.some((g) => g.lists?.length));
   const LIST_PAGE_SIZE = store.lists.pageSize;
 
-  let listMatchedCount = $derived(
-    group?.list && listPage?.q === store.normalizedSearch
-      ? listPage.matched
-      : (group?.list?.rulesTotal ?? 0),
-  );
-  let listUsePagination = $derived(listMatchedCount > LIST_PAGE_SIZE);
-  let listCurrentPage = $derived(Math.floor((listPage?.offset ?? 0) / LIST_PAGE_SIZE) + 1);
-  let listDisplayedRules = $derived.by(() => listPage?.rules ?? []);
-  let listChangedCount = $derived(group ? store.lists.ruleEdits(group.id).length : 0);
+  const listPageOf = (listId: string) =>
+    group ? store.lists.pageState[listKey(group.id, listId)] : undefined;
 
   $effect(() => {
-    if (!group?.list) return;
-    const state = store.lists.pageState[group.id];
-    if (effectiveOpen && !state?.loaded && !state?.failed) {
-      store.lists.loadRules(group.id, 0);
+    if (!group) return;
+    for (const list of group.lists ?? []) {
+      const state = store.lists.pageState[listKey(group.id, list.id)];
+      if (effectiveOpen && !state?.loaded && !state?.failed) {
+        store.lists.loadRules(group.id, list.id, 0);
+      }
     }
   });
 
@@ -461,7 +463,17 @@
                 >
               {/if}
               {#if hasList}
-                <span class="list-badge"><RSS size={12} />{t("list")}</span>
+                <span class="list-badge"
+                  ><RSS size={12} />{listCount > 1
+                    ? counted(
+                        listCount,
+                        locale.current,
+                        t("{n} list"),
+                        t("{n} lists (2-4)"),
+                        t("{n} lists"),
+                      )
+                    : t("list")}</span
+                >
               {/if}
               {#if resolverTagText}
                 <span class="resolver-badge" class:blocked={isBlock} title={resolverTagText}
@@ -478,8 +490,29 @@
                 </Tooltip>
               {/if}
             </div>
-            {#if group.list}
-              <ListHeader {group} />
+            {#each group.lists ?? [] as list (list.id)}
+              <ListHeader {group} {list} />
+            {/each}
+            {#if hasList}
+              <div class="lists-line">
+                <div class="lists-line-row">
+                  <span class="update-interval">
+                    <span class="interval-label">{t("Update:")}</span>
+                    <Select
+                      options={intervalOptionsFor(interval, t)}
+                      selected={String(interval)}
+                      onValueChange={(value) => {
+                        const next = parseIntervalSeconds(value);
+                        if (next !== null) store.setGroupInterval(group.id, next);
+                      }}
+                      class="list-interval"
+                      ariaLabel={t("Update:")}
+                      showSelectedDescription={false}
+                    />
+                  </span>
+                  <span class="own-count">{ownRulesCount} {t("of its own")}</span>
+                </div>
+              </div>
             {/if}
           </div>
         </div>
@@ -514,12 +547,23 @@
           </Tooltip>
 
           {#if hasList}
-            <Tooltip value={t(listSaved ? "Sync List" : "Save the group to sync its list")}>
+            <Tooltip
+              value={t(
+                !listSaved
+                  ? "Save the group to sync its list"
+                  : listCount > 1
+                    ? "Sync all lists"
+                    : "Sync List",
+              )}
+            >
               <Button
                 small
                 inactive={!listSaved}
                 aria-disabled={!listSaved}
-                onclick={() => store.lists.requestSync(group.id)}
+                onclick={() =>
+                  group.lists.length === 1
+                    ? store.lists.syncList(group.id, group.lists[0].id)
+                    : store.lists.syncGroup(group.id)}
               >
                 <Refresh size={20} />
               </Button>
@@ -680,15 +724,23 @@
             />
           {/if}
 
-          {#if hasList && group.list}
+          {#each group.lists ?? [] as list (list.id)}
+            {@const listPage = listPageOf(list.id)}
+            {@const matched =
+              listPage?.q === store.normalizedSearch ? listPage.matched : (list.rulesTotal ?? 0)}
+            {@const changed = store.lists.ruleEdits(group.id, list.id).length}
+            {@const displayed = listPage?.rules ?? []}
             <div class="rules-section-header list-section-header">
               <h3>{t("From the list")}</h3>
+              {#if listCount > 1}
+                <span class="list-section-name" title={list.url}>{listName(list.url)}</span>
+              {/if}
               <span class="rules-section-hint">
-                {listMatchedCount} · {listChangedCount}
+                {matched} · {changed}
                 {t("changed by hand")}
               </span>
             </div>
-            {#if listMatchedCount > 0}
+            {#if matched > 0}
               <div class="list-rules-header">
                 <div class="list-rules-header-column"></div>
                 <div class="list-rules-header-column type">{t("Type")}</div>
@@ -697,25 +749,27 @@
               </div>
             {/if}
             <div class="list-rules">
-              {#each listDisplayedRules as rule, i (rule.id)}
+              {#each displayed as rule, i (`${list.id}/${rule.id}`)}
                 <ListRuleRow
-                  key={rule.id}
-                  bind:rule={listDisplayedRules[i]}
+                  key={`${list.id}/${rule.id}`}
+                  bind:rule={displayed[i]}
                   rule_index={(listPage?.offset ?? 0) + i}
                   group_id={group.id}
+                  list_id={list.id}
                   style={i % 2 ? "" : "background-color: var(--bg-light)"}
                 />
               {/each}
             </div>
-            {#if listUsePagination}
+            {#if matched > LIST_PAGE_SIZE}
               <Pagination
-                totalItems={listMatchedCount}
+                totalItems={matched}
                 pageSize={LIST_PAGE_SIZE}
-                currentPage={listCurrentPage}
-                onPageChange={(p) => store.lists.loadRules(group.id, (p - 1) * LIST_PAGE_SIZE)}
+                currentPage={Math.floor((listPage?.offset ?? 0) / LIST_PAGE_SIZE) + 1}
+                onPageChange={(p) =>
+                  store.lists.loadRules(group.id, list.id, (p - 1) * LIST_PAGE_SIZE)}
               />
             {/if}
-          {/if}
+          {/each}
         </div>
       </Collapsible.Content>
     </Collapsible.Root>
@@ -740,6 +794,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      column-gap: 0.75rem;
       padding: 0.5rem;
       border-radius: 0.5rem;
       background-color: var(--bg-light);
@@ -1114,6 +1169,66 @@
     color: var(--text-2);
   }
 
+  .list-section-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-2);
+  }
+
+  .list-section-header .rules-section-hint {
+    flex: none;
+  }
+
+  .lists-line {
+    margin-left: 0.4rem;
+    overflow: hidden;
+    font-size: 0.8rem;
+    color: var(--text-2);
+  }
+
+  .lists-line-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    row-gap: 0.3rem;
+    margin-left: -0.9rem;
+  }
+
+  .lists-line-row > * {
+    margin-left: 0.9rem;
+  }
+
+  .update-interval {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .update-interval :global([data-select-trigger]) {
+    padding: 0.1rem 0.3rem;
+    font-size: 0.85rem;
+    color: var(--text-2);
+  }
+
+  .update-interval :global(.selected-value) {
+    padding-left: 0;
+  }
+
+  .own-count {
+    position: relative;
+  }
+
+  .own-count::before {
+    content: "•";
+    position: absolute;
+    right: calc(100% + 0.25rem);
+    opacity: 0.5;
+  }
+
   .list-section-header {
     margin-top: 0.4rem;
     border-top: 1px solid var(--bg-light-extra);
@@ -1232,6 +1347,10 @@
   }
 
   @media (max-width: 700px) {
+    .update-interval :global([data-select-trigger]) {
+      min-height: 2rem;
+    }
+
     .group-header {
       display: flex;
       flex-direction: column;

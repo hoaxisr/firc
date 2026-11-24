@@ -42,6 +42,9 @@ const patchGlobal = (key: string, value: unknown) => {
 };
 
 const restoreLocalStorage = patchGlobal("localStorage", createMemoryStorage());
+const LID = "0a0a0a0a";
+const K = (groupId: string) => `${groupId}/${LID}`;
+
 type ProcessLike = { env?: unknown };
 const processObj = (globalThis as unknown as { process?: ProcessLike }).process;
 const originalProcessEnvDescriptor = processObj
@@ -93,6 +96,9 @@ function installFetchStub(handlers: Record<string, Handler>) {
 
     if (path === "/groups?with_rules=true" && !(path in handlers) && seeded) {
       return { ok: true, status: 200, json: async () => ({ groups: structuredClone(seeded) }) };
+    }
+    if (path === "/system/netfilter" && !(path in handlers)) {
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
     }
     if (!(path in handlers)) {
       throw new Error(`unstubbed fetch: ${path}`);
@@ -208,16 +214,34 @@ async function withWindowStub<T>(
   }
 }
 
+const listItem = (id: string, state = "idle", rulesTotal = 0) => ({
+  id: LID,
+  url: `https://example.com/${id}.txt`,
+  interval: 86400,
+  lastUpdate: 1700000000,
+  rulesTotal,
+  sync: { state, error: "", lastCheck: 1700000000 },
+});
+
 const listRecord = (id: string, state = "idle", rulesTotal = 0) => ({
   id,
-  list: {
-    url: `https://example.com/${id}.txt`,
-    interval: 86400,
-    lastUpdate: 1700000000,
-    rulesTotal,
-    sync: { state, error: "", lastCheck: 1700000000 },
-  },
+  lists: [listItem(id, state, rulesTotal)],
 });
+
+const listEvent = (
+  id: string,
+  state = "idle",
+  rulesTotal = 0,
+  over: Record<string, unknown> = {},
+) => ({ groupId: id, listId: LID, list: { ...listItem(id, state, rulesTotal), ...over } });
+
+const progressEvent = (id: string, progress: Record<string, unknown>) =>
+  listEvent(id, "fetching", 0, {
+    sync: { state: "fetching", error: "", lastCheck: 1700000000, progress },
+  });
+
+const failedEvent = (id: string, message: string) =>
+  listEvent(id, "error", 0, { sync: { state: "error", error: message, lastCheck: 1700000000 } });
 
 const makeGroup = (id: string, rulesTotal = 0) => ({
   id,
@@ -226,13 +250,16 @@ const makeGroup = (id: string, rulesTotal = 0) => ({
   enable: true,
   devices: { allow: [], deny: [] },
   rules: [],
-  list: {
-    url: `https://example.com/${id}.txt`,
-    interval: 86400,
-    lastUpdate: 1700000000,
-    rulesTotal,
-    sync: { state: "idle", error: "", lastCheck: 1700000000 },
-  },
+  lists: [
+    {
+      id: LID,
+      url: `https://example.com/${id}.txt`,
+      interval: 86400,
+      lastUpdate: 1700000000,
+      rulesTotal,
+      sync: { state: "idle", error: "", lastCheck: 1700000000 },
+    },
+  ],
 });
 
 const rulesPage = (count: number) => ({
@@ -259,9 +286,9 @@ describe("a group's list, synced over its event stream", () => {
     const id = "a1b2c3d4";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: { status: 202, json: listRecord(id, "queued") },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: { json: rulesPage(3) },
+      [`/groups/${id}/lists/${LID}/sync`]: { status: 202, json: listRecord(id, "queued") },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(3) },
     });
 
     try {
@@ -270,31 +297,28 @@ describe("a group's list, synced over its event stream", () => {
       store.open_state[id] = true;
 
       await withWindowStub(async (toasts) => {
-        const pending = store.lists.requestSync(id);
+        const pending = store.lists.syncList(id, LID);
         const source = await streams.open(1);
-        source.emit("done", {
-          ...listRecord(id, "idle", 3),
-          list: { ...listRecord(id, "idle", 3).list, lastUpdate: 1800000000 },
-        });
+        source.emit("done", listEvent(id, "idle", 3, { lastUpdate: 1800000000 }));
         source.close();
         await pending;
 
         const group = store.data[0];
-        assert.strictEqual(group.list.rulesTotal, 3);
-        assert.strictEqual(group.list.lastUpdate, 1800000000);
-        assert.strictEqual(group.list.sync.state, "idle");
+        assert.strictEqual(group.lists[0].rulesTotal, 3);
+        assert.strictEqual(group.lists[0].lastUpdate, 1800000000);
+        assert.strictEqual(group.lists[0].sync.state, "idle");
         assert.strictEqual(
-          store.lists.pageState[id].rules.length,
+          store.lists.pageState[K(id)].rules.length,
           3,
           "the page the done event asked for",
         );
-        assert.strictEqual(store.lists.pageState[id].offset, 0);
+        assert.strictEqual(store.lists.pageState[K(id)].offset, 0);
         assert.ok(
-          stub.calls.includes(`/groups/${id}/list/rules?offset=0&limit=50`),
+          stub.calls.includes(`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`),
           "the done event reloads page 0",
         );
         assert.strictEqual(streams.count, 1, "one stream, closed on done, never reopened");
-        assert.strictEqual(store.lists.syncProgress[id], undefined, "the progress is over");
+        assert.strictEqual(store.lists.syncProgress[K(id)], undefined, "the progress is over");
         assert.deepStrictEqual(
           toasts.map((t) => `${t.type}:${t.content}`),
           ["success:Synced"],
@@ -310,8 +334,8 @@ describe("a group's list, synced over its event stream", () => {
     const id = "b2c3d4e5";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: { status: 202, json: listRecord(id, "queued") },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/sync`]: { status: 202, json: listRecord(id, "queued") },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -319,29 +343,29 @@ describe("a group's list, synced over its event stream", () => {
       seed(store, [makeGroup(id)]);
 
       await withWindowStub(async () => {
-        const pending = store.lists.requestSync(id);
+        const pending = store.lists.syncList(id, LID);
         const source = await streams.open(1);
 
-        source.emit("progress", { stage: "fetch", bytes: 100, total: 200 });
+        source.emit("progress", progressEvent(id, { stage: "fetch", bytes: 100, total: 200 }));
         await settle();
-        assert.deepStrictEqual(store.lists.syncProgress[id], {
+        assert.deepStrictEqual(store.lists.syncProgress[K(id)], {
           stage: "fetch",
           bytes: 100,
           total: 200,
           lines: 0,
         });
 
-        source.emit("progress", { stage: "parse", lines: 20000 });
+        source.emit("progress", progressEvent(id, { stage: "parse", lines: 20000 }));
         await settle();
-        assert.strictEqual(store.lists.syncProgress[id].stage, "parse");
-        assert.strictEqual(store.lists.syncProgress[id].lines, 20000);
+        assert.strictEqual(store.lists.syncProgress[K(id)].stage, "parse");
+        assert.strictEqual(store.lists.syncProgress[K(id)].lines, 20000);
 
-        source.emit("done", listRecord(id, "idle"));
+        source.emit("done", listEvent(id, "idle"));
         source.close();
         await pending;
 
         assert.strictEqual(
-          store.lists.syncProgress[id],
+          store.lists.syncProgress[K(id)],
           undefined,
           "a finished sync leaves no progress behind",
         );
@@ -355,8 +379,8 @@ describe("a group's list, synced over its event stream", () => {
     const id = "c3d4e5f6";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: { status: 202, json: listRecord(id, "queued") },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/sync`]: { status: 202, json: listRecord(id, "queued") },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -365,21 +389,21 @@ describe("a group's list, synced over its event stream", () => {
       store.open_state[id] = true;
 
       await withWindowStub(async (toasts) => {
-        const pending = store.lists.requestSync(id);
+        const pending = store.lists.syncList(id, LID);
         const source = await streams.open(1);
-        source.emit("error", { error: "fetch failed: HTTP 404" });
+        source.emit("done", failedEvent(id, "fetch failed: HTTP 404"));
         source.close();
         await pending;
 
         const group = store.data[0];
-        assert.strictEqual(group.list.sync.state, "error");
-        assert.strictEqual(group.list.sync.error, "fetch failed: HTTP 404");
+        assert.strictEqual(group.lists[0].sync.state, "error");
+        assert.strictEqual(group.lists[0].sync.error, "fetch failed: HTTP 404");
         assert.deepStrictEqual(
           toasts.map((t) => `${t.type}:${t.content}`),
           ["error:Sync failed: fetch failed: HTTP 404"],
         );
         assert.ok(
-          !stub.calls.some((c) => c.includes("/list/rules")),
+          !stub.calls.some((c) => c.includes("/rules")),
           "a sync that failed replaced no rules, so nothing is reloaded",
         );
         assert.strictEqual(store.canSave, false, "the failure is not an unsaved edit");
@@ -393,8 +417,8 @@ describe("a group's list, synced over its event stream", () => {
     const id = "d4e5f6a7";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: { status: 202, json: listRecord(id, "queued") },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/sync`]: { status: 202, json: listRecord(id, "queued") },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -405,9 +429,9 @@ describe("a group's list, synced over its event stream", () => {
       const originalError = console.error;
       console.error = () => {};
       await withWindowStub(async () => {
-        const pending = store.lists.requestSync(id);
+        const pending = store.lists.syncList(id, LID);
         const first = await streams.open(1);
-        first.emit("progress", { stage: "fetch", bytes: 10, total: 100 });
+        first.emit("progress", progressEvent(id, { stage: "fetch", bytes: 10, total: 100 }));
         await settle();
         first.fail();
         await settle();
@@ -415,11 +439,11 @@ describe("a group's list, synced over its event stream", () => {
         assert.strictEqual(streams.count, 1, "the reopen waits rather than spinning");
 
         const second = await streams.open(2);
-        second.emit("done", listRecord(id, "idle", 7));
+        second.emit("done", listEvent(id, "idle", 7));
         second.close();
         await pending;
 
-        assert.strictEqual(store.data[0].list.rulesTotal, 7);
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 7);
         assert.strictEqual(streams.count, 2, "reopened once");
       });
       console.error = originalError;
@@ -432,18 +456,19 @@ describe("a group's list, synced over its event stream", () => {
     const id = "e5f6a7b8";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id)]);
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
 
       await withWindowStub(async (toasts) => {
         const first = store.lists.followSync(id);
         const second = store.lists.followSync(id);
         const source = await streams.open(1);
-        source.emit("done", listRecord(id, "idle"));
+        source.emit("done", listEvent(id, "idle"));
         source.close();
         await Promise.all([first, second]);
 
@@ -459,7 +484,7 @@ describe("a group's list, synced over its event stream", () => {
     const id = "f6a7b8c9";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -470,7 +495,7 @@ describe("a group's list, synced over its event stream", () => {
       await withWindowStub(async (toasts) => {
         const pending = store.lists.followSync(id);
         const source = await streams.open(1);
-        source.emit("progress", { stage: "fetch", bytes: 10, total: 100 });
+        source.emit("progress", progressEvent(id, { stage: "fetch", bytes: 10, total: 100 }));
         await settle();
 
         store.destroy();
@@ -490,7 +515,7 @@ describe("a group's list, synced over its event stream", () => {
     const id = "b8c9d0e1";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -501,9 +526,9 @@ describe("a group's list, synced over its event stream", () => {
       await withWindowStub(async (toasts) => {
         const pending = store.lists.followSync(id);
         const source = await streams.open(1);
-        source.emit("progress", { stage: "fetch", bytes: 10, total: 100 });
+        source.emit("progress", progressEvent(id, { stage: "fetch", bytes: 10, total: 100 }));
         await settle();
-        assert.ok(store.lists.syncProgress[id], "fixture: the bar is being drawn for this id");
+        assert.ok(store.lists.syncProgress[K(id)], "fixture: the bar is being drawn for this id");
 
         store.lists.forget(id);
 
@@ -515,7 +540,7 @@ describe("a group's list, synced over its event stream", () => {
         assert.ok(ended, "the follow ended instead of going on watching a forgotten id");
         assert.strictEqual(streams.count, 1, "and it was not reopened for that id either");
         assert.strictEqual(
-          store.lists.syncProgress[id],
+          store.lists.syncProgress[K(id)],
           undefined,
           "and no bar is left behind for it",
         );
@@ -531,8 +556,8 @@ describe("a group's list, synced over its event stream", () => {
     const streams = syncStreams();
     let listReads = 0;
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: { status: 202, json: listRecord(id, "queued") },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/sync`]: { status: 202, json: listRecord(id, "queued") },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups": () => {
         listReads++;
         return { json: { groups: [makeGroup(id, 9)] } };
@@ -547,7 +572,7 @@ describe("a group's list, synced over its event stream", () => {
       const originalError = console.error;
       console.error = () => {};
       await withWindowStub(async (toasts) => {
-        const pending = store.lists.requestSync(id);
+        const pending = store.lists.syncList(id, LID);
         (await streams.open(1)).fail();
         (await streams.open(2)).fail();
         await pending;
@@ -555,13 +580,13 @@ describe("a group's list, synced over its event stream", () => {
 
         assert.strictEqual(streams.count, 2, "two attempts, not a reconnect loop");
         assert.strictEqual(listReads, 1, "the record is re-read exactly once");
-        assert.strictEqual(store.data[0].list.rulesTotal, 9);
-        assert.strictEqual(store.data[0].list.sync.state, "idle", "no longer stuck at queued");
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 9);
+        assert.strictEqual(store.data[0].lists[0].sync.state, "idle", "no longer stuck at queued");
         assert.deepStrictEqual(
           toasts.map((t) => `${t.type}:${t.content}`),
           ["error:Sync connection lost"],
         );
-        assert.strictEqual(store.lists.syncProgress[id], undefined);
+        assert.strictEqual(store.lists.syncProgress[K(id)], undefined);
         assert.strictEqual(store.canSave, false, "a re-read record is not an unsaved edit");
       });
       console.error = originalError;
@@ -591,18 +616,18 @@ describe("a group's list, synced over its event stream", () => {
     const putHeld = new Promise<void>((resolve) => (releasePut = resolve));
 
     const stub = installFetchStub({
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: () => ({
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: () => ({
         json: synced ? page(0, "post", 5, 5) : page(0, "pre", 100, 50),
       }),
-      [`/groups/${id}/list/rules?offset=50&limit=50`]: () => ({
+      [`/groups/${id}/lists/${LID}/rules?offset=50&limit=50`]: () => ({
         json: page(50, "pre", 100, 50),
       }),
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups": async () => {
         await putHeld;
         return { json: { status: "ok" } };
       },
-      [`/groups/${id}/list/rules?save=true`]: { json: { status: "ok" } },
+      [`/groups/${id}/lists/${LID}/rules?save=true`]: { json: { status: "ok" } },
     });
 
     try {
@@ -612,11 +637,12 @@ describe("a group's list, synced over its event stream", () => {
       store.open_state[id] = true;
 
       await withWindowStub(async () => {
-        await store.lists.loadRules(id, 0);
-        store.lists.pageState[id].rules[0].enable = false;
-        await store.lists.loadRules(id, 50);
+        await store.lists.loadRules(id, LID, 0);
+        store.lists.pageState[K(id)].rules[0].enable = false;
+        await store.lists.loadRules(id, LID, 50);
         assert.strictEqual(store.canSave, true);
 
+        store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
         const follow = store.lists.followSync(id);
         const source = await streams.open(1);
 
@@ -624,27 +650,28 @@ describe("a group's list, synced over its event stream", () => {
         await settle();
 
         synced = true;
-        source.emit("done", {
-          ...listRecord(id, "idle", 5),
-          list: { ...listRecord(id, "idle", 5).list, lastUpdate: 1800000000 },
-        });
+        source.emit("done", listEvent(id, "idle", 5, { lastUpdate: 1800000000 }));
         source.close();
         await follow;
 
-        assert.strictEqual(store.data[0].list.rulesTotal, 5, "the done landed");
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 5, "the done landed");
 
         releasePut();
         await saving;
 
-        assert.strictEqual(store.data[0].list.rulesTotal, 5, "and the Save did not roll it back");
-        assert.strictEqual(store.data[0].list.lastUpdate, 1800000000);
-        assert.strictEqual(store.data[0].list.sync.state, "idle");
         assert.strictEqual(
-          store.lists.pageState[id].rules[0].id,
+          store.data[0].lists[0].rulesTotal,
+          5,
+          "and the Save did not roll it back",
+        );
+        assert.strictEqual(store.data[0].lists[0].lastUpdate, 1800000000);
+        assert.strictEqual(store.data[0].lists[0].sync.state, "idle");
+        assert.strictEqual(
+          store.lists.pageState[K(id)].rules[0].id,
           "post0000",
           "nor the page it loaded",
         );
-        assert.strictEqual(store.lists.pageState[id].offset, 0);
+        assert.strictEqual(store.lists.pageState[K(id)].offset, 0);
       });
     } finally {
       stub.restore();
@@ -655,7 +682,7 @@ describe("a group's list, synced over its event stream", () => {
     const id = "c9d0e1f2";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -666,11 +693,11 @@ describe("a group's list, synced over its event stream", () => {
       await withWindowStub(async () => {
         const follow = store.lists.followSync(id);
         const source = await streams.open(1);
-        source.emit("done", listRecord(id, "idle"));
+        source.emit("done", listEvent(id, "idle"));
         source.close();
         await follow;
 
-        const at = stub.calls.indexOf(`/groups/${id}/list/sync/events`);
+        const at = stub.calls.indexOf(`/groups/${id}/sync/events`);
         assert.deepStrictEqual(stub.headers[at], { "X-Firc-Token": "session-token" });
       });
     } finally {
@@ -682,7 +709,7 @@ describe("a group's list, synced over its event stream", () => {
   it("a 401 on the stream resets the session and does not reopen", async () => {
     const id = "d0e1f2a3";
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: { status: 401 },
+      [`/groups/${id}/sync/events`]: { status: 401 },
     });
 
     try {
@@ -713,7 +740,7 @@ describe("a group's list, synced over its event stream", () => {
     const streams = syncStreams();
     let opens = 0;
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => {
+      [`/groups/${id}/sync/events`]: (init) => {
         opens++;
         return opens === 1 ? { body: streams.body(init.signal) } : { status: 401 };
       },
@@ -730,9 +757,9 @@ describe("a group's list, synced over its event stream", () => {
       await withWindowStub(async () => {
         const pending = store.lists.followSync(id);
         const source = await streams.open(1);
-        source.emit("progress", { stage: "fetch", bytes: 10, total: 100 });
+        source.emit("progress", progressEvent(id, { stage: "fetch", bytes: 10, total: 100 }));
         await settle();
-        assert.ok(store.lists.syncProgress[id], "fixture: the bar is being drawn for this id");
+        assert.ok(store.lists.syncProgress[K(id)], "fixture: the bar is being drawn for this id");
 
         source.fail();
         await pending;
@@ -741,7 +768,7 @@ describe("a group's list, synced over its event stream", () => {
         assert.strictEqual(opens, 2, "fixture: the drop was reopened, and that reopen got the 401");
         assert.strictEqual(token.current, undefined, "fixture: the session was thrown away");
         assert.strictEqual(
-          store.lists.syncProgress[id],
+          store.lists.syncProgress[K(id)],
           undefined,
           "a refused reopen must leave no bar behind either",
         );
@@ -780,19 +807,21 @@ describe("a group's list, synced over its event stream", () => {
   // Catches a re-read of a still queued or fetching sync being applied as done.
   it("a re-read that finds the sync still running does not apply it as done", async () => {
     const id = "5411c0de";
-    const pageUrl = `/groups/${id}/list/rules?offset=0&limit=50`;
+    const pageUrl = `/groups/${id}/lists/${LID}/rules?offset=0&limit=50`;
     const streams = syncStreams();
     let listReads = 0;
     const stub = installFetchStub({
       [pageUrl]: { json: rulesPage(3) },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups": () => {
         listReads++;
         return {
           json: {
             groups: [makeGroup(id, 4)].map((g) => ({
               ...g,
-              list: { ...g.list, sync: { state: "fetching", error: "", lastCheck: 1700000000 } },
+              lists: [
+                { ...g.lists[0], sync: { state: "fetching", error: "", lastCheck: 1700000000 } },
+              ],
             })),
           },
         };
@@ -802,12 +831,13 @@ describe("a group's list, synced over its event stream", () => {
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 3)]);
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
       store.open_state[id] = true;
       store.lists.syncReopenMs = 20;
 
-      await store.lists.loadRules(id, 0);
-      store.lists.pageState[id].rules[0].enable = false;
-      assert.strictEqual(store.lists.ruleEdits(id).length, 1, "fixture: an edit is waiting");
+      await store.lists.loadRules(id, LID, 0);
+      store.lists.pageState[K(id)].rules[0].enable = false;
+      assert.strictEqual(store.lists.ruleEdits(id, LID).length, 1, "fixture: an edit is waiting");
 
       const originalError = console.error;
       console.error = () => {};
@@ -826,7 +856,7 @@ describe("a group's list, synced over its event stream", () => {
         );
 
         assert.strictEqual(
-          store.data[0].list.sync.state,
+          store.data[0].lists[0].sync.state,
           "fetching",
           "the record says what the daemon says",
         );
@@ -835,9 +865,13 @@ describe("a group's list, synced over its event stream", () => {
           1,
           "but no page is re-read for a list that has not arrived",
         );
-        assert.strictEqual(store.data[0].list.rulesTotal, 3, "and the count is left where it was");
         assert.strictEqual(
-          store.lists.ruleEdits(id).length,
+          store.data[0].lists[0].rulesTotal,
+          3,
+          "and the count is left where it was",
+        );
+        assert.strictEqual(
+          store.lists.ruleEdits(id, LID).length,
           1,
           "and the edit waiting on that page is still there",
         );
@@ -858,23 +892,27 @@ describe("a group's list, synced over its event stream", () => {
             makeGroup("aaaaaaa1", 0),
             {
               ...makeGroup("aaaaaaa2", 0),
-              list: {
-                ...makeGroup("aaaaaaa2").list,
-                sync: { state: "queued", error: "", lastCheck: 0 },
-              },
+              lists: [
+                {
+                  ...makeGroup("aaaaaaa2").lists[0],
+                  sync: { state: "queued", error: "", lastCheck: 0 },
+                },
+              ],
             },
             {
               ...makeGroup("aaaaaaa3", 0),
-              list: {
-                ...makeGroup("aaaaaaa3").list,
-                sync: { state: "fetching", error: "", lastCheck: 0 },
-              },
+              lists: [
+                {
+                  ...makeGroup("aaaaaaa3").lists[0],
+                  sync: { state: "fetching", error: "", lastCheck: 0 },
+                },
+              ],
             },
           ],
         },
       },
-      "/groups/aaaaaaa2/list/sync/events": (init) => ({ body: streams.body(init.signal) }),
-      "/groups/aaaaaaa3/list/sync/events": (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/aaaaaaa2/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/aaaaaaa3/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
@@ -886,13 +924,13 @@ describe("a group's list, synced over its event stream", () => {
 
         assert.deepStrictEqual(
           stub.calls.filter((c) => c.endsWith("/sync/events")).sort(),
-          ["/groups/aaaaaaa2/list/sync/events", "/groups/aaaaaaa3/list/sync/events"],
+          [`/groups/aaaaaaa2/sync/events`, `/groups/aaaaaaa3/sync/events`],
           "the two running syncs are followed and the idle one is not",
         );
 
         for (let n = 1; n <= streams.count; n++) {
           const source = await streams.open(n);
-          source.emit("error", { error: "stopped" });
+          source.emit("done", failedEvent("aaaaaaa2", "stopped"));
           source.close();
         }
         await settle();
@@ -906,13 +944,16 @@ describe("a group's list, synced over its event stream", () => {
 describe("a Save that starts a sync", () => {
   const queuedRecord = (id: string, url: string) => ({
     ...makeGroup(id),
-    list: {
-      url,
-      interval: 86400,
-      lastUpdate: 0,
-      rulesTotal: 0,
-      sync: { state: "queued", error: "", lastCheck: 0 },
-    },
+    lists: [
+      {
+        id: LID,
+        url,
+        interval: 86400,
+        lastUpdate: 0,
+        rulesTotal: 0,
+        sync: { state: "queued", error: "", lastCheck: 0 },
+      },
+    ],
   });
 
   // Catches saveChanges not reading the PUT's answer, so no stream opens for the added list.
@@ -922,38 +963,39 @@ describe("a Save that starts a sync", () => {
     const streams = syncStreams();
     const stub = installFetchStub({
       "/groups?save=true": { json: { groups: [queuedRecord(id, url)] } },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: { json: rulesPage(3) },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(3) },
     });
 
     try {
       const store = new GroupsStore();
-      const { list: _list, ...bare } = makeGroup(id);
-      seed(store, [bare as any]);
+      seed(store, [{ ...makeGroup(id), lists: [] }]);
       store.open_state[id] = true;
-      store.data[0].list = {
+      store.data[0].lists.push({
+        id: LID,
         url,
         interval: 86400,
         lastUpdate: 0,
         rulesTotal: 0,
         sync: { state: "idle", error: "", lastCheck: 0 },
-      };
+      });
       assert.strictEqual(store.canSave, true, "fixture: attaching a list makes Save reachable");
 
       await withWindowStub(async (toasts) => {
         await store.saveChanges();
-        assert.strictEqual(store.data[0].list.sync.state, "queued", "the answer's state, applied");
+        assert.strictEqual(
+          store.data[0].lists[0].sync.state,
+          "queued",
+          "the answer's state, applied",
+        );
 
         const source = await streams.open(1);
-        source.emit("done", {
-          ...queuedRecord(id, url),
-          list: { ...listRecord(id, "idle", 3).list, url },
-        });
+        source.emit("done", listEvent(id, "idle", 3, { url }));
         source.close();
         await settle(3, 10);
 
-        assert.strictEqual(store.data[0].list.rulesTotal, 3);
-        assert.strictEqual(store.lists.pageState[id].rules.length, 3, "the list's rules appear");
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 3);
+        assert.strictEqual(store.lists.pageState[K(id)].rules.length, 3, "the list's rules appear");
         assert.deepStrictEqual(
           toasts.map((t) => `${t.type}:${t.content}`),
           ["success:Saved", "success:Synced"],
@@ -971,10 +1013,10 @@ describe("a Save that starts a sync", () => {
     const next = "https://example.com/next.txt";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups?save=true": async () => {
         const old = await streams.open(1);
-        old.emit("error", { error: "list url changed" });
+        old.emit("done", failedEvent(id, "list url changed"));
         old.close();
         await settle();
         return { json: { groups: [queuedRecord(id, next)] } };
@@ -984,10 +1026,10 @@ describe("a Save that starts a sync", () => {
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 5)]);
-      store.data[0].list.sync = { state: "fetching", error: "", lastCheck: 0 };
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
       void store.lists.followSync(id);
       await streams.open(1);
-      store.setListUrl(id, next);
+      store.setListUrl(id, LID, next);
 
       await withWindowStub(async (toasts) => {
         await store.saveChanges();
@@ -998,11 +1040,11 @@ describe("a Save that starts a sync", () => {
           ["success:Saved"],
           "no Sync failed for the sync the Save replaced",
         );
-        assert.strictEqual(store.data[0].list.sync.state, "queued");
-        assert.strictEqual(store.data[0].list.url, next);
-        assert.strictEqual(store.data[0].list.rulesTotal, 0, "the old list's count is gone");
+        assert.strictEqual(store.data[0].lists[0].sync.state, "queued");
+        assert.strictEqual(store.data[0].lists[0].url, next);
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 0, "the old list's count is gone");
 
-        fresh.emit("error", { error: "stopped" });
+        fresh.emit("done", failedEvent(id, "stopped"));
         fresh.close();
         await settle();
       });
@@ -1017,33 +1059,30 @@ describe("a Save that starts a sync", () => {
     const next = "https://example.com/next.txt";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups?save=true": { json: { groups: [queuedRecord(id, next)] } },
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: { json: rulesPage(2) },
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(2) },
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 5)]);
       store.open_state[id] = true;
-      store.data[0].list.sync = { state: "fetching", error: "", lastCheck: 0 };
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
       void store.lists.followSync(id);
       await streams.open(1);
-      store.setListUrl(id, next);
+      store.setListUrl(id, LID, next);
 
       await withWindowStub(async () => {
         await store.saveChanges();
         const fresh = await streams.open(2);
-        fresh.emit("done", {
-          ...queuedRecord(id, next),
-          list: { ...listRecord(id, "idle", 2).list, url: next },
-        });
+        fresh.emit("done", listEvent(id, "idle", 2, { url: next }));
         fresh.close();
         await settle(3, 10);
 
         assert.strictEqual(streams.count, 2);
-        assert.strictEqual(store.data[0].list.rulesTotal, 2);
-        assert.strictEqual(store.data[0].list.sync.state, "idle");
+        assert.strictEqual(store.data[0].lists[0].rulesTotal, 2);
+        assert.strictEqual(store.data[0].lists[0].sync.state, "idle");
       });
     } finally {
       stub.restore();
@@ -1057,36 +1096,39 @@ describe("a Save that starts a sync", () => {
     const streams = syncStreams();
     let configSaves = 0;
     const stub = installFetchStub({
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: { json: rulesPage(3) },
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(3) },
       "/groups": { json: { groups: [queuedRecord(id, next)] } },
-      [`/groups/${id}/list/rules?save=true`]: { status: 404, json: { error: "rule not found" } },
+      [`/groups/${id}/lists/${LID}/rules?save=true`]: {
+        status: 404,
+        json: { error: "rule not found" },
+      },
       "/system/config/save": () => {
         configSaves++;
         return { json: { status: "ok" } };
       },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 3)]);
       store.open_state[id] = true;
-      await store.lists.loadRules(id, 0);
-      store.lists.pageState[id].rules[0].enable = false;
-      store.setListUrl(id, next);
+      await store.lists.loadRules(id, LID, 0);
+      store.lists.pageState[K(id)].rules[0].enable = false;
+      store.setListUrl(id, LID, next);
 
       await withWindowStub(async (toasts) => {
         await store.saveChanges();
         assert.ok(
-          !stub.calls.includes(`/groups/${id}/list/rules?save=true`),
+          !stub.calls.includes(`/groups/${id}/lists/${LID}/rules?save=true`),
           `no PATCH for dropped rules, got: ${stub.calls.join(", ")}`,
         );
         assert.strictEqual(configSaves, 1, "the one write the Save owes");
-        assert.deepStrictEqual(store.lists.ruleEdits(id), []);
+        assert.deepStrictEqual(store.lists.ruleEdits(id, LID), []);
         assert.ok(toasts.some((t) => t.content === "Saved"));
 
         const source = await streams.open(1);
-        source.emit("error", { error: "stopped" });
+        source.emit("done", failedEvent(id, "stopped"));
         source.close();
         await settle();
       });
@@ -1101,41 +1143,49 @@ describe("a Save that starts a sync", () => {
     const url = `https://example.com/${id}.txt`;
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: { json: rulesPage(3) },
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(3) },
       "/groups": {
         json: {
           groups: [
             {
               ...makeGroup(id, 3),
-              list: {
-                ...makeGroup(id, 3).list,
-                sync: { state: "fetching", error: "", lastCheck: 0 },
-              },
+              lists: [
+                {
+                  ...makeGroup(id, 3).lists[0],
+                  sync: { state: "fetching", error: "", lastCheck: 0 },
+                },
+              ],
             },
           ],
         },
       },
-      [`/groups/${id}/list/rules?save=true`]: { json: { status: "ok" } },
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/rules?save=true`]: { json: { status: "ok" } },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 3)]);
       store.open_state[id] = true;
-      await store.lists.loadRules(id, 0);
-      store.lists.pageState[id].rules[0].enable = false;
-      assert.strictEqual(store.data[0].list.url, url, "fixture: the url is the saved one");
+      await store.lists.loadRules(id, LID, 0);
+      store.lists.pageState[K(id)].rules[0].enable = false;
+      assert.strictEqual(store.data[0].lists[0].url, url, "fixture: the url is the saved one");
 
       await withWindowStub(async () => {
         await store.saveChanges();
-        const patch = stub.requests.find((r) => r.path === `/groups/${id}/list/rules?save=true`);
+        const patch = stub.requests.find(
+          (r) => r.path === `/groups/${id}/lists/${LID}/rules?save=true`,
+        );
         assert.ok(patch, `the PATCH is sent, got: ${stub.calls.join(", ")}`);
         assert.deepStrictEqual(patch!.body, { rules: [{ id: "rule0000", enable: false }] });
-        assert.strictEqual(store.data[0].list.sync.state, "fetching", "the running sync, adopted");
+        assert.strictEqual(
+          store.data[0].lists[0].sync.state,
+          "fetching",
+          "the running sync, adopted",
+        );
 
         const source = await streams.open(1);
-        source.emit("error", { error: "stopped" });
+        source.emit("done", failedEvent(id, "stopped"));
         source.close();
         await settle();
       });
@@ -1149,23 +1199,23 @@ describe("a Save that starts a sync", () => {
     const id = "5a0e0007";
     const streams = syncStreams();
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id, 5)]);
-      store.data[0].list.sync = { state: "fetching", error: "", lastCheck: 1700000000 };
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 1700000000 };
       const follow = store.lists.followSync(id);
       const source = await streams.open(1);
-      store.setListUrl(id, "https://example.com/elsewhere.txt");
+      store.setListUrl(id, LID, "https://example.com/elsewhere.txt");
       await withWindowStub(async (toasts) => {
-        source.emit("error", { error: "list url changed" });
+        source.emit("done", failedEvent(id, "list url changed"));
         source.close();
         await follow;
 
         assert.deepStrictEqual(toasts, [], "superseded, not failed");
-        assert.deepStrictEqual(store.data[0].list.sync, {
+        assert.deepStrictEqual(store.data[0].lists[0].sync, {
           state: "idle",
           error: "",
           lastCheck: 1700000000,
@@ -1184,14 +1234,14 @@ describe("the lost-stream re-read", () => {
     const streams = syncStreams();
     const { rules: _rules, ...rulesless } = makeGroup(id, 9);
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
       "/groups": { json: { groups: [rulesless] } },
     });
 
     try {
       const store = new GroupsStore();
       seed(store, [makeGroup(id)]);
-      store.data[0].list.sync = { state: "queued", error: "", lastCheck: 0 };
+      store.data[0].lists[0].sync = { state: "queued", error: "", lastCheck: 0 };
       store.lists.syncReopenMs = 20;
 
       const originalError = console.error;
@@ -1205,8 +1255,263 @@ describe("the lost-stream re-read", () => {
       });
       console.error = originalError;
 
-      assert.strictEqual(store.data[0].list.rulesTotal, 9);
-      assert.strictEqual(store.data[0].list.sync.state, "idle");
+      assert.strictEqual(store.data[0].lists[0].rulesTotal, 9);
+      assert.strictEqual(store.data[0].lists[0].sync.state, "idle");
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+describe("two lists of one group, synced together", () => {
+  const LID2 = "0b0b0b0b";
+  const twoLists = (id: string, a = "idle", b = "idle") => {
+    const base = makeGroup(id);
+    return {
+      ...base,
+      lists: [
+        { ...base.lists[0], sync: { state: a, error: "", lastCheck: 0 } },
+        {
+          ...base.lists[0],
+          id: LID2,
+          url: `https://example.com/${id}-b.txt`,
+          sync: { state: b, error: "", lastCheck: 0 },
+        },
+      ],
+    };
+  };
+  const eventOf = (
+    id: string,
+    listId: string,
+    sync: Record<string, unknown>,
+    over: Record<string, unknown> = {},
+  ) => ({
+    groupId: id,
+    listId,
+    list: { id: listId, url: `https://example.com/${id}.txt`, rulesTotal: 0, ...over, sync },
+  });
+
+  // Catches sync state kept per group, so an event for list B moves list A too.
+  it("two lists keep separate sync state", async () => {
+    const id = "7a7a0001";
+    const streams = syncStreams();
+    const stub = installFetchStub({
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id, "idle", "queued") as any]);
+
+      await withWindowStub(async () => {
+        const follow = store.lists.followSync(id);
+        const source = await streams.open(1);
+        source.emit(
+          "progress",
+          eventOf(id, LID2, {
+            state: "fetching",
+            error: "",
+            lastCheck: 0,
+            progress: { stage: "fetch", bytes: 10, total: 100 },
+          }),
+        );
+        await settle();
+
+        assert.strictEqual(store.data[0].lists[1].sync.state, "fetching");
+        assert.strictEqual(store.data[0].lists[0].sync.state, "idle", "list A is untouched");
+        assert.deepStrictEqual(store.lists.syncProgress[`${id}/${LID2}`], {
+          stage: "fetch",
+          bytes: 10,
+          total: 100,
+          lines: 0,
+        });
+        assert.strictEqual(store.lists.syncProgress[K(id)], undefined, "and has no bar");
+
+        source.emit("done", eventOf(id, LID2, { state: "idle", error: "", lastCheck: 5 }));
+        source.close();
+        await follow;
+      });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a failed list ending the stream or sinking the list still running beside it.
+  it("a list that failed is told while its sibling goes on", async () => {
+    const id = "7a7a0002";
+    const streams = syncStreams();
+    const stub = installFetchStub({
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id, "fetching", "fetching") as any]);
+
+      await withWindowStub(async (toasts) => {
+        const follow = store.lists.followSync(id);
+        const source = await streams.open(1);
+        source.emit(
+          "progress",
+          eventOf(id, LID, { state: "error", error: "HTTP 404", lastCheck: 7 }),
+        );
+        await settle();
+
+        assert.strictEqual(store.data[0].lists[0].sync.state, "error");
+        assert.strictEqual(store.data[0].lists[0].sync.error, "HTTP 404");
+        assert.strictEqual(store.data[0].lists[1].sync.state, "fetching", "B is still running");
+        assert.deepStrictEqual(
+          toasts.map((t) => `${t.type}:${t.content}`),
+          ["error:Sync failed: HTTP 404"],
+        );
+
+        source.emit("done", eventOf(id, LID2, { state: "idle", error: "", lastCheck: 8 }));
+        source.close();
+        await follow;
+        assert.strictEqual(streams.count, 1, "one stream carried both lists");
+      });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a restated idle list being toasted as a finished sync.
+  it("an idle list restated by the stream is not reported as synced", async () => {
+    const id = "7a7a0003";
+    const streams = syncStreams();
+    const stub = installFetchStub({
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id, "idle", "fetching") as any]);
+
+      await withWindowStub(async (toasts) => {
+        const follow = store.lists.followSync(id);
+        const source = await streams.open(1);
+        source.emit("progress", eventOf(id, LID, { state: "idle", error: "", lastCheck: 0 }));
+        await settle();
+        assert.deepStrictEqual(toasts, []);
+
+        source.emit("done", eventOf(id, LID2, { state: "idle", error: "", lastCheck: 9 }));
+        source.close();
+        await follow;
+        assert.deepStrictEqual(
+          toasts.map((t) => t.content),
+          ["Synced"],
+          "only the list that was running",
+        );
+      });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a done that restates an idle list being applied as a finished sync, wiping its edits.
+  it("a done restating a locally idle list keeps its pending edits and says nothing", async () => {
+    const id = "7a7a0005";
+    const streams = syncStreams();
+    const stub = installFetchStub({
+      [`/groups/${id}/lists/${LID2}/rules?offset=0&limit=50`]: { json: rulesPage(3) },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: { json: rulesPage(1) },
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id) as any]);
+      store.open_state[id] = true;
+      await store.lists.loadRules(id, LID2, 0);
+      store.lists.pageState[`${id}/${LID2}`].rules[0].enable = false;
+      store.data[0].lists[0].sync = { state: "fetching", error: "", lastCheck: 0 };
+
+      await withWindowStub(async (toasts) => {
+        const follow = store.lists.followSync(id);
+        const source = await streams.open(1);
+        source.emit("progress", eventOf(id, LID, { state: "idle", error: "", lastCheck: 3 }));
+        source.emit("done", eventOf(id, LID2, { state: "idle", error: "", lastCheck: 3 }));
+        source.close();
+        await follow;
+
+        assert.deepStrictEqual(store.lists.ruleEdits(id, LID2), [
+          { id: "rule0000", enable: false },
+        ]);
+        assert.ok(store.lists.pageState[`${id}/${LID2}`], "its page is still loaded");
+        assert.deepStrictEqual(
+          toasts.map((t) => t.content),
+          ["Synced"],
+          "only list A, which was running, is reported",
+        );
+      });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a done whose own list is still running leaving it running after the stream is over.
+  it("a list still running at the final event is re-read once", async () => {
+    const id = "7a7a0006";
+    const streams = syncStreams();
+    let reads = 0;
+    const settled = twoLists(id);
+    settled.lists[1].rulesTotal = 2;
+    const stub = installFetchStub({
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      "/groups": () => {
+        reads++;
+        return { json: { groups: [settled] } };
+      },
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id, "fetching", "fetching") as any]);
+
+      await withWindowStub(async () => {
+        const follow = store.lists.followSync(id);
+        const source = await streams.open(1);
+        source.emit("done", eventOf(id, LID2, { state: "fetching", error: "", lastCheck: 0 }));
+        source.close();
+        await follow;
+
+        assert.strictEqual(reads, 1, "one GET of the group");
+        assert.strictEqual(store.data[0].lists[1].sync.state, "idle", "the daemon's state");
+        assert.strictEqual(store.data[0].lists[0].sync.state, "idle");
+        assert.strictEqual(store.data[0].lists[1].rulesTotal, 2);
+      });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches syncGroup syncing one list, or opening a stream per list.
+  it("syncGroup queues every list through the group route and follows one stream", async () => {
+    const id = "7a7a0004";
+    const streams = syncStreams();
+    const queued = twoLists(id, "queued", "queued");
+    const stub = installFetchStub({
+      [`/groups/${id}/sync`]: { status: 202, json: queued },
+      [`/groups/${id}/sync/events`]: (init) => ({ body: streams.body(init.signal) }),
+      "/groups": { json: { groups: [twoLists(id)] } },
+    });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [twoLists(id) as any]);
+
+      await withWindowStub(async () => {
+        const pending = store.lists.syncGroup(id);
+        const source = await streams.open(1);
+        assert.strictEqual(store.data[0].lists[0].sync.state, "queued");
+        assert.strictEqual(store.data[0].lists[1].sync.state, "queued");
+
+        source.emit("done", eventOf(id, LID2, { state: "idle", error: "", lastCheck: 1 }));
+        source.close();
+        await pending;
+        assert.strictEqual(streams.count, 1);
+        assert.ok(stub.calls.includes(`/groups/${id}/sync`));
+      });
     } finally {
       stub.restore();
     }

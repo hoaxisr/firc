@@ -24,6 +24,8 @@
 #include "firc/port_remap.h"
 #include "firc/ruleset.h"
 #include "firc/yamlio.h"
+#include "test_group_lists_util.h"
+#include "test_app_lists_util.h"
 
 #define URL_A "http://127.0.0.1:1/a"
 #define URL_B "http://127.0.0.1:1/b"
@@ -38,6 +40,7 @@ typedef struct fixture {
 typedef struct heard {
     int calls;
     firc_id_t owner;
+    firc_id_t list;
     bool done;
     char error[256];
 } heard_t;
@@ -48,6 +51,7 @@ static void listener(void *ud, firc_id_t owner, const firc_group_list_t *list, b
     (void)ud;
     g_heard.calls++;
     g_heard.owner = owner;
+    g_heard.list = list->id;
     g_heard.done = done;
     snprintf(g_heard.error, sizeof(g_heard.error), "%s", list->sync_error);
 }
@@ -91,6 +95,8 @@ static bool g_nf_open = false;
 
 static firc_id_t id_of(uint8_t tag) { return (firc_id_t){{tag, tag, tag, tag}}; }
 
+static firc_id_t list_id_of(uint8_t tag, uint8_t i) { return (firc_id_t){{tag, 0x1d, i, 0x1d}}; }
+
 /* A group with a list at `url` and nothing else, as a reload or the WebUI's Save hands it to the app. */
 static firc_group_t *group_with_list(uint8_t tag, const char *url, uint32_t interval) {
     firc_group_t *g = firc_group_new();
@@ -101,12 +107,19 @@ static firc_group_t *group_with_list(uint8_t tag, const char *url, uint32_t inte
         firc_group_free(g);
         return NULL;
     }
-    g->list = firc_group_list_new();
-    if (g->list == NULL || firc_strset(&g->list->url, url) != FIRC_OK) {
+    firc_group_list_t *l = firc_group_list_new();
+    if (l == NULL || firc_strset(&l->url, url) != FIRC_OK) {
+        firc_group_list_free(l);
         firc_group_free(g);
         return NULL;
     }
-    g->list->interval = interval;
+    l->id = list_id_of(tag, 0);
+    l->interval = interval;
+    if (firc_group_add_list(g, l) != FIRC_OK) {
+        firc_group_list_free(l);
+        firc_group_free(g);
+        return NULL;
+    }
     return g;
 }
 
@@ -114,14 +127,14 @@ static firc_group_t *group_with_list(uint8_t tag, const char *url, uint32_t inte
 static firc_group_t *synced_group(uint8_t tag, const char *url, const char *rule) {
     firc_group_t *g = group_with_list(tag, url, 3600);
     if (g == NULL) { return NULL; }
-    if (firc_sub_rules_push(&g->list->rules, rule, FIRC_RULE_NAMESPACE, true, test_random_id()) !=
+    if (firc_sub_rules_push(&g->lists[0]->rules, rule, FIRC_RULE_NAMESPACE, true, test_random_id()) !=
         FIRC_OK) {
         firc_group_free(g);
         return NULL;
     }
-    memset(g->list->body_hash, tag, sizeof(g->list->body_hash));
-    g->list->has_body_hash = true;
-    g->list->last_update = 1234;
+    memset(g->lists[0]->body_hash, tag, sizeof(g->lists[0]->body_hash));
+    g->lists[0]->has_body_hash = true;
+    g->lists[0]->last_update = 1234;
     return g;
 }
 
@@ -148,20 +161,20 @@ TEST a_replace_that_reorders_keeps_every_list(void) {
     ASSERT_EQ(FIRC_OK, replace2(group_with_list(2, URL_B, 7200), group_with_list(1, URL_A, 600)));
 
     firc_group_t *a = live(id_of(1)), *b = live(id_of(2));
-    ASSERT(a != NULL && a->list != NULL && b != NULL && b->list != NULL);
-    ASSERT_EQ(1, a->list->rules.n);
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->list->rules, 0));
-    ASSERT_EQ(1, b->list->rules.n);
-    ASSERT_STR_EQ("two.example", firc_sub_rules_text(&b->list->rules, 0));
-    ASSERT(a->list->has_body_hash && b->list->has_body_hash);
-    ASSERT_EQ(1, a->list->body_hash[0]);
-    ASSERT_EQ(2, b->list->body_hash[0]);
-    ASSERT_EQ(1234, a->list->last_update);
-    ASSERT_EQ(1234, b->list->last_update);
-    ASSERT_EQ(600, a->list->interval);
-    ASSERT_EQ(7200, b->list->interval);
-    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->list->sync_state);
-    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, b->list->sync_state);
+    ASSERT(a != NULL && a->n_lists != 0 && b != NULL && b->n_lists != 0);
+    ASSERT_EQ(1, a->lists[0]->rules.n);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->lists[0]->rules, 0));
+    ASSERT_EQ(1, b->lists[0]->rules.n);
+    ASSERT_STR_EQ("two.example", firc_sub_rules_text(&b->lists[0]->rules, 0));
+    ASSERT(a->lists[0]->has_body_hash && b->lists[0]->has_body_hash);
+    ASSERT_EQ(1, a->lists[0]->body_hash[0]);
+    ASSERT_EQ(2, b->lists[0]->body_hash[0]);
+    ASSERT_EQ(1234, a->lists[0]->last_update);
+    ASSERT_EQ(1234, b->lists[0]->last_update);
+    ASSERT_EQ(600, a->lists[0]->interval);
+    ASSERT_EQ(7200, b->lists[0]->interval);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->lists[0]->sync_state);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, b->lists[0]->sync_state);
     ASSERT_EQ(0, g_heard.calls);
 
     g_fx_open = false;
@@ -192,38 +205,39 @@ TEST a_reload_keeps_the_lists_it_already_has(void) {
                               "    name: ads\n"
                               "    interface: br0\n"
                               "    enable: true\n"
-                              "    list:\n"
-                              "      url: '" URL_A "'\n"
-                              "      interval: 3600\n"
-                              "      last_update: 1700000000\n";
+                              "    lists:\n"
+                              "      - id: 7a7a7a01\n"
+                              "        url: '" URL_A "'\n"
+                              "        interval: 3600\n"
+                              "        last_update: 1700000000\n";
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, load_groups_into_app(doc));
 
     firc_group_t *g = live(id_of(1));
-    ASSERT(g != NULL && g->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->list->rules, "one.example", FIRC_RULE_NAMESPACE,
+    ASSERT(g != NULL && g->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "one.example", FIRC_RULE_NAMESPACE,
                                            true, test_random_id()));
-    memset(g->list->body_hash, 0x5a, sizeof(g->list->body_hash));
-    g->list->has_body_hash = true;
-    g->list->last_update = 1800000000;
-    ASSERT_EQ((int)FIRC_SUB_SYNC_QUEUED, (int)g->list->sync_state);
-    g->list->sync_state = FIRC_SUB_SYNC_IDLE;
-    const char *text = g->list->rules.text;
+    memset(g->lists[0]->body_hash, 0x5a, sizeof(g->lists[0]->body_hash));
+    g->lists[0]->has_body_hash = true;
+    g->lists[0]->last_update = 1800000000;
+    ASSERT_EQ((int)FIRC_SUB_SYNC_QUEUED, (int)g->lists[0]->sync_state);
+    g->lists[0]->sync_state = FIRC_SUB_SYNC_IDLE;
+    const char *text = g->lists[0]->rules.text;
 
     ASSERT_EQ(FIRC_OK, load_groups_into_app(doc));
 
     g = live(id_of(1));
-    ASSERT(g != NULL && g->list != NULL);
-    ASSERT_EQ_FMTm("the arena is kept", (size_t)1, g->list->rules.n, "%zu");
-    ASSERTm("moved, not copied", g->list->rules.text == text);
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&g->list->rules, 0));
-    ASSERTm("the hash is kept", g->list->has_body_hash);
-    uint8_t want[sizeof(g->list->body_hash)];
+    ASSERT(g != NULL && g->n_lists != 0);
+    ASSERT_EQ_FMTm("the arena is kept", (size_t)1, g->lists[0]->rules.n, "%zu");
+    ASSERTm("moved, not copied", g->lists[0]->rules.text == text);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&g->lists[0]->rules, 0));
+    ASSERTm("the hash is kept", g->lists[0]->has_body_hash);
+    uint8_t want[sizeof(g->lists[0]->body_hash)];
     memset(want, 0x5a, sizeof(want));
-    ASSERT_MEM_EQ(want, g->list->body_hash, sizeof(want));
+    ASSERT_MEM_EQ(want, g->lists[0]->body_hash, sizeof(want));
     ASSERT_EQ_FMTm("last_update is the daemon's, not the file's", (uint32_t)1800000000,
-                   g->list->last_update, "%u");
-    ASSERT_EQ_FMTm("nothing is asked for", (int)FIRC_SUB_SYNC_IDLE, (int)g->list->sync_state, "%d");
+                   g->lists[0]->last_update, "%u");
+    ASSERT_EQ_FMTm("nothing is asked for", (int)FIRC_SUB_SYNC_IDLE, (int)g->lists[0]->sync_state, "%d");
     ASSERT_EQ(0, g_heard.calls);
 
     g_fx_open = false;
@@ -235,20 +249,20 @@ TEST a_reload_keeps_the_lists_it_already_has(void) {
 TEST a_replace_with_a_changed_url_starts_empty_and_queues_one_sync(void) {
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, synced_group(1, URL_A, "one.example")));
-    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1)));
-    uint64_t seq = live(id_of(1))->list->sync_seq;
+    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1), list0(g_fx.app, id_of(1))));
+    uint64_t seq = (live(id_of(1)))->lists[0]->sync_seq;
     ASSERTm("fixture: the old list's sync is in flight",
-            live(id_of(1))->list->sync_state == FIRC_SUB_SYNC_QUEUED);
+            (live(id_of(1)))->lists[0]->sync_state == FIRC_SUB_SYNC_QUEUED);
 
     ASSERT_EQ(FIRC_OK, replace2(group_with_list(1, URL_B, 3600), NULL));
 
     firc_group_t *a = live(id_of(1));
-    ASSERT(a != NULL && a->list != NULL);
-    ASSERT_STR_EQ(URL_B, a->list->url);
-    ASSERT_EQ(0, a->list->rules.n);
-    ASSERT_FALSE(a->list->has_body_hash);
-    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, a->list->sync_state);
-    ASSERT_EQ_FMT((unsigned long long)seq + 1, (unsigned long long)a->list->sync_seq, "%llu");
+    ASSERT(a != NULL && a->n_lists != 0);
+    ASSERT_STR_EQ(URL_B, a->lists[0]->url);
+    ASSERT_EQ(0, a->lists[0]->rules.n);
+    ASSERT_FALSE(a->lists[0]->has_body_hash);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, a->lists[0]->sync_state);
+    ASSERT_EQ_FMT((unsigned long long)seq + 1, (unsigned long long)a->lists[0]->sync_seq, "%llu");
 
     ASSERT_EQ(1, g_heard.calls);
     ASSERT(firc_id_equal(id_of(1), g_heard.owner));
@@ -264,16 +278,16 @@ TEST a_replace_with_a_changed_url_starts_empty_and_queues_one_sync(void) {
 TEST a_replace_that_adds_a_list_group_queues_its_sync(void) {
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, synced_group(1, URL_A, "one.example")));
-    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1)));
-    uint64_t seq = live(id_of(1))->list->sync_seq;
+    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1), list0(g_fx.app, id_of(1))));
+    uint64_t seq = (live(id_of(1)))->lists[0]->sync_seq;
 
     ASSERT_EQ(FIRC_OK, replace2(group_with_list(1, URL_A, 3600), group_with_list(2, URL_B, 3600)));
 
     firc_group_t *b = live(id_of(2));
-    ASSERT(b != NULL && b->list != NULL);
-    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, b->list->sync_state);
-    ASSERT_EQ_FMT((unsigned long long)seq + 1, (unsigned long long)b->list->sync_seq, "%llu");
-    ASSERT_EQ_FMT((unsigned long long)seq, (unsigned long long)live(id_of(1))->list->sync_seq,
+    ASSERT(b != NULL && b->n_lists != 0);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, b->lists[0]->sync_state);
+    ASSERT_EQ_FMT((unsigned long long)seq + 1, (unsigned long long)b->lists[0]->sync_seq, "%llu");
+    ASSERT_EQ_FMT((unsigned long long)seq, (unsigned long long)(live(id_of(1)))->lists[0]->sync_seq,
                   "%llu");
     ASSERT_EQ(0, g_heard.calls);
 
@@ -286,17 +300,16 @@ TEST a_replace_that_adds_a_list_group_queues_its_sync(void) {
 TEST a_replace_that_drops_a_list_ends_its_stream(void) {
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, synced_group(1, URL_A, "one.example")));
-    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1)));
+    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1), list0(g_fx.app, id_of(1))));
 
     firc_group_t *bare = group_with_list(1, URL_A, 3600);
     ASSERT(bare != NULL);
-    firc_group_list_free(bare->list);
-    bare->list = NULL;
+    test_group_drop_lists(bare);
     ASSERT_EQ(FIRC_OK, replace2(bare, NULL));
 
     firc_group_t *a = live(id_of(1));
     ASSERT(a != NULL);
-    ASSERT_EQ(NULL, a->list);
+    ASSERT_EQ(0u, a->n_lists);
     ASSERT_EQ(1, g_heard.calls);
     ASSERT(firc_id_equal(id_of(1), g_heard.owner));
     ASSERT(g_heard.done);
@@ -311,7 +324,7 @@ TEST a_replace_that_drops_a_list_ends_its_stream(void) {
 TEST deleting_a_list_group_mid_sync_ends_its_stream(void) {
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, synced_group(1, URL_A, "one.example")));
-    live(id_of(1))->list->sync_state = FIRC_SUB_SYNC_FETCHING;
+    (live(id_of(1)))->lists[0]->sync_state = FIRC_SUB_SYNC_FETCHING;
 
     ASSERT(firc_app_remove_group_by_id(g_fx.app, id_of(1)));
 
@@ -337,14 +350,14 @@ TEST an_update_with_the_same_url_keeps_the_arena(void) {
     ASSERT_EQ(FIRC_OK, firc_app_update_group(g_fx.app, id_of(1), built));
 
     firc_group_t *a = live(id_of(1));
-    ASSERT(a != NULL && a->list != NULL);
+    ASSERT(a != NULL && a->n_lists != 0);
     ASSERT_STR_EQ("renamed", a->name);
-    ASSERT_EQ(7200, a->list->interval);
-    ASSERT_EQ(1, a->list->rules.n);
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->list->rules, 0));
-    ASSERT(a->list->has_body_hash);
-    ASSERT_EQ(1234, a->list->last_update);
-    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->list->sync_state);
+    ASSERT_EQ(7200, a->lists[0]->interval);
+    ASSERT_EQ(1, a->lists[0]->rules.n);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->lists[0]->rules, 0));
+    ASSERT(a->lists[0]->has_body_hash);
+    ASSERT_EQ(1234, a->lists[0]->last_update);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->lists[0]->sync_state);
     ASSERT_EQ(0, g_heard.calls);
 
     g_fx_open = false;
@@ -359,8 +372,7 @@ TEST an_update_that_removes_the_list_keeps_the_hand_rules(void) {
 
     firc_group_t *built = group_with_list(1, URL_A, 3600);
     ASSERT(built != NULL);
-    firc_group_list_free(built->list);
-    built->list = NULL;
+    test_group_drop_lists(built);
     firc_rule_t *r = firc_rule_new();
     ASSERT(r != NULL);
     r->id = id_of(9);
@@ -372,7 +384,7 @@ TEST an_update_that_removes_the_list_keeps_the_hand_rules(void) {
 
     firc_group_t *a = live(id_of(1));
     ASSERT(a != NULL);
-    ASSERT_EQ(NULL, a->list);
+    ASSERT_EQ(0u, a->n_lists);
     ASSERT_EQ(1, a->n_rules);
     ASSERT_STR_EQ("hand.example", a->rules[0]->rule);
     ASSERT_EQ(1, g_heard.calls);
@@ -389,19 +401,20 @@ TEST adding_a_group_with_a_list_queues_its_sync(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, group_with_list(1, URL_A, 3600)));
 
     firc_group_t *a = live(id_of(1));
-    ASSERT(a != NULL && a->list != NULL);
-    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, a->list->sync_state);
-    ASSERT_EQ_FMT(1ULL, (unsigned long long)a->list->sync_seq, "%llu");
+    ASSERT(a != NULL && a->n_lists != 0);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, a->lists[0]->sync_state);
+    ASSERT_EQ_FMT(1ULL, (unsigned long long)a->lists[0]->sync_seq, "%llu");
 
     g_fx_open = false;
     fixture_down(&g_fx);
     PASS();
 }
 
-static firc_sub_event_t *group_parsed_event(firc_id_t id, uint64_t seq) {
+static firc_sub_event_t *group_parsed_event(firc_app_t *app, firc_id_t id, uint64_t seq) {
     firc_sub_event_t *ev = calloc(1, sizeof(*ev));
     ev->kind = FIRC_SUB_EV_RESULT;
     ev->group_id = id;
+    ev->list_id = list0(app, id);
     ev->seq = seq;
     ev->result = FIRC_SUB_RESULT_PARSED;
     firc_sub_rules_init(&ev->rules);
@@ -412,24 +425,24 @@ static firc_sub_event_t *group_parsed_event(firc_id_t id, uint64_t seq) {
 TEST a_save_mid_sync_keeps_the_running_job(void) {
     ASSERT(fixture_up(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, group_with_list(1, URL_A, 3600)));
-    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1)));
-    uint64_t seq = live(id_of(1))->list->sync_seq;
-    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, live(id_of(1))->list->sync_state);
+    ASSERT_EQ(FIRC_OK, firc_app_request_sync(g_fx.app, id_of(1), list0(g_fx.app, id_of(1))));
+    uint64_t seq = (live(id_of(1)))->lists[0]->sync_seq;
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, (live(id_of(1)))->lists[0]->sync_state);
 
     ASSERT_EQ(FIRC_OK, replace2(group_with_list(1, URL_A, 3600), NULL));
     ASSERT_EQ_FMTm("the same id and url: the queued seq is carried, not reset",
-                   (unsigned long long)seq, (unsigned long long)live(id_of(1))->list->sync_seq, "%llu");
+                   (unsigned long long)seq, (unsigned long long)(live(id_of(1)))->lists[0]->sync_seq, "%llu");
     ASSERT_EQ_FMTm("no stream ended: the replace kept this list", 0, g_heard.calls, "%d");
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), seq);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), seq);
     firc_sub_rules_push(&ev->rules, "one.example", "namespace", true, test_random_id());
     firc_app_on_sync_event(g_fx.app, ev, 1000);
 
     firc_group_t *a = live(id_of(1));
-    ASSERT(a != NULL && a->list != NULL);
-    ASSERT_EQ_FMTm("the rules applied to the (replaced) group", 1u, (unsigned)a->list->rules.n, "%u");
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->list->rules, 0));
-    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->list->sync_state);
+    ASSERT(a != NULL && a->n_lists != 0);
+    ASSERT_EQ_FMTm("the rules applied to the (replaced) group", 1u, (unsigned)a->lists[0]->rules.n, "%u");
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&a->lists[0]->rules, 0));
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, a->lists[0]->sync_state);
     ASSERT_EQ_FMTm("the listener heard applying, then done", 2, g_heard.calls, "%d");
     ASSERT(firc_id_equal(id_of(1), g_heard.owner));
     ASSERTm("the last call in is the terminal one", g_heard.done);
@@ -473,7 +486,7 @@ TEST a_list_full_of_junk_says_it_once(void) {
     ASSERT_EQ(FIRC_OK, firc_strset(&g->name, "adblock"));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, g));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "010.0.0.1", "subnet", true, test_random_id());
     firc_sub_rules_push(&ev->rules, "aa:bb:cc:dd:ee:ff", "subnet6", true, test_random_id());
     firc_sub_rules_push(&ev->rules, "^[a-z", "regex", true, test_random_id());
@@ -486,10 +499,10 @@ TEST a_list_full_of_junk_says_it_once(void) {
     ASSERT(n != (size_t)-1);
     ASSERTm("the apply actually ran (not dropped as gone)", changed);
     firc_group_t *cur = live(id_of(1));
-    ASSERT(cur != NULL && cur->list != NULL);
+    ASSERT(cur != NULL && cur->n_lists != 0);
     ASSERT_EQ_FMTm("every line installed, junk included -- only netfilter/the "
                    "matcher skip the unusable ones",
-                   4u, (unsigned)cur->list->rules.n, "%u");
+                   4u, (unsigned)cur->lists[0]->rules.n, "%u");
 
     ASSERT_EQ_FMTm("one line for the count, none from the matcher", 1, count_lines(out), "%d");
     ASSERTm("the count", strstr(out, "3 line(s)") != NULL);
@@ -506,7 +519,7 @@ TEST a_clean_list_says_nothing(void) {
     ASSERT(fixture_up_no_worker(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, group_with_list(1, URL_A, 3600)));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "example.com", "namespace", true, test_random_id());
     firc_sub_rules_push(&ev->rules, "a.example.com", "domain", true, test_random_id());
 
@@ -517,8 +530,8 @@ TEST a_clean_list_says_nothing(void) {
     ASSERT_EQ_FMTm("silence when there is nothing to say", (size_t)0, n, "%zu");
     ASSERTm("the apply actually ran (not dropped as gone)", changed);
     firc_group_t *cur = live(id_of(1));
-    ASSERT(cur != NULL && cur->list != NULL);
-    ASSERT_EQ_FMTm("both clean lines installed", 2u, (unsigned)cur->list->rules.n, "%u");
+    ASSERT(cur != NULL && cur->n_lists != 0);
+    ASSERT_EQ_FMTm("both clean lines installed", 2u, (unsigned)cur->lists[0]->rules.n, "%u");
 
     g_fx_open = false;
     fixture_down(&g_fx);
@@ -530,7 +543,7 @@ TEST a_disabled_junk_line_is_not_counted(void) {
     ASSERT(fixture_up_no_worker(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, group_with_list(1, URL_A, 3600)));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "^[a-z", "regex", false, test_random_id());
 
     char out[4096];
@@ -540,10 +553,10 @@ TEST a_disabled_junk_line_is_not_counted(void) {
     ASSERT_EQ_FMTm("a rule the operator turned off is not junk", (size_t)0, n, "%zu");
     ASSERTm("the apply actually ran (not dropped as gone)", changed);
     firc_group_t *cur = live(id_of(1));
-    ASSERT(cur != NULL && cur->list != NULL);
+    ASSERT(cur != NULL && cur->n_lists != 0);
     ASSERT_EQ_FMTm("the disabled line is still installed, just off", 1u,
-                   (unsigned)cur->list->rules.n, "%u");
-    ASSERT_FALSEm("and stays off", firc_sub_rules_enable(&cur->list->rules, 0));
+                   (unsigned)cur->lists[0]->rules.n, "%u");
+    ASSERT_FALSEm("and stays off", firc_sub_rules_enable(&cur->lists[0]->rules, 0));
 
     g_fx_open = false;
     fixture_down(&g_fx);
@@ -558,7 +571,7 @@ TEST dropped_lines_are_said_with_the_group_s_name(void) {
     ASSERT_EQ(FIRC_OK, firc_strset(&g->name, "adblock"));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, g));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "example.com", "namespace", true, test_random_id());
     ev->dropped = 2;
 
@@ -586,7 +599,7 @@ TEST a_failed_sync_is_said_with_the_group_s_name(void) {
     ASSERT_EQ(FIRC_OK, firc_strset(&g->name, "adblock"));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, g));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     ev->result = FIRC_SUB_RESULT_ERROR;
     ev->err = FIRC_ERR_PROTO;
     ev->http_status = 404;
@@ -599,8 +612,8 @@ TEST a_failed_sync_is_said_with_the_group_s_name(void) {
     ASSERTm("names the group", strstr(out, "\"adblock\"") != NULL);
     ASSERTm("says what the server answered", strstr(out, "HTTP 404") != NULL);
     firc_group_t *cur = live(id_of(1));
-    ASSERT(cur != NULL && cur->list != NULL);
-    ASSERTm("and the list records it", strstr(cur->list->sync_error, "HTTP 404") != NULL);
+    ASSERT(cur != NULL && cur->n_lists != 0);
+    ASSERTm("and the list records it", strstr(cur->lists[0]->sync_error, "HTTP 404") != NULL);
 
     g_fx_open = false;
     fixture_down(&g_fx);
@@ -684,17 +697,17 @@ TEST first_sync_fetches_and_marks_changed(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_hsx.app, group_with_list(1, httpsync_url("/a"), 3600)));
 
     bool changed = false;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 1000, NULL, &changed));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 1000, NULL, &changed));
     ASSERT(changed);
 
     firc_group_t *cur = live_in(g_hsx.app, id_of(1));
-    ASSERT(cur != NULL && cur->list != NULL);
-    ASSERT_EQ(2u, cur->list->rules.n);
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&cur->list->rules, 0));
-    ASSERT_STR_EQ("two.example", firc_sub_rules_text(&cur->list->rules, 1));
-    ASSERT_EQ((uint32_t)1000, cur->list->last_update);
-    ASSERT_EQ((uint32_t)1000, cur->list->last_check);
-    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, cur->list->sync_state);
+    ASSERT(cur != NULL && cur->n_lists != 0);
+    ASSERT_EQ(2u, cur->lists[0]->rules.n);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&cur->lists[0]->rules, 0));
+    ASSERT_STR_EQ("two.example", firc_sub_rules_text(&cur->lists[0]->rules, 1));
+    ASSERT_EQ((uint32_t)1000, cur->lists[0]->last_update);
+    ASSERT_EQ((uint32_t)1000, cur->lists[0]->last_check);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, cur->lists[0]->sync_state);
 
     httpsync_down(&g_hsx);
     PASS();
@@ -705,18 +718,18 @@ TEST resync_same_content_is_unchanged_but_bumps_last_check(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_hsx.app, group_with_list(1, httpsync_url("/a"), 3600)));
 
     bool changed = true;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 1000, NULL, &changed));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 1000, NULL, &changed));
     ASSERT(changed);
 
     changed = true;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 2000, NULL, &changed));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 2000, NULL, &changed));
     ASSERT_FALSE(changed);
 
     firc_group_t *cur = live_in(g_hsx.app, id_of(1));
     ASSERT(cur != NULL);
-    ASSERT_EQ((uint32_t)1000, cur->list->last_update);
-    ASSERT_EQ((uint32_t)2000, cur->list->last_check);
-    ASSERT_EQ(2u, cur->list->rules.n);
+    ASSERT_EQ((uint32_t)1000, cur->lists[0]->last_update);
+    ASSERT_EQ((uint32_t)2000, cur->lists[0]->last_check);
+    ASSERT_EQ(2u, cur->lists[0]->rules.n);
 
     httpsync_down(&g_hsx);
     PASS();
@@ -728,22 +741,22 @@ TEST a_sync_applies_the_overrides_to_what_it_fetched(void) {
     ASSERT(g != NULL);
     bool off = false;
     ASSERT_EQ(FIRC_OK, firc_group_list_set_override(
-                           g->list, &(firc_sub_rule_key_t){.text = "two.example"}, "domain", &off));
+                           g->lists[0], &(firc_sub_rule_key_t){.text = "two.example"}, "domain", &off));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_hsx.app, g));
 
     bool changed = false;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 1000, NULL, &changed));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 1000, NULL, &changed));
     ASSERT(changed);
 
     firc_group_t *cur = live_in(g_hsx.app, id_of(1));
     ASSERT(cur != NULL);
-    ASSERT_EQ(2u, cur->list->rules.n);
+    ASSERT_EQ(2u, cur->lists[0]->rules.n);
     ASSERT_STR_EQm("the untouched line keeps the guesser's type", "namespace",
-                   firc_sub_rules_type(&cur->list->rules, 0));
-    ASSERTm("and stays enabled", firc_sub_rules_enable(&cur->list->rules, 0));
+                   firc_sub_rules_type(&cur->lists[0]->rules, 0));
+    ASSERTm("and stays enabled", firc_sub_rules_enable(&cur->lists[0]->rules, 0));
     ASSERT_STR_EQm("the edited line carries the override's type", "domain",
-                   firc_sub_rules_type(&cur->list->rules, 1));
-    ASSERT_FALSEm("and the override's enable", firc_sub_rules_enable(&cur->list->rules, 1));
+                   firc_sub_rules_type(&cur->lists[0]->rules, 1));
+    ASSERT_FALSEm("and the override's enable", firc_sub_rules_enable(&cur->lists[0]->rules, 1));
 
     httpsync_down(&g_hsx);
     PASS();
@@ -755,15 +768,15 @@ TEST a_result_with_a_stale_seq_is_dropped(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_hsx.app, group_with_list(1, httpsync_url("/a"), 3600)));
 
     bool changed = false;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 1000, NULL, &changed));
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 1000, NULL, &changed));
     ASSERT(changed);
     firc_group_t *before = live_in(g_hsx.app, id_of(1));
     ASSERT(before != NULL);
-    uint64_t seq = before->list->sync_seq;
-    uint32_t before_last_check = before->list->last_check;
+    uint64_t seq = before->lists[0]->sync_seq;
+    uint32_t before_last_check = before->lists[0]->last_check;
     ASSERT(seq > 0);
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), seq - 1);
+    firc_sub_event_t *ev = group_parsed_event(g_hsx.app, id_of(1), seq - 1);
     firc_sub_rules_push(&ev->rules, "x.example", "namespace", true, test_random_id());
     bool applied_changed = true;
     firc_err_t err = firc_app_apply_sync_result(g_hsx.app, ev, 2000, &applied_changed);
@@ -773,9 +786,9 @@ TEST a_result_with_a_stale_seq_is_dropped(void) {
 
     firc_group_t *after = live_in(g_hsx.app, id_of(1));
     ASSERT_EQ_FMTm("the list the newer job installed is still there", 2u,
-                   (unsigned)after->list->rules.n, "%u");
-    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&after->list->rules, 0));
-    ASSERT_EQ(before_last_check, after->list->last_check);
+                   (unsigned)after->lists[0]->rules.n, "%u");
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&after->lists[0]->rules, 0));
+    ASSERT_EQ(before_last_check, after->lists[0]->last_check);
 
     httpsync_down(&g_hsx);
     PASS();
@@ -786,13 +799,13 @@ TEST a_result_for_a_deleted_group_is_dropped(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_hsx.app, group_with_list(1, httpsync_url("/a"), 3600)));
 
     bool changed = false;
-    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), 1000, NULL, &changed));
-    uint64_t seq = live_in(g_hsx.app, id_of(1))->list->sync_seq;
+    ASSERT_EQ(FIRC_OK, firc_app_sync_list_now(g_hsx.app, id_of(1), list0(g_hsx.app, id_of(1)), 1000, NULL, &changed));
+    uint64_t seq = (live_in(g_hsx.app, id_of(1)))->lists[0]->sync_seq;
 
     ASSERT(firc_app_remove_group_by_id(g_hsx.app, id_of(1)));
     ASSERT_EQ(NULL, live_in(g_hsx.app, id_of(1)));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), seq + 1);
+    firc_sub_event_t *ev = group_parsed_event(g_hsx.app, id_of(1), seq + 1);
     firc_sub_rules_push(&ev->rules, "x.example", "namespace", true, test_random_id());
     firc_app_on_sync_event(g_hsx.app, ev, 3000);
 
@@ -932,9 +945,9 @@ TEST a_list_sync_resyncs_only_its_own_group(void) {
     g1->enable = true;
     ASSERT_EQ(FIRC_OK, firc_strset(&g1->name, "listed"));
     ASSERT_EQ(FIRC_OK, firc_strset(&g1->iface, "lo"));
-    g1->list = firc_group_list_new();
-    ASSERT(g1->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_strset(&g1->list->url, URL_A));
+    test_group_set_list(g1);
+    ASSERT(g1->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_strset(&g1->lists[0]->url, URL_A));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_nfx.app, g1));
 
     firc_group_t *g2 = firc_group_new();
@@ -976,7 +989,7 @@ TEST a_list_sync_resyncs_only_its_own_group(void) {
 
     uint64_t before = firc_app_nf_passes_for_test(g_nfx.app);
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_nfx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "10.9.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
     bool changed = false;
     ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_nfx.app, ev, 1000, &changed));
@@ -1014,15 +1027,15 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     g1->enable = true;
     ASSERT_EQ(FIRC_OK, firc_strset(&g1->name, "listed"));
     ASSERT_EQ(FIRC_OK, firc_strset(&g1->iface, "lo"));
-    g1->list = firc_group_list_new();
-    ASSERT(g1->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_strset(&g1->list->url, URL_A));
+    test_group_set_list(g1);
+    ASSERT(g1->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_strset(&g1->lists[0]->url, URL_A));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_nfx.app, g1));
 
     char chain1[64];
     nf_chain_name(&g_nfx.cfg, id_of(1), chain1, sizeof(chain1));
 
-    firc_sub_event_t *ev1 = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev1 = group_parsed_event(g_nfx.app, id_of(1), 0);
     firc_sub_rules_push(&ev1->rules, "10.1.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
     bool changed = false;
     ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_nfx.app, ev1, 1000, &changed));
@@ -1037,7 +1050,7 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     snprintf(whole, sizeof(whole), "-A %s -m conntrack --ctdir ORIGINAL -m mark ! --mark 0x40000000/0x40000000 -j MARK",
              chain1);
     firc_fake_ipt_refuse_rules_containing(g_nfx.fake, whole);
-    firc_sub_event_t *ev2 = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev2 = group_parsed_event(g_nfx.app, id_of(1), 0);
     firc_sub_rules_push(&ev2->rules, "10.1.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
     firc_sub_rules_push(&ev2->rules, "0.0.0.0/0", FIRC_RULE_SUBNET, true, test_random_id());
     changed = false;
@@ -1053,7 +1066,7 @@ TEST a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync(void) {
     ASSERT_STR_EQ("not-written", reason);
     ASSERTm("a snapshot is still published", firc_dns_pipeline_snapshot(g_nfx.pipeline) != NULL);
 
-    firc_sub_event_t *ev3 = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev3 = group_parsed_event(g_nfx.app, id_of(1), 0);
     firc_sub_rules_push(&ev3->rules, "10.1.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
     changed = false;
     ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_nfx.app, ev3, 3000, &changed));
@@ -1076,12 +1089,12 @@ TEST a_routed_group_warns_once_not_on_every_resync(void) {
     g->enable = true;
     ASSERT_EQ(FIRC_OK, firc_strset(&g->name, "adblock"));
     ASSERT_EQ(FIRC_OK, firc_strset(&g->iface, "lo"));
-    g->list = firc_group_list_new();
-    ASSERT(g->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_strset(&g->list->url, URL_A));
+    test_group_set_list(g);
+    ASSERT(g->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_strset(&g->lists[0]->url, URL_A));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_nfx.app, g));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_nfx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "010.0.0.1", "subnet", true, test_random_id());
     firc_sub_rules_push(&ev->rules, "one.example", "namespace", true, test_random_id());
 
@@ -1119,7 +1132,7 @@ TEST a_first_changed_sync_clears_provisional_at_once(void) {
     ASSERT(fixture_up_no_worker(&g_fx));
     ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, group_with_list(1, URL_A, 3600)));
 
-    firc_sub_event_t *ev = group_parsed_event(id_of(1), 0);
+    firc_sub_event_t *ev = group_parsed_event(g_fx.app, id_of(1), 0);
     firc_sub_rules_push(&ev->rules, "one.example", "namespace", true, test_random_id());
     bool changed = false;
     ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_fx.app, ev, 1000, &changed));
@@ -1130,6 +1143,265 @@ TEST a_first_changed_sync_clears_provisional_at_once(void) {
     ASSERT(snap != NULL);
     ASSERT_FALSEm("the first list this group ever got is not provisional any more",
                   snap->provisional);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+static firc_group_t *group_with_two_lists(uint8_t tag) {
+    firc_group_t *g = group_with_list(tag, URL_A, 3600);
+    if (g == NULL) { return NULL; }
+    if (test_group_add_list_at(g, URL_B) == NULL) {
+        firc_group_free(g);
+        return NULL;
+    }
+    g->lists[1]->interval = 3600;
+    return g;
+}
+
+TEST patch_of_one_list_leaves_the_other(void) {
+    ASSERT(fixture_up_no_worker(&g_fx));
+    firc_group_t *g = group_with_two_lists(1);
+    ASSERT(g != NULL);
+    firc_id_t rid = test_random_id();
+    for (size_t i = 0; i < 2; i++) {
+        ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[i]->rules, "d.com", FIRC_RULE_NAMESPACE, true, rid));
+        g->lists[i]->has_body_hash = true;
+    }
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, g));
+
+    firc_list_rule_edit_t e = {.rule = rid, .has_enable = true, .enable = false};
+    char msg[128] = "";
+    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(g_fx.app, id_of(1), list_at(g_fx.app, id_of(1), 1), &e, 1, msg,
+                                                 sizeof(msg)));
+    firc_group_t *cur = live(id_of(1));
+    ASSERT(cur != NULL);
+    ASSERTm("list 0's d.com is still on", firc_sub_rules_enable(&cur->lists[0]->rules, 0));
+    ASSERT_FALSEm("list 1's d.com is off", firc_sub_rules_enable(&cur->lists[1]->rules, 0));
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+TEST a_first_failure_ends_the_provisional_snapshot(void) {
+    ASSERT(fixture_up_no_worker(&g_fx));
+    firc_group_t *g = group_with_two_lists(1);
+    ASSERT(g != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "one.example", FIRC_RULE_NAMESPACE, true,
+                                           test_random_id()));
+    g->lists[0]->has_body_hash = true;
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, g));
+    firc_ruleset_snapshot_t *snap = firc_dns_pipeline_snapshot(g_fx.pipeline);
+    ASSERT(snap != NULL);
+    ASSERTm("fixture: list 1 untried keeps it provisional", snap->provisional);
+
+    firc_sub_event_t *ev = calloc(1, sizeof(*ev));
+    ASSERT(ev != NULL);
+    ev->kind = FIRC_SUB_EV_RESULT;
+    ev->group_id = id_of(1);
+    ev->list_id = list_at(g_fx.app, id_of(1), 1);
+    ev->result = FIRC_SUB_RESULT_ERROR;
+    ev->err = FIRC_ERR_UPSTREAM;
+    ev->http_status = 500;
+    firc_sub_rules_init(&ev->rules);
+    bool changed = false;
+    ASSERT_EQ(FIRC_ERR_UPSTREAM, firc_app_apply_sync_result(g_fx.app, ev, 1000, &changed));
+    firc_sub_event_free(ev);
+
+    snap = firc_dns_pipeline_snapshot(g_fx.pipeline);
+    ASSERT(snap != NULL);
+    ASSERT_FALSEm("a tried and failed list no longer holds the snapshot provisional", snap->provisional);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+#define URL_C "http://127.0.0.1:1/c"
+
+static bool add_list_to(firc_group_t *g, firc_id_t id, const char *url, uint32_t interval) {
+    firc_group_list_t *l = firc_group_list_new();
+    if (l == NULL) { return false; }
+    l->id = id;
+    l->interval = interval;
+    if (firc_strset(&l->url, url) != FIRC_OK || firc_group_add_list(g, l) != FIRC_OK) {
+        firc_group_list_free(l);
+        return false;
+    }
+    return true;
+}
+
+static bool load_list(firc_group_list_t *l, const char *rule, uint8_t hash) {
+    if (firc_sub_rules_push(&l->rules, rule, FIRC_RULE_NAMESPACE, true, test_random_id()) != FIRC_OK) { return false; }
+    memset(l->body_hash, hash, sizeof(l->body_hash));
+    l->has_body_hash = true;
+    l->last_update = 1234;
+    return true;
+}
+
+static firc_group_t *two_lists(uint8_t tag, const char *url0, const char *url1) {
+    firc_group_t *g = group_with_list(tag, url0, 3600);
+    if (g != NULL && !add_list_to(g, list_id_of(tag, 1), url1, 3600)) {
+        firc_group_free(g);
+        return NULL;
+    }
+    return g;
+}
+
+static firc_group_t *two_loaded_lists(uint8_t tag) {
+    firc_group_t *g = two_lists(tag, URL_A, URL_B);
+    if (g != NULL && (!load_list(g->lists[0], "zero.example", 0xa0) || !load_list(g->lists[1], "one.example", 0xb1))) {
+        firc_group_free(g);
+        return NULL;
+    }
+    return g;
+}
+
+static firc_sub_event_t *list_parsed_event(firc_id_t gid, firc_id_t lid, uint64_t seq) {
+    firc_sub_event_t *ev = calloc(1, sizeof(*ev));
+    ev->kind = FIRC_SUB_EV_RESULT;
+    ev->group_id = gid;
+    ev->list_id = lid;
+    ev->seq = seq;
+    ev->result = FIRC_SUB_RESULT_PARSED;
+    firc_sub_rules_init(&ev->rules);
+    return ev;
+}
+
+/* Catches: a save carrying only the first list, so every other list is refetched. */
+TEST a_save_keeps_every_list_arena(void) {
+    ASSERT(fixture_up(&g_fx));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, two_loaded_lists(1)));
+    firc_group_t *g = live(id_of(1));
+    ASSERT(g != NULL && g->n_lists == 2);
+    const char *t0 = g->lists[0]->rules.text, *t1 = g->lists[1]->rules.text;
+
+    ASSERT_EQ(FIRC_OK, replace2(two_lists(1, URL_A, URL_B), NULL));
+
+    g = live(id_of(1));
+    ASSERT(g != NULL);
+    ASSERT_EQ_FMT((size_t)2, g->n_lists, "%zu");
+    ASSERT_EQ_FMT((size_t)1, g->lists[0]->rules.n, "%zu");
+    ASSERT_EQ_FMT((size_t)1, g->lists[1]->rules.n, "%zu");
+    ASSERT(g->lists[0]->rules.text == t0);
+    ASSERT(g->lists[1]->rules.text == t1);
+    ASSERT(g->lists[0]->has_body_hash && g->lists[1]->has_body_hash);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, g->lists[0]->sync_state);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, g->lists[1]->sync_state);
+    ASSERT_EQ(0, g_heard.calls);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+/* Catches: a url changed under the same id carrying the old rules, or touching the other list. */
+TEST a_new_url_under_the_same_id_is_fetched_again(void) {
+    ASSERT(fixture_up(&g_fx));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, two_loaded_lists(1)));
+    const char *t0 = live(id_of(1))->lists[0]->rules.text;
+
+    ASSERT_EQ(FIRC_OK, replace2(two_lists(1, URL_A, URL_C), NULL));
+
+    firc_group_t *g = live(id_of(1));
+    ASSERT(g != NULL && g->n_lists == 2);
+    ASSERT(firc_id_equal(list_id_of(1, 1), g->lists[1]->id));
+    ASSERT_STR_EQ(URL_C, g->lists[1]->url);
+    ASSERT_EQ_FMT((size_t)0, g->lists[1]->rules.n, "%zu");
+    ASSERT_FALSE(g->lists[1]->has_body_hash);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, g->lists[1]->sync_state);
+    ASSERT(g->lists[0]->rules.text == t0);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, g->lists[0]->sync_state);
+    ASSERT_EQ(0, g_heard.calls);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+/* Catches: dropping one list costing the other its arena, or the dropped one's stream left open. */
+TEST removing_one_list_keeps_the_other(void) {
+    ASSERT(fixture_up(&g_fx));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, two_loaded_lists(1)));
+    const char *t0 = live(id_of(1))->lists[0]->rules.text;
+
+    ASSERT_EQ(FIRC_OK, replace2(group_with_list(1, URL_A, 3600), NULL));
+
+    firc_group_t *g = live(id_of(1));
+    ASSERT(g != NULL);
+    ASSERT_EQ_FMT((size_t)1, g->n_lists, "%zu");
+    ASSERT(firc_id_equal(list_id_of(1, 0), g->lists[0]->id));
+    ASSERT(g->lists[0]->rules.text == t0);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, g->lists[0]->sync_state);
+    ASSERT_EQ(1, g_heard.calls);
+    ASSERT(firc_id_equal(list_id_of(1, 1), g_heard.list));
+    ASSERT(g_heard.done);
+    ASSERT_STR_EQ("list removed", g_heard.error);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+/* Catches: an edited url mid-sync leaving the stream open, or the old url's late result installed. */
+TEST a_url_edited_mid_sync_drops_the_old_result(void) {
+    ASSERT(fixture_up(&g_fx));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, two_lists(1, URL_A, URL_B)));
+    firc_group_t *g = live(id_of(1));
+    ASSERT(g != NULL && g->n_lists == 2);
+    g->lists[0]->sync_state = FIRC_SUB_SYNC_IDLE;
+    g->lists[1]->sync_state = FIRC_SUB_SYNC_FETCHING;
+    uint64_t seq = g->lists[1]->sync_seq;
+    ASSERT(seq != 0);
+
+    ASSERT_EQ(FIRC_OK, replace2(two_lists(1, URL_A, URL_C), NULL));
+
+    ASSERT_EQ(1, g_heard.calls);
+    ASSERT(firc_id_equal(list_id_of(1, 1), g_heard.list));
+    ASSERT(g_heard.done);
+    ASSERT_STR_EQ("list url changed", g_heard.error);
+    g = live(id_of(1));
+    ASSERT_STR_EQ(URL_C, g->lists[1]->url);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, g->lists[1]->sync_state);
+    ASSERT(g->lists[1]->sync_seq > seq);
+
+    firc_sub_event_t *ev = list_parsed_event(id_of(1), list_id_of(1, 1), seq);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&ev->rules, "x.example", "namespace", true, test_random_id()));
+    bool changed = true;
+    ASSERT_EQ(FIRC_OK, firc_app_apply_sync_result(g_fx.app, ev, 2000, &changed));
+    firc_sub_event_free(ev);
+    ASSERT_FALSE(changed);
+    g = live(id_of(1));
+    ASSERT_EQ_FMT((size_t)0, g->lists[1]->rules.n, "%zu");
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, g->lists[1]->sync_state);
+
+    g_fx_open = false;
+    fixture_down(&g_fx);
+    PASS();
+}
+
+/* Catches: a removed list not told, the stream ended while the kept list still fetches, or its sync reset. */
+TEST a_removed_list_ends_its_sync(void) {
+    ASSERT(fixture_up(&g_fx));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(g_fx.app, two_lists(1, URL_A, URL_B)));
+    firc_group_t *g = live(id_of(1));
+    ASSERT(g != NULL && g->n_lists == 2);
+    g->lists[0]->sync_state = FIRC_SUB_SYNC_FETCHING;
+    g->lists[1]->sync_state = FIRC_SUB_SYNC_FETCHING;
+    uint64_t seq0 = g->lists[0]->sync_seq;
+
+    ASSERT_EQ(FIRC_OK, replace2(group_with_list(1, URL_A, 3600), NULL));
+
+    ASSERT_EQ(1, g_heard.calls);
+    ASSERT(firc_id_equal(list_id_of(1, 1), g_heard.list));
+    ASSERT_FALSEm("the kept list still fetches: the stream stays", g_heard.done);
+    ASSERT_STR_EQ("list removed", g_heard.error);
+    g = live(id_of(1));
+    ASSERT_EQ_FMT((size_t)1, g->n_lists, "%zu");
+    ASSERT_EQ(FIRC_SUB_SYNC_FETCHING, g->lists[0]->sync_state);
+    ASSERT_EQ_FMT((unsigned long long)seq0, (unsigned long long)g->lists[0]->sync_seq, "%llu");
 
     g_fx_open = false;
     fixture_down(&g_fx);
@@ -1175,6 +1447,13 @@ int main(int argc, char **argv) {
     RUN_TEST(a_list_line_the_kernel_refuses_leaves_its_group_out_until_a_resync);
     RUN_TEST(a_routed_group_warns_once_not_on_every_resync);
     RUN_TEST(a_first_changed_sync_clears_provisional_at_once);
+    RUN_TEST(patch_of_one_list_leaves_the_other);
+    RUN_TEST(a_first_failure_ends_the_provisional_snapshot);
     RUN_TEST(adding_a_group_with_a_list_queues_its_sync);
+    RUN_TEST(a_save_keeps_every_list_arena);
+    RUN_TEST(a_new_url_under_the_same_id_is_fetched_again);
+    RUN_TEST(removing_one_list_keeps_the_other);
+    RUN_TEST(a_url_edited_mid_sync_drops_the_old_result);
+    RUN_TEST(a_removed_list_ends_its_sync);
     GREATEST_MAIN_END();
 }

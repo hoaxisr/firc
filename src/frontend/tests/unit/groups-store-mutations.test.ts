@@ -176,13 +176,13 @@ describe("GroupsStore mutations and validation", () => {
   // Catches opening all skipping the retry a single open gives a list whose page failed.
   it("setShownOpen(true) lets a failed list page load again", async () => {
     const store = createStore([
-      { ...makeGroup("g1"), list: { url: "https://l.example/x" } } as Group,
+      { ...makeGroup("g1"), lists: [{ id: "0a0a0a0a", url: "https://l.example/x" }] } as Group,
     ]);
-    store.lists.pageState.g1 = { failed: true } as any;
+    store.lists.pageState["g1/0a0a0a0a"] = { failed: true } as any;
 
     await store.setShownOpen(true);
 
-    assert.strictEqual(store.lists.pageState.g1.failed, false);
+    assert.strictEqual(store.lists.pageState["g1/0a0a0a0a"].failed, false);
   });
 
   it("addGroup prepends group, adds default rule and opens it", async () => {
@@ -463,13 +463,16 @@ describe("mergeOutside", () => {
   /* catches: a list group another tab deleted put back because a sync changed its state here */
   it("a list group lost on the daemon goes although its sync state changed here", () => {
     const list = {
+      id: "0a0a0a0a",
       url: "https://l/x.txt",
       interval: 86400,
       rulesTotal: 3,
       sync: { state: "idle" },
     };
-    const base = [g("a", [], { list })];
-    const current = [g("a", [], { list: { ...list, rulesTotal: 9, sync: { state: "fetching" } } })];
+    const base = [g("a", [], { lists: [list] })];
+    const current = [
+      g("a", [], { lists: [{ ...list, rulesTotal: 9, sync: { state: "fetching" } }] }),
+    ];
     assert.deepStrictEqual(merge(current, base, []), []);
   });
 

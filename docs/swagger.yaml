@@ -902,10 +902,14 @@ definitions:
         type: string
     type: object
   types.GroupList:
-    description: 'The list a group takes rules from in addition to its own. The rules themselves are not here -- they are read a page at a time through GET /api/v1/groups/{groupID}/list/rules.'
+    description: 'A list a group takes rules from in addition to its own. The rules themselves are not here -- they are read a page at a time through GET /api/v1/groups/{groupID}/lists/{listID}/rules.'
     properties:
+      id:
+        description: 'The list''s id within its group, 8 hex characters. In a request it names the live list this item is: absent, the live list with the same url is meant (unless another item names that list''s id), else a new list with an id of its own; an id no live list has is a new list keeping that id. Not 8 hex is 400 "invalid list id".'
+        example: 0a1b2c3d
+        type: string
       interval:
-        description: 'How often to check the list, in seconds. 0 -- no timer. A whole number 0..4294967295; anything else is 400.'
+        description: 'How often to check the list, in seconds. 0 -- no timer. A whole number 0..4294967295; anything else is 400. Absent in a request -- the interval of the live list the item is, else 86400.'
         example: 86400
         type: integer
       lastUpdate:
@@ -969,9 +973,11 @@ definitions:
       interface:
         description: 'The interface the group routes through, or its interface list: 1 to 4 names in order of preference, none twice, blackhole, block and dns only alone. block routes nothing and answers the group''s names locally. dns routes nothing and answers them from the group''s own resolve.server (required; no subnet rules). A list of one is saved and answered as a string.'
         example: nwg0
-      list:
-        $ref: '#/definitions/types.GroupList'
-        description: 'The group''s list. Absent -- the list stays as it is, like devices and rules; null removes the list and keeps the manual rules; an object sets a new list or updates the current one -- url is required and must be http/https with a host, an absent interval keeps the current list''s (0 for a new one, no timer); lastUpdate and sync are never read from the body.'
+      lists:
+        description: 'The group''s lists, 0 to 16. Absent -- the lists stay as they are, like devices and rules; [] removes every list and keeps the manual rules; an array replaces them, in its order. null or anything but an array is 400 "invalid lists"; an item that is not an object, or has no http/https url with a host, is 400 "invalid list"; two items with one url are 400 "duplicate list url", with one id 400 "duplicate list id"; a seventeenth is 400 "a group carries at most 16 lists". An item that is a live list with the same url keeps its rules; with another url it keeps its rule edits and is fetched again; a live list no item is is removed. lastUpdate, rulesTotal and sync are never read from the body.'
+        items:
+          $ref: '#/definitions/types.GroupList'
+        type: array
       name:
         example: Routing
         type: string
@@ -1019,9 +1025,11 @@ definitions:
         items:
           $ref: '#/definitions/types.GroupInterface'
         type: array
-      list:
-        $ref: '#/definitions/types.GroupList'
-        description: 'Present only on a group with a list; the group''s manual rules ("rules") are its own too.'
+      lists:
+        description: 'The group''s lists in order, [] on a group without one; the group''s manual rules ("rules") are its own too.'
+        items:
+          $ref: '#/definitions/types.GroupList'
+        type: array
       live:
         description: 'The group is routed -- it is in the DNS view, its interface''s routes and rules are in the kernel, and its chains are written or awaiting a committer pass while passes succeed.'
         example: true
@@ -2931,13 +2939,18 @@ paths:
       summary: 'Preview a list by URL'
       tags:
       - groups
-  /api/v1/groups/{groupID}/list/rules:
+  /api/v1/groups/{groupID}/lists/{listID}/rules:
     get:
-      description: 'A page of the group''s list rules. The answer never holds the whole list: `total` -- how many rules the list has, `matched` -- how many of them match `q` (equal to `total` without `q`), `rules` -- at most `limit` matching rules starting at matched position `offset`. `q` is a case-insensitive substring of the rule text. An `offset` past the end is an empty page, not an error. The group''s manual rules are at /api/v1/groups/{groupID}/rules. A group without a list is 404 `group has no list`.'
+      description: 'A page of the rules of one list of the group. The answer never holds the whole list: `total` -- how many rules the list has, `matched` -- how many of them match `q` (equal to `total` without `q`), `rules` -- at most `limit` matching rules starting at matched position `offset`. `q` is a case-insensitive substring of the rule text. An `offset` past the end is an empty page, not an error. The group''s manual rules are at /api/v1/groups/{groupID}/rules. A list id the group does not have is 404 `group has no such list`.'
       parameters:
       - description: 'Group ID'
         in: path
         name: groupID
+        required: true
+        type: string
+      - description: 'List ID, 8 hex characters (`lists[].id` of the group record). Not 8 hex is 400 `invalid list id`.'
+        in: path
+        name: listID
         required: true
         type: string
       - description: 'Position of the first rule among the matching ones (default 0). A non-negative integer only: a negative or non-numeric value is 400 `invalid offset`.'
@@ -2964,24 +2977,29 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "404":
-          description: 'Not Found -- no such group, or the group has no list'
+          description: 'Not Found -- no such group, or the group has no such list'
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
           description: Internal Server Error
           schema:
             $ref: '#/definitions/types.ErrorRes'
-      summary: 'A page of the group''s list rules'
+      summary: 'A page of a list''s rules'
       tags:
       - groups
     patch:
       consumes:
       - application/json
-      description: 'Changes `type` and/or `enable` of the named rules of the group''s list, and only theirs: in place, without copying the list and without touching other groups. Any rejection (an unknown rule ID, a pattern in the request) changes nothing; if memory runs out midway, edits already applied may stay, and the answer is 500. A `rule`, `proto` or `ports` field in the request is 400: the pattern and its protocol and ports come from the list. A `comment` is 400 too: a list rule has none. An edit is remembered in the file under the rule text; a type equal to what the list parser guesses removes the type edit. The file is written only with `save=true`. The answer is `{"status":"ok"}`.'
+      description: 'Changes `type` and/or `enable` of the named rules of one list of the group, and only theirs: in place, without copying the list and without touching the group''s other lists or other groups. Any rejection (an unknown rule ID, a pattern in the request) changes nothing; if memory runs out midway, edits already applied may stay, and the answer is 500. A `rule`, `proto` or `ports` field in the request is 400: the pattern and its protocol and ports come from the list. A `comment` is 400 too: a list rule has none. An edit is remembered in the file under the rule text; a type equal to what the list parser guesses removes the type edit. The file is written only with `save=true`. The answer is `{"status":"ok"}`.'
       parameters:
       - description: 'Group ID'
         in: path
         name: groupID
+        required: true
+        type: string
+      - description: 'List ID, 8 hex characters (`lists[].id` of the group record). Not 8 hex is 400 `invalid list id`.'
+        in: path
+        name: listID
         required: true
         type: string
       - description: 'Save the changes to groups.yaml. A write that fails leaves the changes applied and answers 500 "applied, but groups.yaml was not saved: <error>"'
@@ -3004,29 +3022,81 @@ paths:
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "404":
-          description: 'Not Found -- no such group, the group has no list, or the list has no rule with that id'
+          description: 'Not Found -- no such group, the group has no such list, or the list has no rule with that id'
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "500":
           description: Internal Server Error
           schema:
             $ref: '#/definitions/types.ErrorRes'
-      summary: 'Change rules of the group''s list'
+      summary: 'Change rules of a list'
       tags:
       - groups
-  /api/v1/groups/{groupID}/list/sync:
+  /api/v1/groups/{groupID}/lists/{listID}/sync:
     post:
       consumes:
       - application/json
       description: >-
-        Queues the group's list for download and answers 202 at once with the
-        group record, whose `list.sync.state` is `queued`. The result arrives
-        as events on GET /api/v1/groups/{groupID}/list/sync/events or shows in
-        the group's `list.sync` field. The body is optional; `{"url": "..."}`
-        is saved on the list BEFORE queueing (and written to the file if the
-        address really changed); the body hash is kept -- it is the list's
-        hash, not the address's. There is no `save` parameter: the file is
+        Queues one list of the group for download and answers 202 at once with
+        the group record, where that list's `sync.state` is `queued` and the
+        other lists are untouched. The result arrives as events on GET
+        /api/v1/groups/{groupID}/sync/events or shows in the list's `sync`
+        field. The body is optional; `{"url": "..."}` is saved on the list
+        BEFORE queueing (and written to the file if the address really
+        changed); the body hash is kept -- it is the list's hash, not the
+        address's. An address the daemon cannot fetch is 400 `list url is not
+        supported`; an address another list of the group holds is 400
+        `duplicate list url`. There is no `save` parameter: the file is
         written when the list changed.
+      parameters:
+      - description: 'Group ID'
+        in: path
+        name: groupID
+        required: true
+        type: string
+      - description: 'List ID, 8 hex characters (`lists[].id` of the group record). Not 8 hex is 400 `invalid list id`.'
+        in: path
+        name: listID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/types.GroupRes'
+        "400":
+          description: 'Bad Request -- invalid id, unsupported or duplicate address'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- no such group, or the group has no such list'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "500":
+          description: 'Internal Server Error -- the new address could not be saved'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: 'Service Unavailable -- the worker is not running or the queue is full'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+      summary: 'Sync one list of the group'
+      tags:
+      - groups
+  /api/v1/groups/{groupID}/sync:
+    post:
+      description: >-
+        Queues every list of the group for download and answers 202 at once
+        with the group record, where each list that was queued is at
+        `sync.state` `queued`. The results arrive as events on GET
+        /api/v1/groups/{groupID}/sync/events. A group without a list is 404
+        `group has no list`. A list that cannot be queued does not stop the
+        others: the answer is 202 when at least one list was queued (a list
+        left out keeps its own state in the record), and the first refusal
+        only when none was: 400 `list has no url to fetch`, or 503 `sync
+        unavailable` when the worker is not running or the queue is full.
       parameters:
       - description: 'Group ID'
         in: path
@@ -3041,49 +3111,47 @@ paths:
           schema:
             $ref: '#/definitions/types.GroupRes'
         "400":
-          description: 'Bad Request -- invalid id or unsupported address'
+          description: 'Bad Request -- invalid id, or a list has no address'
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "404":
           description: 'Not Found -- no such group, or the group has no list'
           schema:
             $ref: '#/definitions/types.ErrorRes'
-        "500":
-          description: 'Internal Server Error -- the new address could not be saved'
-          schema:
-            $ref: '#/definitions/types.ErrorRes'
         "503":
           description: 'Service Unavailable -- the worker is not running or the queue is full'
           schema:
             $ref: '#/definitions/types.ErrorRes'
-      summary: 'Sync the group''s list'
+      summary: 'Sync every list of the group'
       tags:
       - groups
-  /api/v1/groups/{groupID}/list/sync/events:
+  /api/v1/groups/{groupID}/sync/events:
     get:
       description: >-
-        The group's list sync events, `text/event-stream`. The stream always
-        starts by repeating the current state. Three events, each with one
-        JSON line in `data:`:
+        The sync events of the group's lists, `text/event-stream`. Every event
+        has one JSON line in `data:`, `{"groupId": "...", "listId": "...",
+        "list": {...}}`, where `list` is that list as in the group record
+        (types.GroupList): its `sync.state`, `sync.error`, `sync.progress`
+        (`{"stage":"fetch","bytes":N,"total":N}`, `total` 0 if the server gave
+        no length; `{"stage":"parse","lines":N}`; `{"stage":"apply"}`) and
+        `rulesTotal`. Two event names:
 
 
-        `progress` -- work is under way.
-        `{"stage":"fetch","bytes":N,"total":N}` (`total` is 0 if the server
-        did not give a length), `{"stage":"parse","lines":N}`,
-        `{"stage":"apply"}`.
+        `progress` -- a list moved while some list of the group is still
+        queued or fetching; a list that ended (`idle` or `error`) is told this
+        way too while another list is still in flight.
 
 
-        `done` -- the work finished, `data` holds the group record with its
-        list (types.GroupRes, without `rules`). The stream closes after it.
+        `done` -- the last event: no list of the group is queued or fetching
+        any more. The stream closes after it.
 
 
-        `error` -- the work failed, `data` holds `{"error": "text"}`. The
-        stream also ends this way when the group was deleted (`group
-        removed`), the list was removed (`list removed`) or its address
-        changed (`list url changed`). The stream closes after it.
-
-
-        A list in state `idle` or `error` gets one event and the close.
+        The stream starts by restating every list, one event per list in the
+        group's order; when nothing is in flight the last of them is `done`.
+        A removed list ends with `sync.state` `error` and `sync.error` `list
+        removed` (`list url changed` for a new address, `group removed` when
+        the group was deleted); the stream stays open while another list of
+        the group is in flight.
       parameters:
       - description: 'Group ID'
         in: path

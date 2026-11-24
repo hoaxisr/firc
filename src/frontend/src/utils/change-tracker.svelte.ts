@@ -22,9 +22,11 @@ export class ChangeTracker<T extends object> {
   private dirtyArrays = new Set<object>();
 
   private version = $state(0);
+  private ignored: ReadonlySet<string>;
   baseline: T;
 
-  constructor(initialData: T) {
+  constructor(initialData: T, ignored: readonly string[] = []) {
+    this.ignored = new Set(ignored);
     this.state = $state(initialData);
     this.baseline = structuredClone(initialData);
     this.init(structuredClone(initialData));
@@ -116,6 +118,7 @@ export class ChangeTracker<T extends object> {
   }
 
   private checkObjectField(target: any, prop: string) {
+    if (this.ignored.has(prop)) return;
     const id = target.id;
     if (!id || !this.originalObjects.has(id)) return;
 

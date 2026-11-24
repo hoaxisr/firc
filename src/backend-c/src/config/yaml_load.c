@@ -98,6 +98,29 @@ static void warn_ignored_subscriptions(yaml_document_t *doc, node_t *subs)
               named > 2 ? urls[2] : "", rest);
 }
 
+static void warn_ignored_group_lists(yaml_document_t *doc, node_t *groups)
+{
+    const char *urls[SUBS_URLS_NAMED] = {"?", "?", "?"};
+    size_t n = 0;
+    for (yaml_node_item_t *it = groups->data.sequence.items.start; it < groups->data.sequence.items.top; it++) {
+        node_t *g = node_of(doc, *it);
+        node_t *list = g != NULL && g->type == YAML_MAPPING_NODE ? map_get(doc, g, "list") : NULL;
+        if (list == NULL || node_is_null(list)) { continue; }
+        node_t *url = list->type == YAML_MAPPING_NODE ? map_get(doc, list, "url") : NULL;
+        if (n < SUBS_URLS_NAMED && url != NULL && url->type == YAML_SCALAR_NODE) { urls[n] = scalar_text(url); }
+        n++;
+    }
+    if (n == 0) { return; }
+    size_t named = n < SUBS_URLS_NAMED ? n : SUBS_URLS_NAMED;
+    char rest[48] = "";
+    if (n > named) { snprintf(rest, sizeof(rest), " and %zu more", n - named); }
+    FIRC_WARN("config: the \"list\" key is no longer read -- a group's lists are under \"lists\"; "
+              "its %zu %s ignored, add %s again before the next Save drops the key: %.*s%s%.*s%s%.*s%s",
+              n, n == 1 ? "value is" : "values are", n == 1 ? "it" : "them", SUBS_URL_CLIP, urls[0],
+              named > 1 ? ", " : "", SUBS_URL_CLIP, named > 1 ? urls[1] : "", named > 2 ? ", " : "",
+              SUBS_URL_CLIP, named > 2 ? urls[2] : "", rest);
+}
+
 /* every getter: node NULL/null -> absent, type mismatch -> FIRC_ERR_INVAL */
 typedef enum getter_res {
     GET_ABSENT = 0,
@@ -761,6 +784,41 @@ static firc_err_t load_ifaces(yaml_document_t *doc, node_t *n, firc_group_t *g)
     return firc_group_set_ifaces(g, names, count);
 }
 
+static firc_err_t load_group_lists(yaml_document_t *doc, node_t *seq, firc_group_t *g)
+{
+    if (seq == NULL || node_is_null(seq)) { return FIRC_OK; }
+    if (seq->type != YAML_SEQUENCE_NODE) { return FIRC_ERR_INVAL; }
+    for (yaml_node_item_t *it = seq->data.sequence.items.start; it < seq->data.sequence.items.top; it++) {
+        node_t *item = node_of(doc, *it);
+        if (item == NULL || item->type != YAML_MAPPING_NODE) { return FIRC_ERR_INVAL; }
+        firc_group_list_t *l = firc_group_list_new();
+        if (l == NULL) { return FIRC_ERR_NOMEM; }
+        firc_err_t err = load_group_list(doc, item, l, g->name);
+        if (err == FIRC_OK && get_id(map_get(doc, item, "id"), &l->id, &err) == GET_ERR) {}
+        if (err == FIRC_OK && firc_id_is_zero(l->id)) { err = firc_id_random(&l->id); }
+        if (err == FIRC_OK) {
+            err = firc_group_add_list(g, l);
+            if (err == FIRC_ERR_LIMIT) {
+                FIRC_ERROR("config: group \"%s\": more than %d lists", g->name != NULL ? g->name : "",
+                           FIRC_GROUP_LISTS_MAX);
+                err = FIRC_ERR_INVAL;
+            } else if (err == FIRC_ERR_INVAL) {
+                bool same_url = false;
+                for (size_t i = 0; i < g->n_lists; i++) {
+                    same_url = same_url || strcmp(g->lists[i]->url, l->url) == 0;
+                }
+                FIRC_ERROR("config: group \"%s\": %s", g->name != NULL ? g->name : "",
+                           same_url ? "a list url twice" : "a list id twice");
+            }
+        }
+        if (err != FIRC_OK) {
+            firc_group_list_free(l);
+            return err;
+        }
+    }
+    return FIRC_OK;
+}
+
 static firc_err_t load_group(yaml_document_t *doc, node_t *n, firc_group_t *g)
 {
     firc_err_t err = FIRC_OK;
@@ -848,23 +906,7 @@ static firc_err_t load_group(yaml_document_t *doc, node_t *n, firc_group_t *g)
         return err;
     }
 
-    node_t *list = map_get(doc, n, "list");
-    if (list != NULL && !node_is_null(list)) {
-        if (list->type != YAML_MAPPING_NODE) {
-            return FIRC_ERR_INVAL;
-        }
-        firc_group_list_t *l = firc_group_list_new();
-        if (l == NULL) {
-            return FIRC_ERR_NOMEM;
-        }
-        err = load_group_list(doc, list, l, g->name);
-        if (err != FIRC_OK) {
-            firc_group_list_free(l);
-            return err;
-        }
-        g->list = l;
-    }
-    return FIRC_OK;
+    return load_group_lists(doc, map_get(doc, n, "lists"), g);
 }
 
 static bool group_id_taken(firc_config_t *cfg, firc_group_t *g)
@@ -951,6 +993,8 @@ firc_err_t firc_config_load_buffer(firc_config_t *cfg, const char *buf, size_t l
             }
         }
     }
+
+    if (groups != NULL && groups->type == YAML_SEQUENCE_NODE) { warn_ignored_group_lists(&doc, groups); }
 
     /* the old subscriptions key has no loader (no migration); warned once so nothing is silently lost */
     node_t *subs = root != NULL ? map_get(&doc, root, "subscriptions") : NULL;

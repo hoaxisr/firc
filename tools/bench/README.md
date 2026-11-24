@@ -28,7 +28,8 @@ firc needs a figure from a script here.
 - `run_c_subscription_fault_soak.sh` — sustained load against a failing
   list server.
 - `run_sub_cost.sh` — what a group's list sync costs, through
-  `/groups/{id}/list/*`. Runs against a router.
+  `/groups/{id}/lists/{listId}/*` and `/groups/{id}/sync/events`. Runs against
+  a router.
 - `run_ct_sweep.sh` — what a conntrack flush costs the DNS path. Run it on
   the router.
 - `run_ktcp_ab.sh` — one timed window of router CPU per payload, for kernel TCP

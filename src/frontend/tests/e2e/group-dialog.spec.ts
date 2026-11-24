@@ -11,8 +11,8 @@ async function openDialog(page: Page) {
   await page.locator('[data-value="Add Group"] button').click();
   const dialog = page.getByRole("dialog");
   await dialog.locator("#gd-name").fill("YouTube");
-  await dialog.locator('[aria-label="List by URL"]').click();
   await dialog.locator("#gd-url").fill("https://example.com/list.txt");
+  await dialog.getByRole("button", { name: "Add list", exact: true }).click();
   return dialog;
 }
 
@@ -105,7 +105,7 @@ test.describe("Group dialog: adding a group", () => {
     await expect(page.locator(".list-badge")).toHaveCount(0);
   });
 
-  // Catches the dialog's list block not giving the new group a `list` of {url, interval}.
+  // Catches the dialog's list block not giving the new group a `lists` entry of {id, url, interval}.
   test("the_dialog_adds_a_group_with_a_list", async ({ page }) => {
     await signedIn(page);
     await page.route("**/interfaces", (route) => route.fulfill({ json: { interfaces: ["eth0"] } }));
@@ -126,7 +126,6 @@ test.describe("Group dialog: adding a group", () => {
     await page.locator('[data-value="Add Group"] button').click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("YouTube");
-    await dialog.locator('[aria-label="List by URL"]').click();
     await dialog.locator("#gd-url").fill("https://lists.example.net/youtube.lst");
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
@@ -140,10 +139,13 @@ test.describe("Group dialog: adding a group", () => {
     await page.locator("#save-changes").click();
     await expect(page.getByText("Saved")).toBeVisible();
 
-    expect(savedBody?.groups[0].list).toEqual({
-      url: "https://lists.example.net/youtube.lst",
-      interval: 86400,
-    });
+    expect(savedBody?.groups[0].lists).toEqual([
+      {
+        id: expect.stringMatching(/^[0-9a-f]{8}$/),
+        url: "https://lists.example.net/youtube.lst",
+        interval: 86400,
+      },
+    ]);
   });
 });
 
@@ -205,8 +207,8 @@ test.describe("Group dialog on a phone", () => {
     await dialog.locator("#gd-dns [data-select-trigger]").click();
     await page.getByRole("option", { name: "Через туннель — свой сервер" }).click();
     await dialog.locator("#gd-dns-server").fill("9.9.9.9");
-    await dialog.locator('[aria-label="Список по URL"]').click();
     await dialog.locator("#gd-url").fill("https://example.com/list.txt");
+    await dialog.getByRole("button", { name: "Добавить список", exact: true }).click();
     return dialog;
   }
 
@@ -284,12 +286,10 @@ async function catalogDialog(
   });
   await page.goto("/");
   const add = opts.locale === "ru" ? "Добавить группу" : "Add Group";
-  const toggle = opts.locale === "ru" ? "Список по URL" : "List by URL";
   const open = async () => {
     await page.locator(`[data-value="${add}"] button`).click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("YouTube");
-    await dialog.locator(`[aria-label="${toggle}"]`).click();
     return dialog;
   };
   const dialog = await open();
@@ -298,7 +298,7 @@ async function catalogDialog(
 
 test.describe("Group dialog: finding a list by name", () => {
   // Catches the arrow keys or Enter not picking the highlighted row, or the list staying open after a pick.
-  test("typing a word lists matches, arrow down and Enter put the URL in", async ({ page }) => {
+  test("typing a word lists matches, arrow down and Enter add the list", async ({ page }) => {
     const { dialog } = await catalogDialog(page);
     const field = dialog.locator("#gd-url");
     await field.fill("you");
@@ -309,9 +309,10 @@ test.describe("Group dialog: finding a list by name", () => {
     await expect(field).toHaveAttribute("aria-expanded", "true");
     await field.press("ArrowDown");
     await field.press("Enter");
-    await expect(field).toHaveValue(
+    await expect(dialog.locator(".gd-list-url")).toHaveValue(
       "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs",
     );
+    await expect(field).toHaveValue("");
     await expect(dialog.getByRole("listbox")).toHaveCount(0);
     await expect(field).toHaveAttribute("aria-expanded", "false");
     await expect(dialog.getByRole("button", { name: "Preview", exact: true })).toBeEnabled();
@@ -327,7 +328,7 @@ test.describe("Group dialog: finding a list by name", () => {
       .filter({ hasText: /^\s*youtube\s*(sagernet|hoaxisr)\s*$/ });
     await expect(named).toHaveCount(2);
     await dialog.getByRole("option").filter({ hasText: "hoaxisr" }).click();
-    await expect(field).toHaveValue(
+    await expect(dialog.locator(".gd-list-url")).toHaveValue(
       "https://raw.githubusercontent.com/hoaxisr/rulesets/master/srs/youtube.srs",
     );
     await expect(dialog.getByRole("listbox")).toHaveCount(0);
@@ -353,7 +354,7 @@ test.describe("Group dialog: finding a list by name", () => {
     const { dialog, calls } = await catalogDialog(page);
     const field = dialog.locator("#gd-url");
     await field.fill("https://example.com/list.txt");
-    await expect(dialog.getByRole("button", { name: "Preview", exact: true })).toBeEnabled();
+    await expect(dialog.getByRole("button", { name: "Add list", exact: true })).toBeEnabled();
     await expect(dialog.getByRole("listbox")).toHaveCount(0);
     await expect(field).toHaveAttribute("aria-expanded", "false");
     expect(calls.count).toBe(0);
@@ -363,14 +364,14 @@ test.describe("Group dialog: finding a list by name", () => {
   });
 
   // Catches text without a scheme being treated as a URL, or an empty search showing nothing at all.
-  test("an address without a scheme finds nothing and cannot be previewed", async ({ page }) => {
+  test("an address without a scheme finds nothing and cannot be added", async ({ page }) => {
     const { dialog } = await catalogDialog(page);
     await dialog.locator("#gd-url").fill("raw.githubusercontent.com/x");
     await expect(dialog.locator(".catalog-panel")).toContainText("nothing found");
     await expect(dialog.locator("#gd-url")).toHaveAttribute("aria-controls", "gd-url-catalog");
     await expect(dialog.locator('[role="status"]')).toHaveText("nothing found");
     await expect(dialog.getByRole("option")).toHaveCount(0);
-    await expect(dialog.getByRole("button", { name: "Preview", exact: true })).toBeDisabled();
+    await expect(dialog.getByRole("button", { name: "Add list", exact: true })).toBeDisabled();
   });
 
   // Catches the router's reason being replaced by a generic message, or a failed catalog blocking a hand-typed URL.
@@ -383,7 +384,7 @@ test.describe("Group dialog: finding a list by name", () => {
     await expect(dialog.locator(".catalog-panel")).toContainText("the server answered 404");
     await field.fill("https://example.com/list.txt");
     await expect(dialog.locator(".catalog-panel")).toHaveCount(0);
-    await expect(dialog.getByRole("button", { name: "Preview", exact: true })).toBeEnabled();
+    await expect(dialog.getByRole("button", { name: "Add list", exact: true })).toBeEnabled();
   });
 
   // Catches the unreadable-answer fallback bypassing translation.

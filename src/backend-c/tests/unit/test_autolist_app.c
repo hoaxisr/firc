@@ -1353,13 +1353,13 @@ TEST recheck_goes_through_the_budget(void) {
 
 TEST list_group_takes_the_rule(void) {
     rig_t r;
-    setup_t su = {.mode = "add", .group_extra = "    list:\n      url: 'https://example.invalid/l.txt'\n"};
+    setup_t su = {.mode = "add", .group_extra = "    lists:\n      - id: 7a7a7a01\n        url: 'https://example.invalid/l.txt'\n"};
     ASSERT(rig_up_with(&r, &su));
     ASSERT(fail_twice(&r, "blocked.example.com", 50001));
     cand_want_t want = {"example.com", "added"};
     cJSON_Delete(wait_status(has_candidate, &want));
     rig_stop_loop(&r);
-    ASSERT(target(r.app)->list != NULL);
+    ASSERT((target(r.app))->n_lists != 0);
     ASSERT(rule_of(r.app, "example.com") != NULL);
     rig_down(&r);
     PASS();

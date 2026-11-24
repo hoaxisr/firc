@@ -29,6 +29,8 @@
 #include "firc/loop.h"
 #include "firc/resolveroute.h"
 #include "firc/rtnl.h"
+#include "firc/sub_worker.h"
+#include "test_group_lists_util.h"
 
 typedef struct harness {
     firc_loop_t *loop;
@@ -3044,6 +3046,50 @@ TEST every_rule_route_rolls_back_on_a_failed_sync(void) {
     PASS();
 }
 
+/* catches: a list keeping the rules of a sync whose resync failed */
+TEST a_failed_resync_gives_a_list_its_old_rules_back(void) {
+    harness_t *h = harness_start_with_kernels(true);
+    ASSERT(h != NULL);
+    firc_ruleset_t *rs = live_group_with(h, "[]");
+    ASSERT(rs != NULL);
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    firc_group_list_t *l = test_group_add_list_at(g, "http://127.0.0.1:1/l");
+    ASSERT(l != NULL);
+    firc_id_t rid;
+    ASSERT_EQ(FIRC_OK, firc_id_random(&rid));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l->rules, "old.example", "namespace", true, rid));
+    l->has_body_hash = true;
+    l->last_check = 500;
+    l->last_update = 500;
+    l->sync_seq = 9;
+
+    firc_sub_event_t *ev = calloc(1, sizeof(*ev));
+    ASSERT(ev != NULL);
+    ev->kind = FIRC_SUB_EV_RESULT;
+    ev->result = FIRC_SUB_RESULT_PARSED;
+    ev->group_id = g->id;
+    ev->list_id = l->id;
+    ev->seq = 9;
+    firc_sub_rules_init(&ev->rules);
+    ASSERT_EQ(FIRC_OK, firc_id_random(&rid));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&ev->rules, "new.example", "namespace", true, rid));
+
+    g_sync_fails = 1;
+    bool changed = false;
+    firc_err_t err = firc_app_apply_sync_result(h->app, ev, 1000, &changed);
+    g_sync_fails = 0;
+    firc_sub_event_free(ev);
+    ASSERT_EQ(FIRC_ERR_NOMEM, err);
+    ASSERT(changed);
+    ASSERT_EQ_FMT((size_t)1, l->rules.n, "%zu");
+    ASSERT_STR_EQ("old.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT(500u, (unsigned)l->last_update, "%u");
+    ASSERT_EQ_FMT(500u, (unsigned)l->last_check, "%u");
+    ASSERT_EQ(FIRC_SUB_SYNC_ERROR, l->sync_state);
+    harness_stop(h);
+    PASS();
+}
+
 /* catches: a rule write without ?save touching groups.yaml */
 TEST a_rule_write_without_save_leaves_the_file_alone(void) {
     harness_t *h = harness_start();
@@ -3177,6 +3223,7 @@ int main(int argc, char **argv) {
     RUN_TEST(a_good_sync_takes_the_new_rules_and_saves);
     RUN_TEST(a_rule_listed_twice_is_refused_with_nothing_changed);
     RUN_TEST(every_rule_route_rolls_back_on_a_failed_sync);
+    RUN_TEST(a_failed_resync_gives_a_list_its_old_rules_back);
     RUN_TEST(a_rule_write_without_save_leaves_the_file_alone);
     RUN_TEST(a_groups_resolve_round_trips_and_its_resolver_is_shown);
     RUN_TEST(a_disabled_groups_resolver_lists_no_servers);

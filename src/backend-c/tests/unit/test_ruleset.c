@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_group_lists_util.h"
 
 typedef struct entry {
     int family;
@@ -155,13 +156,13 @@ TEST a_group_plans_its_list_subnets_with_its_own(void) {
     firc_config_init_defaults(&cfg);
     add_group(&cfg, 1, FIRC_RULE_SUBNET, "10.1.0.0/16", true);
     firc_group_t *g = cfg.groups[0];
-    g->list = firc_group_list_new();
-    ASSERT(g->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->list->rules, "10.2.0.0/16", FIRC_RULE_SUBNET, true,
+    test_group_set_list(g);
+    ASSERT(g->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "10.2.0.0/16", FIRC_RULE_SUBNET, true,
                                            (firc_id_t){{1, 2, 0, 0}}));
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->list->rules, "10.3.0.0/16", FIRC_RULE_SUBNET, false,
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "10.3.0.0/16", FIRC_RULE_SUBNET, false,
                                            (firc_id_t){{1, 3, 0, 0}}));
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->list->rules, "list.example.com", FIRC_RULE_DOMAIN, true,
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "list.example.com", FIRC_RULE_DOMAIN, true,
                                            (firc_id_t){{1, 4, 0, 0}}));
 
     plan_t p = {0};
@@ -178,17 +179,40 @@ TEST a_group_plans_its_list_subnets_with_its_own(void) {
     PASS();
 }
 
+/* Catches: only the first list's subnets planned, the second list's prefix never marked. */
+TEST a_subnet_of_the_second_list_is_planned(void) {
+    firc_config_t cfg;
+    firc_config_init_defaults(&cfg);
+    add_group(&cfg, 1, FIRC_RULE_DOMAIN, "hand.example.com", true);
+    firc_group_t *g = cfg.groups[0];
+    ASSERT(test_group_add_list_at(g, "https://a.example/l.txt") != NULL);
+    ASSERT(test_group_add_list_at(g, "https://b.example/l.txt") != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[0]->rules, "10.2.0.0/16", FIRC_RULE_SUBNET, true,
+                                           (firc_id_t){{1, 2, 0, 0}}));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&g->lists[1]->rules, "10.5.0.0/16", FIRC_RULE_SUBNET, true,
+                                           (firc_id_t){{1, 5, 0, 0}}));
+    plan_t p = {0};
+    ASSERT_EQ(FIRC_OK, firc_ruleset_plan_subnets(g, collect, &p));
+    ASSERT_EQ_FMT((size_t)2, p.n, "%zu");
+    const uint8_t want0[4] = {10, 2, 0, 0};
+    const uint8_t want1[4] = {10, 5, 0, 0};
+    ASSERT_MEM_EQ(want0, p.e[0].addr, 4);
+    ASSERT_MEM_EQ(want1, p.e[1].addr, 4);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 /* Catches: a list rule's proto or ports dropped on the way to the chain, marking every protocol. */
 TEST a_list_prefix_carries_its_protocol_and_ports(void) {
     firc_config_t cfg;
     firc_config_init_defaults(&cfg);
     add_group(&cfg, 1, FIRC_RULE_DOMAIN, "hand.example.com", true);
     firc_group_t *g = cfg.groups[0];
-    g->list = firc_group_list_new();
-    ASSERT(g->list != NULL);
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push_spec(&g->list->rules, "10.2.0.0/16", FIRC_RULE_SUBNET, true,
+    test_group_set_list(g);
+    ASSERT(g->n_lists != 0);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push_spec(&g->lists[0]->rules, "10.2.0.0/16", FIRC_RULE_SUBNET, true,
                                                 (firc_id_t){{1, 2, 0, 0}}, "udp", "50000-50099,19200-19400"));
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push_spec(&g->list->rules, "10.3.0.0/16", FIRC_RULE_SUBNET, true,
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push_spec(&g->lists[0]->rules, "10.3.0.0/16", FIRC_RULE_SUBNET, true,
                                                 (firc_id_t){{1, 3, 0, 0}}, NULL, "53"));
     plan_t p = {0};
     ASSERT_EQ(FIRC_OK, firc_ruleset_plan_subnets(g, collect, &p));
@@ -269,6 +293,7 @@ SUITE(ruleset) {
     RUN_TEST(a_subnet_rule_is_a_prefix_for_the_chain);
     RUN_TEST(a_prefix_with_host_bits_is_normalised);
     RUN_TEST(a_group_plans_its_list_subnets_with_its_own);
+    RUN_TEST(a_subnet_of_the_second_list_is_planned);
     RUN_TEST(a_list_prefix_carries_its_protocol_and_ports);
     RUN_TEST(an_unusable_subnet_rule_is_skipped_without_a_word);
 }

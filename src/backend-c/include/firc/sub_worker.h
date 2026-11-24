@@ -11,12 +11,13 @@
 #include "firc/id.h"
 #include "firc/models.h"
 
-/* one waiting slot per group id; jobs fold by id, so syncing one list repeatedly fills one slot */
-#define FIRC_SUB_WORKER_CAPACITY 256
+/* one waiting slot per (group id, list id); jobs fold by that pair, so syncing one list repeatedly fills one slot */
+#define FIRC_SUB_WORKER_CAPACITY 4096
 
 /* every field is a copy taken at enqueue time; url is owned by the job */
 typedef struct firc_sub_job {
     firc_id_t group_id;
+    firc_id_t list_id;
     char *url;
     bool has_hash;
     uint8_t expected_hash[FIRC_SHA256_DIGEST_LEN];
@@ -40,6 +41,7 @@ typedef enum firc_sub_result_kind {
 typedef struct firc_sub_event {
     firc_sub_event_kind_t kind;
     firc_id_t group_id;
+    firc_id_t list_id;
     uint64_t seq;
 
     /* PROGRESS */
@@ -56,15 +58,17 @@ typedef struct firc_sub_event {
     size_t dropped;                       /* PARSED: lines, or sing-box objects/values, nothing was made of */
     size_t unconstrained;                 /* PARSED: names taken without their object's network/port */
     const char *why; /* ERROR from the parse: static text, or NULL */
+    struct firc_sub_event *next;
 } firc_sub_event_t;
 
-/* called on the WORKER thread; the receiver takes ownership (firc_sub_event_free when done) */
-typedef void (*firc_sub_event_fn)(void *ud, firc_sub_event_t *ev);
+/* called on the WORKER thread; true: the receiver took ownership (firc_sub_event_free when done); false: refused, the caller keeps it */
+typedef bool (*firc_sub_event_fn)(void *ud, firc_sub_event_t *ev);
 
 /* Frees the event and the rules it carries. NULL-safe. */
 void firc_sub_event_free(firc_sub_event_t *ev);
 
 /* Runs one job on the calling thread: emits STARTED, PROGRESS, then one RESULT via emit (no queue).
+ * A refused PROGRESS is freed; a refused STARTED or RESULT is offered again until taken or cancel is raised.
  * cancel may be NULL; once raised, the loop frees further events (this job's result included) instead of emitting. */
 void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub_event_fn emit,
                       void *ud);

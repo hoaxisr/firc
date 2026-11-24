@@ -308,6 +308,34 @@ static firc_err_t append_v6(subnets_t *out, const firc_ipv6_subnet_t *subnet) {
     return FIRC_OK;
 }
 
+static firc_err_t list_subnets_collect(const firc_sub_rules_t *lr, subnets_t *out) {
+    for (size_t i = 0; i < lr->n; i++) {
+        if (!firc_sub_rules_enable(lr, i)) { continue; }
+        const char *type = firc_sub_rules_type(lr, i);
+        const char *text = firc_sub_rules_text(lr, i);
+        if (strcmp(type, FIRC_RULE_SUBNET) == 0) {
+            firc_ipv4_subnet_t subnet;
+            if (!firc_rule_parse_subnet4(text, &subnet) ||
+                !subnet_match_fill(firc_sub_rules_proto(lr, i), firc_sub_rules_ports(lr, i), &subnet.proto,
+                                   subnet.ports, sizeof(subnet.ports))) {
+                continue;
+            }
+            firc_err_t err = append_v4(out, &subnet);
+            if (err != FIRC_OK) { return err; }
+        } else if (strcmp(type, FIRC_RULE_SUBNET6) == 0) {
+            firc_ipv6_subnet_t subnet;
+            if (!firc_rule_parse_subnet6(text, &subnet) ||
+                !subnet_match_fill(firc_sub_rules_proto(lr, i), firc_sub_rules_ports(lr, i), &subnet.proto,
+                                   subnet.ports, sizeof(subnet.ports))) {
+                continue;
+            }
+            firc_err_t err = append_v6(out, &subnet);
+            if (err != FIRC_OK) { return err; }
+        }
+    }
+    return FIRC_OK;
+}
+
 static firc_err_t subnets_collect(const firc_group_t *g, subnets_t *out) {
     memset(out, 0, sizeof(*out));
     for (size_t i = 0; i < g->n_rules; i++) {
@@ -332,30 +360,9 @@ static firc_err_t subnets_collect(const firc_group_t *g, subnets_t *out) {
         }
     }
     /* List lines are skipped silently: the list apply already warned once. */
-    const firc_sub_rules_t *lr = g->list != NULL ? &g->list->rules : NULL;
-    for (size_t i = 0; lr != NULL && i < lr->n; i++) {
-        if (!firc_sub_rules_enable(lr, i)) { continue; }
-        const char *type = firc_sub_rules_type(lr, i);
-        const char *text = firc_sub_rules_text(lr, i);
-        if (strcmp(type, FIRC_RULE_SUBNET) == 0) {
-            firc_ipv4_subnet_t subnet;
-            if (!firc_rule_parse_subnet4(text, &subnet) ||
-                !subnet_match_fill(firc_sub_rules_proto(lr, i), firc_sub_rules_ports(lr, i), &subnet.proto,
-                                   subnet.ports, sizeof(subnet.ports))) {
-                continue;
-            }
-            firc_err_t err = append_v4(out, &subnet);
-            if (err != FIRC_OK) { return err; }
-        } else if (strcmp(type, FIRC_RULE_SUBNET6) == 0) {
-            firc_ipv6_subnet_t subnet;
-            if (!firc_rule_parse_subnet6(text, &subnet) ||
-                !subnet_match_fill(firc_sub_rules_proto(lr, i), firc_sub_rules_ports(lr, i), &subnet.proto,
-                                   subnet.ports, sizeof(subnet.ports))) {
-                continue;
-            }
-            firc_err_t err = append_v6(out, &subnet);
-            if (err != FIRC_OK) { return err; }
-        }
+    for (size_t j = 0; j < g->n_lists; j++) {
+        firc_err_t err = list_subnets_collect(&g->lists[j]->rules, out);
+        if (err != FIRC_OK) { return err; }
     }
     return FIRC_OK;
 }

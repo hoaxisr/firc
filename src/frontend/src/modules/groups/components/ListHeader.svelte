@@ -1,17 +1,18 @@
 <script lang="ts">
   import { getContext } from "svelte";
 
-  import Select from "../../../components/ui/Select.svelte";
+  import Button from "../../../components/ui/Button.svelte";
+  import Tooltip from "../../../components/ui/Tooltip.svelte";
   import { t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, normalizeListUrl, type GroupsStore } from "../groups.svelte";
-  import { syncProgressLabel } from "../lists.svelte";
+  import { listKey, syncProgressLabel } from "../lists.svelte";
 
-  import { CloudSync, Link } from "../../../components/ui/icons";
-  import type { Group } from "../../../types";
-  import { intervalOptionsFor, parseIntervalSeconds } from "../intervals";
+  import { CloudSync, Link, Refresh } from "../../../components/ui/icons";
+  import type { Group, GroupList } from "../../../types";
+  import { listName } from "../list-name";
 
-  type Props = { group: Group };
-  let { group }: Props = $props();
+  type Props = { group: Group; list: GroupList };
+  let { group, list }: Props = $props();
 
   const store = getContext<GroupsStore>(GROUPS_STORE_CONTEXT);
   if (!store) {
@@ -36,82 +37,78 @@
     return `${lastUpdateDateFormatter.format(date)} ${lastUpdateTimeFormatter.format(date)}`;
   }
 
-  let urlError = $derived(store.hasListUrlError(group.id));
-  let syncProgress = $derived(store.lists.syncProgress[group.id]);
-  let syncError = $derived(
-    group.list?.sync?.state === "error" ? (group.list.sync.error ?? "") : "",
-  );
+  let urlError = $derived(store.hasListUrlError(group.id, list.id));
+  let syncProgress = $derived(store.lists.syncProgress[listKey(group.id, list.id)]);
+  let syncError = $derived(list.sync?.state === "error" ? (list.sync.error ?? "") : "");
 
-  let ownCount = $derived(group.rules.length);
-  let interval = $derived(group.list?.interval ?? 86400);
-  let listCount = $derived(group.list?.rulesTotal ?? 0);
+  let listCount = $derived(list.rulesTotal ?? 0);
+  let several = $derived((group.lists?.length ?? 0) > 1);
+  let saved = $derived(store.listSaved(group.id, list.id));
 </script>
 
-{#if group.list}
-  <div class="list-header">
-    <div class="url-line">
-      <span class="icon-wrap"><Link size={14} /></span>
-      <input
-        type="url"
-        class="list-url-input"
-        class:invalid={urlError}
-        value={group.list.url}
-        oninput={(e) => store.setListUrl(group.id, (e.currentTarget as HTMLInputElement).value)}
-        onblur={() => store.setListUrl(group.id, normalizeListUrl(group.list?.url ?? ""))}
-        placeholder="https://example.com/list.txt"
-        aria-label={t("URL")}
-        title={group.list.url}
-      />
-    </div>
-    {#if urlError}
-      <span class="url-error">{store.listUrlErrorMessage(group.id)}</span>
+<div class="list-header">
+  <div class="url-line">
+    <span class="icon-wrap"><Link size={14} /></span>
+    {#if several}
+      <span class="list-name" title={list.url}>{listName(list.url ?? "")}</span>
     {/if}
-    <div class="update-line">
-      <div class="update-line-row">
-        <span class="icon-wrap"><CloudSync size={14} /></span>
-        <span class="update-text"
-          >{formatTime(group.list.sync?.lastCheck || group.list.lastUpdate)}</span
+    <input
+      type="url"
+      class="list-url-input"
+      class:invalid={urlError}
+      value={list.url}
+      oninput={(e) =>
+        store.setListUrl(group.id, list.id, (e.currentTarget as HTMLInputElement).value)}
+      onblur={() => store.setListUrl(group.id, list.id, normalizeListUrl(list.url ?? ""))}
+      placeholder="https://example.com/list.txt"
+      aria-label={t("URL")}
+      title={list.url}
+    />
+    {#if several}
+      <Tooltip value={t(saved ? "Sync this list" : "Save the group to sync its list")}>
+        <Button
+          small
+          class="list-sync"
+          inactive={!saved}
+          aria-disabled={!saved}
+          onclick={() => store.lists.syncList(group.id, list.id)}
         >
-        <span class="update-interval">
-          <span class="interval-label">{t("Update:")}</span>
-          <Select
-            options={intervalOptionsFor(interval, t)}
-            selected={String(interval)}
-            onValueChange={(value) => {
-              const next = parseIntervalSeconds(value);
-              if (next !== null) store.setListInterval(group.id, next);
-            }}
-            class="list-interval"
-            ariaLabel={t("Update:")}
-            showSelectedDescription={false}
-          />
-        </span>
-        <span class="update-counts">
-          {listCount}
-          {t("from the list")} + {ownCount}
-          {t("of its own")}
-        </span>
-        {#if syncError && !syncProgress}
-          <span class="update-error">
-            <span class="sync-error" title={syncError}>{syncError}</span>
-          </span>
-        {/if}
-      </div>
-    </div>
-    {#if syncProgress}
-      <div class="sync-progress">
-        {#if syncProgress.stage === "fetch"}
-          {#if syncProgress.total > 0}
-            <progress max={syncProgress.total} value={syncProgress.bytes}></progress>
-          {:else}
-            <progress></progress>
-          {/if}
-        {/if}
-        <span class="sync-progress-text">{syncProgressLabel(syncProgress)}</span>
-      </div>
+          <Refresh size={16} />
+        </Button>
+      </Tooltip>
     {/if}
   </div>
-{/if}
+  {#if urlError}
+    <span class="url-error">{store.listUrlErrorMessage(group.id, list.id)}</span>
+  {/if}
+  <div class="update-line">
+    <div class="update-line-row">
+      <span class="icon-wrap"><CloudSync size={14} /></span>
+      <span class="update-text">{formatTime(list.sync?.lastCheck || list.lastUpdate)}</span>
+      <span class="update-counts">
+        {listCount}
+        {t("from the list")}
+      </span>
+      {#if syncError && !syncProgress}
+        <span class="update-error">
+          <span class="sync-error" title={syncError}>{syncError}</span>
+        </span>
+      {/if}
+    </div>
+  </div>
+  {#if syncProgress}
+    <div class="sync-progress">
+      {#if syncProgress.stage === "fetch"}
+        {#if syncProgress.total > 0}
+          <progress max={syncProgress.total} value={syncProgress.bytes}></progress>
+        {:else}
+          <progress></progress>
+        {/if}
+      {/if}
+      <span class="sync-progress-text">{syncProgressLabel(syncProgress)}</span>
+    </div>
+  {/if}
+</div>
 
 <style>
   .list-header {
@@ -136,6 +133,15 @@
     width: 100%;
     max-width: 100%;
     overflow: hidden;
+  }
+
+  .list-name {
+    flex: none;
+    max-width: 70%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
   }
 
   .list-url-input {
@@ -193,7 +199,6 @@
     opacity: 0.7;
   }
 
-  .update-interval,
   .update-counts,
   .update-error {
     position: relative;
@@ -203,7 +208,6 @@
     min-width: 0;
   }
 
-  .update-interval::before,
   .update-counts::before,
   .update-error::before {
     content: "•";
@@ -239,23 +243,14 @@
     color: var(--text-2);
   }
 
-  .update-interval :global([data-select-trigger]) {
-    padding: 0.1rem 0.3rem;
-    font-size: 0.85rem;
-    color: var(--text-2);
-  }
-
-  .update-interval :global(.selected-value) {
-    padding-left: 0;
+  .url-line :global(.list-sync) {
+    flex: none;
+    padding: 0.15rem;
   }
 
   @media (max-width: 700px) {
     .list-header {
       max-width: 100%;
-    }
-
-    .update-interval :global([data-select-trigger]) {
-      min-height: 2rem;
     }
 
     .url-line {

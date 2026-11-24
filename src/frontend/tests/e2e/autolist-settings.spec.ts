@@ -38,7 +38,7 @@ const LIST_GROUP = {
   name: "Lists",
   interface: "ppp0",
   enable: true,
-  list: { url: "https://example.invalid/l.txt" },
+  lists: [{ id: "0a0a0a0a", url: "https://example.invalid/l.txt" }],
   devices: { allow: [], deny: [] },
   resolve: { tunnel: false, server: "" },
   live: true,

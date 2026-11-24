@@ -15,10 +15,11 @@
     rule: ListRule;
     rule_index: number;
     group_id: string;
+    list_id: string;
     [key: string]: any;
   };
 
-  let { rule = $bindable(), rule_index, group_id, ...rest }: Props = $props();
+  let { rule = $bindable(), rule_index, group_id, list_id, ...rest }: Props = $props();
   const store = getContext<GroupsStore>(GROUPS_STORE_CONTEXT);
   if (!store) {
     throw new Error("GroupsStore context is missing");
@@ -33,7 +34,7 @@
   let overlap = $derived(store.ruleOverlap(rule.id));
   let isHighlighted = $derived(store.isRuleHighlighted(rule.id));
 
-  let baseline = $derived(store.lists.baselineOf(group_id, rule.id));
+  let baseline = $derived(store.lists.baselineOf(group_id, list_id, rule.id));
   let isChanged = $derived(
     Boolean(baseline) && (rule.type !== baseline!.type || rule.enable !== baseline!.enable),
   );

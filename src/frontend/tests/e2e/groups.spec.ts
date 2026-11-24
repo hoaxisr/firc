@@ -579,7 +579,7 @@ test.describe("Groups layout", () => {
     await page.route("**/interfaces", async (route) => {
       await route.fulfill({ json: { interfaces } });
     });
-    await page.route(/\/list\/rules(\?.*)?$/, async (route) => {
+    await page.route(/\/lists\/[0-9a-f]{8}\/rules(\?.*)?$/, async (route) => {
       const rules = [rule("ccccccc1", "domain", "google.com"), rule("ccccccc2", "domain", "x.com")];
       await route.fulfill({ json: { total: 2, matched: 2, offset: 0, rules } });
     });
@@ -703,13 +703,16 @@ test.describe("Groups layout", () => {
     interface: "eth0",
     enable: true,
     rules: [],
-    list: {
-      url: "https://services.should.be.blocked.example/list.txt",
-      interval: 86400,
-      lastUpdate: 1700000000,
-      sync: { state: "idle", error: "", lastCheck: 1800000000 },
-      rulesTotal: 2,
-    },
+    lists: [
+      {
+        id: "0a0a0a0a",
+        url: "https://services.should.be.blocked.example/list.txt",
+        interval: 86400,
+        lastUpdate: 1700000000,
+        sync: { state: "idle", error: "", lastCheck: 1800000000 },
+        rulesTotal: 2,
+      },
+    ],
   };
 
   for (const width of [360, 768, 1440]) {

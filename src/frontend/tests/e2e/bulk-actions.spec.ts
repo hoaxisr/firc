@@ -21,6 +21,7 @@ const group = (id: string, name: string, extra: Record<string, unknown> = {}) =>
 const NAMES = ["Speedtest", "Unavailable", "Insta", "Telegram", "Work"];
 
 const LIST = {
+  id: "0a0a0a0a",
   url: "https://services.should.be.blocked.com",
   interval: 86400,
   lastUpdate: 1790000000,
@@ -33,7 +34,7 @@ async function setup(page: Page, extra: Record<string, Record<string, unknown>> 
   const daemon = { puts: [] as any[], listSearchDelayMs: 0 };
   const groups = NAMES.map((name, i) =>
     group(`0b00000${i + 1}`, name, {
-      ...(name === "Unavailable" ? { list: LIST } : {}),
+      ...(name === "Unavailable" ? { lists: [LIST] } : {}),
       ...extra[name],
     }),
   );
@@ -57,7 +58,7 @@ async function setup(page: Page, extra: Record<string, Record<string, unknown>> 
     route.fulfill({ json: { ok: true, error: "", since: 0 } }),
   );
   await page.route("**/system/config/save", (route) => route.fulfill({ json: {} }));
-  await page.route(/\/groups\/[^/]+\/list\/rules/, async (route) => {
+  await page.route(/\/groups\/[^/]+\/lists\/[^/]+\/rules/, async (route) => {
     const q = new URL(route.request().url()).searchParams.get("q") ?? "";
     if (q) await new Promise((resolve) => setTimeout(resolve, daemon.listSearchDelayMs));
     const matched = !q ? 2 : q.includes(LIST_ONLY) ? 1 : 0;
@@ -1129,10 +1130,10 @@ test.describe("Group bulk actions", () => {
     await expect.poll(() => daemon.puts.length).toBe(1);
     const sent = daemon.puts[0].groups;
     expect(sent.map((g: any) => g.name)).toEqual(["Speedtest", "Unavailable", "Work"]);
-    expect(sent[1].list).toEqual({ url: LIST.url, interval: LIST.interval });
-    expect(sent.filter((g: any) => g.name !== "Unavailable").map((g: any) => g.list)).toEqual([
-      null,
-      null,
+    expect(sent[1].lists).toEqual([{ id: LIST.id, url: LIST.url, interval: LIST.interval }]);
+    expect(sent.filter((g: any) => g.name !== "Unavailable").map((g: any) => g.lists)).toEqual([
+      [],
+      [],
     ]);
   });
 

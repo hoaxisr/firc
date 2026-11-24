@@ -26,6 +26,8 @@
 #include "firc/models.h"
 #include "firc/sub_fetch.h"
 #include "firc/yamlio.h"
+#include "test_group_lists_util.h"
+#include "test_app_lists_util.h"
 
 typedef struct harness {
     firc_loop_t *loop;
@@ -445,6 +447,10 @@ static const char *jstr(cJSON *obj, const char *key) {
 
 static cJSON *jobj(cJSON *obj, const char *key) { return cJSON_GetObjectItemCaseSensitive(obj, key); }
 
+static cJSON *list0_of(cJSON *rec) { return cJSON_GetArrayItem(jobj(rec, "lists"), 0); }
+
+static int lists_n(cJSON *rec) { return cJSON_IsArray(jobj(rec, "lists")) ? cJSON_GetArraySize(jobj(rec, "lists")) : -1; }
+
 static double jnum(cJSON *obj, const char *key) {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsNumber(v) ? v->valuedouble : -1;
@@ -526,13 +532,37 @@ static bool stream_finished(const char *buf, size_t n) {
     return n >= 5 && strcmp(buf + n - 5, "0\r\n\r\n") == 0;
 }
 
+static cJSON *event_at(const char *stream, int k, char *name, size_t cap) {
+    const char *p = stream;
+    for (int i = 0; (p = strstr(p, "event: ")) != NULL; i++, p++) {
+        if (i != k) { continue; }
+        const char *nl = strchr(p, '\n');
+        if (nl == NULL || strncmp(nl + 1, "data: ", 6) != 0) { return NULL; }
+        snprintf(name, cap, "%.*s", (int)(nl - p - 7), p + 7);
+        const char *d = nl + 7;
+        const char *end = strstr(d, "\n\n");
+        return end != NULL ? cJSON_ParseWithLength(d, (size_t)(end - d)) : NULL;
+    }
+    return NULL;
+}
+
+static int events_n(const char *stream) {
+    int n = 0;
+    for (const char *p = strstr(stream, "event: "); p != NULL; p = strstr(p + 1, "event: ")) { n++; }
+    return n;
+}
+
+static const char *event_list_state(cJSON *ev) { return jstr(jobj(jobj(ev, "list"), "sync"), "state"); }
+
+static const char *event_list_error(cJSON *ev) { return jstr(jobj(jobj(ev, "list"), "sync"), "error"); }
+
 /* A group record's `list.sync.state`, or NULL when it has none. */
 static const char *list_state_of(cJSON *record) {
-    cJSON *sync = jobj(jobj(record, "list"), "sync");
+    cJSON *sync = jobj(list0_of(record), "sync");
     return cJSON_IsObject(sync) ? jstr(sync, "state") : NULL;
 }
 
-static double list_total_of(cJSON *record) { return jnum(jobj(record, "list"), "rulesTotal"); }
+static double list_total_of(cJSON *record) { return jnum(list0_of(record), "rulesTotal"); }
 
 /* Polls GET /groups/{id} until its list is neither queued nor fetching; false if it never settles. */
 static bool wait_settled(const char *id, int budget_ms) {
@@ -555,11 +585,14 @@ static bool wait_settled(const char *id, int budget_ms) {
 }
 
 #define GID "aabbccdd"
+#define L0 "a0a0a0a0"
+#define L1 "b1b1b1b1"
+#define AT(path) "http://127.0.0.1:1" path
 
 static int create_stub_group(const char *path) {
     char body[256];
     snprintf(body, sizeof(body),
-             "{\"id\":\"" GID "\",\"name\":\"g\",\"interface\":\"lo\",\"list\":{\"url\":\"%s\"}}",
+             "{\"id\":\"" GID "\",\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"id\":\"" L0 "\",\"url\":\"%s\"}]}",
              stub_url(path));
     return do_request("POST", "/api/v1/groups", body, NULL);
 }
@@ -574,20 +607,20 @@ static firc_group_t *list_group(const char *url, int n_rules) {
         firc_group_free(g);
         return NULL;
     }
-    g->list = firc_group_list_new();
-    if (g->list == NULL) {
+    test_group_set_list(g);
+    if (g->n_lists == 0) {
         firc_group_free(g);
         return NULL;
     }
-    if (firc_strset(&g->list->url, url) != FIRC_OK) {
+    if (firc_id_parse(L0, &g->lists[0]->id) != FIRC_OK || firc_strset(&g->lists[0]->url, url) != FIRC_OK) {
         firc_group_free(g);
         return NULL;
     }
-    g->list->has_body_hash = true;
+    g->lists[0]->has_body_hash = true;
     for (int i = 0; i < n_rules; i++) {
         char text[32];
         snprintf(text, sizeof(text), "r%d.example.com", i);
-        if (firc_sub_rules_push(&g->list->rules, text, "domain", true, test_random_id()) != FIRC_OK) {
+        if (firc_sub_rules_push(&g->lists[0]->rules, text, "domain", true, test_random_id()) != FIRC_OK) {
             firc_group_free(g);
             return NULL;
         }
@@ -626,7 +659,7 @@ TEST put_groups_answers_the_carried_list(void) {
     for (int i = 0; i < cJSON_GetArraySize(groups); i++) {
         cJSON *g = cJSON_GetArrayItem(groups, i);
         const char *id = jstr(g, "id");
-        cJSON *list = jobj(g, "list");
+        cJSON *list = list0_of(g);
         ASSERT(cJSON_IsObject(list));
         if (strcmp(id, id_a) == 0) {
             found_a = true;
@@ -642,8 +675,8 @@ TEST put_groups_answers_the_carried_list(void) {
     PASS();
 }
 
-/* Catches: a PUT without "list" dropping the list, or "list": null keeping it. */
-TEST a_put_without_list_keeps_it_and_null_removes_it(void) {
+/* Catches: a PUT without "lists" dropping them, "lists": null taken as a removal, or [] keeping them. */
+TEST a_put_without_lists_keeps_them_null_is_400_and_empty_removes(void) {
     harness_t *h = harness_start();
     ASSERT(h != NULL);
 
@@ -658,23 +691,29 @@ TEST a_put_without_list_keeps_it_and_null_removes_it(void) {
 
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"g2\",\"interface\":\"lo\"}", &out));
-    cJSON *list = jobj(out, "list");
+    cJSON *list = list0_of(out);
     ASSERT(cJSON_IsObject(list));
     ASSERT_EQ_FMTm("the list's rules are still there", 2.0, jnum(list, "rulesTotal"), "%f");
     ASSERT_STR_EQ("http://127.0.0.1:1/x", jstr(list, "url"));
     cJSON_Delete(out);
 
     ASSERT_EQ(200, do_request("GET", path, NULL, &out));
-    ASSERTm("and so does a fresh GET", cJSON_IsObject(jobj(out, "list")));
+    ASSERTm("and so does a fresh GET", cJSON_IsObject(list0_of(out)));
     cJSON_Delete(out);
 
-    ASSERT_EQ(200,
-             do_request("PUT", path, "{\"name\":\"g2\",\"interface\":\"lo\",\"list\":null}", &out));
-    ASSERTm("null in the PUT removes it from the answer", jobj(out, "list") == NULL);
+    ASSERT_EQ(400, do_request("PUT", path, "{\"name\":\"g2\",\"interface\":\"lo\",\"lists\":null}", &out));
+    ASSERT_STR_EQ("invalid lists", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", path, NULL, &out));
+    ASSERT_EQm("a refused null keeps the list", 1, lists_n(out));
+    cJSON_Delete(out);
+
+    ASSERT_EQ(200, do_request("PUT", path, "{\"name\":\"g2\",\"interface\":\"lo\",\"lists\":[]}", &out));
+    ASSERT_EQm("[] in the PUT removes it from the answer", 0, lists_n(out));
     cJSON_Delete(out);
 
     ASSERT_EQ(200, do_request("GET", path, NULL, &out));
-    ASSERTm("and from a fresh GET", jobj(out, "list") == NULL);
+    ASSERT_EQm("and from a fresh GET", 0, lists_n(out));
     cJSON_Delete(out);
 
     harness_stop(h);
@@ -688,18 +727,18 @@ TEST a_list_needs_a_supported_url(void) {
     cJSON *out = NULL;
     ASSERT_EQ_FMTm("ftp is not supported", 400,
                    do_request("POST", "/api/v1/groups",
-                              "{\"name\":\"g\",\"interface\":\"lo\",\"list\":{\"url\":\"ftp://x\"}}",
+                              "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"url\":\"ftp://x\"}]}",
                               &out),
                    "%d");
     cJSON_Delete(out);
     ASSERT_EQ_FMTm("an empty url", 400,
                    do_request("POST", "/api/v1/groups",
-                              "{\"name\":\"g\",\"interface\":\"lo\",\"list\":{\"url\":\"\"}}", &out),
+                              "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"url\":\"\"}]}", &out),
                    "%d");
     cJSON_Delete(out);
     ASSERT_EQ_FMTm("a list that is not an object", 400,
                    do_request("POST", "/api/v1/groups",
-                              "{\"name\":\"g\",\"interface\":\"lo\",\"list\":\"nope\"}", &out),
+                              "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":\"nope\"}", &out),
                    "%d");
     cJSON_Delete(out);
     harness_stop(h);
@@ -714,9 +753,9 @@ TEST creating_a_group_with_a_list_answers_it_queued(void) {
     ASSERT_EQ(200,
              do_request("POST", "/api/v1/groups",
                         "{\"name\":\"g\",\"interface\":\"lo\","
-                        "\"list\":{\"url\":\"http://127.0.0.1:1/list\"}}",
+                        "\"lists\":[{\"url\":\"http://127.0.0.1:1/list\"}]}",
                         &out));
-    cJSON *list = jobj(out, "list");
+    cJSON *list = list0_of(out);
     ASSERT(cJSON_IsObject(list));
     cJSON *sync = jobj(list, "sync");
     ASSERT(cJSON_IsObject(sync));
@@ -751,9 +790,9 @@ TEST lastUpdate_in_a_body_is_ignored(void) {
 
     firc_group_t *g = list_group("http://127.0.0.1:1/x", 0);
     ASSERT(g != NULL);
-    g->list->last_update = 12345;
+    g->lists[0]->last_update = 12345;
     ASSERT_EQ(FIRC_OK, firc_group_list_set_override(
-                           g->list, &(firc_sub_rule_key_t){.text = "kept.example.com"}, "wildcard", NULL));
+                           g->lists[0], &(firc_sub_rule_key_t){.text = "kept.example.com"}, "wildcard", NULL));
     firc_id_t gid = g->id;
     char id[FIRC_ID_STR_LEN];
     id_of(gid, id);
@@ -761,29 +800,263 @@ TEST lastUpdate_in_a_body_is_ignored(void) {
 
     char path[64];
     snprintf(path, sizeof(path), "/api/v1/groups/%s", id);
+    char lid[FIRC_ID_STR_LEN];
+    id_of(firc_ruleset_group(firc_app_find_group_by_id(h->app, gid))->lists[0]->id, lid);
+    char body[320];
+    snprintf(body, sizeof(body),
+             "{\"name\":\"g\",\"interface\":\"lo\","
+             "\"lists\":[{\"id\":\"%s\",\"url\":\"http://127.0.0.1:1/y\",\"lastUpdate\":1,"
+             "\"overrides\":[{\"rule\":\"kept.example.com\",\"type\":\"domain\"}]}]}",
+             lid);
     cJSON *out = NULL;
-    ASSERT_EQ(200, do_request("PUT", path,
-                             "{\"name\":\"g\",\"interface\":\"lo\","
-                             "\"list\":{\"url\":\"http://127.0.0.1:1/y\",\"lastUpdate\":1,"
-                             "\"overrides\":[{\"rule\":\"kept.example.com\",\"type\":\"domain\"}]}}",
-                             &out));
-    cJSON *list = jobj(out, "list");
+    ASSERT_EQ(200, do_request("PUT", path, body, &out));
+    cJSON *list = list0_of(out);
     ASSERT(cJSON_IsObject(list));
     ASSERT_EQ_FMTm("the pre-PUT value, not the body's 1", 12345.0, jnum(list, "lastUpdate"), "%f");
     cJSON_Delete(out);
 
     ASSERT_EQ(200, do_request("GET", path, NULL, &out));
-    ASSERT_EQ_FMT(12345.0, jnum(jobj(out, "list"), "lastUpdate"), "%f");
+    ASSERT_EQ_FMT(12345.0, jnum(list0_of(out), "lastUpdate"), "%f");
     cJSON_Delete(out);
 
     firc_ruleset_t *rs = firc_app_find_group_by_id(h->app, gid);
     ASSERT(rs != NULL);
-    const firc_group_list_t *live = firc_ruleset_group(rs)->list;
+    const firc_group_list_t *live = (firc_ruleset_group(rs))->lists[0];
     const firc_sub_override_t *ov =
         firc_group_list_find_override(live, &(firc_sub_rule_key_t){.text = "kept.example.com"});
     ASSERT(ov != NULL);
     ASSERT_STR_EQm("the live override, not the body's \"domain\"", "wildcard", ov->type);
 
+    harness_stop(h);
+    PASS();
+}
+
+static bool add_api_list(firc_group_t *g, const char *id_hex, const char *path, int n_rules) {
+    firc_group_list_t *l = firc_group_list_new();
+    if (l == NULL) { return false; }
+    l->interval = 3600;
+    l->has_body_hash = true;
+    bool ok = firc_id_parse(id_hex, &l->id) == FIRC_OK && firc_strset(&l->url, path) == FIRC_OK;
+    for (int i = 0; ok && i < n_rules; i++) {
+        char text[32];
+        snprintf(text, sizeof(text), "%s%d.example.com", id_hex, i);
+        ok = firc_sub_rules_push(&l->rules, text, "domain", true, test_random_id()) == FIRC_OK;
+    }
+    if (!ok || firc_group_add_list(g, l) != FIRC_OK) {
+        firc_group_list_free(l);
+        return false;
+    }
+    return true;
+}
+
+static bool add_two_list_group(harness_t *h) {
+    firc_group_t *g = firc_group_new();
+    if (g == NULL) { return false; }
+    g->enable = true;
+    bool ok = firc_id_parse(GID, &g->id) == FIRC_OK && firc_strset(&g->name, "g") == FIRC_OK &&
+              firc_strset(&g->iface, "lo") == FIRC_OK && add_api_list(g, L0, AT("/a"), 2) && add_api_list(g, L1, AT("/b"), 3) &&
+              firc_group_list_set_override(g->lists[1], &(firc_sub_rule_key_t){.text = "kept.example.com"}, "wildcard",
+                                           NULL) == FIRC_OK;
+    if (!ok) {
+        firc_group_free(g);
+        return false;
+    }
+    return firc_app_add_group(h->app, g) == FIRC_OK;
+}
+
+static int put_lists(const char *lists_json, cJSON **out) {
+    char body[2048];
+    snprintf(body, sizeof(body), "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":%s}", lists_json);
+    return do_request("PUT", "/api/v1/groups/" GID, body, out);
+}
+
+static const firc_group_list_t *live_list(harness_t *h, size_t i) {
+    firc_id_t gid;
+    if (firc_id_parse(GID, &gid) != FIRC_OK) { return NULL; }
+    firc_ruleset_t *rs = firc_app_find_group_by_id(h->app, gid);
+    const firc_group_t *g = rs != NULL ? firc_ruleset_group(rs) : NULL;
+    return g != NULL && i < g->n_lists ? g->lists[i] : NULL;
+}
+
+/* Catches: a url changed under the same id losing its overrides, or carrying the old rules, or touching list 0. */
+TEST a_new_url_under_the_same_id_keeps_its_overrides(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"id\":\"" L0 "\",\"url\":\"%s\"},{\"id\":\"" L1 "\",\"url\":\"%s\"}]",
+             AT("/a"), AT("/c"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists(lists, &out));
+    ASSERT_EQ(2, lists_n(out));
+    cJSON *l0 = cJSON_GetArrayItem(jobj(out, "lists"), 0), *l1 = cJSON_GetArrayItem(jobj(out, "lists"), 1);
+    ASSERT_STR_EQ(L0, jstr(l0, "id"));
+    ASSERT_EQ_FMT(2.0, jnum(l0, "rulesTotal"), "%f");
+    ASSERT_STR_EQ(L1, jstr(l1, "id"));
+    ASSERT_STR_EQ(AT("/c"), jstr(l1, "url"));
+    ASSERT_EQ_FMT(0.0, jnum(l1, "rulesTotal"), "%f");
+    cJSON_Delete(out);
+    const firc_group_list_t *l = live_list(h, 1);
+    ASSERT(l != NULL);
+    ASSERT_FALSE(l->has_body_hash);
+    const firc_sub_override_t *ov = firc_group_list_find_override(l, &(firc_sub_rule_key_t){.text = "kept.example.com"});
+    ASSERT(ov != NULL);
+    ASSERT_STR_EQ("wildcard", ov->type);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: items without ids taken as new lists, so a save of id-less lists refetches every one. */
+TEST a_put_of_lists_without_ids_keeps_their_arenas(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    const char *t0 = live_list(h, 0)->rules.text, *t1 = live_list(h, 1)->rules.text;
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists("[{\"url\":\"" AT("/b") "\"},{\"url\":\"" AT("/a") "\"}]", &out));
+    ASSERT_EQ(2, lists_n(out));
+    cJSON *l0 = cJSON_GetArrayItem(jobj(out, "lists"), 0), *l1 = cJSON_GetArrayItem(jobj(out, "lists"), 1);
+    ASSERT_STR_EQ(L1, jstr(l0, "id"));
+    ASSERT_EQ_FMT(3.0, jnum(l0, "rulesTotal"), "%f");
+    ASSERT_STR_EQ("idle", jstr(jobj(l0, "sync"), "state"));
+    ASSERT_STR_EQ(L0, jstr(l1, "id"));
+    ASSERT_EQ_FMT(2.0, jnum(l1, "rulesTotal"), "%f");
+    ASSERT_STR_EQ("idle", jstr(jobj(l1, "sync"), "state"));
+    cJSON_Delete(out);
+    ASSERT(live_list(h, 0)->rules.text == t1);
+    ASSERT(live_list(h, 1)->rules.text == t0);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: two items with one url accepted, or the refused PUT applied in part. */
+TEST a_duplicate_url_in_a_put_is_400(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"url\":\"%s\"},{\"url\":\"%s\"}]", AT("/n"), AT("/n"));
+    cJSON *out = NULL;
+    ASSERT_EQ(400, put_lists(lists, &out));
+    ASSERT_STR_EQ("duplicate list url", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID, NULL, &out));
+    ASSERT_EQ(2, lists_n(out));
+    ASSERT_EQ_FMT(3.0, jnum(cJSON_GetArrayItem(jobj(out, "lists"), 1), "rulesTotal"), "%f");
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: two items with one id accepted as one list. */
+TEST a_duplicate_id_in_a_put_is_400(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"id\":\"" L0 "\",\"url\":\"%s\"},{\"id\":\"" L0 "\",\"url\":\"%s\"}]",
+             AT("/a"), AT("/z"));
+    cJSON *out = NULL;
+    ASSERT_EQ(400, put_lists(lists, &out));
+    ASSERT_STR_EQ("duplicate list id", jstr(out, "error"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: an absent interval left 0 for a new list, or not taken from the list it pairs with by url. */
+TEST an_absent_interval_takes_the_paired_lists_then_86400(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"url\":\"%s\"},{\"url\":\"%s\"}]", AT("/a"), AT("/n"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists(lists, &out));
+    ASSERT_EQ(2, lists_n(out));
+    cJSON *l0 = cJSON_GetArrayItem(jobj(out, "lists"), 0), *l1 = cJSON_GetArrayItem(jobj(out, "lists"), 1);
+    ASSERT_STR_EQm("paired by url, it takes the live id", L0, jstr(l0, "id"));
+    ASSERT_EQ_FMT(3600.0, jnum(l0, "interval"), "%f");
+    ASSERT_EQ_FMT(2.0, jnum(l0, "rulesTotal"), "%f");
+    ASSERT_EQ_FMT(86400.0, jnum(l1, "interval"), "%f");
+    ASSERT_EQ_FMT((size_t)8, strlen(jstr(l1, "id")), "%zu");
+    ASSERT(strcmp(jstr(l1, "id"), L0) != 0 && strcmp(jstr(l1, "id"), L1) != 0);
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: an item without an id pairing by url with a live list another item names by id. */
+TEST a_url_whose_list_is_named_by_another_item_is_a_new_list(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"id\":\"" L0 "\",\"url\":\"%s\"},{\"url\":\"%s\"}]", AT("/z"),
+             AT("/a"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists(lists, &out));
+    ASSERT_EQ(2, lists_n(out));
+    cJSON *l1 = cJSON_GetArrayItem(jobj(out, "lists"), 1);
+    ASSERT(strcmp(jstr(l1, "id"), L0) != 0);
+    ASSERT_EQ_FMT(0.0, jnum(l1, "rulesTotal"), "%f");
+    ASSERT_EQ_FMT(86400.0, jnum(l1, "interval"), "%f");
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: an unknown id replaced by a random one, or paired with the live list of its url. */
+TEST an_unknown_id_is_a_new_list_keeping_it(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[512];
+    snprintf(lists, sizeof(lists), "[{\"id\":\"c2c2c2c2\",\"url\":\"%s\"}]", AT("/a"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists(lists, &out));
+    ASSERT_EQ(1, lists_n(out));
+    cJSON *l0 = list0_of(out);
+    ASSERT_STR_EQ("c2c2c2c2", jstr(l0, "id"));
+    ASSERT_EQ_FMT(0.0, jnum(l0, "rulesTotal"), "%f");
+    ASSERT_EQ_FMT(86400.0, jnum(l0, "interval"), "%f");
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a seventeenth list accepted, or refused as a server error. */
+TEST seventeen_lists_in_a_put_are_400(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    char lists[2048] = "[";
+    for (int i = 0; i < 17; i++) {
+        char item[96];
+        snprintf(item, sizeof(item), "%s{\"url\":\"http://127.0.0.1:1/l%d\"}", i != 0 ? "," : "", i);
+        strcat(lists, item);
+    }
+    strcat(lists, "]");
+    cJSON *out = NULL;
+    ASSERT_EQ(400, put_lists(lists, &out));
+    ASSERT_STR_EQ("a group carries at most 16 lists", jstr(out, "error"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a list item that is not an object, or whose id is not 8 hex, accepted. */
+TEST a_list_item_must_be_an_object_with_a_valid_id(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    cJSON *out = NULL;
+    ASSERT_EQ(400, put_lists("[\"http://127.0.0.1:1/a\"]", &out));
+    ASSERT_STR_EQ("invalid list", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(400, put_lists("[{\"id\":\"xyz\",\"url\":\"http://127.0.0.1:1/a\"}]", &out));
+    ASSERT_STR_EQ("invalid list id", jstr(out, "error"));
+    cJSON_Delete(out);
     harness_stop(h);
     PASS();
 }
@@ -803,7 +1076,7 @@ static firc_group_t *group_with_rules(const char *id_hex, const rule_spec_t *rul
         return NULL;
     }
     for (size_t i = 0; i < n; i++) {
-        if (firc_sub_rules_push(&g->list->rules, rules[i].text, rules[i].type, rules[i].enable,
+        if (firc_sub_rules_push(&g->lists[0]->rules, rules[i].text, rules[i].type, rules[i].enable,
                                 test_random_id()) != FIRC_OK) {
             firc_group_free(g);
             return NULL;
@@ -844,7 +1117,7 @@ static bool add_two_rule_group(harness_t *h) {
 /* The id the daemon holds for rule `idx` of group `gid`, read from the page. */
 static bool nth_rule_id(const char *gid, int idx, char *out_id, size_t cap) {
     char path[96];
-    snprintf(path, sizeof(path), "/api/v1/groups/%s/list/rules", gid);
+    snprintf(path, sizeof(path), "/api/v1/groups/%s/lists/" L0 "/rules", gid);
     cJSON *out = NULL;
     if (do_request("GET", path, NULL, &out) != 200 || out == NULL) {
         cJSON_Delete(out);
@@ -857,7 +1130,7 @@ static bool nth_rule_id(const char *gid, int idx, char *out_id, size_t cap) {
     return ok;
 }
 
-#define TWO_RULES "/api/v1/groups/" TWO "/list/rules"
+#define TWO_RULES "/api/v1/groups/" TWO "/lists/" L0 "/rules"
 
 /* Catches: a preview serialising every parsed rule instead of counts and a bounded sample. */
 TEST the_preview_is_counts_and_a_bounded_sample(void) {
@@ -1400,11 +1673,11 @@ TEST a_rule_edit_does_not_carry_the_whole_list(void) {
 static int post_list_interval(const char *interval) {
     char body[256];
     snprintf(body, sizeof(body),
-             "{\"name\":\"g\",\"list\":{\"url\":\"http://127.0.0.1:%d/list\",\"interval\":%s}}", STUB_PORT, interval);
+             "{\"name\":\"g\",\"lists\":[{\"url\":\"http://127.0.0.1:%d/list\",\"interval\":%s}]}", STUB_PORT, interval);
     cJSON *out = NULL;
     int status = do_request("POST", "/api/v1/groups", body, &out);
     if (status == 200) {
-        double got = jnum(jobj(out, "list"), "interval");
+        double got = jnum(list0_of(out), "interval");
         char path[64];
         snprintf(path, sizeof(path), "/api/v1/groups/%s", jstr(out, "id"));
         do_request("DELETE", path, NULL, NULL);
@@ -1458,8 +1731,8 @@ TEST a_rule_edit_carries_the_list_through_unchanged(void) {
     };
     firc_group_t *g = group_with_rules(TWO, rules, 2);
     ASSERT(g != NULL);
-    g->list->interval = 4242;
-    g->list->last_update = 1700000000;
+    g->lists[0]->interval = 4242;
+    g->lists[0]->last_update = 1700000000;
     ASSERT(add_on_loop(h, g));
 
     char second[16];
@@ -1473,8 +1746,8 @@ TEST a_rule_edit_carries_the_list_through_unchanged(void) {
 
     ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" TWO, NULL, &out));
     ASSERTm("the group stays enabled", cJSON_IsTrue(jobj(out, "enable")));
-    ASSERT_EQ_FMTm("the interval", 4242.0, jnum(jobj(out, "list"), "interval"), "%f");
-    ASSERT_EQ_FMTm("the last update", 1700000000.0, jnum(jobj(out, "list"), "lastUpdate"), "%f");
+    ASSERT_EQ_FMTm("the interval", 4242.0, jnum(list0_of(out), "interval"), "%f");
+    ASSERT_EQ_FMTm("the last update", 1700000000.0, jnum(list0_of(out), "lastUpdate"), "%f");
     cJSON_Delete(out);
     out = NULL;
 
@@ -1555,7 +1828,7 @@ TEST a_rule_edit_is_checked_the_way_every_other_path_is(void) {
     bool says_rule = rule_msg != NULL && strstr(rule_msg, "rule") != NULL;
     cJSON_Delete(out);
     out = NULL;
-    int unknown_group = do_request("PATCH", "/api/v1/groups/deadbeef/list/rules",
+    int unknown_group = do_request("PATCH", "/api/v1/groups/deadbeef/lists/" L0 "/rules",
                                    "{\"rules\":[{\"id\":\"00000011\",\"enable\":false}]}", &out);
     const char *group_msg = jstr(out, "error");
     bool says_group = group_msg != NULL && strstr(group_msg, "group") != NULL;
@@ -1702,7 +1975,7 @@ TEST agreeing_with_the_guess_leaves_the_rule_alone(void) {
 }
 
 #define SINGBOX_GROUP "0d0d0d0d"
-#define SINGBOX_RULES "/api/v1/groups/" SINGBOX_GROUP "/list/rules"
+#define SINGBOX_RULES "/api/v1/groups/" SINGBOX_GROUP "/lists/" L0 "/rules"
 
 /* Adds a fetched sing-box list: `a.com` as `domain` (index 0), `10.0.0.0/8` as udp `subnet` (1). */
 static bool add_singbox_group(harness_t *h) {
@@ -1711,13 +1984,13 @@ static bool add_singbox_group(harness_t *h) {
         firc_group_free(g);
         return false;
     }
-    g->list->has_body_hash = false;
+    g->lists[0]->has_body_hash = false;
     firc_id_t id = g->id;
     if (!add_on_loop(h, g)) {
         return false;
     }
     bool changed = false;
-    return firc_app_sync_list_now(h->app, id, 1000, NULL, &changed) == FIRC_OK && changed;
+    return firc_app_sync_list_now(h->app, id, list0(h->app, id), 1000, NULL, &changed) == FIRC_OK && changed;
 }
 
 /* Catches: a type edit measured against a fresh guess instead of the list's own type. */
@@ -1843,7 +2116,7 @@ TEST a_rule_edit_naming_a_comment_is_refused(void) {
 }
 
 #define TWINS_GROUP "0e0e0e0e"
-#define TWINS_RULES "/api/v1/groups/" TWINS_GROUP "/list/rules"
+#define TWINS_RULES "/api/v1/groups/" TWINS_GROUP "/lists/" L0 "/rules"
 
 static bool add_singbox_twins_group(harness_t *h) {
     firc_group_t *g = list_group(stub_url("/singbox-twins"), 0);
@@ -1851,11 +2124,11 @@ static bool add_singbox_twins_group(harness_t *h) {
         firc_group_free(g);
         return false;
     }
-    g->list->has_body_hash = false;
+    g->lists[0]->has_body_hash = false;
     firc_id_t id = g->id;
     if (!add_on_loop(h, g)) { return false; }
     bool changed = false;
-    return firc_app_sync_list_now(h->app, id, 1000, NULL, &changed) == FIRC_OK && changed;
+    return firc_app_sync_list_now(h->app, id, list0(h->app, id), 1000, NULL, &changed) == FIRC_OK && changed;
 }
 
 /* Catches: a line list's override keyed by list_type, lost once the type is guessed differently. */
@@ -1928,7 +2201,7 @@ typedef struct reapply_probe {
 static void reapply_probe_fn(void *arg) {
     reapply_probe_t *p = arg;
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(p->h->app, p->id));
-    firc_group_list_t *l = g->list;
+    firc_group_list_t *l = g->lists[0];
     firc_sub_apply_overrides(l, &l->rules);
     for (size_t i = 0; i < l->rules.n; i++) {
         if (strcmp(firc_sub_rules_text(&l->rules, i), "a.com") == 0) {
@@ -1966,7 +2239,7 @@ TEST a_rule_that_loses_its_twin_still_finds_its_typed_override(void) {
     ASSERT_EQ(FIRC_OK, firc_id_parse(TWINS_GROUP, &gid));
     bool changed = false;
     ASSERT_EQ(FIRC_OK,
-             firc_app_sync_list_now(h->app, gid, 1000, stub_url("/singbox-twin-gone"), &changed));
+             firc_app_sync_list_now(h->app, gid, list0(h->app, gid), 1000, stub_url("/singbox-twin-gone"), &changed));
     ASSERT(changed);
     char after_id[16];
     ASSERT(nth_rule_id(TWINS_GROUP, 0, after_id, sizeof(after_id)));
@@ -1998,7 +2271,7 @@ static const char *warn_log_capture_sync(harness_t *h, firc_id_t id) {
     firc_log_set_output_floor(FIRC_LOG_WARN);
     firc_log_set_fd(g_warn_pipe[1]);
     bool changed = false;
-    firc_app_sync_list_now(h->app, id, 1000, NULL, &changed);
+    firc_app_sync_list_now(h->app, id, list0(h->app, id), 1000, NULL, &changed);
     firc_log_set_fd(STDOUT_FILENO);
     firc_log_set_output_floor(FIRC_LOG_DEBUG);
     ssize_t n = read(g_warn_pipe[0], buf, sizeof(buf) - 1);
@@ -2082,11 +2355,11 @@ static void arena_probe_fn(void *arg) {
     arena_probe_t *p = arg;
     const firc_group_t *ga = firc_ruleset_group(firc_app_find_group_by_id(p->h->app, p->a));
     const firc_group_t *gb = firc_ruleset_group(firc_app_find_group_by_id(p->h->app, p->b));
-    p->text_a = ga->list->rules.text;
-    p->seq_a = ga->list->sync_seq;
-    p->text_b = gb->list->rules.text;
-    p->seq_b = gb->list->sync_seq;
-    p->state_b = gb->list->sync_state;
+    p->text_a = ga->lists[0]->rules.text;
+    p->seq_a = ga->lists[0]->sync_seq;
+    p->text_b = gb->lists[0]->rules.text;
+    p->seq_b = gb->lists[0]->sync_seq;
+    p->state_b = gb->lists[0]->sync_state;
 }
 
 /* Catches: a rule edit that copies or resyncs every group's list instead of the one edited. */
@@ -2125,8 +2398,8 @@ TEST patching_a_list_rule_touches_no_other_group(void) {
 TEST sync_unknown_group_is_404(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
-    ASSERT_EQ(404, do_request("POST", "/api/v1/groups/aabbccdd/list/sync", NULL, NULL));
-    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/nothex!/list/sync", NULL, NULL));
+    ASSERT_EQ(404, do_request("POST", "/api/v1/groups/aabbccdd/lists/" L0 "/sync", NULL, NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/nothex!/lists/" L0 "/sync", NULL, NULL));
     harness_stop(h);
     PASS();
 }
@@ -2137,7 +2410,7 @@ TEST sync_answers_202_with_the_record_at_queued(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
     cJSON *out = NULL;
-    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/list/sync", "{}", &out));
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", "{}", &out));
     ASSERT(out != NULL);
     ASSERT_STR_EQm("it is the group's record", GID, jstr(out, "id"));
     ASSERT_STR_EQm("the job was accepted, not finished", "queued", list_state_of(out));
@@ -2154,11 +2427,11 @@ TEST sync_without_body_uses_the_lists_url(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/list"));
     ASSERT(wait_settled(GID, 5000));
-    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/list/sync", NULL, NULL));
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", NULL, NULL));
     ASSERT(wait_settled(GID, 5000));
 
     cJSON *out = NULL;
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules", NULL, &out));
     cJSON *rules = jobj(out, "rules");
     ASSERT_EQ(2, cJSON_GetArraySize(rules));
     ASSERT_STR_EQ("one.example", jstr(cJSON_GetArrayItem(rules, 0), "rule"));
@@ -2166,7 +2439,7 @@ TEST sync_without_body_uses_the_lists_url(void) {
     out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID, NULL, &out));
     ASSERT_EQ_FMT(2.0, list_total_of(out), "%f");
-    ASSERT_STR_EQm("it used its own url", stub_url("/list"), jstr(jobj(out, "list"), "url"));
+    ASSERT_STR_EQm("it used its own url", stub_url("/list"), jstr(list0_of(out), "url"));
     ASSERT_STR_EQm("and finished", "idle", list_state_of(out));
     cJSON_Delete(out);
     harness_stop(h);
@@ -2181,12 +2454,12 @@ TEST sync_with_body_url_stores_the_url_before_queuing(void) {
     char body[256];
     snprintf(body, sizeof(body), "{\"url\":\"%s\"}", stub_url("/list2"));
     cJSON *out = NULL;
-    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/list/sync", body, &out));
-    ASSERT_STR_EQm("the answer already carries it", stub_url("/list2"), jstr(jobj(out, "list"), "url"));
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", body, &out));
+    ASSERT_STR_EQm("the answer already carries it", stub_url("/list2"), jstr(list0_of(out), "url"));
     cJSON_Delete(out);
     out = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID, NULL, &out));
-    ASSERT_STR_EQ(stub_url("/list2"), jstr(jobj(out, "list"), "url"));
+    ASSERT_STR_EQ(stub_url("/list2"), jstr(list0_of(out), "url"));
     cJSON_Delete(out);
     ASSERT(wait_settled(GID, 5000));
     harness_stop(h);
@@ -2201,7 +2474,7 @@ TEST a_url_only_change_is_persisted(void) {
     ASSERT(wait_settled(GID, 5000));
     char body[256];
     snprintf(body, sizeof(body), "{\"url\":\"%s\"}", stub_url("/list2"));
-    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/list/sync", body, NULL));
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", body, NULL));
     ASSERT(wait_settled(GID, 5000));
 
     char groups[160];
@@ -2223,7 +2496,7 @@ TEST sync_without_a_worker_is_unavailable(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/list"));
     cJSON *out = NULL;
-    ASSERT_EQ(503, do_request("POST", "/api/v1/groups/" GID "/list/sync", NULL, &out));
+    ASSERT_EQ(503, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", NULL, &out));
     ASSERT_STR_EQ("sync unavailable", jstr(out, "error"));
     cJSON_Delete(out);
     harness_stop(h);
@@ -2235,9 +2508,9 @@ TEST a_sync_for_an_unknown_id_is_404_whatever_url_it_names(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     static const char bad_url[] = "{\"url\":\"ftp://example.com/list.txt\"}";
-    ASSERT_EQ(404, do_request("POST", "/api/v1/groups/" GID "/list/sync", bad_url, NULL));
+    ASSERT_EQ(404, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", bad_url, NULL));
     ASSERT_EQ(200, create_stub_group("/list"));
-    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/" GID "/list/sync", bad_url, NULL));
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", bad_url, NULL));
     ASSERT(wait_settled(GID, 5000));
     harness_stop(h);
     PASS();
@@ -2252,7 +2525,7 @@ TEST a_synced_html_page_ends_in_error_with_the_reason(void) {
     cJSON *rec = NULL;
     ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID, NULL, &rec));
     ASSERT_STR_EQ("error", list_state_of(rec));
-    const char *err = jstr(jobj(jobj(rec, "list"), "sync"), "error");
+    const char *err = jstr(jobj(list0_of(rec), "sync"), "error");
     ASSERTm("the reason names the raw-file fix", err != NULL && strstr(err, "raw") != NULL);
     cJSON_Delete(rec);
     harness_stop(h);
@@ -2265,7 +2538,7 @@ TEST the_events_stream_reports_progress_then_done(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
 
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char buf[8192];
     size_t n = read_stream(fd, buf, sizeof(buf), 5000);
@@ -2282,12 +2555,13 @@ TEST the_events_stream_reports_progress_then_done(void) {
     ASSERT_EQ_FMTm("exactly one done", 1, count_events(buf, "done"), "%d");
     ASSERT_EQ_FMTm("and no error", 0, count_events(buf, "error"), "%d");
 
-    cJSON *rec = event_data(buf, "done");
-    ASSERTm("done carries the record", rec != NULL);
-    ASSERT_STR_EQm("the group's", GID, jstr(rec, "id"));
-    ASSERT_EQ_FMTm("with the rules that arrived in its list", 2.0, list_total_of(rec), "%f");
-    ASSERT_STR_EQ("idle", list_state_of(rec));
-    cJSON_Delete(rec);
+    cJSON *ev = event_data(buf, "done");
+    ASSERTm("done carries the list", ev != NULL);
+    ASSERT_STR_EQm("of the group", GID, jstr(ev, "groupId"));
+    ASSERT_STR_EQm("naming the list", L0, jstr(ev, "listId"));
+    ASSERT_EQ_FMTm("with the rules that arrived in it", 2.0, jnum(jobj(ev, "list"), "rulesTotal"), "%f");
+    ASSERT_STR_EQ("idle", event_list_state(ev));
+    cJSON_Delete(ev);
     ASSERTm("the stream is finished", stream_finished(buf, n));
     harness_stop(h);
     PASS();
@@ -2298,19 +2572,19 @@ TEST the_events_stream_reports_an_error(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow404"));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char buf[8192];
     size_t n = read_stream(fd, buf, sizeof(buf), 5000);
     close(fd);
     ASSERT(n > 0);
-    ASSERT_EQ_FMTm("one error", 1, count_events(buf, "error"), "%d");
-    ASSERT_EQ_FMTm("and no done", 0, count_events(buf, "done"), "%d");
-    cJSON *err = event_data(buf, "error");
-    ASSERT(err != NULL);
-    const char *text = jstr(err, "error");
+    ASSERT_EQ_FMTm("one done", 1, count_events(buf, "done"), "%d");
+    cJSON *ev = event_data(buf, "done");
+    ASSERT(ev != NULL);
+    ASSERT_STR_EQm("its list ended in error", "error", event_list_state(ev));
+    const char *text = event_list_error(ev);
     ASSERTm("the error names what the server answered", text != NULL && strstr(text, "404") != NULL);
-    cJSON_Delete(err);
+    cJSON_Delete(ev);
     ASSERTm("the stream is finished", stream_finished(buf, n));
 
     cJSON *rec = NULL;
@@ -2327,7 +2601,7 @@ TEST the_events_stream_for_an_idle_list_answers_one_event_and_closes(void) {
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/list"));
     ASSERT(wait_settled(GID, 5000));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char buf[8192];
     size_t n = read_stream(fd, buf, sizeof(buf), 3000);
@@ -2335,10 +2609,10 @@ TEST the_events_stream_for_an_idle_list_answers_one_event_and_closes(void) {
     ASSERT(n > 0);
     ASSERT_EQ_FMTm("one done", 1, count_events(buf, "done"), "%d");
     ASSERT_EQ_FMTm("no progress", 0, count_events(buf, "progress"), "%d");
-    cJSON *rec = event_data(buf, "done");
-    ASSERT(rec != NULL);
-    ASSERT_STR_EQ("idle", list_state_of(rec));
-    cJSON_Delete(rec);
+    cJSON *ev = event_data(buf, "done");
+    ASSERT(ev != NULL);
+    ASSERT_STR_EQ("idle", event_list_state(ev));
+    cJSON_Delete(ev);
     ASSERTm("the stream is finished", stream_finished(buf, n));
     harness_stop(h);
     PASS();
@@ -2348,8 +2622,8 @@ TEST the_events_stream_for_an_idle_list_answers_one_event_and_closes(void) {
 TEST the_events_stream_is_404_for_an_unknown_id(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
-    ASSERT_EQ(404, do_request("GET", "/api/v1/groups/aabbccdd/list/sync/events", NULL, NULL));
-    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/nothex!/list/sync/events", NULL, NULL));
+    ASSERT_EQ(404, do_request("GET", "/api/v1/groups/aabbccdd/sync/events", NULL, NULL));
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/nothex!/sync/events", NULL, NULL));
     harness_stop(h);
     PASS();
 }
@@ -2359,7 +2633,7 @@ TEST a_stream_still_open_at_shutdown_is_ended(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char head[4096];
     ASSERTm("the stream is open and reporting", read_until_progress(fd, head, sizeof(head)));
@@ -2376,7 +2650,7 @@ TEST a_delete_ends_the_streams_watching_that_group(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char head[4096];
     ASSERTm("the stream is open and reporting", read_until_progress(fd, head, sizeof(head)));
@@ -2385,39 +2659,38 @@ TEST a_delete_ends_the_streams_watching_that_group(void) {
     size_t m = read_stream(fd, rest, sizeof(rest), 3000);
     close(fd);
     ASSERTm("the stream ended: the body is terminated", stream_finished(rest, m));
-    ASSERT_EQ_FMTm("one error, naming the reason", 1, count_events(rest, "error"), "%d");
-    ASSERT_EQ_FMTm("and no done for a record that is gone", 0, count_events(rest, "done"), "%d");
-    cJSON *payload = event_data(rest, "error");
+    ASSERT_EQ_FMTm("one done", 1, count_events(rest, "done"), "%d");
+    cJSON *payload = event_data(rest, "done");
     ASSERT(payload != NULL);
-    ASSERT_STR_EQ("group removed", jstr(payload, "error"));
+    ASSERT_STR_EQm("its list ended in error", "error", event_list_state(payload));
+    ASSERT_STR_EQ("group removed", event_list_error(payload));
     cJSON_Delete(payload);
     harness_stop(h);
     PASS();
 }
 
-/* Catches: a `"list": null` PUT freeing the watched list without ending its stream. */
-TEST a_null_list_ends_the_open_stream(void) {
+/* Catches: a `"lists": []` PUT freeing the watched list without ending its stream. */
+TEST an_empty_lists_ends_the_open_stream(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char head[4096];
     ASSERTm("the stream is open and reporting", read_until_progress(fd, head, sizeof(head)));
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/" GID,
-                              "{\"name\":\"g\",\"interface\":\"lo\",\"list\":null}", &out));
-    ASSERTm("the answer has no list", jobj(out, "list") == NULL);
+                              "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":[]}", &out));
+    ASSERT_EQm("the answer has no list", 0, lists_n(out));
     cJSON_Delete(out);
     char rest[8192];
     size_t m = read_stream(fd, rest, sizeof(rest), 3000);
     close(fd);
     ASSERTm("the stream ended: the body is terminated", stream_finished(rest, m));
-    ASSERT_EQ_FMTm("one error", 1, count_events(rest, "error"), "%d");
-    ASSERT_EQ_FMTm("and no done", 0, count_events(rest, "done"), "%d");
-    cJSON *payload = event_data(rest, "error");
+    ASSERT_EQ_FMTm("one done", 1, count_events(rest, "done"), "%d");
+    cJSON *payload = event_data(rest, "done");
     ASSERT(payload != NULL);
-    ASSERT_STR_EQ("list removed", jstr(payload, "error"));
+    ASSERT_STR_EQ("list removed", event_list_error(payload));
     cJSON_Delete(payload);
     harness_stop(h);
     PASS();
@@ -2428,27 +2701,26 @@ TEST a_stale_result_changes_nothing_observable(void) {
     harness_t *h = harness_start_with_worker();
     ASSERT(h != NULL);
     ASSERT_EQ(200, create_stub_group("/slow"));
-    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/list/sync", NULL, NULL));
-    int fd = stream_open("/api/v1/groups/" GID "/list/sync/events");
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", NULL, NULL));
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
     ASSERT(fd >= 0);
     char buf[8192];
     size_t n = read_stream(fd, buf, sizeof(buf), 8000);
     close(fd);
     ASSERT(n > 0);
     ASSERT_EQ_FMTm("one done, not two", 1, count_events(buf, "done"), "%d");
-    ASSERT_EQ_FMTm("and no error", 0, count_events(buf, "error"), "%d");
-    cJSON *rec = event_data(buf, "done");
-    ASSERT(rec != NULL);
-    ASSERT_EQ_FMT(2.0, list_total_of(rec), "%f");
-    ASSERT_STR_EQ("idle", list_state_of(rec));
-    cJSON_Delete(rec);
+    cJSON *ev = event_data(buf, "done");
+    ASSERT(ev != NULL);
+    ASSERT_EQ_FMT(2.0, jnum(jobj(ev, "list"), "rulesTotal"), "%f");
+    ASSERT_STR_EQ("idle", event_list_state(ev));
+    cJSON_Delete(ev);
     ASSERT(wait_settled(GID, 5000));
     harness_stop(h);
     PASS();
 }
 
 #define NINE "0c0c0c0c"
-#define NINE_RULES "/api/v1/groups/" NINE "/list/rules"
+#define NINE_RULES "/api/v1/groups/" NINE "/lists/" L0 "/rules"
 
 static bool add_nine_rule_group(harness_t *h) {
     static const rule_spec_t nine[] = {
@@ -2497,7 +2769,7 @@ TEST a_page_is_a_window_onto_the_list_in_order(void) {
     cJSON_Delete(out);
     out = NULL;
 
-    ASSERT_EQ(404, do_request("GET", "/api/v1/groups/deadbeef/list/rules", NULL, &out));
+    ASSERT_EQ(404, do_request("GET", "/api/v1/groups/deadbeef/lists/" L0 "/rules", NULL, &out));
     cJSON_Delete(out);
     harness_stop(h);
     PASS();
@@ -2561,32 +2833,32 @@ TEST the_page_refuses_a_number_it_cannot_mean(void) {
     ASSERT_EQ(200, create_stub_group("/big"));
     ASSERT(wait_settled(GID, 5000));
     cJSON *out = NULL;
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules?limit=1", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?limit=1", NULL, &out));
     ASSERT_EQ_FMTm("fixture: the whole stub list arrived", 540.0, jnum(out, "total"), "%f");
     cJSON_Delete(out);
     out = NULL;
 
-    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/list/rules?offset=-1", NULL, &out));
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?offset=-1", NULL, &out));
     ASSERT_STR_EQ("invalid offset", jstr(out, "error"));
     cJSON_Delete(out);
     out = NULL;
-    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/list/rules?limit=-1", NULL, &out));
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?limit=-1", NULL, &out));
     ASSERT_STR_EQ("invalid limit", jstr(out, "error"));
     cJSON_Delete(out);
     out = NULL;
-    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/list/rules?limit=abc", NULL, &out));
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?limit=abc", NULL, &out));
     ASSERT_STR_EQ("invalid limit", jstr(out, "error"));
     cJSON_Delete(out);
     out = NULL;
-    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/list/rules?offset=1x", NULL, &out));
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?offset=1x", NULL, &out));
     cJSON_Delete(out);
     out = NULL;
 
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules?limit=0", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?limit=0", NULL, &out));
     ASSERT_EQ_FMTm("limit=0 is the default page size", 50, cJSON_GetArraySize(jobj(out, "rules")), "%d");
     cJSON_Delete(out);
     out = NULL;
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules", NULL, &out));
     ASSERT_EQ_FMTm("and so is no limit at all", 50, cJSON_GetArraySize(jobj(out, "rules")), "%d");
     cJSON_Delete(out);
     harness_stop(h);
@@ -2600,12 +2872,12 @@ TEST an_offset_past_the_last_match_is_an_empty_page_that_still_counts(void) {
     ASSERT_EQ(200, create_stub_group("/big"));
     ASSERT(wait_settled(GID, 5000));
     cJSON *out = NULL;
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules?q=h04&offset=99", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?q=h04&offset=99", NULL, &out));
     ASSERT_EQ_FMT(1, cJSON_GetArraySize(jobj(out, "rules")), "%d");
     ASSERT_EQ_FMT(100.0, jnum(out, "matched"), "%f");
     cJSON_Delete(out);
     out = NULL;
-    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/list/rules?q=h04&offset=100", NULL, &out));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?q=h04&offset=100", NULL, &out));
     ASSERT_EQ_FMT(0, cJSON_GetArraySize(jobj(out, "rules")), "%d");
     ASSERT_EQ_FMT(100.0, jnum(out, "matched"), "%f");
     ASSERT_EQ_FMT(540.0, jnum(out, "total"), "%f");
@@ -2613,7 +2885,7 @@ TEST an_offset_past_the_last_match_is_an_empty_page_that_still_counts(void) {
     cJSON_Delete(out);
     out = NULL;
     ASSERT_EQ(200,
-              do_request("GET", "/api/v1/groups/" GID "/list/rules?q=h04&offset=100000", NULL, &out));
+              do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules?q=h04&offset=100000", NULL, &out));
     ASSERT_EQ_FMT(0, cJSON_GetArraySize(jobj(out, "rules")), "%d");
     ASSERT_EQ_FMT(100.0, jnum(out, "matched"), "%f");
     cJSON_Delete(out);
@@ -2628,29 +2900,321 @@ TEST list_routes_on_a_manual_group_are_404(void) {
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("POST", "/api/v1/groups",
                               "{\"id\":\"" GID "\",\"name\":\"hand\",\"interface\":\"lo\"}", &out));
-    ASSERTm("fixture: a group with no list", jobj(out, "list") == NULL);
+    ASSERT_EQm("fixture: a group with no list", 0, lists_n(out));
     cJSON_Delete(out);
 
     static const struct {
-        const char *method, *path, *body;
+        const char *method, *path, *body, *error;
     } calls[] = {
-        {"GET", "/api/v1/groups/" GID "/list/rules", NULL},
-        {"PATCH", "/api/v1/groups/" GID "/list/rules", "{\"rules\":[]}"},
-        {"POST", "/api/v1/groups/" GID "/list/sync", NULL},
-        {"GET", "/api/v1/groups/" GID "/list/sync/events", NULL},
+        {"GET", "/api/v1/groups/" GID "/lists/" L0 "/rules", NULL, "group has no such list"},
+        {"PATCH", "/api/v1/groups/" GID "/lists/" L0 "/rules", "{\"rules\":[]}", "group has no such list"},
+        {"POST", "/api/v1/groups/" GID "/lists/" L0 "/sync", NULL, "group has no such list"},
+        {"POST", "/api/v1/groups/" GID "/sync", NULL, "group has no list"},
+        {"GET", "/api/v1/groups/" GID "/sync/events", NULL, "group has no list"},
     };
     for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
         out = NULL;
         int code = do_request(calls[i].method, calls[i].path, calls[i].body, &out);
         const char *msg = jstr(out, "error");
-        bool says = msg != NULL && strcmp(msg, "group has no list") == 0;
+        bool says = msg != NULL && strcmp(msg, calls[i].error) == 0;
         cJSON_Delete(out);
         if (code != 404 || !says) {
             fprintf(stderr, "%s %s: %d\n", calls[i].method, calls[i].path, code);
         }
         ASSERT_EQ_FMTm("404", 404, code, "%d");
-        ASSERTm("saying the group has no list", says);
+        ASSERTm("saying what is missing", says);
     }
+    harness_stop(h);
+    PASS();
+}
+
+static int create_two_list_group(const char *path0, const char *path1) {
+    char u0[128], u1[128], body[512];
+    snprintf(u0, sizeof(u0), "%s", stub_url(path0));
+    snprintf(u1, sizeof(u1), "%s", stub_url(path1));
+    snprintf(body, sizeof(body),
+             "{\"id\":\"" GID "\",\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"id\":\"" L0
+             "\",\"url\":\"%s\"},{\"id\":\"" L1 "\",\"url\":\"%s\"}]}",
+             u0, u1);
+    return do_request("POST", "/api/v1/groups", body, NULL);
+}
+
+static const char *nth_list_state(cJSON *rec, int i) {
+    return jstr(jobj(cJSON_GetArrayItem(jobj(rec, "lists"), i), "sync"), "state");
+}
+
+static bool every_list_settled(const char *id, int budget_ms) {
+    char path[64];
+    snprintf(path, sizeof(path), "/api/v1/groups/%s", id);
+    for (int waited = 0; waited <= budget_ms; waited += 10) {
+        cJSON *rec = NULL;
+        bool settled = do_request("GET", path, NULL, &rec) == 200 && lists_n(rec) > 0;
+        for (int i = 0; settled && i < lists_n(rec); i++) {
+            const char *st = nth_list_state(rec, i);
+            settled = st != NULL && strcmp(st, "queued") != 0 && strcmp(st, "fetching") != 0;
+        }
+        cJSON_Delete(rec);
+        if (settled) { return true; }
+        ms_sleep(10);
+    }
+    return false;
+}
+
+static bool stream_has_list_event(const char *stream, const char *name, const char *list_id, const char *state,
+                                  const char *error) {
+    for (int k = 0; k < events_n(stream); k++) {
+        char got[32] = "";
+        cJSON *ev = event_at(stream, k, got, sizeof(got));
+        const char *lid = jstr(ev, "listId"), *st = event_list_state(ev), *er = event_list_error(ev);
+        bool hit = ev != NULL && strcmp(got, name) == 0 && lid != NULL && strcmp(lid, list_id) == 0 &&
+                   st != NULL && strcmp(st, state) == 0 && (error == NULL || (er != NULL && strcmp(er, error) == 0));
+        cJSON_Delete(ev);
+        if (hit) { return true; }
+    }
+    return false;
+}
+
+static size_t read_more(int fd, char *buf, size_t len, size_t cap, int budget_ms) {
+    return len + read_stream(fd, buf + len, cap - len, budget_ms);
+}
+
+TEST rules_page_of_the_second_list(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L1 "/rules", NULL, &out));
+    ASSERT_EQ_FMT(3.0, jnum(out, "total"), "%f");
+    ASSERT_STR_EQ(L1 "0.example.com", jstr(cJSON_GetArrayItem(jobj(out, "rules"), 0), "rule"));
+    cJSON_Delete(out);
+    out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules", NULL, &out));
+    ASSERT_EQ_FMT(2.0, jnum(out, "total"), "%f");
+    ASSERT_STR_EQ(L0 "0.example.com", jstr(cJSON_GetArrayItem(jobj(out, "rules"), 0), "rule"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST patch_names_its_list(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L1 "/rules", NULL, &out));
+    char rid[FIRC_ID_STR_LEN];
+    snprintf(rid, sizeof(rid), "%s", jstr(cJSON_GetArrayItem(jobj(out, "rules"), 0), "id"));
+    cJSON_Delete(out);
+    out = NULL;
+    char body[128];
+    snprintf(body, sizeof(body), "{\"rules\":[{\"id\":\"%s\",\"enable\":false}]}", rid);
+    ASSERT_EQ(200, do_request("PATCH", "/api/v1/groups/" GID "/lists/" L1 "/rules", body, NULL));
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L1 "/rules", NULL, &out));
+    ASSERTm("list 1's rule is off", cJSON_IsFalse(jobj(cJSON_GetArrayItem(jobj(out, "rules"), 0), "enable")));
+    cJSON_Delete(out);
+    out = NULL;
+    ASSERT_EQ(200, do_request("GET", "/api/v1/groups/" GID "/lists/" L0 "/rules", NULL, &out));
+    cJSON *rules = jobj(out, "rules");
+    ASSERT_EQ(2, cJSON_GetArraySize(rules));
+    ASSERTm("list 0's rules stay on", cJSON_IsTrue(jobj(cJSON_GetArrayItem(rules, 0), "enable")) &&
+                                          cJSON_IsTrue(jobj(cJSON_GetArrayItem(rules, 1), "enable")));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST sync_of_one_list_queues_only_it(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT_EQ(200, create_two_list_group("/list", "/list2"));
+    ASSERT(every_list_settled(GID, 5000));
+    cJSON *out = NULL;
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/lists/" L1 "/sync", NULL, &out));
+    ASSERT_STR_EQm("list 0 is left alone", "idle", nth_list_state(out, 0));
+    ASSERT_STR_EQm("list 1 is queued", "queued", nth_list_state(out, 1));
+    cJSON_Delete(out);
+    ASSERT(every_list_settled(GID, 5000));
+    harness_stop(h);
+    PASS();
+}
+
+TEST group_sync_queues_every_list(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT_EQ(200, create_two_list_group("/list", "/list2"));
+    ASSERT(every_list_settled(GID, 5000));
+    cJSON *out = NULL;
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/sync", NULL, &out));
+    ASSERT_STR_EQm("it is the group's record", GID, jstr(out, "id"));
+    ASSERT_STR_EQ("queued", nth_list_state(out, 0));
+    ASSERT_STR_EQ("queued", nth_list_state(out, 1));
+    cJSON_Delete(out);
+    ASSERT(every_list_settled(GID, 5000));
+    out = NULL;
+    ASSERT_EQ(404, do_request("POST", "/api/v1/groups/deadbeef/sync", NULL, &out));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST an_unknown_list_id_is_404(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    static const struct {
+        const char *method, *path, *body;
+    } calls[] = {
+        {"GET", "/api/v1/groups/" GID "/lists/deadbeef/rules", NULL},
+        {"PATCH", "/api/v1/groups/" GID "/lists/deadbeef/rules", "{\"rules\":[]}"},
+        {"POST", "/api/v1/groups/" GID "/lists/deadbeef/sync", NULL},
+    };
+    for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+        cJSON *out = NULL;
+        ASSERT_EQ(404, do_request(calls[i].method, calls[i].path, calls[i].body, &out));
+        ASSERT_STR_EQ("group has no such list", jstr(out, "error"));
+        cJSON_Delete(out);
+    }
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("GET", "/api/v1/groups/" GID "/lists/nothex!/rules", NULL, &out));
+    ASSERT_STR_EQ("invalid list id", jstr(out, "error"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_sync_url_another_list_holds_is_a_duplicate(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/" GID "/lists/" L1 "/sync", "{\"url\":\"" AT("/a") "\"}", &out));
+    ASSERT_STR_EQ("duplicate list url", jstr(out, "error"));
+    cJSON_Delete(out);
+    out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/" GID "/lists/" L1 "/sync", "{\"url\":\"ftp://x/l.txt\"}", &out));
+    ASSERT_STR_EQ("list url is not supported", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_STR_EQm("nothing was stored", AT("/b"), live_list(h, 1)->url);
+    harness_stop(h);
+    PASS();
+}
+
+TEST the_stream_stays_open_until_the_last_list_ends(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    gate_reset();
+    ASSERT_EQ(200, create_two_list_group("/slow", "/gate"));
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
+    ASSERT(fd >= 0);
+    ASSERTm("list 1 is fetching, so list 0 has ended", wait_gate_entered(1, 5000));
+    static char buf[16384];
+    size_t n = read_more(fd, buf, 0, sizeof(buf), 300);
+    ASSERTm("list 0's end was told", stream_has_list_event(buf, "progress", L0, "idle", NULL));
+    ASSERT_FALSEm("the stream is still open", stream_finished(buf, n));
+    atomic_store(&g_gate_open, true);
+    n = read_more(fd, buf, n, sizeof(buf), 5000);
+    close(fd);
+    ASSERTm("the stream ended", stream_finished(buf, n));
+    ASSERT_EQ_FMT(1, count_events(buf, "done"), "%d");
+    ASSERTm("with list 1's end", stream_has_list_event(buf, "done", L1, "idle", NULL));
+    ASSERT(every_list_settled(GID, 5000));
+    harness_stop(h);
+    PASS();
+}
+
+TEST removing_a_list_mid_sync_keeps_the_stream_for_the_other(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    gate_reset();
+    ASSERT_EQ(200, create_two_list_group("/gate", "/slow"));
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
+    ASSERT(fd >= 0);
+    ASSERT(wait_gate_entered(1, 5000));
+    char lists[256];
+    snprintf(lists, sizeof(lists), "[{\"id\":\"" L0 "\",\"url\":\"%s\"}]", stub_url("/gate"));
+    cJSON *out = NULL;
+    ASSERT_EQ(200, put_lists(lists, &out));
+    ASSERT_EQ(1, lists_n(out));
+    cJSON_Delete(out);
+    static char buf[16384];
+    size_t n = read_more(fd, buf, 0, sizeof(buf), 300);
+    ASSERTm("list 1's removal was told", stream_has_list_event(buf, "progress", L1, "error", "list removed"));
+    ASSERT_FALSEm("the stream stays for list 0", stream_finished(buf, n));
+    atomic_store(&g_gate_open, true);
+    n = read_more(fd, buf, n, sizeof(buf), 5000);
+    close(fd);
+    ASSERTm("the stream ended", stream_finished(buf, n));
+    ASSERT_EQ_FMT(1, count_events(buf, "done"), "%d");
+    ASSERTm("with list 0's end", stream_has_list_event(buf, "done", L0, "idle", NULL));
+    harness_stop(h);
+    PASS();
+}
+
+TEST the_first_event_restates_every_list(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT(add_two_list_group(h));
+    int fd = stream_open("/api/v1/groups/" GID "/sync/events");
+    ASSERT(fd >= 0);
+    static char buf[16384];
+    size_t n = read_stream(fd, buf, sizeof(buf), 3000);
+    close(fd);
+    ASSERTm("the stream ended", stream_finished(buf, n));
+    ASSERT_EQ_FMT(2, events_n(buf), "%d");
+    char name[32];
+    cJSON *ev = event_at(buf, 0, name, sizeof(name));
+    ASSERT(ev != NULL);
+    ASSERT_STR_EQ("progress", name);
+    ASSERT_STR_EQ(GID, jstr(ev, "groupId"));
+    ASSERT_STR_EQ(L0, jstr(ev, "listId"));
+    ASSERT_EQ_FMT(2.0, jnum(jobj(ev, "list"), "rulesTotal"), "%f");
+    cJSON_Delete(ev);
+    ev = event_at(buf, 1, name, sizeof(name));
+    ASSERT(ev != NULL);
+    ASSERT_STR_EQ("done", name);
+    ASSERT_STR_EQ(L1, jstr(ev, "listId"));
+    ASSERT_EQ_FMT(3.0, jnum(jobj(ev, "list"), "rulesTotal"), "%f");
+    cJSON_Delete(ev);
+    harness_stop(h);
+    PASS();
+}
+
+static bool add_group_of_urls(harness_t *h, const char *url0, const char *url1) {
+    firc_group_t *g = firc_group_new();
+    if (g == NULL) { return false; }
+    g->enable = true;
+    bool ok = firc_id_parse(GID, &g->id) == FIRC_OK && firc_strset(&g->name, "g") == FIRC_OK &&
+              firc_strset(&g->iface, "lo") == FIRC_OK && add_api_list(g, L0, url0, 0) &&
+              (url1 == NULL || add_api_list(g, L1, url1, 0));
+    if (!ok) {
+        firc_group_free(g);
+        return false;
+    }
+    return add_on_loop(h, g);
+}
+
+TEST a_group_sync_that_queued_one_list_is_accepted(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT(add_group_of_urls(h, "", AT("/b")));
+    cJSON *out = NULL;
+    ASSERT_EQ(202, do_request("POST", "/api/v1/groups/" GID "/sync", NULL, &out));
+    ASSERT_STR_EQm("the list without a url stays idle", "idle", nth_list_state(out, 0));
+    ASSERT_STR_EQm("the other was queued", "queued", nth_list_state(out, 1));
+    cJSON_Delete(out);
+    ASSERT(every_list_settled(GID, 5000));
+    harness_stop(h);
+    PASS();
+}
+
+TEST a_group_sync_that_queued_nothing_is_refused(void) {
+    harness_t *h = harness_start_with_worker();
+    ASSERT(h != NULL);
+    ASSERT(add_group_of_urls(h, "", NULL));
+    cJSON *out = NULL;
+    ASSERT_EQ(400, do_request("POST", "/api/v1/groups/" GID "/sync", NULL, &out));
+    ASSERT_STR_EQ("list has no url to fetch", jstr(out, "error"));
+    cJSON_Delete(out);
     harness_stop(h);
     PASS();
 }
@@ -2670,11 +3234,20 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     GREATEST_SET_TEARDOWN_CB(stop_live_harness, NULL);
     RUN_TEST(put_groups_answers_the_carried_list);
-    RUN_TEST(a_put_without_list_keeps_it_and_null_removes_it);
+    RUN_TEST(a_put_without_lists_keeps_them_null_is_400_and_empty_removes);
     RUN_TEST(a_list_needs_a_supported_url);
     RUN_TEST(creating_a_group_with_a_list_answers_it_queued);
     RUN_TEST(a_duplicate_group_id_is_409);
     RUN_TEST(lastUpdate_in_a_body_is_ignored);
+    RUN_TEST(a_new_url_under_the_same_id_keeps_its_overrides);
+    RUN_TEST(a_put_of_lists_without_ids_keeps_their_arenas);
+    RUN_TEST(a_duplicate_url_in_a_put_is_400);
+    RUN_TEST(a_duplicate_id_in_a_put_is_400);
+    RUN_TEST(an_absent_interval_takes_the_paired_lists_then_86400);
+    RUN_TEST(a_url_whose_list_is_named_by_another_item_is_a_new_list);
+    RUN_TEST(an_unknown_id_is_a_new_list_keeping_it);
+    RUN_TEST(seventeen_lists_in_a_put_are_400);
+    RUN_TEST(a_list_item_must_be_an_object_with_a_valid_id);
     RUN_TEST(the_preview_is_counts_and_a_bounded_sample);
     RUN_TEST(the_preview_says_how_many_lines_it_could_not_use);
     RUN_TEST(the_preview_of_an_html_page_says_so);
@@ -2730,7 +3303,7 @@ int main(int argc, char **argv) {
     RUN_TEST(the_events_stream_is_404_for_an_unknown_id);
     RUN_TEST(a_stream_still_open_at_shutdown_is_ended);
     RUN_TEST(a_delete_ends_the_streams_watching_that_group);
-    RUN_TEST(a_null_list_ends_the_open_stream);
+    RUN_TEST(an_empty_lists_ends_the_open_stream);
     RUN_TEST(a_stale_result_changes_nothing_observable);
     RUN_TEST(a_page_is_a_window_onto_the_list_in_order);
     RUN_TEST(a_search_is_done_by_the_daemon);
@@ -2738,5 +3311,16 @@ int main(int argc, char **argv) {
     RUN_TEST(the_page_refuses_a_number_it_cannot_mean);
     RUN_TEST(an_offset_past_the_last_match_is_an_empty_page_that_still_counts);
     RUN_TEST(list_routes_on_a_manual_group_are_404);
+    RUN_TEST(rules_page_of_the_second_list);
+    RUN_TEST(patch_names_its_list);
+    RUN_TEST(sync_of_one_list_queues_only_it);
+    RUN_TEST(group_sync_queues_every_list);
+    RUN_TEST(an_unknown_list_id_is_404);
+    RUN_TEST(a_sync_url_another_list_holds_is_a_duplicate);
+    RUN_TEST(the_stream_stays_open_until_the_last_list_ends);
+    RUN_TEST(removing_a_list_mid_sync_keeps_the_stream_for_the_other);
+    RUN_TEST(the_first_event_restates_every_list);
+    RUN_TEST(a_group_sync_that_queued_one_list_is_accepted);
+    RUN_TEST(a_group_sync_that_queued_nothing_is_refused);
     GREATEST_MAIN_END();
 }

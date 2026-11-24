@@ -268,11 +268,11 @@ static void emit_sub_override(emitter_ctx_t *ctx, const firc_sub_override_t *o)
     map_end(ctx);
 }
 
-/* nested under list so it sits beside the group's hand-written rules; written only when g->list is set */
 static void emit_group_list(emitter_ctx_t *ctx, const firc_group_list_t *l)
 {
-    emit_plain(ctx, "list");
     map_start(ctx);
+    emit_plain(ctx, "id");
+    emit_id(ctx, l->id);
     emit_plain(ctx, "url");
     emit_string(ctx, l->url != NULL ? l->url : "");
     emit_plain(ctx, "interval");
@@ -321,8 +321,11 @@ static void emit_group(emitter_ctx_t *ctx, const firc_group_t *g)
         emit_rule(ctx, g->rules[i]);
     }
     seq_end(ctx);
-    if (g->list != NULL) {
-        emit_group_list(ctx, g->list);
+    if (g->n_lists != 0) {
+        emit_plain(ctx, "lists");
+        seq_start(ctx, false);
+        for (size_t i = 0; i < g->n_lists; i++) { emit_group_list(ctx, g->lists[i]); }
+        seq_end(ctx);
     }
     map_end(ctx);
 }

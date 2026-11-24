@@ -19,6 +19,8 @@ var (
 	hostAddr    = flag.String("addr", "0.0.0.0", "listen address for DNS proxy and HTTP (use [::] on dual-stack hosts)")
 	listURL     = flag.String("list-url", "", "give the group a list fetched from this url (empty: no list)")
 	listIval    = flag.Int("list-interval", 86400, "the list's update interval in seconds (0: no timer)")
+	nLists      = flag.Int("lists", 1, "lists per group; with more than one, -list-url takes two %d: group and list index")
+	nGroups     = flag.Int("groups", 1, "number of groups; only the first carries the rules")
 )
 
 func ruleFor(i int, t string) (string, string) {
@@ -49,17 +51,28 @@ func main() {
 	b.WriteString("  netfilter:\n    iptables:\n      chainPrefix: FIRC_\n    ipset:\n      tablePrefix: firc_\n      additionalTTL: 1h0m0s\n    disableIPv4: false\n    disableIPv6: false\n    startMarkTableIndex: 1718186595\n")
 	b.WriteString("  link: []\n")
 	b.WriteString("groups:\n")
-	fmt.Fprintf(&b, "  - id: aa000001\n    name: Bench\n    color: '#ffffff'\n    interface: %s\n    enable: %v\n    rules:\n", "blackhole", *groupEnable)
-	for i := 0; i < *nRules; i++ {
-		t := *ruleType
-		if t == "mixed" {
-			t = mixed[i%len(mixed)]
+	for g := 0; g < *nGroups; g++ {
+		fmt.Fprintf(&b, "  - id: %08x\n    name: Bench%d\n    color: '#ffffff'\n    interface: %s\n    enable: %v\n    rules:\n", 0xaa000001+g, g, "blackhole", *groupEnable)
+		if g == 0 {
+			for i := 0; i < *nRules; i++ {
+				t := *ruleType
+				if t == "mixed" {
+					t = mixed[i%len(mixed)]
+				}
+				rt, rv := ruleFor(i, t)
+				fmt.Fprintf(&b, "      - id: %08x\n        name: r%d\n        type: %s\n        rule: '%s'\n        enable: true\n", 0x10000000+i, i, rt, rv)
+			}
 		}
-		rt, rv := ruleFor(i, t)
-		fmt.Fprintf(&b, "      - id: %08x\n        name: r%d\n        type: %s\n        rule: '%s'\n        enable: true\n", 0x10000000+i, i, rt, rv)
-	}
-	if *listURL != "" {
-		fmt.Fprintf(&b, "    list:\n      url: '%s'\n      interval: %d\n", *listURL, *listIval)
+		if *listURL != "" {
+			b.WriteString("    lists:\n")
+			for l := 0; l < *nLists; l++ {
+				u := *listURL
+				if *nLists > 1 {
+					u = fmt.Sprintf(*listURL, g, l)
+				}
+				fmt.Fprintf(&b, "      - id: %08x\n        url: '%s'\n        interval: %d\n", 0x7a7a7a01+l, u, *listIval)
+			}
+		}
 	}
 
 	if *out == "-" {

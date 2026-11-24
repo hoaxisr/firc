@@ -78,10 +78,12 @@ static firc_err_t append_group(firc_ruleset_snapshot_t *snap, const firc_group_t
         err = entry_add(&b, r->type, r->rule, r->enable, false);
     }
     /* list text is borrowed from the arena; a list free/replace must release the snapshot first */
-    const firc_sub_rules_t *lr = g->list != NULL ? &g->list->rules : NULL;
-    for (size_t j = 0; err == FIRC_OK && lr != NULL && j < lr->n; j++) {
-        err = entry_add(&b, firc_sub_rules_type(lr, j), firc_sub_rules_text(lr, j),
-                        firc_sub_rules_enable(lr, j), true);
+    for (size_t k = 0; err == FIRC_OK && k < g->n_lists; k++) {
+        const firc_sub_rules_t *lr = &g->lists[k]->rules;
+        for (size_t j = 0; err == FIRC_OK && j < lr->n; j++) {
+            err = entry_add(&b, firc_sub_rules_type(lr, j), firc_sub_rules_text(lr, j),
+                            firc_sub_rules_enable(lr, j), true);
+        }
     }
     entry_end(&b, snap, err);
     return err;
@@ -131,12 +133,15 @@ firc_ruleset_snapshot_t *firc_ruleset_snapshot_build_where(const firc_config_t *
             return NULL;
         }
     }
-    /* provisional while an enabled group with a list has no body fetched yet */
-    for (size_t i = 0; i < cfg->n_groups; i++) {
+    /* provisional while an enabled group has a list nothing has been fetched for yet */
+    for (size_t i = 0; i < cfg->n_groups && !snap->provisional; i++) {
         const firc_group_t *g = cfg->groups[i];
-        if (g->enable && (keep == NULL || keep(g, ud)) && g->list != NULL && !g->list->has_body_hash) {
-            snap->provisional = true;
-            break;
+        if (!g->enable || (keep != NULL && !keep(g, ud))) { continue; }
+        for (size_t k = 0; k < g->n_lists; k++) {
+            if (firc_group_list_untried(g->lists[k])) {
+                snap->provisional = true;
+                break;
+            }
         }
     }
     return snap;

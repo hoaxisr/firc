@@ -21,6 +21,22 @@ export function groupsFromFile(fileName: string, text: string): Group[] {
   return foreign ? groups.reverse() : groups;
 }
 
+export type OldLists = { count: number; urls: string[] };
+
+export function oldListsOf(text: string): OldLists {
+  const raw = JSON.parse(text);
+  const urls: string[] = [];
+  let count = 0;
+  for (const group of Array.isArray(raw?.groups) ? raw.groups : []) {
+    if (!group || typeof group !== "object" || !("list" in group) || "lists" in group) continue;
+    const list = group.list;
+    if (list === null || list === undefined) continue;
+    if (urls.length < 3) urls.push(typeof list?.url === "string" ? list.url.slice(0, 200) : "?");
+    count++;
+  }
+  return { count, urls };
+}
+
 export function cloneGroupWithNewIds(group: Group): Group {
   return {
     ...group,
@@ -31,15 +47,14 @@ export function cloneGroupWithNewIds(group: Group): Group {
       ...rule,
       id: randomId(),
     })),
-    list: group.list
-      ? {
-          url: group.list.url,
-          interval: group.list.interval,
-          lastUpdate: 0,
-          rulesTotal: 0,
-          sync: syncIdle(),
-        }
-      : group.list,
+    lists: (group.lists ?? []).map((list) => ({
+      id: randomId(),
+      url: list.url,
+      interval: list.interval,
+      lastUpdate: 0,
+      rulesTotal: 0,
+      sync: syncIdle(),
+    })),
   };
 }
 

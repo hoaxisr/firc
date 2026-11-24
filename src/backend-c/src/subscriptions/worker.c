@@ -11,6 +11,7 @@
 
 /* at most one mid-transfer progress event per this many ms; each costs the loop a wakeup and a write */
 #define FIRC_SUB_FETCH_PROGRESS_MIN_MS 200u
+#define FIRC_SUB_EMIT_RETRY_MS 10u
 
 void firc_sub_event_free(firc_sub_event_t *ev)
 {
@@ -36,19 +37,35 @@ static uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+static void sleep_ms(unsigned ms)
+{
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)ms * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
 /* check-then-emit, not atomic: a raise landing between the two still hands over one event, by design */
 static void post(run_ctx_t *c, firc_sub_event_t *ev)
 {
     if (ev == NULL) {
         return;
     }
-    if (firc_cancel_raised(c->cancel)) {
-        firc_sub_event_free(ev);
-        return;
-    }
     ev->group_id = c->job->group_id;
+    ev->list_id = c->job->list_id;
     ev->seq = c->job->seq;
-    c->emit(c->ud, ev);
+    for (;;) {
+        if (firc_cancel_raised(c->cancel)) {
+            firc_sub_event_free(ev);
+            return;
+        }
+        if (c->emit(c->ud, ev)) {
+            return;
+        }
+        if (ev->kind == FIRC_SUB_EV_PROGRESS) {
+            firc_sub_event_free(ev);
+            return;
+        }
+        sleep_ms(FIRC_SUB_EMIT_RETRY_MS);
+    }
 }
 
 static bool fetch_progress(void *ud, size_t bytes, size_t total)
@@ -180,14 +197,14 @@ struct firc_sub_worker {
     bool started;
     bool stopping;
 
-    firc_sub_job_t *waiting; /* one slot per id, replaced in place */
+    firc_sub_job_t *waiting; /* one slot per (group, list), replaced in place */
     size_t n_waiting;
     size_t cap;
 
     firc_sub_job_t running;
     bool has_running;
 
-    firc_sub_job_t follow_up; /* for running.group_id only */
+    firc_sub_job_t follow_up; /* for the running (group, list) only */
     bool has_follow_up;
 };
 
@@ -243,6 +260,11 @@ size_t firc_sub_worker_waiting_for_test(firc_sub_worker_t *w)
     return n;
 }
 
+static bool same_list(const firc_sub_job_t *a, const firc_sub_job_t *b)
+{
+    return firc_id_equal(a->group_id, b->group_id) && firc_id_equal(a->list_id, b->list_id);
+}
+
 firc_err_t firc_sub_worker_enqueue(firc_sub_worker_t *w, firc_sub_job_t *job)
 {
     if (w == NULL || job == NULL || job->url == NULL) {
@@ -261,7 +283,7 @@ firc_err_t firc_sub_worker_enqueue(firc_sub_worker_t *w, firc_sub_job_t *job)
         return FIRC_ERR_STATE;
     }
 
-    if (w->has_running && firc_id_equal(w->running.group_id, job->group_id)) {
+    if (w->has_running && same_list(&w->running, job)) {
         /* already being fetched: a follow-up replaces any earlier one rather than queueing behind it */
         if (w->has_follow_up) {
             free(w->follow_up.url);
@@ -271,7 +293,7 @@ firc_err_t firc_sub_worker_enqueue(firc_sub_worker_t *w, firc_sub_job_t *job)
     } else {
         size_t slot = w->n_waiting;
         for (size_t i = 0; i < w->n_waiting; i++) {
-            if (firc_id_equal(w->waiting[i].group_id, job->group_id)) {
+            if (same_list(&w->waiting[i], job)) {
                 slot = i;
                 break;
             }

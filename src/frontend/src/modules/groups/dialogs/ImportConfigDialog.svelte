@@ -3,20 +3,24 @@
   import Checkbox from "../../../components/ui/Checkbox.svelte";
   import GenericDialog from "../../../components/ui/GenericDialog.svelte";
   import Switch from "../../../components/ui/Switch.svelte";
-  import { t } from "../../../data/locale.svelte";
+  import { locale, t } from "../../../data/locale.svelte";
 
   import { Check, Scan } from "../../../components/ui/icons";
   import type { Group } from "../../../types";
+  import { counted } from "../../../utils/plural";
+  import type { OldLists } from "../groups-data";
 
   let {
     open = false,
     groups = [],
+    oldLists = { count: 0, urls: [] },
     fileName = "",
     onclose,
     onimport,
   }: {
     open?: boolean;
     groups?: Group[];
+    oldLists?: OldLists;
     fileName?: string;
     onclose?: () => void;
     onimport?: (data: { groups: Group[]; replace: boolean }) => void;
@@ -101,11 +105,39 @@
           />
           <div class="group-info">
             <span class="group-name">{group.name || `${t("Group")} ${index + 1}`}</span>
-            <span class="group-meta">#{group.rules.length}</span>
+            <span class="group-meta"
+              >#{group.rules.length}{#if group.lists?.length}
+                · {counted(
+                  group.lists.length,
+                  locale.current,
+                  t("{n} list"),
+                  t("{n} lists (2-4)"),
+                  t("{n} lists"),
+                )}{/if}</span
+            >
           </div>
         </label>
       {/each}
     </div>
+    {#if oldLists.count > 0}
+      <div class="old-lists" role="status">
+        <span
+          >{t(
+            "These lists are not imported: this file keeps one list under the old key, and lists are now added to a group by hand",
+          )}</span
+        >
+        <ul>
+          {#each oldLists.urls as url, i (i)}
+            <li>{url}</li>
+          {/each}
+        </ul>
+        {#if oldLists.count > oldLists.urls.length}
+          <span
+            >{t("and {n} more").replace("{n}", String(oldLists.count - oldLists.urls.length))}</span
+          >
+        {/if}
+      </div>
+    {/if}
     {#if triedSubmit && !selectedCount}
       <div class="validation">{t("Select at least one group")}</div>
     {/if}
@@ -214,6 +246,19 @@
     color: var(--text-2);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+  }
+
+  .old-lists {
+    color: var(--yellow);
+    font-size: 0.85rem;
+    line-height: 1.4;
+  }
+
+  .old-lists ul {
+    margin: 0.25rem 0;
+    padding-left: 1.1rem;
+    color: var(--text-2);
+    word-break: break-all;
   }
 
   .validation {

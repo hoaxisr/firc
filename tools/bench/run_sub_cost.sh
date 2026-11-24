@@ -13,6 +13,7 @@ if sleep 0.1 2>/dev/null; then POLL_SLEEP=0.1; else POLL_SLEEP=1; fi
 CONF="$WORK/conf"
 LIST="$WORK/list.txt"
 GROUP_ID=5eba1111
+LIST_ID=7a7a7a01
 
 cleanup() {
     rm -f "$WORK/probing"
@@ -62,9 +63,10 @@ groups:
     interface: nwg0
     enable: true
     rules: []
-    list:
-      url: 'http://127.0.0.1:$PORT/list.txt'
-      interval: 86400
+    lists:
+      - id: $LIST_ID
+        url: 'http://127.0.0.1:$PORT/list.txt'
+        interval: 86400
 EOF
 
 rss() { awk '/^VmRSS:/ { print $2 }' "/proc/$DAEMON_PID/status" 2>/dev/null; }
@@ -113,12 +115,12 @@ since() { awk -v a="$1" -v b="$(now_s)" 'BEGIN { printf "%.2f", b - a }'; }
 # shut-none: a half-closed socket reads as a gone client and ends the event stream after one event.
 sync_once() {
     _t0=$(now_s)
-    _code=$(printf 'POST /api/v1/groups/%s/list/sync HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n' \
-        "$GROUP_ID" | socat -t "$REQ_TIMEOUT" - "UNIX-CONNECT:$SOCK" 2>/dev/null | head -1 |
+    _code=$(printf 'POST /api/v1/groups/%s/lists/%s/sync HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n' \
+        "$GROUP_ID" "$LIST_ID" | socat -t "$REQ_TIMEOUT" - "UNIX-CONNECT:$SOCK" 2>/dev/null | head -1 |
         awk '{ print $2 }')
-    _ev=$(printf 'GET /api/v1/groups/%s/list/sync/events HTTP/1.1\r\nHost: x\r\n\r\n' \
+    _ev=$(printf 'GET /api/v1/groups/%s/sync/events HTTP/1.1\r\nHost: x\r\n\r\n' \
         "$GROUP_ID" | socat -t "$REQ_TIMEOUT" - "UNIX-CONNECT:$SOCK,shut-none" 2>/dev/null |
-        awk '/^event: done/ { print "done"; exit } /^event: error/ { print "error"; exit }')
+        awk '/^event: done/ { getline; print ($0 ~ /"state":"error"/) ? "error" : "done"; exit }')
     printf '%s %s %s' "$(since "$_t0")" "${_code:--}" "${_ev:--}"
 }
 
@@ -184,7 +186,7 @@ for n in $SIZES; do
     set -- $(sync_once)
     t_unchanged=$1; code_unchanged=$2; ev_unchanged=$3
 
-    set -- $(req GET "/api/v1/groups/$GROUP_ID/list/rules?offset=100000&limit=50&q=ads7")
+    set -- $(req GET "/api/v1/groups/$GROUP_ID/lists/$LIST_ID/rules?offset=100000&limit=50&q=ads7")
     t_page=$1; code_page=$2
 
     t_nosave=-

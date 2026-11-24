@@ -149,6 +149,8 @@ async function withWindowStub<T>(action: () => Promise<T>): Promise<T> {
   }
 }
 
+const LID = "0a0a0a0a";
+
 const makeGroup = (id: string, withList = false) => ({
   id,
   name: `group-${id}`,
@@ -157,17 +159,18 @@ const makeGroup = (id: string, withList = false) => ({
   devices: { allow: [], deny: [] },
   resolve: { tunnel: true, server: "" },
   rules: [{ id: `r${id}`, enable: true, rule: `${id}.example.com`, type: "domain" }],
-  ...(withList
-    ? {
-        list: {
+  lists: withList
+    ? [
+        {
+          id: LID,
           url: `https://example.com/${id}.txt`,
           interval: 86400,
           lastUpdate: 1700000000,
           rulesTotal: 3,
           sync: { state: "idle" as const, error: "", lastCheck: 1700000000 },
         },
-      }
-    : {}),
+      ]
+    : [],
 });
 
 function seed(store: any, groups: ReturnType<typeof makeGroup>[]) {
@@ -204,21 +207,70 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
       const putRequest = stub.requests.find((r) => r.path === "/groups?save=true");
       assert.ok(putRequest, "expected a PUT to /groups?save=true");
       const sentGroup = (putRequest!.body as any).groups[0];
-      assert.deepStrictEqual(sentGroup.list, {
-        url: `https://example.com/${id}.txt`,
-        interval: 86400,
-      });
+      assert.deepStrictEqual(sentGroup.lists, [
+        { id: LID, url: `https://example.com/${id}.txt`, interval: 86400 },
+      ]);
       assert.strictEqual(
-        (sentGroup.list as any).rulesTotal,
+        (sentGroup.lists[0] as any).rulesTotal,
         undefined,
         "rulesTotal is the daemon's own and must not ride along",
       );
-      assert.strictEqual((sentGroup.list as any).lastUpdate, undefined);
-      assert.strictEqual((sentGroup.list as any).sync, undefined);
+      assert.strictEqual((sentGroup.lists[0] as any).lastUpdate, undefined);
+      assert.strictEqual((sentGroup.lists[0] as any).sync, undefined);
       assert.strictEqual(
-        (sentGroup.list as any).rules,
+        (sentGroup.lists[0] as any).rules,
         undefined,
         "never the list's rules -- this is the whole point of the split",
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a manual group sending no `lists` key, which the daemon reads as "keep" and never clears.
+  it("a group with lists [] serialises lists: []", async () => {
+    const id = "5a5e0010";
+    const stub = installFetchStub({ "/groups?save=true": { status: "ok" } });
+
+    try {
+      const store = new GroupsStore();
+      seed(store, [makeGroup(id)]);
+      store.data[0].name = "renamed";
+
+      await withWindowStub(() => store.saveChanges());
+
+      const putRequest = stub.requests.find((r) => r.path === "/groups?save=true");
+      assert.deepStrictEqual((putRequest!.body as any).groups[0].lists, []);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  // Catches a Save dropping the second list's edit because only the first list is read.
+  it("editing the second list's url is sent and marks the group unsaved", async () => {
+    const id = "5a5e0011";
+    const stub = installFetchStub({ "/groups?save=true": { status: "ok" } });
+
+    try {
+      const store = new GroupsStore();
+      const group = makeGroup(id, true) as any;
+      group.lists.push({ ...group.lists[0], id: "0b0b0b0b", url: "https://b.example/l" });
+      seed(store, [group]);
+      assert.strictEqual(store.groupDirty(store.data[0]), false);
+
+      store.setListUrl(id, "0b0b0b0b", "https://b.example/changed");
+
+      assert.strictEqual(store.groupDirty(store.data[0]), true);
+      assert.strictEqual(store.canSave, true);
+      await withWindowStub(() => store.saveChanges());
+      const sent = (stub.requests.find((r) => r.path === "/groups?save=true")!.body as any)
+        .groups[0].lists;
+      assert.deepStrictEqual(
+        sent.map((l: any) => [l.id, l.url]),
+        [
+          [LID, `https://example.com/${id}.txt`],
+          ["0b0b0b0b", "https://b.example/changed"],
+        ],
       );
     } finally {
       stub.restore();
@@ -229,9 +281,9 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
     const withEdit = "5a5e0002";
     const withoutEdit = "5a5e0003";
     const stub = installFetchStub({
-      [`/groups/${withEdit}/list/rules?offset=0&limit=50`]: rulesPage(3),
+      [`/groups/${withEdit}/lists/${LID}/rules?offset=0&limit=50`]: rulesPage(3),
       "/groups": { status: "ok" },
-      [`/groups/${withEdit}/list/rules?save=true`]: { status: "ok" },
+      [`/groups/${withEdit}/lists/${LID}/rules?save=true`]: { status: "ok" },
     });
 
     try {
@@ -239,24 +291,24 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
       seed(store, [makeGroup(withEdit, true), makeGroup(withoutEdit, true)]);
       store.open_state[withEdit] = true;
 
-      await store.lists.loadRules(withEdit, 0);
-      store.lists.pageState[withEdit].rules[0].enable = false;
+      await store.lists.loadRules(withEdit, LID, 0);
+      store.lists.pageState[`${withEdit}/${LID}`].rules[0].enable = false;
       assert.strictEqual(store.canSave, true, "fixture: the edit makes Save reachable");
 
       await withWindowStub(() => store.saveChanges());
 
       const patchRequest = stub.requests.find(
-        (r) => r.path === `/groups/${withEdit}/list/rules?save=true`,
+        (r) => r.path === `/groups/${withEdit}/lists/${LID}/rules?save=true`,
       );
       assert.ok(patchRequest, "expected a PATCH for the group with the edit");
       assert.deepStrictEqual(patchRequest!.body, {
         rules: [{ id: "rule0000", enable: false }],
       });
       assert.ok(
-        !stub.calls.includes(`/groups/${withoutEdit}/list/rules?save=true`),
+        !stub.calls.includes(`/groups/${withoutEdit}/lists/${LID}/rules?save=true`),
         "the group with no edit gets no PATCH",
       );
-      assert.deepStrictEqual(store.lists.ruleEdits(withEdit), [], "the edit is saved");
+      assert.deepStrictEqual(store.lists.ruleEdits(withEdit, LID), [], "the edit is saved");
     } finally {
       stub.restore();
     }
@@ -274,7 +326,7 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
       await withWindowStub(() => store.saveChanges());
 
       assert.ok(
-        !stub.calls.some((c) => c.includes("/list/rules")),
+        !stub.calls.some((c) => c.includes("/rules")),
         `expected no PATCH request, got: ${stub.calls.join(", ")}`,
       );
       assert.deepStrictEqual(stub.calls, ["/groups?with_rules=true", "/groups?save=true"]);
@@ -286,9 +338,9 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
   it("only the last request asks for a write", async () => {
     const id = "5a5e0005";
     const stub = installFetchStub({
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: rulesPage(3),
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: rulesPage(3),
       "/groups": { status: "ok" },
-      [`/groups/${id}/list/rules?save=true`]: { status: "ok" },
+      [`/groups/${id}/lists/${LID}/rules?save=true`]: { status: "ok" },
     });
 
     try {
@@ -296,15 +348,15 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
       seed(store, [makeGroup(id, true)]);
       store.open_state[id] = true;
 
-      await store.lists.loadRules(id, 0);
-      store.lists.pageState[id].rules[0].enable = false;
+      await store.lists.loadRules(id, LID, 0);
+      store.lists.pageState[`${id}/${LID}`].rules[0].enable = false;
 
       const before = stub.calls.length;
       await withWindowStub(() => store.saveChanges());
 
       assert.deepStrictEqual(
         stub.calls.slice(before),
-        ["/groups?with_rules=true", "/groups", `/groups/${id}/list/rules?save=true`],
+        ["/groups?with_rules=true", "/groups", `/groups/${id}/lists/${LID}/rules?save=true`],
         "the metadata PUT carries no query, the trailing PATCH is the only `?save=true`",
       );
     } finally {
@@ -315,19 +367,24 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
   it("duplicating a list group keeps its url and interval and nothing fetched", () => {
     const store = new GroupsStore();
     const source = makeGroup("5a5e0006", true) as any;
-    source.list.rulesTotal = 12345;
-    source.list.lastUpdate = 1700000000;
-    source.list.sync = { state: "idle", error: "", lastCheck: 1700000000 };
+    source.lists[0].rulesTotal = 12345;
+    source.lists[0].lastUpdate = 1700000000;
+    source.lists[0].sync = { state: "idle", error: "", lastCheck: 1700000000 };
 
     const cloned = store.cloneGroupWithNewIds(source);
 
     assert.notStrictEqual(cloned.id, source.id);
-    assert.ok(cloned.list, "fixture: the clone keeps a list at all");
-    assert.strictEqual(cloned.list!.url, source.list.url);
-    assert.strictEqual(cloned.list!.interval, source.list.interval);
-    assert.strictEqual(cloned.list!.rulesTotal, 0, "nothing has been fetched for the copy yet");
-    assert.strictEqual(cloned.list!.lastUpdate, 0);
-    assert.deepStrictEqual(cloned.list!.sync, { state: "idle", error: "", lastCheck: 0 });
+    assert.strictEqual(cloned.lists.length, 1, "fixture: the clone keeps its list");
+    assert.notStrictEqual(
+      cloned.lists[0].id,
+      source.lists[0].id,
+      "the copy's list has an id of its own",
+    );
+    assert.strictEqual(cloned.lists[0].url, source.lists[0].url);
+    assert.strictEqual(cloned.lists[0].interval, source.lists[0].interval);
+    assert.strictEqual(cloned.lists[0].rulesTotal, 0, "nothing has been fetched for the copy yet");
+    assert.strictEqual(cloned.lists[0].lastUpdate, 0);
+    assert.deepStrictEqual(cloned.lists[0].sync, { state: "idle", error: "", lastCheck: 0 });
   });
 });
 
@@ -399,16 +456,16 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
       seed(store, [makeGroup(id, true)]);
       assert.strictEqual(store.canSave, false, "fixture: nothing edited yet");
 
-      store.setListUrl(id, "https://example.com/new.txt");
+      store.setListUrl(id, LID, "https://example.com/new.txt");
       assert.strictEqual(store.canSave, true, "the url edit must make Save reachable");
-      assert.strictEqual(store.data[0].list.url, "https://example.com/new.txt");
+      assert.strictEqual(store.data[0].lists[0].url, "https://example.com/new.txt");
 
       await withWindowStub(() => store.saveChanges());
 
       const putRequest = stub.requests.find((r) => r.path === "/groups?save=true");
       assert.ok(putRequest, "expected a PUT to /groups?save=true");
       assert.strictEqual(
-        (putRequest!.body as any).groups[0].list.url,
+        (putRequest!.body as any).groups[0].lists[0].url,
         "https://example.com/new.txt",
       );
       assert.strictEqual(store.canSave, false, "clean again once the edit is saved");
@@ -426,14 +483,14 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
       seed(store, [makeGroup(id, true)]);
       assert.strictEqual(store.canSave, false, "fixture: nothing edited yet");
 
-      store.setListInterval(id, 3600);
+      store.setListInterval(id, LID, 3600);
       assert.strictEqual(store.canSave, true, "the interval edit must make Save reachable");
-      assert.strictEqual(store.data[0].list.interval, 3600);
+      assert.strictEqual(store.data[0].lists[0].interval, 3600);
 
       await withWindowStub(() => store.saveChanges());
 
       const putRequest = stub.requests.find((r) => r.path === "/groups?save=true");
-      assert.strictEqual((putRequest!.body as any).groups[0].list.interval, 3600);
+      assert.strictEqual((putRequest!.body as any).groups[0].lists[0].interval, 3600);
       assert.strictEqual(store.canSave, false, "clean again once the edit is saved");
     } finally {
       stub.restore();
@@ -448,7 +505,7 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
     seed(store, [group]);
     assert.strictEqual(store.canSave, false, "fixture: nothing edited yet");
 
-    store.setListUrl(id, group.list.url);
+    store.setListUrl(id, LID, group.lists[0].url);
 
     assert.strictEqual(store.canSave, false, "the same value must not make Save reachable");
   });
@@ -458,13 +515,13 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
     const id = "5a5e000a";
     const store = new GroupsStore();
     const group = makeGroup(id, true) as any;
-    const originalUrl = group.list.url;
+    const originalUrl = group.lists[0].url;
     seed(store, [group]);
 
-    store.setListUrl(id, "https://example.com/typed-then-reverted.txt");
+    store.setListUrl(id, LID, "https://example.com/typed-then-reverted.txt");
     assert.strictEqual(store.canSave, true, "fixture: the edit itself must dirty it");
 
-    store.setListUrl(id, originalUrl);
+    store.setListUrl(id, LID, originalUrl);
     assert.strictEqual(store.canSave, false, "reverted by hand, so nothing is left to save");
   });
 
@@ -472,11 +529,14 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
   it("a sync persists only url, so an unsaved interval edit survives it", async () => {
     const id = "5a5e000b";
     const stub = installFetchStub({
-      [`/groups/${id}/list/sync`]: {
-        list: {
-          url: "https://example.com/synced.txt",
-          sync: { state: "queued", error: "", lastCheck: 0 },
-        },
+      [`/groups/${id}/lists/${LID}/sync`]: {
+        lists: [
+          {
+            id: LID,
+            url: "https://example.com/synced.txt",
+            sync: { state: "queued", error: "", lastCheck: 0 },
+          },
+        ],
       },
       "/groups?save=true": { status: "ok" },
     });
@@ -487,25 +547,25 @@ describe("a list's url/interval, edited from the header or the dialog", () => {
       seed(store, [group]);
       store.lists.syncReopenMs = 0;
 
-      store.setListInterval(id, 604800);
+      store.setListInterval(id, LID, 604800);
       assert.strictEqual(store.canSave, true, "fixture: the interval edit must dirty it");
 
-      await withWindowStub(() => store.lists.requestSync(id, "https://example.com/synced.txt"));
+      await withWindowStub(() => store.lists.syncList(id, LID, "https://example.com/synced.txt"));
 
       assert.strictEqual(
         store.canSave,
         true,
         "the sync persisted url, not the still-unsaved interval",
       );
-      assert.strictEqual(store.data[0].list.interval, 604800, "the edit itself must survive");
+      assert.strictEqual(store.data[0].lists[0].interval, 604800, "the edit itself must survive");
 
       await withWindowStub(() => store.saveChanges());
 
       const putRequest = stub.requests.find((r) => r.path === "/groups?save=true");
       assert.ok(putRequest, "expected a PUT to /groups?save=true");
-      assert.strictEqual((putRequest!.body as any).groups[0].list.interval, 604800);
+      assert.strictEqual((putRequest!.body as any).groups[0].lists[0].interval, 604800);
       assert.strictEqual(
-        (putRequest!.body as any).groups[0].list.url,
+        (putRequest!.body as any).groups[0].lists[0].url,
         "https://example.com/synced.txt",
       );
     } finally {
@@ -526,7 +586,9 @@ describe("updateGroupFromDialog, the settings button on an existing group", () =
       name: group.name,
       interface: group.interface,
       devices: { allow: [...group.devices.allow], deny: [...group.devices.deny] },
-      list: { url: group.list.url, interval: group.list.interval },
+      lists: [
+        { id: group.lists[0].id, url: group.lists[0].url, interval: group.lists[0].interval },
+      ],
       resolve: { tunnel: true, server: "" },
     });
 
@@ -543,12 +605,90 @@ describe("updateGroupFromDialog, the settings button on an existing group", () =
       name: group.name,
       interface: group.interface,
       devices: group.devices,
-      list: { url: "https://example.com/changed.txt", interval: group.list.interval },
+      lists: [
+        {
+          id: group.lists[0].id,
+          url: "https://example.com/changed.txt",
+          interval: group.lists[0].interval,
+        },
+      ],
       resolve: { tunnel: true, server: "" },
     });
 
     assert.strictEqual(store.canSave, true, "a real change must still be reachable to save");
-    assert.strictEqual(store.data[0].list.url, "https://example.com/changed.txt");
+    assert.strictEqual(store.data[0].lists[0].url, "https://example.com/changed.txt");
+  });
+
+  it("a list added in the dialog joins the kept one with an id of its own", () => {
+    const id = "5a5e000e";
+    const store = new GroupsStore();
+    const group = makeGroup(id, true) as any;
+    seed(store, [group]);
+
+    store.updateGroupFromDialog(0, {
+      name: group.name,
+      interface: group.interface,
+      devices: group.devices,
+      lists: [
+        { id: LID, url: `https://example.com/${id}.txt`, interval: 3600 },
+        { url: "https://example.com/second.txt", interval: 3600 },
+      ],
+      resolve: { tunnel: true, server: "" },
+    });
+
+    const lists = store.data[0].lists;
+    assert.strictEqual(lists.length, 2);
+    assert.strictEqual(lists[0].id, LID);
+    assert.strictEqual(lists[0].interval, 3600);
+    assert.strictEqual(lists[1].url, "https://example.com/second.txt");
+    assert.strictEqual(lists[1].interval, 3600);
+    assert.match(lists[1].id, /^[0-9a-f]{8}$/);
+    assert.notStrictEqual(lists[1].id, LID);
+    assert.strictEqual(store.canSave, true);
+  });
+
+  it("the card's interval reaches every list of the group", () => {
+    const id = "5a5e0010";
+    const store = new GroupsStore();
+    const group = makeGroup(id, true) as any;
+    group.lists.push({
+      ...group.lists[0],
+      id: "0b0b0b0b",
+      url: "https://example.com/two.txt",
+      interval: 604800,
+    });
+    seed(store, [group]);
+
+    store.setGroupInterval(id, 3600);
+
+    assert.deepStrictEqual(
+      store.data[0].lists.map((l: any) => l.interval),
+      [3600, 3600],
+    );
+    assert.strictEqual(store.canSave, true);
+  });
+
+  it("a list left out of the dialog leaves the group and dirties it", () => {
+    const id = "5a5e000f";
+    const store = new GroupsStore();
+    const group = makeGroup(id, true) as any;
+    group.lists.push({ ...group.lists[0], id: "0b0b0b0b", url: "https://example.com/two.txt" });
+    seed(store, [group]);
+    assert.strictEqual(store.canSave, false, "fixture: nothing edited yet");
+
+    store.updateGroupFromDialog(0, {
+      name: group.name,
+      interface: group.interface,
+      devices: group.devices,
+      lists: [{ id: "0b0b0b0b", url: "https://example.com/two.txt", interval: 86400 }],
+      resolve: { tunnel: true, server: "" },
+    });
+
+    assert.deepStrictEqual(
+      store.data[0].lists.map((l: any) => l.id),
+      ["0b0b0b0b"],
+    );
+    assert.strictEqual(store.canSave, true);
   });
 });
 
@@ -856,7 +996,7 @@ describe("GroupsStore live state", () => {
     store.data[1].rules.pop();
     assert.strictEqual(store.groupDirty(byId(store, b)), false);
 
-    store.setListUrl(a, "https://example.com/other.txt");
+    store.setListUrl(a, LID, "https://example.com/other.txt");
     assert.strictEqual(store.groupDirty(byId(store, a)), true, "a list's url");
 
     store.data.push({ ...makeGroup("11ve0008") } as any);
@@ -1228,7 +1368,7 @@ describe("a write elsewhere while only list rules are edited", () => {
   it("does not reload the store", async () => {
     const id = "5a5e0301";
     const stub = installFetchStub({
-      [`/groups/${id}/list/rules?offset=0&limit=50`]: rulesPage(3),
+      [`/groups/${id}/lists/${LID}/rules?offset=0&limit=50`]: rulesPage(3),
       [`/groups/${id}/rules?save=true`]: { id: "ee00ee00" },
       "/groups?with_rules=true": { groups: [makeGroup(id, true)] },
       "/system/netfilter": {},
@@ -1238,8 +1378,8 @@ describe("a write elsewhere while only list rules are edited", () => {
       store.dataLoaded = true;
       seed(store, [makeGroup(id, true)]);
       store.open_state[id] = true;
-      await store.lists.loadRules(id, 0);
-      store.lists.pageState[id].rules[0].enable = false;
+      await store.lists.loadRules(id, LID, 0);
+      store.lists.pageState[`${id}/${LID}`].rules[0].enable = false;
       assert.ok(store.lists.hasPendingEdits);
       assert.ok(!store.tracker.isDirty);
       await fetcher.post(`/groups/${id}/rules?save=true`, {});

@@ -16,6 +16,7 @@
 #include "firc/recall.h"
 #include "firc/rulesnap.h"
 #include "firc/tap.h"
+#include "test_group_lists_util.h"
 
 static firc_config_t make_cfg(void) {
     firc_config_t c;
@@ -574,8 +575,8 @@ static void add_unfetched_list_group(firc_config_t *cfg) {
     firc_strset(&g->name, "list1");
     firc_strset(&g->iface, "nwg0");
     g->enable = true;
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "https://example.invalid/l.txt");
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "https://example.invalid/l.txt");
     firc_config_add_group(cfg, g);
 }
 
@@ -2589,10 +2590,10 @@ static void add_scoped_list_group(firc_config_t *cfg) {
     firc_strset(&g->name, "kids-list");
     firc_strset(&g->iface, "nwg0");
     g->enable = true;
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "https://example.invalid/l.txt");
-    g->list->has_body_hash = true;
-    firc_sub_rules_push(&g->list->rules, "example.com", FIRC_RULE_NAMESPACE, true, (firc_id_t){{9, 1, 0, 0}});
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "https://example.invalid/l.txt");
+    g->lists[0]->has_body_hash = true;
+    firc_sub_rules_push(&g->lists[0]->rules, "example.com", FIRC_RULE_NAMESPACE, true, (firc_id_t){{9, 1, 0, 0}});
     g->devices.allow = calloc(1, sizeof(char *));
     g->devices.allow[0] = strdup("192.168.1.0/24");
     g->devices.n_allow = 1;

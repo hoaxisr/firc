@@ -49,6 +49,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include "test_group_lists_util.h"
+#include "test_app_lists_util.h"
 
 static firc_group_t *make_group(const char *name, bool enable) {
     firc_group_t *g = firc_group_new();
@@ -1532,11 +1534,11 @@ static firc_ruleset_t *live_list_group(locked_app_t *l, const char *const (*spec
     g->name = strdup("g");
     g->iface = strdup("lo");
     g->enable = true;
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "http://127.0.0.1:1/list");
-    g->list->has_body_hash = true;
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "http://127.0.0.1:1/list");
+    g->lists[0]->has_body_hash = true;
     for (size_t i = 0; i < n; i++) {
-        firc_sub_rules_push(&g->list->rules, specs[i][0], specs[i][1], true, test_random_id());
+        firc_sub_rules_push(&g->lists[0]->rules, specs[i][0], specs[i][1], true, test_random_id());
     }
     *out_gid = g->id;
     firc_app_set_running(l->app, true);
@@ -1548,7 +1550,7 @@ static firc_ruleset_t *live_list_group(locked_app_t *l, const char *const (*spec
 }
 
 static firc_id_t list_rule_id(firc_ruleset_t *rs, size_t i) {
-    return firc_sub_rules_id(&firc_ruleset_group(rs)->list->rules, i);
+    return firc_sub_rules_id(&(firc_ruleset_group(rs))->lists[0]->rules, i);
 }
 
 /* Catches: disabling a list's subnet rule in the DNS view while its chain keeps marking it. */
@@ -1566,7 +1568,7 @@ TEST disabling_a_subnet_list_rule_asks_for_one_pass_and_the_chain_drops_it(void)
 
     firc_list_rule_edit_t e = {.rule = list_rule_id(rs, 0), .has_enable = true, .enable = false};
     char msg[128] = "";
-    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, &e, 1, msg, sizeof(msg)));
+    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, list0(l->app, gid), &e, 1, msg, sizeof(msg)));
     ASSERTm("one pass", wait_passes(l, before + 1));
     ASSERTm("written", wait_written_after(l, before));
     sleep_ms(300);
@@ -1593,7 +1595,7 @@ TEST a_name_list_rule_edit_asks_for_no_pass(void) {
     firc_list_rule_edit_t e = {.rule = list_rule_id(rs, 1), .has_enable = true, .enable = false,
                                .type = FIRC_RULE_DOMAIN};
     char msg[128] = "";
-    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, &e, 1, msg, sizeof(msg)));
+    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, list0(l->app, gid), &e, 1, msg, sizeof(msg)));
     sleep_ms(600);
     ASSERT_EQ_FMTm("a name rule costs the kernel nothing", (unsigned long long)before,
                    (unsigned long long)firc_app_nf_passes_for_test(l->app), "%llu");
@@ -1617,7 +1619,7 @@ TEST a_list_rule_moved_to_subnet_asks_for_one_pass(void) {
 
     firc_list_rule_edit_t e = {.rule = list_rule_id(rs, 0), .type = FIRC_RULE_SUBNET};
     char msg[128] = "";
-    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, &e, 1, msg, sizeof(msg)));
+    ASSERT_EQ(FIRC_OK, firc_app_patch_list_rules(l->app, gid, list0(l->app, gid), &e, 1, msg, sizeof(msg)));
     ASSERTm("one pass", wait_passes(l, before + 1));
     ASSERTm("written", wait_written_after(l, before));
     ASSERTm("and the chain marks it now", chain_marks(l, gid, "10.7.0.0/16"));
@@ -1640,7 +1642,7 @@ TEST a_list_rule_moved_off_subnet_asks_for_one_pass(void) {
 
     firc_list_rule_edit_t e = {.rule = list_rule_id(rs, 0), .type = FIRC_RULE_REGEX};
     char msg[128] = "";
-    ASSERT_EQ_FMTm(msg, FIRC_OK, firc_app_patch_list_rules(l->app, gid, &e, 1, msg, sizeof(msg)), "%d");
+    ASSERT_EQ_FMTm(msg, FIRC_OK, firc_app_patch_list_rules(l->app, gid, list0(l->app, gid), &e, 1, msg, sizeof(msg)), "%d");
     ASSERTm("one pass", wait_passes(l, before + 1));
     ASSERTm("written", wait_written_after(l, before));
     ASSERT_FALSEm("and the chain no longer marks it", chain_marks(l, gid, "10.9.0.0/16"));
@@ -1659,10 +1661,10 @@ static firc_group_t *activation_group(uint8_t tag, const char *hand_rule, const 
     g->enable = true;
     if (hand_rule != NULL) { firc_group_add_rule(g, edit_rule(FIRC_RULE_DOMAIN, hand_rule)); }
     if (list_url != NULL) {
-        g->list = firc_group_list_new();
-        firc_strset(&g->list->url, list_url);
-        firc_sub_rules_push(&g->list->rules, list_rule, FIRC_RULE_NAMESPACE, true, test_random_id());
-        g->list->has_body_hash = true;
+        test_group_set_list(g);
+        firc_strset(&g->lists[0]->url, list_url);
+        firc_sub_rules_push(&g->lists[0]->rules, list_rule, FIRC_RULE_NAMESPACE, true, test_random_id());
+        g->lists[0]->has_body_hash = true;
     }
     return g;
 }
@@ -1744,16 +1746,17 @@ TEST a_replace_whose_activation_fails_frees_lists_after_the_release(void) {
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(2, "keep.example", NULL, NULL)));
     firc_ruleset_t *rs = firc_app_find_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}});
     ASSERT(rs != NULL);
-    firc_ruleset_group_mut(rs)->list->sync_state = FIRC_SUB_SYNC_FETCHING;
+    (firc_ruleset_group_mut(rs))->lists[0]->sync_state = FIRC_SUB_SYNC_FETCHING;
     const firc_ruleset_snapshot_t *snap = firc_dns_pipeline_snapshot(l.pipeline);
     ASSERTm("fixture: the list's name is served",
             snap != NULL &&
             firc_ruleset_snapshot_owner(snap, "a.ads.example.com", NULL, NULL, NULL, NULL, NULL) != NULL);
 
     firc_group_t *arrival = activation_group(1, NULL, "http://127.0.0.1:1/l", "x.invalid");
-    firc_sub_rules_free(&arrival->list->rules);
-    firc_sub_rules_init(&arrival->list->rules);
-    arrival->list->has_body_hash = false;
+    arrival->lists[0]->id = (firc_ruleset_group(rs))->lists[0]->id;
+    firc_sub_rules_free(&arrival->lists[0]->rules);
+    firc_sub_rules_init(&arrival->lists[0]->rules);
+    arrival->lists[0]->has_body_hash = false;
     firc_group_t **arr = calloc(2, sizeof(*arr));
     arr[0] = arrival;
     arr[1] = activation_group(2, "keep.example", NULL, NULL);
@@ -2432,9 +2435,9 @@ static firc_group_t *list_group(firc_id_t id, const char *iface, bool enable) {
     g->name = strdup("s");
     g->iface = strdup(iface);
     g->enable = enable;
-    g->list = firc_group_list_new();
-    free(g->list->url);
-    g->list->url = strdup("http://example.invalid/list");
+    test_group_set_list(g);
+    free(g->lists[0]->url);
+    g->lists[0]->url = strdup("http://example.invalid/list");
     return g;
 }
 
@@ -4300,11 +4303,12 @@ TEST live_reads_the_tunnel_behind_the_interface(void) {
     PASS();
 }
 
-static firc_sub_event_t *sync_event(uint8_t tag, firc_sub_event_kind_t kind) {
+static firc_sub_event_t *sync_event(firc_app_t *app, uint8_t tag, firc_sub_event_kind_t kind) {
     firc_sub_event_t *ev = calloc(1, sizeof(*ev));
     if (ev == NULL) { return NULL; }
     ev->kind = kind;
     ev->group_id = (firc_id_t){{tag, tag, tag, tag}};
+    ev->list_id = list0(app, ev->group_id);
     ev->seq = 0;
     return ev;
 }
@@ -4319,24 +4323,24 @@ TEST a_syncs_progress_does_not_interrupt_the_pass(void) {
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}}));
 
     uint64_t before = firc_app_nf_enters_for_test(l.app);
-    firc_app_on_sync_event(l.app, sync_event(1, FIRC_SUB_EV_STARTED), 1000);
-    ASSERT_EQ(FIRC_SUB_SYNC_FETCHING, g->list->sync_state);
+    firc_app_on_sync_event(l.app, sync_event(l.app, 1, FIRC_SUB_EV_STARTED), 1000);
+    ASSERT_EQ(FIRC_SUB_SYNC_FETCHING, g->lists[0]->sync_state);
     for (size_t i = 1; i <= 30; i++) {
-        firc_sub_event_t *ev = sync_event(1, FIRC_SUB_EV_PROGRESS);
+        firc_sub_event_t *ev = sync_event(l.app, 1, FIRC_SUB_EV_PROGRESS);
         ASSERT(ev != NULL);
         ev->bytes = i * 1000;
         firc_app_on_sync_event(l.app, ev, 1000);
     }
-    ASSERT_EQ_FMT((size_t)30000, g->list->sync_progress.bytes, "%zu");
+    ASSERT_EQ_FMT((size_t)30000, g->lists[0]->sync_progress.bytes, "%zu");
     ASSERT_EQ_FMTm("no report took the interrupting lock", (unsigned long long)before,
                    (unsigned long long)firc_app_nf_enters_for_test(l.app), "%llu");
 
-    firc_sub_event_t *res = sync_event(1, FIRC_SUB_EV_RESULT);
+    firc_sub_event_t *res = sync_event(l.app, 1, FIRC_SUB_EV_RESULT);
     ASSERT(res != NULL);
     res->result = FIRC_SUB_RESULT_ERROR;
     res->err = FIRC_ERR_IO;
     firc_app_on_sync_event(l.app, res, 1000);
-    ASSERT_EQ(FIRC_SUB_SYNC_ERROR, g->list->sync_state);
+    ASSERT_EQ(FIRC_SUB_SYNC_ERROR, g->lists[0]->sync_state);
     ASSERT_EQ_FMTm("the result did", (unsigned long long)(before + 1),
                    (unsigned long long)firc_app_nf_enters_for_test(l.app), "%llu");
     locked_app_down(&l);
@@ -4354,13 +4358,67 @@ TEST a_lists_bookkeeping_does_not_interrupt_the_pass(void) {
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l.app, gid));
 
     uint64_t before = firc_app_nf_enters_for_test(l.app);
-    (void)firc_app_request_sync(l.app, gid);
+    (void)firc_app_request_sync(l.app, gid, list0(l.app, gid));
     firc_app_request_sync_missing(l.app);
     firc_app_request_sync_due(l.app, 4000000000);
-    ASSERT_EQ(FIRC_OK, firc_app_set_list_url(l.app, gid, "https://y.example/l"));
-    ASSERT_STR_EQ("https://y.example/l", g->list->url);
+    ASSERT_EQ(FIRC_OK, firc_app_set_list_url(l.app, gid, list0(l.app, gid), "https://y.example/l"));
+    ASSERT_STR_EQ("https://y.example/l", g->lists[0]->url);
     ASSERT_EQ_FMT((unsigned long long)before, (unsigned long long)firc_app_nf_enters_for_test(l.app), "%llu");
     locked_app_down(&l);
+    PASS();
+}
+
+static bool two_list_worker_up(locked_app_t *l, firc_loop_t **loop, const char *url0) {
+    if (firc_loop_create(loop) != FIRC_OK || !locked_app_up_with_loop(l, *loop)) { return false; }
+    if (firc_app_start_list_worker(l->app) != FIRC_OK) { return false; }
+    firc_group_t *g = activation_group(1, "a.example", NULL, NULL);
+    if (test_group_add_list_at(g, url0) == NULL || test_group_add_list_at(g, "http://127.0.0.1:1/b") == NULL) {
+        firc_group_free(g);
+        return false;
+    }
+    for (size_t i = 0; i < g->n_lists; i++) { g->lists[i]->has_body_hash = true; }
+    return firc_app_add_group(l->app, g) == FIRC_OK;
+}
+
+static firc_sub_sync_state_t list_state(locked_app_t *l, size_t at) {
+    return firc_ruleset_group(firc_app_find_group_by_id(l->app, (firc_id_t){{1, 1, 1, 1}}))->lists[at]->sync_state;
+}
+
+TEST request_sync_group_queues_every_list(void) {
+    locked_app_t l;
+    firc_loop_t *loop = NULL;
+    ASSERT(two_list_worker_up(&l, &loop, "http://127.0.0.1:1/a"));
+    firc_id_t gid = {{1, 1, 1, 1}};
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, list_state(&l, 1));
+    size_t queued = 0;
+    ASSERT_EQ(FIRC_OK, firc_app_request_sync_group(l.app, gid, &queued));
+    ASSERT_EQ_FMT((size_t)2, queued, "%zu");
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, list_state(&l, 0));
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, list_state(&l, 1));
+    ASSERT(firc_app_group_syncing(firc_ruleset_group(firc_app_find_group_by_id(l.app, gid))));
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, activation_group(2, "b.example", NULL, NULL)));
+    queued = 9;
+    ASSERT_EQ(FIRC_ERR_NOENT, firc_app_request_sync_group(l.app, (firc_id_t){{2, 2, 2, 2}}, &queued));
+    ASSERT_EQ_FMT((size_t)0, queued, "%zu");
+    firc_app_stop_list_worker(l.app);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
+    PASS();
+}
+
+TEST request_sync_group_tries_every_list_before_its_error(void) {
+    locked_app_t l;
+    firc_loop_t *loop = NULL;
+    ASSERT(two_list_worker_up(&l, &loop, ""));
+    size_t queued = 0;
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_app_request_sync_group(l.app, (firc_id_t){{1, 1, 1, 1}}, &queued));
+    ASSERT_EQ_FMT((size_t)1, queued, "%zu");
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, list_state(&l, 0));
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, list_state(&l, 1));
+    ASSERT(firc_app_group_syncing(firc_ruleset_group(firc_app_find_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}}))));
+    firc_app_stop_list_worker(l.app);
+    locked_app_down(&l);
+    firc_loop_destroy(loop);
     PASS();
 }
 
@@ -5907,12 +5965,12 @@ TEST a_dns_groups_list_subnets_stage_nothing(void) {
     fake_rtnl_set_link_flags(l.kernel, 0x1 | 0x10);
     firc_app_set_running(l.app, true);
     firc_group_t *g = dns_group(1, NULL, "9.9.9.9");
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "http://127.0.0.1:1/list");
-    g->list->has_body_hash = true;
-    firc_sub_rules_push(&g->list->rules, "10.9.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
-    firc_sub_rules_push(&g->list->rules, "2001:db8::/32", FIRC_RULE_SUBNET6, true, test_random_id());
-    firc_sub_rules_push(&g->list->rules, "example.com", FIRC_RULE_NAMESPACE, true, test_random_id());
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "http://127.0.0.1:1/list");
+    g->lists[0]->has_body_hash = true;
+    firc_sub_rules_push(&g->lists[0]->rules, "10.9.0.0/16", FIRC_RULE_SUBNET, true, test_random_id());
+    firc_sub_rules_push(&g->lists[0]->rules, "2001:db8::/32", FIRC_RULE_SUBNET6, true, test_random_id());
+    firc_sub_rules_push(&g->lists[0]->rules, "example.com", FIRC_RULE_NAMESPACE, true, test_random_id());
     firc_id_t gid = g->id;
     size_t rules = fake_rtnl_count(l.kernel, RTM_NEWRULE, 0);
     ASSERT_EQ(FIRC_OK, firc_app_add_group(l.app, g));
@@ -6121,13 +6179,13 @@ static bool edit_is_list(subnet_edit_t how) { return how == EDIT_LIST_REFRESH ||
 static firc_group_t *subnet_group(const char *const *subnets, size_t n, bool as_list) {
     firc_group_t *g = activation_group(1, "a.example", NULL, NULL);
     if (as_list) {
-        g->list = firc_group_list_new();
-        firc_strset(&g->list->url, "https://x.example/l");
-        g->list->has_body_hash = true;
+        test_group_set_list(g);
+        firc_strset(&g->lists[0]->url, "https://x.example/l");
+        g->lists[0]->has_body_hash = true;
     }
     for (size_t i = 0; i < n; i++) {
         if (as_list) {
-            firc_sub_rules_push(&g->list->rules, subnets[i], FIRC_RULE_SUBNET, true, test_random_id());
+            firc_sub_rules_push(&g->lists[0]->rules, subnets[i], FIRC_RULE_SUBNET, true, test_random_id());
         } else {
             firc_group_add_rule(g, edit_rule(FIRC_RULE_SUBNET, subnets[i]));
         }
@@ -6154,11 +6212,12 @@ static bool subnet_flows_up(locked_app_t *l, bool as_list) {
     return true;
 }
 
-static firc_err_t refresh_list(locked_app_t *l, const char *const *want, size_t n) {
+static firc_err_t refresh_list_at(locked_app_t *l, size_t at, const char *const *want, size_t n) {
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l->app, (firc_id_t){{1, 1, 1, 1}}));
-    firc_sub_event_t *ev = sync_event(1, FIRC_SUB_EV_RESULT);
+    firc_sub_event_t *ev = sync_event(l->app, 1, FIRC_SUB_EV_RESULT);
     if (ev == NULL) { return FIRC_ERR_NOMEM; }
-    ev->seq = g->list->sync_seq;
+    ev->list_id = g->lists[at]->id;
+    ev->seq = g->lists[at]->sync_seq;
     ev->result = FIRC_SUB_RESULT_PARSED;
     firc_sub_rules_init(&ev->rules);
     for (size_t i = 0; i < n; i++) {
@@ -6171,6 +6230,10 @@ static firc_err_t refresh_list(locked_app_t *l, const char *const *want, size_t 
     return err;
 }
 
+static firc_err_t refresh_list(locked_app_t *l, const char *const *want, size_t n) {
+    return refresh_list_at(l, 0, want, n);
+}
+
 static bool among(const char *text, const char *const *want, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (strcmp(text, want[i]) == 0) { return true; }
@@ -6180,7 +6243,7 @@ static bool among(const char *text, const char *const *want, size_t n) {
 
 static firc_err_t disable_list_rules_but(locked_app_t *l, const char *const *want, size_t n) {
     firc_id_t gid = {{1, 1, 1, 1}};
-    const firc_sub_rules_t *rules = &firc_ruleset_group(firc_app_find_group_by_id(l->app, gid))->list->rules;
+    const firc_sub_rules_t *rules = &(firc_ruleset_group(firc_app_find_group_by_id(l->app, gid)))->lists[0]->rules;
     firc_list_rule_edit_t edits[4];
     size_t k = 0;
     for (size_t i = 0; i < rules->n && k < 4; i++) {
@@ -6188,7 +6251,7 @@ static firc_err_t disable_list_rules_but(locked_app_t *l, const char *const *wan
         edits[k++] = (firc_list_rule_edit_t){.rule = firc_sub_rules_id(rules, i), .has_enable = true, .enable = false};
     }
     char msg[128] = "";
-    return firc_app_patch_list_rules(l->app, gid, edits, k, msg, sizeof(msg));
+    return firc_app_patch_list_rules(l->app, gid, list0(l->app, gid), edits, k, msg, sizeof(msg));
 }
 
 static firc_err_t set_subnets_by(locked_app_t *l, subnet_edit_t how, const char *const *want, size_t n) {
@@ -6327,8 +6390,8 @@ TEST a_list_not_loaded_yet_keeps_its_group_s_flows_outside_the_pool(void) {
     locked_app_t l;
     ASSERT(subnet_flows_up(&l, false));
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}}));
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "https://x.example/l");
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "https://x.example/l");
     uint64_t started = firc_app_nf_passes_for_test(l.app);
     static const char *const keep[] = {"10.2.0.0/16"};
     ASSERT_EQ(FIRC_OK, set_subnets_by(&l, EDIT_PUT_RULES, keep, 1));
@@ -6343,8 +6406,8 @@ static enum greatest_test_res first_load_sweeps(const char *const *loaded, size_
     locked_app_t l;
     ASSERT(subnet_flows_up(&l, false));
     firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l.app, (firc_id_t){{1, 1, 1, 1}}));
-    g->list = firc_group_list_new();
-    firc_strset(&g->list->url, "https://x.example/l");
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "https://x.example/l");
     const uint8_t listed[4] = {10, 5, 0, 5};
     plant_flow(&l, 1, listed, listed);
     uint64_t started = firc_app_nf_passes_for_test(l.app);
@@ -6377,6 +6440,45 @@ TEST a_list_s_first_load_sweeps_what_nothing_covers_after_the_pass(void) {
 /* Catches: the same put-off sweep never paid when the list loads empty, matching the rules it held. */
 TEST an_empty_list_s_first_load_sweeps_too(void) {
     return first_load_sweeps(NULL, 0);
+}
+
+static bool loaded_and_unloaded_lists_up(locked_app_t *l) {
+    if (!subnet_flows_up(l, false)) { return false; }
+    firc_group_t *g = firc_ruleset_group_mut(firc_app_find_group_by_id(l->app, (firc_id_t){{1, 1, 1, 1}}));
+    firc_group_list_t *loaded = test_group_add_list_at(g, "https://x.example/l");
+    firc_group_list_t *unloaded = test_group_add_list_at(g, "https://y.example/l");
+    if (loaded == NULL || unloaded == NULL) { return false; }
+    loaded->has_body_hash = true;
+    if (firc_sub_rules_push(&loaded->rules, "10.5.0.0/16", FIRC_RULE_SUBNET, true, test_random_id()) != FIRC_OK) {
+        return false;
+    }
+    uint64_t started = firc_app_nf_passes_for_test(l->app);
+    static const char *const keep[] = {"10.2.0.0/16"};
+    if (set_subnets_by(l, EDIT_PUT_RULES, keep, 1) != FIRC_OK) { return false; }
+    return wait_written_after(l, started);
+}
+
+TEST a_second_list_not_loaded_keeps_its_group_s_flows(void) {
+    locked_app_t l;
+    ASSERT(loaded_and_unloaded_lists_up(&l));
+    ASSERT_FALSEm("list 1 may route 10.1.0.0/16", fake_ct_deleted(l.ctk, k_gone_dst, 4));
+    ASSERT_FALSEm("or 10.3.0.0/16", fake_ct_deleted(l.ctk, k_loose_dst, 4));
+    locked_app_down(&l);
+    PASS();
+}
+
+TEST the_second_list_first_load_sweeps(void) {
+    locked_app_t l;
+    ASSERT(loaded_and_unloaded_lists_up(&l));
+    ASSERT_FALSEm("fixture: kept while list 1 is not loaded", fake_ct_deleted(l.ctk, k_gone_dst, 4));
+    uint64_t started = firc_app_nf_passes_for_test(l.app);
+    static const char *const loaded[] = {"10.6.0.0/16"};
+    ASSERT_EQ(FIRC_OK, refresh_list_at(&l, 1, loaded, 1));
+    ASSERT(wait_written_after(&l, started));
+    ASSERTm("the prefix nothing covers now went", fake_ct_deleted(l.ctk, k_gone_dst, 4));
+    ASSERT_FALSEm("the hand rule's prefix stays", fake_ct_deleted(l.ctk, k_kept_dst, 4));
+    locked_app_down(&l);
+    PASS();
 }
 
 /* Catches: a removed subnet6 rule's flows left to the barrier, or a kept v6 prefix's flows reset. */
@@ -11584,6 +11686,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_new_group_rolled_out_leaves_no_retry_timer);
     RUN_TEST(a_syncs_progress_does_not_interrupt_the_pass);
     RUN_TEST(a_lists_bookkeeping_does_not_interrupt_the_pass);
+    RUN_TEST(request_sync_group_queues_every_list);
+    RUN_TEST(request_sync_group_tries_every_list_before_its_error);
     RUN_TEST(in_view_routed_and_the_chain_name_say_what_the_kernel_has);
     RUN_TEST(a_delete_outlives_a_failed_pass);
     RUN_TEST(stopping_takes_the_chains_a_refused_pass_left);
@@ -11625,6 +11729,8 @@ int main(int argc, char **argv) {
     RUN_TEST(a_list_not_loaded_yet_keeps_its_group_s_flows_outside_the_pool);
     RUN_TEST(a_list_s_first_load_sweeps_what_nothing_covers_after_the_pass);
     RUN_TEST(an_empty_list_s_first_load_sweeps_too);
+    RUN_TEST(a_second_list_not_loaded_keeps_its_group_s_flows);
+    RUN_TEST(the_second_list_first_load_sweeps);
     RUN_TEST(a_rules_put_without_a_v6_prefix_flushes_its_flows_after_the_pass);
     RUN_TEST(a_selector_group_s_chunk_jumps_to_its_devices_chain);
     RUN_TEST(a_subnet_rule_of_a_selector_group_jumps_to_its_devices_chain);

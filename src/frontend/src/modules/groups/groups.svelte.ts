@@ -4,7 +4,7 @@ import { followGroupsLoad, setKnownGroups } from "../../data/known-groups.svelte
 import { locale, t } from "../../data/locale.svelte";
 import { ChangeTracker } from "../../utils/change-tracker.svelte";
 import { ask } from "../../utils/confirm.svelte";
-import { ListsController } from "./lists.svelte";
+import { listKey, ListsController } from "./lists.svelte";
 
 import { DNS, isSink } from "../../data/iface-choices";
 import {
@@ -13,6 +13,7 @@ import {
   syncIdle,
   type DeviceSelector,
   type Group,
+  type GroupList,
   type GroupResolve,
   type Rule,
 } from "../../types";
@@ -131,10 +132,25 @@ export type GroupDialogPayload = {
   name: string;
   interface: string | string[];
   devices: DeviceSelector;
-  list?: { url: string; interval: number } | null;
+  lists?: { id?: string; url: string; interval: number }[];
   resolve: GroupResolve;
   cloudflare: boolean;
 };
+
+export const LISTS_MAX = 16;
+
+function newList(taken: GroupList[], item: { url: string; interval: number }): GroupList {
+  let id = randomId();
+  while (taken.some((list) => list.id === id)) id = randomId();
+  return {
+    id,
+    url: item.url,
+    interval: item.interval,
+    lastUpdate: 0,
+    rulesTotal: 0,
+    sync: syncIdle(),
+  };
+}
 
 export type VisibleGroup = {
   group_index: number;
@@ -203,6 +219,8 @@ type GroupsStoreOptions = {
 const OUTSIDE_WRITE =
   /^\/groups(\?|$|\/[0-9a-f]{8}(\?|$|\/rules))|^\/system\/autolist\/candidates\/[^/]+\/add/;
 
+const LIST_UNTRACKED = ["rulesTotal", "lastUpdate", "sync", "url", "interval"];
+
 const DAEMON_ONLY = ["live", "liveReason", "active", "interfaces"];
 
 function stripLive(group: any): Group {
@@ -256,10 +274,14 @@ function mergeById<T extends { id: string }>(
 }
 
 function bodyShape(group: any): Group {
-  const { list, resolver: _resolver, ...rest } = stripLive(group) as any;
+  const { lists, resolver: _resolver, ...rest } = stripLive(group) as any;
   return {
     ...withoutStale(rest),
-    list: list ? { url: list.url, interval: list.interval } : null,
+    lists: (lists ?? []).map((list: any) => ({
+      id: list.id,
+      url: list.url,
+      interval: list.interval,
+    })),
   } as Group;
 }
 
@@ -276,23 +298,24 @@ export function mergeOutside(current: Group[], base: Group[], daemon: Group[]): 
 export class GroupsStore {
   onRenderComplete?: () => void;
 
-  tracker = $state(new ChangeTracker<Group[]>([]));
+  tracker = $state(new ChangeTracker<Group[]>([], LIST_UNTRACKED));
   data = $derived.by(() => this.tracker.data);
   dataRevision = $state(0);
 
   lists = new ListsController((id) => this.data.find((group) => group.id === id), {
-    listGroups: () => this.data.filter((group) => Boolean(group.list)),
+    listGroups: () => this.data.filter((group) => group.lists?.length),
     isOpen: (id) => Boolean(this.open_state[id]),
     query: () => this.searchValue.trim().toLowerCase(),
-    isSaved: (id) => this.listSaved(id),
+    isSaved: (groupId, listId) => this.listSaved(groupId, listId),
     pageLoaded: () => this.refreshDuplicateRuleIds(),
-    acknowledgeListSaved: (id) => {
-      const group = this.data.find((g) => g.id === id);
-      if (!group?.list) return;
-      const previous = this.#listMetaBaseline.get(id);
-      this.#listMetaBaseline.set(id, {
-        url: group.list.url,
-        interval: previous?.interval ?? group.list.interval ?? 86400,
+    acknowledgeListSaved: (groupId, listId) => {
+      const list = this.data.find((g) => g.id === groupId)?.lists?.find((l) => l.id === listId);
+      if (!list) return;
+      const key = listKey(groupId, listId);
+      const previous = this.#listMetaBaseline.get(key);
+      this.#listMetaBaseline.set(key, {
+        url: list.url,
+        interval: previous?.interval ?? list.interval ?? 86400,
       });
     },
   });
@@ -302,29 +325,42 @@ export class GroupsStore {
   resetListMetaBaseline(groups: Group[]) {
     this.#listMetaBaseline.clear();
     for (const group of groups) {
-      if (!group.list) continue;
-      this.#listMetaBaseline.set(group.id, {
-        url: group.list.url,
-        interval: group.list.interval ?? 86400,
-      });
+      for (const list of group.lists ?? []) {
+        this.#listMetaBaseline.set(listKey(group.id, list.id), {
+          url: list.url,
+          interval: list.interval ?? 86400,
+        });
+      }
     }
   }
 
-  listMetaDirty(groupId: string): boolean {
-    const group = this.data.find((g) => g.id === groupId);
-    if (!group?.list) return false;
-    const baseline = this.#listMetaBaseline.get(groupId);
-    if (!baseline) return true;
-    return group.list.url !== baseline.url || (group.list.interval ?? 86400) !== baseline.interval;
+  #forgetListMeta(groupId: string, listId?: string) {
+    for (const key of [...this.#listMetaBaseline.keys()]) {
+      if (listId === undefined ? key.startsWith(`${groupId}/`) : key === listKey(groupId, listId)) {
+        this.#listMetaBaseline.delete(key);
+      }
+    }
   }
 
-  listSaved(groupId: string): boolean {
-    return this.#listMetaBaseline.has(groupId);
+  listMetaDirty(groupId: string, listId?: string): boolean {
+    const group = this.data.find((g) => g.id === groupId);
+    if (!group) return false;
+    for (const list of group.lists ?? []) {
+      if (listId !== undefined && list.id !== listId) continue;
+      const baseline = this.#listMetaBaseline.get(listKey(groupId, list.id));
+      if (!baseline) return true;
+      if (list.url !== baseline.url || (list.interval ?? 86400) !== baseline.interval) return true;
+    }
+    return false;
+  }
+
+  listSaved(groupId: string, listId: string): boolean {
+    return this.#listMetaBaseline.has(listKey(groupId, listId));
   }
 
   get hasListMetaEdits(): boolean {
     for (const group of this.data) {
-      if (group.list && this.listMetaDirty(group.id)) return true;
+      if (this.listMetaDirty(group.id)) return true;
     }
     return false;
   }
@@ -342,37 +378,39 @@ export class GroupsStore {
 
   listUrlErrors = $derived.by(() => {
     const errors = new Map<string, string>();
-    const idsByUrl = new Map<string, string[]>();
+    const keysByUrl = new Map<string, string[]>();
 
     for (const group of this.data) {
-      if (!group.list) continue;
-      const normalized = normalizeListUrl(group.list.url ?? "");
+      for (const list of group.lists ?? []) {
+        const key = listKey(group.id, list.id);
+        const normalized = normalizeListUrl(list.url ?? "");
 
-      if (!isValidListUrl(normalized)) {
-        errors.set(group.id, "Invalid URL");
-        continue;
+        if (!isValidListUrl(normalized)) {
+          errors.set(key, "Invalid URL");
+          continue;
+        }
+
+        const keys = keysByUrl.get(normalized) ?? [];
+        keys.push(key);
+        keysByUrl.set(normalized, keys);
       }
-
-      const ids = idsByUrl.get(normalized) ?? [];
-      ids.push(group.id);
-      idsByUrl.set(normalized, ids);
     }
 
-    for (const ids of idsByUrl.values()) {
-      if (ids.length <= 1) continue;
-      for (const id of ids) errors.set(id, "List already exists");
+    for (const keys of keysByUrl.values()) {
+      if (keys.length <= 1) continue;
+      for (const key of keys) errors.set(key, "List already exists");
     }
 
     return errors;
   });
   validListUrls = $derived(this.listUrlErrors.size === 0);
 
-  hasListUrlError(groupId: string): boolean {
-    return this.listUrlErrors.has(groupId);
+  hasListUrlError(groupId: string, listId: string): boolean {
+    return this.listUrlErrors.has(listKey(groupId, listId));
   }
 
-  listUrlErrorMessage(groupId: string): string {
-    const reason = this.listUrlErrors.get(groupId);
+  listUrlErrorMessage(groupId: string, listId: string): string {
+    const reason = this.listUrlErrors.get(listKey(groupId, listId));
     if (reason === "List already exists") return t("List already exists");
     if (reason === "Invalid URL") return t("Invalid URL");
     return "";
@@ -389,9 +427,12 @@ export class GroupsStore {
   }
 
   setOpen = (groupId: string, open: boolean) => {
-    const state = this.lists.pageState[groupId];
-    if (open && state?.failed) {
-      this.lists.pageState[groupId] = { ...state, failed: false };
+    if (open) {
+      for (const list of this.data.find((g) => g.id === groupId)?.lists ?? []) {
+        const key = listKey(groupId, list.id);
+        const state = this.lists.pageState[key];
+        if (state?.failed) this.lists.pageState[key] = { ...state, failed: false };
+      }
     }
     this.open_state[groupId] = open;
   };
@@ -575,7 +616,7 @@ export class GroupsStore {
     return (
       this.tracker.isDirtyWithin(group) ||
       this.listMetaDirty(group.id) ||
-      this.lists.ruleEdits(group.id).length > 0
+      this.lists.groupRuleEdits(group.id).length > 0
     );
   }
 
@@ -811,15 +852,15 @@ export class GroupsStore {
         .catch((error) => console.error("Failed to read netfilter state:", error));
       const fetched = records.map(stripLive);
       if (ifClean && (this.#hasEdits() || saves !== this.#saves)) return;
-      this.tracker = new ChangeTracker(fetched);
+      this.tracker = new ChangeTracker(fetched, LIST_UNTRACKED);
       this.dataRevision = 0;
       this.resetListMetaBaseline(fetched);
 
       for (const group of fetched) {
-        const state = group.list?.sync?.state;
-        if (state === "queued" || state === "fetching") {
-          void this.lists.followSync(group.id);
-        }
+        const running = group.lists?.some(
+          (list) => list.sync?.state === "queued" || list.sync?.state === "fetching",
+        );
+        if (running) void this.lists.followSync(group.id);
       }
     } catch (error) {
       this.fetchError = true;
@@ -1224,15 +1265,23 @@ export class GroupsStore {
     current = bodyGroups.map((g) => {
       const was = full.get(g.id);
       if (!was) return g;
-      const out: Group = g.list && was.list ? { ...g, list: { ...was.list, ...g.list } } : g;
+      const out: Group = {
+        ...g,
+        lists: (g.lists ?? []).map((list) => {
+          const full = was.lists?.find((item) => item.id === list.id);
+          return full ? { ...full, ...list } : list;
+        }),
+      };
       return was.resolver ? { ...out, resolver: was.resolver } : out;
     });
-    const edits = current
-      .map((group) => ({ id: group.id, rules: this.lists.ruleEdits(group.id) }))
-      .filter((e) => e.rules.length > 0);
+    const edits = current.flatMap((group) =>
+      this.lists
+        .groupRuleEdits(group.id)
+        .map((edit) => ({ id: group.id, listId: edit.listId, rules: edit.rules })),
+    );
 
     const savedUrls = new Map(
-      Array.from(this.#listMetaBaseline, ([id, baseline]) => [id, baseline.url]),
+      Array.from(this.#listMetaBaseline, ([key, baseline]) => [key, baseline.url]),
     );
 
     const save = (last: boolean) => (last ? "?save=true" : "");
@@ -1247,21 +1296,27 @@ export class GroupsStore {
 
       const replaced = new Set<string>();
       for (const record of answer?.groups ?? []) {
-        const state = record?.list?.sync?.state;
-        if (state !== "queued" && state !== "fetching") continue;
-        const repointed = savedUrls.get(record.id) !== record.list.url;
-        if (this.lists.adoptQueuedSync(record.id, record, repointed)) replaced.add(record.id);
+        for (const item of record?.lists ?? []) {
+          const state = item?.sync?.state;
+          if (state !== "queued" && state !== "fetching") continue;
+          const key = listKey(record.id, item.id);
+          const repointed = savedUrls.get(key) !== item.url;
+          if (this.lists.adoptQueuedSync(record.id, item, repointed)) replaced.add(key);
+        }
       }
 
-      const patches = edits.filter((edit) => !replaced.has(edit.id));
+      const patches = edits.filter((edit) => !replaced.has(listKey(edit.id, edit.listId)));
       if (edits.length > 0 && patches.length === 0) {
         await fetcher.post("/system/config/save", {});
       }
       for (let i = 0; i < patches.length; i++) {
         const edit = patches[i];
-        await fetcher.patch(`/groups/${edit.id}/list/rules${save(i === patches.length - 1)}`, {
-          rules: edit.rules,
-        });
+        await fetcher.patch(
+          `/groups/${edit.id}/lists/${edit.listId}/rules${save(i === patches.length - 1)}`,
+          {
+            rules: edit.rules,
+          },
+        );
         landed++;
       }
 
@@ -1272,19 +1327,23 @@ export class GroupsStore {
         const withResolver = answerById.get(group.id)?.resolver
           ? { ...group, resolver: answerById.get(group.id).resolver }
           : group;
-        if (!withResolver.list) return withResolver;
+        if (!withResolver.lists?.length) return withResolver;
         /* List sync fields from live data, not `current`: a sync can land mid-Save. */
         const live = this.data.find((g) => g.id === group.id);
         const fresh = live ? ($state.snapshot(live) as Group) : undefined;
         return {
           ...withResolver,
-          list: {
-            url: withResolver.list.url,
-            interval: withResolver.list.interval,
-            rulesTotal: fresh?.list?.rulesTotal ?? withResolver.list.rulesTotal,
-            lastUpdate: fresh?.list?.lastUpdate ?? withResolver.list.lastUpdate,
-            sync: fresh?.list?.sync ?? withResolver.list.sync,
-          },
+          lists: withResolver.lists.map((list) => {
+            const now = fresh?.lists?.find((item) => item.id === list.id);
+            return {
+              id: list.id,
+              url: list.url,
+              interval: list.interval,
+              rulesTotal: now?.rulesTotal ?? list.rulesTotal,
+              lastUpdate: now?.lastUpdate ?? list.lastUpdate,
+              sync: now?.sync ?? list.sync,
+            };
+          }),
         };
       });
       this.tracker.reset(saved);
@@ -1342,7 +1401,9 @@ export class GroupsStore {
       devices: group.devices,
       rules: [
         ...group.rules,
-        ...((group.list ? (this.lists.pageState[group.id]?.rules ?? []) : []) as Rule[]),
+        ...(group.lists ?? []).flatMap(
+          (list) => (this.lists.pageState[listKey(group.id, list.id)]?.rules ?? []) as Rule[],
+        ),
       ],
     }));
     const ruleOverlaps = computeOverlaps(groups);
@@ -1744,19 +1805,24 @@ export class GroupsStore {
     el?.querySelector<HTMLInputElement>("input.group-name")?.focus();
   }
 
-  setListUrl(groupId: string, url: string) {
-    const group = this.data.find((g) => g.id === groupId);
-    /* Mutated in place: replacing `list` dirties ChangeTracker by identity. */
-    if (!group?.list || group.list.url === url) return;
-    group.list.url = url;
+  setListUrl(groupId: string, listId: string, url: string) {
+    const list = this.data.find((g) => g.id === groupId)?.lists?.find((l) => l.id === listId);
+    if (!list || list.url === url) return;
+    list.url = url;
     this.markDataRevision();
   }
 
-  setListInterval(groupId: string, interval: number) {
-    const group = this.data.find((g) => g.id === groupId);
-    if (!group?.list || group.list.interval === interval) return;
-    group.list.interval = interval;
+  setListInterval(groupId: string, listId: string, interval: number) {
+    const list = this.data.find((g) => g.id === groupId)?.lists?.find((l) => l.id === listId);
+    if (!list || list.interval === interval) return;
+    list.interval = interval;
     this.markDataRevision();
+  }
+
+  setGroupInterval(groupId: string, interval: number) {
+    for (const list of this.data.find((g) => g.id === groupId)?.lists ?? []) {
+      this.setListInterval(groupId, list.id, interval);
+    }
   }
 
   async createGroupFromDialog(payload: GroupDialogPayload) {
@@ -1770,16 +1836,9 @@ export class GroupsStore {
       resolve: { ...payload.resolve },
       cloudflare: payload.cloudflare,
       rules: [],
-      list: payload.list
-        ? {
-            url: payload.list.url,
-            interval: payload.list.interval,
-            lastUpdate: 0,
-            rulesTotal: 0,
-            sync: syncIdle(),
-          }
-        : undefined,
+      lists: [],
     };
+    for (const item of payload.lists ?? []) group.lists.push(newList(group.lists, item));
     this.data.push(group);
     this.open_state[group.id] = true;
     this.markDataRevision();
@@ -1804,6 +1863,7 @@ export class GroupsStore {
       resolve: DEFAULT_RESOLVE(),
       cloudflare: false,
       rules: [],
+      lists: [],
     };
     this.data.unshift(group);
     this.open_state[group.id] = true;
@@ -1852,31 +1912,33 @@ export class GroupsStore {
       changed = true;
     }
 
-    if (payload.list === null) {
-      if (group.list) {
-        this.lists.forget(group.id);
-        this.#listMetaBaseline.delete(group.id);
-        group.list = undefined;
-        changed = true;
+    if (payload.lists) {
+      const was = group.lists ?? [];
+      const wanted = new Set(payload.lists.map((item) => item.id));
+      for (const list of was) {
+        if (wanted.has(list.id)) continue;
+        this.lists.forgetList(group.id, list.id);
+        this.#forgetListMeta(group.id, list.id);
       }
-    } else if (payload.list) {
-      if (group.list) {
-        if (group.list.url !== payload.list.url) {
-          group.list.url = payload.list.url;
+      const next: GroupList[] = [];
+      for (const item of payload.lists) {
+        const live = item.id === undefined ? undefined : was.find((l) => l.id === item.id);
+        if (!live) {
+          next.push(newList([...was, ...next], item));
+          continue;
+        }
+        if (live.url !== item.url) {
+          live.url = item.url;
           changed = true;
         }
-        if (group.list.interval !== payload.list.interval) {
-          group.list.interval = payload.list.interval;
+        if (live.interval !== item.interval) {
+          live.interval = item.interval;
           changed = true;
         }
-      } else {
-        group.list = {
-          url: payload.list.url,
-          interval: payload.list.interval,
-          lastUpdate: 0,
-          rulesTotal: 0,
-          sync: syncIdle(),
-        };
+        next.push(live);
+      }
+      if (next.length !== was.length || next.some((list, i) => list !== was[i])) {
+        group.lists = next;
         changed = true;
       }
     }
@@ -1914,7 +1976,7 @@ export class GroupsStore {
       this.removeForcedGroup(removed.id);
       delete this.open_state[removed.id];
       this.lists.forget(removed.id);
-      this.#listMetaBaseline.delete(removed.id);
+      this.#forgetListMeta(removed.id);
       if (this.selectedIds.includes(removed.id)) {
         this.selectedIds = this.selectedIds.filter((id) => id !== removed.id);
       }
@@ -1972,7 +2034,7 @@ export class GroupsStore {
     this.renderGroupsLimit = 1;
     for (const removed of this.data) {
       this.lists.forget(removed.id);
-      this.#listMetaBaseline.delete(removed.id);
+      this.#forgetListMeta(removed.id);
     }
     this.data.splice(0, this.data.length);
     this.open_state = {};

@@ -57,9 +57,11 @@ bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, bool field_
     *out = NULL;
     *out_n = 0;
     if (g == NULL) { return true; }
-    bool unloaded = field_kept && g->list != NULL && g->list->rules.n == 0;
-    if (g->n_rules == 0 && g->list == NULL) { return true; }
-    const firc_sub_rules_t *lr = g->list != NULL ? &g->list->rules : NULL;
+    bool unloaded = false;
+    for (size_t k = 0; field_kept && k < g->n_lists; k++) {
+        if (g->lists[k]->rules.n == 0) { unloaded = true; }
+    }
+    if (g->n_rules == 0 && g->n_lists == 0) { return true; }
     /* Counted first: a long list holds only a handful of subnet rules. */
     size_t want = unloaded ? 2 : 0;
     for (size_t i = 0; i < g->n_rules; i++) {
@@ -69,11 +71,14 @@ bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, bool field_
             want++;
         }
     }
-    for (size_t i = 0; lr != NULL && i < lr->n; i++) {
-        if (!firc_sub_rules_enable(lr, i)) { continue; }
-        const char *type = firc_sub_rules_type(lr, i);
-        if (strcmp(type, FIRC_RULE_SUBNET) == 0 || strcmp(type, FIRC_RULE_SUBNET6) == 0) {
-            want++;
+    for (size_t k = 0; k < g->n_lists; k++) {
+        const firc_sub_rules_t *lr = &g->lists[k]->rules;
+        for (size_t i = 0; i < lr->n; i++) {
+            if (!firc_sub_rules_enable(lr, i)) { continue; }
+            const char *type = firc_sub_rules_type(lr, i);
+            if (strcmp(type, FIRC_RULE_SUBNET) == 0 || strcmp(type, FIRC_RULE_SUBNET6) == 0) {
+                want++;
+            }
         }
     }
     if (want == 0) { return true; }
@@ -108,28 +113,31 @@ bool firc_stale_group_subnets(const firc_group_t *g, uint32_t field, bool field_
         v[n].field = field;
         n++;
     }
-    for (size_t i = 0; lr != NULL && i < lr->n && n < want; i++) {
-        if (!firc_sub_rules_enable(lr, i)) { continue; }
-        const char *type = firc_sub_rules_type(lr, i);
-        const char *text = firc_sub_rules_text(lr, i);
-        if (strcmp(type, FIRC_RULE_SUBNET) == 0) {
-            firc_ipv4_subnet_t s4;
-            if (!firc_rule_parse_subnet4(text, &s4)) { continue; }
-            v[n].family = AF_INET;
-            memcpy(v[n].base, s4.addr, 4);
-            v[n].prefix = s4.cidr;
-        } else if (strcmp(type, FIRC_RULE_SUBNET6) == 0) {
-            firc_ipv6_subnet_t s6;
-            if (!firc_rule_parse_subnet6(text, &s6)) { continue; }
-            v[n].family = AF_INET6;
-            memcpy(v[n].base, s6.addr, 16);
-            v[n].prefix = s6.cidr;
-        } else {
-            continue;
+    for (size_t k = 0; k < g->n_lists; k++) {
+        const firc_sub_rules_t *lr = &g->lists[k]->rules;
+        for (size_t i = 0; i < lr->n && n < want; i++) {
+            if (!firc_sub_rules_enable(lr, i)) { continue; }
+            const char *type = firc_sub_rules_type(lr, i);
+            const char *text = firc_sub_rules_text(lr, i);
+            if (strcmp(type, FIRC_RULE_SUBNET) == 0) {
+                firc_ipv4_subnet_t s4;
+                if (!firc_rule_parse_subnet4(text, &s4)) { continue; }
+                v[n].family = AF_INET;
+                memcpy(v[n].base, s4.addr, 4);
+                v[n].prefix = s4.cidr;
+            } else if (strcmp(type, FIRC_RULE_SUBNET6) == 0) {
+                firc_ipv6_subnet_t s6;
+                if (!firc_rule_parse_subnet6(text, &s6)) { continue; }
+                v[n].family = AF_INET6;
+                memcpy(v[n].base, s6.addr, 16);
+                v[n].prefix = s6.cidr;
+            } else {
+                continue;
+            }
+            v[n].is_subnet = true;
+            v[n].field = field;
+            n++;
         }
-        v[n].is_subnet = true;
-        v[n].field = field;
-        n++;
     }
     if (n == 0) {
         free(v);

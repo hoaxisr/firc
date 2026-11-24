@@ -97,7 +97,8 @@ def wait_settled(conn, group_id, tries=400):
         for rec in obj["groups"]:
             if rec.get("id") == group_id:
                 found = True
-                last = ((rec.get("list") or {}).get("sync") or {}).get("state")
+                states = [((l or {}).get("sync") or {}).get("state") for l in rec.get("lists") or []]
+                last = next((st for st in states if st in ("queued", "fetching")), states[0] if states else None)
                 if last not in ("queued", "fetching"):
                     return last
         if not found:
@@ -105,7 +106,7 @@ def wait_settled(conn, group_id, tries=400):
             return None
         time.sleep(0.05)
     raise RuntimeError(
-        "group %s did not settle in %.0f s: list.sync.state is %r"
+        "group %s did not settle in %.0f s: lists sync state is %r"
         % (group_id, tries * 0.05, last)
     )
 
@@ -425,11 +426,11 @@ def run_api_sequence(conn, out):
     t.step("GET", "/api/v1/groups")
     list_body = json.dumps(
         {"id": "40404040", "name": "s1", "interface": "eth0", "enable": False,
-         "list": {"url": "https://example.com/list.txt"}}
+         "lists": [{"id": "41414141", "url": "https://example.com/list.txt"}]}
     )
     t.step("POST", "/api/v1/groups", list_body)
     t.step("POST", "/api/v1/groups", list_body)  # duplicate id -> 409
-    t.step("POST", "/api/v1/groups", json.dumps({"name": "no-url", "list": {}}))  # no url -> 400
+    t.step("POST", "/api/v1/groups", json.dumps({"name": "no-url", "lists": [{}]}))  # no url -> 400
     t.step("GET", "/api/v1/groups")
 
     def bulk_rule_id():
@@ -452,7 +453,7 @@ def run_api_sequence(conn, out):
                 },
                 {"id": "30303030", "name": "bulk-2", "interface": "eth1", "enable": False},
                 {"id": "40404040", "name": "s1-renamed", "enable": False,
-                 "list": {"url": "https://example.com/list.txt"}},
+                 "lists": [{"id": "41414141", "url": "https://example.com/list.txt"}]},
             ]
         }
     )
@@ -475,17 +476,21 @@ def run_api_sequence(conn, out):
             return []
         return [(r["id"], "<SUBRULE-%d>" % i) for i, r in enumerate(resp.get("rules") or [])]
 
-    t.step("POST", "/api/v1/groups/deadbeef/list/sync")  # unknown id -> 404
+    t.step("POST", "/api/v1/groups/deadbeef/lists/41414141/sync")  # unknown group -> 404
+    t.step("POST", "/api/v1/groups/40404040/lists/deadbeef/sync")  # unknown list -> 404
     # 202: accepted, not finished; wait for it untraced.
-    t.step("POST", "/api/v1/groups/40404040/list/sync", json.dumps({"url": STUB_SUB_URL}),
+    t.step("POST", "/api/v1/groups/40404040/lists/41414141/sync", json.dumps({"url": STUB_SUB_URL}),
           learn=learn_sync_rule_ids)
     wait_settled(conn, "40404040")
     t.step("GET", "/api/v1/groups")
-    t.step("POST", "/api/v1/groups/40404040/list/sync")  # re-sync, same content -> unchanged
+    t.step("GET", "/api/v1/groups/40404040/lists/41414141/rules", learn=learn_sync_rule_ids)
+    t.step("GET", "/api/v1/groups/40404040/lists/deadbeef/rules")  # unknown list -> 404
+    t.step("POST", "/api/v1/groups/40404040/sync")  # every list, same content -> unchanged
     wait_settled(conn, "40404040")
+    t.step("POST", "/api/v1/groups/deadbeef/sync")  # unknown id -> 404
     # A list with nothing running gets one event and a close.
-    t.sse_step("/api/v1/groups/40404040/list/sync/events")
-    t.sse_step("/api/v1/groups/deadbeef/list/sync/events")  # unknown id -> 404
+    t.sse_step("/api/v1/groups/40404040/sync/events")
+    t.sse_step("/api/v1/groups/deadbeef/sync/events")  # unknown id -> 404
 
     t.step("DELETE", "/api/v1/groups/40404040")
     t.step("DELETE", "/api/v1/groups/40404040")  # already gone -> 404

@@ -50,6 +50,8 @@
 #include "firc/sub_worker.h"
 #include "firc/subparse.h"
 
+enum { LIST_URL_CLIP = 200 };
+
 #define FIRC_IFACE_NAME_CAP 16
 
 /* a flow flush a pass must carry before it runs */
@@ -186,7 +188,13 @@ struct firc_app {
     size_t cap_held;
 
     firc_sub_worker_t *sub_worker;
+    pthread_mutex_t sync_mu;
+    firc_sub_event_t *sync_head;
+    firc_sub_event_t *sync_tail;
+    bool sync_wake_posted;
     uint64_t sync_seq_counter; /* monotonic across the app, not per list */
+    uint64_t snapshots_built;
+    uint64_t groups_saves;
     firc_app_sync_listener_fn sync_listener;
     void *sync_listener_ud;
     bool sync_listener_muted; /* raised for the length of firc_app_sync_list_now, a test seam with no stream watching it */
@@ -474,7 +482,10 @@ static bool list_not_loaded(void *ud, const firc_group_t *g, const char *id, uin
     (void)ud;
     (void)id;
     (void)field;
-    return g->list != NULL && !g->list->has_body_hash;
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (!g->lists[i]->has_body_hash) { return true; }
+    }
+    return false;
 }
 
 static void sweep_stale_field(firc_app_t *app, uint32_t value, const char *who) {
@@ -1047,22 +1058,36 @@ static void release_dns_snapshot(firc_app_t *app) {
     if (app->pipeline != NULL) { firc_dns_pipeline_set_snapshot(app->pipeline, NULL); }
 }
 
+static firc_group_t *find_group(firc_app_t *app, firc_id_t id) {
+    for (size_t i = 0; i < app->cfg->n_groups; i++) {
+        if (firc_id_equal(app->cfg->groups[i]->id, id)) { return app->cfg->groups[i]; }
+    }
+    return NULL;
+}
+
+static bool list_syncing(const firc_group_list_t *l) {
+    return l->sync_state == FIRC_SUB_SYNC_QUEUED || l->sync_state == FIRC_SUB_SYNC_FETCHING;
+}
+
+static bool group_stream_ends(firc_app_t *app, firc_id_t owner) {
+    const firc_group_t *g = find_group(app, owner);
+    return g == NULL || !firc_app_group_syncing(g);
+}
+
 /* without this a DELETE mid-sync leaves the socket held forever: the worker's result is dropped for a gone owner */
 static void sync_end_for_removed_list(firc_app_t *app, firc_id_t owner, firc_group_list_t *l,
                                       const char *why) {
     if (app->sync_listener == NULL) { return; }
     l->sync_state = FIRC_SUB_SYNC_ERROR;
     snprintf(l->sync_error, sizeof(l->sync_error), "%s", why);
-    app->sync_listener(app->sync_listener_ud, owner, l, true);
+    app->sync_listener(app->sync_listener_ud, owner, l, group_stream_ends(app, owner));
 }
 
 /* an idle list has no stream open; handle_get_sync_events answers one with its terminal event directly */
 static void end_sync_in_flight(firc_app_t *app, firc_group_t *g, const char *why) {
-    if (g->list == NULL) { return; }
-    if (g->list->sync_state != FIRC_SUB_SYNC_QUEUED && g->list->sync_state != FIRC_SUB_SYNC_FETCHING) {
-        return;
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (list_syncing(g->lists[i])) { sync_end_for_removed_list(app, g->id, g->lists[i], why); }
     }
-    sync_end_for_removed_list(app, g->id, g->list, why);
 }
 
 /* a firmware-listed resolver inside firc's own pool routes nowhere; filtered here, the one place both are held */
@@ -1280,6 +1305,7 @@ static firc_err_t republish_dns_matching_only(firc_app_t *app) {
     firc_ruleset_snapshot_t *snap = app->running ? firc_ruleset_snapshot_build_where(app->cfg, group_in_view, app)
                                                  : firc_ruleset_snapshot_build(app->cfg);
     if (snap == NULL) { return FIRC_ERR_NOMEM; }
+    app->snapshots_built++;
     if (app->pipeline != NULL) {
         firc_dns_pipeline_set_snapshot(app->pipeline, snap);
     } else {
@@ -1322,6 +1348,7 @@ firc_app_t *firc_app_create(const firc_app_deps_t *deps) {
     app->doh = deps->doh;
     app->pool_snap = firc_fakeip_snapshot_take(deps->pool); /* so a pass before anything is issued still has a consistent view */
     pthread_mutex_init(&app->snap_mu, NULL);
+    pthread_mutex_init(&app->sync_mu, NULL);
     app->pipeline = deps->pipeline;
     app->config_path = deps->config_path;
     app->config_version = deps->config_version;
@@ -1438,6 +1465,7 @@ void firc_app_destroy(firc_app_t *app) {
     firc_ktcp_image_free(&app->pass_image);
     firc_ktcp_image_free(&app->last_image);
     pthread_mutex_destroy(&app->snap_mu);
+    pthread_mutex_destroy(&app->sync_mu);
     firc_app_config_clear(&app->saved);
     free(app);
 }
@@ -1532,7 +1560,7 @@ static firc_err_t firc_app_add_group_unlocked(firc_app_t *app, firc_group_t *gro
     }
     if (activate) { /* a batch republishes once and asks for missing lists once, in firc_app_replace_groups; a single add (POST /groups) does both here */
         republish_or_log(app);
-        if (group->list != NULL) { firc_app_request_sync_missing_unlocked(app); }
+        if (group->n_lists != 0) { firc_app_request_sync_missing_unlocked(app); }
     }
     return FIRC_OK;
 }
@@ -1778,8 +1806,8 @@ static void clear_groups_keeping(firc_app_t *app, firc_group_t *const *keep, siz
         const firc_group_t *g = firc_ruleset_group(app->rulesets[i]);
         (void)app_group_down(app, app->rulesets[i]);
         if (!id_among(g->id, keep, n_keep)) {
-            if (g->list != NULL) {
-                sync_end_for_removed_list(app, g->id, g->list, "group removed");
+            for (size_t j = 0; j < g->n_lists; j++) {
+                sync_end_for_removed_list(app, g->id, g->lists[j], "group removed");
             }
             if (gone != NULL) { gone[n_gone++] = g->id; }
         }
@@ -1831,15 +1859,20 @@ static bool same_url(const firc_group_list_t *a, const firc_group_list_t *b) {
     return strcmp(a->url != NULL ? a->url : "", b->url != NULL ? b->url : "") == 0;
 }
 
-/* carried into arrival's list if the url is the same; otherwise the stream watching live's list ends */
-static void hand_over_list(firc_app_t *app, firc_group_t *live, firc_group_t *arrival) {
-    if (live->list == NULL) { return; }
-    if (arrival->list == NULL) {
-        sync_end_for_removed_list(app, live->id, live->list, "list removed");
-    } else if (same_url(arrival->list, live->list)) {
-        carry_list(arrival->list, live->list);
-    } else {
-        end_sync_in_flight(app, live, "list url changed");
+static void hand_over_lists(firc_app_t *app, firc_group_t *live, firc_group_t *arrival) {
+    for (size_t j = 0; j < live->n_lists; j++) {
+        firc_group_list_t *l = live->lists[j];
+        firc_group_list_t *a = firc_group_find_list(arrival, l->id);
+        if (a == NULL) {
+            sync_end_for_removed_list(app, live->id, l, "list removed");
+        } else if (!same_url(a, l) && list_syncing(l)) {
+            sync_end_for_removed_list(app, live->id, l, "list url changed");
+        }
+    }
+    for (size_t j = 0; j < live->n_lists; j++) {
+        firc_group_list_t *l = live->lists[j];
+        firc_group_list_t *a = firc_group_find_list(arrival, l->id);
+        if (a != NULL && same_url(a, l)) { carry_list(a, l); }
     }
 }
 
@@ -1888,7 +1921,7 @@ firc_err_t firc_app_replace_groups(firc_app_t *app, firc_group_t **groups, size_
     for (size_t i = 0; i < n; i++) {
         for (size_t j = 0; j < app->cfg->n_groups; j++) {
             if (firc_id_equal(app->cfg->groups[j]->id, groups[i]->id)) {
-                hand_over_list(app, app->cfg->groups[j], groups[i]);
+                hand_over_lists(app, app->cfg->groups[j], groups[i]);
                 break;
             }
         }
@@ -1961,11 +1994,11 @@ static void group_move_into(firc_app_t *app, firc_group_t *into, firc_group_t *f
     into->resolve = from->resolve;
     into->block = from->block;
     into->cloudflare = from->cloudflare;
-    if (into->list != NULL) { /* hand_over_list: after it, into's list is either carried into from's (blank) or finished with */
-        hand_over_list(app, into, from);
-        firc_group_list_free(into->list);
-    }
-    into->list = from->list;
+    hand_over_lists(app, into, from);
+    for (size_t i = 0; i < into->n_lists; i++) { firc_group_list_free(into->lists[i]); }
+    free(into->lists);
+    into->lists = from->lists;
+    into->n_lists = from->n_lists;
     free(from); /* the shell: everything it held has moved */
 }
 
@@ -2038,11 +2071,11 @@ static bool has_typed_override(const firc_group_list_t *l, const char *text, con
     return false;
 }
 
-firc_err_t firc_app_patch_list_rules(firc_app_t *app, firc_id_t id, const firc_list_rule_edit_t *edits,
-                                     size_t n, char *msg, size_t msg_len) {
+firc_err_t firc_app_patch_list_rules(firc_app_t *app, firc_id_t id, firc_id_t list_id,
+                                     const firc_list_rule_edit_t *edits, size_t n, char *msg, size_t msg_len) {
     app_nf_enter(app);
     firc_ruleset_t *rs = firc_app_find_group_by_id(app, id);
-    firc_group_list_t *l = rs != NULL ? firc_ruleset_group_mut(rs)->list : NULL;
+    firc_group_list_t *l = rs != NULL ? firc_group_find_list(firc_ruleset_group(rs), list_id) : NULL;
     if (l == NULL) {
         app_nf_leave(app);
         return FIRC_ERR_NOENT;
@@ -2157,7 +2190,7 @@ static void firc_app_remove_group_by_index_unlocked(firc_app_t *app, size_t idx)
     firc_ruleset_free(app->rulesets[idx]);
     rulesets_remove_at(app, idx);
     release_dns_snapshot(app); /* it borrows the list freed next */
-    if (g->list != NULL) { sync_end_for_removed_list(app, gid, g->list, "group removed"); }
+    for (size_t j = 0; j < g->n_lists; j++) { sync_end_for_removed_list(app, gid, g->lists[j], "group removed"); }
     firc_config_remove_group_by_index(app->cfg, idx);
     pool_forget_group_id(app, gid); /* after the list is consistent: see clear_groups_keeping */
     republish_or_log(app);
@@ -2242,15 +2275,8 @@ static void warn_unusable_list_lines(const char *owner_name, const firc_sub_rule
     }
 }
 
-static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id); /* for "ask again" on a stale UNCHANGED */
-static firc_group_list_t *find_list(firc_app_t *app, firc_id_t id, const char **name); /* defined below */
-
-/* provisional flips false->true only at the next republish; without this call it would never clear */
-static void republish_if_first_list(firc_app_t *app, bool first_list) {
-    if (!first_list) { return; }
-    release_dns_snapshot(app); /* before the new one is built, as on the path that actually moved rules */
-    republish_or_log(app);
-}
+static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id, firc_id_t list_id); /* for "ask again" on a stale UNCHANGED */
+static firc_group_list_t *find_list(firc_app_t *app, firc_id_t id, firc_id_t list_id, const char **name); /* defined below */
 
 static void sweep_after_first_load(firc_app_t *app, firc_id_t id) {
     firc_ruleset_t *rs = firc_app_find_group_by_id(app, id);
@@ -2258,18 +2284,41 @@ static void sweep_after_first_load(firc_app_t *app, firc_id_t id) {
     if (rs != NULL && queue_field_sweep(app, rs, &none)) { app_request_more_locked(app); }
 }
 
-/* the app-touching half of a sync; ev is not freed here, its rules may be moved out; the lock is the caller's */
-static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_event_t *ev,
-                                                      int64_t now_unix, bool *out_changed) {
-    *out_changed = false;
+typedef struct sync_item {
+    firc_sub_event_t *ev;
+    firc_group_list_t *list;
+    const char *name;
+    firc_err_t err;
+    bool changed;
+    bool staged;
+    bool first_load;
+    bool sweep_after;
+    firc_sub_rules_t prev_rules;
+    uint32_t prev_last_check;
+    uint32_t prev_last_update;
+    uint64_t refresh_ms, compare_ms, rebuild_ms, snapshot_ms, save_ms;
+} sync_item_t;
 
-    const char *name = NULL;
-    firc_group_list_t *list = find_list(app, ev->group_id, &name);
-    if (list == NULL) { return FIRC_ERR_NOENT; }
+typedef struct sync_batch {
+    sync_item_t *items;
+    size_t n;
+    bool republish;
+} sync_batch_t;
+
+static void stage_sync_result(firc_app_t *app, sync_batch_t *b, sync_item_t *it, int64_t now_unix) {
+    firc_sub_event_t *ev = it->ev;
+    it->list = find_list(app, ev->group_id, ev->list_id, &it->name);
+    if (it->list == NULL) {
+        it->err = FIRC_ERR_NOENT;
+        return;
+    }
+    firc_group_list_t *list = it->list;
+    const char *name = it->name;
     if (!sync_seq_is_current(list, ev)) {
         FIRC_DEBUG("\"%s\": a superseded result (seq %llu, latest %llu) is dropped", name,
                    (unsigned long long)ev->seq, (unsigned long long)list->sync_seq);
-        return FIRC_OK;
+        it->list = NULL;
+        return;
     }
 
     /* told BEFORE the work runs: what follows is the seconds somebody watches a progress bar for */
@@ -2278,17 +2327,16 @@ static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_
         app->sync_listener(app->sync_listener_ud, ev->group_id, list, false);
     }
 
-    uint64_t refresh_ms = 0, compare_ms = 0, rebuild_ms = 0, snapshot_ms = 0, save_ms = 0;
-    firc_err_t ret = FIRC_OK;
-
     switch (ev->result) {
     case FIRC_SUB_RESULT_ERROR:
         /* set even on failure: firc_sub_is_due reads it with failed_fetches to pace the retry */
         sync_set_error(list, ev->err, ev->http_status, ev->why);
         list->last_check = (uint32_t)now_unix;
+        if (firc_group_list_untried(list)) { b->republish = true; } /* provisional clears only at the next republish */
         if (list->failed_fetches < UINT8_MAX) { list->failed_fetches++; }
-        FIRC_WARN("group \"%s\": its list was not synced: %s", name, list->sync_error);
-        ret = ev->err;
+        FIRC_WARN("group \"%s\": list %.*s was not synced: %s", name, LIST_URL_CLIP,
+                  list->url != NULL ? list->url : "", list->sync_error);
+        it->err = ev->err;
         break;
 
     case FIRC_SUB_RESULT_UNCHANGED:
@@ -2299,7 +2347,7 @@ static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_
                        name);
             list->last_check = (uint32_t)now_unix;
             sync_set_idle(list);
-            firc_err_t qerr = firc_app_request_sync_unlocked(app, ev->group_id);
+            firc_err_t qerr = firc_app_request_sync_unlocked(app, ev->group_id, ev->list_id);
             if (qerr != FIRC_OK) { /* not this sync's failure to report; firc_sub_is_due comes back to it at the interval */
                 FIRC_WARN("\"%s\": could not ask for the parse it needs: %s", name,
                           firc_err_str(qerr));
@@ -2328,7 +2376,7 @@ static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_
         /* carries the old arena's ids/types/enables across by rule text; the parser allocated fresh ids for everything */
         firc_err_t rerr = firc_sub_rules_inherit(&ev->rules, &list->rules);
         uint64_t t1 = sync_mono_ms();
-        refresh_ms = t1 - t0;
+        it->refresh_ms = t1 - t0;
 
         bool same = false;
         firc_err_t cerr = rerr;
@@ -2336,10 +2384,10 @@ static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_
             firc_sub_apply_overrides(list, &ev->rules); /* before the comparison, or a changed override reads as "the list has not moved" */
             cerr = firc_sub_same_rules_checked(&list->rules, &ev->rules, &same); /* could not tell is not a change: don't replace rules on an allocation failure */
         }
-        compare_ms = sync_mono_ms() - t1;
+        it->compare_ms = sync_mono_ms() - t1;
         if (cerr != FIRC_OK) {
             sync_set_error(list, cerr, 0, NULL);
-            ret = cerr;
+            it->err = cerr;
             break;
         }
         if (same) {
@@ -2349,80 +2397,126 @@ static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_
             list->has_body_hash = true;
             list->last_check = (uint32_t)now_unix;
             sync_set_idle(list);
-            republish_if_first_list(app, first_list);
-            if (first_list) { sweep_after_first_load(app, ev->group_id); }
+            if (first_list) {
+                b->republish = true;
+                it->sweep_after = true;
+            }
             break;
         }
-        bool first_load = !list->has_body_hash;
-
-        firc_sub_rules_t prev_rules = list->rules; /* kept aside for the rollback below; the list holds the new ones from here */
-        uint32_t prev_last_check = list->last_check;
-        uint32_t prev_last_update = list->last_update;
+        it->first_load = !list->has_body_hash;
+        it->prev_rules = list->rules; /* kept aside for the rollback in the flush; the list holds the new ones from here */
+        it->prev_last_check = list->last_check;
+        it->prev_last_update = list->last_update;
         list->rules = ev->rules; /* moved: the event owns nothing now */
         firc_sub_rules_init(&ev->rules);
         list->last_check = (uint32_t)now_unix;
         list->last_update = (uint32_t)now_unix;
 
         warn_unusable_list_lines(name, &list->rules); /* once per changed list, the one place that sees every line */
+        it->staged = true;
+        it->changed = true;
+        break;
+    }
+    }
+}
 
-        release_dns_snapshot(app); /* before anything new is built: holding both was the transition the router could not survive. Old rules stay until the resync succeeds, for the rollback. */
-        uint64_t t2 = sync_mono_ms();
-        firc_ruleset_t *group_rs = firc_app_find_group_by_id(app, ev->group_id);
+static void rollback_staged(sync_item_t *it, firc_err_t err) {
+    firc_sub_rules_free(&it->list->rules);
+    it->list->rules = it->prev_rules;
+    it->list->last_check = it->prev_last_check;
+    it->list->last_update = it->prev_last_update;
+    sync_set_error(it->list, err, 0, NULL);
+    it->err = err;
+}
+
+static void keep_staged(sync_item_t *it) {
+    firc_sub_rules_free(&it->prev_rules);
+    /* set BEFORE the republish: snapshot.c reads has_body_hash on the live group at build time */
+    memcpy(it->list->body_hash, it->ev->hash, sizeof(it->list->body_hash));
+    it->list->has_body_hash = true;
+    sync_set_idle(it->list);
+}
+
+static void flush_sync_batch(firc_app_t *app, sync_batch_t *b) {
+    bool any_staged = false;
+    for (size_t i = 0; i < b->n; i++) { any_staged = any_staged || b->items[i].staged; }
+    if (!any_staged && !b->republish) { return; }
+
+    release_dns_snapshot(app); /* before anything new is built: holding both was the transition the router could not survive. Old rules stay until the resync succeeds, for the rollback. */
+    sync_item_t *last = NULL;
+    bool save = false;
+    for (size_t i = 0; i < b->n; i++) {
+        if (!b->items[i].staged) { continue; }
+        firc_id_t gid = b->items[i].ev->group_id;
+        uint64_t t0 = sync_mono_ms();
+        firc_ruleset_t *group_rs = firc_app_find_group_by_id(app, gid);
         firc_err_t err = group_rs != NULL ? sync_group_ruleset_locked(app, group_rs) : FIRC_ERR_NOENT;
-        uint64_t t3 = sync_mono_ms();
-        rebuild_ms = t3 - t2;
+        b->items[i].rebuild_ms = sync_mono_ms() - t0;
+        bool first_load = false;
+        for (size_t j = i; j < b->n; j++) {
+            sync_item_t *o = &b->items[j];
+            if (!o->staged || !firc_id_equal(o->ev->group_id, gid)) { continue; }
+            o->staged = false;
+            last = o;
+            if (err != FIRC_OK) {
+                rollback_staged(o, err);
+                continue;
+            }
+            keep_staged(o);
+            first_load = first_load || o->first_load;
+            save = true;
+        }
         if (err != FIRC_OK) {
-            firc_sub_rules_free(&list->rules);
-            list->rules = prev_rules;
-            list->last_check = prev_last_check;
-            list->last_update = prev_last_update;
             firc_err_t rollback_err = group_rs != NULL ? sync_group_ruleset_locked(app, group_rs) : FIRC_ERR_NOENT;
             if (rollback_err != FIRC_OK) {
                 FIRC_ERROR("failed to rollback the group's ruleset: %s", firc_err_str(rollback_err));
             }
-            republish_or_log(app); /* the rule-set released above, from the rules kept */
-            snapshot_ms = sync_mono_ms() - t3;
-            sync_set_error(list, err, 0, NULL);
-            *out_changed = true; /* a change was attempted, even though rolled back */
-            ret = err;
-            break;
+        } else if (first_load) {
+            sweep_after_first_load(app, gid);
         }
-        firc_sub_rules_free(&prev_rules);
+    }
 
-        /* set BEFORE the republish: snapshot.c reads has_body_hash on the live group at build time */
-        memcpy(list->body_hash, ev->hash, sizeof(list->body_hash));
-        list->has_body_hash = true;
-        if (first_load) { sweep_after_first_load(app, ev->group_id); }
-        republish_or_log(app);
+    uint64_t t3 = sync_mono_ms();
+    republish_or_log(app);
+    if (last != NULL) { last->snapshot_ms = sync_mono_ms() - t3; }
+    for (size_t i = 0; i < b->n; i++) {
+        if (b->items[i].sweep_after) { sweep_after_first_load(app, b->items[i].ev->group_id); }
+    }
+
+    /* written here and nowhere else now: the sync route has no save parameter to gate it on */
+    if (save && app->config_path != NULL) {
         uint64_t t4 = sync_mono_ms();
-        snapshot_ms = t4 - t3;
-
-        sync_set_idle(list);
-        *out_changed = true;
-
-        /* written here and nowhere else now: the sync route has no save parameter to gate it on */
-        if (app->config_path != NULL) {
-            firc_err_t serr = firc_app_save_groups(app, app->config_path,
-                                                   app->config_version != NULL ? app->config_version
-                                                                               : "");
-            if (serr != FIRC_OK) {
-                FIRC_ERROR("failed to save the groups file: %s", firc_err_str(serr));
-            }
-            save_ms = sync_mono_ms() - t4;
+        firc_err_t serr = firc_app_save_groups(app, app->config_path,
+                                               app->config_version != NULL ? app->config_version : "");
+        if (serr != FIRC_OK) {
+            FIRC_ERROR("failed to save the groups file: %s", firc_err_str(serr));
         }
-        break;
+        last->save_ms = sync_mono_ms() - t4;
     }
-    }
+}
 
-    list->sync_progress.applying = false;
-    if (ev->result == FIRC_SUB_RESULT_PARSED) { /* tools/bench/run_sub_cost.sh sums this format */
+static void finish_sync_item(const sync_item_t *it) {
+    if (it->list == NULL) { return; }
+    it->list->sync_progress.applying = false;
+    if (it->ev->result == FIRC_SUB_RESULT_PARSED) { /* tools/bench/run_sub_cost.sh sums this format */
         FIRC_DEBUG("%s: sync applied: refresh %llu ms, compare %llu ms, "
                    "rebuild %llu ms, snapshot %llu ms, save %llu ms, rules %zu",
-                   name, (unsigned long long)refresh_ms, (unsigned long long)compare_ms,
-                   (unsigned long long)rebuild_ms, (unsigned long long)snapshot_ms,
-                   (unsigned long long)save_ms, list->rules.n);
+                   it->name, (unsigned long long)it->refresh_ms, (unsigned long long)it->compare_ms,
+                   (unsigned long long)it->rebuild_ms, (unsigned long long)it->snapshot_ms,
+                   (unsigned long long)it->save_ms, it->list->rules.n);
     }
-    return ret;
+}
+
+/* the lock is the caller's */
+static firc_err_t firc_app_apply_sync_result_unlocked(firc_app_t *app, firc_sub_event_t *ev,
+                                                      int64_t now_unix, bool *out_changed) {
+    sync_item_t it = {.ev = ev};
+    sync_batch_t b = {.items = &it, .n = 1};
+    stage_sync_result(app, &b, &it, now_unix);
+    flush_sync_batch(app, &b);
+    finish_sync_item(&it);
+    *out_changed = it.changed;
+    return it.err;
 }
 
 firc_err_t firc_app_apply_sync_result(firc_app_t *app, firc_sub_event_t *ev, int64_t now_unix,
@@ -2433,57 +2527,101 @@ firc_err_t firc_app_apply_sync_result(firc_app_t *app, firc_sub_event_t *ev, int
     return r;
 }
 
-/* no lock but for a RESULT: STARTED/PROGRESS write only the list's own sync fields, which no pass reads */
+static bool later_result_of_group(const sync_batch_t *b, size_t i) {
+    for (size_t j = i + 1; j < b->n; j++) {
+        if (b->items[j].list != NULL && firc_id_equal(b->items[j].ev->group_id, b->items[i].ev->group_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void apply_sync_batch(firc_app_t *app, sync_batch_t *b) {
+    flush_sync_batch(app, b);
+    for (size_t i = 0; i < b->n; i++) { finish_sync_item(&b->items[i]); }
+    app_nf_leave(app);
+    for (size_t i = 0; i < b->n; i++) {
+        sync_item_t *it = &b->items[i];
+        if (it->list != NULL) {
+            if (it->err != FIRC_OK && it->ev->result != FIRC_SUB_RESULT_ERROR) {
+                FIRC_WARN("\"%s\": list %.*s: sync failed: %s", it->name, LIST_URL_CLIP,
+                          it->list->url != NULL ? it->list->url : "", firc_err_str(it->err));
+            }
+            if (app->sync_listener != NULL) {
+                firc_id_t gid = it->ev->group_id;
+                app->sync_listener(app->sync_listener_ud, gid, it->list,
+                                   !later_result_of_group(b, i) && group_stream_ends(app, gid));
+            }
+        }
+        firc_sub_event_free(it->ev);
+    }
+    b->n = 0;
+    b->republish = false;
+}
+
+/* STARTED/PROGRESS take no lock: they write only the list's own sync fields, which no pass reads */
+static void apply_sync_events(firc_app_t *app, firc_sub_event_t *head, int64_t now_unix) {
+    size_t n_results = 0;
+    for (firc_sub_event_t *ev = head; ev != NULL; ev = ev->next) {
+        if (ev->kind == FIRC_SUB_EV_RESULT) { n_results++; }
+    }
+    sync_item_t one;
+    sync_batch_t b = {.items = n_results > 1 ? calloc(n_results, sizeof(*b.items)) : NULL};
+    size_t cap = b.items != NULL ? n_results : 1;
+    if (b.items == NULL) { b.items = &one; }
+
+    firc_sub_event_t *next = NULL;
+    for (firc_sub_event_t *ev = head; ev != NULL; ev = next) {
+        next = ev->next;
+        ev->next = NULL;
+        const char *name = NULL;
+        firc_group_list_t *list = find_list(app, ev->group_id, ev->list_id, &name);
+        if (list == NULL) { /* deleted while the job ran; the worker could not have known */
+            char idbuf[FIRC_ID_STR_LEN];
+            firc_id_format(ev->group_id, idbuf);
+            FIRC_DEBUG("sync event for %s, which is gone: dropped", idbuf);
+            firc_sub_event_free(ev);
+            continue;
+        }
+        if (!sync_seq_is_current(list, ev)) {
+            FIRC_DEBUG("\"%s\": a superseded sync event (seq %llu, latest %llu) is dropped", name,
+                       (unsigned long long)ev->seq, (unsigned long long)list->sync_seq);
+            firc_sub_event_free(ev);
+            continue;
+        }
+        if (ev->kind != FIRC_SUB_EV_RESULT) {
+            if (ev->kind == FIRC_SUB_EV_STARTED) {
+                list->sync_state = FIRC_SUB_SYNC_FETCHING;
+                memset(&list->sync_progress, 0, sizeof(list->sync_progress));
+            } else {
+                list->sync_progress.stage = ev->stage;
+                list->sync_progress.bytes = ev->bytes;
+                list->sync_progress.total = ev->total;
+                list->sync_progress.lines = ev->lines;
+                list->sync_progress.applying = false;
+            }
+            if (app->sync_listener != NULL) { app->sync_listener(app->sync_listener_ud, ev->group_id, list, false); }
+            firc_sub_event_free(ev);
+            continue;
+        }
+        if (b.n == 0) { app_nf_enter(app); }
+        b.items[b.n] = (sync_item_t){.ev = ev};
+        stage_sync_result(app, &b, &b.items[b.n], now_unix);
+        b.n++;
+        if (b.n == cap) { apply_sync_batch(app, &b); }
+    }
+    if (b.n > 0) { apply_sync_batch(app, &b); }
+    if (b.items != &one) { free(b.items); }
+}
+
 void firc_app_on_sync_event(firc_app_t *app, firc_sub_event_t *ev, int64_t now_unix) {
     if (ev == NULL) { return; }
     if (app == NULL) {
         firc_sub_event_free(ev);
         return;
     }
-    const char *name = NULL;
-    firc_group_list_t *list = find_list(app, ev->group_id, &name);
-    if (list == NULL) { /* deleted while the job ran; the worker could not have known */
-        char idbuf[FIRC_ID_STR_LEN];
-        firc_id_format(ev->group_id, idbuf);
-        FIRC_DEBUG("sync event for %s, which is gone: dropped", idbuf);
-        firc_sub_event_free(ev);
-        return;
-    }
-    if (!sync_seq_is_current(list, ev)) {
-        FIRC_DEBUG("\"%s\": a superseded sync event (seq %llu, latest %llu) is dropped", name,
-                   (unsigned long long)ev->seq, (unsigned long long)list->sync_seq);
-        firc_sub_event_free(ev);
-        return;
-    }
-
-    switch (ev->kind) {
-    case FIRC_SUB_EV_STARTED:
-        list->sync_state = FIRC_SUB_SYNC_FETCHING;
-        memset(&list->sync_progress, 0, sizeof(list->sync_progress));
-        break;
-    case FIRC_SUB_EV_PROGRESS:
-        list->sync_progress.stage = ev->stage;
-        list->sync_progress.bytes = ev->bytes;
-        list->sync_progress.total = ev->total;
-        list->sync_progress.lines = ev->lines;
-        list->sync_progress.applying = false;
-        break;
-    case FIRC_SUB_EV_RESULT: {
-        bool changed = false;
-        app_nf_enter(app);
-        firc_err_t err = firc_app_apply_sync_result_unlocked(app, ev, now_unix, &changed);
-        app_nf_leave(app);
-        if (err != FIRC_OK && ev->result != FIRC_SUB_RESULT_ERROR) {
-            FIRC_WARN("\"%s\": sync failed: %s", name, firc_err_str(err));
-        }
-        break;
-    }
-    }
-
-    if (app->sync_listener != NULL) {
-        app->sync_listener(app->sync_listener_ud, ev->group_id, list, ev->kind == FIRC_SUB_EV_RESULT);
-    }
-    firc_sub_event_free(ev);
+    ev->next = NULL;
+    apply_sync_events(app, ev, now_unix);
 }
 
 void firc_app_set_sync_listener(firc_app_t *app, firc_app_sync_listener_fn fn, void *ud) {
@@ -2491,33 +2629,31 @@ void firc_app_set_sync_listener(firc_app_t *app, firc_app_sync_listener_fn fn, v
     app->sync_listener_ud = ud;
 }
 
-/* NULL when no group has id, or it holds no list */
-static firc_group_list_t *find_list(firc_app_t *app, firc_id_t id, const char **name) {
-    for (size_t i = 0; i < app->cfg->n_groups; i++) {
-        firc_group_t *g = app->cfg->groups[i];
-        if (!firc_id_equal(g->id, id)) { continue; }
-        if (name != NULL) { *name = g->name != NULL ? g->name : ""; }
-        return g->list;
-    }
-    return NULL;
+/* NULL when no group has id, or it holds no list list_id */
+static firc_group_list_t *find_list(firc_app_t *app, firc_id_t id, firc_id_t list_id, const char **name) {
+    firc_group_t *g = find_group(app, id);
+    if (g == NULL) { return NULL; }
+    if (name != NULL) { *name = g->name != NULL ? g->name : ""; }
+    return firc_group_find_list(g, list_id);
 }
 
-static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id) {
+static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id, firc_id_t list_id) {
     if (app->sub_worker == NULL) { return FIRC_ERR_STATE; }
-    firc_group_list_t *l = find_list(app, id, NULL);
+    firc_group_list_t *l = find_list(app, id, list_id, NULL);
     if (l == NULL) { return FIRC_ERR_NOENT; }
     if (l->url == NULL || l->url[0] == '\0') { return FIRC_ERR_INVAL; }
 
     firc_sub_job_t job;
     memset(&job, 0, sizeof(job));
     job.group_id = id;
+    job.list_id = l->id;
     if (firc_strset(&job.url, l->url) != FIRC_OK) { return FIRC_ERR_NOMEM; }
     job.has_hash = l->has_body_hash;
     memcpy(job.expected_hash, l->body_hash, sizeof(job.expected_hash));
     job.seq = ++app->sync_seq_counter;
 
     firc_err_t err = firc_sub_worker_enqueue(app->sub_worker, &job); /* takes job.url on every return, error ones included */
-    if (err != FIRC_OK) { return err; } /* FIRC_ERR_LIMIT: FIRC_SUB_WORKER_CAPACITY distinct ids already waiting; the list is left exactly as it was */
+    if (err != FIRC_OK) { return err; } /* FIRC_ERR_LIMIT: FIRC_SUB_WORKER_CAPACITY distinct (group, list) pairs already waiting; the list is left exactly as it was */
 
     l->sync_seq = job.seq;
     l->sync_state = FIRC_SUB_SYNC_QUEUED;
@@ -2527,13 +2663,40 @@ static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id) 
 }
 
 /* this, the url change and the two sweeps below take no lock: they write only a list's own fields, no pass reads */
-firc_err_t firc_app_request_sync(firc_app_t *app, firc_id_t id) {
-    return firc_app_request_sync_unlocked(app, id);
+firc_err_t firc_app_request_sync(firc_app_t *app, firc_id_t id, firc_id_t list_id) {
+    return firc_app_request_sync_unlocked(app, id, list_id);
 }
 
-firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, const char *url) {
+firc_err_t firc_app_request_sync_group(firc_app_t *app, firc_id_t id, size_t *queued) {
+    size_t n = 0;
+    firc_group_t *g = find_group(app, id);
+    firc_err_t first = g == NULL || g->n_lists == 0 ? FIRC_ERR_NOENT : FIRC_OK;
+    for (size_t i = 0; g != NULL && i < g->n_lists; i++) {
+        firc_err_t err = firc_app_request_sync_unlocked(app, id, g->lists[i]->id);
+        if (err == FIRC_OK) { n++; }
+        if (first == FIRC_OK) { first = err; }
+    }
+    if (queued != NULL) { *queued = n; }
+    return first;
+}
+
+bool firc_app_group_syncing(const firc_group_t *g) {
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (list_syncing(g->lists[i])) { return true; }
+    }
+    return false;
+}
+
+static bool url_held_by_another(const firc_group_t *g, const firc_group_list_t *l, const char *url) {
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (g->lists[i] != l && strcmp(g->lists[i]->url != NULL ? g->lists[i]->url : "", url) == 0) { return true; }
+    }
+    return false;
+}
+
+firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, firc_id_t list_id, const char *url) {
     /* id checked first: 400 "cannot take this url" would be a lie when there is no such list at all */
-    firc_group_list_t *l = find_list(app, id, NULL);
+    firc_group_list_t *l = find_list(app, id, list_id, NULL);
     if (l == NULL) {
         return FIRC_ERR_NOENT;
     }
@@ -2543,6 +2706,7 @@ firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, const char *url)
     if (strcmp(l->url != NULL ? l->url : "", url) == 0) {
         return FIRC_OK;
     }
+    if (url_held_by_another(find_group(app, id), l, url)) { return FIRC_ERR_INVAL; }
     if (firc_strset(&l->url, url) != FIRC_OK) {
         return FIRC_ERR_NOMEM;
     }
@@ -2558,27 +2722,28 @@ firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, const char *url)
     return FIRC_OK;
 }
 
-static void log_request_failure(firc_id_t id, const char *name, firc_err_t err) {
+static void log_request_failure(firc_id_t id, const char *name, const firc_group_list_t *l, firc_err_t err) {
     char idbuf[FIRC_ID_STR_LEN];
     firc_id_format(id, idbuf);
-    FIRC_WARN("list of %s (\"%s\") was not queued for a sync: %s", idbuf, name,
-              firc_err_str(err));
+    FIRC_WARN("list %.*s of %s (\"%s\") was not queued for a sync: %s", LIST_URL_CLIP, l->url != NULL ? l->url : "",
+              idbuf, name, firc_err_str(err));
 }
 
-/* has_body_hash is the filter, not last_check; skips QUEUED/FETCHING, unlike the due sweep, which must not */
+/* has_body_hash is the filter, not last_check; skips QUEUED/FETCHING, the due sweep only FETCHING */
 static void request_if_missing(firc_app_t *app, firc_id_t id, const char *name, bool enable,
                                const firc_group_list_t *l) {
     if (!enable || l->url == NULL || l->url[0] == '\0' || l->has_body_hash) { return; }
-    if (l->sync_state == FIRC_SUB_SYNC_QUEUED || l->sync_state == FIRC_SUB_SYNC_FETCHING) { return; }
-    firc_err_t err = firc_app_request_sync_unlocked(app, id);
-    if (err != FIRC_OK) { log_request_failure(id, name, err); }
+    if (list_syncing(l)) { return; }
+    firc_err_t err = firc_app_request_sync_unlocked(app, id, l->id);
+    if (err != FIRC_OK) { log_request_failure(id, name, l, err); }
 }
 
 static void firc_app_request_sync_missing_unlocked(firc_app_t *app) {
     for (size_t i = 0; i < app->cfg->n_groups; i++) {
         firc_group_t *g = app->cfg->groups[i];
-        if (g->list == NULL) { continue; }
-        request_if_missing(app, g->id, g->name != NULL ? g->name : "", g->enable, g->list);
+        for (size_t j = 0; j < g->n_lists; j++) {
+            request_if_missing(app, g->id, g->name != NULL ? g->name : "", g->enable, g->lists[j]);
+        }
     }
 }
 
@@ -2589,9 +2754,12 @@ void firc_app_request_sync_missing(firc_app_t *app) {
 void firc_app_request_sync_due(firc_app_t *app, int64_t now_unix) {
     for (size_t i = 0; i < app->cfg->n_groups; i++) {
         firc_group_t *g = app->cfg->groups[i];
-        if (g->list == NULL || !firc_sub_is_due(g->enable, g->list, now_unix)) { continue; } /* not skipped when QUEUED/FETCHING */
-        firc_err_t err = firc_app_request_sync_unlocked(app, g->id);
-        if (err != FIRC_OK) { log_request_failure(g->id, g->name != NULL ? g->name : "", err); }
+        for (size_t j = 0; j < g->n_lists; j++) {
+            if (!firc_sub_is_due(g->enable, g->lists[j], now_unix)) { continue; }
+            if (g->lists[j]->sync_state == FIRC_SUB_SYNC_FETCHING) { continue; }
+            firc_err_t err = firc_app_request_sync_unlocked(app, g->id, g->lists[j]->id);
+            if (err != FIRC_OK) { log_request_failure(g->id, g->name != NULL ? g->name : "", g->lists[j], err); }
+        }
     }
 }
 
@@ -2599,23 +2767,24 @@ typedef struct sync_capture {
     firc_sub_event_t *result; /* the last RESULT the job emitted, owned */
 } sync_capture_t;
 
-static void sync_capture_emit(void *ud, firc_sub_event_t *ev) {
+static bool sync_capture_emit(void *ud, firc_sub_event_t *ev) {
     sync_capture_t *cap = ud;
     if (ev->kind != FIRC_SUB_EV_RESULT) {
         firc_sub_event_free(ev); /* nobody is watching a synchronous job */
-        return;
+        return true;
     }
     firc_sub_event_free(cap->result);
     cap->result = ev;
+    return true;
 }
 
-static firc_err_t firc_app_sync_list_now_unlocked(firc_app_t *app, firc_id_t id,
+static firc_err_t firc_app_sync_list_now_unlocked(firc_app_t *app, firc_id_t id, firc_id_t list_id,
                                                   int64_t now_unix,
                                                   const char *url_override,
                                                   bool *out_changed) {
     *out_changed = false;
 
-    firc_group_list_t *list = find_list(app, id, NULL);
+    firc_group_list_t *list = find_list(app, id, list_id, NULL);
     if (list == NULL) { return FIRC_ERR_NOENT; }
     const char *fetch_url = (url_override != NULL && url_override[0] != '\0') ? url_override
                                                                              : list->url;
@@ -2624,6 +2793,7 @@ static firc_err_t firc_app_sync_list_now_unlocked(firc_app_t *app, firc_id_t id,
     firc_sub_job_t job;
     memset(&job, 0, sizeof(job));
     job.group_id = id;
+    job.list_id = list->id;
     if (firc_strset(&job.url, fetch_url) != FIRC_OK) { return FIRC_ERR_NOMEM; }
     job.has_hash = list->has_body_hash;
     memcpy(job.expected_hash, list->body_hash, sizeof(job.expected_hash));
@@ -2674,28 +2844,28 @@ static firc_err_t firc_app_sync_list_now_unlocked(firc_app_t *app, firc_id_t id,
     return FIRC_OK;
 }
 
-firc_err_t firc_app_sync_list_now(firc_app_t *app, firc_id_t id, int64_t now_unix,
+firc_err_t firc_app_sync_list_now(firc_app_t *app, firc_id_t id, firc_id_t list_id, int64_t now_unix,
                                   const char *url_override, bool *out_changed) {
     app_nf_enter(app);
-    firc_err_t r = firc_app_sync_list_now_unlocked(app, id, now_unix, url_override,
+    firc_err_t r = firc_app_sync_list_now_unlocked(app, id, list_id, now_unix, url_override,
                                                            out_changed);
     app_nf_leave(app);
     return r;
 }
 
-typedef struct posted_sync_event {
-    firc_app_t *app;
-    firc_sub_event_t *ev;
-} posted_sync_event_t;
-
-static void on_posted_sync_event(firc_loop_t *loop, void *ud) {
+static void on_sync_mailbox(firc_loop_t *loop, void *ud) {
     (void)loop;
-    posted_sync_event_t *p = ud;
-    firc_app_on_sync_event(p->app, p->ev, (int64_t)time(NULL));
-    free(p);
+    firc_app_t *app = ud;
+    pthread_mutex_lock(&app->sync_mu);
+    firc_sub_event_t *head = app->sync_head;
+    app->sync_head = NULL;
+    app->sync_tail = NULL;
+    app->sync_wake_posted = false;
+    pthread_mutex_unlock(&app->sync_mu);
+    apply_sync_events(app, head, (int64_t)time(NULL));
 }
 
-/* file-scope, not app fields: the drop runs at firc_loop_destroy, after firc_app_destroy, with no app left */
+/* file-scope, not app fields: a test reads them after firc_app_destroy */
 static _Atomic size_t g_sync_events_posted;
 static _Atomic size_t g_sync_results_posted;
 static _Atomic size_t g_sync_events_dropped;
@@ -2707,34 +2877,49 @@ void firc_app_sync_event_counts_for_test(size_t *out_posted, size_t *out_results
     if (out_dropped != NULL) { *out_dropped = atomic_load(&g_sync_events_dropped); }
 }
 
-/* a result the loop never read carries a rules arena, freed here rather than left to the wrapper's own free */
-static void drop_posted_sync_event(void *ud) {
-    posted_sync_event_t *p = ud;
-    firc_sub_event_free(p->ev);
-    free(p);
-    atomic_fetch_add(&g_sync_events_dropped, 1);
+static bool same_job(const firc_sub_event_t *a, const firc_sub_event_t *b) {
+    return firc_id_equal(a->group_id, b->group_id) && firc_id_equal(a->list_id, b->list_id) && a->seq == b->seq;
 }
 
-/* worker thread; reads nothing of the app's but the loop it was created with */
-static void sync_worker_emit(void *ud, firc_sub_event_t *ev) {
+static bool sync_worker_emit(void *ud, firc_sub_event_t *ev) {
     firc_app_t *app = ud;
-    posted_sync_event_t *p = malloc(sizeof(*p));
-    if (p == NULL || app->loop == NULL) {
-        free(p);
+    if (app->loop == NULL) {
         firc_sub_event_free(ev);
-        return;
+        return true;
     }
-    p->app = app;
-    p->ev = ev;
-    bool is_result = ev->kind == FIRC_SUB_EV_RESULT; /* read before the post: a successful post may free ev before this call returns */
-    if (firc_loop_post_with_drop(app->loop, on_posted_sync_event, p, drop_posted_sync_event) ==
-        FIRC_OK) {
-        if (is_result) { atomic_fetch_add(&g_sync_results_posted, 1); }
-        atomic_fetch_add(&g_sync_events_posted, 1);
-    } else { /* a failed post leaves the list QUEUED/FETCHING; the due sweep asks again */
+    bool is_result = ev->kind == FIRC_SUB_EV_RESULT; /* read before the post: the loop may free ev once it is queued */
+    ev->next = NULL;
+    pthread_mutex_lock(&app->sync_mu);
+    firc_sub_event_t *tail = app->sync_tail;
+    if (ev->kind == FIRC_SUB_EV_PROGRESS && tail != NULL && tail->kind == FIRC_SUB_EV_PROGRESS && same_job(tail, ev)) {
+        tail->stage = ev->stage;
+        tail->bytes = ev->bytes;
+        tail->total = ev->total;
+        tail->lines = ev->lines;
+        pthread_mutex_unlock(&app->sync_mu);
         firc_sub_event_free(ev);
-        free(p);
+        return true;
     }
+    if (tail != NULL) {
+        tail->next = ev;
+    } else {
+        app->sync_head = ev;
+    }
+    app->sync_tail = ev;
+    bool wake = !app->sync_wake_posted;
+    app->sync_wake_posted = true;
+    pthread_mutex_unlock(&app->sync_mu);
+    if (wake && firc_loop_post(app->loop, on_sync_mailbox, app) != FIRC_OK) {
+        pthread_mutex_lock(&app->sync_mu);
+        app->sync_head = NULL; /* with no post standing the mailbox held nothing before ev */
+        app->sync_tail = NULL;
+        app->sync_wake_posted = false;
+        pthread_mutex_unlock(&app->sync_mu);
+        return false;
+    }
+    if (is_result) { atomic_fetch_add(&g_sync_results_posted, 1); }
+    atomic_fetch_add(&g_sync_events_posted, 1);
+    return true;
 }
 
 firc_err_t firc_app_start_list_worker(firc_app_t *app) {
@@ -2758,6 +2943,18 @@ void firc_app_stop_list_worker(firc_app_t *app) {
     if (app == NULL || app->sub_worker == NULL) { return; }
     firc_sub_worker_free(app->sub_worker); /* raises the cancel token, ends the transfer in flight, and joins */
     app->sub_worker = NULL;
+    pthread_mutex_lock(&app->sync_mu);
+    firc_sub_event_t *head = app->sync_head;
+    app->sync_head = NULL;
+    app->sync_tail = NULL;
+    app->sync_wake_posted = false;
+    pthread_mutex_unlock(&app->sync_mu);
+    while (head != NULL) {
+        firc_sub_event_t *next = head->next;
+        firc_sub_event_free(head);
+        atomic_fetch_add(&g_sync_events_dropped, 1);
+        head = next;
+    }
 }
 
 static bool all_digits(const char *p, const char *end) {
@@ -2872,7 +3069,13 @@ firc_err_t firc_app_save_groups(firc_app_t *app, const char *conf_path, const ch
     char groups_path[4096];
     firc_err_t err = firc_config_groups_path(conf_path, groups_path, sizeof(groups_path));
     if (err != FIRC_OK) { return err; }
+    app->groups_saves++;
     return firc_config_save_part_file(app->cfg, version, FIRC_CFG_GROUPS, groups_path);
+}
+
+void firc_app_publish_counts_for_test(const firc_app_t *app, uint64_t *out_snapshots, uint64_t *out_saves) {
+    if (out_snapshots != NULL) { *out_snapshots = app->snapshots_built; }
+    if (out_saves != NULL) { *out_saves = app->groups_saves; }
 }
 
 firc_err_t firc_app_save_config(firc_app_t *app, const char *conf_path, const char *version) {

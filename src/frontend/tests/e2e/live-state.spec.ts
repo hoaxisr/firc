@@ -23,13 +23,16 @@ const GROUPS = () => [
   group("0a000004", "Work", { enable: false, live: false, liveReason: "disabled" }),
   group("0a000005", "Tele2", { live: false, liveReason: "not-written" }),
   group("0a000006", "Unavailable", {
-    list: {
-      url: "https://example.com/list.txt",
-      interval: 86400,
-      lastUpdate: 1790000000,
-      rulesTotal: 2,
-      sync: { state: "idle", error: "", lastCheck: 1790000000 },
-    },
+    lists: [
+      {
+        id: "0a0a0a0a",
+        url: "https://example.com/list.txt",
+        interval: 86400,
+        lastUpdate: 1790000000,
+        rulesTotal: 2,
+        sync: { state: "idle", error: "", lastCheck: 1790000000 },
+      },
+    ],
   }),
   group("0a000007", "Vless", { interface: "tunvless0", live: false, liveReason: "tunnel-down" }),
 ];

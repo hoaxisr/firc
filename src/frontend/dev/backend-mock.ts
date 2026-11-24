@@ -160,17 +160,20 @@ if (!DATA.groups.some((g: any) => g.id === "a1b2c3d4")) {
     enable: true,
     devices: { allow: [], deny: [] },
     rules: [],
-    list: {
-      url: "https://services.should.be.blocked.com",
-      interval: 86400,
-      lastUpdate: Math.floor(Date.now() / 1000),
-      sync: { state: "idle", error: "", lastCheck: 0 },
-      syncProgress: null,
-      rules: [
-        { enable: true, id: "11223344", rule: "google.com", type: "domain" },
-        { enable: true, id: "55667788", rule: "facebook.com", type: "domain" },
-      ],
-    },
+    lists: [
+      {
+        id: "b1b1b1b1",
+        url: "https://services.should.be.blocked.com",
+        interval: 86400,
+        lastUpdate: Math.floor(Date.now() / 1000),
+        sync: { state: "idle", error: "", lastCheck: 0 },
+        syncProgress: null,
+        rules: [
+          { enable: true, id: "11223344", rule: "google.com", type: "domain" },
+          { enable: true, id: "55667788", rule: "facebook.com", type: "domain" },
+        ],
+      },
+    ],
   });
 }
 
@@ -271,7 +274,7 @@ function liveOf(group: any, active: string): { live: boolean; liveReason?: strin
   return { live: true };
 }
 
-function groupRes({ list, rules: handRules, block, ...group }: any, withRules = false) {
+function groupRes({ lists, rules: handRules, block, ...group }: any, withRules = false) {
   const isDns = group.interface === "dns";
   const baseResolve = group.resolve ?? { tunnel: true, server: "" };
   const withResolve = {
@@ -293,9 +296,29 @@ function groupRes({ list, rules: handRules, block, ...group }: any, withRules = 
       ...(IFACE_STATES[name] ?? { state: "unknown", since: 0, error: "" }),
     }));
   }
-  if (!list) return out;
-  const { rules, syncProgress: _syncProgress, ...listMeta } = list;
-  return { ...out, list: { ...listMeta, rulesTotal: rules?.length ?? 0 } };
+  return { ...out, lists: (lists ?? []).map(listRes) };
+}
+
+const isRunning = (list: any) => list.sync?.state === "queued" || list.sync?.state === "fetching";
+
+function listRes(list: any) {
+  const { rules, syncProgress: _syncProgress, sync, ...meta } = list;
+  return {
+    ...meta,
+    rulesTotal: rules?.length ?? 0,
+    sync: { ...sync, progress: isRunning(list) ? syncStage(list) : null },
+  };
+}
+
+function findList(group: any, id: string) {
+  return (group.lists ?? []).find((l: any) => l.id === id);
+}
+
+function newListId(group: any) {
+  for (;;) {
+    const id = Math.random().toString(16).substring(2, 10).padEnd(8, "0");
+    if (!findList(group, id)) return id;
+  }
 }
 
 function syncStage(list: any) {
@@ -647,38 +670,64 @@ function listUrlIsSupported(url: string): boolean {
   }
 }
 
-function applyListFromReq(
+function applyListsFromReq(
   existing: any,
   body: any,
-): { list: any; startSync: boolean; refusal?: string } {
-  if (!("list" in body)) return { list: existing?.list, startSync: false };
-  if (body.list === null || body.list === undefined) return { list: undefined, startSync: false };
-
-  const incoming = body.list;
-  const url = typeof incoming.url === "string" ? incoming.url : (existing?.list?.url ?? "");
-  if (!listUrlIsSupported(url)) {
-    return { list: existing?.list, startSync: false, refusal: "list url must be http or https" };
-  }
-  const interval =
-    incoming.interval !== undefined ? incoming.interval : (existing?.list?.interval ?? 0);
-
-  if (existing?.list && existing.list.url === url) {
-    /* In place: a running sync writes its state onto this very object. */
-    Object.assign(existing.list, { url, interval });
-    return { list: existing.list, startSync: false };
+): { lists: any[] | undefined; toSync: any[]; refusal?: string } {
+  if (!("lists" in body)) return { lists: existing?.lists, toSync: [] };
+  if (!Array.isArray(body.lists))
+    return { lists: existing?.lists, toSync: [], refusal: "invalid lists" };
+  if (body.lists.length > 16) {
+    return { lists: existing?.lists, toSync: [], refusal: "a group carries at most 16 lists" };
   }
 
-  return {
-    list: {
-      url,
+  const seenUrls = new Set<string>();
+  const seenIds = new Set<string>();
+  for (const item of body.lists) {
+    if (!item || typeof item !== "object" || !listUrlIsSupported(item.url)) {
+      return { lists: existing?.lists, toSync: [], refusal: "invalid list" };
+    }
+    if (seenUrls.has(item.url)) {
+      return { lists: existing?.lists, toSync: [], refusal: "duplicate list url" };
+    }
+    seenUrls.add(item.url);
+    if (item.id !== undefined) {
+      if (seenIds.has(item.id)) {
+        return { lists: existing?.lists, toSync: [], refusal: "duplicate list id" };
+      }
+      seenIds.add(item.id);
+    }
+  }
+
+  const live: any[] = existing?.lists ?? [];
+  const used = new Set<any>();
+  const toSync: any[] = [];
+  const next = body.lists.map((item: any) => {
+    const byId = item.id !== undefined ? live.find((l) => l.id === item.id) : undefined;
+    const byUrl = live.find((l) => l.url === item.url && !used.has(l));
+    const match = byId ?? byUrl;
+    if (match) used.add(match);
+    const interval = item.interval !== undefined ? item.interval : (match?.interval ?? 86400);
+
+    if (match && match.url === item.url) {
+      /* In place: a running sync writes its state onto this very object. */
+      Object.assign(match, { interval });
+      return match;
+    }
+
+    const list = {
+      id: item.id ?? newListId({ lists: [...live, ...body.lists] }),
+      url: item.url,
       interval,
       lastUpdate: 0,
-      sync: { state: "queued", error: "", lastCheck: existing?.list?.sync?.lastCheck ?? 0 },
+      sync: { state: "queued", error: "", lastCheck: match?.sync?.lastCheck ?? 0 },
       syncProgress: null,
       rules: [],
-    },
-    startSync: true,
-  };
+    };
+    toSync.push(list);
+    return list;
+  });
+  return { lists: next, toSync };
 }
 
 app.put(`${API_BASE}/groups`, async (c) => {
@@ -711,28 +760,24 @@ app.put(`${API_BASE}/groups`, async (c) => {
     return c.json({ error: "random error" }, 500);
   }
 
-  /* Validated in a pass of its own: applyListFromReq mutates lists in place. */
+  /* Validated in a pass of its own: applyListsFromReq mutates lists in place. */
   for (const group of body?.groups ?? []) {
-    if (!("list" in group) || group.list === null || group.list === undefined) continue;
-    const existing: any = DATA.groups.find((g: any) => g.id === group.id);
-    const url = typeof group.list.url === "string" ? group.list.url : (existing?.list?.url ?? "");
-    if (!listUrlIsSupported(url)) {
-      return c.json({ error: "list url must be http or https" }, 400);
-    }
+    const { refusal } = applyListsFromReq({ lists: [] }, group);
+    if (refusal) return c.json({ error: refusal }, 400);
   }
 
   const toSync: any[] = [];
   const next = (body?.groups ?? []).map((group: any) => {
     const existing: any = DATA.groups.find((g: any) => g.id === group.id);
-    const { list: _requestedList, resolver: _requestedResolver, ...rest } = group;
-    const { list, startSync } = applyListFromReq(existing, group);
+    const { lists: _requestedLists, resolver: _requestedResolver, ...rest } = group;
+    const applied = applyListsFromReq(existing, group);
     const merged: any = { ...rest };
     if (rest.interface !== "block") delete merged.block;
     if (rest.interface !== "dns" && merged.resolve) delete merged.resolve.fallback;
     else if (rest.block === undefined) merged.block = existing?.block ?? "null";
     else if (rest.block === null) merged.block = "null";
-    if (list !== undefined) merged.list = list;
-    if (startSync) toSync.push(list);
+    merged.lists = applied.lists ?? [];
+    toSync.push(...applied.toSync);
     return merged;
   });
 
@@ -748,31 +793,31 @@ const readSizeParam = (raw: string | undefined, dflt: number): number | null => 
   return Number.isSafeInteger(value) ? value : null;
 };
 
-app.get(`${API_BASE}/groups/:id{[0-9a-f]{8}}/list/rules`, (c) => {
+app.get(`${API_BASE}/groups/:id{[0-9a-f]{8}}/lists/:lid/rules`, (c) => {
   const group: any = DATA.groups.find((g: any) => g.id === c.req.param("id"));
   if (!group) return c.json({ error: "group not found" }, 404);
-  if (!group.list) return c.json({ error: "group has no list" }, 404);
+  const list = findList(group, c.req.param("lid"));
+  if (!list) return c.json({ error: "group has no such list" }, 404);
   const offset = readSizeParam(c.req.query("offset"), 0);
   if (offset === null) return c.json({ error: "invalid offset" }, 400);
   const asked = readSizeParam(c.req.query("limit"), 50);
   if (asked === null) return c.json({ error: "invalid limit" }, 400);
   const limit = Math.min(asked || 50, 500);
   const q = (c.req.query("q") ?? "").toLowerCase();
-  const matches = (group.list.rules ?? []).filter(
-    (r: any) => !q || r.rule.toLowerCase().includes(q),
-  );
+  const matches = (list.rules ?? []).filter((r: any) => !q || r.rule.toLowerCase().includes(q));
   return c.json({
-    total: group.list.rules?.length ?? 0,
+    total: list.rules?.length ?? 0,
     matched: matches.length,
     offset,
     rules: matches.slice(offset, offset + limit),
   });
 });
 
-app.patch(`${API_BASE}/groups/:id/list/rules`, async (c) => {
+app.patch(`${API_BASE}/groups/:id/lists/:lid/rules`, async (c) => {
   const group: any = DATA.groups.find((g: any) => g.id === c.req.param("id"));
   if (!group) return c.json({ error: "group not found" }, 404);
-  if (!group.list) return c.json({ error: "group has no list" }, 404);
+  const list = findList(group, c.req.param("lid"));
+  if (!list) return c.json({ error: "group has no such list" }, 404);
   const body = await c.req.json();
   const staged: { rule: any; edit: any }[] = [];
   for (const edit of body.rules ?? []) {
@@ -782,7 +827,7 @@ app.patch(`${API_BASE}/groups/:id/list/rules`, async (c) => {
     if (edit.comment !== undefined) {
       return c.json({ error: "a list's rules carry no comment" }, 400);
     }
-    const rule = (group.list.rules ?? []).find((r: any) => r.id === edit.id);
+    const rule = (list.rules ?? []).find((r: any) => r.id === edit.id);
     if (!rule) return c.json({ error: "rule not found" }, 404);
     staged.push({ rule, edit });
   }
@@ -861,42 +906,72 @@ app.post(`${API_BASE}/groups/:id/move-up`, (c) => {
   return c.json(groupRes(group));
 });
 
-app.post(`${API_BASE}/groups/:id/list/sync`, async (c) => {
+function queueList(list: any) {
+  list.sync = { state: "queued", error: "", lastCheck: list.sync?.lastCheck ?? 0 };
+  runSync(list);
+}
+
+app.post(`${API_BASE}/groups/:id/lists/:lid/sync`, async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => ({}));
   console.debug("queued a sync", id, body);
   const group: any = DATA.groups.find((g: any) => g.id === id);
   if (!group) return c.json({ error: "group not found" }, 404);
-  if (!group.list) return c.json({ error: "group has no list" }, 404);
+  const list = findList(group, c.req.param("lid"));
+  if (!list) return c.json({ error: "group has no such list" }, 404);
 
-  if (body?.url) group.list.url = body.url;
-  group.list.sync = { state: "queued", error: "", lastCheck: group.list.sync?.lastCheck ?? 0 };
-  runSync(group.list);
+  const url = body?.url || list.url;
+  if (String(url).includes("fail")) return c.json({ error: "sync failed" }, 500);
+  if (body?.url) list.url = body.url;
+  queueList(list);
   return c.json(groupRes(group), 202);
 });
 
-app.get(`${API_BASE}/groups/:id/list/sync/events`, (c) => {
+app.post(`${API_BASE}/groups/:id/sync`, (c) => {
   const id = c.req.param("id");
   const group: any = DATA.groups.find((g: any) => g.id === id);
   if (!group) return c.json({ error: "group not found" }, 404);
-  if (!group.list) return c.json({ error: "group has no list" }, 404);
+  if (!group.lists?.length) return c.json({ error: "group has no list" }, 404);
+  if (group.lists.some((l: any) => String(l.url).includes("fail"))) {
+    return c.json({ error: "sync failed" }, 500);
+  }
+  for (const list of group.lists) queueList(list);
+  return c.json(groupRes(group), 202);
+});
+
+app.get(`${API_BASE}/groups/:id/sync/events`, (c) => {
+  const id = c.req.param("id");
+  const group: any = DATA.groups.find((g: any) => g.id === id);
+  if (!group) return c.json({ error: "group not found" }, 404);
+  if (!group.lists?.length) return c.json({ error: "group has no list" }, 404);
+
+  const payload = (list: any) =>
+    JSON.stringify({ groupId: group.id, listId: list.id, list: listRes(list) });
+  const running = () => group.lists.some(isRunning);
 
   return streamSSE(c, async (stream) => {
+    const sent = new Map<string, string>();
+    for (const list of [...group.lists]) {
+      const data = payload(list);
+      sent.set(list.id, data);
+      const last = list === group.lists[group.lists.length - 1] && !running();
+      await stream.writeSSE({ event: last ? "done" : "progress", data });
+    }
+    if (!running()) return;
+
     for (;;) {
-      const state = group.list.sync?.state ?? "idle";
-      if (state === "error") {
-        await stream.writeSSE({
-          event: "error",
-          data: JSON.stringify({ error: group.list.sync.error }),
-        });
-        return;
-      }
-      if (state === "idle") {
-        await stream.writeSSE({ event: "done", data: JSON.stringify(groupRes(group)) });
-        return;
-      }
-      await stream.writeSSE({ event: "progress", data: JSON.stringify(syncStage(group.list)) });
       await stream.sleep(300);
+      const changed = group.lists.filter((l: any) => sent.get(l.id) !== payload(l));
+      const finished = !running();
+      const tail = finished ? (changed.pop() ?? group.lists[group.lists.length - 1]) : undefined;
+      for (const list of changed) {
+        sent.set(list.id, payload(list));
+        await stream.writeSSE({ event: "progress", data: payload(list) });
+      }
+      if (tail) {
+        await stream.writeSSE({ event: "done", data: payload(tail) });
+        return;
+      }
     }
   });
 });

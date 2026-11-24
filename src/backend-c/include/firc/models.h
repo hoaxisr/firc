@@ -68,8 +68,11 @@ typedef struct firc_group {
     firc_group_resolve_t resolve;
     firc_block_answer_t block;
     bool cloudflare;
-    firc_group_list_t *list; /* NULL: a manual group */
+    firc_group_list_t **lists; /* n_lists == 0: a manual group */
+    size_t n_lists;
 } firc_group_t;
+
+#define FIRC_GROUP_LISTS_MAX 16
 
 /* Entries in the group's interface list: 1 + the ones after `iface`. */
 static inline size_t firc_group_n_ifaces(const firc_group_t *g) { return 1u + g->n_iface_rest; }
@@ -164,6 +167,7 @@ const char *firc_sub_sync_state_name(firc_sub_sync_state_t s);
 
 /* A group's list: what it's fetched from, what was changed, and (runtime only) the sync state. */
 typedef struct firc_group_list {
+    firc_id_t id;
     char *url;
     uint32_t interval;
     uint32_t last_update;
@@ -277,6 +281,14 @@ firc_err_t firc_rule_set_comment(firc_rule_t *r, const char *s, const char **why
 
 firc_group_t *firc_group_new(void);
 void firc_group_free(firc_group_t *g);
+/* Takes l on FIRC_OK only; FIRC_ERR_LIMIT at 16 lists, FIRC_ERR_INVAL for a zero id or an id or url already in g. */
+firc_err_t firc_group_add_list(firc_group_t *g, firc_group_list_t *l);
+/* NULL when g has no list with that id. */
+firc_group_list_t *firc_group_find_list(const firc_group_t *g, firc_id_t id);
+/* Frees list i and keeps the order of the rest. */
+void firc_group_remove_list(firc_group_t *g, size_t i);
+/* True while l has no body and no fetch has failed: its rules are still to come. */
+bool firc_group_list_untried(const firc_group_list_t *l);
 firc_err_t firc_group_add_rule(firc_group_t *g, firc_rule_t *r); /* takes ownership */
 /* Fills the zeroed out with g's rule pointers in order, the one at `at` replaced by put (dropped when put is
  * NULL; at SIZE_MAX touches none), then append when not NULL. Shares the pointers; FIRC_ERR_NOMEM frees out's array only. */

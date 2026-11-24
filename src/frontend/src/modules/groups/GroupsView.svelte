@@ -28,7 +28,7 @@
   import { droppable } from "../../lib/dnd";
   import { type Group, type Rule } from "../../types";
   import { toast } from "../../utils/events";
-  import { groupsFromFile } from "./groups-data";
+  import { groupsFromFile, oldListsOf, type OldLists } from "./groups-data";
 
   type Props = {
     onRenderComplete?: () => void;
@@ -88,6 +88,7 @@
   });
 
   let importedGroups = $state<Group[]>([]);
+  let importedOldLists = $state<OldLists>({ count: 0, urls: [] });
   let isImportingConfig = $state(false);
   let isImportingRules = $state(false);
   let pendingToast = $state<string | null>(null);
@@ -95,6 +96,7 @@
   function resetImportConfigModal() {
     importConfigModal = { open: false, fileName: "" };
     importedGroups = [];
+    importedOldLists = { count: 0, urls: [] };
   }
 
   function openImportRulesModal(groupIndex: number) {
@@ -181,6 +183,7 @@
         }
 
         importedGroups = groups;
+        importedOldLists = oldListsOf(event.target?.result as string);
         importConfigModal = {
           open: true,
           fileName: file.name,
@@ -420,6 +423,7 @@
 <ImportConfigDialog
   open={importConfigModal.open}
   groups={importedGroups}
+  oldLists={importedOldLists}
   fileName={importConfigModal.fileName}
   onclose={resetImportConfigModal}
   onimport={handleImportConfig}

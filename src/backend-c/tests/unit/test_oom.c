@@ -34,6 +34,7 @@
 #include "fake_rtnl.h"
 #include "firc/fakeip.h"
 #include <net/if.h>
+#include "test_group_lists_util.h"
 
 void *__wrap_malloc(size_t n);
 void *__wrap_calloc(size_t a, size_t b);
@@ -225,11 +226,12 @@ TEST an_override_is_never_dropped_because_memory_ran_out(void) {
         "groups:\n"
         "  - id: 5eba1111\n"
         "    name: ads\n"
-        "    list:\n"
-        "      url: 'https://example.invalid/l.txt'\n"
-        "      overrides:\n"
-        "        - rule: '^ads[0-9]{1,3}\\.example\\.com$'\n"
-        "          type: regex\n";
+        "    lists:\n"
+        "      - id: 7a7a7a01\n"
+        "        url: 'https://example.invalid/l.txt'\n"
+        "        overrides:\n"
+        "          - rule: '^ads[0-9]{1,3}\\.example\\.com$'\n"
+        "            type: regex\n";
     long bad = -1, lied = -1;
     bool reached_end = false;
     firc_err_t lied_err = FIRC_OK;
@@ -241,8 +243,8 @@ TEST an_override_is_never_dropped_because_memory_ran_out(void) {
         long seen = intercepted();
         disarm();
         ASSERTm("the allocator seam intercepted nothing -- the test proves nothing", seen > 0);
-        if (err == FIRC_OK && (cfg.n_groups != 1 || cfg.groups[0]->list == NULL ||
-                               cfg.groups[0]->list->n_overrides == 0)) {
+        if (err == FIRC_OK && (cfg.n_groups != 1 || cfg.groups[0]->n_lists == 0 ||
+                               cfg.groups[0]->lists[0]->n_overrides == 0)) {
             bad = at;
         }
         if (err != FIRC_OK && err != FIRC_ERR_NOMEM) {
@@ -271,15 +273,15 @@ static firc_group_t *published_list_group(firc_app_t *app, firc_dns_pipeline_t *
     if (g == NULL) { return NULL; }
     g->id = (firc_id_t){{0x0a, 0x0b, 0x0c, 0x0d}};
     g->enable = true;
-    g->list = firc_group_list_new();
-    if (g->list == NULL || firc_strset(&g->iface, "eth0") != FIRC_OK ||
-        firc_strset(&g->list->url, "https://example.invalid/l.txt") != FIRC_OK ||
-        firc_sub_rules_push(&g->list->rules, "ads.example.com", "namespace", true,
+    test_group_set_list(g);
+    if (g->n_lists == 0 || firc_strset(&g->iface, "eth0") != FIRC_OK ||
+        firc_strset(&g->lists[0]->url, "https://example.invalid/l.txt") != FIRC_OK ||
+        firc_sub_rules_push(&g->lists[0]->rules, "ads.example.com", "namespace", true,
                             test_random_id()) != FIRC_OK) {
         firc_group_free(g);
         return NULL;
     }
-    g->list->has_body_hash = true;
+    g->lists[0]->has_body_hash = true;
     firc_id_t id = g->id;
     if (firc_app_add_group(app, g) != FIRC_OK) { return NULL; }
     if (firc_app_republish_dns_snapshot(app) != FIRC_OK) { return NULL; }
@@ -298,7 +300,7 @@ static bool a_dropped_list_still_owns_the_name(firc_app_t *app, firc_dns_pipelin
         snap != NULL ? firc_ruleset_snapshot_owner(snap, "a.ads.example.com", NULL, NULL, NULL, NULL, NULL)
                      : NULL;
     firc_ruleset_t *rs = firc_app_find_group_by_id(app, (firc_id_t){{0x0a, 0x0b, 0x0c, 0x0d}});
-    bool list_there = rs != NULL && firc_ruleset_group(rs)->list != NULL;
+    bool list_there = rs != NULL && (firc_ruleset_group(rs))->n_lists != 0;
     return owner != NULL && !list_there;
 }
 
@@ -429,7 +431,7 @@ typedef struct job_sink {
     size_t n_rules;
 } job_sink_t;
 
-static void job_sink_emit(void *ud, firc_sub_event_t *ev) {
+static bool job_sink_emit(void *ud, firc_sub_event_t *ev) {
     job_sink_t *s = ud;
     if (ev->kind == FIRC_SUB_EV_STARTED) {
         s->n_started++;
@@ -441,6 +443,7 @@ static void job_sink_emit(void *ud, firc_sub_event_t *ev) {
         s->n_rules = ev->rules.n;
     }
     firc_sub_event_free(ev);
+    return true;
 }
 
 /* Catches: a job that posted STARTED unable to post its result for lack of memory. */

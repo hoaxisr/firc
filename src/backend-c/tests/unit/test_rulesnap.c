@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "firc/log.h"
+#include "test_group_lists_util.h"
 
 static firc_config_t make_cfg(void)
 {
@@ -287,10 +288,10 @@ TEST multiple_groups_independently_match(void)
 static void add_group_list_rule(firc_group_t *g, firc_id_t id, const char *type, const char *rule,
                                 bool enable)
 {
-    if (g->list == NULL) {
-        g->list = firc_group_list_new();
+    if (g->n_lists == 0) {
+        test_group_set_list(g);
     }
-    firc_sub_rules_push(&g->list->rules, rule, type, enable, id);
+    firc_sub_rules_push(&g->lists[0]->rules, rule, type, enable, id);
 }
 
 /* Catches: a refcount that frees the snapshot under its second holder, or leaks it (under sanitize). */
@@ -382,24 +383,103 @@ TEST a_hand_rule_and_a_list_rule_of_one_group_give_one_owner(void)
     PASS();
 }
 
+/* Catches: the snapshot reading only a group's first list. */
+TEST a_name_of_the_second_list_belongs_to_the_group(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "g", true);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l0->rules, "a.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 1, 0, 0}}));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l1->rules, "b.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 2, 0, 0}}));
+    firc_config_add_group(&cfg, g);
+
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    const firc_group_snapshot_t *owner = firc_ruleset_snapshot_owner(snap, "b.com", NULL, NULL, NULL, NULL, NULL);
+    ASSERT(owner != NULL);
+    ASSERT(firc_id_equal(g->id, owner->id));
+    ASSERT(firc_ruleset_snapshot_owner(snap, "a.com", NULL, NULL, NULL, NULL, NULL) != NULL);
+    ASSERT(firc_ruleset_snapshot_owner(snap, "c.com", NULL, NULL, NULL, NULL, NULL) == NULL);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a disabled rule of one list taking the same name from another list. */
+TEST a_disabled_rule_of_one_list_leaves_the_other(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "g", true);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l0->rules, "c.com", FIRC_RULE_DOMAIN, false, (firc_id_t){{1, 1, 0, 0}}));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l1->rules, "c.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 2, 0, 0}}));
+    firc_config_add_group(&cfg, g);
+
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT(firc_ruleset_snapshot_owner(snap, "c.com", NULL, NULL, NULL, NULL, NULL) != NULL);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a list that failed its fetch keeping the snapshot provisional for good. */
+TEST a_failed_list_does_not_keep_the_snapshot_provisional(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "g", true);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    l0->has_body_hash = true;
+    l1->failed_fetches = 1;
+    firc_config_add_group(&cfg, g);
+
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT_FALSE(snap->provisional);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: only the first list deciding whether the snapshot is provisional. */
+TEST an_untried_list_keeps_it_provisional(void)
+{
+    firc_config_t cfg = make_cfg();
+    firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "g", true);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    l0->has_body_hash = true;
+    firc_config_add_group(&cfg, g);
+
+    firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
+    ASSERT(snap->provisional);
+    firc_ruleset_snapshot_free(snap);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
 /* Catches: a list group without a body not making the snapshot provisional. */
 TEST a_list_group_without_a_body_makes_the_snapshot_provisional(void)
 {
     firc_config_t cfg = make_cfg();
     firc_group_t *g = make_group((firc_id_t){{1, 0, 0, 0}}, "g", true);
-    g->list = firc_group_list_new();
+    test_group_set_list(g);
     firc_config_add_group(&cfg, g);
 
     firc_ruleset_snapshot_t *snap = firc_ruleset_snapshot_build(&cfg);
     ASSERTm("no body hash yet: a name this list would route still passes today", snap->provisional);
     firc_ruleset_snapshot_free(snap);
 
-    g->list->has_body_hash = true;
+    g->lists[0]->has_body_hash = true;
     snap = firc_ruleset_snapshot_build(&cfg);
     ASSERT_FALSEm("a list is in: nothing left to be provisional about", snap->provisional);
     firc_ruleset_snapshot_free(snap);
 
-    g->list->has_body_hash = false;
+    g->lists[0]->has_body_hash = false;
     g->enable = false;
     snap = firc_ruleset_snapshot_build(&cfg);
     ASSERT_FALSEm("a disabled group can never route; its missing list is moot", snap->provisional);
@@ -550,7 +630,7 @@ TEST a_kept_out_group_is_out_of_the_view_and_of_provisional(void)
     firc_group_add_rule(g1, make_rule((firc_id_t){{1, 1, 0, 0}}, "domain", "a.example.com", true));
     firc_group_t *g2 = make_group((firc_id_t){{2, 0, 0, 0}}, "two", true);
     firc_group_add_rule(g2, make_rule((firc_id_t){{2, 1, 0, 0}}, "domain", "b.example.com", true));
-    g2->list = firc_group_list_new();
+    test_group_set_list(g2);
     firc_config_add_group(&cfg, g1);
     firc_config_add_group(&cfg, g2);
 
@@ -657,6 +737,10 @@ int main(int argc, char **argv)
     RUN_TEST(a_manual_group_above_a_list_group_owns_a_shared_name);
     RUN_TEST(a_hand_rule_and_a_list_rule_of_one_group_give_one_owner);
     RUN_TEST(a_list_group_without_a_body_makes_the_snapshot_provisional);
+    RUN_TEST(a_name_of_the_second_list_belongs_to_the_group);
+    RUN_TEST(a_disabled_rule_of_one_list_leaves_the_other);
+    RUN_TEST(a_failed_list_does_not_keep_the_snapshot_provisional);
+    RUN_TEST(an_untried_list_keeps_it_provisional);
     RUN_TEST(a_list_group_without_an_interface_still_takes_its_names);
     RUN_TEST(a_kept_out_group_is_out_of_the_view_and_of_provisional);
     RUN_TEST(an_unscoped_upper_group_owns_every_device);

@@ -84,6 +84,7 @@ export type SyncState = InferOutput<typeof SyncStateSchema>;
 export const syncIdle = (): SyncState => ({ state: "idle", error: "", lastCheck: 0 });
 
 export const GroupListSchema = object({
+  id: fallback(pipe(string(), length(8), regex(/^[0-9a-f]{8}/)), () => randomId()),
   url: fallback(string(), ""),
   interval: fallback(optional(number()), 86400),
   lastUpdate: fallback(optional(number()), 0),
@@ -143,7 +144,7 @@ export const GroupSchema = object({
   enable: fallback(boolean(), true),
   devices: fallback(DeviceSelectorSchema, { allow: [], deny: [] }),
   rules: array(RuleSchema),
-  list: optional(nullable(GroupListSchema)),
+  lists: fallback(array(GroupListSchema), []),
   resolve: fallback(GroupResolveSchema, DEFAULT_RESOLVE),
   resolver: optional(GroupResolverSchema),
   cloudflare: fallback(boolean(), false),

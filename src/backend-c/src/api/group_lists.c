@@ -16,13 +16,34 @@
 
 #include "groups_internal.h"
 
-/* false with the answer already written when the id is bad, the group is not there, or it has no list */
-static bool resolve_list(firc_groups_ctx_t *ctx, firc_http_req_t *req, firc_http_res_t *res,
-                         firc_group_t **out) {
+/* false with the answer already written when an id is bad, the group is not there, or it has no such list */
+static bool resolve_list(firc_groups_ctx_t *ctx, firc_http_req_t *req, firc_http_res_t *res, firc_group_t **out,
+                         firc_group_list_t **out_list) {
+    firc_ruleset_t *rs;
+    if (!firc_groups_resolve(ctx, req, res, &rs)) { return false; }
+    const char *id_str = firc_http_req_param(req, "listID");
+    firc_id_t list_id;
+    if (id_str == NULL || firc_id_parse(id_str, &list_id) != FIRC_OK) {
+        firc_http_res_write_error(res, 400, "invalid list id");
+        return false;
+    }
+    firc_group_t *g = firc_ruleset_group_mut(rs);
+    firc_group_list_t *l = firc_group_find_list(g, list_id);
+    if (l == NULL) {
+        firc_http_res_write_error(res, 404, "group has no such list");
+        return false;
+    }
+    *out = g;
+    *out_list = l;
+    return true;
+}
+
+static bool resolve_listed_group(firc_groups_ctx_t *ctx, firc_http_req_t *req, firc_http_res_t *res,
+                                 firc_group_t **out) {
     firc_ruleset_t *rs;
     if (!firc_groups_resolve(ctx, req, res, &rs)) { return false; }
     firc_group_t *g = firc_ruleset_group_mut(rs);
-    if (g->list == NULL) {
+    if (g->n_lists == 0) {
         firc_http_res_write_error(res, 404, "group has no list");
         return false;
     }
@@ -273,7 +294,8 @@ static bool ci_contains(const char *hay, const char *needle, size_t needle_len) 
 /* each matching rule is dumped straight into the answer's bytes: a cJSON tree of the whole list has killed the router */
 static void handle_get_page(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_group_t *g;
-    if (!resolve_list(ud, req, res, &g)) { return; }
+    firc_group_list_t *l;
+    if (!resolve_list(ud, req, res, &g, &l)) { return; }
     size_t offset = 0, limit = FIRC_LIST_PAGE_DEFAULT;
     if (!firc_http_req_size(req, res, "offset", 0, &offset)) { return; }
     if (!firc_http_req_size(req, res, "limit", FIRC_LIST_PAGE_DEFAULT, &limit)) { return; }
@@ -293,7 +315,7 @@ static void handle_get_page(firc_http_req_t *req, firc_http_res_t *res, void *ud
         for (size_t i = 0; i < needle_len; i++) { needle[i] = (char)tolower((unsigned char)needle[i]); }
     }
 
-    const firc_sub_rules_t *rs = &g->list->rules;
+    const firc_sub_rules_t *rs = &l->rules;
     firc_bytebuf_t b;
     firc_bytebuf_init(&b);
     firc_err_t err = firc_bytebuf_append_str(&b, "{\"rules\":[");
@@ -329,8 +351,10 @@ static void handle_get_page(firc_http_req_t *req, firc_http_res_t *res, void *ud
 static void handle_patch_rules(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_groups_ctx_t *ctx = ud;
     firc_group_t *g;
-    if (!resolve_list(ctx, req, res, &g)) { return; }
+    firc_group_list_t *l;
+    if (!resolve_list(ctx, req, res, &g, &l)) { return; }
     firc_id_t gid = g->id;
+    firc_id_t list_id = l->id;
     cJSON *json = parse_body_json(req);
     if (!json) {
         firc_http_res_write_error(res, 400, "failed to parse request");
@@ -384,7 +408,7 @@ static void handle_patch_rules(firc_http_req_t *req, firc_http_res_t *res, void 
         return;
     }
     char msg[384] = "invalid rule edit";
-    firc_err_t err = firc_app_patch_list_rules(ctx->app, gid, edits, n, msg, sizeof(msg));
+    firc_err_t err = firc_app_patch_list_rules(ctx->app, gid, list_id, edits, n, msg, sizeof(msg));
     free(edits);
     cJSON_Delete(json);
     if (err == FIRC_ERR_NOENT) {
@@ -438,28 +462,27 @@ static firc_err_t build_event(firc_bytebuf_t *b, const char *event, const char *
     return err;
 }
 
-/* done means the job finished: last event, stream closes after; error is read off the list alone, owner may be gone */
+/* done: no list of the group is in flight any more, so this is the last event and the stream closes after it */
 static bool subscriber_send(list_subscriber_t *e, firc_id_t owner, const firc_group_list_t *list, bool done) {
-    const char *name;
-    cJSON *payload;
-    if (!done) {
-        name = "progress";
-        payload = firc_api_list_progress_json(list);
-    } else if (list->sync_state == FIRC_SUB_SYNC_ERROR) {
-        name = "error";
-        payload = cJSON_CreateObject();
-        if (payload != NULL) { cJSON_AddStringToObject(payload, "error", list->sync_error); }
+    char gid[FIRC_ID_STR_LEN], lid[FIRC_ID_STR_LEN];
+    firc_id_format(owner, gid);
+    firc_id_format(list->id, lid);
+    cJSON *payload = cJSON_CreateObject();
+    cJSON *item = firc_groups_list_json(list);
+    bool ok = payload != NULL && item != NULL && cJSON_AddStringToObject(payload, "groupId", gid) != NULL &&
+              cJSON_AddStringToObject(payload, "listId", lid) != NULL;
+    if (ok && cJSON_AddItemToObject(payload, "list", item)) {
+        item = NULL;
     } else {
-        name = "done";
-        firc_ruleset_t *rs = firc_app_find_group_by_id(e->ctx->app, owner);
-        payload = rs != NULL ? firc_groups_group_json(e->ctx->app, firc_ruleset_group(rs), false) : NULL;
+        ok = false;
     }
-    char *text = payload != NULL ? firc_json_dump(payload) : NULL;
+    cJSON_Delete(item);
+    char *text = ok ? firc_json_dump(payload) : NULL;
     cJSON_Delete(payload);
 
     firc_bytebuf_t b;
     firc_bytebuf_init(&b);
-    firc_err_t built = text != NULL ? build_event(&b, name, text) : FIRC_ERR_NOMEM;
+    firc_err_t built = text != NULL ? build_event(&b, done ? "done" : "progress", text) : FIRC_ERR_NOMEM;
     free(text);
     if (built != FIRC_OK) {
         firc_bytebuf_free(&b);
@@ -489,11 +512,11 @@ static void sync_listener(void *ud, firc_id_t owner, const firc_group_list_t *li
     }
 }
 
-/* holds the connection; the first event restates current state so a late/reconnecting client never waits forever */
+/* holds the connection; the first events restate every list so a late/reconnecting client never waits forever */
 static void handle_get_sync_events(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_groups_ctx_t *ctx = ud;
     firc_group_t *g;
-    if (!resolve_list(ctx, req, res, &g)) { return; }
+    if (!resolve_listed_group(ctx, req, res, &g)) { return; }
 
     list_subscriber_t *e = calloc(1, sizeof(*e));
     if (e == NULL) {
@@ -513,8 +536,10 @@ static void handle_get_sync_events(firc_http_req_t *req, firc_http_res_t *res, v
         firc_http_res_write_error(res, 500, "out of memory");
         return;
     }
-    bool running = g->list->sync_state == FIRC_SUB_SYNC_QUEUED || g->list->sync_state == FIRC_SUB_SYNC_FETCHING;
-    (void)subscriber_send(e, g->id, g->list, !running);
+    bool idle = !firc_app_group_syncing(g);
+    for (size_t i = 0; i < g->n_lists; i++) {
+        if (!subscriber_send(e, g->id, g->lists[i], idle && i + 1 == g->n_lists)) { return; }
+    }
 }
 
 void firc_groups_api_close_streams(firc_groups_ctx_t *ctx) {
@@ -542,41 +567,9 @@ void firc_groups_api_close_streams(firc_groups_ctx_t *ctx) {
     }
 }
 
-/* an optional {"url"} body is stored before the enqueue: the job is built from the list, a new url must be on it */
-static void handle_sync(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
-    firc_groups_ctx_t *ctx = ud;
-    firc_group_t *g;
-    if (!resolve_list(ctx, req, res, &g)) { return; }
-    firc_id_t id = g->id;
-
-    size_t body_len;
-    (void)firc_http_req_body(req, &body_len);
-    if (body_len > 0) {
-        cJSON *json = parse_body_json(req);
-        if (!json) {
-            firc_http_res_write_error(res, 400, "failed to parse request");
-            return;
-        }
-        const char *url = get_string(json, "url");
-        firc_err_t uerr = url[0] != '\0' ? firc_app_set_list_url(ctx->app, id, url) : FIRC_OK;
-        cJSON_Delete(json);
-        if (uerr == FIRC_ERR_NOENT) {
-            firc_http_res_write_error(res, 404, "group has no list");
-            return;
-        }
-        if (uerr == FIRC_ERR_INVAL) {
-            firc_http_res_write_error(res, 400, "list url is not supported");
-            return;
-        }
-        if (uerr != FIRC_OK) {
-            firc_http_res_write_error(res, 500, firc_err_str(uerr));
-            return;
-        }
-    }
-
-    firc_err_t err = firc_app_request_sync(ctx->app, id);
+static void answer_request_sync(firc_groups_ctx_t *ctx, firc_http_res_t *res, firc_group_t *g, firc_err_t err) {
     if (err == FIRC_ERR_NOENT) {
-        firc_http_res_write_error(res, 404, "group has no list");
+        firc_http_res_write_error(res, 404, "group has no such list");
         return;
     }
     if (err == FIRC_ERR_INVAL) {
@@ -601,12 +594,59 @@ static void handle_sync(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     firc_http_res_write_json(res, 202, record);
 }
 
+/* an optional {"url"} body is stored before the enqueue: the job is built from the list, a new url must be on it */
+static void handle_sync(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    firc_groups_ctx_t *ctx = ud;
+    firc_group_t *g;
+    firc_group_list_t *l;
+    if (!resolve_list(ctx, req, res, &g, &l)) { return; }
+    firc_id_t id = g->id;
+    firc_id_t list_id = l->id;
+
+    size_t body_len;
+    (void)firc_http_req_body(req, &body_len);
+    if (body_len > 0) {
+        cJSON *json = parse_body_json(req);
+        if (!json) {
+            firc_http_res_write_error(res, 400, "failed to parse request");
+            return;
+        }
+        const char *url = get_string(json, "url");
+        bool supported = firc_sub_url_is_supported(url);
+        firc_err_t uerr = url[0] != '\0' ? firc_app_set_list_url(ctx->app, id, list_id, url) : FIRC_OK;
+        cJSON_Delete(json);
+        if (uerr == FIRC_ERR_NOENT) {
+            firc_http_res_write_error(res, 404, "group has no such list");
+            return;
+        }
+        if (uerr == FIRC_ERR_INVAL) {
+            firc_http_res_write_error(res, 400, supported ? "duplicate list url" : "list url is not supported");
+            return;
+        }
+        if (uerr != FIRC_OK) {
+            firc_http_res_write_error(res, 500, firc_err_str(uerr));
+            return;
+        }
+    }
+    answer_request_sync(ctx, res, g, firc_app_request_sync(ctx->app, id, list_id));
+}
+
+static void handle_sync_group(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    firc_groups_ctx_t *ctx = ud;
+    firc_group_t *g;
+    if (!resolve_listed_group(ctx, req, res, &g)) { return; }
+    size_t queued = 0;
+    firc_err_t err = firc_app_request_sync_group(ctx->app, g->id, &queued);
+    answer_request_sync(ctx, res, g, queued != 0 ? FIRC_OK : err);
+}
+
 void firc_group_lists_register_routes(firc_httpd_t *h, firc_groups_ctx_t *ctx) {
     must_route(h, "GET", "/api/v1/groups/list/preview", handle_preview, ctx);
     firc_list_catalog_register_routes(h, ctx);
-    must_route(h, "GET", "/api/v1/groups/{groupID}/list/rules", handle_get_page, ctx);
-    must_route(h, "PATCH", "/api/v1/groups/{groupID}/list/rules", handle_patch_rules, ctx);
-    must_route(h, "POST", "/api/v1/groups/{groupID}/list/sync", handle_sync, ctx);
-    must_route(h, "GET", "/api/v1/groups/{groupID}/list/sync/events", handle_get_sync_events, ctx);
+    must_route(h, "GET", "/api/v1/groups/{groupID}/lists/{listID}/rules", handle_get_page, ctx);
+    must_route(h, "PATCH", "/api/v1/groups/{groupID}/lists/{listID}/rules", handle_patch_rules, ctx);
+    must_route(h, "POST", "/api/v1/groups/{groupID}/lists/{listID}/sync", handle_sync, ctx);
+    must_route(h, "POST", "/api/v1/groups/{groupID}/sync", handle_sync_group, ctx);
+    must_route(h, "GET", "/api/v1/groups/{groupID}/sync/events", handle_get_sync_events, ctx);
     firc_app_set_sync_listener(ctx->app, sync_listener, ctx); /* one listener; both servers share ctx */
 }

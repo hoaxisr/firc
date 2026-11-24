@@ -40,9 +40,7 @@ static const char *comment_from_req(const cJSON *req, const char **why) {
     return item->valuestring;
 }
 
-/* list is config only here; the app's carry_list gate moves a live list's arena/sync state in when the url matches */
-
-/* absent list keeps the group's own, as an absent devices/rules does; NULL on OOM */
+/* absent lists keep the group's own, as an absent devices/rules does; NULL on OOM */
 static firc_group_list_t *list_config_copy(const firc_group_list_t *src) {
     firc_group_list_t *list = firc_group_list_new();
     if (list == NULL) { return NULL; }
@@ -50,6 +48,7 @@ static firc_group_list_t *list_config_copy(const firc_group_list_t *src) {
         firc_group_list_free(list);
         return NULL;
     }
+    list->id = src->id;
     list->interval = src->interval;
     list->last_update = src->last_update;
     for (size_t i = 0; i < src->n_overrides; i++) {
@@ -64,21 +63,60 @@ static firc_group_list_t *list_config_copy(const firc_group_list_t *src) {
     return list;
 }
 
-/* url is required; interval absent keeps the live list's own; overrides always come from existing, never the body */
-static firc_err_t list_from_req(const cJSON *list_j, const firc_group_list_t *existing,
+static bool lists_req_names(const cJSON *lists_j, firc_id_t id) {
+    const cJSON *item;
+    cJSON_ArrayForEach(item, lists_j) {
+        firc_id_t named;
+        bool has;
+        if (parse_optional_id(item, "id", &named, &has) == FIRC_OK && has && firc_id_equal(named, id)) { return true; }
+    }
+    return false;
+}
+
+static const firc_group_list_t *paired_live_list(const firc_group_t *existing, const cJSON *lists_j, firc_id_t id,
+                                                 const char *url) {
+    if (existing == NULL) { return NULL; }
+    if (!firc_id_is_zero(id)) { return firc_group_find_list(existing, id); }
+    for (size_t i = 0; i < existing->n_lists; i++) {
+        const firc_group_list_t *l = existing->lists[i];
+        if (strcmp(l->url, url) == 0 && !lists_req_names(lists_j, l->id)) { return l; }
+    }
+    return NULL;
+}
+
+static firc_err_t list_from_req(const cJSON *list_j, const cJSON *lists_j, const firc_group_t *existing,
                                firc_group_list_t **out, const char **err_msg) {
+    if (!cJSON_IsObject(list_j)) {
+        *err_msg = "invalid list";
+        return FIRC_ERR_INVAL;
+    }
+    firc_id_t id = {{0, 0, 0, 0}};
+    bool has_id;
+    if (parse_optional_id(list_j, "id", &id, &has_id) != FIRC_OK) {
+        *err_msg = "invalid list id";
+        return FIRC_ERR_INVAL;
+    }
     const char *url = get_string(list_j, "url");
     if (url[0] == '\0' || !firc_sub_url_is_supported(url)) {
         *err_msg = "invalid list";
         return FIRC_ERR_INVAL;
     }
+    const firc_group_list_t *paired = paired_live_list(existing, lists_j, id, url);
     firc_group_list_t *list = firc_group_list_new();
     if (list == NULL) { return FIRC_ERR_NOMEM; }
     firc_err_t err = firc_strset(&list->url, url);
+    if (paired != NULL) {
+        list->id = paired->id;
+    } else if (!firc_id_is_zero(id)) {
+        list->id = id;
+    } else if (err == FIRC_OK) {
+        err = firc_id_random(&list->id);
+    }
     if (err != FIRC_OK) {
         firc_group_list_free(list);
         return err;
     }
+    list->interval = paired != NULL ? paired->interval : 86400;
     cJSON *interval_j = cJSON_GetObjectItemCaseSensitive(list_j, "interval");
     if (cJSON_IsNumber(interval_j)) {
         uint64_t interval;
@@ -88,13 +126,11 @@ static firc_err_t list_from_req(const cJSON *list_j, const firc_group_list_t *ex
             return FIRC_ERR_INVAL;
         }
         list->interval = (uint32_t)interval;
-    } else if (existing != NULL) {
-        list->interval = existing->interval;
     }
-    if (existing != NULL) {
-        list->last_update = existing->last_update;
-        for (size_t i = 0; i < existing->n_overrides; i++) {
-            const firc_sub_override_t *o = existing->overrides[i];
+    if (paired != NULL) {
+        list->last_update = paired->last_update;
+        for (size_t i = 0; i < paired->n_overrides; i++) {
+            const firc_sub_override_t *o = paired->overrides[i];
             firc_sub_rule_key_t key = {o->rule, o->list_type, o->proto, o->ports};
             if (firc_group_list_set_override(list, &key, o->type,
                                              o->has_enable ? &o->enable : NULL) != FIRC_OK) {
@@ -104,6 +140,45 @@ static firc_err_t list_from_req(const cJSON *list_j, const firc_group_list_t *ex
         }
     }
     *out = list;
+    return FIRC_OK;
+}
+
+static firc_err_t add_req_list(firc_group_t *group, firc_group_list_t *list, const char **err_msg) {
+    bool dup_id = firc_group_find_list(group, list->id) != NULL;
+    firc_err_t err = firc_group_add_list(group, list);
+    if (err == FIRC_OK) { return FIRC_OK; }
+    firc_group_list_free(list);
+    if (err == FIRC_ERR_INVAL) { *err_msg = dup_id ? "duplicate list id" : "duplicate list url"; }
+    if (err == FIRC_ERR_LIMIT) {
+        *err_msg = "a group carries at most 16 lists";
+        err = FIRC_ERR_INVAL;
+    }
+    return err;
+}
+
+static firc_err_t lists_from_req(const cJSON *req, const firc_group_t *existing, firc_group_t *group,
+                                 const char **err_msg) {
+    cJSON *lists_j = cJSON_GetObjectItemCaseSensitive(req, "lists");
+    if (lists_j == NULL) {
+        for (size_t i = 0; existing != NULL && i < existing->n_lists; i++) {
+            firc_group_list_t *copy = list_config_copy(existing->lists[i]);
+            if (copy == NULL) { return FIRC_ERR_NOMEM; }
+            firc_err_t err = add_req_list(group, copy, err_msg);
+            if (err != FIRC_OK) { return err; }
+        }
+        return FIRC_OK;
+    }
+    if (!cJSON_IsArray(lists_j)) {
+        *err_msg = "invalid lists";
+        return FIRC_ERR_INVAL;
+    }
+    const cJSON *item;
+    cJSON_ArrayForEach(item, lists_j) {
+        firc_group_list_t *made = NULL;
+        firc_err_t err = list_from_req(item, lists_j, existing, &made, err_msg);
+        if (err == FIRC_OK) { err = add_req_list(group, made, err_msg); }
+        if (err != FIRC_OK) { return err; }
+    }
     return FIRC_OK;
 }
 
@@ -487,28 +562,10 @@ static firc_err_t group_from_req(const cJSON *req, const firc_group_t *existing,
         return err;
     }
 
-    /* absent keeps the live list as a config copy; null removes it; an object replaces it; anything else is refused */
-    cJSON *list_j = cJSON_GetObjectItemCaseSensitive(req, "list");
-    if (list_j == NULL) {
-        if (existing != NULL && existing->list != NULL) {
-            group->list = list_config_copy(existing->list);
-            if (group->list == NULL) {
-                firc_group_free(group);
-                return FIRC_ERR_NOMEM;
-            }
-        }
-    } else if (cJSON_IsNull(list_j)) {
-        /* group->list is already NULL */
-    } else if (cJSON_IsObject(list_j)) {
-        err = list_from_req(list_j, existing != NULL ? existing->list : NULL, &group->list, err_msg);
-        if (err != FIRC_OK) {
-            firc_group_free(group);
-            return err;
-        }
-    } else {
+    err = lists_from_req(req, existing, group, err_msg);
+    if (err != FIRC_OK) {
         firc_group_free(group);
-        *err_msg = "invalid list";
-        return FIRC_ERR_INVAL;
+        return err;
     }
 
     cJSON *rules_j = cJSON_GetObjectItemCaseSensitive(req, "rules");
@@ -615,10 +672,13 @@ static cJSON *wrap_rules(firc_rule_t **rules, size_t n) {
 }
 
 /* never the rules themselves, only their count; sync.progress is null outside QUEUED/FETCHING; NULL on OOM */
-static cJSON *list_to_json(const firc_group_list_t *l) {
+cJSON *firc_groups_list_json(const firc_group_list_t *l) {
     cJSON *obj = cJSON_CreateObject();
     if (obj == NULL) { return NULL; }
-    if (cJSON_AddStringToObject(obj, "url", l->url ? l->url : "") == NULL ||
+    char id_buf[FIRC_ID_STR_LEN];
+    firc_id_format(l->id, id_buf);
+    if (cJSON_AddStringToObject(obj, "id", id_buf) == NULL ||
+        cJSON_AddStringToObject(obj, "url", l->url ? l->url : "") == NULL ||
         cJSON_AddNumberToObject(obj, "interval", l->interval) == NULL ||
         cJSON_AddNumberToObject(obj, "lastUpdate", l->last_update) == NULL ||
         cJSON_AddNumberToObject(obj, "rulesTotal", (double)l->rules.n) == NULL) {
@@ -743,13 +803,18 @@ cJSON *firc_groups_group_json(firc_app_t *app, const firc_group_t *g, bool with_
     }
     /* "rules" key omitted otherwise */
     if (with_rules) { cJSON_AddItemToObject(obj, "rules", rules_to_json_array(g->rules, g->n_rules)); }
-    if (g->list != NULL) {
-        cJSON *list = list_to_json(g->list);
-        if (list == NULL) {
+    cJSON *lists = cJSON_AddArrayToObject(obj, "lists");
+    if (lists == NULL) {
+        cJSON_Delete(obj);
+        return NULL;
+    }
+    for (size_t i = 0; i < g->n_lists; i++) {
+        cJSON *list = firc_groups_list_json(g->lists[i]);
+        if (list == NULL || !cJSON_AddItemToArray(lists, list)) {
+            cJSON_Delete(list);
             cJSON_Delete(obj);
             return NULL;
         }
-        cJSON_AddItemToObject(obj, "list", list);
     }
     return obj;
 }

@@ -12,6 +12,17 @@ type ListRule = {
   ports?: string;
 };
 
+const LID = "0a0a0a0a";
+
+type ListData = {
+  id: string;
+  url: string;
+  interval: number;
+  lastUpdate: number;
+  sync: { state: string; error: string; lastCheck: number };
+  rules: ListRule[];
+};
+
 type ListGroup = {
   id: string;
   name: string;
@@ -19,13 +30,7 @@ type ListGroup = {
   enable: boolean;
   devices: { allow: string[]; deny: string[] };
   rules: ListRule[];
-  list: {
-    url: string;
-    interval: number;
-    lastUpdate: number;
-    sync: { state: string; error: string; lastCheck: number };
-    rules: ListRule[];
-  };
+  lists: ListData[];
 };
 
 const makeListGroup = (
@@ -42,23 +47,28 @@ const makeListGroup = (
   enable: true,
   devices: { allow: [], deny: [] },
   rules: [],
-  list: {
-    url,
-    interval: 86400,
-    lastUpdate: 1700000000,
-    sync: { state: "idle", error: "", lastCheck: 1800000000 },
-    rules: listRules,
-  },
+  lists: [
+    {
+      id: LID,
+      url,
+      interval: 86400,
+      lastUpdate: 1700000000,
+      sync: { state: "idle", error: "", lastCheck: 1800000000 },
+      rules: listRules,
+    },
+  ],
 });
 
+const listRes = ({ rules, ...meta }: ListData) => ({ ...meta, rulesTotal: rules.length });
+
 function groupRes(group: ListGroup) {
-  if (!group.list) return { ...group };
-  const { rules: listRules, ...listMeta } = group.list;
-  return { ...group, list: { ...listMeta, rulesTotal: listRules.length } };
+  return { ...group, lists: (group.lists ?? []).map(listRes) };
 }
 
-const doneStream = (group: ListGroup) =>
-  `event: done\ndata: ${JSON.stringify(groupRes(group))}\n\n`;
+const doneEvent = (group: ListGroup, list: ListData) =>
+  `event: done\ndata: ${JSON.stringify({ groupId: group.id, listId: list.id, list: listRes(list) })}\n\n`;
+
+const doneStream = (group: ListGroup) => doneEvent(group, group.lists[0]);
 
 const readSizeParam = (params: URLSearchParams, name: string, dflt: number): number | null => {
   const raw = params.get(name);
@@ -92,23 +102,19 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
       savedBody = route.request().postDataJSON();
       groups = (savedBody?.groups ?? []).map((g: any) => {
         const existing = groups.find((x) => x.id === g.id);
-        let list = existing?.list;
-        if ("list" in g) {
-          if (g.list === null || g.list === undefined) {
-            list = undefined as any;
-          } else if (list && list.url === g.list.url) {
-            list = { ...list, interval: g.list.interval };
-          } else {
-            list = {
-              url: g.list.url,
-              interval: g.list.interval,
-              lastUpdate: 1800000000,
-              sync: { state: "queued", error: "", lastCheck: 0 },
-              rules: [{ enable: true, id: "87654321", rule: "synced.example.com", type: "domain" }],
-            };
-          }
-        }
-        return structuredClone({ ...g, rules: g.rules ?? existing?.rules ?? [], list });
+        const lists = (g.lists ?? existing?.lists ?? []).map((item: any) => {
+          const live = existing?.lists.find((l) => l.id === item.id || l.url === item.url);
+          if (live && live.url === item.url) return { ...live, interval: item.interval };
+          return {
+            id: item.id ?? LID,
+            url: item.url,
+            interval: item.interval,
+            lastUpdate: 1800000000,
+            sync: { state: "queued", error: "", lastCheck: 0 },
+            rules: [{ enable: true, id: "87654321", rule: "synced.example.com", type: "domain" }],
+          };
+        });
+        return structuredClone({ ...g, rules: g.rules ?? existing?.rules ?? [], lists });
       });
       await route.fulfill({ json: { groups: groups.map(groupRes) } });
       return;
@@ -122,14 +128,16 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
     await route.fulfill({ json: { status: "ok" } });
   });
 
-  await page.route(/\/groups\/[0-9a-f]{8}\/list\/rules(\?.*)?$/, async (route) => {
-    const id = route.request().url().replace(/\?.*$/, "").split("/").at(-3) ?? "";
+  await page.route(/\/groups\/[0-9a-f]{8}\/lists\/[0-9a-f]{8}\/rules(\?.*)?$/, async (route) => {
+    const parts = route.request().url().replace(/\?.*$/, "").split("/");
+    const id = parts.at(-4) ?? "";
     const group = groups.find((item) => item.id === id);
+    const list = group?.lists.find((item) => item.id === parts.at(-2));
 
     if (route.request().method() === "GET") {
       pageUrls.push(route.request().url());
-      if (!group?.list) {
-        await route.fulfill({ status: 404, json: { error: "group has no list" } });
+      if (!list) {
+        await route.fulfill({ status: 404, json: { error: "group has no such list" } });
         return;
       }
       const requestUrl = new URL(route.request().url());
@@ -145,10 +153,10 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
       }
       const limit = Math.min(asked || 50, 500);
       const q = (requestUrl.searchParams.get("q") ?? "").toLowerCase();
-      const matches = group.list.rules.filter((r) => !q || r.rule.toLowerCase().includes(q));
+      const matches = list.rules.filter((r) => !q || r.rule.toLowerCase().includes(q));
       await route.fulfill({
         json: {
-          total: group.list.rules.length,
+          total: list.rules.length,
           matched: matches.length,
           offset,
           rules: matches.slice(offset, offset + limit),
@@ -160,8 +168,8 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
     const body = route.request().postDataJSON();
     writeUrls.push(route.request().url());
     patchBodies.push({ id, body });
-    if (!group?.list) {
-      await route.fulfill({ status: 404, json: { error: "group has no list" } });
+    if (!list) {
+      await route.fulfill({ status: 404, json: { error: "group has no such list" } });
       return;
     }
     const staged: { rule: ListRule; edit: any }[] = [];
@@ -173,7 +181,7 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
         });
         return;
       }
-      const rule = group.list.rules.find((r) => r.id === edit.id);
+      const rule = list.rules.find((r) => r.id === edit.id);
       if (!rule) {
         await route.fulfill({ status: 404, json: { error: "rule not found" } });
         return;
@@ -187,39 +195,40 @@ async function setupGroupLists(page: Page, data: ListGroup[], options: { expand?
     await route.fulfill({ json: { status: "ok" } });
   });
 
-  await page.route("**/groups/*/list/sync", async (route) => {
+  await page.route("**/groups/*/lists/*/sync", async (route) => {
     syncBody = route.request().postDataJSON();
-    const id = route.request().url().split("/").at(-3);
-    const group = groups.find((item) => item.id === id);
-    if (!group?.list) {
-      await route.fulfill({ status: 404, json: { error: "group has no list" } });
+    const parts = route.request().url().split("/");
+    const group = groups.find((item) => item.id === parts.at(-4));
+    const list = group?.lists.find((item) => item.id === parts.at(-2));
+    if (!group || !list) {
+      await route.fulfill({ status: 404, json: { error: "group has no such list" } });
       return;
     }
 
-    group.list.url = syncBody?.url ?? group.list.url;
-    group.list.rules = [
-      { enable: true, id: "87654321", rule: "synced.example.com", type: "domain" },
-    ];
-    group.list.lastUpdate = 1800000000;
-    group.list.sync = { state: "queued", error: "", lastCheck: group.list.sync.lastCheck };
+    list.url = syncBody?.url ?? list.url;
+    list.rules = [{ enable: true, id: "87654321", rule: "synced.example.com", type: "domain" }];
+    list.lastUpdate = 1800000000;
+    list.sync = { state: "queued", error: "", lastCheck: list.sync.lastCheck };
 
     await route.fulfill({ status: 202, json: groupRes(group) });
   });
 
-  await page.route("**/groups/*/list/sync/events", async (route) => {
+  await page.route("**/groups/*/sync/events", async (route) => {
     const id = route
       .request()
       .url()
-      .replace(/\/list\/sync\/events.*$/, "")
+      .replace(/\/sync\/events.*$/, "")
       .split("/")
       .at(-1);
     const group = groups.find((item) => item.id === id);
-    if (!group?.list) {
+    if (!group?.lists.length) {
       await route.fulfill({ status: 404, json: { error: "group has no list" } });
       return;
     }
     streamUrls.push(route.request().url());
-    group.list.sync = { state: "idle", error: "", lastCheck: group.list.sync.lastCheck };
+    for (const list of group.lists) {
+      list.sync = { state: "idle", error: "", lastCheck: list.sync.lastCheck };
+    }
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
@@ -272,7 +281,7 @@ test.describe("Groups with a list", () => {
   test("the list line shows the last fetch, else the last change", async ({ page }) => {
     const fetched = makeListGroup("a1b2c3d4", "https://a.example/list.txt", "Fetched");
     const unfetched = makeListGroup("e5f6a7b8", "https://b.example/list.txt", "Unfetched");
-    unfetched.list.sync.lastCheck = 0;
+    unfetched.lists[0].sync.lastCheck = 0;
     await setupGroupLists(page, [fetched, unfetched], { expand: false });
     const lines = page.locator(".update-text");
     await expect(lines.nth(0)).toContainText("15.01.2027");
@@ -294,7 +303,7 @@ test.describe("Groups with a list", () => {
     await saveButton.click();
 
     await expect(page.getByText("Saved")).toBeVisible();
-    expect(state.savedBody?.groups[0].list.url).toBe("https://new.example/list.txt");
+    expect(state.savedBody?.groups[0].lists[0].url).toBe("https://new.example/list.txt");
   });
 
   // Catches a Save sending the list's fetched rules back, which hits the 1 MiB body cap.
@@ -319,13 +328,13 @@ test.describe("Groups with a list", () => {
     );
 
     expect(state.pageUrls[0]).toContain("offset=0");
-    expect(state.savedBody?.groups[0].list).not.toHaveProperty("rules");
+    expect(state.savedBody?.groups[0].lists[0]).not.toHaveProperty("rules");
     expect(state.patchBodies).toHaveLength(1);
     expect(state.patchBodies[0].id).toBe("a1b2c3d4");
     expect(state.patchBodies[0].body.rules).toHaveLength(1);
     expect(state.patchBodies[0].body.rules[0]).toEqual({ id: "a1b2aaaa", enable: false });
-    expect(state.groups[0].list.rules).toHaveLength(1);
-    expect(state.groups[0].list.rules[0].enable).toBe(false);
+    expect(state.groups[0].lists[0].rules).toHaveLength(1);
+    expect(state.groups[0].lists[0].rules[0].enable).toBe(false);
 
     expect(state.writeUrls).toHaveLength(2);
     expect(state.writeUrls[0]).not.toContain("save=true");
@@ -351,7 +360,7 @@ test.describe("Groups with a list", () => {
 
     expect(state.patchBodies).toHaveLength(1);
     expect(state.patchBodies[0].body.rules[0]).toEqual({ id: "87654321", enable: false });
-    expect(state.groups[0].list.rules[0].enable).toBe(false);
+    expect(state.groups[0].lists[0].rules[0].enable).toBe(false);
   });
 
   // Catches a PATCH addressing the dialog preview's ids instead of the ids the sync handed out.
@@ -361,7 +370,6 @@ test.describe("Groups with a list", () => {
     await page.locator('[data-value="Add Group"] button').click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("New List Group");
-    await dialog.locator('[aria-label="List by URL"]').click();
     await dialog.locator("#gd-url").fill("https://new.example/list.txt");
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
@@ -392,7 +400,6 @@ test.describe("Groups with a list", () => {
     await page.locator('[data-value="Add Group"] button').click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("New List Group");
-    await dialog.locator('[aria-label="List by URL"]').click();
     await dialog.locator("#gd-url").fill("https://new.example/list.txt");
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
@@ -413,7 +420,6 @@ test.describe("Groups with a list", () => {
     await page.locator('[data-value="Add Group"] button').click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("New List Group");
-    await dialog.locator('[aria-label="List by URL"]').click();
     await dialog.locator("#gd-url").fill("https://new.example/list.txt");
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
@@ -440,7 +446,6 @@ test.describe("Groups with a list", () => {
     await page.locator('[data-value="Add Group"] button').click();
     const dialog = page.getByRole("dialog");
     await dialog.locator("#gd-name").fill("New List Group");
-    await dialog.locator('[aria-label="List by URL"]').click();
     await dialog.locator("#gd-url").fill("https://new.example/list.txt");
     await dialog.getByRole("button", { name: "Create", exact: true }).click();
     await dialog.waitFor({ state: "hidden" });
@@ -460,7 +465,7 @@ test.describe("Groups with a list", () => {
       makeListGroup("a1b2c3d4", "https://old.example/list.txt"),
     ]);
 
-    await page.route(/\/groups\/[^/]+\/list\/rules(\?.*)?$/, async (route) => {
+    await page.route(/\/groups\/[^/]+\/lists\/[^/]+\/rules(\?.*)?$/, async (route) => {
       if (route.request().method() !== "PATCH") {
         await route.fallback();
         return;
@@ -531,7 +536,7 @@ test.describe("Groups with a list", () => {
       await route.fulfill({ json: { status: "ok" } });
     });
 
-    await page.route(/\/groups\/[^/]+\/list\/rules(\?.*)?$/, async (route) => {
+    await page.route(/\/groups\/[^/]+\/lists\/[^/]+\/rules(\?.*)?$/, async (route) => {
       if (route.request().method() !== "PATCH") {
         await route.fallback();
         return;
@@ -594,25 +599,35 @@ test.describe("Groups with a list", () => {
     ]);
 
     let streams = 0;
-    await page.route("**/groups/*/list/sync/events", async (route) => {
+    await page.route("**/groups/*/sync/events", async (route) => {
       streams++;
       if (streams === 1) {
         await route.fulfill({
           status: 200,
           contentType: "text/event-stream",
           body: `event: progress\ndata: ${JSON.stringify({
-            stage: "fetch",
-            bytes: 3145728,
-            total: 7786120,
+            groupId: state.groups[0].id,
+            listId: LID,
+            list: {
+              ...listRes(state.groups[0].lists[0]),
+              sync: {
+                state: "fetching",
+                error: "",
+                lastCheck: 0,
+                progress: { stage: "fetch", bytes: 3145728, total: 7786120 },
+              },
+            },
           })}\n\n`,
         });
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 1500));
+      const list = state.groups[0].lists[0];
+      list.sync = { state: "idle", error: "", lastCheck: list.sync.lastCheck };
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
-        body: `event: done\ndata: ${JSON.stringify(groupRes(state.groups[0]))}\n\n`,
+        body: doneStream(state.groups[0]),
       });
     });
 
@@ -633,11 +648,18 @@ test.describe("Groups with a list", () => {
       makeListGroup("a1b2c3d4", "https://old.example/list.txt"),
     ]);
 
-    await page.route("**/groups/*/list/sync/events", async (route) => {
+    await page.route("**/groups/*/sync/events", async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "text/event-stream",
-        body: `event: error\ndata: ${JSON.stringify({ error: "fetch failed: HTTP 404" })}\n\n`,
+        body: `event: done\ndata: ${JSON.stringify({
+          groupId: state.groups[0].id,
+          listId: LID,
+          list: {
+            ...listRes(state.groups[0].lists[0]),
+            sync: { state: "error", error: "fetch failed: HTTP 404", lastCheck: 0 },
+          },
+        })}\n\n`,
       });
     });
 
@@ -661,7 +683,7 @@ test.describe("Groups with a list", () => {
       type: "domain",
     }));
     const group = makeListGroup(groupId, "https://old.example/list.txt");
-    group.list.rules = manyRules;
+    group.lists[0].rules = manyRules;
 
     const state = await setupGroupLists(page, [group]);
 
@@ -695,19 +717,21 @@ test.describe("Groups with a list", () => {
       type: "domain",
     }));
     const group = makeListGroup(groupId, "https://old.example/list.txt");
-    group.list.rules = manyRules;
+    group.lists[0].rules = manyRules;
 
     const state = await setupGroupLists(page, [group]);
 
-    await page.route("**/groups/*/list/sync", async (route) => {
+    await page.route("**/groups/*/lists/*/sync", async (route) => {
       const syncedRules = Array.from({ length: 60 }, (_, i) => ({
         enable: true,
         id: `synced${i.toString(16).padStart(4, "0")}`,
         rule: `synced-${i}.example.com`,
         type: "domain",
       }));
-      state.groups[0].list.rules = syncedRules;
-      state.groups[0].list.lastUpdate = 1900000000;
+      state.groups[0].lists[0].rules = syncedRules;
+      state.groups[0].lists[0].lastUpdate = 1900000000;
+      const synced = state.groups[0].lists[0];
+      synced.sync = { state: "queued", error: "", lastCheck: synced.sync.lastCheck };
       await route.fulfill({ status: 202, json: groupRes(state.groups[0]) });
     });
 
@@ -731,7 +755,7 @@ test.describe("Groups with a list", () => {
 
     let getCount = 0;
     let answer = 500;
-    await page.route(/\/groups\/[0-9a-f]{8}\/list\/rules(\?.*)?$/, async (route) => {
+    await page.route(/\/groups\/[0-9a-f]{8}\/lists\/[0-9a-f]{8}\/rules(\?.*)?$/, async (route) => {
       if (route.request().method() !== "GET") {
         await route.fallback();
         return;
@@ -767,7 +791,7 @@ test.describe("Groups with a list", () => {
 
   test("search is answered by the daemon", async ({ page }) => {
     const group = makeListGroup("a1b2c3d4", "https://old.example/list.txt");
-    group.list.rules = [
+    group.lists[0].rules = [
       { enable: true, id: "a1b20001", rule: "alpha.example.com", type: "domain" },
       { enable: true, id: "a1b20002", rule: "beta.example.net", type: "domain" },
     ];
@@ -797,7 +821,7 @@ test.describe("Groups with a list", () => {
       { enable: true, id: "c1c20001", rule: "other.example.com", type: "domain" },
     ]);
     await setupGroupLists(page, [voice, other], { expand: false });
-    await page.route(/\/groups\/[0-9a-f]{8}\/list\/rules\?.*q=/, async (route) => {
+    await page.route(/\/groups\/[0-9a-f]{8}\/lists\/[0-9a-f]{8}\/rules\?.*q=/, async (route) => {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       await route.fallback();
     });
@@ -818,7 +842,7 @@ test.describe("Groups with a list", () => {
 
   test("clearing the search reloads the page the daemon filtered", async ({ page }) => {
     const group = makeListGroup("a1b2c3d4", "https://old.example/list.txt");
-    group.list.rules = [
+    group.lists[0].rules = [
       { enable: true, id: "a1b20001", rule: "alpha.example.com", type: "domain" },
       { enable: true, id: "a1b20002", rule: "beta.example.net", type: "domain" },
     ];
@@ -887,7 +911,7 @@ test.describe("Groups with a list", () => {
 
   test("a_group_without_a_list_shows_no_list_section", async ({ page }) => {
     const group = makeListGroup("a1b2c3d4", "https://old.example/list.txt");
-    (group as any).list = undefined;
+    (group as any).lists = [];
     group.rules = [{ enable: true, id: "handrule", rule: "hand.example.com", type: "domain" }];
     await setupGroupLists(page, [group]);
 
@@ -936,7 +960,7 @@ test.describe("Groups with a list", () => {
 
   test("the_place_number_follows_a_drag", async ({ page }) => {
     const manual = { ...makeListGroup("aaaaaaa1", "") } as any;
-    delete manual.list;
+    manual.lists = [];
     manual.name = "Manual";
 
     const listGroup = makeListGroup("bbbbbbb2", "https://old.example/list.txt", "Listed");

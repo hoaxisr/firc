@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "firc/events.h"
 #include "firc/log.h"
+#include "test_group_lists_util.h"
 
 static firc_err_t load_str(firc_config_t *cfg, const char *doc)
 {
@@ -455,8 +456,9 @@ TEST the_two_halves_hold_the_whole_config(void)
         "    name: A list\n"
         "    interface: nwg0\n"
         "    enable: true\n"
-        "    list:\n"
-        "      url: https://example.com/list.txt\n";
+        "    lists:\n"
+        "      - id: 7a7a7a01\n"
+        "        url: https://example.com/list.txt\n";
     ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
 
     char *whole = NULL, *settings = NULL, *groups = NULL;
@@ -469,9 +471,9 @@ TEST the_two_halves_hold_the_whole_config(void)
 
     ASSERTm("settings carry the app block", strstr(settings, "\napp:\n") != NULL);
     ASSERT_FALSEm("and not the groups", strstr(settings, "\ngroups:") != NULL);
-    ASSERT_FALSEm("nor a list", strstr(settings, "\n  list:") != NULL);
+    ASSERT_FALSEm("nor a list", strstr(settings, "\n  lists:") != NULL);
     ASSERTm("groups carry the groups", strstr(groups, "\ngroups:\n") != NULL);
-    ASSERTm("and their lists with them", strstr(groups, "\n  list:\n") != NULL);
+    ASSERTm("and their lists with them", strstr(groups, "\n  lists:\n") != NULL);
     ASSERT_FALSEm("and not the app block", strstr(groups, "\napp:") != NULL);
     ASSERTm("each says its version", strstr(settings, "configVersion: 0.99.0") != NULL);
     ASSERTm("each says its version", strstr(groups, "configVersion: 0.99.0") != NULL);
@@ -995,9 +997,10 @@ TEST a_conf_that_still_names_the_fake_ptr_switch_loads_and_drops_it(void)
     "    name: ads\n"                                                                              \
     "    interface: nwg0\n"                                                                        \
     "    enable: true\n"                                                                           \
-    "    list:\n"                                                                                  \
-    "      url: 'https://example.invalid/l.txt'\n"                                                 \
-    "      interval: 86400\n"
+    "    lists:\n"                                                                                 \
+    "      - id: 7a7a7a01\n"                                                                       \
+    "        url: 'https://example.invalid/l.txt'\n"                                               \
+    "        interval: 86400\n"
 
 /* Adds a group with a list to `cfg`; NULL on OOM. */
 static firc_group_list_t *add_list_group(firc_config_t *cfg, const char *name)
@@ -1005,16 +1008,16 @@ static firc_group_list_t *add_list_group(firc_config_t *cfg, const char *name)
     firc_group_t *g = firc_group_new();
     if (g == NULL) { return NULL; }
     g->id = test_random_id();
-    g->list = firc_group_list_new();
-    if (g->list == NULL || firc_strset(&g->name, name) != FIRC_OK ||
+    test_group_set_list(g);
+    if (g->n_lists == 0 || firc_strset(&g->name, name) != FIRC_OK ||
         firc_strset(&g->iface, "nwg0") != FIRC_OK ||
-        firc_strset(&g->list->url, "https://example.invalid/l.txt") != FIRC_OK ||
+        firc_strset(&g->lists[0]->url, "https://example.invalid/l.txt") != FIRC_OK ||
         firc_config_add_group(cfg, g) != FIRC_OK) {
         firc_group_free(g);
         return NULL;
     }
     g->enable = true;
-    return g->list;
+    return g->lists[0];
 }
 
 /* Catches: a group's list logging a line at every load. */
@@ -1027,9 +1030,9 @@ TEST a_group_list_in_the_new_shape_loads_quietly(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     firc_err_t err = load_str(&cfg, LIST_GROUP_DOC
-                              "      overrides:\n"
-                              "        - rule: edited.example.com\n"
-                              "          enable: false\n");
+                              "        overrides:\n"
+                              "          - rule: edited.example.com\n"
+                              "            enable: false\n");
     firc_log_set_fd(STDOUT_FILENO);
     close(fds[1]);
     char out[1024];
@@ -1039,7 +1042,7 @@ TEST a_group_list_in_the_new_shape_loads_quietly(void)
     ASSERT_EQ(FIRC_OK, err);
     ASSERT_EQ_FMTm("nothing to say", (size_t)0, (size_t)got, "%zu");
     ASSERT_EQ(1, (int)cfg.n_groups);
-    ASSERT(firc_group_list_find_override(cfg.groups[0]->list,
+    ASSERT(firc_group_list_find_override(cfg.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "edited.example.com"}) != NULL);
     firc_config_clear(&cfg);
     PASS();
@@ -1071,7 +1074,7 @@ TEST a_saved_group_list_carries_edits_not_rules(void)
     ASSERT_FALSEm("and the fetched rule is not in the file at all",
                   strstr(out, "fetched.example.com") != NULL);
     ASSERT_FALSEm("nor is a rules key under the list",
-                  strstr(strstr(out, "list:"), "rules:") != NULL);
+                  strstr(strstr(out, "lists:"), "rules:") != NULL);
 
     free(out);
     firc_config_clear(&cfg);
@@ -1111,15 +1114,15 @@ TEST overrides_round_trip(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ads.example.com'\n"
-                                "          type: domain\n"
-                                "          enable: false\n"
-                                "        - rule: 'other.example.com'\n"
-                                "          type: wildcard\n"));
+                                "        overrides:\n"
+                                "          - rule: 'ads.example.com'\n"
+                                "            type: domain\n"
+                                "            enable: false\n"
+                                "          - rule: 'other.example.com'\n"
+                                "            type: wildcard\n"));
     ASSERT_EQ(1, (int)cfg.n_groups);
     const firc_sub_override_t *o =
-        firc_group_list_find_override(cfg.groups[0]->list,
+        firc_group_list_find_override(cfg.groups[0]->lists[0],
                                       &(firc_sub_rule_key_t){.text = "ads.example.com"});
     ASSERT(o != NULL);
     ASSERT_STR_EQ("domain", o->type);
@@ -1127,7 +1130,7 @@ TEST overrides_round_trip(void)
     ASSERT_FALSE(o->enable);
 
     const firc_sub_override_t *o2 =
-        firc_group_list_find_override(cfg.groups[0]->list,
+        firc_group_list_find_override(cfg.groups[0]->lists[0],
                                       &(firc_sub_rule_key_t){.text = "other.example.com"});
     ASSERT(o2 != NULL);
     ASSERT_STR_EQ("wildcard", o2->type);
@@ -1143,15 +1146,15 @@ TEST an_override_with_a_full_key_round_trips(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: '10.0.0.0/8'\n"
-                                "          list_type: subnet\n"
-                                "          proto: udp\n"
-                                "          ports: \"53\"\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: '10.0.0.0/8'\n"
+                                "            list_type: subnet\n"
+                                "            proto: udp\n"
+                                "            ports: \"53\"\n"
+                                "            enable: false\n"));
     firc_sub_rule_key_t key = {
         .text = "10.0.0.0/8", .list_type = "subnet", .proto = "udp", .ports = "53"};
-    const firc_sub_override_t *o = firc_group_list_find_override(cfg.groups[0]->list, &key);
+    const firc_sub_override_t *o = firc_group_list_find_override(cfg.groups[0]->lists[0], &key);
     ASSERTm("the full key is found right after loading", o != NULL);
     ASSERT_FALSE(o->enable);
 
@@ -1167,7 +1170,7 @@ TEST an_override_with_a_full_key_round_trips(void)
     firc_config_t back;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
     ASSERT_EQ(FIRC_OK, firc_config_load_buffer(&back, out, out_len));
-    const firc_sub_override_t *o2 = firc_group_list_find_override(back.groups[0]->list, &key);
+    const firc_sub_override_t *o2 = firc_group_list_find_override(back.groups[0]->lists[0], &key);
     ASSERTm("the same full key finds it again after the reload", o2 != NULL);
     ASSERT_FALSE(o2->enable);
     free(out);
@@ -1181,17 +1184,17 @@ TEST an_override_key_is_folded_like_the_rule_it_names(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'Ads.Example.COM.'\n"
-                                "          enable: false\n"
-                                "        - rule: '\\A(?:^Ads\\.example\\.com$)\\z'\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: 'Ads.Example.COM.'\n"
+                                "            enable: false\n"
+                                "          - rule: '\\A(?:^Ads\\.example\\.com$)\\z'\n"
+                                "            enable: false\n"));
     ASSERT_EQ(1, (int)cfg.n_groups);
-    ASSERT(firc_group_list_find_override(cfg.groups[0]->list,
+    ASSERT(firc_group_list_find_override(cfg.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "ads.example.com"}) != NULL);
-    ASSERT(firc_group_list_find_override(cfg.groups[0]->list,
+    ASSERT(firc_group_list_find_override(cfg.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "Ads.Example.COM."}) == NULL);
-    ASSERT(firc_group_list_find_override(cfg.groups[0]->list,
+    ASSERT(firc_group_list_find_override(cfg.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "\\A(?:^Ads\\.example\\.com$)\\z"}) != NULL);
     firc_config_clear(&cfg);
     PASS();
@@ -1202,11 +1205,11 @@ TEST a_hand_typed_regex_override_key_is_not_folded(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: '^A\\D+\\.com$'\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: '^A\\D+\\.com$'\n"
+                                "            enable: false\n"));
     ASSERT_EQ(1, (int)cfg.n_groups);
-    ASSERT(firc_group_list_find_override(cfg.groups[0]->list,
+    ASSERT(firc_group_list_find_override(cfg.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "^A\\D+\\.com$"}) != NULL);
     firc_config_clear(&cfg);
     PASS();
@@ -1218,18 +1221,18 @@ TEST a_list_typed_regex_override_key_is_not_folded_without_a_metacharacter(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ABC'\n"
-                                "          list_type: regex\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: 'ABC'\n"
+                                "            list_type: regex\n"
+                                "            enable: false\n"));
     ASSERT_EQ(1, (int)cfg.n_groups);
     ASSERTm("the mixed-case key is kept as written",
             firc_group_list_find_override(
-                cfg.groups[0]->list, &(firc_sub_rule_key_t){.text = "ABC", .list_type = "regex"}) !=
+                cfg.groups[0]->lists[0], &(firc_sub_rule_key_t){.text = "ABC", .list_type = "regex"}) !=
                 NULL);
     ASSERTm("it was not folded to lower case",
             firc_group_list_find_override(
-                cfg.groups[0]->list, &(firc_sub_rule_key_t){.text = "abc", .list_type = "regex"}) ==
+                cfg.groups[0]->lists[0], &(firc_sub_rule_key_t){.text = "abc", .list_type = "regex"}) ==
                 NULL);
     firc_config_clear(&cfg);
     PASS();
@@ -1241,12 +1244,12 @@ TEST an_unusable_override_type_does_not_take_the_enable_with_it(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ads.example.com'\n"
-                                "          type: subnet\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: 'ads.example.com'\n"
+                                "            type: subnet\n"
+                                "            enable: false\n"));
     const firc_sub_override_t *o =
-        firc_group_list_find_override(cfg.groups[0]->list,
+        firc_group_list_find_override(cfg.groups[0]->lists[0],
                                       &(firc_sub_rule_key_t){.text = "ads.example.com"});
     ASSERTm("the entry survives", o != NULL);
     ASSERT_EQm("without the type nobody can use", NULL, o->type);
@@ -1262,13 +1265,13 @@ TEST an_override_type_unusable_with_its_own_proto_is_dropped(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'a.com'\n"
-                                "          proto: udp\n"
-                                "          type: domain\n"
-                                "          enable: false\n"));
+                                "        overrides:\n"
+                                "          - rule: 'a.com'\n"
+                                "            proto: udp\n"
+                                "            type: domain\n"
+                                "            enable: false\n"));
     const firc_sub_override_t *o = firc_group_list_find_override(
-        cfg.groups[0]->list, &(firc_sub_rule_key_t){.text = "a.com", .proto = "udp"});
+        cfg.groups[0]->lists[0], &(firc_sub_rule_key_t){.text = "a.com", .proto = "udp"});
     ASSERTm("the entry survives", o != NULL);
     ASSERT_EQm("domain cannot carry a proto, so the type is dropped", NULL, o->type);
     ASSERTm("and the switch the operator threw is kept", o->has_enable);
@@ -1436,10 +1439,10 @@ TEST an_override_that_was_only_a_bad_type_is_dropped(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ads.example.com'\n"
-                                "          type: subnet\n"));
-    ASSERT_EQ_FMTm("nothing left to say", 0, (int)cfg.groups[0]->list->n_overrides, "%d");
+                                "        overrides:\n"
+                                "          - rule: 'ads.example.com'\n"
+                                "            type: subnet\n"));
+    ASSERT_EQ_FMTm("nothing left to say", 0, (int)cfg.groups[0]->lists[0]->n_overrides, "%d");
     firc_config_clear(&cfg);
     PASS();
 }
@@ -1467,7 +1470,7 @@ TEST an_override_with_no_type_writes_no_type_key(void)
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
     ASSERT_EQ(FIRC_OK, firc_config_load_buffer(&back, out, len));
     const firc_sub_override_t *o =
-        firc_group_list_find_override(back.groups[0]->list,
+        firc_group_list_find_override(back.groups[0]->lists[0],
                                       &(firc_sub_rule_key_t){.text = "ads.example.com"});
     ASSERT(o != NULL);
     ASSERT_EQ(NULL, o->type);
@@ -1510,10 +1513,10 @@ TEST enabling_a_legacy_override_by_its_full_key_survives_a_reload(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ads.example.com'\n"
-                                "          enable: false\n"));
-    firc_group_list_t *l = cfg.groups[0]->list;
+                                "        overrides:\n"
+                                "          - rule: 'ads.example.com'\n"
+                                "            enable: false\n"));
+    firc_group_list_t *l = cfg.groups[0]->lists[0];
     bool on = true;
     ASSERT_EQ(FIRC_OK,
               firc_group_list_set_override(
@@ -1537,7 +1540,7 @@ TEST enabling_a_legacy_override_by_its_full_key_survives_a_reload(void)
     firc_sub_rules_init(&rules);
     ASSERT_EQ(FIRC_OK,
               firc_sub_rules_push(&rules, "ads.example.com", "domain", true, test_random_id()));
-    firc_sub_apply_overrides(back.groups[0]->list, &rules);
+    firc_sub_apply_overrides(back.groups[0]->lists[0], &rules);
     ASSERTm("the rule reads enabled after the reload", firc_sub_rules_enable(&rules, 0));
 
     firc_sub_rules_free(&rules);
@@ -1551,10 +1554,10 @@ TEST a_type_edit_on_a_legacy_overridden_rule_survives_a_reload(void)
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
     ASSERT_EQ(FIRC_OK, load_str(&cfg, LIST_GROUP_DOC
-                                "      overrides:\n"
-                                "        - rule: 'ads.example.com'\n"
-                                "          enable: false\n"));
-    firc_group_list_t *l = cfg.groups[0]->list;
+                                "        overrides:\n"
+                                "          - rule: 'ads.example.com'\n"
+                                "            enable: false\n"));
+    firc_group_list_t *l = cfg.groups[0]->lists[0];
     ASSERT_EQ(FIRC_OK,
               firc_group_list_set_override(
                   l, &(firc_sub_rule_key_t){.text = "ads.example.com", .list_type = "domain"},
@@ -1576,7 +1579,7 @@ TEST a_type_edit_on_a_legacy_overridden_rule_survives_a_reload(void)
     firc_sub_rules_init(&rules);
     ASSERT_EQ(FIRC_OK,
               firc_sub_rules_push(&rules, "ads.example.com", "domain", true, test_random_id()));
-    firc_sub_apply_overrides(back.groups[0]->list, &rules);
+    firc_sub_apply_overrides(back.groups[0]->lists[0], &rules);
     ASSERT_STR_EQm("the type survived the reload", "wildcard", firc_sub_rules_type(&rules, 0));
     ASSERT_FALSEm("and so did the old enable opinion", firc_sub_rules_enable(&rules, 0));
 
@@ -1962,37 +1965,38 @@ TEST a_group_list_round_trips(void)
         "    interface: nwg0\n"
         "    enable: true\n"
         "    rules: []\n"
-        "    list:\n"
-        "      url: 'https://example.invalid/l.txt'\n"
-        "      interval: 86400\n"
-        "      last_update: 1700000000\n"
-        "      overrides:\n"
-        "        - rule: 'Ads.Example.COM'\n"
-        "          type: domain\n"
-        "          enable: false\n"
-        "        - rule: '\\A(?:^Weird\\.Example\\.com$)\\z'\n"
-        "          enable: false\n";
+        "    lists:\n"
+        "      - id: 7a7a7a01\n"
+        "        url: 'https://example.invalid/l.txt'\n"
+        "        interval: 86400\n"
+        "        last_update: 1700000000\n"
+        "        overrides:\n"
+        "          - rule: 'Ads.Example.COM'\n"
+        "            type: domain\n"
+        "            enable: false\n"
+        "          - rule: '\\A(?:^Weird\\.Example\\.com$)\\z'\n"
+        "            enable: false\n";
     ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
     ASSERT_EQ(1, (int)cfg.n_groups);
-    ASSERT(cfg.groups[0]->list != NULL);
-    ASSERT_STR_EQ("https://example.invalid/l.txt", cfg.groups[0]->list->url);
-    ASSERT_EQ_FMT((uint32_t)86400, cfg.groups[0]->list->interval, "%u");
-    ASSERT_EQ_FMT((uint32_t)1700000000, cfg.groups[0]->list->last_update, "%u");
+    ASSERT(cfg.groups[0]->n_lists != 0);
+    ASSERT_STR_EQ("https://example.invalid/l.txt", cfg.groups[0]->lists[0]->url);
+    ASSERT_EQ_FMT((uint32_t)86400, cfg.groups[0]->lists[0]->interval, "%u");
+    ASSERT_EQ_FMT((uint32_t)1700000000, cfg.groups[0]->lists[0]->last_update, "%u");
     const firc_sub_override_t *o =
-        firc_group_list_find_override(cfg.groups[0]->list,
+        firc_group_list_find_override(cfg.groups[0]->lists[0],
                                       &(firc_sub_rule_key_t){.text = "ads.example.com"});
     ASSERTm("a mixed-case key is folded", o != NULL);
     ASSERT_STR_EQ("domain", o->type);
     ASSERT_FALSE(o->enable);
     ASSERT_FALSEm("the unfolded original key is gone",
-                  firc_group_list_find_override(cfg.groups[0]->list,
+                  firc_group_list_find_override(cfg.groups[0]->lists[0],
                                                 &(firc_sub_rule_key_t){.text = "Ads.Example.COM"}) != NULL);
     const firc_sub_override_t *o2 = firc_group_list_find_override(
-        cfg.groups[0]->list, &(firc_sub_rule_key_t){.text = "\\A(?:^Weird\\.Example\\.com$)\\z"});
+        cfg.groups[0]->lists[0], &(firc_sub_rule_key_t){.text = "\\A(?:^Weird\\.Example\\.com$)\\z"});
     ASSERTm("a regex key is not folded", o2 != NULL);
     ASSERT_FALSE(o2->enable);
 
-    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&cfg.groups[0]->list->rules,
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&cfg.groups[0]->lists[0]->rules,
                                            "must-not-be-written.example.com", FIRC_RULE_DOMAIN,
                                            true, (firc_id_t){{9, 9, 0, 0}}));
 
@@ -2001,10 +2005,10 @@ TEST a_group_list_round_trips(void)
     ASSERT_EQ(FIRC_OK,
               firc_config_save_buffer_part(&cfg, "0.7.0", FIRC_CFG_GROUPS, &out, &out_len));
     const char *rules_pos = strstr(out, "rules:");
-    const char *list_pos = strstr(out, "list:");
+    const char *list_pos = strstr(out, "lists:");
     ASSERT(rules_pos != NULL);
-    ASSERTm("list: is written", list_pos != NULL);
-    ASSERTm("list: comes after the group's own rules:", list_pos > rules_pos);
+    ASSERTm("lists: is written", list_pos != NULL);
+    ASSERTm("lists: comes after the group's own rules:", list_pos > rules_pos);
     ASSERT_FALSEm("the list's own rule is not written",
                   strstr(out, "must-not-be-written.example.com") != NULL);
     ASSERT_FALSEm("no list rules key is written", strstr(list_pos, "rules:") != NULL);
@@ -2013,13 +2017,13 @@ TEST a_group_list_round_trips(void)
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
     ASSERT_EQ(FIRC_OK, load_str(&back, out));
     free(out);
-    ASSERT(back.groups[0]->list != NULL);
-    ASSERT_STR_EQ("https://example.invalid/l.txt", back.groups[0]->list->url);
-    ASSERT_EQ_FMT((uint32_t)86400, back.groups[0]->list->interval, "%u");
-    ASSERT_EQ_FMT((uint32_t)1700000000, back.groups[0]->list->last_update, "%u");
-    ASSERT(firc_group_list_find_override(back.groups[0]->list,
+    ASSERT(back.groups[0]->n_lists != 0);
+    ASSERT_STR_EQ("https://example.invalid/l.txt", back.groups[0]->lists[0]->url);
+    ASSERT_EQ_FMT((uint32_t)86400, back.groups[0]->lists[0]->interval, "%u");
+    ASSERT_EQ_FMT((uint32_t)1700000000, back.groups[0]->lists[0]->last_update, "%u");
+    ASSERT(firc_group_list_find_override(back.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "ads.example.com"}) != NULL);
-    ASSERT(firc_group_list_find_override(back.groups[0]->list,
+    ASSERT(firc_group_list_find_override(back.groups[0]->lists[0],
                                          &(firc_sub_rule_key_t){.text = "\\A(?:^Weird\\.Example\\.com$)\\z"}) != NULL);
 
     firc_config_clear(&back);
@@ -2046,8 +2050,9 @@ TEST a_group_list_without_a_url_fails_the_load(void)
         "    interface: nwg0\n"
         "    enable: true\n"
         "    rules: []\n"
-        "    list:\n"
-        "      interval: 86400\n";
+        "    lists:\n"
+        "      - id: 7a7a7a01\n"
+        "        interval: 86400\n";
     firc_err_t err = load_str(&cfg, missing);
     firc_log_set_fd(STDOUT_FILENO);
     close(fds[1]);
@@ -2070,8 +2075,9 @@ TEST a_group_list_without_a_url_fails_the_load(void)
         "    interface: nwg0\n"
         "    enable: true\n"
         "    rules: []\n"
-        "    list:\n"
-        "      url: ''\n";
+        "    lists:\n"
+        "      - id: 7a7a7a01\n"
+        "        url: ''\n";
     err = load_str(&cfg, empty);
     firc_log_set_fd(STDOUT_FILENO);
     close(fds[1]);
@@ -2085,8 +2091,8 @@ TEST a_group_list_without_a_url_fails_the_load(void)
     PASS();
 }
 
-/* Catches: `list: null` refused instead of read as no list. */
-TEST a_null_list_is_no_list(void)
+/* Catches: `lists: null` refused instead of read as no list. */
+TEST a_null_lists_is_no_lists(void)
 {
     firc_config_t cfg;
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
@@ -2098,10 +2104,226 @@ TEST a_null_list_is_no_list(void)
         "    interface: nwg0\n"
         "    enable: true\n"
         "    rules: []\n"
-        "    list: null\n";
+        "    lists: null\n";
     ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
     ASSERT_EQ(1, (int)cfg.n_groups);
-    ASSERT(cfg.groups[0]->list == NULL);
+    ASSERT(cfg.groups[0]->n_lists == 0);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+#define LISTS_HEAD                                                                                 \
+    "configVersion: 0.7.0\n"                                                                       \
+    "groups:\n"                                                                                    \
+    "  - id: 0a1b2c3d\n"                                                                           \
+    "    name: ads\n"                                                                              \
+    "    interface: nwg0\n"                                                                        \
+    "    enable: true\n"                                                                           \
+    "    rules: []\n"
+
+static void id_text(firc_id_t id, char *buf) { firc_id_format(id, buf); }
+
+/* Catches: a list lost, reordered, or its id or overrides changed by a save and load. */
+TEST lists_round_trip_three(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, LISTS_HEAD
+                                "    lists:\n"
+                                "      - id: 0c0c0c03\n"
+                                "        url: 'https://c.example/c.txt'\n"
+                                "        interval: 300\n"
+                                "        last_update: 1700000003\n"
+                                "      - id: 0a0a0a01\n"
+                                "        url: 'https://a.example/a.txt'\n"
+                                "        interval: 100\n"
+                                "        last_update: 1700000001\n"
+                                "        overrides:\n"
+                                "          - rule: x.example.com\n"
+                                "            type: domain\n"
+                                "            enable: false\n"
+                                "      - id: 0b0b0b02\n"
+                                "        url: 'https://b.example/b.txt'\n"
+                                "        interval: 200\n"));
+    ASSERT_EQ(3, (int)cfg.groups[0]->n_lists);
+    char *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_config_save_buffer_part(&cfg, "0.7.0", FIRC_CFG_GROUPS, &out, &out_len));
+    firc_config_t back;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
+    ASSERT_EQ(FIRC_OK, load_str(&back, out));
+    ASSERT_EQ(3, (int)back.groups[0]->n_lists);
+    static const char *const ids[] = {"0c0c0c03", "0a0a0a01", "0b0b0b02"};
+    static const char *const urls[] = {"https://c.example/c.txt", "https://a.example/a.txt",
+                                       "https://b.example/b.txt"};
+    static const uint32_t ivals[] = {300, 100, 200};
+    for (size_t i = 0; i < 3; i++) {
+        const firc_group_list_t *l = back.groups[0]->lists[i];
+        char text[16];
+        id_text(l->id, text);
+        ASSERT_STR_EQ(ids[i], text);
+        ASSERT_STR_EQ(urls[i], l->url);
+        ASSERT_EQ_FMT(ivals[i], l->interval, "%u");
+    }
+    ASSERT_EQ_FMT((uint32_t)1700000001, back.groups[0]->lists[1]->last_update, "%u");
+    ASSERT_EQ(1, (int)back.groups[0]->lists[1]->n_overrides);
+    ASSERT_FALSE(back.groups[0]->lists[1]->overrides[0]->enable);
+    ASSERT_EQ(0, (int)back.groups[0]->lists[0]->n_overrides);
+    free(out);
+    firc_config_clear(&back);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a list with no id loading with the zero id, or the id it got not being saved. */
+TEST a_list_without_an_id_gets_one(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, LISTS_HEAD
+                                "    lists:\n"
+                                "      - url: 'https://a.example/a.txt'\n"));
+    ASSERT_EQ(1, (int)cfg.groups[0]->n_lists);
+    ASSERT_FALSE(firc_id_is_zero(cfg.groups[0]->lists[0]->id));
+    char want[16];
+    id_text(cfg.groups[0]->lists[0]->id, want);
+    char *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_config_save_buffer_part(&cfg, "0.7.0", FIRC_CFG_GROUPS, &out, &out_len));
+    ASSERTm(out, strstr(out, want) != NULL);
+    free(out);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: a seventeenth list accepted, or the refusal not naming the group. */
+TEST seventeen_lists_refuse_the_file(void)
+{
+    char doc[4096] = LISTS_HEAD "    lists:\n";
+    size_t at = strlen(doc);
+    for (int i = 1; i <= 17; i++) {
+        at += (size_t)snprintf(doc + at, sizeof(doc) - at,
+                               "      - id: %08x\n        url: 'https://e.example/%d.txt'\n", i, i);
+    }
+    char log[2048];
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_ERR_INVAL, load_str_logged(&cfg, doc, log, sizeof(log)));
+    ASSERTm(log, strstr(log, "\"ads\"") != NULL);
+    ASSERTm(log, strstr(log, "more than 16 lists") != NULL);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: two lists with one url accepted. */
+TEST a_duplicate_list_url_refuses_the_file(void)
+{
+    char log[2048];
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_ERR_INVAL, load_str_logged(&cfg, LISTS_HEAD
+                                              "    lists:\n"
+                                              "      - id: 0a0a0a01\n"
+                                              "        url: 'https://a.example/a.txt'\n"
+                                              "      - id: 0b0b0b02\n"
+                                              "        url: 'https://a.example/a.txt'\n",
+                                              log, sizeof(log)));
+    ASSERTm(log, strstr(log, "\"ads\"") != NULL);
+    ASSERTm(log, strstr(log, "a list url twice") != NULL);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: two lists with one id accepted. */
+TEST a_duplicate_list_id_refuses_the_file(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT(load_str(&cfg, LISTS_HEAD
+                    "    lists:\n"
+                    "      - id: 0a0a0a01\n"
+                    "        url: 'https://a.example/a.txt'\n"
+                    "      - id: 0a0a0a01\n"
+                    "        url: 'https://b.example/b.txt'\n") != FIRC_OK);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: the old `list:` key read as a list, warned per group, or missing urls in the warning. */
+TEST the_old_list_key_warns_once_and_loads_the_group(void)
+{
+    char doc[8192];
+    size_t at = (size_t)snprintf(doc, sizeof(doc), "configVersion: 0.7.0\ngroups:\n");
+    char longurl[301];
+    memset(longurl, 'a', sizeof(longurl) - 1);
+    memcpy(longurl, "https://long.example/", 21);
+    longurl[300] = '\0';
+    const char *urls[5] = {longurl, "https://two.example/l", "https://three.example/l",
+                           "https://four.example/l", "https://five.example/l"};
+    for (int i = 0; i < 5; i++) {
+        at += (size_t)snprintf(doc + at, sizeof(doc) - at,
+                               "  - id: 0a1b2c0%d\n    name: g%d\n    interface: nwg0\n    enable: true\n"
+                               "    list:\n      url: '%s'\n",
+                               i + 1, i + 1, urls[i]);
+    }
+    char log[8192];
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str_logged(&cfg, doc, log, sizeof(log)));
+    ASSERT_EQ(5, (int)cfg.n_groups);
+    for (size_t i = 0; i < 5; i++) { ASSERT_EQ(0, (int)cfg.groups[i]->n_lists); }
+    int lines = 0;
+    for (const char *p = log; (p = strstr(p, "\"list\" key is no longer read")) != NULL; p++) { lines++; }
+    ASSERT_EQ_FMTm("once for the load", 1, lines, "%d");
+    ASSERTm(log, strstr(log, "WRN") != NULL);
+    ASSERTm("url 1 cut to 200", strstr(log, longurl) == NULL);
+    char clipped[202];
+    memcpy(clipped, longurl, 200);
+    clipped[200] = '\0';
+    ASSERTm("its first 200 chars", strstr(log, clipped) != NULL);
+    clipped[200] = 'a';
+    clipped[201] = '\0';
+    ASSERTm("and no more", strstr(log, clipped) == NULL);
+    ASSERTm("url 2", strstr(log, "https://two.example/l") != NULL);
+    ASSERTm("url 3", strstr(log, "https://three.example/l") != NULL);
+    ASSERTm("not url 4", strstr(log, "https://four.example/l") == NULL);
+    ASSERTm("not url 5", strstr(log, "https://five.example/l") == NULL);
+    ASSERTm("the rest counted", strstr(log, "and 2 more") != NULL);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: `list:` beside `lists:` replacing the lists, or its url left out of the warning. */
+TEST a_group_with_both_keys_reads_lists_and_counts_the_old_url(void)
+{
+    char log[4096];
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str_logged(&cfg, LISTS_HEAD
+                                       "    list:\n"
+                                       "      url: 'https://old.example/o.txt'\n"
+                                       "    lists:\n"
+                                       "      - id: 0a0a0a01\n"
+                                       "        url: 'https://new.example/n.txt'\n",
+                                       log, sizeof(log)));
+    ASSERT_EQ(1, (int)cfg.groups[0]->n_lists);
+    ASSERT_STR_EQ("https://new.example/n.txt", cfg.groups[0]->lists[0]->url);
+    ASSERTm(log, strstr(log, "https://old.example/o.txt") != NULL);
+    firc_config_clear(&cfg);
+    PASS();
+}
+
+/* Catches: an unsaved empty lists key written, or a group with no lists writing the old key. */
+TEST a_group_with_no_lists_writes_no_list_key(void)
+{
+    firc_config_t cfg;
+    ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&cfg));
+    ASSERT_EQ(FIRC_OK, load_str(&cfg, LISTS_HEAD));
+    char *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ(FIRC_OK, firc_config_save_buffer_part(&cfg, "0.7.0", FIRC_CFG_GROUPS, &out, &out_len));
+    ASSERT(strstr(out, "list") == NULL);
+    free(out);
     firc_config_clear(&cfg);
     PASS();
 }
@@ -2120,7 +2342,7 @@ TEST a_group_without_a_list_writes_no_list_key(void)
         "    enable: true\n"
         "    rules: []\n";
     ASSERT_EQ(FIRC_OK, load_str(&cfg, doc));
-    ASSERT(cfg.groups[0]->list == NULL);
+    ASSERT(cfg.groups[0]->n_lists == 0);
 
     char *out = NULL;
     size_t out_len = 0;
@@ -2132,7 +2354,7 @@ TEST a_group_without_a_list_writes_no_list_key(void)
     ASSERT_EQ(FIRC_OK, firc_config_init_defaults(&back));
     ASSERT_EQ(FIRC_OK, load_str(&back, out));
     free(out);
-    ASSERT(back.groups[0]->list == NULL);
+    ASSERT(back.groups[0]->n_lists == 0);
     firc_config_clear(&back);
     firc_config_clear(&cfg);
     PASS();
@@ -2439,6 +2661,94 @@ TEST cloudflare_on_a_dns_group_fails_the_load(void)
     PASS();
 }
 
+static firc_group_list_t *mk_list(uint8_t id, const char *url)
+{
+    firc_group_list_t *l = firc_group_list_new();
+    if (l == NULL) { return NULL; }
+    l->id.b[3] = id;
+    if (firc_strset(&l->url, url) != FIRC_OK) { firc_group_list_free(l); return NULL; }
+    return l;
+}
+
+TEST add_list_refuses_a_seventeenth(void)
+{
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    for (uint8_t i = 1; i <= 16; i++) {
+        char u[32];
+        snprintf(u, sizeof u, "http://x/%u", i);
+        ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(i, u)));
+    }
+    firc_group_list_t *l = mk_list(17, "http://x/17");
+    ASSERT_EQ(FIRC_ERR_LIMIT, firc_group_add_list(g, l));
+    ASSERT_EQ((size_t)16, g->n_lists);
+    firc_group_list_free(l);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST add_list_refuses_a_duplicate_id(void)
+{
+    firc_group_t *g = firc_group_new();
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(1, "http://x/a")));
+    firc_group_list_t *l = mk_list(1, "http://x/b");
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_group_add_list(g, l));
+    ASSERT_EQ((size_t)1, g->n_lists);
+    firc_group_list_free(l);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST add_list_refuses_a_duplicate_url(void)
+{
+    firc_group_t *g = firc_group_new();
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(1, "http://x/a")));
+    firc_group_list_t *l = mk_list(2, "http://x/a");
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_group_add_list(g, l));
+    ASSERT_EQ((size_t)1, g->n_lists);
+    firc_group_list_free(l);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST add_list_refuses_a_zero_id(void)
+{
+    firc_group_t *g = firc_group_new();
+    firc_group_list_t *l = mk_list(0, "http://x/a");
+    ASSERT_EQ(FIRC_ERR_INVAL, firc_group_add_list(g, l));
+    ASSERT_EQ((size_t)0, g->n_lists);
+    firc_group_list_free(l);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST remove_list_keeps_the_order(void)
+{
+    firc_group_t *g = firc_group_new();
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(1, "http://x/a")));
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(2, "http://x/b")));
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(3, "http://x/c")));
+    firc_group_remove_list(g, 1);
+    ASSERT_EQ((size_t)2, g->n_lists);
+    ASSERT_EQ(1, g->lists[0]->id.b[3]);
+    ASSERT_EQ(3, g->lists[1]->id.b[3]);
+    firc_group_free(g);
+    PASS();
+}
+
+TEST find_list_by_id(void)
+{
+    firc_group_t *g = firc_group_new();
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(1, "http://x/a")));
+    ASSERT_EQ(FIRC_OK, firc_group_add_list(g, mk_list(2, "http://x/b")));
+    firc_id_t want = {{0, 0, 0, 2}}, none = {{0, 0, 0, 9}};
+    ASSERT(g->lists[1] == firc_group_find_list(g, want));
+    ASSERT(NULL == firc_group_find_list(g, none));
+    ASSERT(g->lists[0] == g->lists[0]);
+    firc_group_free(g);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv)
@@ -2494,7 +2804,15 @@ int main(int argc, char **argv)
     RUN_TEST(an_empty_subscriptions_key_says_nothing_is_lost);
     RUN_TEST(a_group_list_round_trips);
     RUN_TEST(a_group_list_without_a_url_fails_the_load);
-    RUN_TEST(a_null_list_is_no_list);
+    RUN_TEST(a_null_lists_is_no_lists);
+    RUN_TEST(lists_round_trip_three);
+    RUN_TEST(a_list_without_an_id_gets_one);
+    RUN_TEST(seventeen_lists_refuse_the_file);
+    RUN_TEST(a_duplicate_list_url_refuses_the_file);
+    RUN_TEST(a_duplicate_list_id_refuses_the_file);
+    RUN_TEST(the_old_list_key_warns_once_and_loads_the_group);
+    RUN_TEST(a_group_with_both_keys_reads_lists_and_counts_the_old_url);
+    RUN_TEST(a_group_with_no_lists_writes_no_list_key);
     RUN_TEST(a_group_without_a_list_writes_no_list_key);
     RUN_TEST(any_config_version_loads);
     RUN_TEST(an_empty_document_is_refused);
@@ -2533,5 +2851,11 @@ int main(int argc, char **argv)
     RUN_TEST(an_upstream_that_is_not_an_address_is_refused);
     RUN_TEST(a_conf_that_still_names_a_skin_loads_and_drops_it);
     RUN_TEST(a_conf_that_still_names_the_fake_ptr_switch_loads_and_drops_it);
+    RUN_TEST(add_list_refuses_a_seventeenth);
+    RUN_TEST(add_list_refuses_a_duplicate_id);
+    RUN_TEST(add_list_refuses_a_duplicate_url);
+    RUN_TEST(add_list_refuses_a_zero_id);
+    RUN_TEST(remove_list_keeps_the_order);
+    RUN_TEST(find_list_by_id);
     GREATEST_MAIN_END();
 }

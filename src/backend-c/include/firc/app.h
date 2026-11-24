@@ -213,10 +213,10 @@ typedef struct {
     const char *type; /* NULL: unchanged */
 } firc_list_rule_edit_t;
 
-/* edits the list of group id in place; two passes: first validates every edit, second applies. FIRC_ERR_NOENT unknown
- * id/list/rule, FIRC_ERR_INVAL bad type (msg set), FIRC_ERR_NOMEM otherwise. Caller saves the file. */
-firc_err_t firc_app_patch_list_rules(firc_app_t *app, firc_id_t id, const firc_list_rule_edit_t *edits,
-                                     size_t n, char *msg, size_t msg_len);
+/* edits list list_id of group id in place; two passes: first validates every edit, second applies. FIRC_ERR_NOENT
+ * unknown id/list/rule, FIRC_ERR_INVAL bad type (msg set), FIRC_ERR_NOMEM otherwise. Caller saves the file. */
+firc_err_t firc_app_patch_list_rules(firc_app_t *app, firc_id_t id, firc_id_t list_id,
+                                     const firc_list_rule_edit_t *edits, size_t n, char *msg, size_t msg_len);
 
 uint64_t firc_app_nf_enters_for_test(const firc_app_t *app); /* test seam */
 uint64_t firc_app_nf_passes_for_test(const firc_app_t *app); /* test seam */
@@ -238,22 +238,35 @@ void firc_app_stop_list_worker(firc_app_t *app);
 void firc_app_sync_event_counts_for_test(size_t *out_posted, size_t *out_results,
                                          size_t *out_dropped);
 
-/* builds a job and enqueues it (list goes QUEUED); answer arrives as events. FIRC_ERR_NOENT unknown id/no list,
- * FIRC_ERR_INVAL no url, FIRC_ERR_STATE no worker, FIRC_ERR_LIMIT queue full (jobs fold by id) */
-firc_err_t firc_app_request_sync(firc_app_t *app, firc_id_t id);
+/* test seam: DNS-matching snapshots built and groups-file saves since create; either out-pointer may be NULL */
+void firc_app_publish_counts_for_test(const firc_app_t *app, uint64_t *out_snapshots, uint64_t *out_saves);
 
-/* stores url on the list and, if changed, writes the groups file under the lock. FIRC_ERR_NOENT unknown id/no list,
- * FIRC_ERR_INVAL unsupported url; a failed file write is logged, not returned. */
-firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, const char *url);
+/* builds a job for list list_id of group id and enqueues it (list goes QUEUED); answer arrives as events.
+ * FIRC_ERR_NOENT unknown id/list, FIRC_ERR_INVAL no url, FIRC_ERR_STATE no worker, FIRC_ERR_LIMIT queue full
+ * (jobs fold by group and list) */
+firc_err_t firc_app_request_sync(firc_app_t *app, firc_id_t id, firc_id_t list_id);
+
+/* requests every list of group id; FIRC_OK when all queued, else the first error after trying all;
+ * FIRC_ERR_NOENT unknown id or no list; *queued (nullable) is how many lists were queued, errors included */
+firc_err_t firc_app_request_sync_group(firc_app_t *app, firc_id_t id, size_t *queued);
+
+/* true while some list of g is QUEUED or FETCHING */
+bool firc_app_group_syncing(const firc_group_t *g);
+
+/* stores url on list list_id and, if changed, writes the groups file under the lock. FIRC_ERR_NOENT unknown
+ * id/list, FIRC_ERR_INVAL unsupported url or one another list of the group holds; a failed file write is
+ * logged, not returned. */
+firc_err_t firc_app_set_list_url(firc_app_t *app, firc_id_t id, firc_id_t list_id, const char *url);
 
 /* requests every enabled list with a url but no body yet; not a re-fetch of everything the ticker already owns */
 void firc_app_request_sync_missing(firc_app_t *app);
 
-/* requests every list firc_sub_is_due says is due; a list already in flight is asked again, not skipped: a lost
- * result would otherwise never be retried; the queue folds the duplicate by id */
+/* requests every list firc_sub_is_due says is due but one being fetched, whose result always comes back; a QUEUED
+ * one is asked again and the queue folds the duplicate by group and list */
 void firc_app_request_sync_due(firc_app_t *app, int64_t now_unix);
 
-/* consumes one worker event (frees it and any rules it carries); STARTED/PROGRESS move state, RESULT applies it */
+/* consumes one worker event (frees it and any rules it carries); STARTED/PROGRESS move state, RESULT applies it.
+ * The worker's events reach the loop as a batch through the same path: one resync per group, one snapshot, one save */
 void firc_app_on_sync_event(firc_app_t *app, firc_sub_event_t *ev, int64_t now_unix);
 
 /* the apply half of a sync under the lock: inherit ids, apply overrides, compare, and on a real change swap the
@@ -264,7 +277,7 @@ firc_err_t firc_app_apply_sync_result(firc_app_t *app, firc_sub_event_t *ev, int
 
 /* runs a sync on the calling thread, no worker/queue; a test seam and the CLI path, never called by the daemon.
  * Listener-silent. url_override replaces the list's url for this run only, restored on failure. */
-firc_err_t firc_app_sync_list_now(firc_app_t *app, firc_id_t id, int64_t now_unix,
+firc_err_t firc_app_sync_list_now(firc_app_t *app, firc_id_t id, firc_id_t list_id, int64_t now_unix,
                                   const char *url_override, bool *out_changed);
 
 /* told after every sync event for owner; done means the job finished; list must not be kept past the call */

@@ -180,6 +180,72 @@ describe("ChangeTracker", () => {
     });
   });
 
+  describe("A group's lists", () => {
+    const makeGroup = () => ({
+      id: "g1",
+      name: "g",
+      lists: [
+        { id: "l1", url: "https://a.example/x", rulesTotal: 1, sync: { state: "idle" } },
+        { id: "l2", url: "https://b.example/x", rulesTotal: 2, sync: { state: "idle" } },
+      ],
+    });
+
+    it("editing the second list's url marks the group unsaved", () => {
+      const tracker = new ChangeTracker([makeGroup()]);
+      const [group] = tracker.data;
+
+      group.lists[1].url = "https://c.example/x";
+
+      assert.strictEqual(tracker.isDirty, true);
+      assert.strictEqual(tracker.isDirtyWithin(group), true);
+      assert.strictEqual(tracker.isFieldDirty(group.lists[1], "url"), true);
+      assert.strictEqual(tracker.isFieldDirty(group.lists[0], "url"), false);
+    });
+
+    it("an edit put back leaves the group saved", () => {
+      const tracker = new ChangeTracker([makeGroup()]);
+      const [group] = tracker.data;
+
+      group.lists[1].url = "https://c.example/x";
+      group.lists[1].url = "https://b.example/x";
+
+      assert.strictEqual(tracker.isDirty, false);
+    });
+
+    it("an ignored runtime field does not make the group unsaved", () => {
+      const tracker = new ChangeTracker([makeGroup()], ["rulesTotal", "sync"]);
+      const [group] = tracker.data;
+
+      group.lists[0].rulesTotal = 99;
+      group.lists[1].sync = { state: "fetching" };
+
+      assert.strictEqual(tracker.isDirty, false);
+    });
+
+    it("without the ignore a runtime field makes the group unsaved", () => {
+      const tracker = new ChangeTracker([makeGroup()]);
+      const [group] = tracker.data;
+
+      group.lists[0].rulesTotal = 99;
+
+      assert.strictEqual(tracker.isDirty, true);
+    });
+
+    it("adding a list marks the group unsaved", () => {
+      const tracker = new ChangeTracker([makeGroup()]);
+      const [group] = tracker.data;
+
+      group.lists.push({
+        id: "l3",
+        url: "https://d.example/x",
+        rulesTotal: 0,
+        sync: { state: "idle" },
+      });
+
+      assert.strictEqual(tracker.isDirtyWithin(group), true);
+    });
+  });
+
   describe("Reset", () => {
     it("should clear changes on reset", () => {
       const tracker = new ChangeTracker([createItem({ id: "1" })]);

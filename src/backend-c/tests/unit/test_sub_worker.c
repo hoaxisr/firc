@@ -1,6 +1,7 @@
 #include "greatest.h"
 
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,12 @@ typedef struct sink {
     uint64_t first_parse_ms;
     firc_cancel_t *raise_on_parse;
     size_t raise_at_lines;
+    size_t refuse_results;
+    bool refuse_progress;
+    bool refuse_all;
+    size_t result_offers;
+    size_t progress_refused;
+    bool offered_twice;
 } sink_t;
 
 static sink_t *g_open_sink = NULL;
@@ -93,9 +100,28 @@ static void sink_init(sink_t *s) {
     g_open_sink = s;
 }
 
-static void sink_emit(void *ud, firc_sub_event_t *ev) {
+static bool sink_refuses(sink_t *s, firc_sub_event_t *ev) {
+    if (ev->http_status == -1) { s->offered_twice = true; }
+    if (ev->kind == FIRC_SUB_EV_RESULT) { s->result_offers++; }
+    bool refuse = s->refuse_all || (ev->kind == FIRC_SUB_EV_PROGRESS && s->refuse_progress);
+    if (!refuse && ev->kind == FIRC_SUB_EV_RESULT && s->refuse_results > 0) {
+        s->refuse_results--;
+        refuse = true;
+    }
+    if (refuse && ev->kind == FIRC_SUB_EV_PROGRESS) {
+        s->progress_refused++;
+        ev->http_status = -1;
+    }
+    return refuse;
+}
+
+static bool sink_emit(void *ud, firc_sub_event_t *ev) {
     sink_t *s = ud;
     pthread_mutex_lock(&s->mu);
+    if (sink_refuses(s, ev)) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
     if (ev->kind == FIRC_SUB_EV_PROGRESS) {
         if (ev->stage == FIRC_SUB_STAGE_FETCH) {
             s->n_fetch++;
@@ -114,6 +140,7 @@ static void sink_emit(void *ud, firc_sub_event_t *ev) {
         firc_sub_event_free(ev);
     }
     pthread_mutex_unlock(&s->mu);
+    return true;
 }
 
 static void sink_free(sink_t *s) {
@@ -630,6 +657,140 @@ TEST a_follow_up_enqueued_while_running_runs_once_after(void) {
     PASS();
 }
 
+static firc_sub_job_t job_for_list(uint8_t group_byte, uint32_t list_no, const char *path,
+                                   uint64_t seq) {
+    firc_sub_job_t j = job_for(group_byte, path, seq);
+    firc_id_t l = {{0x10, 0x20, (uint8_t)(list_no >> 8), (uint8_t)list_no}};
+    j.list_id = l;
+    return j;
+}
+
+/* Catches: two lists of one group folding into one slot. */
+TEST two_lists_of_one_group_wait_in_two_slots(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_worker_t *w = worker_new(8, sink_emit, &s);
+    ASSERT(w != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_start(w));
+
+    firc_sub_job_t slow = job_for_list(0x31, 9, "/slow", 1);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &slow));
+    ASSERT(wait_events(&s, FIRC_SUB_EV_STARTED, 1, 2000));
+
+    firc_sub_job_t a = job_for_list(0x32, 1, "/a", 2);
+    firc_sub_job_t b = job_for_list(0x32, 2, "/b", 3);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &a));
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &b));
+    ASSERT_EQ(2u, firc_sub_worker_waiting_for_test(w));
+
+    ASSERT(wait_events(&s, FIRC_SUB_EV_RESULT, 3, 5000));
+    const firc_sub_event_t *r1 = sink_nth(&s, FIRC_SUB_EV_RESULT, 1);
+    const firc_sub_event_t *r2 = sink_nth(&s, FIRC_SUB_EV_RESULT, 2);
+    ASSERT(r1 != NULL && r2 != NULL);
+    ASSERT_EQ((uint64_t)2, r1->seq);
+    ASSERT_EQ(2u, r1->rules.n);
+    ASSERT_EQ((uint64_t)3, r2->seq);
+    ASSERT_EQ(1u, r2->rules.n);
+    ASSERT(r1->list_id.b[3] == 1 && r2->list_id.b[3] == 2);
+
+    worker_free(w);
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: the same (group, list) queued twice running twice. */
+TEST the_same_list_twice_folds_into_one(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_worker_t *w = worker_new(8, sink_emit, &s);
+    ASSERT(w != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_start(w));
+
+    firc_sub_job_t slow = job_for_list(0x41, 9, "/slow", 1);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &slow));
+    ASSERT(wait_events(&s, FIRC_SUB_EV_STARTED, 1, 2000));
+
+    firc_sub_job_t a = job_for_list(0x42, 1, "/a", 2);
+    firc_sub_job_t b = job_for_list(0x42, 1, "/b", 3);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &a));
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &b));
+    ASSERT_EQ(1u, firc_sub_worker_waiting_for_test(w));
+
+    ASSERT(wait_events(&s, FIRC_SUB_EV_RESULT, 2, 5000));
+    sleep_ms(300);
+    ASSERT_EQ(2u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 1);
+    ASSERT(r != NULL);
+    ASSERT_EQ((uint64_t)3, r->seq);
+
+    worker_free(w);
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: another list of the running group taking the running list's follow-up slot. */
+TEST a_list_of_the_running_group_is_not_its_follow_up(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_worker_t *w = worker_new(8, sink_emit, &s);
+    ASSERT(w != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_start(w));
+
+    firc_sub_job_t slow = job_for_list(0x51, 1, "/slow", 1);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &slow));
+    ASSERT(wait_events(&s, FIRC_SUB_EV_STARTED, 1, 2000));
+
+    firc_sub_job_t b = job_for_list(0x51, 2, "/a", 2);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &b));
+    firc_sub_job_t a2 = job_for_list(0x51, 1, "/b", 3);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &a2));
+    ASSERT_EQm("B waits and A's follow-up holds its own slot", 2u,
+               firc_sub_worker_waiting_for_test(w));
+
+    ASSERT(wait_events(&s, FIRC_SUB_EV_RESULT, 3, 5000));
+    sleep_ms(200);
+    ASSERT_EQ(3u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r1 = sink_nth(&s, FIRC_SUB_EV_RESULT, 1);
+    const firc_sub_event_t *r2 = sink_nth(&s, FIRC_SUB_EV_RESULT, 2);
+    ASSERT(r1 != NULL && r2 != NULL);
+    ASSERT_EQm("A's follow-up goes to the front", (uint64_t)3, r1->seq);
+    ASSERT_EQ((uint64_t)2, r2->seq);
+    ASSERT_EQ(2, r2->list_id.b[3]);
+
+    worker_free(w);
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a capacity other than 4096 waiting (group, list) jobs. */
+TEST capacity_is_4096_waiting_jobs(void) {
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_worker_t *w = worker_new(FIRC_SUB_WORKER_CAPACITY, sink_emit, &s);
+    ASSERT(w != NULL);
+
+    for (uint32_t i = 0; i < 4096; i++) {
+        firc_sub_job_t j = job_for_list(0x62, i, "/a", 2 + i);
+        ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &j));
+    }
+    ASSERT_EQ(4096u, firc_sub_worker_waiting_for_test(w));
+    firc_sub_job_t extra = job_for_list(0x62, 4096, "/a", 9999);
+    ASSERT_EQ(FIRC_ERR_LIMIT, firc_sub_worker_enqueue(w, &extra));
+
+    worker_free(w);
+    sink_free(&s);
+    PASS();
+}
+
 /* Catches: a result posted after the cancel was raised at the end of the parse. */
 TEST nothing_is_posted_once_the_cancel_is_raised(void) {
     harness_t *h = harness_start();
@@ -651,6 +812,123 @@ TEST nothing_is_posted_once_the_cancel_is_raised(void) {
                sink_count(&s, FIRC_SUB_EV_RESULT));
 
     firc_cancel_free(cancel);
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+typedef struct bounded_run {
+    firc_sub_job_t *job;
+    firc_cancel_t *cancel;
+    sink_t *sink;
+    sem_t done;
+} bounded_run_t;
+
+static void *bounded_run_thread(void *ud) {
+    bounded_run_t *r = ud;
+    firc_sub_job_run(r->job, r->cancel, sink_emit, r->sink);
+    sem_post(&r->done);
+    return NULL;
+}
+
+static bool run_job_within(firc_sub_job_t *job, firc_cancel_t *cancel, sink_t *sink, unsigned raise_after_ms,
+                           unsigned ms) {
+    static bounded_run_t r;
+    r = (bounded_run_t){.job = job, .cancel = cancel, .sink = sink};
+    sem_init(&r.done, 0, 0);
+    pthread_t t;
+    if (pthread_create(&t, NULL, bounded_run_thread, &r) != 0) { return false; }
+    if (raise_after_ms > 0) {
+        sleep_ms(raise_after_ms);
+        firc_cancel_raise(cancel);
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    if (sem_timedwait(&r.done, &ts) != 0) { return false; }
+    pthread_join(t, NULL);
+    sem_destroy(&r.done);
+    return true;
+}
+
+/* Catches: a refused result freed instead of offered again. */
+TEST a_refused_result_is_offered_again(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    s.refuse_results = 3;
+
+    firc_sub_job_t job = job_for(0x71, "/a", 1);
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    bool ended = run_job_within(&job, cancel, &s, 0, 5000);
+    free(job.url);
+    firc_cancel_free(cancel);
+    ASSERT(ended);
+
+    ASSERT_EQ_FMT((size_t)4, s.result_offers, "%zu");
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT_EQ_FMT((size_t)2, r->rules.n, "%zu");
+
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a refused progress event offered again, which holds the job back for a bar. */
+TEST a_refused_progress_is_not_offered_again(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    s.refuse_progress = true;
+
+    firc_sub_job_t job = job_for(0x72, "/big", 1);
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    bool ended = run_job_within(&job, cancel, &s, 0, 10000);
+    free(job.url);
+    firc_cancel_free(cancel);
+    ASSERT(ended);
+
+    ASSERTm("progress was refused", s.progress_refused >= (size_t)(BIG_LINES / FIRC_SUB_PARSE_PROGRESS_LINES));
+    ASSERT_FALSE(s.offered_twice);
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+
+    sink_free(&s);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a worker that keeps offering a refused event after the cancel. */
+TEST a_cancel_ends_the_offers(void) {
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    s.refuse_all = true;
+
+    firc_sub_job_t job = job_for(0x73, "/a", 1);
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    uint64_t t0 = mono_ms();
+    bool ended = run_job_within(&job, cancel, &s, 100, 3000);
+    uint64_t took = mono_ms() - t0;
+    free(job.url);
+    if (ended) { firc_cancel_free(cancel); }
+    ASSERT(ended);
+    ASSERTm("ended soon after the raise", took < 1000);
+    ASSERT_EQ(0u, sink_count(&s, FIRC_SUB_EV_RESULT));
+
     sink_free(&s);
     harness_stop(h);
     PASS();
@@ -782,7 +1060,14 @@ int main(int argc, char **argv) {
     RUN_TEST(a_follow_up_enqueued_while_running_runs_once_after);
     RUN_TEST(a_follow_up_is_never_dropped_by_a_full_queue);
     RUN_TEST(a_queued_follow_up_counts_against_the_capacity);
+    RUN_TEST(two_lists_of_one_group_wait_in_two_slots);
+    RUN_TEST(the_same_list_twice_folds_into_one);
+    RUN_TEST(a_list_of_the_running_group_is_not_its_follow_up);
+    RUN_TEST(capacity_is_4096_waiting_jobs);
     RUN_TEST(nothing_is_posted_once_the_cancel_is_raised);
+    RUN_TEST(a_refused_result_is_offered_again);
+    RUN_TEST(a_refused_progress_is_not_offered_again);
+    RUN_TEST(a_cancel_ends_the_offers);
     RUN_TEST(a_worker_freed_before_it_starts_frees_what_it_holds);
     GREATEST_MAIN_END();
 }

@@ -90,7 +90,8 @@ groups:
   interface: nwg1
   enable: true
   rules: []
-  list:
+  lists:
+  - id: 7a7a7a01
     url: https://example.com/list.txt
     interval: 86400
     last_update: 1700000000

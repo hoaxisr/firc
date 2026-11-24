@@ -7,6 +7,7 @@
 #include "firc/mark.h"
 #include "firc/models.h"
 #include "firc/stale_marks.h"
+#include "test_group_lists_util.h"
 
 typedef struct {
     fake_ct_t *kernel;
@@ -421,10 +422,10 @@ TEST a_list_group_with_no_hand_rules_is_swept(void) {
     firc_group_t *g = firc_group_new();
     ASSERT(g != NULL);
     ASSERT_EQ_FMTm("no hand rules", (size_t)0, g->n_rules, "%zu");
-    g->list = firc_group_list_new();
-    ASSERT(g->list != NULL);
+    test_group_set_list(g);
+    ASSERT(g->n_lists != 0);
     ASSERT_EQ(FIRC_OK,
-              firc_sub_rules_push(&g->list->rules, "10.0.0.0/8", FIRC_RULE_SUBNET, true,
+              firc_sub_rules_push(&g->lists[0]->rules, "10.0.0.0/8", FIRC_RULE_SUBNET, true,
                                   (firc_id_t){{1, 0, 0, 0}}));
 
     firc_ct_chunk_t *v = NULL;
@@ -448,8 +449,8 @@ TEST a_group_whose_list_is_not_loaded_keeps_its_field_s_flows(void) {
     ASSERT(up(&f));
     firc_group_t *g = firc_group_new();
     ASSERT(g != NULL);
-    g->list = firc_group_list_new();
-    ASSERT(g->list != NULL);
+    test_group_set_list(g);
+    ASSERT(g->n_lists != 0);
     uint32_t f4 = firc_mark_group_value(4);
     firc_ct_chunk_t *v = NULL;
     size_t n = 0;
@@ -474,6 +475,69 @@ TEST a_group_whose_list_is_not_loaded_keeps_its_field_s_flows(void) {
     PASS();
 }
 
+/* Catches: the sweep reading subnets of the first list only. */
+TEST a_subnet_of_the_second_list_is_seen(void) {
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    l0->has_body_hash = true;
+    l1->has_body_hash = true;
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l0->rules, "a.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 0, 0, 0}}));
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l1->rules, "10.0.0.0/8", FIRC_RULE_SUBNET, true, (firc_id_t){{2, 0, 0, 0}}));
+
+    firc_ct_chunk_t *v = NULL;
+    size_t n = 0;
+    ASSERT(firc_stale_group_subnets(g, firc_mark_group_value(1), false, &v, &n));
+    ASSERT_EQ_FMT((size_t)1, n, "%zu");
+    ASSERT_EQ_FMT((int)AF_INET, (int)v[0].family, "%d");
+    ASSERT_EQ_FMT(8, (int)v[0].prefix, "%d");
+    free(v);
+    firc_group_free(g);
+    PASS();
+}
+
+/* Catches: a loaded first list hiding a second one that is not loaded yet. */
+TEST one_unloaded_list_keeps_the_group_unloaded(void) {
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l0->rules, "a.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 0, 0, 0}}));
+
+    firc_ct_chunk_t *v = NULL;
+    size_t n = 0;
+    ASSERT(firc_stale_group_subnets(g, firc_mark_group_value(1), true, &v, &n));
+    ASSERT_EQ_FMT((size_t)2, n, "%zu");
+    ASSERT(v[0].is_subnet && v[1].is_subnet);
+    ASSERT_EQ_FMT(0, (int)v[0].prefix, "%d");
+    ASSERT_EQ_FMT(0, (int)v[1].prefix, "%d");
+    free(v);
+    firc_group_free(g);
+    PASS();
+}
+
+/* Catches: an empty body of one list counted as loaded. */
+TEST an_empty_body_still_counts_as_unloaded(void) {
+    firc_group_t *g = firc_group_new();
+    ASSERT(g != NULL);
+    firc_group_list_t *l0 = test_group_set_list(g);
+    firc_group_list_t *l1 = test_group_add_list_at(g, "http://t.example/1");
+    ASSERT(l0 != NULL && l1 != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_rules_push(&l0->rules, "a.com", FIRC_RULE_DOMAIN, true, (firc_id_t){{1, 0, 0, 0}}));
+    l1->has_body_hash = true;
+
+    firc_ct_chunk_t *v = NULL;
+    size_t n = 0;
+    ASSERT(firc_stale_group_subnets(g, firc_mark_group_value(1), true, &v, &n));
+    ASSERT_EQ_FMT((size_t)2, n, "%zu");
+    free(v);
+    firc_group_free(g);
+    PASS();
+}
+
 /* Catches: an unfetched list vouching for every flow on a field it did not hold last run. */
 TEST an_unfetched_list_vouches_only_for_a_field_the_file_says_it_held(void) {
     const uint8_t src[4] = {192, 168, 1, 10}, dst[4] = {93, 184, 216, 34};
@@ -483,8 +547,8 @@ TEST an_unfetched_list_vouches_only_for_a_field_the_file_says_it_held(void) {
         ASSERT(up(&f));
         firc_group_t *g = firc_group_new();
         ASSERT(g != NULL);
-        g->list = firc_group_list_new();
-        ASSERT(g->list != NULL);
+        test_group_set_list(g);
+        ASSERT(g->n_lists != 0);
         firc_ct_chunk_t *v = NULL;
         size_t n = 99;
         ASSERT(firc_stale_group_subnets(g, field, kept == 1, &v, &n));
@@ -599,6 +663,9 @@ int main(int argc, char **argv) {
     RUN_TEST(a_group_with_no_subnet_rules_is_not_a_failure);
     RUN_TEST(a_list_group_with_no_hand_rules_is_swept);
     RUN_TEST(a_group_whose_list_is_not_loaded_keeps_its_field_s_flows);
+    RUN_TEST(a_subnet_of_the_second_list_is_seen);
+    RUN_TEST(one_unloaded_list_keeps_the_group_unloaded);
+    RUN_TEST(an_empty_body_still_counts_as_unloaded);
     RUN_TEST(an_unfetched_list_vouches_only_for_a_field_the_file_says_it_held);
     RUN_TEST(each_group_s_chunks_carry_that_group_s_field);
     RUN_TEST(a_group_with_no_chunks_yet_does_not_stop_the_sweep);

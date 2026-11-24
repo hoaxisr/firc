@@ -15,6 +15,7 @@ export function defaultGroup(): Group {
     cloudflare: false,
     resolve: DEFAULT_RESOLVE(),
     rules: [],
+    lists: [],
   };
 }
 

@@ -1,4 +1,4 @@
-# Groups and their rules. A group may also carry a `list:` URL it fetches rules from.
+# Groups and their rules. A group may also carry `lists:` it fetches rules from.
 # The WebUI rewrites this file on every save, and comments here do not survive it.
 configVersion: 0.7.0
 groups:

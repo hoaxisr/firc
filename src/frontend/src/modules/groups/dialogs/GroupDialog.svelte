@@ -12,9 +12,14 @@
   import { policies } from "../../../data/policies.svelte";
   import { fetchResolvers, resolvers } from "../../../data/resolvers.svelte";
   import IfacePicker from "../components/IfacePicker.svelte";
-  import { isValidListUrl, normalizeListUrl, type GroupDialogPayload } from "../groups.svelte";
+  import {
+    isValidListUrl,
+    LISTS_MAX,
+    normalizeListUrl,
+    type GroupDialogPayload,
+  } from "../groups.svelte";
 
-  import { Globe, Link, LoaderCircle, Type } from "../../../components/ui/icons";
+  import { Eye, Globe, Link, LoaderCircle, Type, X } from "../../../components/ui/icons";
   import { BLOCK, DNS, isSink } from "../../../data/iface-choices";
   import { RULE_TYPES, type DeviceSelector, type Group, type ListRule } from "../../../types";
   import { coverageLabel } from "../../../utils/device-picker";
@@ -29,6 +34,7 @@
     type Catalog,
     type CatalogRow,
   } from "../list-catalog";
+  import { listName } from "../list-name";
   import type { GroupLive } from "../live-state";
   import {
     autoEffectiveServers,
@@ -55,7 +61,9 @@
   let name = $state("");
   let draft = $state<{ interface: string | string[] }>({ interface: "" });
   let selectedInterface = $derived(ifaceList(draft)[0]);
-  let listEnabled = $state(false);
+  type Row = { key: string; id?: string; url: string };
+  let rows = $state<Row[]>([]);
+  let rowSeq = 0;
   let url = $state("");
   let interval = $state(86400);
   let seededFor = $state<string | null>(null);
@@ -80,6 +88,7 @@
   let previewUnconstrained = $state(0);
   let previewRules = $state<ListRule[]>([]);
   let previewedUrl = $state<string | null>(null);
+  let previewKey = $state<string | null>(null);
 
   let catalog = $state<Catalog | null>(null);
   let catalogError = $state<string | null>(null);
@@ -87,7 +96,8 @@
   let catalogOpen = $state(false);
   let catalogActive = $state(-1);
   let catalogQuery = $derived(isUrlText(url) ? "" : url.trim());
-  let catalogShown = $derived(listEnabled && catalogOpen && catalogQuery !== "");
+  let full = $derived(rows.length >= LISTS_MAX);
+  let catalogShown = $derived(!full && catalogOpen && catalogQuery !== "");
   let catalogHits = $derived(
     catalog && catalogQuery !== "" ? searchCatalog(catalog, catalogQuery) : { rows: [], more: 0 },
   );
@@ -101,6 +111,28 @@
           : t("nothing found"),
   );
   let urlInvalid = $derived(url !== "" && isUrlText(url) && !isValidListUrl(url));
+  let rowUrls = $derived(rows.map((row) => normalizeListUrl(row.url)));
+  let urlTaken = $derived(isValidListUrl(url) && rowUrls.includes(normalizeListUrl(url)));
+  let canAdd = $derived(!full && isValidListUrl(url) && !urlTaken);
+
+  function rowProblem(i: number): string | null {
+    if (!isValidListUrl(rowUrls[i])) return t("Invalid URL");
+    if (rowUrls.indexOf(rowUrls[i]) !== i) return t("List already exists");
+    return null;
+  }
+
+  function addRow(target: string) {
+    const next = normalizeListUrl(target);
+    if (full || !isValidListUrl(next) || rowUrls.includes(next)) return false;
+    rows.push({ key: `new-${rowSeq++}`, url: next });
+    url = "";
+    return true;
+  }
+
+  function removeRow(key: string) {
+    rows = rows.filter((row) => row.key !== key);
+    if (previewKey === key) resetPreview();
+  }
 
   function askCatalog() {
     if (catalog || catalogLoading) return;
@@ -121,13 +153,19 @@
   }
 
   function pickCatalog(row: CatalogRow) {
-    url = row.url;
+    if (!addRow(row.url)) url = row.url;
     catalogOpen = false;
     catalogActive = -1;
   }
 
   function onUrlKey(e: KeyboardEvent) {
-    if (!catalogShown) return;
+    if (!catalogShown) {
+      if (e.key === "Enter" && canAdd) {
+        e.preventDefault();
+        addRow(url);
+      }
+      return;
+    }
     const n = catalogHits.rows.length;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
@@ -158,6 +196,7 @@
     previewUnconstrained = 0;
     previewRules = [];
     previewedUrl = null;
+    previewKey = null;
   }
 
   $effect(() => {
@@ -176,9 +215,9 @@
       id: group?.id ?? "draft",
       devices: group?.devices ? { ...group.devices } : { allow: [], deny: [] },
     };
-    listEnabled = Boolean(group?.list);
-    url = group?.list?.url ?? "";
-    interval = group?.list?.interval ?? 86400;
+    rows = (group?.lists ?? []).map((list) => ({ key: list.id, id: list.id, url: list.url }));
+    url = "";
+    interval = group?.lists?.[0]?.interval ?? 86400;
     resetPreview();
     catalogOpen = false;
     catalogActive = -1;
@@ -195,7 +234,9 @@
     coverageLabel(devicesTarget.devices, hosts.list, policies.list, t, locale.current),
   );
 
-  let isUrlValid = $derived(!listEnabled || isValidListUrl(url));
+  let isUrlValid = $derived(
+    rows.every((_, i) => rowProblem(i) === null) && (url.trim() === "" || canAdd),
+  );
   let isSinkChoice = $derived(isSink(selectedInterface));
   let isDnsChoice = $derived(selectedInterface === DNS);
   let firmwareServers = $derived(firmwareServersFor(resolvers.list, selectedInterface));
@@ -232,9 +273,10 @@
     dispatch("close");
   }
 
-  async function runPreview() {
-    const target = normalizeListUrl(url);
+  async function runPreview(row: Row) {
+    const target = normalizeListUrl(row.url);
     if (!target) return;
+    previewKey = row.key;
     previewLoading = true;
     previewError = null;
     try {
@@ -245,6 +287,7 @@
         dropped?: number;
         unconstrained?: number;
       }>(`/groups/list/preview?url=${encodeURIComponent(target)}`, { quiet: true });
+      if (previewKey !== row.key) return;
       previewRules = res.rules ?? [];
       previewTotal = res.total ?? previewRules.length;
       previewByType = res.byType ?? {};
@@ -252,6 +295,7 @@
       previewUnconstrained = res.unconstrained ?? 0;
       previewedUrl = target;
     } catch (e) {
+      if (previewKey !== row.key) return;
       previewRules = [];
       previewTotal = 0;
       previewByType = {};
@@ -269,7 +313,7 @@
       }
       previewError = message;
     } finally {
-      previewLoading = false;
+      if (previewKey === row.key) previewLoading = false;
     }
   }
 
@@ -290,11 +334,16 @@
       serverErrorShown = t("A DNS only group needs a server");
       return;
     }
+    if (url.trim() !== "") addRow(url);
     const payload: GroupDialogPayload = {
       name: name.trim(),
       interface: ifaceValue(ifaceList(draft)),
       devices: devicesTarget.devices,
-      list: listEnabled ? { url: normalizeListUrl(url), interval } : null,
+      lists: rows.map((row) => ({
+        ...(row.id ? { id: row.id } : {}),
+        url: normalizeListUrl(row.url),
+        interval,
+      })),
       resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer, fallbackOn),
       cloudflare: selectedInterface !== BLOCK && selectedInterface !== DNS && cloudflare,
     };
@@ -302,6 +351,53 @@
     handleClose();
   }
 </script>
+
+{#snippet previewResult()}
+  {#if previewError}
+    <p class="preview-error">{previewError}</p>
+  {:else if previewedUrl}
+    <div class="preview-result">
+      <div class="preview-counts">
+        <span class="count">
+          <b>{previewTotal}</b><span class="count-label">{t("total")}</span>
+        </span>
+        {#if typeBreakdown}
+          <span class="breakdown">({typeBreakdown})</span>
+        {/if}
+      </div>
+      {#if previewTotal === 0 && previewDropped === 0}
+        <div class="preview-note">{t("This list holds nothing firc can route")}</div>
+      {:else if previewDropped > 0}
+        <div class="preview-note">
+          {t("Lines that are not rules")}: {previewDropped}
+          {#if previewTotal === 0}
+            &mdash; {t("this list is in a format firc does not route")}
+          {/if}
+        </div>
+      {/if}
+      {#if previewUnconstrained > 0}
+        <div class="preview-note">
+          {t("Names without a protocol limit")}: {previewUnconstrained}
+        </div>
+      {/if}
+      {#if previewRules.length > 0}
+        {#if previewTotal > previewRules.length}
+          <div class="preview-shown">
+            {t("Showing the first {n}").replace("{n}", String(previewRules.length))}
+          </div>
+        {/if}
+        <div class="preview-rules">
+          {#each previewRules as rule (rule.id)}
+            <div class="preview-rule-row">
+              <span class="preview-rule-type">{ruleTypeLabel(rule.type)}</span>
+              <span class="preview-rule-pattern">{rule.rule}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
 
 {#snippet serverField(dns: boolean)}
   <div class="field">
@@ -421,15 +517,76 @@
 
     <div class="list-block">
       <div class="list-toggle">
-        <Switch bind:checked={listEnabled} aria-label={t("List by URL")} />
-        <span class="list-toggle-label">{t("List by URL")}</span>
-        <span class="list-toggle-hint">{t("optional: without it the group is manual")}</span>
+        <span class="list-toggle-label">{t("Lists by URL")}</span>
+        <span class="list-toggle-hint">{t("optional: without them the group is manual")}</span>
       </div>
 
-      {#if listEnabled}
-        <div class="field">
-          <label for="gd-url">{t("Address or name")}</label>
-          <div class="group-dialog-input-wrapper">
+      {#if rows.length > 0}
+        <div class="gd-list-rows">
+          {#each rows as row, i (row.key)}
+            {@const problem = rowProblem(i)}
+            <div class="gd-list-row">
+              {#if problem === null}
+                <span class="gd-list-name">{listName(rowUrls[i])}</span>
+              {/if}
+              <div class="gd-list-line">
+                <div class="group-dialog-input-wrapper gd-list-field">
+                  <span class="icon"><Link size={18} /></span>
+                  <input
+                    type="text"
+                    class="gd-list-url"
+                    class:invalid={problem !== null}
+                    bind:value={row.url}
+                    aria-label={t("List address")}
+                    aria-invalid={problem !== null}
+                    title={row.url}
+                  />
+                </div>
+                <Button
+                  type="button"
+                  small
+                  class="gd-list-preview"
+                  aria-label={t("Preview")}
+                  title={t("Preview")}
+                  onclick={() => runPreview(row)}
+                  disabled={problem !== null || (previewLoading && previewKey === row.key)}
+                >
+                  {#if previewLoading && previewKey === row.key}
+                    <LoaderCircle class="spin" size={18} />
+                  {:else}
+                    <Eye size={18} />
+                  {/if}
+                </Button>
+                <Button
+                  type="button"
+                  small
+                  class="gd-list-remove"
+                  aria-label={t("Remove list")}
+                  title={t("Remove list")}
+                  onclick={() => removeRow(row.key)}
+                >
+                  <X size={18} />
+                </Button>
+              </div>
+              {#if problem !== null}
+                <span class="field-error">{problem}</span>
+              {/if}
+              {#if previewKey === row.key}
+                {@render previewResult()}
+              {/if}
+            </div>
+          {/each}
+        </div>
+        <div class="preview-hint-line">
+          <Eye size={14} /><span class="preview-hint">{t("fetches and parses, saves nothing")}</span
+          >
+        </div>
+      {/if}
+
+      <div class="field">
+        <label for="gd-url">{t("Address or name")}</label>
+        <div class="gd-list-line gd-add-line">
+          <div class="group-dialog-input-wrapper gd-list-field">
             <span class="icon"><Link size={18} /></span>
             <input
               id="gd-url"
@@ -449,49 +606,60 @@
               onkeydown={onUrlKey}
               onblur={() => (catalogOpen = false)}
               placeholder="https://example.com/list.txt"
-              class:invalid={urlInvalid}
+              disabled={full}
+              class:invalid={urlInvalid || urlTaken}
             />
           </div>
-          <span class="catalog-status" role="status">{catalogStatus}</span>
-          {#if catalogShown}
-            <div class="catalog-panel" id="gd-url-catalog">
-              {#if catalogHits.rows.length > 0}
-                <ul role="listbox" aria-label={t("Address or name")}>
-                  {#each catalogHits.rows as row, i (i)}
-                    <!-- svelte-ignore a11y_click_events_have_key_events -->
-                    <li
-                      id={`gd-url-option-${i}`}
-                      role="option"
-                      aria-selected={i === catalogActive}
-                      class:active={i === catalogActive}
-                      onpointerdown={(e) => e.preventDefault()}
-                      onclick={() => pickCatalog(row)}
-                    >
-                      <span class="catalog-name">{row.name}</span>
-                      <span class="catalog-badge">{row.source}</span>
-                    </li>
-                  {/each}
-                </ul>
-                {#if catalogHits.more > 0}
-                  <div class="catalog-note">
-                    {t("{n} more").replace("{n}", String(catalogHits.more))}
-                  </div>
-                {/if}
-              {:else if catalogLoading}
-                <div class="catalog-note">{t("loading the catalog…")}</div>
-              {:else if catalogError !== null}
-                <div class="catalog-note catalog-error">
-                  {catalogError || t("Catalog unavailable")}
-                </div>
-              {:else}
-                <div class="catalog-note">{t("nothing found")}</div>
-              {/if}
-            </div>
-          {/if}
-          {#if urlInvalid}
-            <span class="field-error">{t("Invalid URL")}</span>
-          {/if}
+          <Button type="button" class="gd-list-add" onclick={() => addRow(url)} disabled={!canAdd}>
+            {t("Add list")}
+          </Button>
         </div>
+        <span class="catalog-status" role="status">{catalogStatus}</span>
+        {#if catalogShown}
+          <div class="catalog-panel" id="gd-url-catalog">
+            {#if catalogHits.rows.length > 0}
+              <ul role="listbox" aria-label={t("Address or name")}>
+                {#each catalogHits.rows as hit, i (i)}
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <li
+                    id={`gd-url-option-${i}`}
+                    role="option"
+                    aria-selected={i === catalogActive}
+                    class:active={i === catalogActive}
+                    onpointerdown={(e) => e.preventDefault()}
+                    onclick={() => pickCatalog(hit)}
+                  >
+                    <span class="catalog-name">{hit.name}</span>
+                    <span class="catalog-badge">{hit.source}</span>
+                  </li>
+                {/each}
+              </ul>
+              {#if catalogHits.more > 0}
+                <div class="catalog-note">
+                  {t("{n} more").replace("{n}", String(catalogHits.more))}
+                </div>
+              {/if}
+            {:else if catalogLoading}
+              <div class="catalog-note">{t("loading the catalog…")}</div>
+            {:else if catalogError !== null}
+              <div class="catalog-note catalog-error">
+                {catalogError || t("Catalog unavailable")}
+              </div>
+            {:else}
+              <div class="catalog-note">{t("nothing found")}</div>
+            {/if}
+          </div>
+        {/if}
+        {#if urlInvalid}
+          <span class="field-error">{t("Invalid URL")}</span>
+        {:else if urlTaken}
+          <span class="field-error">{t("List already exists")}</span>
+        {:else if full}
+          <span class="list-toggle-hint">{t("A group holds at most 16 lists")}</span>
+        {/if}
+      </div>
+
+      {#if rows.length > 0 || url.trim() !== ""}
         <div class="field">
           <span class="lbl">{t("Update:")}</span>
           <Select
@@ -505,67 +673,6 @@
             ariaLabel={t("Update:")}
           />
         </div>
-
-        <div class="preview-row">
-          <Button
-            type="button"
-            onclick={runPreview}
-            disabled={!isValidListUrl(url) || previewLoading}
-          >
-            <div class="button-content">
-              {#if previewLoading}
-                <LoaderCircle class="spin" size={16} />
-              {/if}
-              <span>{t("Preview")}</span>
-            </div>
-          </Button>
-          <span class="preview-hint">{t("fetches and parses, saves nothing")}</span>
-        </div>
-
-        {#if previewError}
-          <p class="preview-error">{previewError}</p>
-        {:else if previewedUrl}
-          <div class="preview-result">
-            <div class="preview-counts">
-              <span class="count">
-                <b>{previewTotal}</b><span class="count-label">{t("total")}</span>
-              </span>
-              {#if typeBreakdown}
-                <span class="breakdown">({typeBreakdown})</span>
-              {/if}
-            </div>
-            {#if previewTotal === 0 && previewDropped === 0}
-              <div class="preview-note">{t("This list holds nothing firc can route")}</div>
-            {:else if previewDropped > 0}
-              <div class="preview-note">
-                {t("Lines that are not rules")}: {previewDropped}
-                {#if previewTotal === 0}
-                  &mdash; {t("this list is in a format firc does not route")}
-                {/if}
-              </div>
-            {/if}
-            {#if previewUnconstrained > 0}
-              <div class="preview-note">
-                {t("Names without a protocol limit")}: {previewUnconstrained}
-              </div>
-            {/if}
-            {#if previewRules.length > 0}
-              {#if previewTotal > previewRules.length}
-                <div class="preview-shown">
-                  {t("Showing the first {n}").replace("{n}", String(previewRules.length))}
-                </div>
-              {/if}
-              <div class="preview-rules">
-                {#each previewRules as rule (rule.id)}
-                  <div class="preview-rule-row">
-                    <span class="preview-rule-type">{ruleTypeLabel(rule.type)}</span>
-                    <span class="preview-rule-pattern">{rule.rule}</span>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/if}
       {/if}
     </div>
 
@@ -762,30 +869,77 @@
     color: var(--text-2);
   }
 
-  .preview-row {
+  .gd-list-rows {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.5rem 0.75rem;
+    flex-direction: column;
+    gap: 0.6rem;
   }
 
-  .preview-row :global(button) {
-    flex: 0 0 auto;
-    padding: 0.5rem 1rem;
+  .gd-list-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+
+  .gd-list-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.85rem;
+    color: var(--text);
+  }
+
+  .gd-list-line {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+
+  .gd-list-field {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .gd-list-url {
+    text-overflow: ellipsis;
+  }
+
+  .gd-list-line :global(.gd-list-add) {
+    flex: none;
+    padding: 0.5rem 0.8rem;
+    white-space: nowrap;
+  }
+
+  .gd-list-line :global(.gd-list-preview),
+  .gd-list-line :global(.gd-list-remove) {
+    flex: none;
+  }
+
+  @media (max-width: 700px) {
+    .gd-add-line {
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .gd-add-line .gd-list-field {
+      flex-basis: 100%;
+    }
+  }
+
+  .preview-hint-line {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--text-2);
   }
 
   .preview-hint {
-    flex: 1 1 10rem;
     min-width: 0;
     font-size: 0.8rem;
     line-height: 1.3;
     color: var(--text-2);
-  }
-
-  .button-content {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
   }
 
   .preview-error {

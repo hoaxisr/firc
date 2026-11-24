@@ -10,13 +10,16 @@ const record = (over: Record<string, unknown> = {}) => ({
   interface: "eth0",
   enable: true,
   rules: [],
-  list: {
-    url: "https://example.com/list.txt",
-    rulesTotal: 3,
-    lastUpdate: 1700000000,
-    interval: 86400,
-    sync: { state: "idle", error: "", lastCheck: 0 },
-  },
+  lists: [
+    {
+      id: "0a0a0a0a",
+      url: "https://example.com/list.txt",
+      rulesTotal: 3,
+      lastUpdate: 1700000000,
+      interval: 86400,
+      sync: { state: "idle", error: "", lastCheck: 0 },
+    },
+  ],
   ...over,
 });
 
@@ -36,27 +39,47 @@ describe("a group's list, from the daemon", () => {
   // Catches a list schema stricter than the daemon, refusing a config over one thin record.
   it("survives a list with no url", () => {
     const thin: Record<string, unknown> = record();
-    delete (thin.list as Record<string, unknown>).url;
+    delete ((thin.lists as Record<string, unknown>[])[0] as Record<string, unknown>).url;
 
     const [parsed] = parse(array(GroupSchema), [thin]);
-    assert.strictEqual(parsed.list?.url, "");
+    assert.strictEqual(parsed.lists[0].url, "");
     assert.strictEqual(parsed.id, "a1b2c3d4", "and the rest of it is untouched");
   });
 
   // GET /groups never sends a list's rules; the schema must keep only the count and sync state.
   it("keeps a list to its count, never its rules", () => {
     const [parsed] = parse(array(GroupSchema), [record()]);
-    assert.strictEqual(parsed.list?.rulesTotal, 3);
-    assert.deepStrictEqual(parsed.list?.sync, { state: "idle", error: "", lastCheck: 0 });
-    assert.strictEqual((parsed.list as any).rules, undefined);
+    assert.strictEqual(parsed.lists[0].rulesTotal, 3);
+    assert.deepStrictEqual(parsed.lists[0].sync, { state: "idle", error: "", lastCheck: 0 });
+    assert.strictEqual((parsed.lists[0] as any).rules, undefined);
   });
 
   // Catches a list being conjured from fallbacks for a group that has none.
-  it("leaves a group with no list as having none", () => {
+  it("leaves a group with no lists as having none", () => {
     const thin: Record<string, unknown> = record();
-    delete thin.list;
+    delete thin.lists;
     const [parsed] = parse(array(GroupSchema), [thin]);
-    assert.strictEqual(parsed.list, undefined);
+    assert.deepStrictEqual(parsed.lists, []);
+  });
+
+  // Catches a fallback id drawn once at load, so two lists with no usable id collide.
+  it("gives two lists with unusable ids two different ones", () => {
+    const [parsed] = parse(array(GroupSchema), [
+      record({
+        lists: [
+          { id: "x", url: "https://a.example/l" },
+          { id: "", url: "https://b.example/l" },
+        ],
+      }),
+    ]);
+    assert.match(parsed.lists[0].id, /^[0-9a-f]{8}$/);
+    assert.notStrictEqual(parsed.lists[0].id, parsed.lists[1].id);
+  });
+
+  // Catches the schema dropping a list's id, which every per-list key is built from.
+  it("keeps a list's id", () => {
+    const [parsed] = parse(array(GroupSchema), [record()]);
+    assert.strictEqual(parsed.lists[0].id, "0a0a0a0a");
   });
 
   // Catches the schema stripping a group's device selector.

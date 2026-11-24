@@ -79,41 +79,46 @@ groups:
     interface: ""
     enable: true
     rules: []
-    list:
-      url: "http://127.0.0.1:$STUB_SUB_PORT/good"
-      interval: 4
+    lists:
+      - id: 7a7a7a01
+        url: "http://127.0.0.1:$STUB_SUB_PORT/good"
+        interval: 4
   - id: 10000002
     name: redirect-loop
     interface: ""
     enable: true
     rules: []
-    list:
-      url: "http://127.0.0.1:$STUB_SUB_PORT/loopA"
-      interval: 4
+    lists:
+      - id: 7a7a7a02
+        url: "http://127.0.0.1:$STUB_SUB_PORT/loopA"
+        interval: 4
   - id: 10000003
     name: not-found
     interface: ""
     enable: true
     rules: []
-    list:
-      url: "http://127.0.0.1:$STUB_SUB_PORT/404"
-      interval: 4
+    lists:
+      - id: 7a7a7a03
+        url: "http://127.0.0.1:$STUB_SUB_PORT/404"
+        interval: 4
   - id: 10000004
     name: oversized
     interface: ""
     enable: true
     rules: []
-    list:
-      url: "http://127.0.0.1:$STUB_SUB_PORT/big"
-      interval: 4
+    lists:
+      - id: 7a7a7a04
+        url: "http://127.0.0.1:$STUB_SUB_PORT/big"
+        interval: 4
   - id: 10000005
     name: connection-refused
     interface: ""
     enable: true
     rules: []
-    list:
-      url: "http://127.0.0.1:1/nope"
-      interval: 4
+    lists:
+      - id: 7a7a7a05
+        url: "http://127.0.0.1:1/nope"
+        interval: 4
 EOF
 
 echo "== building bench tools + daemon"
@@ -175,7 +180,7 @@ echo "$DURATION,$final_rss" >> "$RSS_CSV"
 alive="no"
 kill -0 "$DP" 2>/dev/null && alive="yes"
 
-sync_errors=$(grep -c '": sync failed: ' "$OUT_DIR/daemon.log" 2>/dev/null || echo 0)
+sync_errors=$(grep -c ' was not synced: ' "$OUT_DIR/daemon.log" 2>/dev/null || echo 0)
 reloads=$(grep -c "config reloaded" "$OUT_DIR/daemon.log" 2>/dev/null || echo 0)
 
 kill -TERM "$DP" 2>/dev/null
