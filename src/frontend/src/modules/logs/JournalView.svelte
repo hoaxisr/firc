@@ -72,6 +72,7 @@
   let timer: ReturnType<typeof setInterval> | undefined;
   let captureTimer: ReturnType<typeof setTimeout> | undefined;
   let pane = $state<HTMLDivElement | undefined>(undefined);
+  let atEnd = true;
   let toolbarWidth = $state(0);
   const narrow = $derived(toolbarWidth > 0 && toolbarWidth <= 640);
 
@@ -123,6 +124,7 @@
   }
 
   function resume() {
+    atEnd = true;
     frozen = null;
   }
 
@@ -146,6 +148,7 @@
   }
 
   function clearView() {
+    atEnd = true;
     cleared = {
       boot: journal.boot,
       seq: journal.events.at(-1)?.seq ?? 0,
@@ -170,7 +173,11 @@
   }
 
   function scrollToBottom() {
-    if (!paused && pane) pane.scrollTop = pane.scrollHeight;
+    if (!paused && atEnd && pane) pane.scrollTop = pane.scrollHeight;
+  }
+
+  function onPaneScroll() {
+    if (pane) atEnd = pane.scrollHeight - pane.clientHeight - pane.scrollTop <= 4;
   }
 
   function scheduleCaptureTick() {
@@ -227,6 +234,7 @@
 
   $effect(() => {
     if (!pane) return;
+    atEnd = true;
     const observer = new ResizeObserver(scrollToBottom);
     observer.observe(pane);
     return () => observer.disconnect();
@@ -241,7 +249,14 @@
       view = "events";
       group = request.group;
       if (!sources.has("dns")) sources = new Set([...sources, "dns"]);
+      atEnd = true;
+      scrollToBottom();
     });
+  });
+
+  $effect(() => {
+    void [sources, levels, group, query];
+    atEnd = true;
   });
 
   $effect(() => {
@@ -470,7 +485,7 @@
       </div>
     {/if}
     <div class="card">
-      <div class="pane" bind:this={pane}>
+      <div class="pane" bind:this={pane} onscroll={onPaneScroll}>
         {#if rendered.length === 0}
           <p class="empty">{t("Nothing matches the filters.")}</p>
         {/if}

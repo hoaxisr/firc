@@ -1,0 +1,16 @@
+groups:
+- id: "13131313"
+  name: Crlf none
+  interface: nwg0
+  enable: true   
+  rules:
+  - id: "13130001"
+    type: domain
+    rule: crlf.example
+    enable: true
+  lists:
+  - id: 7a7a7a13
+    url: https://example.com/crlf-none.txt
+    interval: 86400
+    last_update: 0
+    overrides: []

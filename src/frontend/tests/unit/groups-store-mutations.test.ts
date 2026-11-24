@@ -288,6 +288,54 @@ describe("GroupsStore mutations and validation", () => {
     assert.strictEqual(store.data.length, 2);
   });
 
+  const create = (store: InstanceType<typeof GroupsStore>, position?: "start" | "end") =>
+    withPatchedGlobal("document", { querySelector: () => null }, () =>
+      store.createGroupFromDialog(dialogPayload(position) as any),
+    );
+
+  const dialogPayload = (position?: "start" | "end") => ({
+    name: "New",
+    interface: "eth0",
+    devices: { allow: [], deny: [] },
+    resolve: { tunnel: false, server: "", fallback: true },
+    cloudflare: false,
+    ...(position ? { position } : {}),
+  });
+
+  // Catches: createGroupFromDialog pushing last whatever the chosen position.
+  it("a group created at the start is first", async () => {
+    const store = createStore([makeGroup("g1"), makeGroup("g2")]);
+    await create(store, "start");
+    assert.strictEqual(store.data.length, 3);
+    assert.strictEqual(store.data[0].name, "New");
+    assert.deepStrictEqual(groupIds(store).slice(1), ["g1", "g2"]);
+  });
+
+  // Catches: the default or "end" moving the group to the front.
+  it("a group created at the end is last", async () => {
+    for (const position of ["end", undefined] as const) {
+      const store = createStore([makeGroup("g1"), makeGroup("g2")]);
+      await create(store, position);
+      assert.strictEqual(store.data[2].name, "New");
+      assert.deepStrictEqual(groupIds(store).slice(0, 2), ["g1", "g2"]);
+    }
+  });
+
+  // Catches: a group added at the start being hidden by the active search.
+  it("a group added at the start while searching stays visible", async () => {
+    const store = createStore([makeGroup("g1")]);
+    Object.defineProperty(store, "searchActive", { value: true });
+    Object.defineProperty(store, "normalizedSearch", { value: "zzz" });
+    const forced: string[] = [];
+    const original = store.forceVisibleGroup.bind(store);
+    store.forceVisibleGroup = (id: string) => {
+      forced.push(id);
+      original(id);
+    };
+    await create(store, "start");
+    assert.deepStrictEqual(forced, [store.data[0].id]);
+  });
+
   // Catches a second copy of a held name, or a disabled copy left off instead of switched on.
   it("blockName skips a name the group holds and switches a disabled one on", async () => {
     const store = createStore([

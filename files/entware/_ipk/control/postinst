@@ -191,6 +191,71 @@ migrate_groups() {
         END { flush_item(); print off + 0 > countfile }
     ' "$f" > "$f.new" || return 1
 
+    LC_ALL=C awk '
+        function spaces(k,   s) {
+            s = ""
+            while (k-- > 0) { s = s " " }
+            return s
+        }
+        function key_of(i,   head) {
+            head = substr(G[i], 1, kcol)
+            if (i == 1 ? head !~ /^ *- *$/ : head !~ /^ *$/) { return "" }
+            head = substr(G[i], kcol + 1)
+            if (head !~ /^[A-Za-z_][A-Za-z0-9_]*:([ \t\r]|$)/) { return "" }
+            return substr(head, 1, index(head, ":") - 1)
+        }
+        function is_blank(line) { return line ~ /^[ \t\r]*(#.*)?$/ }
+        function indent_of(line) { match(line, /^ */); return RLENGTH }
+        function flush_group(   i, j, li, end_i, val, cr, c, d, first, s) {
+            li = 0
+            for (i = 1; i <= gn; i++) {
+                if (key_of(i) == "lists") { li = -1; break }
+                if (key_of(i) == "list" && li == 0) { li = i }
+            }
+            if (li > 0) {
+                cr = G[li] ~ /\r$/ ? "\r" : ""
+                val = substr(G[li], kcol + 1 + length("list:"))
+                sub(/^[ \t]+/, "", val)
+                sub(/(^|[ \t]+)#.*$/, "", val)
+                sub(/[ \t\r]+$/, "", val)
+                for (end_i = li + 1; end_i <= gn && (is_blank(G[end_i]) || indent_of(G[end_i]) > kcol); end_i++) {}
+                end_i--
+                while (end_i > li && is_blank(G[end_i])) { end_i-- }
+                if (val ~ /^\{.*\}$/ && val !~ /^\{[ \t]*\}$/) {
+                    G[li] = substr(G[li], 1, kcol) "lists: [" val "]" cr
+                } else if (val == "" && end_i > li) {
+                    G[li] = substr(G[li], 1, kcol) "lists:" cr
+                    first = 1
+                    for (j = li + 1; j <= end_i; j++) {
+                        if (is_blank(G[j])) { continue }
+                        s = indent_of(G[j])
+                        if (first) {
+                            c = s
+                            d = kcol + 2 - c
+                            G[j] = spaces(kcol) "- " substr(G[j], c + 1)
+                            first = 0
+                        } else {
+                            G[j] = spaces(s + d) substr(G[j], s + 1)
+                        }
+                    }
+                }
+            }
+            for (i = 1; i <= gn; i++) { print G[i] }
+            gn = 0
+        }
+        /^[^ \t#-]/ { flush_group(); in_groups = ($0 ~ /^groups:[ \t\r]*$/); gi = -1 }
+        in_groups && /^ *- / && (gi < 0 || indent_of($0) == gi) {
+            flush_group()
+            gi = indent_of($0)
+            match($0, /^ *- */)
+            kcol = RLENGTH
+        }
+        {
+            if (in_groups && (gn > 0 || gi >= 0)) { G[++gn] = $0 } else { print }
+        }
+        END { flush_group() }
+    ' "$f.new" > "$f.lists" && mv "$f.lists" "$f.new" || { rm -f "$f.new" "$f.lists" "$f.off"; return 1; }
+
     if [ ! -s "$f.new" ]; then
         rm -f "$f.new" "$f.off"
         return 1

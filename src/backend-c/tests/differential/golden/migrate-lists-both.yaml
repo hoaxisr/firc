@@ -1,0 +1,15 @@
+groups:
+- id: "99999999"
+  name: Nine
+  interface: nwg0
+  enable: true
+  rules: []
+  list:
+    url: https://example.com/old.txt
+    interval: 86400
+  lists:
+  - id: 7a7a7a09
+    url: https://example.com/nine.txt
+    interval: 86400
+    last_update: 0
+    overrides: []

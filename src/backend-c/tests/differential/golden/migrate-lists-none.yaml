@@ -1,0 +1,22 @@
+groups:
+- id: "77777777"
+  name: Seven
+  interface: nwg0
+  enable: true
+  rules:
+  - id: "77770001"
+    comment: 'list: not a key'
+    type: domain
+    rule: list.example
+    enable: true
+  lists:
+  - id: 7a7a7a07
+    url: https://example.com/seven.txt
+    interval: 86400
+    last_update: 0
+    overrides: []
+- id: "88888888"
+  name: Eight
+  interface: nwg1
+  enable: false
+  rules: []

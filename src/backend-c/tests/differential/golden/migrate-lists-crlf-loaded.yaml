@@ -1,0 +1,12 @@
+groups:
+- id: "12121212"
+  name: Crlf
+  interface: nwg0
+  enable: true
+  rules: []
+  lists:
+  - id: RANDOM
+    url: https://example.com/crlf.txt
+    interval: 86400
+    last_update: 0
+    overrides: []

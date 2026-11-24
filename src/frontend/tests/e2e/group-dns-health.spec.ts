@@ -203,6 +203,49 @@ test.describe("The DNS health tag opens the journal", () => {
     await expect(groupFilter).toHaveText("Flaky");
   });
 
+  // Catches a focus request for the group already selected leaving a scrolled-back reader off the live end.
+  test("a focus request for the selected group lands at the end", async ({ page }) => {
+    const events = Array.from({ length: 90 }, (_, i) => ({
+      seq: i + 1,
+      at: 1790000000 + i,
+      kind: "dns",
+      client: "192.168.1.42",
+      name: `n${i + 1}.example`,
+      qtype: "A",
+      rcode: "NOERROR",
+      decision: "issued",
+      group: { id: "0a000021", name: "Flaky" },
+      fake: "198.18.0.5",
+      reals: ["142.250.1.1"],
+    }));
+    await page.route(/\/system\/events(\?.*)?$/, (route) => {
+      const since = Number(new URL(route.request().url()).searchParams.get("since") ?? 0);
+      const fresh = since === 0 ? events : [];
+      return route.fulfill({ json: { events: fresh, next: since === 0 ? 90 : since, dropped: 0 } });
+    });
+    await setup(page, [
+      group("0a000021", "Flaky", {
+        total: 37,
+        fallbacks: 4,
+        last: LAST,
+        reason: "fallback_timeout",
+      }),
+    ]);
+    await page.locator(".health-badge").click();
+    const pane = page.locator(".pane");
+    await expect(pane.locator(".row")).toHaveCount(90);
+    await pane.evaluate((el) => (el.scrollTop = 0));
+    await page.getByRole("tab", { name: "Groups" }).click();
+    await page.locator(".health-badge").click();
+    await expect(page.getByRole("tab", { name: "Journal" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await expect
+      .poll(() => pane.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop))
+      .toBeLessThanOrEqual(1);
+  });
+
   // Catches a spent focus request replaying after logout and login, past the user's own tab.
   test("a click before logout does not steer the next login", async ({ page }) => {
     await setup(page, [

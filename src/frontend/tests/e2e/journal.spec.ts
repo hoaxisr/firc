@@ -1230,3 +1230,119 @@ test("at 360 px a DNS row's links are at least 32 px tall to a tap", async ({ pa
   expect(heights.length).toBe(2);
   for (const h of heights) expect(h).toBeGreaterThanOrEqual(32);
 });
+
+test.describe("a scrolled-back reader", () => {
+  const row = (seq: number) => ({
+    seq,
+    at: 1790000000 + seq,
+    kind: "log",
+    level: "info",
+    source: "fircd",
+    message: `line ${seq}`,
+  });
+  const rowsFrom = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => row(from + i));
+  const gap = (el: HTMLElement) => el.scrollHeight - el.clientHeight - el.scrollTop;
+
+  async function open(page: Page, all: unknown[]) {
+    await shellWith(page, (route) => {
+      const since = Number(new URL(route.request().url()).searchParams.get("since") ?? 0);
+      const fresh = (all as { seq: number }[]).filter((e) => e.seq > since);
+      const next = fresh.length ? fresh[fresh.length - 1].seq : since;
+      return route.fulfill({ json: { events: fresh, next, dropped: 0 } });
+    });
+    await page.goto("/journal");
+    await expect(page.locator(".pane .row")).toHaveCount(all.length);
+  }
+
+  for (const size of [
+    { width: 390, height: 844 },
+    { width: 1280, height: 800 },
+  ]) {
+    // Catches new entries throwing a reader who scrolled back to the live end.
+    test(`a reader scrolled back stays where they are when entries arrive at ${size.width}`, async ({
+      page,
+    }) => {
+      await page.setViewportSize(size);
+      const all = rowsFrom(1, 90);
+      await open(page, all);
+      const pane = page.locator(".pane");
+      await pane.evaluate((el) => (el.scrollTop = 0));
+      await expect(page.getByText("line 1", { exact: true })).toBeVisible();
+      all.push(...rowsFrom(91, 100));
+      await expect(page.locator(".pane .row")).toHaveCount(100, { timeout: 6000 });
+      expect(await pane.evaluate((el) => el.scrollTop)).toBe(0);
+      await expect(page.getByText("line 1", { exact: true })).toBeVisible();
+    });
+
+    // Catches a fix that never follows: a reader at the live end must keep following.
+    test(`a reader at the live end follows new entries at ${size.width}`, async ({ page }) => {
+      await page.setViewportSize(size);
+      const all = rowsFrom(1, 90);
+      await open(page, all);
+      all.push(...rowsFrom(91, 100));
+      await expect(page.locator(".pane .row")).toHaveCount(100, { timeout: 6000 });
+      await expect(page.getByText("line 100", { exact: true })).toBeVisible();
+      expect(await page.locator(".pane").evaluate(gap)).toBeLessThanOrEqual(1);
+    });
+  }
+
+  // Catches a filter change leaving the reader on a stale position instead of the live end.
+  test("a filter change while scrolled back lands at the end", async ({ page }) => {
+    const all = rowsFrom(1, 90);
+    await open(page, all);
+    const pane = page.locator(".pane");
+    await pane.evaluate((el) => (el.scrollTop = 0));
+    await page.getByRole("searchbox").fill("line");
+    await expect.poll(() => pane.evaluate(gap)).toBeLessThanOrEqual(1);
+    await page.getByRole("searchbox").fill("line 5");
+    await page.getByRole("searchbox").fill("line");
+    await expect.poll(() => pane.evaluate(gap)).toBeLessThanOrEqual(1);
+  });
+
+  // Catches Clear leaving a scrolled-back reader off the end of the rows that arrive next.
+  test("clear while scrolled back follows the next entries", async ({ page }) => {
+    const all = rowsFrom(1, 90);
+    await open(page, all);
+    const pane = page.locator(".pane");
+    await pane.evaluate((el) => (el.scrollTop = 0));
+    await page.getByRole("button", { name: "Clear view" }).click();
+    all.push(...rowsFrom(91, 190));
+    await expect(page.locator(".pane .row")).toHaveCount(100, { timeout: 6000 });
+    expect(await pane.evaluate(gap)).toBeLessThanOrEqual(1);
+  });
+
+  // Catches a tab switch resetting the position the reader had.
+  test("scrolling back, switching tab and returning keeps the position", async ({ page }) => {
+    const all = rowsFrom(1, 90);
+    await open(page, all);
+    const pane = page.locator(".pane");
+    await pane.evaluate((el) => (el.scrollTop = 200));
+    await page.getByRole("tab", { name: "Settings", exact: true }).click();
+    await expect(pane).toBeHidden();
+    await page.getByRole("tab", { name: "Journal", exact: true }).click();
+    await expect(pane).toBeVisible();
+    expect(await pane.evaluate((el) => el.scrollTop)).toBe(200);
+    all.push(...rowsFrom(91, 100));
+    await expect(page.locator(".pane .row")).toHaveCount(100, { timeout: 6000 });
+    expect(await pane.evaluate((el) => el.scrollTop)).toBe(200);
+  });
+
+  // Catches the Events pane rebuilt at the top after a visit to another journal view while the stale flag stops it following.
+  test("leaving Events for another view and returning lands at the end and follows", async ({
+    page,
+  }) => {
+    const all = rowsFrom(1, 90);
+    await open(page, all);
+    const pane = page.locator(".pane");
+    await pane.evaluate((el) => (el.scrollTop = 0));
+    await page.getByRole("tab", { name: "DNS stats", exact: true }).click();
+    await expect(page.locator(".pane .row")).toHaveCount(0);
+    await page.getByRole("tab", { name: /^Events/ }).click();
+    await expect(page.locator(".pane .row")).toHaveCount(90);
+    await expect.poll(() => pane.evaluate(gap)).toBeLessThanOrEqual(1);
+    all.push(...rowsFrom(91, 100));
+    await expect(page.locator(".pane .row")).toHaveCount(100, { timeout: 6000 });
+    await expect.poll(() => pane.evaluate(gap)).toBeLessThanOrEqual(1);
+  });
+});

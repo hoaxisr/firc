@@ -1,0 +1,19 @@
+groups:
+- id: "55555555"
+  name: Five
+  interface: nwg0
+  enable: true
+  list:
+      url: https://example.com/five.txt
+      interval: 86400
+      last_update: 1700000000
+      overrides: []
+  rules:
+  - id: "66660001"
+    type: domain
+    rule: hand.example
+    enable: true
+  - id: "66660002"
+    type: subnet
+    rule: 10.0.0.0/8
+    enable: false

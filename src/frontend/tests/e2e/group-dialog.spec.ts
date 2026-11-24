@@ -610,3 +610,125 @@ test.describe("Group dialog: DNS only", () => {
     expect(saved[1].groups[0].resolve.fallback).not.toBe(false);
   });
 });
+
+test.describe("Group dialog: where a new group goes", () => {
+  const existing = (id: string, name: string) => ({
+    id,
+    name,
+    interface: "eth0",
+    enable: true,
+    devices: { allow: [], deny: [] },
+    resolve: { fallback: true },
+    rules: [],
+    lists: [],
+    live: true,
+  });
+
+  async function setup(page: Page, opts: { init?: () => void } = {}) {
+    await signedIn(page);
+    if (opts.init) await page.addInitScript(opts.init);
+    await page.route("**/interfaces", (route) => route.fulfill({ json: { interfaces: ["eth0"] } }));
+    await page.route("**/groups?with_rules=true", (route) =>
+      route.fulfill({
+        json: { groups: [existing("0a000001", "Old A"), existing("0a000002", "Old B")] },
+      }),
+    );
+    await page.goto("/");
+  }
+
+  async function addNamed(page: Page, name: string) {
+    await page.locator('[data-value="Add Group"] button').click();
+    const dialog = page.getByRole("dialog");
+    await dialog.locator("#gd-name").fill(name);
+    return dialog;
+  }
+
+  const names = (page: Page) => page.locator("input.group-name");
+
+  // Catches: the choice being ignored on create, not remembered over a reload, or the end choice not restoring.
+  test("the create dialog adds a group where the user chose", async ({ page }) => {
+    await setup(page);
+    let dialog = await addNamed(page, "First");
+    await dialog.getByRole("button", { name: "at the start", exact: true }).click();
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await expect(names(page)).toHaveCount(3);
+    await expect(names(page).first()).toHaveValue("First");
+
+    await page.reload();
+    await page.locator('[data-value="Add Group"] button').click();
+    dialog = page.getByRole("dialog");
+    await expect(dialog.getByRole("button", { name: "at the start", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(dialog.getByRole("button", { name: "at the end", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    await dialog.getByRole("button", { name: "at the end", exact: true }).click();
+    await dialog.locator("#gd-name").fill("Last");
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await expect(names(page)).toHaveCount(3);
+    await expect(names(page).last()).toHaveValue("Last");
+  });
+
+  // Catches: the control leaking into the edit dialog, where it would imply a move.
+  test("the edit dialog has no position control", async ({ page }) => {
+    await setup(page);
+    await page.getByRole("button", { name: "Group Settings" }).first().click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.locator("#gd-name")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "at the start" })).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "at the end" })).toHaveCount(0);
+  });
+
+  // Catches: a throwing localStorage breaking the dialog or defaulting to the start.
+  test("storage that throws opens with at the end", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    await setup(page, {
+      init: () => {
+        const boom = () => {
+          throw new Error("blocked");
+        };
+        const original = Storage.prototype.getItem;
+        Storage.prototype.getItem = function (key: string) {
+          if (key === "firc.groupAddPosition") boom();
+          return original.call(this, key);
+        };
+        const set = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (key: string, value: string) {
+          if (key === "firc.groupAddPosition") boom();
+          return set.call(this, key, value);
+        };
+      },
+    });
+    const dialog = await addNamed(page, "Safe");
+    await expect(dialog.getByRole("button", { name: "at the end", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await dialog.getByRole("button", { name: "at the start", exact: true }).click();
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await expect(names(page).first()).toHaveValue("Safe");
+    expect(errors).toEqual([]);
+  });
+
+  // Catches: a stored value other than start being read as start.
+  test("a garbage stored value means at the end", async ({ page }) => {
+    await setup(page, {
+      init: () => localStorage.setItem("firc.groupAddPosition", "sideways"),
+    });
+    const dialog = await addNamed(page, "Tail");
+    await expect(dialog.getByRole("button", { name: "at the end", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await expect(names(page).last()).toHaveValue("Tail");
+  });
+});

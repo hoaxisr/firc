@@ -135,6 +135,7 @@ export type GroupDialogPayload = {
   lists?: { id?: string; url: string; interval: number }[];
   resolve: GroupResolve;
   cloudflare: boolean;
+  position?: "start" | "end";
 };
 
 export const LISTS_MAX = 16;
@@ -1839,7 +1840,8 @@ export class GroupsStore {
       lists: [],
     };
     for (const item of payload.lists ?? []) group.lists.push(newList(group.lists, item));
-    this.data.push(group);
+    if (payload.position === "start") this.data.unshift(group);
+    else this.data.push(group);
     this.open_state[group.id] = true;
     this.markDataRevision();
     if (this.searchActive) {

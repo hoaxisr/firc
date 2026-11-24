@@ -1,0 +1,7 @@
+groups:
+- id: "14141414"
+  name: Flow
+  interface: nwg0
+  enable: true
+  rules: []
+  list: {url: https://example.com/flow.txt, interval: 3600}

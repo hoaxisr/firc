@@ -328,6 +328,25 @@
       .join(", "),
   );
 
+  const POSITION_KEY = "firc.groupAddPosition";
+
+  function readPosition(): "start" | "end" {
+    try {
+      return localStorage.getItem(POSITION_KEY) === "start" ? "start" : "end";
+    } catch {
+      return "end";
+    }
+  }
+
+  let position = $state<"start" | "end">(readPosition());
+
+  function choosePosition(next: "start" | "end") {
+    position = next;
+    try {
+      localStorage.setItem(POSITION_KEY, next);
+    } catch {}
+  }
+
   function handleSubmit() {
     if (!canSubmit) return;
     if (isDnsChoice && dnsServer.trim() === "") {
@@ -346,6 +365,7 @@
       })),
       resolve: submittedResolve(selectedInterface, group?.resolve, dnsMode, dnsServer, fallbackOn),
       cloudflare: selectedInterface !== BLOCK && selectedInterface !== DNS && cloudflare,
+      ...(mode === "create" ? { position } : {}),
     };
     dispatch("submit", payload);
     handleClose();
@@ -675,15 +695,28 @@
         </div>
       {/if}
     </div>
-
-    {#if mode === "create"}
-      <p class="footer-note">
-        {t("The group goes to the end of the list. Drag it up to have it take names earlier.")}
-      </p>
-    {/if}
   </div>
 
   <div slot="actions" class="group-dialog-actions">
+    {#if mode === "create"}
+      <div class="position" title={t("Groups higher in the list are checked first")}>
+        <span class="position-label">{t("Add:")}</span>
+        <div class="position-seg" role="group" aria-label={t("Add:")}>
+          <button
+            type="button"
+            data-position="start"
+            aria-pressed={position === "start"}
+            onclick={() => choosePosition("start")}>{t("at the start")}</button
+          >
+          <button
+            type="button"
+            data-position="end"
+            aria-pressed={position === "end"}
+            onclick={() => choosePosition("end")}>{t("at the end")}</button
+          >
+        </div>
+      </div>
+    {/if}
     <div class="button-container">
       <Button onclick={handleSubmit} disabled={!canSubmit} class="primary" style="width: 100%">
         {mode === "create" ? t("Create") : t("Save")}
@@ -1072,23 +1105,76 @@
     white-space: nowrap;
   }
 
-  .footer-note {
-    margin: 0;
-    font-size: 0.8rem;
-    color: var(--text-2);
-    line-height: 1.4;
-  }
-
   .group-dialog-actions {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
     width: 100%;
+  }
+
+  .position {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-2);
+    font-size: 0.9rem;
+  }
+
+  .position-seg {
+    display: flex;
+    background: var(--bg-light);
+    border: 1px solid var(--bg-light-extra);
+    border-radius: 0.5rem;
+    padding: 0.2rem;
+    gap: 0.2rem;
+  }
+
+  .position-seg button {
+    all: unset;
+    cursor: pointer;
+    padding: 0.42rem 0.7rem 0.38rem;
+    border-radius: 0.35rem;
+    color: color-mix(in srgb, var(--text-2) 75%, transparent);
+    font-size: 0.92rem;
+    white-space: nowrap;
+  }
+
+  .position-seg button:hover {
+    color: var(--text);
+  }
+
+  .position-seg button:focus-visible {
+    outline: 2px solid var(--accent, currentColor);
+  }
+
+  .position-seg button[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--accent, var(--text)) 16%, var(--bg-light-extra));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent, var(--text)) 55%, transparent);
+    color: var(--text);
+  }
+
+  @media (max-width: 700px) {
+    .group-dialog-actions {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .position {
+      justify-content: space-between;
+    }
   }
 
   .button-container {
     width: 33.33%;
     min-width: 140px;
+  }
+
+  @media (max-width: 700px) {
+    .button-container {
+      width: 100%;
+    }
   }
 
   :global(.spin) {

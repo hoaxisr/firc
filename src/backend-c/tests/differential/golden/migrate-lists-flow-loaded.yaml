@@ -1,0 +1,12 @@
+groups:
+- id: "14141414"
+  name: Flow
+  interface: nwg0
+  enable: true
+  rules: []
+  lists:
+  - id: RANDOM
+    url: https://example.com/flow.txt
+    interval: 3600
+    last_update: 0
+    overrides: []

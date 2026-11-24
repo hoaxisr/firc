@@ -1,0 +1,14 @@
+groups:
+- id: "11111111"
+  name: One
+  interface: nwg0
+  enable: true
+  rules: []
+  lists:
+  - id: RANDOM
+    url: https://example.com/one.txt
+    interval: 86400
+    last_update: 1700000000
+    overrides:
+    - rule: off.example
+      enable: false

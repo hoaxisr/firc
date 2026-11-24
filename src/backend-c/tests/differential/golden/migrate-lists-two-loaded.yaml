@@ -1,0 +1,25 @@
+groups:
+- id: "33333333"
+  name: Three
+  interface: nwg0
+  enable: true
+  rules: []
+  lists:
+  - id: RANDOM
+    url: https://example.com/three.txt
+    interval: 86400
+    last_update: 0
+    overrides:
+    - rule: a.example
+      type: domain
+- id: "44444444"
+  name: Four
+  interface: nwg1
+  enable: true
+  rules: []
+  lists:
+  - id: 7a7a7a04
+    url: https://example.com/four.txt
+    interval: 7200
+    last_update: 0
+    overrides: []

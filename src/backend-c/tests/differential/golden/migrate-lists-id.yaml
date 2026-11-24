@@ -1,0 +1,12 @@
+groups:
+- id: "22222222"
+  name: Two
+  interface: nwg1
+  enable: false
+  rules: []
+  list:
+    id: 7a7a7a01
+    url: https://example.com/two.srs
+    interval: 3600
+    last_update: 0
+    overrides: []
