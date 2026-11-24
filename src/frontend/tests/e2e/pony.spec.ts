@@ -55,6 +55,54 @@ async function expectOnGroupCard(page: Page, box: { y: number; height: number })
   expect(Math.abs(box.y + box.height - card.y)).toBeLessThan(10);
 }
 
+test("the pony runs to the middle of the Journal margin and turns pages", async ({ page }) => {
+  await startPony(page);
+  await page.evaluate(() => {
+    const panel = document.createElement("div");
+    panel.setAttribute("data-tabs-content", "");
+    panel.dataset.state = "active";
+    panel.style.cssText = "position:fixed;left:320px;right:0;top:60px;bottom:0";
+    document.body.append(panel);
+    for (const label of ["Groups", "Tunnels", "Journal"]) {
+      const tab = document.createElement("button");
+      tab.setAttribute("data-tabs-trigger", "");
+      tab.dataset.state = label === "Groups" ? "active" : "inactive";
+      tab.textContent = label;
+      tab.onclick = () => {
+        for (const other of document.querySelectorAll<HTMLElement>("[data-tabs-trigger]")) {
+          other.dataset.state = other === tab ? "active" : "inactive";
+        }
+      };
+      document.body.append(tab);
+    }
+  });
+  const start = await ponyBox(page);
+  await page.getByRole("button", { name: "Journal" }).click();
+  await advanceUntil(page, "[data-pony-reading]", 10000);
+  await advanceUntil(page, '[data-pony-reading="walk"][data-pony-action="run"]', 2500);
+  await advanceUntil(page, '[data-pony-reading="reading"]', 15000);
+  expect((await ponyBox(page)).x).toBeLessThan(start.x);
+  for (const prop of ["chair", "glasses", "book"]) {
+    await expect(page.locator(`[data-pony-${prop}]`)).toBeVisible();
+  }
+  const chair = await page.locator("[data-pony-chair]").boundingBox();
+  if (!chair) throw new Error("Chair is missing");
+  expect(Math.abs(chair.x + chair.width / 2 - 160)).toBeLessThan(5);
+  const sheet = page.locator("[data-pony-book-page]");
+  const original = await sheet.getAttribute("transform");
+  let turned = false;
+  for (let elapsed = 0; !turned && elapsed < 6500; elapsed += 120) {
+    await page.clock.runFor(120);
+    turned = (await sheet.getAttribute("transform")) !== original;
+  }
+  expect(turned).toBe(true);
+  await page.getByRole("button", { name: "Groups" }).click();
+  await page.clock.runFor(1600);
+  await expect(
+    page.locator("[data-pony-reading], [data-pony-chair], [data-pony-glasses], [data-pony-book]"),
+  ).toHaveCount(0);
+});
+
 test("the pony eats an apple dropped nearby", async ({ page }) => {
   await startPony(page);
   const box = await ponyBox(page);

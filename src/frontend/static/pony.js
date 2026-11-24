@@ -1815,7 +1815,7 @@
           }
         }
       }
-      const pageHold = page.reading ? "lie" : page.dialog || page.typing ? "rest" : null;
+      const pageHold = page.dialog || page.typing ? "rest" : null;
       if (page.typing && !out.face) out.face = toward(page.searchX);
       if (joy) {
         joy.t += dt;
@@ -2098,6 +2098,94 @@
       );
     });
     return rainbow;
+  }
+  const READING_POSE = pose({
+    body: 74,
+    neck: -39,
+    head: -48,
+    tail: 90,
+    legFL1: -22,
+    legFL2: 64,
+    legFR1: -27,
+    legFR2: 67,
+    legBL1: 17,
+    legBL2: -91,
+    legBR1: 23,
+    legBR2: -97,
+  });
+  function createReadingProps() {
+    const chair = el("g", { "data-pony-chair": "" });
+    chair.append(
+      el("path", {
+        d: "M177 174V133Q177 127 183 127H193Q198 127 198 133V200M134 181L129 200M174 181L171 200",
+        fill: "none",
+        stroke: "#492f2a",
+        "stroke-width": 7,
+        "stroke-linecap": "round",
+      }),
+      el("rect", { x: 174, y: 131, width: 25, height: 31, rx: 4, fill: "#a16b49" }),
+      el("rect", { x: 126, y: 174, width: 75, height: 10, rx: 4, fill: "#794d36" }),
+      el("path", {
+        d: "M132 176H195M179 135H194M179 149H194",
+        fill: "none",
+        stroke: "#d69f6b",
+        "stroke-width": 2,
+        "stroke-linecap": "round",
+      }),
+    );
+    const glasses = el("g", {
+      "data-pony-glasses": "",
+      stroke: "#172137",
+      "stroke-width": 2.8,
+      "stroke-linejoin": "round",
+    });
+    glasses.append(
+      el("path", { d: "M59 60L63 61M81 60L99 55L104 58", fill: "none" }),
+      el("path", {
+        d: "M61 57Q71 53 82 57L80 64Q76 72 65 68Z",
+        fill: "#c1edff",
+        "fill-opacity": 0.24,
+      }),
+      el("path", { d: "M65 60L70 58", fill: "none", stroke: "#e8faff", "stroke-width": 1.5 }),
+    );
+    const book = el("g", { "data-pony-book": "", "stroke-linejoin": "round" });
+    book.append(
+      el("path", {
+        d: "M47 79L77 84L108 77L103 103L77 110L51 104Z",
+        fill: "#8c3d34",
+        stroke: "#512823",
+        "stroke-width": 3,
+      }),
+      el("path", {
+        d: "M47 77Q65 73 77 84Q92 73 108 76L101 100Q87 99 77 107Q67 99 53 101Z",
+        fill: "#fff0cb",
+        stroke: "#bb9364",
+        "stroke-width": 1.5,
+      }),
+      el("path", {
+        d: "M77 84V107M55 82Q66 81 72 86M57 88Q66 87 72 92M58 94Q66 93 72 98M82 88Q91 81 100 82M82 94Q90 88 98 88M82 100Q89 94 97 94",
+        fill: "none",
+        stroke: "#ba9c77",
+        "stroke-width": 1.4,
+      }),
+    );
+    const sheet = el("g", { "data-pony-page": "", "data-pony-book-page": "" });
+    sheet.append(
+      el("path", {
+        d: "M77 84Q92 73 108 76L101 100Q87 99 77 107Z",
+        fill: "#fff0cb",
+        stroke: "#bb9364",
+        "stroke-width": 1.5,
+      }),
+      el("path", {
+        d: "M82 88Q91 81 100 82M82 94Q90 88 98 88M82 100Q89 94 97 94",
+        fill: "none",
+        stroke: "#ba9c77",
+        "stroke-width": 1.4,
+      }),
+    );
+    book.append(sheet);
+    return { chair, glasses, book, sheet };
   }
   const TURN_TIME = 0.45;
   const MIN_WIDTH = 0.5;
@@ -2469,6 +2557,7 @@
     let shownReaction = null;
     let dialogOpen = false;
     let peeking = false;
+    let journal = null;
     const firstHurdleAt = lastInput + HURDLE_FIRST;
     let nextHurdleCheck = -Infinity;
     let hurdleRunup = null;
@@ -2590,11 +2679,97 @@
       }
       return best;
     }
-    function approach(s, x) {
+    function approach(s, x, gait = "walk") {
       if (Math.abs(x - s.x) <= 0.06 * size) return true;
-      director.hold("walk");
+      director.hold(gait);
       director.face(Math.sign(x - s.x));
       return false;
+    }
+    function readingPhase(phase, now) {
+      journal.phase = phase;
+      journal.since = now;
+      layer.setAttribute("data-pony-reading", phase);
+    }
+    function clearReading() {
+      if (!journal) return;
+      journal.chair.remove();
+      journal.glasses.remove();
+      journal.book.remove();
+      journal = null;
+      layer.removeAttribute("data-pony-reading");
+      director.hold("rest");
+    }
+    function aimReading() {
+      const toggle = document.querySelector(".upt:not([data-hidden])")?.getBoundingClientRect();
+      const panel = document
+        .querySelector('[data-tabs-content][data-state="active"]')
+        ?.getBoundingClientRect();
+      const gutter = panel?.left ?? 0;
+      journal.scale = Math.min(gutter < size ? 0.74 : 1, pageWidth / width || 1);
+      const seat = width * (0.5 + (0.5 - 164 / VB_W) * journal.scale);
+      const center =
+        gutter >= size ? gutter / 2 : Math.max(size / 2, (toggle?.right ?? 0) + 0.3 * size);
+      journal.x = positionAt(center - seat);
+    }
+    function drawReading(s, now) {
+      if (journal.phase === "walk") {
+        if (!approach(s, journal.x, "run")) return;
+        director.hold("rest");
+        director.face(1);
+        if (hop || turn || facing !== -1 || s.action !== "rest") return;
+        svg.insertBefore(journal.chair, parts.body);
+        parts.head.append(journal.glasses);
+        svg.append(journal.book);
+        readingPhase("sit", now);
+      }
+      director.hold("rest");
+      let elapsed = now - journal.since;
+      if (journal.phase === "sit" && elapsed >= 560) readingPhase("glasses", now);
+      else if (journal.phase === "glasses" && elapsed >= 740) readingPhase("reading", now);
+      else if (journal.phase === "reading" && elapsed >= 2700) readingPhase("turn", now);
+      else if (journal.phase === "turn" && elapsed >= 720) readingPhase("reading", now);
+      elapsed = now - journal.since;
+      const { phase, chair, glasses, book, sheet } = journal;
+      if (phase === "stand" && elapsed >= 740) {
+        clearReading();
+        return;
+      }
+      let bend = phase === "sit" ? easeInOut(elapsed / 560) : 1;
+      let eyewear = phase === "sit" ? 0 : phase === "glasses" ? easeInOut(elapsed / 490) : 1;
+      let open = phase === "sit" ? 0 : phase === "glasses" ? ramp(elapsed, [480, 720]) : 1;
+      const flip = phase === "turn" ? easeInOut(elapsed / 720) : 0;
+      const lift =
+        phase === "glasses" ? ramp(elapsed, [20, 490]) * (1 - ramp(elapsed, [510, 740])) : 0;
+      const sweep = Math.sin(Math.PI * flip);
+      let seated = {
+        ...READING_POSE,
+        legFL1: READING_POSE.legFL1 + 76 * lift + 14 * sweep,
+        legFL2: READING_POSE.legFL2 + 16 * lift + 12 * sweep,
+      };
+      if (phase === "stand") {
+        bend = journal.exit.bend * (1 - easeInOut((elapsed - 170) / 570));
+        eyewear = journal.exit.eyewear * (1 - easeInOut(elapsed / 260));
+        open = journal.exit.open * (1 - easeInOut(elapsed / 230));
+        seated = journal.exit.seated;
+      }
+      journal.current = { bend, eyewear, open, seated };
+      const pose = lerpPose(s.pose, seated, bend);
+      const y = groundLift(pose) * size;
+      chair.setAttribute("transform", `translate(0 ${(y * VB_H) / size})`);
+      chair.setAttribute("opacity", ramp(bend, [0, 0.26]));
+      glasses.setAttribute("opacity", ramp(eyewear, [0, 0.22]));
+      glasses.setAttribute("transform", `translate(${-34 * (1 - eyewear)} ${45 * (1 - eyewear)})`);
+      book.setAttribute("opacity", open);
+      book.setAttribute(
+        "transform",
+        `translate(0 ${89 * (1 - open)}) scale(1 ${0.22 + 0.78 * open})`,
+      );
+      sheet.setAttribute(
+        "transform",
+        `translate(77 ${-11 * sweep}) scale(${Math.cos(Math.PI * flip)} 1) translate(-77 0)`,
+      );
+      sheet.setAttribute("opacity", 1 - ramp(flip, [0.78, 1]));
+      return { pose, y, scale: 1 + bend * (journal.scale - 1) };
     }
     const markLayout = () => {
       layoutDirty = true;
@@ -2615,6 +2790,24 @@
         pageWidth = viewportWidth();
         candidate = findPlatform(groundLine);
       }
+      const pageState = page ? page.poll() : undefined;
+      const readingBlocked = pageState?.dialog || document.hidden || motion?.matches;
+      const readingWanted = pageState?.reading && !readingBlocked;
+      if (journal && readingBlocked) clearReading();
+      if (readingWanted && !journal) {
+        clearHurdles(now);
+        clearScene();
+        if (reaction?.type !== "dialog") reaction = null;
+        journal = createReadingProps();
+        aimReading();
+        readingPhase("walk", now);
+      } else if (journal && !readingWanted && journal.phase !== "stand") {
+        if (!journal.current) clearReading();
+        else {
+          journal.exit = journal.current;
+          readingPhase("stand", now);
+        }
+      } else if (journal && checkLayout) aimReading();
       const edge = reaction?.type === "edge" ? reaction : null;
       const edgeX = edge && pageWidth === edge.pageWidth ? edgeAnchor(edge.dir) : undefined;
       if (
@@ -2632,14 +2825,26 @@
           }
         } else clearScene();
       }
-      director.setWidth(pageWidth, edge && edge.phase !== "sneak" ? edgeX : undefined);
+      director.setWidth(
+        pageWidth,
+        journal && journal.phase !== "walk"
+          ? journal.x
+          : edge && edge.phase !== "sneak"
+            ? edgeX
+            : undefined,
+      );
       const takeoff =
         reaction?.type === "hurdle" && !reaction.action && reaction.next < reaction.hurdles.length
           ? reaction.x - reaction.dir * hurdleLead - 0.5 * width
           : undefined;
-      const s = director.step(dt, takeoff ?? (hurdleRunup?.platform ? hurdleRunup.x : edgeX));
+      const walkingToRead = journal?.phase === "walk";
+      const strideEnd = walkingToRead
+        ? journal.x
+        : (takeoff ?? (hurdleRunup?.platform ? hurdleRunup.x : edgeX));
+      const s = director.step(dt, strideEnd);
       const mid = s.x + 0.5 * width;
       const found =
+        journal ||
         (hurdleRunup && !hurdleRunup.platform) ||
         (reaction?.foreground && !reaction.platform) ||
         edge ||
@@ -2676,8 +2881,7 @@
       }
       const bottom = groundLine - y;
       const box = { left: s.x, right: s.x + width, top: bottom - size, bottom };
-      const pageState = page ? page.poll() : undefined;
-      const pageBusy = pageState?.dialog || pageState?.reading || pageState?.typing;
+      const pageBusy = journal || pageState?.dialog || pageState?.reading || pageState?.typing;
       const platform = plat?.el;
       const bounds = lane(plat);
       const autoHurdle =
@@ -2779,7 +2983,7 @@
         dialogOpen = !!pageState?.dialog;
         layer.style.zIndex = dialogOpen ? "14" : "2147483000";
       }
-      if (!reaction && !pageState?.dialog && !hop) {
+      if (!reaction && !journal && !pageState?.dialog && !hop) {
         if (cursorJump) {
           reaction = { type: "cursor", action: "jump", resume: s.action, dir: s.dir };
         } else if (wasRunning && !ACTIONS[s.action].speed && dust.particles.length) {
@@ -2922,7 +3126,11 @@
       wasRunning = running && !hop;
       let cover = null;
       let renderX = s.x;
-      if (reaction?.type === "dialog") {
+      let renderScale = 1;
+      if (journal) {
+        const reading = drawReading(s, now);
+        if (reading) ({ pose, y, scale: renderScale } = reading);
+      } else if (reaction?.type === "dialog") {
         const r = reaction.card.getBoundingClientRect();
         const left = Math.max(0, r.left);
         const right = Math.min(pageWidth, r.right);
@@ -3116,14 +3324,14 @@
           }
         }
         if (reaction?.action) director.hold(reaction.action);
-      } else if (!reaction && !hurdleRunup) {
+      } else if (!reaction && !hurdleRunup && !journal) {
         if (cmd.face) director.face(cmd.face);
         if (cmd.play) director.play(cmd.play);
         else if (cmd.hold) director.hold(cmd.hold);
         else if (cmd.flee) director.flee(cmd.flee);
         else if (cmd.follow !== null) director.follow(cmd.follow);
       }
-      if (!reaction && cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
+      if (!reaction && !journal && cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
         pose = { ...pose, head: (pose.head || 0) + cmd.gaze };
       if (cover) {
         const { left, top, right, bottom } = cover;
@@ -3181,7 +3389,8 @@
         }
         pose = lerpPose(pose, TURN_POSE, TURN_REAR * rise);
       }
-      svg.style.transform = `translate(${renderX}px, ${-y - 0.05 * size * rise}px) scaleX(${sx})${yaw ? ` perspective(${6 * size}px) rotateY(${yaw.toFixed(1)}deg)` : ""}`;
+      const renderY = -y * renderScale + 0.5 * size * (1 - renderScale) - 0.05 * size * rise;
+      svg.style.transform = `translate(${renderX}px, ${renderY}px) scaleX(${sx})${yaw ? ` perspective(${6 * size}px) rotateY(${yaw.toFixed(1)}deg)` : ""}${renderScale === 1 ? "" : ` scale(${renderScale})`}`;
       applyPose(parts, pose);
       if (type === "butterfly") {
         const { butterfly, wings, phase, since, dir } = reaction;
@@ -3294,6 +3503,7 @@
         for (const hurdle of hurdleAnimations.keys()) hurdle.remove();
         hurdleAnimations.clear();
         clearScene();
+        clearReading();
         hiddenAt = performance.now();
         return;
       }
@@ -3315,6 +3525,7 @@
     const onDoubleClick = (e) => {
       if (
         !ponyBox ||
+        journal ||
         (reaction && reaction.type !== "hurdle" && !sceneActive()) ||
         dialogOpen ||
         e.button !== 0 ||
@@ -3391,7 +3602,12 @@
     rt.layer.remove();
   }
   function playAction(name) {
-    if (!runtime?.director || !Object.hasOwn(ACTIONS, name)) return;
+    if (
+      !runtime?.director ||
+      runtime.layer.hasAttribute("data-pony-reading") ||
+      !Object.hasOwn(ACTIONS, name)
+    )
+      return;
     runtime.clearHurdles();
     runtime.clearScene();
     runtime.director.play(name);
