@@ -2320,6 +2320,7 @@
       dialog:
         '[data-dialog-content][data-state="open"], [data-alert-dialog-content][data-state="open"]',
       reading: 2,
+      tunnels: 1,
     },
   };
   const CHECK_EVERY = 250;
@@ -2342,6 +2343,7 @@
   }
   function createPage(cfg, items, now = () => performance.now()) {
     let tab = -1;
+    let tunnelPanel = null;
     let dialog = false;
     let checkedAt = -Infinity;
     let poke = null;
@@ -2385,11 +2387,19 @@
         }
         if (t - checkedAt >= CHECK_EVERY) {
           checkedAt = t;
-          const idx = all(cfg.tabs).findIndex((el) => el.getAttribute("data-state") === "active");
+          const tabs = all(cfg.tabs).filter((el) => !el.closest("[data-tabs-content]"));
+          const idx = tabs.findIndex((el) => el.getAttribute("data-state") === "active");
           if (idx !== tab) {
             if (tab !== -1 && idx !== -1) events.push({ type: "tab", index: idx });
             tab = idx;
           }
+          tunnelPanel =
+            tab === cfg.tunnels
+              ? (document.getElementById(tabs[tab].getAttribute("aria-controls")) ??
+                all('[data-tabs-content][data-state="active"]').find(
+                  (el) => !el.parentElement.closest("[data-tabs-content]"),
+                ))
+              : null;
           dialog = all(cfg.dialog).length > 0;
         }
         if (!missChecked && t - typedAt >= NO_MATCH_AFTER) {
@@ -2401,6 +2411,8 @@
           events,
           dialog,
           reading: tab !== -1 && tab === cfg.reading,
+          tunnels: tab !== -1 && tab === cfg.tunnels,
+          tunnelPanel,
           typing: !!value && t - typedAt < TYPING_FOR,
           searchX,
         };
@@ -2558,6 +2570,11 @@
     let dialogOpen = false;
     let peeking = false;
     let journal = null;
+    let tunnel = null;
+    let tunnelPanel = null;
+    let tunnelWasActive = false;
+    let nodeCheck = null;
+    const checkObserver = page && new MutationObserver(syncNodeCheck);
     const firstHurdleAt = lastInput + HURDLE_FIRST;
     let nextHurdleCheck = -Infinity;
     let hurdleRunup = null;
@@ -2685,6 +2702,215 @@
       director.face(Math.sign(x - s.x));
       return false;
     }
+    function nodeResults(scope) {
+      return [...scope.querySelectorAll(".lat .fb, .lat .fail")].map((el) => ({
+        row: el.closest(".lat"),
+        outcome: el.matches(".fb") ? "success" : "failure",
+        value: el.textContent,
+      }));
+    }
+    function syncNodeCheck() {
+      if (
+        nodeCheck &&
+        !nodeCheck.done &&
+        (!nodeCheck.button.isConnected || !nodeCheck.button.querySelector(".spin"))
+      ) {
+        const results = nodeResults(nodeCheck.scope).filter(({ row, outcome, value }) => {
+          const before = nodeCheck.before.get(row);
+          return before?.outcome !== outcome || before.value !== value;
+        });
+        if (!nodeCheck.outcome && nodeCheck.button.isConnected && results.length)
+          nodeCheck.outcome = results.some(({ outcome }) => outcome === "success")
+            ? "success"
+            : "failure";
+        nodeCheck.done = true;
+      }
+      if (nodeCheck || !tunnelPanel) return;
+      const row = tunnelPanel.querySelector(".check .spin")?.closest(".check");
+      const bulk = tunnelPanel.querySelector(".tools .text-btn .spin")?.closest(".text-btn");
+      const button = row ?? bulk;
+      const scope = row ? row.closest(".lat") : bulk?.closest("section");
+      if (button && scope)
+        nodeCheck = {
+          button,
+          scope,
+          before: new Map(nodeResults(scope).map((result) => [result.row, result])),
+          done: false,
+        };
+    }
+    function watchNodeChecks(panel) {
+      if (panel === tunnelPanel) return;
+      checkObserver.disconnect();
+      tunnelPanel = panel;
+      nodeCheck = null;
+      if (!panel) return;
+      checkObserver.observe(panel, { childList: true, subtree: true, characterData: true });
+      syncNodeCheck();
+    }
+    if (checkObserver) rt.cleanup.push(() => checkObserver.disconnect());
+    function tunnelPhase(phase, now) {
+      tunnel.phase = phase;
+      tunnel.since = now;
+      layer.setAttribute("data-pony-tunnel", phase);
+    }
+    function clearTunnel() {
+      if (!tunnel) return;
+      for (const arch of tunnel.arches) arch.remove();
+      tunnel = null;
+      svg.style.clipPath = "";
+      svg.style.visibility = "";
+      layer.removeAttribute("data-pony-tunnel");
+      director.hold("rest");
+    }
+    function startTunnel(now) {
+      clearHurdles(now);
+      clearScene();
+      reaction = null;
+      const panel = tunnelPanel?.getBoundingClientRect();
+      const toggle = document.querySelector(".upt:not([data-hidden])")?.getBoundingClientRect();
+      const margin = Math.min(0.38 * size, pageWidth * 0.08);
+      const left = Math.min(pageWidth * 0.2, Math.max(margin, (toggle?.right ?? 0) + margin));
+      const right = pageWidth - margin;
+      const span = 2.85 * width;
+      const gutterLeft = Math.min(right, panel?.left ?? left);
+      const gutterRight = Math.max(left, panel?.right ?? right);
+      const [lo, hi] =
+        right - gutterRight >= span
+          ? [gutterRight, right]
+          : gutterLeft - left >= span
+            ? [left, gutterLeft]
+            : [left, right];
+      const scale = Math.min(1, (hi - lo) / span);
+      const stage = clamp((ponyBox?.left ?? lo) - 0.5 * width, lo, hi - span * scale);
+      const inset = 0.5 * width * (1 - scale);
+      const a = positionAt(stage + 0.08 * width * scale - inset);
+      const b = positionAt(stage + 1.77 * width * scale - inset);
+      const dir = (ponyBox?.left ?? a) > (a + b) / 2 ? -1 : 1;
+      const [start, end] = dir === 1 ? [a, b] : [b, a];
+      const travel = 0.8 * width * scale;
+      const lip = (x, fraction) => x + inset + fraction * width * scale;
+      const arches = [lip(start, dir === 1 ? 0.8 : 0.2), lip(end, dir === 1 ? 0.2 : 0.8)].map(
+        (x, i) => {
+          const arch = el("svg", {
+            viewBox: "0 0 64 80",
+            width: 0.75 * size * scale,
+            height: 0.94 * size * scale,
+            "data-pony-tunnel-arch": i === 0 ? "entry" : "exit",
+          });
+          arch.style.cssText = `position:absolute;left:${x}px;bottom:0;transform-origin:50% 100%;transform:translateX(-50%) scaleY(0)`;
+          arch.append(
+            el("path", {
+              d: "M5 79V34a27 27 0 0 1 54 0v45Z",
+              fill: "#172c46",
+              stroke: "#77a6ca",
+              "stroke-width": 5,
+            }),
+            el("path", {
+              d: "M12 79V34a20 20 0 0 1 40 0v45",
+              fill: "none",
+              stroke: "currentColor",
+              "stroke-width": 2,
+            }),
+          );
+          arch.style.color = "#6dd7ff";
+          svg.before(arch);
+          return arch;
+        },
+      );
+      const ears = el("path", {
+        d: "M21 61l-3-15 12 10m5 0 11-12-2 17Z",
+        fill: "#3db0ff",
+        opacity: 0,
+      });
+      arches[1].append(ears);
+      tunnel = { arches, ears, start, end, dir, scale, travel, pageWidth, anchor: start };
+      tunnelPhase("run", now);
+    }
+    function enterTunnel(now) {
+      if (tunnel.check && !tunnel.check.done) tunnelPhase("waiting", now);
+      else tunnelPhase(tunnel.check?.outcome === "failure" ? "failure" : "enter", now);
+    }
+    function drawTunnel(s, now) {
+      const { start, end, dir, scale, travel, arches, ears, phase } = tunnel;
+      const elapsed = now - tunnel.since;
+      let x = s.x;
+      let pose = s.pose;
+      let rise = phase === "run" ? 0 : 1;
+      if (phase === "run") {
+        if (approach(s, start, "run")) {
+          director.hold("rest");
+          director.face(dir);
+          if (!hop && !turn && facing === -dir) tunnelPhase("rise", now);
+        }
+      } else if (phase === "rise") {
+        rise = easeInOut(elapsed / 420);
+        if (elapsed >= 420) tunnelPhase("sniff", now);
+      } else if (phase === "sniff") {
+        pose = poseAt("sniff", Math.min(2, elapsed / 550));
+        if (elapsed >= 1100) {
+          tunnel.check = nodeCheck;
+          enterTunnel(now);
+        }
+      } else if (phase === "waiting") {
+        pose = { ...pose, head: 4 * Math.sin(elapsed / 300) };
+        if (tunnel.check.done) enterTunnel(now);
+      } else if (phase === "failure") {
+        arches[0].style.color = "#ff7979";
+        const retreat = positionAt(start - dir * 0.32 * width * scale);
+        x = start + (retreat - start) * easeInOut(elapsed / 560);
+        pose = poseAt("walk", (560 - elapsed) / 1000);
+        if (elapsed >= 560) {
+          tunnel.anchor = retreat;
+          tunnelPhase("shake", now);
+        }
+      } else if (phase === "enter" || phase === "emerge") {
+        const u = clamp(elapsed / 620, 0, 1);
+        const entering = phase === "enter";
+        x = entering ? start + dir * travel * u : end - dir * travel * (1 - u);
+        const left = x + 0.5 * width * (1 - scale);
+        const span = width * scale;
+        const mouth = Number.parseFloat(arches[entering ? 0 : 1].style.left);
+        const crossed = clamp(
+          dir === 1 ? (mouth - left) / span : (left + span - mouth) / span,
+          0,
+          1,
+        );
+        const cut = 100 * (entering ? 1 - crossed : crossed);
+        pose = poseAt("walk", elapsed / 1000);
+        svg.style.visibility = "";
+        svg.style.clipPath = entering ? `inset(0 0 0 ${cut}%)` : `inset(0 ${cut}% 0 0)`;
+        if (u === 1) {
+          svg.style.clipPath = "";
+          svg.style.visibility = entering ? "hidden" : "";
+          tunnelPhase(entering ? "hidden" : "shake", now);
+        }
+      } else if (phase === "hidden") {
+        const peek = easeInOut((elapsed - 120) / 300);
+        ears.setAttribute("opacity", peek);
+        ears.setAttribute("transform", `translate(0 ${10 * (1 - peek) + 2 * Math.sin(now / 100)})`);
+        if (elapsed >= 480) {
+          ears.setAttribute("opacity", 0);
+          tunnel.anchor = end;
+          tunnelPhase("emerge", now);
+        }
+      } else if (phase === "shake") {
+        pose = poseAt("shake", elapsed / 1000);
+        if (elapsed >= 750)
+          tunnelPhase(tunnel.check?.outcome === "success" ? "success" : "lower", now);
+      } else if (phase === "success") {
+        arches[1].style.color = "#66e6a2";
+        if (elapsed >= 700) tunnelPhase("lower", now);
+      } else {
+        rise = 1 - easeInOut(elapsed / 320);
+        if (elapsed >= 320) {
+          if (nodeCheck === tunnel.check) nodeCheck = null;
+          clearTunnel();
+          syncNodeCheck();
+        }
+      }
+      for (const arch of arches) arch.style.transform = `translateX(-50%) scaleY(${rise})`;
+      return { x, y: groundLift(pose) * size, pose, scale: phase === "run" ? 1 : scale };
+    }
     function readingPhase(phase, now) {
       journal.phase = phase;
       journal.since = now;
@@ -2792,6 +3018,20 @@
       }
       const pageState = page ? page.poll() : undefined;
       const readingBlocked = pageState?.dialog || document.hidden || motion?.matches;
+      const tunnelActive = pageState?.tunnels && !readingBlocked;
+      if (checkObserver) watchNodeChecks(tunnelActive ? (pageState.tunnelPanel ?? null) : null);
+      const tunnelResized = tunnel && tunnel.pageWidth !== pageWidth;
+      if (tunnel && (!tunnelActive || tunnelResized)) clearTunnel();
+      if (
+        tunnelActive &&
+        !tunnel &&
+        pageWidth > 0 &&
+        (!tunnelWasActive || nodeCheck || tunnelResized)
+      ) {
+        clearReading();
+        startTunnel(now);
+      }
+      tunnelWasActive = tunnelActive && pageWidth > 0;
       const readingWanted = pageState?.reading && !readingBlocked;
       if (journal && readingBlocked) clearReading();
       if (readingWanted && !journal) {
@@ -2829,9 +3069,11 @@
         pageWidth,
         journal && journal.phase !== "walk"
           ? journal.x
-          : edge && edge.phase !== "sneak"
-            ? edgeX
-            : undefined,
+          : tunnel && tunnel.phase !== "run"
+            ? tunnel.anchor
+            : edge && edge.phase !== "sneak"
+              ? edgeX
+              : undefined,
       );
       const takeoff =
         reaction?.type === "hurdle" && !reaction.action && reaction.next < reaction.hurdles.length
@@ -2840,11 +3082,12 @@
       const walkingToRead = journal?.phase === "walk";
       const strideEnd = walkingToRead
         ? journal.x
-        : (takeoff ?? (hurdleRunup?.platform ? hurdleRunup.x : edgeX));
+        : (tunnel?.start ?? takeoff ?? (hurdleRunup?.platform ? hurdleRunup.x : edgeX));
       const s = director.step(dt, strideEnd);
       const mid = s.x + 0.5 * width;
       const found =
         journal ||
+        tunnel ||
         (hurdleRunup && !hurdleRunup.platform) ||
         (reaction?.foreground && !reaction.platform) ||
         edge ||
@@ -2881,7 +3124,8 @@
       }
       const bottom = groundLine - y;
       const box = { left: s.x, right: s.x + width, top: bottom - size, bottom };
-      const pageBusy = journal || pageState?.dialog || pageState?.reading || pageState?.typing;
+      const pageBusy =
+        journal || tunnel || pageState?.dialog || pageState?.reading || pageState?.typing;
       const platform = plat?.el;
       const bounds = lane(plat);
       const autoHurdle =
@@ -2983,7 +3227,7 @@
         dialogOpen = !!pageState?.dialog;
         layer.style.zIndex = dialogOpen ? "14" : "2147483000";
       }
-      if (!reaction && !journal && !pageState?.dialog && !hop) {
+      if (!reaction && !journal && !tunnel && !pageState?.dialog && !hop) {
         if (cursorJump) {
           reaction = { type: "cursor", action: "jump", resume: s.action, dir: s.dir };
         } else if (wasRunning && !ACTIONS[s.action].speed && dust.particles.length) {
@@ -3130,6 +3374,10 @@
       if (journal) {
         const reading = drawReading(s, now);
         if (reading) ({ pose, y, scale: renderScale } = reading);
+      } else if (tunnel) {
+        const drawing = drawTunnel(s, now);
+        ({ x: renderX, pose, scale: renderScale } = drawing);
+        if (tunnel?.phase !== "run") y = drawing.y;
       } else if (reaction?.type === "dialog") {
         const r = reaction.card.getBoundingClientRect();
         const left = Math.max(0, r.left);
@@ -3324,14 +3572,14 @@
           }
         }
         if (reaction?.action) director.hold(reaction.action);
-      } else if (!reaction && !hurdleRunup && !journal) {
+      } else if (!reaction && !hurdleRunup && !journal && !tunnel) {
         if (cmd.face) director.face(cmd.face);
         if (cmd.play) director.play(cmd.play);
         else if (cmd.hold) director.hold(cmd.hold);
         else if (cmd.flee) director.flee(cmd.flee);
         else if (cmd.follow !== null) director.follow(cmd.follow);
       }
-      if (!reaction && !journal && cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
+      if (!reaction && !journal && !tunnel && cmd.gaze && GAZE_ACTIONS.has(s.action) && !hop)
         pose = { ...pose, head: (pose.head || 0) + cmd.gaze };
       if (cover) {
         const { left, top, right, bottom } = cover;
@@ -3504,6 +3752,8 @@
         hurdleAnimations.clear();
         clearScene();
         clearReading();
+        clearTunnel();
+        if (checkObserver) watchNodeChecks(null);
         hiddenAt = performance.now();
         return;
       }
@@ -3526,6 +3776,7 @@
       if (
         !ponyBox ||
         journal ||
+        tunnel ||
         (reaction && reaction.type !== "hurdle" && !sceneActive()) ||
         dialogOpen ||
         e.button !== 0 ||
@@ -3605,6 +3856,7 @@
     if (
       !runtime?.director ||
       runtime.layer.hasAttribute("data-pony-reading") ||
+      runtime.layer.hasAttribute("data-pony-tunnel") ||
       !Object.hasOwn(ACTIONS, name)
     )
       return;
