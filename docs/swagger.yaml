@@ -2115,6 +2115,10 @@ definitions:
       device:
         example: tunvless0
         type: string
+      enable:
+        description: 'The tunnel is switched on; a switch of its OpkgTun made in the router changes it'
+        example: true
+        type: boolean
       groups:
         description: 'Names of the groups routed through the device'
         items:

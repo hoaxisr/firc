@@ -132,6 +132,46 @@ const stub = (handlers: Record<string, Handler>) => {
   return s;
 };
 
+describe("TunnelsStore and a switch made in the router", () => {
+  const withEnable = (enable: boolean) => ({ ...stateOf("main"), enable });
+
+  it("a polled switch becomes the saved one and leaves other edits unsaved", async () => {
+    let enable = true;
+    stub({
+      "/tunnels": { tunnels: [tunnel("main")] },
+      "/tunnels/state": () => ({ tunnels: [withEnable(enable)] }),
+    });
+    const store = new TunnelsStore();
+    await store.load();
+    await store.pollState();
+    assert.strictEqual(store.data[0].enable, true);
+    enable = false;
+    await store.pollState();
+    assert.strictEqual(store.data[0].enable, false);
+    assert.strictEqual(store.savedOf("main")?.enable, false);
+    assert.strictEqual(store.canSave, false);
+    store.data[0].interval = 90;
+    enable = true;
+    await store.pollState();
+    assert.strictEqual(store.data[0].enable, true);
+    assert.strictEqual(store.data[0].interval, 90);
+    assert.strictEqual(store.canSave, true);
+  });
+
+  it("an unsaved switch on the page is kept", async () => {
+    stub({
+      "/tunnels": { tunnels: [tunnel("main")] },
+      "/tunnels/state": { tunnels: [withEnable(true)] },
+    });
+    const store = new TunnelsStore();
+    await store.load();
+    store.data[0].enable = false;
+    await store.pollState();
+    assert.strictEqual(store.data[0].enable, false);
+    assert.strictEqual(store.canSave, true);
+  });
+});
+
 describe("TunnelsStore load and dirty", () => {
   // Catches a loaded set that already reads dirty, which would arm the save button and the unload guard.
   it("a fresh load is clean", async () => {

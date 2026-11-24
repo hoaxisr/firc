@@ -36,6 +36,7 @@ typedef struct {
     bool gone;
     firc_opkgtun_want_t w;
     uint32_t recheck;
+    uint32_t turn;
     bool have_seen;
     firc_opkgtun_seen_t seen;
     bool waiting;
@@ -944,6 +945,52 @@ static bool route_wanted(const firc_tunrun_t *t, const orec_t *o, int64_t now)
     return may && (settled || (kept && !unchecked));
 }
 
+static const char *take_switch(firc_tunrun_t *t, const char *device, bool up)
+{
+    if (t->path == NULL || !firc_tunnels_file_unchanged(&t->cur, t->path)) {
+        return "tunnels.yaml changed on disk since it was loaded";
+    }
+    firc_tunnels_t set = {0};
+    firc_tun_err_t e = {0};
+    if (firc_tunnels_load_file(&set, t->path, &e) != FIRC_OK) {
+        return "tunnels.yaml could not be read";
+    }
+    const char *why = NULL;
+    for (size_t i = 0; i < set.n; i++) {
+        if (strcmp(set.t[i].device, device) == 0) {
+            set.t[i].enable = up;
+        }
+    }
+    if (firc_tunnels_save_file(&set, t->path) != FIRC_OK) {
+        why = "tunnels.yaml could not be written";
+    } else {
+        (void)firc_tunrun_apply(t, &set);
+        if (set.t != NULL) {
+            why = "the change could not be applied";
+        }
+    }
+    firc_tunnels_free(&set);
+    return why;
+}
+
+static void router_switch(firc_tunrun_t *t, orec_t *o)
+{
+    char device[16];
+    memcpy(device, o->w.device, sizeof device);
+    bool up = o->seen.router_up;
+    const char *word = up ? "on" : "off";
+    const char *why = take_switch(t, device, up);
+    if (why == NULL) {
+        firc_log_from(FIRC_LOG_INFO, device, "switched %s in the router", word);
+        return;
+    }
+    firc_log_from(FIRC_LOG_WARN, device, "switched %s in the router, but %s; switched back %s", word, why,
+                  up ? "off" : "on");
+    o->w.turn = ++o->turn;
+    o->w.recheck = ++o->recheck;
+    send_wants(t);
+}
+
 static void on_router(firc_loop_t *loop, int fd, uint32_t events, void *ud)
 {
     (void)loop;
@@ -957,6 +1004,7 @@ static void on_router(firc_loop_t *loop, int fd, uint32_t events, void *ud)
     uint32_t swept = 0;
     size_t m = t->router.seen(v, FIRC_OPKGTUN_MAX_WANTS, &swept, t->router.ud);
     bool resend = false;
+    bool toggled[OPKG_N] = {false};
     for (size_t i = 0; i < m && i < FIRC_OPKGTUN_MAX_WANTS; i++) {
         int n = record_index(v[i].name);
         if (n < 0) {
@@ -985,6 +1033,10 @@ static void on_router(firc_loop_t *loop, int fd, uint32_t events, void *ud)
         if (!was_ready) {
             t->router.pass(t->router.ud);
         }
+        if (v[i].toggled && v[i].turned == o->turn && v[i].router_up != o->w.up) {
+            toggled[n] = true;
+            continue;
+        }
         if (v[i].rechecked == o->recheck) {
             open_waiter(t, o);
         }
@@ -999,6 +1051,11 @@ static void on_router(firc_loop_t *loop, int fd, uint32_t events, void *ud)
     }
     if (resend) {
         send_wants(t);
+    }
+    for (int n = 0; n < OPKG_N; n++) {
+        if (toggled[n]) {
+            router_switch(t, &t->orec[n]);
+        }
     }
 }
 
@@ -1562,6 +1619,7 @@ static bool plan_wants(const firc_tunnels_t *want, firc_opkgtun_want_t w[OPKG_N]
         snprintf(x->mark, sizeof x->mark, "firc:%s", tun->id);
         snprintf(x->desc, sizeof x->desc, "%s", desc);
         x->present = true;
+        x->up = tun->enable;
         x->policies = tun->router_policies;
         free(desc);
         named[n] = true;
@@ -1586,8 +1644,12 @@ static void record_wants(firc_tunrun_t *t, const firc_opkgtun_want_t w[OPKG_N], 
         }
         if (named[n]) {
             const firc_tunnel_t *tun = firc_tunnels_by_device(&t->cur, w[n].device);
+            if (!o->named || o->w.up != w[n].up) {
+                o->turn++;
+            }
             o->w = w[n];
             o->w.recheck = o->recheck;
+            o->w.turn = o->turn;
             o->named = true;
             o->removing = false;
             o->route_ok = o->route_ok && w[n].policies && tun != NULL && tun->enable;
@@ -1772,18 +1834,24 @@ firc_err_t firc_tunrun_start(firc_tunrun_t *t, firc_tunnels_t *want)
     return err;
 }
 
-void firc_tunrun_link_down(firc_tunrun_t *t, const char *device)
+void firc_tunrun_link(firc_tunrun_t *t, const char *device, bool up)
 {
-    int n = device != NULL ? opkg_n(device) : -1;
-    if (t == NULL || t->stopped || !t->has_router || n < 0) {
+    if (t == NULL || t->stopped || !t->has_router) {
         return;
     }
-    orec_t *o = &t->orec[n];
-    if (!o->named || !o->have_seen || o->seen.removing || o->seen.state != FIRC_OPKG_READY) {
-        return;
+    bool any = false;
+    for (int n = 0; n < OPKG_N; n++) {
+        orec_t *o = &t->orec[n];
+        if (!o->named || !o->have_seen || o->seen.removing || o->seen.state == FIRC_OPKG_FOREIGN ||
+            (device != NULL && (opkg_n(device) != n || o->w.up == up))) {
+            continue;
+        }
+        o->w.recheck = ++o->recheck;
+        any = true;
     }
-    o->w.recheck = ++o->recheck;
-    send_wants(t);
+    if (any) {
+        send_wants(t);
+    }
 }
 
 static bool router_pending(const orec_t *o)

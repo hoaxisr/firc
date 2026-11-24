@@ -39,6 +39,8 @@ typedef struct {
     char mark[24];
     char desc[85];
     bool present;
+    bool up;
+    uint32_t turn;
     uint32_t recheck;
     bool policies;
     bool route;
@@ -52,6 +54,9 @@ typedef struct {
     bool saved;
     bool removing;
     uint32_t rechecked;
+    uint32_t turned;
+    bool toggled;
+    bool router_up;
     char error[160];
     firc_opkg_pol_t policies;
     char pol_error[160];
@@ -93,8 +98,9 @@ void firc_opkgtun_rci_io(firc_opkgtun_rci_t *rci, const char *base_url, const ch
 firc_opkgtun_t *firc_opkgtun_start(const firc_opkgtun_io_t *io);
 
 /* Replaces the wanted set: present records to keep configured, absent ones to remove. A set over
-   FIRC_OPKGTUN_MAX_WANTS, or naming a record twice, is warned and the last set stays. A change of only policies,
-   route, keep or checked keeps the record's state; keep leaves a route line as found and adds none. No save starts
+   FIRC_OPKGTUN_MAX_WANTS, or naming a record twice, is warned and the last set stays. A record is brought to up once
+   per turn; a later change made in the router is not undone but reported as toggled with router_up, until the next
+   turn. A change of only policies, route, keep or checked keeps the record's state; keep leaves a route line as found and adds none. No save starts
    while a route added, or found after a start with unsaved changes, is not yet checked. */
 void firc_opkgtun_want(firc_opkgtun_t *m, const firc_opkgtun_want_t *w, size_t n);
 

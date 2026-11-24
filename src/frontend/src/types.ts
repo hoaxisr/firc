@@ -294,6 +294,7 @@ export type TunnelSubState = {
 export type TunnelState = {
   id: string;
   device: string;
+  enable: boolean;
   status: TunnelStatus;
   since: number;
   backoffS: number;

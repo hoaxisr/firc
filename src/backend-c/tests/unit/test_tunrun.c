@@ -3808,7 +3808,6 @@ TEST each_spawn_runs_a_full_present_sequence(void)
 
 TEST a_link_down_of_a_ready_device_asks_for_a_converge(void)
 {
-    /* catches: a ready record taken down in NDM left down, or a recheck asked for a record still in work */
     static fx_t f;
     ASSERT(fx_up(&f, 0));
     fr_attach(&f, FR_READY);
@@ -3816,21 +3815,166 @@ TEST a_link_down_of_a_ready_device_asks_for_a_converge(void)
     ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
     run_ms(&f, 100);
     int before = g_fr.wants;
-    firc_tunrun_link_down(f.run, "tunvless3");
-    firc_tunrun_link_down(f.run, "opkgtun4");
+    firc_tunrun_link(f.run, "tunvless3", false);
+    firc_tunrun_link(f.run, "opkgtun4", false);
     ASSERT_EQ(before, g_fr.wants);
-    firc_tunrun_link_down(f.run, "opkgtun3");
+    firc_tunrun_link(f.run, "opkgtun3", false);
     ASSERT_EQ(before + 1, g_fr.wants);
     ASSERT_EQ(2u, fr_last("OpkgTun3")->recheck);
     g_fr.mode = FR_MANUAL;
-    firc_tunrun_link_down(f.run, "opkgtun3");
+    firc_tunrun_link(f.run, "opkgtun3", false);
     ASSERT_EQ(3u, fr_last("OpkgTun3")->recheck);
     g_fr.n_seen = 0;
     fr_answer("OpkgTun3", FIRC_OPKG_PENDING, false, 3, "", true);
     run_ms(&f, 100);
-    firc_tunrun_link_down(f.run, "opkgtun3");
-    ASSERT_EQ(3u, fr_last("OpkgTun3")->recheck);
+    firc_tunrun_link(f.run, "opkgtun3", false);
+    ASSERT_EQ(4u, fr_last("OpkgTun3")->recheck);
+    fr_answer("OpkgTun3", FIRC_OPKG_FAILED, false, 4, "refused", true);
+    run_ms(&f, 100);
+    firc_tunrun_link(f.run, "opkgtun3", false);
+    ASSERT_EQ(5u, fr_last("OpkgTun3")->recheck);
+    fr_answer("OpkgTun3", FIRC_OPKG_FOREIGN, false, 5, "", true);
+    run_ms(&f, 100);
+    firc_tunrun_link(f.run, "opkgtun3", false);
+    ASSERT_EQ(5u, fr_last("OpkgTun3")->recheck);
     ASSERT_EQ(1, starts_of(&f, "opkgtun3"));
+    fx_down(&f);
+    PASS();
+}
+
+static const char k_opkg3_doc[] = "tunnels:\n  - id: t1\n    device: opkgtun3\n    sources:\n      - id: 0000000a\n"
+                                  "        link: \"vless://" U "@a.example:443?security=none#A\"\n";
+
+static void fr_toggle(bool up, uint32_t turned)
+{
+    fr_answer("OpkgTun3", FIRC_OPKG_READY, false, fr_last("OpkgTun3")->recheck, "", true);
+    for (size_t i = 0; i < g_fr.n_seen; i++) {
+        if (strcmp(g_fr.seen[i].name, "OpkgTun3") == 0) {
+            g_fr.seen[i].toggled = true;
+            g_fr.seen[i].router_up = up;
+            g_fr.seen[i].turned = turned;
+        }
+    }
+}
+
+TEST a_toggle_in_the_router_switches_the_tunnel_and_writes_the_file(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    char path[128];
+    snprintf(path, sizeof path, "%s/tunnels.yaml", f.dir);
+    firc_tunrun_set_path(f.run, path);
+    fr_attach(&f, FR_READY);
+    apply_file(&f, path, k_opkg3_doc);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    ASSERT(fr_last("OpkgTun3")->up);
+    firc_event_reset_for_test();
+    uint32_t turn = fr_last("OpkgTun3")->turn;
+    fr_toggle(false, turn + 1);
+    run_ms(&f, 200);
+    ASSERT(firc_tunrun_config(f.run)->t[0].enable);
+    fr_toggle(false, turn);
+    ASSERT_EQ(FIRC_TUN_ST_OFF, run_until_status(&f, "t1", FIRC_TUN_ST_OFF, 2000));
+    ASSERT_FALSE(firc_tunrun_config(f.run)->t[0].enable);
+    ASSERT_FALSE(fr_last("OpkgTun3")->up);
+    ASSERT(fr_last("OpkgTun3")->present);
+    ASSERT_EQ(turn + 1, fr_last("OpkgTun3")->turn);
+    char buf[2048];
+    slurp(path, buf, sizeof buf);
+    ASSERT(strstr(buf, "enable: false") != NULL);
+    ASSERT_EQ(1, journal_at(FIRC_LOG_INFO, "opkgtun3", "switched off in the router"));
+    fr_toggle(true, turn + 1);
+    ASSERT_EQ(2, run_until_starts(&f, "opkgtun3", 2, 3000));
+    ASSERT(firc_tunrun_config(f.run)->t[0].enable);
+    ASSERT(fr_last("OpkgTun3")->up);
+    ASSERT_EQ(turn + 2, fr_last("OpkgTun3")->turn);
+    slurp(path, buf, sizeof buf);
+    ASSERT(strstr(buf, "enable: false") == NULL);
+    unlink(path);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_toggle_in_the_router_is_put_back_over_a_hand_edited_file(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    char path[128];
+    snprintf(path, sizeof path, "%s/tunnels.yaml", f.dir);
+    firc_tunrun_set_path(f.run, path);
+    fr_attach(&f, FR_READY);
+    apply_file(&f, path, k_opkg3_doc);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    FILE *fp = fopen(path, "ae");
+    ASSERT(fp != NULL);
+    fputs("# by hand\n", fp);
+    fclose(fp);
+    char edited[2048];
+    slurp(path, edited, sizeof edited);
+    firc_event_reset_for_test();
+    uint32_t turn = fr_last("OpkgTun3")->turn;
+    uint32_t recheck = fr_last("OpkgTun3")->recheck;
+    fr_toggle(false, turn);
+    run_ms(&f, 300);
+    ASSERT(firc_tunrun_config(f.run)->t[0].enable);
+    ASSERT(fr_last("OpkgTun3")->up);
+    ASSERT_EQ(turn + 1, fr_last("OpkgTun3")->turn);
+    ASSERT_EQ(recheck + 1, fr_last("OpkgTun3")->recheck);
+    ASSERT_EQ(1, starts_of(&f, "opkgtun3"));
+    char buf[2048];
+    slurp(path, buf, sizeof buf);
+    ASSERT_STR_EQ(edited, buf);
+    ASSERT_EQ(1, journal_at(FIRC_LOG_WARN, "opkgtun3",
+                            "switched off in the router, but tunnels.yaml changed on disk since it was loaded; "
+                            "switched back on"));
+    unlink(path);
+    fx_down(&f);
+    PASS();
+}
+
+TEST a_switch_in_firc_is_one_turn_and_other_edits_are_none(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    oapply(&f, k_t1_opkg3, 1);
+    uint32_t turn = fr_last("OpkgTun3")->turn;
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(turn, fr_last("OpkgTun3")->turn);
+    const ospec_t off[] = {{"t1", "opkgtun3", true}};
+    oapply(&f, off, 1);
+    ASSERT_EQ(turn + 1, fr_last("OpkgTun3")->turn);
+    ASSERT_FALSE(fr_last("OpkgTun3")->up);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(turn + 2, fr_last("OpkgTun3")->turn);
+    ASSERT(fr_last("OpkgTun3")->up);
+    fx_down(&f);
+    PASS();
+}
+
+TEST only_a_link_against_the_switch_is_checked(void)
+{
+    static fx_t f;
+    ASSERT(fx_up(&f, 0));
+    fr_attach(&f, FR_READY);
+    const ospec_t off[] = {{"t1", "opkgtun3", true}};
+    oapply(&f, off, 1);
+    run_ms(&f, 100);
+    uint32_t r = fr_last("OpkgTun3")->recheck;
+    firc_tunrun_link(f.run, "opkgtun3", false);
+    ASSERT_EQ(r, fr_last("OpkgTun3")->recheck);
+    firc_tunrun_link(f.run, "opkgtun3", true);
+    ASSERT_EQ(r + 1, fr_last("OpkgTun3")->recheck);
+    oapply(&f, k_t1_opkg3, 1);
+    ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
+    run_ms(&f, 100);
+    r = fr_last("OpkgTun3")->recheck;
+    firc_tunrun_link(f.run, "opkgtun3", true);
+    ASSERT_EQ(r, fr_last("OpkgTun3")->recheck);
+    firc_tunrun_link(f.run, "opkgtun3", false);
+    ASSERT_EQ(r + 1, fr_last("OpkgTun3")->recheck);
+    firc_tunrun_link(f.run, NULL, false);
+    ASSERT_EQ(r + 2, fr_last("OpkgTun3")->recheck);
     fx_down(&f);
     PASS();
 }
@@ -4008,12 +4152,12 @@ TEST an_up_only_restore_asks_for_a_pass(void)
     fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 1, "", true);
     ASSERT_EQ(1, run_until_starts(&f, "opkgtun3", 1, 2000));
     ASSERT_EQ(1, g_fr.passes);
-    firc_tunrun_link_down(f.run, "opkgtun3");
+    firc_tunrun_link(f.run, "opkgtun3", false);
     ASSERT_EQ(2u, fr_last("OpkgTun3")->recheck);
     fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 2, "", true);
     run_ms(&f, 200);
     ASSERT_EQ(2, g_fr.passes);
-    firc_tunrun_link_down(f.run, "opkgtun3");
+    firc_tunrun_link(f.run, "opkgtun3", false);
     fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 3, "", false);
     fr_answer("OpkgTun3", FIRC_OPKG_READY, false, 3, "", true);
     run_ms(&f, 200);
@@ -4958,6 +5102,10 @@ SUITE(opkg)
     RUN_TEST(no_release_while_another_tunnel_names_it);
     RUN_TEST(each_spawn_runs_a_full_present_sequence);
     RUN_TEST(a_link_down_of_a_ready_device_asks_for_a_converge);
+    RUN_TEST(a_toggle_in_the_router_switches_the_tunnel_and_writes_the_file);
+    RUN_TEST(a_toggle_in_the_router_is_put_back_over_a_hand_edited_file);
+    RUN_TEST(a_switch_in_firc_is_one_turn_and_other_edits_are_none);
+    RUN_TEST(only_a_link_against_the_switch_is_checked);
     RUN_TEST(the_starting_window_covers_pending);
     RUN_TEST(a_start_with_our_old_record_brings_up_the_tunvless_tunnel);
     RUN_TEST(wants_are_recorded_before_the_apply);

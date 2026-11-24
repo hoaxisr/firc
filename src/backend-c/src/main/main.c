@@ -916,6 +916,7 @@ static void on_watcher_lost(void *ud)
 {
     struct daemon *d = ud;
     FIRC_DEBUG("netlink watcher missed events; re-reading every interface");
+    firc_tunrun_link(d->tunrun, NULL, false);
     firc_tunrun_net_event(d->tunrun, NULL);
     schedule_refresh(d, NULL);
 }
@@ -963,10 +964,8 @@ static void on_link_up(const char *iface_name, bool up, void *ud)
     FIRC_DEBUG("interface %s: %s", up ? "up" : "down", iface_name);
     if (d->ifwatch != NULL) { firc_ifwatch_link(d->ifwatch, iface_name, up); }
     firc_app_refresh_remap(d->app, iface_name);
-    if (!up) {
-        firc_tunrun_link_down(d->tunrun, iface_name);
-        return;
-    }
+    firc_tunrun_link(d->tunrun, iface_name, up);
+    if (!up) { return; }
     for (size_t i = 0; i < firc_app_user_group_count(d->app); i++) {
         firc_ruleset_t *rs = firc_app_user_group_at(d->app, i);
         const firc_group_t *g = firc_ruleset_group(rs);

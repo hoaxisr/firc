@@ -55,6 +55,7 @@ typedef struct {
     int64_t next_ms;
     unsigned attempts;
     bool own_create;
+    bool switched;
     bool unsaved;
     bool hold;
     bool adopt;
@@ -462,7 +463,7 @@ static char *ns_body(const char *addr, const char *domain, const char *name)
     return dump(arr, ok);
 }
 
-static char *config_body(const char *name, const char *desc, bool level, const char *addr, bool up, int *count)
+static char *config_body(const char *name, const char *desc, bool level, const char *addr, const bool *up, int *count)
 {
     cJSON *arr = cJSON_CreateArray();
     bool ok = arr != NULL;
@@ -486,9 +487,9 @@ static char *config_body(const char *name, const char *desc, bool level, const c
              cJSON_AddStringToObject(a, "mask", HOST32) != NULL;
         (*count)++;
     }
-    if (ok && up) {
+    if (ok && up != NULL) {
         cJSON *i = iface_item(arr, name);
-        ok = i != NULL && cJSON_AddTrueToObject(i, "up") != NULL;
+        ok = i != NULL && cJSON_AddBoolToObject(i, "up", *up) != NULL;
         (*count)++;
     }
     return dump(arr, ok);
@@ -661,8 +662,8 @@ static bool read_back(const firc_opkgtun_rc_t *rc, const firc_opkgtun_want_t *w,
         say(msg, cap, "the router kept mask %s", rc->mask[0] != '\0' ? rc->mask : "none");
         return false;
     }
-    if (!rc->up) {
-        say(msg, cap, "the router kept %s down", w->name);
+    if (rc->up != w->up) {
+        say(msg, cap, "the router kept %s %s", w->name, rc->up ? "up" : "down");
         return false;
     }
     return true;
@@ -670,7 +671,7 @@ static bool read_back(const firc_opkgtun_rc_t *rc, const firc_opkgtun_want_t *w,
 
 static seq_t device_step(ctx_t *c, rec_t *r)
 {
-    int d = dev_wait(c, r->w.device, true);
+    int d = r->w.up ? dev_wait(c, r->w.device, true) : 1;
     if (d < 0) { return S_STOP; }
     if (d == 0) {
         finish(c, r, FIRC_OPKG_FAILED, true, "no device yet");
@@ -936,6 +937,7 @@ static seq_t policies_step(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc)
 
 static seq_t settle(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc)
 {
+    r->switched = true;
     seq_t p = policies_step(c, r, rc);
     return p == S_STOP ? S_STOP : device_step(c, r);
 }
@@ -949,7 +951,13 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
         strcmp(rc->description, w->desc) != 0 && (r->kept[0] == '\0' || strcmp(rc->description, r->kept) != 0);
     bool d_level = !rc->public_level;
     bool d_addr = strcmp(rc->address, addr) != 0 || strcmp(rc->mask, HOST32) != 0;
-    bool d_up = !rc->up;
+    bool d_up = rc->up != w->up;
+    r->s.toggled = d_up && r->switched;
+    r->s.router_up = rc->up;
+    if (r->s.toggled) {
+        finish(c, r, FIRC_OPKG_READY, false, "%s", "");
+        return S_DONE;
+    }
     if (!d_desc && !d_level && !d_addr && !d_up) { return settle(c, r, rc); }
     if (d_addr && !held_ok) {
         char holder[16];
@@ -966,7 +974,7 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
         return S_DONE;
     }
     int count = 0;
-    char *body = config_body(w->name, d_desc ? w->desc : NULL, d_level, d_addr ? addr : NULL, d_up, &count);
+    char *body = config_body(w->name, d_desc ? w->desc : NULL, d_level, d_addr ? addr : NULL, d_up ? &w->up : NULL, &count);
     firc_opkg_item_t out[4] = {FIRC_OPKG_ITEM_REFUSED};
     char err[MSG_MAX];
     post_t p = post_items(c, body, T_WRITE, out, count, err, sizeof err);
@@ -988,7 +996,7 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
                 next.dirty = false;
                 if (!put_intent(c, &next)) { FIRC_WARN("opkgtun: cannot write %s", c->io->intent_path); }
             }
-            finish(c, r, FIRC_OPKG_FAILED, false, "%s", err);
+            finish(c, r, FIRC_OPKG_FAILED, only_up, "%s", err);
             return S_DONE;
         }
     } else if (!only_up) {
@@ -1015,6 +1023,7 @@ static seq_t configure(ctx_t *c, rec_t *r, const firc_opkgtun_rc_t *rc, bool hel
 static seq_t create(ctx_t *c, rec_t *r, int k)
 {
     const firc_opkgtun_want_t *w = &r->w;
+    r->switched = false;
     intent_t next = c->in;
     next.creating[k] = true;
     next.dirty = true;
@@ -1451,6 +1460,14 @@ static void sync_wants(firc_opkgtun_t *m)
                 r->attempts = 0;
                 r->s.state = FIRC_OPKG_PENDING;
             }
+            if (old->w.turn != wants[i].turn || old->w.up != wants[i].up) {
+                r->due = true;
+                r->next_ms = 0;
+                r->attempts = 0;
+                r->switched = r->s.toggled && wants[i].up == r->s.router_up;
+                r->s.toggled = false;
+                r->s.state = FIRC_OPKG_PENDING;
+            }
         } else {
             r->unsaved = old != NULL ? old->unsaved : m->c.in.dirty;
             if (old != NULL) {
@@ -1611,6 +1628,7 @@ static void *worker(void *arg)
             seq_t s = r->w.present ? present(c, r) : absent(c, r);
             if (s == S_STOP) { return NULL; }
             r->s.rechecked = r->w.recheck;
+            r->s.turned = r->w.turn;
             moved = moved || fresh || seen_moved(&before, &r->s);
             worked = true;
             publish(m);
@@ -1794,7 +1812,7 @@ int firc_opkgtun_fd(const firc_opkgtun_t *m)
 bool firc_opkgtun_idle_for_test(firc_opkgtun_t *m)
 {
     pthread_mutex_lock(&m->mu);
-    bool idle = m->idle;
+    bool idle = m->idle && m->gen == m->gen_seen && !m->sweep_req && m->trips == 0;
     pthread_mutex_unlock(&m->mu);
     return idle;
 }

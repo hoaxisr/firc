@@ -877,6 +877,8 @@ TEST state_lists_every_tunnel_with_its_nodes_groups_and_subscriptions(void)
     ASSERT(same_json(at(a, "groups"), "[\"via-tunnel\",\"second-entry\"]"));
     ASSERT(same_json(at(a, "subscriptions"), "[]"));
     ASSERT(cJSON_IsTrue(at(a, "uplinkOk")));
+    ASSERT(cJSON_IsTrue(at(a, "enable")));
+    ASSERT(cJSON_IsFalse(at(cJSON_GetArrayItem(at(ans, "tunnels"), 1), "enable")));
     double since = at(a, "since")->valuedouble;
     double now = (double)time(NULL);
     ASSERT(since > now - 60 && since <= now + 1);

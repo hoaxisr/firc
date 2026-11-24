@@ -34,7 +34,7 @@ const STATE_TIMEOUT_MS = 4000 as const;
 
 export class TunnelsStore {
   data = $state<ClientTunnel[]>([]);
-  #baseline = "[]";
+  #baseline = $state("[]");
   loaded = $state(false);
   fetchError = $state(false);
   saving = $state(false);
@@ -94,6 +94,21 @@ export class TunnelsStore {
       const key = keys.get(tn.id);
       return key ? { ...tn, key } : withKey(tn);
     });
+  }
+
+  #followSwitches() {
+    if (this.saving) return;
+    const base = JSON.parse(this.#baseline) as Tunnel[];
+    let changed = false;
+    for (const saved of base) {
+      const enable = this.stateOf(saved.id)?.enable;
+      if (enable === undefined || enable === saved.enable) continue;
+      const draft = this.data.find((tn) => tn.id === saved.id);
+      if (draft && draft.enable === saved.enable) draft.enable = enable;
+      saved.enable = enable;
+      changed = true;
+    }
+    if (changed) this.#baseline = JSON.stringify(base);
   }
 
   get restarting(): string[] {
@@ -190,6 +205,7 @@ export class TunnelsStore {
       const body = { tunnels: plain($state.snapshot(this.data) as Tunnel[]) };
       const answer = await fetcher.put<TunnelsRes>("/tunnels", body);
       this.#adopt(answer?.tunnels ?? body.tunnels);
+      this.#taken = this.#seq;
       toast.success(t("Saved"));
       void fetchInterfaces();
       void this.pollState();
@@ -304,6 +320,7 @@ export class TunnelsStore {
       if (seq <= this.#taken) return;
       this.#taken = seq;
       this.states = answer?.tunnels ?? [];
+      this.#followSwitches();
       if (this.#pollFailing) console.info("Tunnel state polls answer again");
       this.#pollFailing = false;
     } catch (error) {

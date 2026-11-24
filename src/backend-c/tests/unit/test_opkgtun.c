@@ -31,6 +31,7 @@
     "{\"interface\":{\"name\":\"OpkgTun3\",\"ip\":{\"address\":{\"address\":\"203.0.113.4\",\"mask\":" \
     "\"255.255.255.255\"}}}}"
 #define UP3 "{\"interface\":{\"name\":\"OpkgTun3\",\"up\":true}}"
+#define DOWN3 "{\"interface\":{\"name\":\"OpkgTun3\",\"up\":false}}"
 #define P5_3 "POST [" DESC3 "," ADDR3 "," UP3 "] T=10"
 #define DELETE3 "POST [{\"interface\":{\"name\":\"OpkgTun3\",\"no\":true}}] T=10"
 #define SAVE "POST [{\"system\":{\"configuration\":{\"save\":{}}}}] T=30"
@@ -132,6 +133,11 @@ static char *rc_from(const char *fixture, const char *name, const char *desc, co
 static char *ours3(void)
 {
     return rc_from("rc-list-ours.json", "OpkgTun3", "firc:t1 PRAW-1", "203.0.113.4", "255.255.255.255", 1, false);
+}
+
+static char *down3(void)
+{
+    return rc_from("rc-list-ours.json", "OpkgTun3", "firc:t1 PRAW-1", "203.0.113.4", "255.255.255.255", 0, false);
 }
 
 static char *created3(void)
@@ -462,7 +468,7 @@ static firc_opkgtun_seen_t seen_of(fake_t *f)
 static firc_opkgtun_want_t want3(void)
 {
     firc_opkgtun_want_t w = {.name = "OpkgTun3", .device = "opkgtun3", .n = 3, .mark = "firc:t1",
-                             .desc = "firc:t1 PRAW-1", .present = true};
+                             .desc = "firc:t1 PRAW-1", .present = true, .up = true};
     return w;
 }
 
@@ -797,6 +803,167 @@ TEST an_up_only_restore_saves_nothing(void)
     PASS();
 }
 
+TEST a_disabled_tunnels_record_is_taken_down(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->posts, &f->n_posts, ok(fx("configure-up-only.json")));
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.up = false;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    static const char *const want[] = {"L", "POST [" DOWN3 "] T=10", "L", "GET route", NULL};
+    ASSERT(log_is(f, true, want));
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    ASSERT(seen_of(f).saved);
+    ASSERT_FALSE(seen_of(f).toggled);
+    fake_end(f);
+    PASS();
+}
+
+TEST a_toggle_in_the_router_is_reported_and_not_undone(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    for (int i = 0; i < 4; i++) { f->devs[f->n_devs++] = true; }
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.turn = 1;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_FALSE(seen_of(f).toggled);
+    w.recheck = 1;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT(seen_of(f).toggled);
+    ASSERT_FALSE(seen_of(f).router_up);
+    ASSERT_EQ(1u, seen_of(f).turned);
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    w.up = false;
+    w.turn = 2;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT_FALSE(seen_of(f).toggled);
+    ASSERT_EQ(2u, seen_of(f).turned);
+    w.recheck = 2;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT(seen_of(f).toggled);
+    ASSERT(seen_of(f).router_up);
+    ASSERT_EQ(0, count(f, "POST"));
+    fake_end(f);
+    PASS();
+}
+
+TEST a_new_turn_writes_the_switch_again(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->posts, &f->n_posts, ok(fx("configure-up-only.json")));
+    for (int i = 0; i < 3; i++) { f->devs[f->n_devs++] = true; }
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.turn = 1;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    w.recheck = 1;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT(seen_of(f).toggled);
+    w.turn = 2;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(1, count(f, "POST [" UP3 "] T=10"));
+    ASSERT_FALSE(seen_of(f).toggled);
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    fake_end(f);
+    PASS();
+}
+
+TEST a_second_toggle_before_the_first_is_taken_is_reported_too(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    f->devs[f->n_devs++] = true;
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.turn = 1;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    w.recheck = 1;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT(seen_of(f).toggled);
+    w.up = false;
+    w.turn = 2;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT(seen_of(f).toggled);
+    ASSERT(seen_of(f).router_up);
+    ASSERT_EQ(2u, seen_of(f).turned);
+    ASSERT_EQ(0, count(f, "POST"));
+    fake_end(f);
+    PASS();
+}
+
+TEST a_record_made_again_is_no_toggle(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    base_script(f);
+    static const bool devs[] = {true, false, true};
+    for (int i = 0; i < 3; i++) { f->devs[f->n_devs++] = devs[i]; }
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.turn = 1;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    w.recheck = 1;
+    want1(f, w);
+    ASSERT(fake_settle(f));
+    ASSERT_FALSE(seen_of(f).toggled);
+    ASSERT_EQ(1, count(f, CREATE3));
+    ASSERT_EQ(1, count(f, P5_3));
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    fake_end(f);
+    PASS();
+}
+
+TEST a_refused_switch_is_tried_again(void)
+{
+    fake_t *f = fake_new();
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(ours3()));
+    add(f->lists, &f->n_lists, ok(down3()));
+    add(f->posts, &f->n_posts, ok(fx("create-index-too-large.json")));
+    add(f->posts, &f->n_posts, ok(fx("configure-up-only.json")));
+    fake_start(f);
+    firc_opkgtun_want_t w = want3();
+    w.up = false;
+    want1(f, w);
+    fake_go(f);
+    ASSERT(fake_settle(f));
+    ASSERT_EQ(2, count(f, "POST [" DOWN3 "] T=10"));
+    ASSERT_EQ(FIRC_OPKG_READY, seen_of(f).state);
+    fake_end(f);
+    PASS();
+}
+
 /* catches: a refused create that leaves dirty set with nothing pending */
 TEST a_refused_create_leaves_nothing_dirty(void)
 {
@@ -1080,7 +1247,7 @@ TEST the_sweep_keeps_what_is_wanted_when_it_runs(void)
     firc_opkgtun_want(f->m, NULL, 0);
     firc_opkgtun_sweep_now(f->m);
     firc_opkgtun_want_t b = {.name = "OpkgTun2", .device = "opkgtun2", .n = 2, .mark = "firc:b", .desc = "firc:b",
-                             .present = true};
+                             .present = true, .up = true};
     want1(f, b);
     fake_go(f);
     ASSERT(fake_settle(f));
@@ -1270,7 +1437,7 @@ TEST a_timeout_elsewhere_keeps_dirty(void)
     add(f->posts, &f->n_posts, ok(fx("create-index-too-large.json")));
     fake_start(f);
     firc_opkgtun_want_t w[2] = {{.name = "OpkgTun2", .device = "opkgtun2", .n = 2, .mark = "firc:t2",
-                                 .desc = "firc:t2 B", .present = true},
+                                 .desc = "firc:t2 B", .present = true, .up = true},
                                 want3()};
     firc_opkgtun_want(f->m, w, 2);
     fake_go(f);
@@ -1441,7 +1608,7 @@ TEST no_save_within_five_seconds_of_a_delete_whoever_asks(void)
     f->devs[f->n_devs++] = true;
     fake_start(f);
     firc_opkgtun_want_t w[2] = {gone3(), {.name = "OpkgTun5", .device = "opkgtun5", .n = 5, .mark = "firc:t5",
-                                          .desc = "firc:t5 E", .present = true}};
+                                          .desc = "firc:t5 E", .present = true, .up = true}};
     firc_opkgtun_want(f->m, w, 2);
     fake_go(f);
     ASSERT(fake_settle(f));
@@ -1751,7 +1918,7 @@ TEST a_stuck_want_does_not_block_another_tunnels_save(void)
     f->devs[f->n_devs++] = true;
     fake_start(f);
     firc_opkgtun_want_t w[2] = {{.name = "OpkgTun2", .device = "opkgtun2", .n = 2, .mark = "firc:t2",
-                                 .desc = "firc:t2", .present = true},
+                                 .desc = "firc:t2", .present = true, .up = true},
                                 want3()};
     firc_opkgtun_want(f->m, w, 2);
     fake_go(f);
@@ -1885,7 +2052,7 @@ TEST the_sweep_reports_what_it_removed(void)
     firc_opkgtun_want(f->m, NULL, 0);
     firc_opkgtun_sweep_now(f->m);
     firc_opkgtun_want_t b = {.name = "OpkgTun2", .device = "opkgtun2", .n = 2, .mark = "firc:b", .desc = "firc:b",
-                             .present = true};
+                             .present = true, .up = true};
     want1(f, b);
     ASSERT_EQ(0u, firc_opkgtun_swept(f->m));
     fake_go(f);
@@ -2983,6 +3150,12 @@ int main(int argc, char **argv)
     RUN_TEST(an_adopted_record_that_matches_writes_nothing);
     RUN_TEST(an_adopted_record_that_differs_is_reconfigured_and_saved);
     RUN_TEST(an_up_only_restore_saves_nothing);
+    RUN_TEST(a_disabled_tunnels_record_is_taken_down);
+    RUN_TEST(a_toggle_in_the_router_is_reported_and_not_undone);
+    RUN_TEST(a_new_turn_writes_the_switch_again);
+    RUN_TEST(a_second_toggle_before_the_first_is_taken_is_reported_too);
+    RUN_TEST(a_record_made_again_is_no_toggle);
+    RUN_TEST(a_refused_switch_is_tried_again);
     RUN_TEST(a_refused_create_leaves_nothing_dirty);
     RUN_TEST(a_refusal_removes_its_creating_line);
     RUN_TEST(a_timed_out_create_whose_record_exists_is_adopted);

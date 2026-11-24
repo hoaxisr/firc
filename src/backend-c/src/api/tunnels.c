@@ -1146,7 +1146,7 @@ static cJSON *tunnel_state_json(firc_tunnels_ctx_t *ctx, const firc_tunnel_t *t,
     uint64_t rx = 0, tx = 0;
     rates_of(ctx, t->device, &rx, &tx);
     ok = ok && cJSON_AddStringToObject(o, "id", t->id) != NULL &&
-         cJSON_AddStringToObject(o, "device", t->device) != NULL &&
+         cJSON_AddStringToObject(o, "device", t->device) != NULL && cJSON_AddBoolToObject(o, "enable", t->enable) != NULL &&
          cJSON_AddStringToObject(o, "status", status_name(st->status)) != NULL &&
          cJSON_AddStringToObject(o, "why", st->why) != NULL && put_router(o, ctx, t);
     if (ok) {

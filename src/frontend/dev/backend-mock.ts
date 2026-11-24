@@ -1181,6 +1181,7 @@ const tunnelState = (tn: any) => {
   return {
     id: tn.id,
     device: tn.device,
+    enable: tn.enable !== false,
     status,
     since: Math.floor(Date.now() / 1000) - 60,
     backoffS: status === "backoff" || status === "no_node" ? 12 : 0,

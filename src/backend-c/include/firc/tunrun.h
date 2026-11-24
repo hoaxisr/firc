@@ -64,8 +64,9 @@ void firc_tunrun_set_router(firc_tunrun_t *t, const firc_tunrun_router_t *r);
    only after a good load and a good apply. */
 firc_err_t firc_tunrun_start(firc_tunrun_t *t, firc_tunnels_t *want);
 
-/* device went down: a ready opkgtun<N> record is checked again. */
-void firc_tunrun_link_down(firc_tunrun_t *t, const char *device);
+/* device went up or down: an opkgtun<N> record is checked again when that is not its tunnel's switch, and every one
+   for a NULL device (events were lost). */
+void firc_tunrun_link(firc_tunrun_t *t, const char *device, bool up);
 
 /* The OpkgTun record of tunnel id as last seen, PENDING before any; false when id is not configured or its device
    is not opkgtun<N>. */
@@ -74,7 +75,8 @@ bool firc_tunrun_router_of(const firc_tunrun_t *t, const char *id, firc_opkgtun_
 /* Takes subscription bodies from subs from the next apply on; NULL detaches. */
 void firc_tunrun_set_subs(firc_tunrun_t *t, firc_tunsubs_t *subs);
 
-/* Where a refresh that drops keys of gone nodes writes the running set; kept, not copied; NULL writes nothing. */
+/* Where a refresh that drops keys of gone nodes, or a switch made in the router, writes the running set; kept, not
+   copied; NULL writes nothing and puts the router's switch back. */
 void firc_tunrun_set_path(firc_tunrun_t *t, const char *path);
 /* The changed() of firc_tunsubs_new, ud the tunrun: rebuilds every node list from the running config and
    sends the new list to the tunnels whose list changed. */
