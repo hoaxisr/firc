@@ -224,8 +224,13 @@ export class TunnelsStore {
         `/tunnels/${encodeURIComponent(id)}/refresh`,
         {},
       );
+      const saved = this.savedOf(id);
       if (answer?.queued) toast.success(t("Subscriptions are being refreshed"));
-      else toast.info(t("No subscriptions to refresh"));
+      else if (!saved?.sources.some((src) => src.kind === "subscription"))
+        toast.info(t("No subscriptions to refresh"));
+      else if (!(this.stateOf(id)?.enable ?? saved.enable))
+        toast.info(t("The tunnel is off: its subscriptions refresh once it is on"));
+      else toast.warning(t("Subscriptions not refreshed: the tunnel's uplink is down"));
       void this.pollState();
     } catch {
       return;

@@ -244,6 +244,39 @@ test.describe("Tunnels page", () => {
     );
   });
 
+  // Catches a refresh nothing queued blamed on missing subscriptions when the tunnel is off or its uplink is down.
+  test("a refresh nothing queued says why: tunnel off or uplink down", async ({ page }) => {
+    const sub = {
+      name: "Provider",
+      url: "https://sub.example/feed",
+      kind: "subscription",
+      id: "s1",
+      interval: 21600,
+    };
+    await stubDaemon(page, {
+      tunnels: [
+        tunnel("off", "tunvless0", { sources: [sub], enable: false }),
+        tunnel("down", "tunvless1", { sources: [sub] }),
+      ],
+      states: [
+        state("off", "tunvless0", { status: "off", enable: false }),
+        state("down", "tunvless1", { status: "uplink_down", uplinkOk: false }),
+      ],
+    });
+    await page.route("**/tunnels/*/refresh", (route) => route.fulfill({ json: { queued: false } }));
+    const tunnels = new TunnelsPage(page);
+    await tunnels.open();
+    await tunnels.card("off").getByRole("button", { name: "Refresh subscriptions" }).click();
+    await expect(
+      page.getByText("The tunnel is off: its subscriptions refresh once it is on"),
+    ).toBeVisible();
+    await tunnels.card("down").getByRole("button", { name: "Refresh subscriptions" }).click();
+    await expect(
+      page.getByText("Subscriptions not refreshed: the tunnel's uplink is down"),
+    ).toBeVisible();
+    await expect(page.getByText("No subscriptions to refresh")).toHaveCount(0);
+  });
+
   // Catches a state looked up by list position instead of the daemon's tunnel id, or a status word lost on the card.
   test("every state renders on its own card by tunnel id", async ({ page }) => {
     const sub = {

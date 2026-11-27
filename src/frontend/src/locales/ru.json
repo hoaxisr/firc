@@ -470,6 +470,8 @@
   "No nodes yet: a new subscription is fetched after saving": "Узлов пока нет: новая подписка загрузится после сохранения",
   "No sources yet: add a subscription or a link": "Источников пока нет: добавьте подписку или ссылку",
   "No subscriptions to refresh": "Обновлять нечего: подписок нет",
+  "The tunnel is off: its subscriptions refresh once it is on": "Туннель выключен: подписки обновятся после включения",
+  "Subscriptions not refreshed: the tunnel's uplink is down": "Подписки не обновлены: выход туннеля недоступен",
   "Node": "Узел",
   "Node check": "Проверка узлов",
   "Nodes": "Узлы",
