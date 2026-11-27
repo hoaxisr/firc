@@ -207,6 +207,24 @@ TEST labels_and_system_names_are_trimmed(void)
     PASS();
 }
 
+/* Catches: a long Cyrillic label cut inside a two-byte character. */
+TEST a_long_label_is_cut_on_a_character_boundary(void)
+{
+    char json[256];
+    char want[64];
+    char label[160] = "";
+    for (int i = 0; i < 40; i++) { strcat(label, "\xD0\x96"); }
+    snprintf(json, sizeof json, "{\"Wg\":{\"description\":\"%s\"}}", label);
+    snprintf(want, sizeof want, "%.62s", label);
+    firc_kn_iface_meta_t *metas = NULL;
+    size_t n = 0;
+    ASSERT_EQ(FIRC_OK, firc_kn_parse_interface_list(json, &metas, &n));
+    ASSERT_EQ(1, n);
+    ASSERT_STR_EQ(want, metas[0].description);
+    free(metas);
+    PASS();
+}
+
 TEST empty_list_yields_no_aliases(void)
 {
     firc_kn_iface_meta_t *metas = NULL;
@@ -587,6 +605,7 @@ int main(int argc, char **argv)
     RUN_TEST(an_entry_carries_both_names_and_drops_one_equal_to_the_kernel_name);
     RUN_TEST(aliases_skip_empty_and_redundant);
     RUN_TEST(labels_and_system_names_are_trimmed);
+    RUN_TEST(a_long_label_is_cut_on_a_character_boundary);
     RUN_TEST(empty_list_yields_no_aliases);
     RUN_TEST(platform_default_is_empty_and_safe);
     RUN_TEST(inet_role_comes_from_the_entry_or_from_a_port);

@@ -12,6 +12,7 @@
 
 #include "firc/log.h"
 #include "firc/rci_token.h"
+#include "firc/utf8.h"
 
 static bool is_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
@@ -25,7 +26,7 @@ static void copy_trimmed(char *dst, size_t dst_sz, const char *src) {
     while (*src && is_space(*src)) { src++; }
     size_t len = strlen(src);
     while (len > 0 && is_space(src[len - 1])) { len--; }
-    if (len >= dst_sz) { len = dst_sz - 1; }
+    if (len >= dst_sz) { len = (size_t)firc_utf8_clamp(src, (int)dst_sz - 1); }
     memcpy(dst, src, len);
     dst[len] = '\0';
 }
