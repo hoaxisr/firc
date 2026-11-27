@@ -19,7 +19,7 @@ type ListData = {
   url: string;
   interval: number;
   lastUpdate: number;
-  sync: { state: string; error: string; lastCheck: number };
+  sync: { state: string; error: string; lastCheck: number; cachedAt?: number };
   rules: ListRule[];
 };
 
@@ -709,6 +709,34 @@ test.describe("Groups with a list", () => {
     await expect(page.getByText("Sync failed: fetch failed: HTTP 404")).toBeVisible();
     await expect(page.locator(".sync-error")).toHaveText("fetch failed: HTTP 404");
     expect(state.pageUrls.length).toBe(pagesBefore);
+  });
+
+  test("a list from the cache says so, a fetched one does not", async ({ page }) => {
+    // Catches: the cache note missing, shown for cachedAt 0, or without the age.
+    const cached = makeListGroup("a1b2c3d4", "https://old.example/list.txt");
+    cached.lists[0].sync = {
+      state: "error",
+      error: "fetch failed: HTTP 404",
+      lastCheck: 1800000000,
+      cachedAt: Math.floor(Date.now() / 1000) - 3 * 3600 - 30,
+    };
+    const fetched = makeListGroup("b1b2c3d4", "https://new.example/list.txt");
+    fetched.lists[0].sync = {
+      state: "error",
+      error: "fetch failed: HTTP 404",
+      lastCheck: 1800000000,
+      cachedAt: 0,
+    };
+    await setupGroupLists(page, [cached, fetched]);
+
+    const headers = page.locator(".list-header");
+    await expect(headers).toHaveCount(2);
+    const note = headers.nth(0).locator(".cache-note");
+    await expect(note).toHaveText("from the cache, 3 h ago");
+    await expect(headers.nth(0).locator(".update-counts")).toContainText("1");
+    await expect(headers.nth(0).locator(".sync-error")).toHaveText("fetch failed: HTTP 404");
+    await expect(headers.nth(1).locator(".sync-error")).toHaveText("fetch failed: HTTP 404");
+    await expect(headers.nth(1).locator(".cache-note")).toHaveCount(0);
   });
 
   test("an edit on page one survives a visit to page two", async ({ page }) => {

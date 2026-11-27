@@ -176,6 +176,7 @@ typedef struct firc_group_list {
     uint8_t body_hash[FIRC_SHA256_DIGEST_LEN];
     bool has_body_hash;
     uint8_t failed_fetches;
+    int64_t cached_at;
     firc_sub_rules_t rules;
     firc_sub_override_t **overrides;
     size_t n_overrides;

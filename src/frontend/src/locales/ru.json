@@ -221,6 +221,7 @@
   "changed by hand": "изменено вручную",
   "checked together with the list, same owner": "проверяются вместе со списком, тот же владелец",
   "from the list": "из списка",
+  "from the cache, {age}": "из кэша, {age}",
   "from the group's DNS cache": "из кэша DNS группы",
   "list": "список",
   "of its own": "своих",

@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { getContext } from "svelte";
+  import { getContext, onMount } from "svelte";
 
   import Button from "../../../components/ui/Button.svelte";
   import Tooltip from "../../../components/ui/Tooltip.svelte";
+  import { relativeTime } from "../../../data/dnsstats.svelte";
   import { t } from "../../../data/locale.svelte";
   import { GROUPS_STORE_CONTEXT, normalizeListUrl, type GroupsStore } from "../groups.svelte";
   import { listKey, syncProgressLabel } from "../lists.svelte";
@@ -40,6 +41,16 @@
   let urlError = $derived(store.hasListUrlError(group.id, list.id));
   let syncProgress = $derived(store.lists.syncProgress[listKey(group.id, list.id)]);
   let syncError = $derived(list.sync?.state === "error" ? (list.sync.error ?? "") : "");
+
+  let now = $state(Math.floor(Date.now() / 1000));
+  onMount(() => {
+    const clock = setInterval(() => (now = Math.floor(Date.now() / 1000)), 30000);
+    return () => clearInterval(clock);
+  });
+  let cachedAt = $derived(list.sync?.cachedAt ?? 0);
+  let cacheNote = $derived(
+    cachedAt > 0 ? t("from the cache, {age}").replace("{age}", relativeTime(cachedAt, now, t)) : "",
+  );
 
   let listCount = $derived(list.rulesTotal ?? 0);
   let several = $derived((group.lists?.length ?? 0) > 1);
@@ -89,6 +100,9 @@
         {listCount}
         {t("from the list")}
       </span>
+      {#if cacheNote}
+        <span class="cache-note">{cacheNote}</span>
+      {/if}
       {#if syncError && !syncProgress}
         <span class="update-error">
           <span class="sync-error" title={syncError}>{syncError}</span>
@@ -204,6 +218,7 @@
   }
 
   .update-counts,
+  .cache-note,
   .update-error {
     position: relative;
     display: inline-flex;
@@ -213,6 +228,7 @@
   }
 
   .update-counts::before,
+  .cache-note::before,
   .update-error::before {
     content: "•";
     position: absolute;

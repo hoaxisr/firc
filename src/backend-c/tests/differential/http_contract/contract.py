@@ -51,13 +51,13 @@ def start_stub_sub_server():
     return server
 
 
-_LIVE_TS_KEYS = ("lastUpdate", "lastCheck")
+_LIVE_TS_KEYS = ("lastUpdate", "lastCheck", "cachedAt")
 
 _VOLATILE_KEYS = ("since", "backoffS", "lastExit", "rxBps", "txBps", "lastOk", "lastTry")
 
 
 def _redact_live_timestamps(obj):
-    """Replaces non-zero lastUpdate/lastCheck values and every live tunnel figure with a placeholder."""
+    """Replaces non-zero lastUpdate/lastCheck/cachedAt values and every live tunnel figure with a placeholder."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():

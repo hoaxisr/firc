@@ -6,12 +6,27 @@
 #include <string.h>
 #include <time.h>
 
+#include "firc/listcache.h"
+#include "firc/log.h"
 #include "firc/sub_fetch.h"
 #include "firc/subparse.h"
 
 /* at most one mid-transfer progress event per this many ms; each costs the loop a wakeup and a write */
 #define FIRC_SUB_FETCH_PROGRESS_MIN_MS 200u
 #define FIRC_SUB_EMIT_RETRY_MS 10u
+#define FIRC_SUB_WARNED_SLOTS 64u
+#define FIRC_SUB_URL_CLIP 200
+
+typedef struct warned {
+    char key[17];
+    uint8_t hash[8];
+} warned_t;
+
+typedef struct warned_set {
+    warned_t slot[FIRC_SUB_WARNED_SLOTS];
+    size_t n;
+    size_t next;
+} warned_set_t;
 
 void firc_sub_event_free(firc_sub_event_t *ev)
 {
@@ -111,8 +126,84 @@ static bool parse_progress(void *ud, size_t lines)
     return true;
 }
 
-void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub_event_fn emit,
-                      void *ud)
+static bool warn_first(warned_set_t *ws, const char *key, const uint8_t *hash)
+{
+    if (ws == NULL) {
+        return true;
+    }
+    for (size_t i = 0; i < ws->n; i++) {
+        if (strcmp(ws->slot[i].key, key) == 0 &&
+            memcmp(ws->slot[i].hash, hash, sizeof(ws->slot[i].hash)) == 0) {
+            return false;
+        }
+    }
+    warned_t *w = &ws->slot[ws->next];
+    memcpy(w->key, key, sizeof(w->key));
+    memcpy(w->hash, hash, sizeof(w->hash));
+    ws->next = (ws->next + 1) % FIRC_SUB_WARNED_SLOTS;
+    if (ws->n < FIRC_SUB_WARNED_SLOTS) {
+        ws->n++;
+    }
+    return true;
+}
+
+static void cache_store(const firc_sub_job_t *job, const char *dir, warned_set_t *ws,
+                        const char *key, const char *body, size_t len, const uint8_t *hash)
+{
+    firc_err_t err = firc_listcache_write(dir, key, (const uint8_t *)body, len, hash);
+    if (err != FIRC_OK && warn_first(ws, key, hash)) {
+        FIRC_WARN("list %.*s: its body is not kept on disk: %s", FIRC_SUB_URL_CLIP, job->url,
+                  err == FIRC_ERR_LIMIT ? "not enough free space" : firc_err_str(err));
+    }
+}
+
+typedef enum cache_outcome {
+    CACHE_MISS,
+    CACHE_POSTED,
+    CACHE_CANCELED,
+} cache_outcome_t;
+
+static cache_outcome_t cache_load(run_ctx_t *c, const char *dir, const char *key,
+                                  firc_sub_event_t *res)
+{
+    uint8_t *raw = NULL;
+    size_t len = 0;
+    time_t mtime = 0;
+    if (firc_listcache_read(dir, key, &raw, &len, res->hash, &mtime) != FIRC_OK) {
+        return CACHE_MISS;
+    }
+    char *body = realloc(raw, len + 1);
+    if (body == NULL) {
+        free(raw);
+        return CACHE_MISS;
+    }
+    body[len] = '\0';
+    firc_sub_parse_stats_t st;
+    firc_err_t perr = firc_sub_parse_rules_stats(body, len, &res->rules, &st, parse_progress, c);
+    free(body);
+    if (perr == FIRC_ERR_CANCELED) {
+        return CACHE_CANCELED;
+    }
+    if (perr != FIRC_OK) {
+        if (perr == FIRC_ERR_INVAL) {
+            (void)firc_listcache_remove(dir, key, res->hash);
+        }
+        firc_sub_rules_free(&res->rules);
+        firc_sub_rules_init(&res->rules);
+        memset(res->hash, 0, sizeof(res->hash));
+        return CACHE_MISS;
+    }
+    res->dropped = st.dropped;
+    res->unconstrained = st.unconstrained;
+    res->result = FIRC_SUB_RESULT_PARSED;
+    res->from_cache = true;
+    res->cached_at = (int64_t)mtime;
+    post(c, res);
+    return CACHE_POSTED;
+}
+
+static void job_run(const firc_sub_job_t *job, const char *cache_dir, warned_set_t *ws,
+                    firc_cancel_t *cancel, firc_sub_event_fn emit, void *ud)
 {
     if (job == NULL || emit == NULL) {
         return;
@@ -131,6 +222,23 @@ void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub
     if (started != NULL) {
         started->kind = FIRC_SUB_EV_STARTED;
         post(&c, started);
+    }
+
+    char key[17] = {0};
+    if (cache_dir != NULL && job->url == NULL) {
+        cache_dir = NULL;
+    }
+    if (cache_dir != NULL) {
+        firc_listcache_key(job->url, key);
+        if (job->cache_first) {
+            cache_outcome_t got = cache_load(&c, cache_dir, key, res);
+            if (got == CACHE_CANCELED) {
+                firc_sub_event_free(res);
+            }
+            if (got != CACHE_MISS) {
+                return;
+            }
+        }
     }
 
     char *body = NULL;
@@ -157,6 +265,9 @@ void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub
 
     /* cheap hash test, off the loop: the same bytes are not parsed again */
     if (job->has_hash && memcmp(job->expected_hash, res->hash, sizeof(res->hash)) == 0) {
+        if (cache_dir != NULL) {
+            cache_store(job, cache_dir, ws, key, body, len, res->hash);
+        }
         free(body);
         res->result = FIRC_SUB_RESULT_UNCHANGED;
         post(&c, res);
@@ -165,6 +276,9 @@ void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub
 
     firc_sub_parse_stats_t st;
     firc_err_t perr = firc_sub_parse_rules_stats(body, len, &res->rules, &st, parse_progress, &c);
+    if (perr == FIRC_OK && cache_dir != NULL) {
+        cache_store(job, cache_dir, ws, key, body, len, res->hash);
+    }
     free(body);
     if (perr == FIRC_ERR_CANCELED) {
         firc_sub_event_free(res);
@@ -182,6 +296,12 @@ void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub
 
     res->result = FIRC_SUB_RESULT_PARSED;
     post(&c, res);
+}
+
+void firc_sub_job_run(const firc_sub_job_t *job, const char *cache_dir, firc_cancel_t *cancel,
+                      firc_sub_event_fn emit, void *ud)
+{
+    job_run(job, cache_dir, NULL, cancel, emit, ud);
 }
 
 struct firc_sub_worker {
@@ -206,9 +326,13 @@ struct firc_sub_worker {
 
     firc_sub_job_t follow_up; /* for the running (group, list) only */
     bool has_follow_up;
+
+    char *cache_dir;
+    warned_set_t warned;
 };
 
-firc_sub_worker_t *firc_sub_worker_new(size_t capacity, firc_sub_event_fn emit, void *ud)
+firc_sub_worker_t *firc_sub_worker_new(size_t capacity, firc_sub_event_fn emit, void *ud,
+                                       const char *cache_dir)
 {
     if (capacity == 0 || capacity == SIZE_MAX || emit == NULL) {
         return NULL; /* SIZE_MAX: the follow-up's extra slot would wrap */
@@ -241,6 +365,18 @@ firc_sub_worker_t *firc_sub_worker_new(size_t capacity, firc_sub_event_fn emit, 
         free(w->waiting);
         free(w);
         return NULL;
+    }
+    if (cache_dir != NULL) {
+        w->cache_dir = strdup(cache_dir);
+        if (w->cache_dir == NULL) {
+            pthread_cond_destroy(&w->cv);
+            pthread_mutex_destroy(&w->mu);
+            firc_cancel_free(w->cancel);
+            free(w->waiting);
+            free(w);
+            return NULL;
+        }
+        (void)firc_listcache_sweep(w->cache_dir, NULL, 0);
     }
     w->emit = emit;
     w->ud = ud;
@@ -341,7 +477,7 @@ static void *worker_main(void *arg)
         }
         pthread_mutex_unlock(&w->mu);
 
-        firc_sub_job_run(&w->running, w->cancel, w->emit, w->ud);
+        job_run(&w->running, w->cache_dir, &w->warned, w->cancel, w->emit, w->ud);
 
         pthread_mutex_lock(&w->mu);
         free(w->running.url);
@@ -412,5 +548,6 @@ void firc_sub_worker_free(firc_sub_worker_t *w)
     pthread_cond_destroy(&w->cv);
     pthread_mutex_destroy(&w->mu);
     firc_cancel_free(w->cancel);
+    free(w->cache_dir);
     free(w);
 }

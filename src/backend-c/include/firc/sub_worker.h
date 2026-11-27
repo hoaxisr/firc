@@ -22,6 +22,7 @@ typedef struct firc_sub_job {
     bool has_hash;
     uint8_t expected_hash[FIRC_SHA256_DIGEST_LEN];
     uint64_t seq;
+    bool cache_first;
 } firc_sub_job_t;
 
 typedef enum firc_sub_event_kind {
@@ -58,6 +59,8 @@ typedef struct firc_sub_event {
     size_t dropped;                       /* PARSED: lines, or sing-box objects/values, nothing was made of */
     size_t unconstrained;                 /* PARSED: names taken without their object's network/port */
     const char *why; /* ERROR from the parse: static text, or NULL */
+    bool from_cache;
+    int64_t cached_at;
     struct firc_sub_event *next;
 } firc_sub_event_t;
 
@@ -69,14 +72,17 @@ void firc_sub_event_free(firc_sub_event_t *ev);
 
 /* Runs one job on the calling thread: emits STARTED, PROGRESS, then one RESULT via emit (no queue).
  * A refused PROGRESS is freed; a refused STARTED or RESULT is offered again until taken or cancel is raised.
- * cancel may be NULL; once raised, the loop frees further events (this job's result included) instead of emitting. */
-void firc_sub_job_run(const firc_sub_job_t *job, firc_cancel_t *cancel, firc_sub_event_fn emit,
-                      void *ud);
+ * cancel may be NULL; once raised, the loop frees further events (this job's result included) instead of emitting.
+ * cache_dir NULL: no list cache is read or written. */
+void firc_sub_job_run(const firc_sub_job_t *job, const char *cache_dir, firc_cancel_t *cancel,
+                      firc_sub_event_fn emit, void *ud);
 
 typedef struct firc_sub_worker firc_sub_worker_t;
 
-/* capacity bounds jobs WAITING (a follow-up counts, the running job doesn't); NULL on OOM or capacity 0. */
-firc_sub_worker_t *firc_sub_worker_new(size_t capacity, firc_sub_event_fn emit, void *ud);
+/* capacity bounds jobs WAITING (a follow-up counts, the running job doesn't); NULL on OOM or capacity 0.
+ * cache_dir NULL: no list cache; else its stale temp files are removed here. */
+firc_sub_worker_t *firc_sub_worker_new(size_t capacity, firc_sub_event_fn emit, void *ud,
+                                       const char *cache_dir);
 
 firc_err_t firc_sub_worker_start(firc_sub_worker_t *w);
 
