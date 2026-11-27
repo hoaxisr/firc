@@ -1051,5 +1051,9 @@
   "Sync this list": "Обновить этот список",
   "{n} list": "{n} список",
   "{n} lists (2-4)": "{n} списка",
-  "{n} lists": "{n} списков"
+  "{n} lists": "{n} списков",
+  "Preset sources": "Источники пресетов",
+  "Comes with the catalog": "Входит в каталог",
+  "Downloaded to the router once turned on": "Загружается на роутер после включения",
+  "Catalog unavailable: {names}": "Каталог недоступен: {names}"
 }

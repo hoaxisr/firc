@@ -3,8 +3,10 @@
 
   import Button from "../../components/ui/Button.svelte";
   import Placeholder from "../../components/ui/Placeholder.svelte";
+  import Switch from "../../components/ui/Switch.svelte";
   import Tooltip from "../../components/ui/Tooltip.svelte";
   import { locale, t } from "../../data/locale.svelte";
+  import { presetChoices, setProviderOn } from "../groups/preset-sources.svelte";
   import SaveDialog from "./SaveDialog.svelte";
   import SettingRow from "./SettingRow.svelte";
   import {
@@ -18,6 +20,12 @@
 
   import { CircleCheck, RotateCw, Save, Undo2 } from "../../components/ui/icons";
   import { counted as countedIn } from "../../utils/plural";
+  import {
+    loadCatalog,
+    presetProviders,
+    providerOn,
+    type PresetProvider,
+  } from "../groups/list-catalog";
   import { SECTIONS, type Row, type Section } from "./catalogue";
   import { autolistTtlWarning, changedKeys, groupChanges } from "./settings";
   import { running } from "./update";
@@ -58,6 +66,19 @@
   const rowsOf = (section: Section, klass: "live" | "restart") =>
     section.rows.filter((r) => rowClass(r) === klass);
   const wholeRestart = (section: Section) => rowsOf(section, "live").length === 0;
+
+  /* the catalog's providers: a choice lives in this browser and never touches lists already added */
+  let presets = $state<PresetProvider[] | null>(null);
+  let presetsError = $state<string | null>(null);
+  $effect(() => {
+    if (!active || presets !== null) return;
+    void loadCatalog().then((r) => {
+      if (r.ok) {
+        presets = presetProviders(r.data);
+        presetsError = null;
+      } else presetsError = r.error;
+    });
+  });
 
   let dialogOpen = $state(false);
   const installing = $derived(update.installing || running(update.res));
@@ -164,6 +185,37 @@
         </div>
       {/if}
     {/each}
+
+    <section class="panel" data-section="preset-sources">
+      <header>
+        <span class="title">{t("Preset sources")}</span>
+      </header>
+      {#if presets !== null}
+        {#each presets as p (p.id)}
+          <div class="preset" data-provider={p.id}>
+            <div>
+              <div>{p.name}</div>
+              <div class="hint">
+                {p.builtin
+                  ? t("Comes with the catalog")
+                  : t("Downloaded to the router once turned on")}
+              </div>
+            </div>
+            <Switch
+              aria-label={p.name}
+              checked={providerOn(presetChoices(), p)}
+              onCheckedChange={(v: boolean) => setProviderOn(p, v)}
+            />
+          </div>
+        {/each}
+      {:else}
+        <div class="preset hint" role="status">
+          {presetsError === null
+            ? t("loading the catalog…")
+            : presetsError || t("Catalog unavailable")}
+        </div>
+      {/if}
+    </section>
   {/if}
   <SaveDialog
     open={dialogOpen}
@@ -247,5 +299,24 @@
   .subheading {
     padding: 16px 12px 6px;
     border-top: 1px solid var(--bg-light);
+  }
+  /* the grid of SettingRow, so a switch here lines up with the switches above */
+  .preset {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    align-items: center;
+    gap: 24px;
+    padding: 12px;
+    border-top: 1px solid var(--bg-light);
+  }
+  @media (max-width: 700px) {
+    .preset {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 8px;
+    }
+  }
+  .hint {
+    font-size: 0.85rem;
+    color: var(--text-2);
   }
 </style>

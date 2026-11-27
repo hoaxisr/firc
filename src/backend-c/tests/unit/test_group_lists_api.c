@@ -21,6 +21,7 @@
 
 #include "firc/app.h"
 #include "firc/groups.h"
+#include "firc/list_catalog.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/models.h"
@@ -176,13 +177,52 @@ static const char catalog_body[] =
     "{\"id\":\"sagernet\",\"url\":\"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs\","
     "\"names\":[\"youtube\",\"youtube@cn\"]},"
     "{\"id\":\"hoaxisr\",\"url\":\"https://raw.githubusercontent.com/hoaxisr/rulesets/master/srs/{}.srs\","
-    "\"names\":[\"discord\"]}]}";
+    "\"names\":[\"discord\"]}],"
+    "\"providers\":[{\"id\":\"sagernet\",\"name\":\"SagerNet\"},{\"id\":\"demo\",\"name\":\"Demo\"},"
+    "{\"id\":\"spoof\",\"name\":\"Spoof\"}]}";
+
+static atomic_int g_provider_hits;
+
+/* catalog/<provider>.json beside the stub's /catalog index */
+static void h_stub_provider_demo(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    atomic_fetch_add(&g_provider_hits, 1);
+    static const char body[] =
+        "{\"generated\":\"2026-11-27T00:00:00Z\",\"sources\":[{\"id\":\"demo-geoip\","
+        "\"url\":\"https://raw.githubusercontent.com/demo/geoip/release/text/{}.txt\",\"names\":[\"ru\",\"us\"]}]}";
+    firc_http_res_write(res, 200, "application/json", (const uint8_t *)body, sizeof(body) - 1);
+}
+
+static void h_stub_provider_spoof(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    atomic_fetch_add(&g_provider_hits, 1);
+    static const char body[] =
+        "{\"generated\":\"x\",\"sources\":[{\"id\":\"sagernet\","
+        "\"url\":\"https://raw.githubusercontent.com/evil/x/{}.srs\",\"names\":[\"youtube\"]}]}";
+    firc_http_res_write(res, 200, "application/json", (const uint8_t *)body, sizeof(body) - 1);
+}
 
 static void h_stub_catalog(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
     (void)req;
     (void)ud;
     atomic_fetch_add(&g_catalog_hits, 1);
     firc_http_res_write(res, 200, "application/json", (const uint8_t *)catalog_body, sizeof(catalog_body) - 1);
+}
+
+static void h_stub_catalog_many(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    atomic_fetch_add(&g_catalog_hits, 1);
+    char body[2048];
+    size_t len = (size_t)snprintf(body, sizeof body,
+                                  "{\"sources\":[],\"providers\":[{\"id\":\"demo\",\"name\":\"Demo\"}");
+    for (int i = 0; i < FIRC_LIST_CATALOG_PROVIDERS_MAX; i++) {
+        len += (size_t)snprintf(body + len, sizeof body - len, ",{\"id\":\"absent%d\",\"name\":\"Absent\"}", i);
+    }
+    len += (size_t)snprintf(body + len, sizeof body - len, "]}");
+    firc_http_res_write(res, 200, "application/json", (const uint8_t *)body, len);
 }
 
 static void h_stub_catalog_slow(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
@@ -317,11 +357,14 @@ static harness_t *harness_start_ex(bool with_worker, bool with_config) {
     firc_httpd_route(h->stub, "GET", "/slow404", h_stub_slow_404, NULL);
     firc_httpd_route(h->stub, "GET", "/gate", h_stub_gate, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog", h_stub_catalog, NULL);
+    firc_httpd_route(h->stub, "GET", "/catalog-many", h_stub_catalog_many, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-slow", h_stub_catalog_slow, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-gate", h_stub_catalog_gate, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-404", h_stub_catalog_404, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-bad", h_stub_catalog_bad, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-big", h_stub_catalog_big, NULL);
+    firc_httpd_route(h->stub, "GET", "/catalog/demo.json", h_stub_provider_demo, NULL);
+    firc_httpd_route(h->stub, "GET", "/catalog/spoof.json", h_stub_provider_spoof, NULL);
     if (firc_httpd_listen_tcp(h->stub, "127.0.0.1", STUB_PORT) != FIRC_OK) { return NULL; }
     pthread_create(&h->stub_thread, NULL, loop_thread, h->stub_loop);
 
@@ -1440,6 +1483,7 @@ static bool catalog_use(harness_t *h, const char *url) {
 
 static harness_t *catalog_harness(const char *path) {
     atomic_store(&g_catalog_hits, 0);
+    atomic_store(&g_provider_hits, 0);
     atomic_store(&g_catalog_now, (uint64_t)1000000);
     harness_t *h = harness_start();
     if (h != NULL && !catalog_use(h, stub_url(path))) { return NULL; }
@@ -1450,6 +1494,113 @@ static void catalog_advance(uint64_t ms) { atomic_fetch_add(&g_catalog_now, ms);
 
 static cJSON *catalog_names(cJSON *out, int source) {
     return jobj(cJSON_GetArrayItem(jobj(out, "sources"), source), "names");
+}
+
+/* Catches: the provider list of the index lost on the way to the WebUI. */
+TEST catalog_passes_its_providers_on(void) {
+    harness_t *h = catalog_harness("/catalog");
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, &out));
+    cJSON *ps = jobj(out, "providers");
+    ASSERT_EQ(3, cJSON_GetArraySize(ps));
+    ASSERT_STR_EQ("Demo", jstr(cJSON_GetArrayItem(ps, 1), "name"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a provider file looked for elsewhere, refetched every time, or sharing the index's copy. */
+TEST provider_catalog_is_fetched_beside_the_index_and_kept_apart(void) {
+    harness_t *h = catalog_harness("/catalog");
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, &out));
+    ASSERT_STR_EQ("2026-11-27T00:00:00Z", jstr(out, "generated"));
+    ASSERT(cJSON_IsFalse(jobj(out, "stale")));
+    ASSERT_STR_EQ("demo-geoip", jstr(cJSON_GetArrayItem(jobj(out, "sources"), 0), "id"));
+    ASSERTm("a provider's file names no providers", jobj(out, "providers") == NULL);
+    cJSON_Delete(out);
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_provider_hits));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
+    out = NULL;
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, &out));
+    ASSERT_STR_EQ("sagernet", jstr(cJSON_GetArrayItem(jobj(out, "sources"), 0), "id"));
+    cJSON_Delete(out);
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
+    catalog_advance(CATALOG_FRESH_MS);
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(2, atomic_load(&g_provider_hits));
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a provider id used as a path without the id check. */
+TEST provider_catalog_refuses_a_bad_id(void) {
+    harness_t *h = catalog_harness("/catalog");
+    ASSERT(h != NULL);
+    const char *bad[] = {"", "Demo", "..%2Fx", "a.b", "a%2Fb"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char path[128];
+        snprintf(path, sizeof path, CATALOG_PATH "?provider=%s", bad[i]);
+        cJSON *out = NULL;
+        ASSERT_EQ(400, do_request("GET", path, NULL, &out));
+        ASSERT_STR_EQ("provider is not a catalog id", jstr(out, "error"));
+        cJSON_Delete(out);
+    }
+    ASSERT_EQ(400, do_request("GET", CATALOG_PATH "?provider=demo%00x", NULL, NULL));
+    ASSERT_EQ(0, atomic_load(&g_catalog_hits));
+    ASSERT_EQ(0, atomic_load(&g_provider_hits));
+    harness_stop(h);
+    PASS();
+}
+
+/* Catches: a provider's file passing off sources under another provider's id. */
+TEST provider_catalog_refuses_another_providers_sources(void) {
+    harness_t *h = catalog_harness("/catalog");
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(502, do_request("GET", CATALOG_PATH "?provider=spoof", NULL, &out));
+    ASSERT_STR_EQ("catalog refused: source sagernet is not one of spoof", jstr(out, "error"));
+    cJSON_Delete(out);
+    harness_stop(h);
+    PASS();
+}
+
+/* An unknown ID must not allocate a slot or start a provider fetch. */
+TEST provider_catalog_requires_an_index_entry(void) {
+    harness_t *h = catalog_harness("/catalog");
+    ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(404, do_request("GET", CATALOG_PATH "?provider=unknown", NULL, &out));
+    ASSERT_STR_EQ("provider is not in the catalog", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(404, do_request("GET", CATALOG_PATH "?provider=sagernet", NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
+    ASSERT_EQ(0, atomic_load(&g_provider_hits));
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_provider_hits));
+    harness_stop(h);
+    PASS();
+}
+
+/* Sequential requests can recycle idle slots while the index remains independently cached. */
+TEST provider_catalogs_recycle_idle_slots(void) {
+    harness_t *h = catalog_harness("/catalog-many");
+    ASSERT(h != NULL);
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    for (int i = 0; i < FIRC_LIST_CATALOG_PROVIDERS_MAX; i++) {
+        char path[128];
+        snprintf(path, sizeof path, CATALOG_PATH "?provider=absent%d", i);
+        ASSERT_EQ(502, do_request("GET", path, NULL, NULL));
+    }
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(2, atomic_load(&g_provider_hits));
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
+    harness_stop(h);
+    PASS();
 }
 
 /* Catches: a catalog fetched on every request, or an answer missing its fields. */
@@ -3261,6 +3412,12 @@ int main(int argc, char **argv) {
     RUN_TEST(previews_past_two_at_once_are_503);
     RUN_TEST(a_preview_in_flight_at_shutdown_is_ended);
     RUN_TEST(catalog_is_fetched_once_and_cached);
+    RUN_TEST(catalog_passes_its_providers_on);
+    RUN_TEST(provider_catalog_is_fetched_beside_the_index_and_kept_apart);
+    RUN_TEST(provider_catalog_refuses_a_bad_id);
+    RUN_TEST(provider_catalog_refuses_another_providers_sources);
+    RUN_TEST(provider_catalog_requires_an_index_entry);
+    RUN_TEST(provider_catalogs_recycle_idle_slots);
     RUN_TEST(catalog_requests_share_one_fetch);
     RUN_TEST(catalog_refetches_after_six_hours);
     RUN_TEST(catalog_failure_is_remembered_for_a_minute);

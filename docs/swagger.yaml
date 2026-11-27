@@ -1717,6 +1717,17 @@ definitions:
         example: https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs
         type: string
     type: object
+  types.ListCatalogProvider:
+    properties:
+      id:
+        description: 'Provider id, `[a-z0-9-]{1,32}`; its sources are the index''s sources with this id or this id and a dash, or the ones in its own file'
+        example: loyalsoldier
+        type: string
+      name:
+        description: 'Display name, 1 to 32 bytes, no control characters'
+        example: Loyalsoldier
+        type: string
+    type: object
   types.ListCatalogRes:
     properties:
       fetchedAt:
@@ -1727,6 +1738,11 @@ definitions:
         description: 'When the index was built, as the index says'
         example: '2026-10-22T03:00:00Z'
         type: string
+      providers:
+        description: 'Every provider of presets, in the order the index gives; absent from an index that names none and from a provider''s file'
+        items:
+          $ref: '#/definitions/types.ListCatalogProvider'
+        type: array
       sources:
         items:
           $ref: '#/definitions/types.ListCatalogSource'
@@ -2889,7 +2905,12 @@ paths:
       - rules
   /api/v1/groups/list/catalog:
     get:
-      description: 'The index of sing-box rule-sets the group dialog searches by name. The router fetches it from https://raw.githubusercontent.com/hoaxisr/rulesets/master/catalog.json on first use and keeps it in memory for 6 hours; the body is capped at 1 MiB and refused whole if any source or name is malformed. The fetch runs on a separate thread: requests arriving meanwhile wait for that one fetch, and a client that closes the connection does not cancel it. A failed fetch is remembered for 1 minute and answered without a new fetch. A refetch that fails while an older copy exists answers that copy with `stale: true`.'
+      description: 'The index of sing-box rule-sets the group dialog searches by name. The router fetches it from https://raw.githubusercontent.com/hoaxisr/rulesets/master/catalog.json on first use and considers the copy fresh for 6 hours; the body is capped at 1 MiB and refused whole if any source or name is malformed. The fetch runs on a separate thread: requests arriving meanwhile wait for that one fetch, and a client that closes the connection does not cancel it. A failed fetch is remembered for 1 minute and answered without a new fetch. A refetch that fails while an older copy exists answers that copy with `stale: true`. With `provider`, the same for that provider''s own file, catalog/<provider>.json beside the index, kept and refetched apart from it; it is refused whole if any source id is neither the provider id nor the provider id and a dash. The provider must be advertised by the index and have no inline source. A request on a cold daemon loads the index first. At most 16 provider slots are kept at once. The least recently used idle slot is reclaimed at capacity. A provider copy is evicted after 6 hours without use, and an empty slot after 1 minute, checked once a minute.'
+      parameters:
+      - description: 'An optional provider advertised by the index, `[a-z0-9-]{1,32}`'
+        in: query
+        name: provider
+        type: string
       produces:
       - application/json
       responses:
@@ -2897,12 +2918,24 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/types.ListCatalogRes'
+        "400":
+          description: 'Bad Request -- invalid catalog provider id or malformed query'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "404":
+          description: 'Not Found -- the provider is not advertised as an optional file in the index'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
         "500":
           description: 'Internal Server Error -- out of memory, or the fetch could not start'
           schema:
             $ref: '#/definitions/types.ErrorRes'
         "502":
           description: 'Bad Gateway -- no copy and the fetch failed: the reason a list fetch reports (`the server answered 404`, `the list is too big`, libcurl''s text), or `catalog refused: <why>` for an index that did not pass the checks'
+          schema:
+            $ref: '#/definitions/types.ErrorRes'
+        "503":
+          description: 'Service Unavailable -- `too many provider catalogs at once`: all 16 provider slots are fetching a different file'
           schema:
             $ref: '#/definitions/types.ErrorRes'
       summary: 'Rule-set catalog'

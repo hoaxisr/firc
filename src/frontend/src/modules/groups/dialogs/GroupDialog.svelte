@@ -18,6 +18,7 @@
     normalizeListUrl,
     type GroupDialogPayload,
   } from "../groups.svelte";
+  import { presetChoices } from "../preset-sources.svelte";
 
   import { Eye, Globe, Link, LoaderCircle, Type, X } from "../../../components/ui/icons";
   import { BLOCK, DNS, isSink } from "../../../data/iface-choices";
@@ -30,7 +31,12 @@
   import {
     isUrlText,
     loadCatalog,
+    loadProvider,
+    presetProviders,
+    providerOn,
     searchCatalog,
+    visibleSources,
+    wantedFiles,
     type Catalog,
     type CatalogRow,
   } from "../list-catalog";
@@ -93,22 +99,40 @@
   let catalog = $state<Catalog | null>(null);
   let catalogError = $state<string | null>(null);
   let catalogLoading = $state(false);
+  /* files of the optional providers that are on, fetched once the owner starts typing */
+  let providerFiles = $state<Record<string, Catalog>>({});
+  let providerFailed = $state<Record<string, string>>({});
+  let providerPending = $state<string[]>([]);
+  let failedNames = $derived(
+    catalog
+      ? presetProviders(catalog)
+          .filter((p) => Object.hasOwn(providerFailed, p.id) && providerOn(presetChoices(), p))
+          .map((p) => p.name)
+      : [],
+  );
   let catalogOpen = $state(false);
   let catalogActive = $state(-1);
   let catalogQuery = $derived(isUrlText(url) ? "" : url.trim());
   let full = $derived(rows.length >= LISTS_MAX);
   let catalogShown = $derived(!full && catalogOpen && catalogQuery !== "");
   let catalogHits = $derived(
-    catalog && catalogQuery !== "" ? searchCatalog(catalog, catalogQuery) : { rows: [], more: 0 },
+    catalog && catalogQuery !== ""
+      ? searchCatalog(
+          { sources: visibleSources(catalog, providerFiles, presetChoices()) },
+          catalogQuery,
+        )
+      : { rows: [], more: 0 },
   );
   let catalogStatus = $derived(
     !catalogShown || catalogHits.rows.length > 0
       ? ""
-      : catalogLoading
+      : catalogLoading || providerPending.length > 0
         ? t("loading the catalog…")
         : catalogError !== null
           ? catalogError || t("Catalog unavailable")
-          : t("nothing found"),
+          : failedNames.length > 0
+            ? t("Catalog unavailable: {names}").replace("{names}", failedNames.join(", "))
+            : t("nothing found"),
   );
   let urlInvalid = $derived(url !== "" && isUrlText(url) && !isValidListUrl(url));
   let rowUrls = $derived(rows.map((row) => normalizeListUrl(row.url)));
@@ -134,14 +158,33 @@
     if (previewKey === key) resetPreview();
   }
 
+  function askProviders(index: Catalog) {
+    for (const p of wantedFiles(index, presetChoices())) {
+      if (Object.hasOwn(providerFiles, p.id) || providerPending.includes(p.id)) continue;
+      providerPending = [...providerPending, p.id];
+      providerFailed = Object.fromEntries(
+        Object.entries(providerFailed).filter(([id]) => id !== p.id),
+      );
+      void loadProvider(p.id).then((r) => {
+        providerPending = providerPending.filter((id) => id !== p.id);
+        if (!open || !providerOn(presetChoices(), p)) return;
+        if (r.ok) providerFiles = { ...providerFiles, [p.id]: r.data };
+        else providerFailed = { ...providerFailed, [p.id]: r.error };
+      });
+    }
+  }
+
   function askCatalog() {
-    if (catalog || catalogLoading) return;
+    if (catalog) return askProviders(catalog);
+    if (catalogLoading) return;
     catalogLoading = true;
     catalogError = null;
     void loadCatalog().then((r) => {
       catalogLoading = false;
-      if (r.ok) catalog = r.data;
-      else catalogError = r.error;
+      if (r.ok) {
+        catalog = r.data;
+        if (open && catalogShown) askProviders(r.data);
+      } else catalogError = r.error;
     });
   }
 
@@ -202,6 +245,8 @@
   $effect(() => {
     if (!open) {
       seededFor = null;
+      providerFiles = {};
+      providerFailed = {};
       return;
     }
     const key = mode === "edit" ? (group?.id ?? "edit") : "create";
@@ -659,11 +704,20 @@
                   {t("{n} more").replace("{n}", String(catalogHits.more))}
                 </div>
               {/if}
-            {:else if catalogLoading}
+              {#if failedNames.length > 0}
+                <div class="catalog-note catalog-error">
+                  {t("Catalog unavailable: {names}").replace("{names}", failedNames.join(", "))}
+                </div>
+              {/if}
+            {:else if catalogLoading || providerPending.length > 0}
               <div class="catalog-note">{t("loading the catalog…")}</div>
             {:else if catalogError !== null}
               <div class="catalog-note catalog-error">
                 {catalogError || t("Catalog unavailable")}
+              </div>
+            {:else if failedNames.length > 0}
+              <div class="catalog-note catalog-error">
+                {t("Catalog unavailable: {names}").replace("{names}", failedNames.join(", "))}
               </div>
             {:else}
               <div class="catalog-note">{t("nothing found")}</div>
