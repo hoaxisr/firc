@@ -838,8 +838,67 @@ app.patch(`${API_BASE}/groups/:id/lists/:lid/rules`, async (c) => {
   return c.json({ status: "ok" });
 });
 
-app.get(`${API_BASE}/groups/list/catalog`, (c) =>
-  c.json({
+const RAW = "https://raw.githubusercontent.com";
+// The optional providers' files, served for ?provider=<id> as the router serves catalog/<id>.json.
+const providerCatalogs: Record<string, { id: string; url: string; names: string[] }[]> = {
+  loyalsoldier: [
+    {
+      id: "loyalsoldier-geoip",
+      url: `${RAW}/Loyalsoldier/geoip/release/text/{}.txt`,
+      names: ["ru", "google", "telegram", "netflix"],
+    },
+    {
+      id: "loyalsoldier-geosite",
+      url: `${RAW}/hoaxisr/rulesets/geo/loyalsoldier/geosite/{}.srs`,
+      names: ["google", "youtube", "gfw"],
+    },
+  ],
+  v2fly: [
+    {
+      id: "v2fly-geoip",
+      url: `${RAW}/v2fly/geoip/release/text/{}.txt`,
+      names: ["ru", "private", "us"],
+    },
+  ],
+  runetfreedom: [
+    {
+      id: "runetfreedom-geosite",
+      url: `${RAW}/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geosite/geosite-{}.srs`,
+      names: ["ru-blocked", "youtube", "google"],
+    },
+    {
+      id: "runetfreedom-geoip",
+      url: `${RAW}/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geoip/geoip-{}.srs`,
+      names: ["ru-blocked", "telegram"],
+    },
+  ],
+  itdog: [
+    {
+      id: "itdog-services",
+      url: `${RAW}/itdoginfo/allow-domains/main/Services/{}.lst`,
+      names: ["youtube", "discord", "telegram"],
+    },
+    {
+      id: "itdog-ipv4",
+      url: `${RAW}/itdoginfo/allow-domains/main/Subnets/IPv4/{}.lst`,
+      names: ["discord", "telegram"],
+    },
+  ],
+};
+
+app.get(`${API_BASE}/groups/list/catalog`, (c) => {
+  const provider = c.req.query("provider");
+  if (provider !== undefined) {
+    const sources = providerCatalogs[provider];
+    if (!sources) return c.json({ error: "the server answered 404" }, 502);
+    return c.json({
+      generated: "2026-11-27T00:00:00Z",
+      fetchedAt: Math.floor(Date.now() / 1000),
+      stale: false,
+      sources,
+    });
+  }
+  return c.json({
     generated: "2026-10-22T00:00:00Z",
     fetchedAt: Math.floor(Date.now() / 1000),
     stale: false,
@@ -855,8 +914,16 @@ app.get(`${API_BASE}/groups/list/catalog`, (c) =>
         names: ["youtube", "discord", "telegram-ip", "meta"],
       },
     ],
-  }),
-);
+    providers: [
+      { id: "sagernet", name: "SagerNet" },
+      { id: "hoaxisr", name: "hoaxisr" },
+      { id: "itdog", name: "ITDog" },
+      { id: "loyalsoldier", name: "Loyalsoldier" },
+      { id: "runetfreedom", name: "RunetFreedom" },
+      { id: "v2fly", name: "V2Fly" },
+    ],
+  });
+});
 
 app.get(`${API_BASE}/groups/list/preview`, (c) => {
   const url = c.req.query("url");

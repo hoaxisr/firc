@@ -499,7 +499,7 @@ for (const locale of ["ru", "en"]) {
       await page.setViewportSize({ width, height: 900 });
       await expect(page.locator('[data-section="pool"] header .whole')).toBeVisible();
       expect(await lineCounts(page.locator("section.panel header .title"))).toEqual([
-        1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1,
       ]);
       const clear = await page.locator("section.panel header:has(.whole)").evaluateAll((els) =>
         els.map((h) => {
