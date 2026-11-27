@@ -34,6 +34,9 @@
 #ifndef FIRC_TUNNELS_CACHE_DIR
 #define FIRC_TUNNELS_CACHE_DIR "/opt/var/lib/firc/tunnels"
 #endif
+#ifndef FIRC_LISTS_CACHE_DIR
+#define FIRC_LISTS_CACHE_DIR "/opt/var/lib/firc/lists"
+#endif
 #ifndef FIRC_UPDATE_DIR
 #define FIRC_UPDATE_DIR "/opt/var/lib/firc/update"
 #endif
@@ -84,6 +87,9 @@
 #endif
 #ifndef FIRC_TUNNELS_CACHE_DIR
 #define FIRC_TUNNELS_CACHE_DIR "/var/lib/firc/tunnels"
+#endif
+#ifndef FIRC_LISTS_CACHE_DIR
+#define FIRC_LISTS_CACHE_DIR "/var/lib/firc/lists"
 #endif
 #ifndef FIRC_UPDATE_DIR
 #define FIRC_UPDATE_DIR "/var/lib/firc/update"

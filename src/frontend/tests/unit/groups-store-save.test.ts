@@ -384,7 +384,12 @@ describe("GroupsStore.saveChanges, with a list in the array", () => {
     assert.strictEqual(cloned.lists[0].interval, source.lists[0].interval);
     assert.strictEqual(cloned.lists[0].rulesTotal, 0, "nothing has been fetched for the copy yet");
     assert.strictEqual(cloned.lists[0].lastUpdate, 0);
-    assert.deepStrictEqual(cloned.lists[0].sync, { state: "idle", error: "", lastCheck: 0 });
+    assert.deepStrictEqual(cloned.lists[0].sync, {
+      state: "idle",
+      error: "",
+      lastCheck: 0,
+      cachedAt: 0,
+    });
   });
 });
 

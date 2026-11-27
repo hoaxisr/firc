@@ -544,7 +544,7 @@ export class ListsController {
         live.url = record?.url ?? target;
         live.sync = record?.sync
           ? syncOf(record.sync)
-          : { state: "queued", error: "", lastCheck: 0 };
+          : { state: "queued", error: "", lastCheck: 0, cachedAt: 0 };
         this.#acknowledgeListSaved(groupId, listId);
       }
     } catch (error) {
@@ -747,13 +747,19 @@ export class ListsController {
     if (state === "error") {
       const message = String(record.sync?.error ?? "");
       if (message === "list url changed" && live.url !== this.#followedUrl.get(key)) {
-        live.sync = { state: "idle", error: "", lastCheck: live.sync?.lastCheck ?? 0 };
+        live.sync = {
+          state: "idle",
+          error: "",
+          lastCheck: live.sync?.lastCheck ?? 0,
+          cachedAt: live.sync?.cachedAt ?? 0,
+        };
         return;
       }
       live.sync = {
         state: "error",
         error: message,
         lastCheck: record.sync?.lastCheck ?? live.sync?.lastCheck ?? 0,
+        cachedAt: record.sync?.cachedAt ?? live.sync?.cachedAt ?? 0,
       };
       if (wasRunning) toast.error(`${t("Sync failed")}: ${message}`);
       return;

@@ -189,6 +189,7 @@ SUBSCRIPTIONS_SRCS := \
     src/subscriptions/fetch.c \
     src/subscriptions/subhdr.c \
     src/subscriptions/subinfo.c \
+    src/subscriptions/listcache.c \
     src/subscriptions/worker.c \
     src/dns/doh.c
 
@@ -397,6 +398,13 @@ SYSTEM_WRAP := -Wl,--wrap=firc_app_netfilter_health,--wrap=firc_dnsstat_new,--wr
 $(BUILDDIR)/tests/test_system: tests/unit/test_system.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(SYSTEM_WRAP) -o $@ $< \
+	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
+
+LISTCACHE_WRAP := -Wl,--wrap=malloc,--wrap=realloc,--wrap=read,--wrap=__read_chk,--wrap=statvfs
+
+$(BUILDDIR)/tests/test_listcache: tests/unit/test_listcache.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Itests/vendor -Itests/unit $(LDFLAGS) $(LISTCACHE_WRAP) -o $@ $< \
 	    $(LIB_OBJS) $(TEST_SUPPORT_OBJS) $(LDLIBS) $(DEP_LIBS)
 
 $(BUILDDIR)/tests/%: tests/unit/%.c $(LIB_OBJS) $(TEST_SUPPORT_OBJS)

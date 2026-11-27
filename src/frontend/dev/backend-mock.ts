@@ -166,7 +166,12 @@ if (!DATA.groups.some((g: any) => g.id === "a1b2c3d4")) {
         url: "https://services.should.be.blocked.com",
         interval: 86400,
         lastUpdate: Math.floor(Date.now() / 1000),
-        sync: { state: "idle", error: "", lastCheck: 0 },
+        sync: {
+          state: "error",
+          error: "fetch failed: HTTP 503",
+          lastCheck: Math.floor(Date.now() / 1000) - 600,
+          cachedAt: Math.floor(Date.now() / 1000) - 4 * 3600,
+        },
         syncProgress: null,
         rules: [
           { enable: true, id: "11223344", rule: "google.com", type: "domain" },
@@ -331,7 +336,7 @@ function syncStage(list: any) {
 function runSync(list: any) {
   const total = 7786120;
   let bytes = 0;
-  list.sync = { state: "fetching", error: "", lastCheck: list.sync?.lastCheck ?? 0 };
+  list.sync = { state: "fetching", error: "", lastCheck: list.sync?.lastCheck ?? 0, cachedAt: 0 };
   list.syncProgress = { stage: "fetch", bytes: 0, total, lines: 0 };
 
   const tick = () => {
@@ -348,7 +353,12 @@ function runSync(list: any) {
       setTimeout(() => {
         const now = Math.floor(Date.now() / 1000);
         if (Math.random() < 0.2) {
-          list.sync = { state: "error", error: "fetch failed: HTTP 404", lastCheck: now };
+          list.sync = {
+            state: "error",
+            error: "fetch failed: HTTP 404",
+            lastCheck: now,
+            cachedAt: 0,
+          };
           return;
         }
         const count = Math.floor(Math.random() * 70) + 5;
@@ -370,7 +380,7 @@ function runSync(list: any) {
               },
         );
         list.lastUpdate = now;
-        list.sync = { state: "idle", error: "", lastCheck: now };
+        list.sync = { state: "idle", error: "", lastCheck: now, cachedAt: 0 };
       }, 400);
     }, 600);
   };
@@ -720,7 +730,7 @@ function applyListsFromReq(
       url: item.url,
       interval,
       lastUpdate: 0,
-      sync: { state: "queued", error: "", lastCheck: match?.sync?.lastCheck ?? 0 },
+      sync: { state: "queued", error: "", lastCheck: match?.sync?.lastCheck ?? 0, cachedAt: 0 },
       syncProgress: null,
       rules: [],
     };
@@ -907,7 +917,7 @@ app.post(`${API_BASE}/groups/:id/move-up`, (c) => {
 });
 
 function queueList(list: any) {
-  list.sync = { state: "queued", error: "", lastCheck: list.sync?.lastCheck ?? 0 };
+  list.sync = { state: "queued", error: "", lastCheck: list.sync?.lastCheck ?? 0, cachedAt: 0 };
   runSync(list);
 }
 

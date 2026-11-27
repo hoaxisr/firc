@@ -927,6 +927,10 @@ definitions:
             description: 'Text of the last failure; empty in every other state.'
             example: ''
             type: string
+          cachedAt:
+            description: Unix time of the on-disk copy the list's rules were loaded from; 0 when they came from a fetch.
+            example: 0
+            type: integer
           lastCheck:
             description: 'When the list was last checked (unix time); 0 -- never since the daemon started.'
             example: 1700000000

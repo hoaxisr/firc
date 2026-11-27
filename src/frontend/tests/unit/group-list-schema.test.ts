@@ -50,7 +50,12 @@ describe("a group's list, from the daemon", () => {
   it("keeps a list to its count, never its rules", () => {
     const [parsed] = parse(array(GroupSchema), [record()]);
     assert.strictEqual(parsed.lists[0].rulesTotal, 3);
-    assert.deepStrictEqual(parsed.lists[0].sync, { state: "idle", error: "", lastCheck: 0 });
+    assert.deepStrictEqual(parsed.lists[0].sync, {
+      state: "idle",
+      error: "",
+      lastCheck: 0,
+      cachedAt: 0,
+    });
     assert.strictEqual((parsed.lists[0] as any).rules, undefined);
   });
 

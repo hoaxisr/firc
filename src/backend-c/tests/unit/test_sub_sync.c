@@ -1,11 +1,14 @@
 #include "greatest.h"
 #include "test_ids.h"
 
+#include <netinet/in.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -13,6 +16,8 @@
 #include "firc/dnspipeline.h"
 #include "firc/httpd.h"
 #include "firc/events.h"
+#include "firc/hash.h"
+#include "firc/listcache.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/rulesnap.h"
@@ -1607,6 +1612,7 @@ typedef struct orphan_fixture {
     firc_app_t *app;
     char dir[64];
     char conf[128];
+    char cache[96];
 } orphan_fixture_t;
 
 static void *orphan_stub_thread(void *ud) {
@@ -1634,6 +1640,13 @@ static void orphan_fixture_stop(orphan_fixture_t *f) {
         f->stub_loop = NULL;
     }
     firc_config_clear(&f->cfg);
+    if (f->cache[0] != '\0') {
+        static const char *const none[1] = {NULL};
+        (void)firc_listcache_sweep(f->cache, NULL, 0);
+        (void)firc_listcache_sweep(f->cache, none, 0);
+        rmdir(f->cache);
+        f->cache[0] = '\0';
+    }
     if (f->dir[0] != '\0') {
         char groups[160];
         snprintf(groups, sizeof(groups), "%s/groups.yaml", f->dir);
@@ -1718,7 +1731,7 @@ TEST a_result_the_loop_never_read_gives_its_rules_back(void) {
 
 static list_ud_t g_list_many = {.body = NULL};
 
-static bool idle_loop_fixture_start(orphan_fixture_t *f, bool with_conf) {
+static bool idle_loop_fixture_start_ex(orphan_fixture_t *f, bool with_conf, bool with_cache) {
     memset(f, 0, sizeof(*f));
     firc_config_init_defaults(&f->cfg);
     g_orphan_open = true;
@@ -1738,10 +1751,21 @@ static bool idle_loop_fixture_start(orphan_fixture_t *f, bool with_conf) {
             return false;
         }
         snprintf(f->conf, sizeof(f->conf), "%s/firc.conf", f->dir);
+        if (with_cache) {
+            snprintf(f->cache, sizeof(f->cache), "%s/lists", f->dir);
+            if (mkdir(f->cache, 0700) != 0) { return false; }
+        }
     }
-    firc_app_deps_t deps = {.cfg = &f->cfg, .loop = f->app_loop, .config_path = with_conf ? f->conf : NULL};
+    firc_app_deps_t deps = {.cfg = &f->cfg,
+                            .loop = f->app_loop,
+                            .config_path = with_conf ? f->conf : NULL,
+                            .lists_cache_dir = f->cache[0] != '\0' ? f->cache : NULL};
     f->app = firc_app_create(&deps);
     return f->app != NULL && firc_app_start_list_worker(f->app) == FIRC_OK;
+}
+
+static bool idle_loop_fixture_start(orphan_fixture_t *f, bool with_conf) {
+    return idle_loop_fixture_start_ex(f, with_conf, false);
 }
 
 static const char *orphan_url(const char *path) {
@@ -1892,6 +1916,267 @@ TEST results_of_one_iteration_build_and_save_once(void) {
 
     g_orphan_open = false;
     orphan_fixture_stop(f);
+    PASS();
+}
+
+#define SILENT_PORT 18112
+
+static int silent_listener(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(SILENT_PORT), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static const char *silent_url(void) {
+    snprintf(g_url, sizeof(g_url), "http://127.0.0.1:%d/l.txt", SILENT_PORT);
+    return g_url;
+}
+
+static bool wait_results(size_t want) {
+    size_t results = 0;
+    for (int i = 0; i < 1000; i++) {
+        firc_app_sync_event_counts_for_test(NULL, &results, NULL);
+        if (results >= want) { return true; }
+        sleep_ms(5);
+    }
+    return false;
+}
+
+static void run_posted(orphan_fixture_t *f) {
+    if (firc_loop_post(f->app_loop, stop_post, NULL) == FIRC_OK) { (void)firc_loop_run(f->app_loop); }
+}
+
+static uint64_t saves_of(orphan_fixture_t *f) {
+    uint64_t saves = 0;
+    firc_app_publish_counts_for_test(f->app, NULL, &saves);
+    return saves;
+}
+
+static firc_group_list_t *live_list0(orphan_fixture_t *f, firc_id_t id) {
+    const firc_group_t *g = find_group(f->app, id);
+    return g != NULL && g->n_lists > 0 ? g->lists[0] : NULL;
+}
+
+static firc_sub_event_t *cached_event(firc_id_t id, firc_group_list_t *l, const char *rule, int64_t at,
+                                      const char *body) {
+    firc_sub_event_t *ev = parsed_event(id, l->id, l->sync_seq, rule);
+    ev->from_cache = true;
+    ev->cached_at = at;
+    firc_sha256((const uint8_t *)body, strlen(body), ev->hash);
+    return ev;
+}
+
+/* Catches: a cached body that waits for the network, or a fetch after it that does not expect its hash. */
+TEST a_cached_body_routes_at_once_and_its_fetch_expects_its_hash(void) {
+    orphan_fixture_t *f = &g_orphan;
+    ASSERT(idle_loop_fixture_start(f, true));
+    firc_id_t id = idle_loop_group(f, "/a", NULL);
+    firc_group_list_t *l = live_list0(f, id);
+    ASSERT(l != NULL);
+    uint64_t seq0 = l->sync_seq;
+    uint64_t saves0 = saves_of(f);
+    size_t results0 = 0;
+    firc_app_sync_event_counts_for_test(NULL, &results0, NULL);
+
+    firc_app_on_sync_event(f->app, cached_event(id, l, "cached.example", 1700000000, g_list_a.body), 1800000000);
+
+    ASSERT_EQ_FMT((size_t)1, l->rules.n, "%zu");
+    ASSERT_STR_EQ("cached.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT((long long)1700000000, (long long)l->cached_at, "%lld");
+    ASSERT_EQm("a fetch is owed", FIRC_SUB_SYNC_QUEUED, l->sync_state);
+    ASSERT(l->sync_seq > seq0);
+    ASSERT_EQ_FMTm("an old body is not an update", 0u, l->last_update, "%u");
+    ASSERT_EQ_FMTm("nothing to save", (unsigned long long)saves0, (unsigned long long)saves_of(f), "%llu");
+
+    ASSERT(wait_results(results0 + 1));
+    run_posted(f);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, l->sync_state);
+    ASSERT_STR_EQm("the same bytes are not parsed again", "cached.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT((long long)0, (long long)l->cached_at, "%lld");
+    ASSERT_EQ_FMT((unsigned long long)saves0, (unsigned long long)saves_of(f), "%llu");
+
+    g_orphan_open = false;
+    orphan_fixture_stop(f);
+    PASS();
+}
+
+/* Catches: a failed fetch dropping the cached rules, the cache date, or the minute's retry; a landed fetch keeping them. */
+TEST a_cached_list_keeps_its_rules_through_errors_until_a_fetch_lands(void) {
+    orphan_fixture_t *f = &g_orphan;
+    ASSERT(idle_loop_fixture_start(f, true));
+    firc_id_t id = idle_loop_group(f, "/a", NULL);
+    firc_group_list_t *l = live_list0(f, id);
+    ASSERT(l != NULL);
+    l->interval = 86400;
+    uint64_t saves0 = saves_of(f);
+
+    firc_app_on_sync_event(f->app, cached_event(id, l, "cached.example", 1700000000, "old body"), 1800000000);
+    firc_sub_event_t *err = event_new(FIRC_SUB_EV_RESULT, id, l->id, l->sync_seq);
+    err->result = FIRC_SUB_RESULT_ERROR;
+    err->err = FIRC_ERR_IO;
+    firc_app_on_sync_event(f->app, err, 1800000100);
+    ASSERT_EQ(FIRC_SUB_SYNC_ERROR, l->sync_state);
+    ASSERT_EQ_FMT((long long)1700000000, (long long)l->cached_at, "%lld");
+    ASSERT_STR_EQ("cached.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT(1, (int)l->failed_fetches, "%d");
+    ASSERT_FALSE(firc_sub_is_due(true, l, 1800000159));
+    ASSERTm("retried after a minute, not the interval", firc_sub_is_due(true, l, 1800000160));
+    ASSERTm("the journal names the copy", ring_says("using the copy of 2023-11-14 22:13 UTC"));
+
+    firc_sub_event_t *same = event_new(FIRC_SUB_EV_RESULT, id, l->id, l->sync_seq);
+    same->result = FIRC_SUB_RESULT_UNCHANGED;
+    memcpy(same->hash, l->body_hash, sizeof(same->hash));
+    firc_app_on_sync_event(f->app, same, 1800000200);
+    ASSERT_EQ(FIRC_SUB_SYNC_IDLE, l->sync_state);
+    ASSERT_EQ_FMT((long long)0, (long long)l->cached_at, "%lld");
+    ASSERT_EQ_FMT(0, (int)l->failed_fetches, "%d");
+    ASSERT_FALSE(firc_sub_is_due(true, l, 1800000260));
+
+    firc_app_on_sync_event(f->app, cached_event(id, l, "cached.example", 1700000500, "old body"), 1800000300);
+    ASSERT_EQ_FMT((long long)1700000500, (long long)l->cached_at, "%lld");
+    err = event_new(FIRC_SUB_EV_RESULT, id, l->id, l->sync_seq);
+    err->result = FIRC_SUB_RESULT_ERROR;
+    err->err = FIRC_ERR_IO;
+    firc_app_on_sync_event(f->app, err, 1800000400);
+    ASSERT_EQ_FMT(1, (int)l->failed_fetches, "%d");
+    ASSERT_EQ_FMT((unsigned long long)saves0, (unsigned long long)saves_of(f), "%llu");
+
+    firc_app_on_sync_event(f->app, parsed_event(id, l->id, l->sync_seq, "net.example"), 1800000500);
+    ASSERT_STR_EQ("net.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT((long long)0, (long long)l->cached_at, "%lld");
+    ASSERT_EQ_FMT(0, (int)l->failed_fetches, "%d");
+    ASSERT_EQ_FMT(1800000500u, l->last_update, "%u");
+    ASSERT_EQ_FMTm("a body from the net is saved", (unsigned long long)saves0 + 1, (unsigned long long)saves_of(f), "%llu");
+
+    g_orphan_open = false;
+    orphan_fixture_stop(f);
+    PASS();
+}
+
+/* Catches: a cached body that parses to what the list holds owing no fetch. */
+TEST a_cached_body_equal_to_the_held_rules_still_owes_a_fetch(void) {
+    orphan_fixture_t *f = &g_orphan;
+    ASSERT(idle_loop_fixture_start(f, true));
+    firc_id_t id = idle_loop_group(f, "/a", NULL);
+    firc_group_list_t *l = live_list0(f, id);
+    ASSERT(l != NULL);
+    uint64_t saves0 = saves_of(f);
+    firc_sub_event_t *ev = cached_event(id, l, "x", 1700000000, "# nothing\n");
+    firc_sub_rules_free(&ev->rules);
+    firc_sub_rules_init(&ev->rules);
+    firc_app_on_sync_event(f->app, ev, 1800000000);
+    ASSERT(l->has_body_hash);
+    ASSERT_EQ(FIRC_SUB_SYNC_QUEUED, l->sync_state);
+    ASSERT_EQ_FMT((long long)1700000000, (long long)l->cached_at, "%lld");
+    ASSERT_EQ_FMT((unsigned long long)saves0, (unsigned long long)saves_of(f), "%llu");
+    g_orphan_open = false;
+    orphan_fixture_stop(f);
+    PASS();
+}
+
+/* Catches: a list with no body that does not read its cached file, or a worker given no cache dir. */
+TEST a_list_with_no_body_starts_from_its_cached_file(void) {
+    int silent = silent_listener();
+    ASSERT(silent >= 0);
+    orphan_fixture_t *f = &g_orphan;
+    ASSERT(idle_loop_fixture_start_ex(f, true, true));
+    static const char body[] = "cached.example\n";
+    uint8_t hash[FIRC_SHA256_DIGEST_LEN];
+    firc_sha256((const uint8_t *)body, sizeof(body) - 1, hash);
+    char key[17];
+    firc_listcache_key(silent_url(), key);
+    ASSERT_EQ(FIRC_OK, firc_listcache_write(f->cache, key, (const uint8_t *)body, sizeof(body) - 1, hash));
+    char file[160];
+    snprintf(file, sizeof(file), "%s/%s-", f->cache, key);
+    for (int i = 0; i < 8; i++) { snprintf(file + strlen(file), sizeof(file) - strlen(file), "%02x", hash[i]); }
+    struct stat st;
+    ASSERT_EQ(0, stat(file, &st));
+
+    firc_group_t *g = firc_group_new();
+    g->id = test_random_id();
+    firc_strset(&g->name, "");
+    firc_strset(&g->iface, "eth0");
+    g->enable = true;
+    test_group_set_list(g);
+    firc_strset(&g->lists[0]->url, "");
+    firc_id_t id = g->id;
+    ASSERT_EQ(FIRC_OK, firc_app_add_group(f->app, g));
+    ASSERT_EQ(FIRC_OK, firc_app_set_list_url(f->app, id, list0(f->app, id), silent_url()));
+    size_t results0 = 0;
+    firc_app_sync_event_counts_for_test(NULL, &results0, NULL);
+    firc_app_request_sync_missing(f->app);
+    ASSERT(wait_results(results0 + 1));
+    run_posted(f);
+
+    firc_group_list_t *l = live_list0(f, id);
+    ASSERT(l != NULL);
+    ASSERT_EQ_FMT((size_t)1, l->rules.n, "%zu");
+    ASSERT_STR_EQ("cached.example", firc_sub_rules_text(&l->rules, 0));
+    ASSERT_EQ_FMT((long long)st.st_mtime, (long long)l->cached_at, "%lld");
+    ASSERT_EQ(0, memcmp(hash, l->body_hash, sizeof(hash)));
+    ASSERT(l->sync_state == FIRC_SUB_SYNC_QUEUED || l->sync_state == FIRC_SUB_SYNC_FETCHING);
+
+    g_orphan_open = false;
+    orphan_fixture_stop(f);
+    close(silent);
+    PASS();
+}
+
+/* Catches: a Save that forgets the list runs from the cache and paces it by its interval. */
+TEST a_replace_keeps_the_cache_date_of_a_carried_list(void) {
+    orphan_fixture_t *f = &g_orphan;
+    ASSERT(idle_loop_fixture_start(f, false));
+    firc_id_t id = idle_loop_group(f, "/a", NULL);
+    firc_group_list_t *l = live_list0(f, id);
+    ASSERT(l != NULL);
+    firc_app_on_sync_event(f->app, cached_event(id, l, "cached.example", 1700000000, "old body"), 1800000000);
+
+    firc_group_t *nw = firc_group_new();
+    nw->id = id;
+    firc_strset(&nw->name, "");
+    firc_strset(&nw->iface, "eth0");
+    nw->enable = true;
+    firc_group_list_t *nl = test_group_set_list(nw);
+    nl->id = l->id;
+    firc_strset(&nl->url, l->url);
+    firc_group_t **arr = calloc(1, sizeof(*arr));
+    arr[0] = nw;
+    ASSERT_EQ(FIRC_OK, firc_app_replace_groups(f->app, arr, 1));
+
+    firc_group_list_t *after = live_list0(f, id);
+    ASSERT(after != NULL);
+    ASSERT_STR_EQ("cached.example", firc_sub_rules_text(&after->rules, 0));
+    ASSERT_EQ_FMT((long long)1700000000, (long long)after->cached_at, "%lld");
+
+    g_orphan_open = false;
+    orphan_fixture_stop(f);
+    PASS();
+}
+
+/* Catches: a cached list paced by its interval after failures instead of the backoff. */
+TEST a_list_running_from_the_cache_backs_off_like_one_with_no_body(void) {
+    firc_group_list_t *l = firc_group_list_new();
+    firc_strset(&l->url, "https://example.invalid/l.txt");
+    l->interval = 86400;
+    l->last_check = 1000;
+    l->has_body_hash = true;
+    l->cached_at = 900;
+    l->failed_fetches = 2;
+    ASSERT_FALSE(firc_sub_is_due(true, l, 1119));
+    ASSERT(firc_sub_is_due(true, l, 1120));
+    l->failed_fetches = 6;
+    ASSERT_FALSEm("a counter a landed fetch never reset waits 32 minutes", firc_sub_is_due(true, l, 1060));
+    l->cached_at = 0;
+    l->failed_fetches = 2;
+    ASSERT_FALSE(firc_sub_is_due(true, l, 1120));
+    firc_group_list_free(l);
     PASS();
 }
 
@@ -2074,6 +2359,12 @@ int main(int argc, char **argv) {
     RUN_TEST(a_result_reaches_the_list_when_the_loop_queue_is_full);
     RUN_TEST(results_of_one_iteration_build_and_save_once);
     RUN_TEST(a_batch_ends_the_group_stream_at_its_last_result);
+    RUN_TEST(a_cached_body_routes_at_once_and_its_fetch_expects_its_hash);
+    RUN_TEST(a_cached_list_keeps_its_rules_through_errors_until_a_fetch_lands);
+    RUN_TEST(a_cached_body_equal_to_the_held_rules_still_owes_a_fetch);
+    RUN_TEST(a_list_with_no_body_starts_from_its_cached_file);
+    RUN_TEST(a_list_running_from_the_cache_backs_off_like_one_with_no_body);
+    RUN_TEST(a_replace_keeps_the_cache_date_of_a_carried_list);
     RUN_TEST(progress_waiting_for_the_loop_is_kept_once_per_job);
     RUN_TEST(a_stop_ends_a_worker_waiting_on_a_full_loop_queue);
     RUN_TEST(a_due_sweep_leaves_the_list_being_fetched_alone);

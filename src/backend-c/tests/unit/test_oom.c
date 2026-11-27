@@ -455,7 +455,7 @@ TEST a_start_is_always_followed_by_an_end(void) {
     job_sink_t warm = {0};
     firc_sub_job_t probe = {.group_id = {{5, 6, 7, 8}}, .url = strdup(url), .seq = 0};
     arm(LONG_MAX);
-    firc_sub_job_run(&probe, NULL, job_sink_emit, &warm);
+    firc_sub_job_run(&probe, NULL, NULL, job_sink_emit, &warm);
     long total = intercepted();
     disarm();
     free(probe.url);
@@ -471,7 +471,7 @@ TEST a_start_is_always_followed_by_an_end(void) {
         firc_sub_job_t job = {.group_id = {{5, 6, 7, 8}}, .url = strdup(url), .seq = (uint64_t)at};
         if (job.url == NULL) { break; }
         arm(at);
-        firc_sub_job_run(&job, NULL, job_sink_emit, &s);
+        firc_sub_job_run(&job, NULL, NULL, job_sink_emit, &s);
         disarm();
         free(job.url);
 
@@ -494,7 +494,7 @@ TEST a_job_that_ran_out_of_memory_says_so(void) {
     job_sink_t warm = {0};
     firc_sub_job_t probe = {.group_id = {{1, 2, 3, 4}}, .url = strdup(url), .seq = 0};
     arm(LONG_MAX);
-    firc_sub_job_run(&probe, NULL, job_sink_emit, &warm);
+    firc_sub_job_run(&probe, NULL, NULL, job_sink_emit, &warm);
     long total = intercepted();
     disarm();
     free(probe.url);
@@ -515,7 +515,7 @@ TEST a_job_that_ran_out_of_memory_says_so(void) {
         firc_sub_job_t job = {.group_id = {{1, 2, 3, 4}}, .url = strdup(url), .seq = (uint64_t)at};
         if (job.url == NULL) { break; }
         arm(at);
-        firc_sub_job_run(&job, NULL, job_sink_emit, &s);
+        firc_sub_job_run(&job, NULL, NULL, job_sink_emit, &s);
         disarm();
         free(job.url);
 

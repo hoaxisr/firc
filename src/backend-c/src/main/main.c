@@ -1605,6 +1605,7 @@ int main(int argc, char **argv)
         /* The one file the app writes on its own: a sync that changed a group's list. */
         .config_path = d.config_path,
         .config_version = FIRC_VERSION,
+        .lists_cache_dir = FIRC_LISTS_CACHE_DIR,
     };
     d.app = firc_app_create(&app_deps);
     if (d.app == NULL) {
@@ -1861,6 +1862,7 @@ int main(int argc, char **argv)
     /* Committer last, once everything a rebuild reaches is up. */
     firc_app_set_port_remap(d.app, d.port_remap);
     /* List worker before the committer: starting it cannot leave the tables half written. */
+    firc_app_sweep_list_cache(d.app);
     err = firc_app_start_list_worker(d.app);
     if (err != FIRC_OK) {
         FIRC_ERROR("failed to start the list worker: %s", firc_err_str(err));
@@ -1890,7 +1892,7 @@ int main(int argc, char **argv)
         firc_ifcheck_free(d.ifcheck);
         d.ifcheck = NULL;
     }
-    /* Boot sweep: no list body is kept on flash, so every enabled list needs a first fetch. */
+    /* Boot sweep: every enabled list needs a first fetch; one with a cached body routes from it before. */
     firc_app_request_sync_missing(d.app);
 
     err = firc_app_start_netfilter_committer(d.app);

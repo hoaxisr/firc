@@ -1,14 +1,20 @@
 #include "greatest.h"
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "firc/hash.h"
 #include "firc/httpd.h"
+#include "firc/listcache.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/sub_fetch.h"
@@ -231,7 +237,12 @@ static void stop_open_harness(void *unused) {
 
 /* firc_sub_worker_new, recorded so a failed test's worker is still freed. */
 static firc_sub_worker_t *worker_new(size_t capacity, firc_sub_event_fn emit, void *ud) {
-    g_open_worker = firc_sub_worker_new(capacity, emit, ud);
+    g_open_worker = firc_sub_worker_new(capacity, emit, ud, NULL);
+    return g_open_worker;
+}
+
+static firc_sub_worker_t *worker_new_in(const char *dir, firc_sub_event_fn emit, void *ud) {
+    g_open_worker = firc_sub_worker_new(FIRC_SUB_WORKER_CAPACITY, emit, ud, dir);
     return g_open_worker;
 }
 
@@ -312,7 +323,7 @@ TEST a_job_posts_started_then_a_parsed_result(void) {
     sink_init(&s);
 
     firc_sub_job_t job = job_for(0x11, "/a", 1);
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_STARTED));
@@ -344,7 +355,7 @@ TEST a_sing_box_body_reports_unconstrained_and_dropped(void) {
     sink_init(&s);
 
     firc_sub_job_t job = job_for(0x55, "/mix", 1);
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
@@ -368,7 +379,7 @@ TEST an_html_body_is_an_error_with_the_reason(void) {
     sink_init(&s);
 
     firc_sub_job_t job = job_for(0x66, "/html", 1);
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
@@ -396,7 +407,7 @@ TEST the_same_bytes_are_unchanged_and_carry_no_rules(void) {
     static sink_t s;
     sink_init(&s);
     firc_sub_job_t first = job_for(0x22, "/a", 1);
-    firc_sub_job_run(&first, NULL, sink_emit, &s);
+    firc_sub_job_run(&first, NULL, NULL, sink_emit, &s);
     free(first.url);
     const firc_sub_event_t *r1 = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
     ASSERT(r1 != NULL);
@@ -408,7 +419,7 @@ TEST the_same_bytes_are_unchanged_and_carry_no_rules(void) {
     firc_sub_job_t second = job_for(0x22, "/a", 2);
     second.has_hash = true;
     memcpy(second.expected_hash, want, sizeof(want));
-    firc_sub_job_run(&second, NULL, sink_emit, &s2);
+    firc_sub_job_run(&second, NULL, NULL, sink_emit, &s2);
     free(second.url);
 
     const firc_sub_event_t *r2 = sink_nth(&s2, FIRC_SUB_EV_RESULT, 0);
@@ -424,7 +435,7 @@ TEST the_same_bytes_are_unchanged_and_carry_no_rules(void) {
     firc_sub_job_t third = job_for(0x22, "/a", 3);
     third.has_hash = true;
     memset(third.expected_hash, 0xAB, sizeof(third.expected_hash));
-    firc_sub_job_run(&third, NULL, sink_emit, &s3);
+    firc_sub_job_run(&third, NULL, NULL, sink_emit, &s3);
     free(third.url);
     const firc_sub_event_t *r3 = sink_nth(&s3, FIRC_SUB_EV_RESULT, 0);
     ASSERT(r3 != NULL);
@@ -446,7 +457,7 @@ TEST a_404_is_an_error_with_the_status(void) {
     sink_init(&s);
 
     firc_sub_job_t job = job_for(0x33, "/404", 7);
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
@@ -472,7 +483,7 @@ TEST an_unusable_url_is_an_error_with_no_status(void) {
     job.group_id = id_of(0x77);
     job.url = strdup("ftp://127.0.0.1/list");
     job.seq = 9;
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
@@ -494,7 +505,7 @@ TEST progress_is_posted_and_rate_limited(void) {
 
     firc_sub_job_t job = job_for(0x44, "/big", 1);
     uint64_t t0 = mono_ms();
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     free(job.url);
 
     const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
@@ -523,7 +534,7 @@ TEST a_stalled_fetch_is_rate_limited_too(void) {
 
     firc_sub_job_t job = job_for(0x46, "/slow", 1);
     uint64_t t0 = mono_ms();
-    firc_sub_job_run(&job, NULL, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, NULL, sink_emit, &s);
     uint64_t elapsed = mono_ms() - t0;
     free(job.url);
 
@@ -803,7 +814,7 @@ TEST nothing_is_posted_once_the_cancel_is_raised(void) {
     s.raise_at_lines = BIG_LINES;
 
     firc_sub_job_t job = job_for(0x66, "/big", 1);
-    firc_sub_job_run(&job, cancel, sink_emit, &s);
+    firc_sub_job_run(&job, NULL, cancel, sink_emit, &s);
     free(job.url);
 
     ASSERT_EQm("the parse ran to its last line", (size_t)(BIG_LINES / FIRC_SUB_PARSE_PROGRESS_LINES),
@@ -826,7 +837,7 @@ typedef struct bounded_run {
 
 static void *bounded_run_thread(void *ud) {
     bounded_run_t *r = ud;
-    firc_sub_job_run(r->job, r->cancel, sink_emit, r->sink);
+    firc_sub_job_run(r->job, NULL, r->cancel, sink_emit, r->sink);
     sem_post(&r->done);
     return NULL;
 }
@@ -1036,6 +1047,428 @@ TEST a_worker_freed_before_it_starts_frees_what_it_holds(void) {
     PASS();
 }
 
+static const uint8_t g_hash_a[FIRC_SHA256_DIGEST_LEN] = {
+    0x67, 0xc9, 0x27, 0x1d, 0x2a, 0x37, 0xe1, 0x56, 0x90, 0x77, 0x3c,
+    0xb6, 0xa4, 0xeb, 0xfa, 0xf9, 0xef, 0x74, 0x4e, 0x54, 0x4d, 0x61,
+    0x1d, 0x45, 0xd0, 0x40, 0x69, 0x6b, 0x2b, 0xf3, 0x2a, 0x4f};
+static const char g_body_a[] = "one.example\ntwo.example";
+
+static char g_cdir[64];
+
+static bool cdir_make(void) {
+    snprintf(g_cdir, sizeof g_cdir, "/tmp/firc_sw_XXXXXX");
+    return mkdtemp(g_cdir) != NULL;
+}
+
+static void cdir_remove(void) {
+    DIR *d = opendir(g_cdir);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) { continue; }
+            char p[512];
+            snprintf(p, sizeof p, "%s/%s", g_cdir, e->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+    rmdir(g_cdir);
+}
+
+static void cache_path(const char *url, const char *hash16, char *out, size_t cap) {
+    char key[17];
+    firc_listcache_key(url, key);
+    snprintf(out, cap, "%s/%s-%s", g_cdir, key, hash16);
+}
+
+static bool cache_put(const char *url, const char *body, const uint8_t hash[32]) {
+    char key[17];
+    firc_listcache_key(url, key);
+    return firc_listcache_write(g_cdir, key, (const uint8_t *)body, strlen(body), hash) == FIRC_OK;
+}
+
+static bool cache_holds(const char *url, const char *body) {
+    char key[17];
+    firc_listcache_key(url, key);
+    uint8_t *got = NULL;
+    size_t len = 0;
+    uint8_t h[32];
+    time_t mt;
+    if (firc_listcache_read(g_cdir, key, &got, &len, h, &mt) != FIRC_OK) { return false; }
+    bool same = len == strlen(body) && memcmp(got, body, len) == 0;
+    free(got);
+    return same;
+}
+
+static bool path_exists(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0;
+}
+
+static bool room_no(uint64_t t, uint64_t f, uint64_t held, uint64_t size) {
+    (void)t;
+    (void)f;
+    (void)held;
+    (void)size;
+    return false;
+}
+
+/* Catches: a cached list fetched anyway, or its result missing the cache flag, date or hash. */
+TEST cache_first_with_a_file_parses_it_and_fetches_nothing(void) {
+    ASSERT(cdir_make());
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC1, "/a", 1);
+    job.cache_first = true;
+    ASSERT(cache_put(job.url, g_body_a, g_hash_a));
+    char path[256];
+    cache_path(job.url, "67c9271d2a37e156", path, sizeof path);
+    struct timeval tv[2] = {{1700000000, 0}, {1700000000, 0}};
+    ASSERT_EQ(0, utimes(path, tv));
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_STARTED));
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT(r->from_cache);
+    ASSERT_EQ((int64_t)1700000000, r->cached_at);
+    ASSERT_MEM_EQ(g_hash_a, r->hash, sizeof(g_hash_a));
+    ASSERT_EQ(2u, r->rules.n);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&r->rules, 0));
+    ASSERT_STR_EQ("two.example", firc_sub_rules_text(&r->rules, 1));
+    ASSERT_EQm("no stub listens, so any fetch would have reported", 0u, s.n_fetch);
+
+    sink_free(&s);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a missing cache file ending the job instead of falling through to the fetch. */
+TEST cache_first_without_a_file_fetches(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC2, "/a", 1);
+    job.cache_first = true;
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT_FALSE(r->from_cache);
+    ASSERT_EQ((int64_t)0, r->cached_at);
+    ASSERT_EQ(2u, r->rules.n);
+    ASSERT(s.n_fetch >= 1);
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a cached body that fails to parse reported as the job's error instead of fetching. */
+TEST cache_first_with_an_unparsable_file_fetches(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC3, "/a", 1);
+    job.cache_first = true;
+    static const uint8_t html_hash[FIRC_SHA256_DIGEST_LEN] = {
+        0x16, 0x23, 0xf1, 0xd0, 0x81, 0x16, 0x0d, 0x97, 0x6d, 0xd6, 0x58,
+        0x83, 0x73, 0xdd, 0x6e, 0x73, 0xe2, 0x4a, 0xf9, 0xa6, 0xff, 0x05,
+        0x6a, 0x65, 0x3e, 0xbd, 0x0f, 0xba, 0x2f, 0x35, 0x5b, 0xcd};
+    ASSERT(cache_put(job.url, g_list_html.body, html_hash));
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT_FALSE(r->from_cache);
+    ASSERT_EQ(2u, r->rules.n);
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: the cache read for a job that did not ask for it. */
+TEST without_cache_first_the_file_is_not_read(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC4, "/a", 1);
+    static const uint8_t cached_hash[FIRC_SHA256_DIGEST_LEN] = {
+        0x01, 0x73, 0x9c, 0xdc, 0x46, 0x82, 0x10, 0x45, 0x32, 0xe2, 0x51,
+        0xe3, 0xe6, 0xf7, 0xd4, 0x8d, 0x56, 0x28, 0x23, 0x89, 0x2a, 0x74,
+        0xda, 0x20, 0xa0, 0x7b, 0x43, 0xf3, 0x2d, 0xba, 0x7f, 0xec};
+    ASSERT(cache_put(job.url, "cached.example", cached_hash));
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT_FALSE(r->from_cache);
+    ASSERT_EQ(2u, r->rules.n);
+    ASSERT_STR_EQ("one.example", firc_sub_rules_text(&r->rules, 0));
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a parsed fetch not kept, or kept under another key or hash. */
+TEST a_parsed_fetch_is_written_to_the_cache(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC5, "/a", 1);
+    char path[256];
+    cache_path(job.url, "67c9271d2a37e156", path, sizeof path);
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    ASSERT(path_exists(path));
+    ASSERT(cache_holds(job.url, g_body_a));
+    free(job.url);
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: an unchanged body left unwritten for a key that has no file (a url change). */
+TEST an_unchanged_fetch_writes_a_missing_file(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC6, "/a", 1);
+    job.has_hash = true;
+    memcpy(job.expected_hash, g_hash_a, sizeof(g_hash_a));
+    char path[256];
+    cache_path(job.url, "67c9271d2a37e156", path, sizeof path);
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_UNCHANGED, r->result);
+    ASSERT(path_exists(path));
+    ASSERT(cache_holds(job.url, g_body_a));
+    free(job.url);
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+static int g_wlog[2] = {-1, -1};
+
+static void wlog_start(void) {
+    if (pipe(g_wlog) != 0) { return; }
+    fcntl(g_wlog[0], F_SETFL, O_NONBLOCK);
+    firc_log_set_output_floor(FIRC_LOG_WARN);
+    firc_log_set_fd(g_wlog[1]);
+}
+
+static int wlog_count(const char *needle) {
+    firc_log_set_fd(STDOUT_FILENO);
+    firc_log_set_output_floor(FIRC_LOG_ERROR);
+    close(g_wlog[1]);
+    static char buf[65536];
+    ssize_t n = read(g_wlog[0], buf, sizeof(buf) - 1);
+    close(g_wlog[0]);
+    buf[n > 0 ? n : 0] = '\0';
+    int count = 0;
+    for (const char *at = buf; (at = strstr(at, needle)) != NULL; at += strlen(needle)) { count++; }
+    return count;
+}
+
+/* Catches: a refused write failing the sync, warning on every sync, or not warning at all. */
+TEST a_refused_write_warns_once_and_still_parses(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_worker_t *w = worker_new_in(g_cdir, sink_emit, &s);
+    ASSERT(w != NULL);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_start(w));
+    firc_listcache_room_hook_for_test = room_no;
+    wlog_start();
+
+    firc_sub_job_t j1 = job_for(0xC7, "/a", 1);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &j1));
+    bool first = wait_events(&s, FIRC_SUB_EV_RESULT, 1, 5000);
+    firc_sub_job_t j2 = job_for(0xC7, "/a", 2);
+    ASSERT_EQ(FIRC_OK, firc_sub_worker_enqueue(w, &j2));
+    bool second = wait_events(&s, FIRC_SUB_EV_RESULT, 2, 5000);
+    worker_free(w);
+    int warned = wlog_count("not kept on disk");
+    firc_listcache_room_hook_for_test = NULL;
+
+    ASSERT(first);
+    ASSERT(second);
+    for (size_t i = 0; i < 2; i++) {
+        const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, i);
+        ASSERT(r != NULL);
+        ASSERT_EQ(FIRC_SUB_RESULT_PARSED, r->result);
+    }
+    ASSERT_EQ(1, warned);
+    ASSERT_FALSE(cache_holds(url_for("/a"), g_body_a));
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a stale temp file kept at worker creation, or a cache file swept with it. */
+TEST a_new_worker_removes_temp_files_only(void) {
+    ASSERT(cdir_make());
+    static sink_t s;
+    sink_init(&s);
+    char tmp[256], kept[256];
+    snprintf(tmp, sizeof tmp, "%s/0123456789abcdef-0123456789abcdef.tmp.Ab12Cd", g_cdir);
+    snprintf(kept, sizeof kept, "%s/0123456789abcdef-fedcba9876543210", g_cdir);
+    FILE *f = fopen(tmp, "w");
+    ASSERT(f != NULL);
+    fclose(f);
+    f = fopen(kept, "w");
+    ASSERT(f != NULL);
+    fclose(f);
+
+    firc_sub_worker_t *w = worker_new_in(g_cdir, sink_emit, &s);
+    ASSERT(w != NULL);
+    worker_free(w);
+
+    ASSERT_FALSE(path_exists(tmp));
+    ASSERT(path_exists(kept));
+    sink_free(&s);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: an unparsable cached body kept on disk and parsed again at every start. */
+TEST an_unparsable_cached_body_is_removed(void) {
+    ASSERT(cdir_make());
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC8, "/a", 1);
+    job.cache_first = true;
+    static const uint8_t html_hash[FIRC_SHA256_DIGEST_LEN] = {
+        0x16, 0x23, 0xf1, 0xd0, 0x81, 0x16, 0x0d, 0x97, 0x6d, 0xd6, 0x58,
+        0x83, 0x73, 0xdd, 0x6e, 0x73, 0xe2, 0x4a, 0xf9, 0xa6, 0xff, 0x05,
+        0x6a, 0x65, 0x3e, 0xbd, 0x0f, 0xba, 0x2f, 0x35, 0x5b, 0xcd};
+    ASSERT(cache_put(job.url, g_list_html.body, html_hash));
+    char path[256];
+    cache_path(job.url, "1623f1d081160d97", path, sizeof path);
+    ASSERT(path_exists(path));
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    ASSERT_EQ(1u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_ERROR, r->result);
+    ASSERT_FALSE(path_exists(path));
+
+    sink_free(&s);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a fetched body that failed to parse written to the cache. */
+TEST an_unparsable_fetch_is_not_written(void) {
+    ASSERT(cdir_make());
+    harness_t *h = harness_start();
+    ASSERT(h != NULL);
+    static sink_t s;
+    sink_init(&s);
+    firc_sub_job_t job = job_for(0xC9, "/html", 1);
+
+    firc_sub_job_run(&job, g_cdir, NULL, sink_emit, &s);
+    free(job.url);
+
+    const firc_sub_event_t *r = sink_nth(&s, FIRC_SUB_EV_RESULT, 0);
+    ASSERT(r != NULL);
+    ASSERT_EQ(FIRC_SUB_RESULT_ERROR, r->result);
+    ASSERT_EQ(FIRC_ERR_INVAL, r->err);
+    DIR *d = opendir(g_cdir);
+    ASSERT(d != NULL);
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) { n++; }
+    }
+    closedir(d);
+    ASSERT_EQ(0, n);
+
+    sink_free(&s);
+    harness_stop(h);
+    cdir_remove();
+    PASS();
+}
+
+/* Catches: a cache parse cancelled midway that still posts, fetches, leaks its result or drops the file. */
+TEST cancel_during_a_cache_parse_posts_no_result(void) {
+    ASSERT(cdir_make());
+    static sink_t s;
+    sink_init(&s);
+    firc_cancel_t *cancel = firc_cancel_new();
+    ASSERT(cancel != NULL);
+    s.raise_on_parse = cancel;
+    s.raise_at_lines = FIRC_SUB_PARSE_PROGRESS_LINES;
+    firc_sub_job_t job = job_for(0xCA, "/a", 1);
+    job.cache_first = true;
+    uint8_t big_hash[FIRC_SHA256_DIGEST_LEN];
+    firc_sha256((const uint8_t *)g_list_big.body, strlen(g_list_big.body), big_hash);
+    ASSERT(cache_put(job.url, g_list_big.body, big_hash));
+
+    firc_sub_job_run(&job, g_cdir, cancel, sink_emit, &s);
+    bool kept = cache_holds(job.url, g_list_big.body);
+    free(job.url);
+
+    ASSERT(s.n_parse >= 1);
+    ASSERT_EQ(0u, sink_count(&s, FIRC_SUB_EV_RESULT));
+    ASSERT_EQ(0u, s.n_fetch);
+    ASSERT(kept);
+
+    firc_cancel_free(cancel);
+    sink_free(&s);
+    cdir_remove();
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -1069,5 +1502,16 @@ int main(int argc, char **argv) {
     RUN_TEST(a_refused_progress_is_not_offered_again);
     RUN_TEST(a_cancel_ends_the_offers);
     RUN_TEST(a_worker_freed_before_it_starts_frees_what_it_holds);
+    RUN_TEST(cache_first_with_a_file_parses_it_and_fetches_nothing);
+    RUN_TEST(cache_first_without_a_file_fetches);
+    RUN_TEST(cache_first_with_an_unparsable_file_fetches);
+    RUN_TEST(without_cache_first_the_file_is_not_read);
+    RUN_TEST(a_parsed_fetch_is_written_to_the_cache);
+    RUN_TEST(an_unparsable_cached_body_is_removed);
+    RUN_TEST(an_unparsable_fetch_is_not_written);
+    RUN_TEST(cancel_during_a_cache_parse_posts_no_result);
+    RUN_TEST(an_unchanged_fetch_writes_a_missing_file);
+    RUN_TEST(a_refused_write_warns_once_and_still_parses);
+    RUN_TEST(a_new_worker_removes_temp_files_only);
     GREATEST_MAIN_END();
 }

@@ -78,10 +78,11 @@ export const SyncStateSchema = object({
   state: fallback(picklist(["idle", "queued", "fetching", "error"]), "idle"),
   error: fallback(string(), ""),
   lastCheck: fallback(number(), 0),
+  cachedAt: fallback(number(), 0),
 });
 export type SyncState = InferOutput<typeof SyncStateSchema>;
 
-export const syncIdle = (): SyncState => ({ state: "idle", error: "", lastCheck: 0 });
+export const syncIdle = (): SyncState => ({ state: "idle", error: "", lastCheck: 0, cachedAt: 0 });
 
 export const GroupListSchema = object({
   id: fallback(pipe(string(), length(8), regex(/^[0-9a-f]{8}/)), () => randomId()),

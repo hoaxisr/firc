@@ -20,6 +20,7 @@
 #include "firc/json.h"
 #include "firc/utf8.h"
 #include "firc/hash.h"
+#include "firc/listcache.h"
 #include "firc/log.h"
 #include "firc/logrep.h"
 #include "firc/match.h"
@@ -200,6 +201,7 @@ struct firc_app {
     bool sync_listener_muted; /* raised for the length of firc_app_sync_list_now, a test seam with no stream watching it */
     const char *config_path; /* borrowed; NULL means an applied sync writes no file */
     const char *config_version;
+    const char *lists_cache_dir;
     /* _Atomic/relaxed: committer reads it per pass while the loop writes it; a plain bool here is a data race */
     _Atomic bool tap_open;
     int64_t tap_ends_at;
@@ -1352,6 +1354,7 @@ firc_app_t *firc_app_create(const firc_app_deps_t *deps) {
     app->pipeline = deps->pipeline;
     app->config_path = deps->config_path;
     app->config_version = deps->config_version;
+    app->lists_cache_dir = deps->lists_cache_dir;
     app->start_idx = deps->start_idx;
     if (app->loop != NULL && (app->al_ptr = firc_ptr_new(app->loop, 3000)) == NULL) {
         firc_app_destroy(app);
@@ -1846,6 +1849,7 @@ static void carry_list(firc_group_list_t *nw, firc_group_list_t *old) {
     nw->has_body_hash = old->has_body_hash;
     nw->last_check = old->last_check;
     nw->failed_fetches = old->failed_fetches;
+    nw->cached_at = old->cached_at;
     nw->last_update = old->last_update; /* the daemon's, never a body's */
     firc_sub_apply_overrides(nw, &nw->rules);
 
@@ -2278,6 +2282,19 @@ static void warn_unusable_list_lines(const char *owner_name, const firc_sub_rule
 static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id, firc_id_t list_id); /* for "ask again" on a stale UNCHANGED */
 static firc_group_list_t *find_list(firc_app_t *app, firc_id_t id, firc_id_t list_id, const char **name); /* defined below */
 
+static void sync_landed(firc_app_t *app, firc_group_list_t *list, const firc_sub_event_t *ev, const char *name) {
+    if (!ev->from_cache) {
+        list->cached_at = 0;
+        list->failed_fetches = 0;
+        return;
+    }
+    list->cached_at = ev->cached_at;
+    firc_err_t qerr = firc_app_request_sync_unlocked(app, ev->group_id, ev->list_id);
+    if (qerr != FIRC_OK) {
+        FIRC_WARN("\"%s\": could not ask for the fetch its cached list is owed: %s", name, firc_err_str(qerr));
+    }
+}
+
 static void sweep_after_first_load(firc_app_t *app, firc_id_t id) {
     firc_ruleset_t *rs = firc_app_find_group_by_id(app, id);
     static const firc_nf_prefixes_t none = {NULL, 0};
@@ -2334,8 +2351,19 @@ static void stage_sync_result(firc_app_t *app, sync_batch_t *b, sync_item_t *it,
         list->last_check = (uint32_t)now_unix;
         if (firc_group_list_untried(list)) { b->republish = true; } /* provisional clears only at the next republish */
         if (list->failed_fetches < UINT8_MAX) { list->failed_fetches++; }
-        FIRC_WARN("group \"%s\": list %.*s was not synced: %s", name, LIST_URL_CLIP,
-                  list->url != NULL ? list->url : "", list->sync_error);
+        if (list->cached_at != 0) {
+            char when[32];
+            struct tm tm;
+            time_t at = (time_t)list->cached_at;
+            if (gmtime_r(&at, &tm) == NULL || strftime(when, sizeof(when), "%Y-%m-%d %H:%M UTC", &tm) == 0) {
+                snprintf(when, sizeof(when), "%lld", (long long)list->cached_at);
+            }
+            FIRC_WARN("group \"%s\": list %.*s was not synced: %s; using the copy of %s", name, LIST_URL_CLIP,
+                      list->url != NULL ? list->url : "", list->sync_error, when);
+        } else {
+            FIRC_WARN("group \"%s\": list %.*s was not synced: %s", name, LIST_URL_CLIP,
+                      list->url != NULL ? list->url : "", list->sync_error);
+        }
         it->err = ev->err;
         break;
 
@@ -2359,6 +2387,8 @@ static void stage_sync_result(firc_app_t *app, sync_batch_t *b, sync_item_t *it,
         list->has_body_hash = true;
         list->last_check = (uint32_t)now_unix;
         sync_set_idle(list);
+        list->cached_at = 0;
+        list->failed_fetches = 0;
         break;
 
     case FIRC_SUB_RESULT_PARSED: {
@@ -2395,8 +2425,9 @@ static void stage_sync_result(firc_app_t *app, sync_batch_t *b, sync_item_t *it,
             firc_sub_rules_free(&ev->rules);
             memcpy(list->body_hash, ev->hash, sizeof(list->body_hash));
             list->has_body_hash = true;
-            list->last_check = (uint32_t)now_unix;
+            if (!ev->from_cache) { list->last_check = (uint32_t)now_unix; }
             sync_set_idle(list);
+            sync_landed(app, list, ev, name);
             if (first_list) {
                 b->republish = true;
                 it->sweep_after = true;
@@ -2409,8 +2440,10 @@ static void stage_sync_result(firc_app_t *app, sync_batch_t *b, sync_item_t *it,
         it->prev_last_update = list->last_update;
         list->rules = ev->rules; /* moved: the event owns nothing now */
         firc_sub_rules_init(&ev->rules);
-        list->last_check = (uint32_t)now_unix;
-        list->last_update = (uint32_t)now_unix;
+        if (!ev->from_cache) {
+            list->last_check = (uint32_t)now_unix;
+            list->last_update = (uint32_t)now_unix;
+        }
 
         warn_unusable_list_lines(name, &list->rules); /* once per changed list, the one place that sees every line */
         it->staged = true;
@@ -2429,12 +2462,13 @@ static void rollback_staged(sync_item_t *it, firc_err_t err) {
     it->err = err;
 }
 
-static void keep_staged(sync_item_t *it) {
+static void keep_staged(firc_app_t *app, sync_item_t *it) {
     firc_sub_rules_free(&it->prev_rules);
     /* set BEFORE the republish: snapshot.c reads has_body_hash on the live group at build time */
     memcpy(it->list->body_hash, it->ev->hash, sizeof(it->list->body_hash));
     it->list->has_body_hash = true;
     sync_set_idle(it->list);
+    sync_landed(app, it->list, it->ev, it->name);
 }
 
 static void flush_sync_batch(firc_app_t *app, sync_batch_t *b) {
@@ -2462,9 +2496,9 @@ static void flush_sync_batch(firc_app_t *app, sync_batch_t *b) {
                 rollback_staged(o, err);
                 continue;
             }
-            keep_staged(o);
+            keep_staged(app, o);
             first_load = first_load || o->first_load;
-            save = true;
+            save = save || !o->ev->from_cache;
         }
         if (err != FIRC_OK) {
             firc_err_t rollback_err = group_rs != NULL ? sync_group_ruleset_locked(app, group_rs) : FIRC_ERR_NOENT;
@@ -2649,6 +2683,7 @@ static firc_err_t firc_app_request_sync_unlocked(firc_app_t *app, firc_id_t id, 
     job.list_id = l->id;
     if (firc_strset(&job.url, l->url) != FIRC_OK) { return FIRC_ERR_NOMEM; }
     job.has_hash = l->has_body_hash;
+    job.cache_first = !l->has_body_hash;
     memcpy(job.expected_hash, l->body_hash, sizeof(job.expected_hash));
     job.seq = ++app->sync_seq_counter;
 
@@ -2800,7 +2835,7 @@ static firc_err_t firc_app_sync_list_now_unlocked(firc_app_t *app, firc_id_t id,
     job.seq = ++app->sync_seq_counter;
 
     sync_capture_t cap = {.result = NULL};
-    firc_sub_job_run(&job, NULL, sync_capture_emit, &cap);
+    firc_sub_job_run(&job, NULL, NULL, sync_capture_emit, &cap);
     free(job.url);
     if (cap.result == NULL) { return FIRC_ERR_NOMEM; } /* a job that could not allocate its result says nothing, rather than a start with no end */
 
@@ -2926,7 +2961,7 @@ firc_err_t firc_app_start_list_worker(firc_app_t *app) {
     if (app->sub_worker != NULL) { return FIRC_ERR_STATE; }
     if (app->loop == NULL) { return FIRC_ERR_STATE; } /* a worker that can fetch but not report is worse than none */
 
-    app->sub_worker = firc_sub_worker_new(FIRC_SUB_WORKER_CAPACITY, sync_worker_emit, app);
+    app->sub_worker = firc_sub_worker_new(FIRC_SUB_WORKER_CAPACITY, sync_worker_emit, app, app->lists_cache_dir);
     if (app->sub_worker == NULL) { return FIRC_ERR_NOMEM; }
 
     firc_err_t err = firc_sub_worker_start(app->sub_worker);
@@ -3070,7 +3105,37 @@ firc_err_t firc_app_save_groups(firc_app_t *app, const char *conf_path, const ch
     firc_err_t err = firc_config_groups_path(conf_path, groups_path, sizeof(groups_path));
     if (err != FIRC_OK) { return err; }
     app->groups_saves++;
-    return firc_config_save_part_file(app->cfg, version, FIRC_CFG_GROUPS, groups_path);
+    err = firc_config_save_part_file(app->cfg, version, FIRC_CFG_GROUPS, groups_path);
+    if (err == FIRC_OK) { firc_app_sweep_list_cache(app); }
+    return err;
+}
+
+void firc_app_sweep_list_cache(firc_app_t *app) {
+    if (app->lists_cache_dir == NULL) { return; }
+    size_t n = 0;
+    for (size_t i = 0; i < app->cfg->n_groups; i++) { n += app->cfg->groups[i]->n_lists; }
+    char (*keys)[17] = calloc(n + 1, sizeof(*keys));
+    const char **ptrs = calloc(n + 1, sizeof(*ptrs));
+    if (keys == NULL || ptrs == NULL) {
+        free(keys);
+        free(ptrs);
+        return;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < app->cfg->n_groups; i++) {
+        const firc_group_t *g = app->cfg->groups[i];
+        for (size_t j = 0; j < g->n_lists; j++) {
+            const char *url = g->lists[j]->url;
+            if (url == NULL || url[0] == '\0') { continue; }
+            firc_listcache_key(url, keys[k]);
+            ptrs[k] = keys[k];
+            k++;
+        }
+    }
+    firc_err_t err = firc_listcache_sweep(app->lists_cache_dir, ptrs, k);
+    if (err != FIRC_OK) { FIRC_WARN("lists: the cache in %s was not swept: %s", app->lists_cache_dir, firc_err_str(err)); }
+    free(keys);
+    free(ptrs);
 }
 
 void firc_app_publish_counts_for_test(const firc_app_t *app, uint64_t *out_snapshots, uint64_t *out_saves) {

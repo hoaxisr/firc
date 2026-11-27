@@ -64,6 +64,7 @@ typedef struct firc_app_deps {
     int64_t (*wall_s)(void); /* NULL takes time() */
     const char *config_path; /* nullable; NULL means write nothing */
     const char *config_version;
+    const char *lists_cache_dir; /* nullable; NULL keeps no list body on disk */
 } firc_app_deps_t;
 
 /* rebuilds/republishes the DNS-matching snapshot (no-op if pipeline NULL); an in-place rule edit must call this */
@@ -237,6 +238,9 @@ void firc_app_stop_list_worker(firc_app_t *app);
 /* test seam: posted/result/dropped sync-event counts, process-wide, monotonic; any out-pointer may be NULL */
 void firc_app_sync_event_counts_for_test(size_t *out_posted, size_t *out_results,
                                          size_t *out_dropped);
+
+/* Removes cached list bodies whose url no list of any group holds; loop thread. */
+void firc_app_sweep_list_cache(firc_app_t *app);
 
 /* test seam: DNS-matching snapshots built and groups-file saves since create; either out-pointer may be NULL */
 void firc_app_publish_counts_for_test(const firc_app_t *app, uint64_t *out_snapshots, uint64_t *out_saves);

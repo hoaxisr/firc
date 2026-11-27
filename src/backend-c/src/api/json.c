@@ -145,7 +145,8 @@ cJSON *firc_api_list_sync_json(const firc_group_list_t *l) {
     if (obj == NULL) { return NULL; }
     if (cJSON_AddStringToObject(obj, "state", firc_sub_sync_state_name(l->sync_state)) == NULL ||
         cJSON_AddStringToObject(obj, "error", l->sync_error) == NULL ||
-        cJSON_AddNumberToObject(obj, "lastCheck", l->last_check) == NULL) {
+        cJSON_AddNumberToObject(obj, "lastCheck", (double)l->last_check) == NULL ||
+        cJSON_AddNumberToObject(obj, "cachedAt", (double)l->cached_at) == NULL) {
         cJSON_Delete(obj);
         return NULL;
     }

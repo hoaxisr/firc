@@ -1219,6 +1219,7 @@ describe("a Save that starts a sync", () => {
           state: "idle",
           error: "",
           lastCheck: 1700000000,
+          cachedAt: 0,
         });
       });
     } finally {

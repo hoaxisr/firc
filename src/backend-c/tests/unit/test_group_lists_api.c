@@ -21,6 +21,8 @@
 
 #include "firc/app.h"
 #include "firc/groups.h"
+#include "firc/hash.h"
+#include "firc/listcache.h"
 #include "firc/log.h"
 #include "firc/loop.h"
 #include "firc/models.h"
@@ -43,6 +45,7 @@ typedef struct harness {
 
     char cfg_dir[64];
     char cfg_path[96];
+    char lists_dir[96];
 } harness_t;
 
 static void *loop_thread(void *ud) {
@@ -281,11 +284,14 @@ static harness_t *harness_start_ex(bool with_worker, bool with_config) {
         snprintf(h->cfg_dir, sizeof(h->cfg_dir), "/tmp/firc-glists-api-%d", (int)getpid());
         if (mkdir(h->cfg_dir, 0700) != 0 && errno != EEXIST) { return NULL; }
         snprintf(h->cfg_path, sizeof(h->cfg_path), "%s/firc.conf", h->cfg_dir);
+        snprintf(h->lists_dir, sizeof(h->lists_dir), "%s/lists", h->cfg_dir);
+        if (mkdir(h->lists_dir, 0700) != 0 && errno != EEXIST) { return NULL; }
     }
     firc_app_deps_t deps = {.cfg = &h->cfg,
                             .loop = h->loop,
                             .config_path = with_config ? h->cfg_path : NULL,
-                            .config_version = with_config ? "0.7.0" : NULL};
+                            .config_version = with_config ? "0.7.0" : NULL,
+                            .lists_cache_dir = with_config ? h->lists_dir : NULL};
     h->app = firc_app_create(&deps);
     if (h->app == NULL) { return NULL; }
     if (with_worker && firc_app_start_list_worker(h->app) != FIRC_OK) { return NULL; }
@@ -355,6 +361,10 @@ static void harness_stop(harness_t *h) {
         snprintf(groups, sizeof(groups), "%s/groups.yaml", h->cfg_dir);
         unlink(groups);
         unlink(h->cfg_path);
+        static const char *const none[1] = {NULL};
+        (void)firc_listcache_sweep(h->lists_dir, NULL, 0);
+        (void)firc_listcache_sweep(h->lists_dir, none, 0);
+        rmdir(h->lists_dir);
         rmdir(h->cfg_dir);
     }
     free(h);
@@ -2490,6 +2500,46 @@ TEST a_url_only_change_is_persisted(void) {
     PASS();
 }
 
+
+static bool cache_file_of(const harness_t *h, const char *url, char *out, size_t cap) {
+    static const char body[] = "kept.example\n";
+    uint8_t hash[FIRC_SHA256_DIGEST_LEN];
+    firc_sha256((const uint8_t *)body, sizeof(body) - 1, hash);
+    char key[17];
+    firc_listcache_key(url, key);
+    if (firc_listcache_write(h->lists_dir, key, (const uint8_t *)body, sizeof(body) - 1, hash) != FIRC_OK) { return false; }
+    int n = snprintf(out, cap, "%s/%s-", h->lists_dir, key);
+    for (int i = 0; i < 8 && n > 0 && (size_t)n < cap; i++) { n += snprintf(out + n, cap - (size_t)n, "%02x", hash[i]); }
+    return access(out, F_OK) == 0;
+}
+
+/* Catches: a deleted list's cached body left on flash after the save, or a kept list's file swept with it. */
+TEST a_saved_delete_of_a_list_removes_its_cached_body(void) {
+    harness_t *h = harness_start_saving();
+    ASSERT(h != NULL);
+    char body[512];
+    char list_url[128];
+    snprintf(list_url, sizeof(list_url), "%s", stub_url("/list"));
+    snprintf(body, sizeof(body),
+             "{\"id\":\"" GID "\",\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"id\":\"" L0
+             "\",\"url\":\"%s\"},{\"id\":\"b0b0b0b0\",\"url\":\"%s\"}]}",
+             list_url, stub_url("/list2"));
+    ASSERT_EQ(200, do_request("POST", "/api/v1/groups", body, NULL));
+    ASSERT(wait_settled(GID, 5000));
+    char kept[192], gone[192];
+    ASSERT(cache_file_of(h, list_url, kept, sizeof(kept)));
+    ASSERT(cache_file_of(h, stub_url("/list2"), gone, sizeof(gone)));
+
+    snprintf(body, sizeof(body),
+             "{\"name\":\"g\",\"interface\":\"lo\",\"lists\":[{\"id\":\"" L0 "\",\"url\":\"%s\"}]}", list_url);
+    ASSERT_EQ(200, do_request("PUT", "/api/v1/groups/" GID "?save=true", body, NULL));
+    ASSERT(wait_settled(GID, 5000));
+    ASSERTm("the deleted list's file is gone", access(gone, F_OK) != 0);
+    ASSERTm("the kept list's file stays", access(kept, F_OK) == 0);
+    harness_stop(h);
+    PASS();
+}
+
 /* Catches: a 202 from a daemon whose list worker never started. */
 TEST sync_without_a_worker_is_unavailable(void) {
     harness_t *h = harness_start();
@@ -3294,6 +3344,7 @@ int main(int argc, char **argv) {
     RUN_TEST(sync_without_body_uses_the_lists_url);
     RUN_TEST(sync_with_body_url_stores_the_url_before_queuing);
     RUN_TEST(a_url_only_change_is_persisted);
+    RUN_TEST(a_saved_delete_of_a_list_removes_its_cached_body);
     RUN_TEST(sync_without_a_worker_is_unavailable);
     RUN_TEST(a_sync_for_an_unknown_id_is_404_whatever_url_it_names);
     RUN_TEST(a_synced_html_page_ends_in_error_with_the_reason);
