@@ -3061,6 +3061,7 @@ static void t_post_waits_for_window(void) {
     check("window: 60000", 0, gl_post(0, "x") || transport_write(&g_t[0], gl_big, 59999));
     UNTIL(!g_t[0].xh.f.bat.n);
     check("window: 10000 more", 0, transport_write(&g_t[0], gl_big, 10000));
+    UNTIL(P_NSID(0) >= 3);
     turns(10);
     /* catches: a POST cut to a nearly closed window, or bytes refused instead of held for it */
     check("window: held, 5535 is too small a POST", 10000, (int)g_t[0].xh.f.bat.n);
