@@ -939,6 +939,10 @@
     text-overflow: ellipsis;
   }
 
+  .gd-list-url:focus {
+    text-overflow: clip;
+  }
+
   .gd-list-line :global(.gd-list-add) {
     flex: none;
     padding: 0.5rem 0.8rem;

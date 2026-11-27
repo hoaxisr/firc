@@ -261,4 +261,70 @@ test.describe("A group with several lists", () => {
       "geosite-instagram.srs",
     ]);
   });
+
+  // Catches a focused list address still ending in an ellipsis, which leaves its tail unreachable by scrolling or by the cursor.
+  test("a long list address scrolls to its end while focused", async ({ page }) => {
+    const long = `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${"x".repeat(160)}-tail.srs`;
+    await setup(page, [makeGroup([makeList(1, long)])]);
+
+    const dialog = await openSettings(page);
+    const input = dialog.locator(".gd-list-url");
+    const overflow = () => input.evaluate((el) => getComputedStyle(el).textOverflow);
+    const scroll = () => input.evaluate((el) => [el.scrollLeft, el.scrollWidth - el.clientWidth]);
+
+    await expect(input).toHaveValue(long);
+    expect((await scroll())[1]).toBeGreaterThan(0);
+    expect(await overflow()).toBe("ellipsis");
+
+    await input.focus();
+    await expect(input).toBeFocused();
+    expect(await overflow()).toBe("clip");
+
+    await input.press("End");
+    const [atEnd, max] = await scroll();
+    expect(Math.round(atEnd)).toBe(Math.round(max));
+    await expect(input).toBeFocused();
+    await input.press("Home");
+    expect(await input.evaluate((el: HTMLInputElement) => el.selectionStart)).toBe(0);
+
+    await dialog.getByRole("heading").first().click();
+    expect(await overflow()).toBe("ellipsis");
+  });
+
+  // Catches the clipped, focused address being edited or saved wrongly.
+  test("a long list address can be edited and saved", async ({ page }) => {
+    const long = `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${"x".repeat(160)}.srs`;
+    const state = await setup(page, [makeGroup([makeList(1, long)])]);
+
+    const dialog = await openSettings(page);
+    const input = dialog.locator(".gd-list-url");
+    await input.focus();
+    await input.press("End");
+    await input.pressSequentially("2");
+    await expect(input).toHaveValue(`${long}2`);
+    await dialog.getByRole("button", { name: "Save", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+
+    await page.locator("#save-changes").click();
+    await expect(page.getByText("Saved")).toBeVisible();
+    expect(state.puts[0].groups[0].lists[0].url).toBe(`${long}2`);
+  });
+
+  // Catches a long list address widening the dialog past a phone screen.
+  test("a long list address does not widen the dialog on a phone", async ({ page }) => {
+    const long = `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${"x".repeat(300)}.srs`;
+    await setup(page, [makeGroup([makeList(1, long)])]);
+
+    const dialog = await openSettings(page);
+    await page.setViewportSize({ width: 375, height: 800 });
+    await dialog.locator(".gd-list-url").focus();
+    const box = (await dialog.boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(375);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
+      375,
+    );
+    const field = (await dialog.locator(".gd-list-field").first().boundingBox())!;
+    expect(field.x + field.width).toBeLessThanOrEqual(box.x + box.width);
+  });
 });
