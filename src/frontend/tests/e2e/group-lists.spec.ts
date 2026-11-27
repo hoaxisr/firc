@@ -306,6 +306,43 @@ test.describe("Groups with a list", () => {
     expect(state.savedBody?.groups[0].lists[0].url).toBe("https://new.example/list.txt");
   });
 
+  // Catches a focused list address still ending in an ellipsis, which leaves its tail unreachable by scrolling or by the cursor.
+  test("a long list address scrolls to its end while focused", async ({ page }) => {
+    const long = `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${"x".repeat(200)}-tail.srs`;
+    await setupGroupLists(page, [makeListGroup("a1b2c3d4", long)]);
+
+    const input = page.locator(".list-url-input").first();
+    const overflow = () => input.evaluate((el) => getComputedStyle(el).textOverflow);
+    const scroll = () => input.evaluate((el) => [el.scrollLeft, el.scrollWidth - el.clientWidth]);
+
+    await expect(input).toHaveValue(long);
+    expect((await scroll())[1]).toBeGreaterThan(0);
+    expect(await overflow()).toBe("ellipsis");
+
+    await input.focus();
+    expect(await overflow()).toBe("clip");
+    await input.press("End");
+    const [atEnd, max] = await scroll();
+    expect(Math.round(atEnd)).toBe(Math.round(max));
+    await input.press("Home");
+    expect(await input.evaluate((el: HTMLInputElement) => el.selectionStart)).toBe(0);
+
+    await input.blur();
+    expect(await overflow()).toBe("ellipsis");
+  });
+
+  // Catches a long list address widening the card past a phone screen.
+  test("a long list address does not widen the page on a phone", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 800 });
+    const long = `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${"x".repeat(300)}.srs`;
+    await setupGroupLists(page, [makeListGroup("a1b2c3d4", long)]);
+
+    await page.locator(".list-url-input").first().focus();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
+      375,
+    );
+  });
+
   // Catches a Save sending the list's fetched rules back, which hits the 1 MiB body cap.
   test("saves a rule edit without sending the list back", async ({ page }) => {
     const state = await setupGroupLists(page, [

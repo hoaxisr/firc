@@ -159,6 +159,10 @@
     text-overflow: ellipsis;
   }
 
+  .list-url-input:focus {
+    text-overflow: clip;
+  }
+
   .list-url-input:focus-visible {
     outline: none;
     color: var(--text);
