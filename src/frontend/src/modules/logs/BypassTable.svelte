@@ -153,10 +153,10 @@
       <div class="row" data-address={a.address}>
         <span class="addr">
           <span class="ip">{a.address}</span>
-          <span class="ptr" title={a.ptrState === "name" ? a.ptr : undefined}>{ptrText(a)}</span>
+          <span class="ptr">{ptrText(a)}</span>
         </span>
         <span class="nm">
-          <span class="sni" title={a.name}>{a.name || "—"}</span>
+          <span class="sni">{a.name || "—"}</span>
           {#if a.outcome === "bypass"}
             <span class="pill">{t("past firc")}</span>
             <span class="how" title={howText(a)}>{howText(a)}</span>
@@ -283,9 +283,7 @@
   .ptr {
     font-family: var(--font-mono);
     font-size: 0.74rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .nm {
     align-items: flex-start;
@@ -293,9 +291,7 @@
   }
   .sni {
     max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .meta {
     display: none;

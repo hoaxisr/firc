@@ -291,6 +291,36 @@ test("bypass addresses show as a table", async ({ page }) => {
   await expect(page.locator(".note")).toHaveCount(0);
 });
 
+test("long names in both tables wrap whole instead of ending in an ellipsis", async ({ page }) => {
+  const fake = a1();
+  const longName = "ruastriamicro1.gangplatform-edge-delivery-network.example.com";
+  fake.candidates.push(candidate(longName, `cdn-static-1.${longName}`, "no-answer"));
+  fake.addresses = [
+    address("212.118.56.133", {
+      name: longName,
+      ptr: "v3012160.hosted-by-vdsina.ru.long-reverse-zone.example.net",
+      ptrState: "name",
+    }),
+  ];
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await shell(page, fake);
+  await open(page);
+  const clipped = (sel: string) =>
+    page
+      .locator(sel)
+      .first()
+      .evaluate((el) => el.scrollWidth > el.clientWidth);
+  for (const sel of [
+    `[data-domain='${longName}'] .name`,
+    `[data-domain='${longName}'] .host`,
+    "[data-address] .sni",
+    "[data-address] .ptr",
+  ]) {
+    await expect(page.locator(sel).first()).toBeVisible();
+    expect(await clipped(sel), sel).toBe(false);
+  }
+});
+
 test("the addresses table is absent when there are none", async ({ page }) => {
   const fake = a1();
   fake.addresses = [];

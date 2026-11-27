@@ -295,9 +295,7 @@
           {@const locked = busy.has(c.domain)}
           <div class="row" data-domain={c.domain} data-state={c.state}>
             <span class="dom"
-              ><span class="name" title={c.domain}>{c.domain}</span><span class="host"
-                >{c.host}</span
-              ></span
+              ><span class="name">{c.domain}</span><span class="host">{c.host}</span></span
             >
             <span class="why">
               {#if c.state === "checking"}
@@ -450,16 +448,12 @@
   }
   .name {
     font-weight: 700;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .host {
     font-family: var(--font-mono);
     font-size: 0.74rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .why,
   .last {
