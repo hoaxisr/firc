@@ -30,6 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include "osrand.h"
 #include <stdlib.h>
 #if defined(__aarch64__)
@@ -171,6 +172,11 @@ static void ext(struct buf *b, unsigned type, const void *body, size_t n) {
     put(b, body, n);
 }
 
+static int sni_sendable(const char *s) {
+    unsigned char ip[16];
+    return s[0] && inet_pton(AF_INET, s, ip) != 1 && inet_pton(AF_INET6, s, ip) != 1;
+}
+
 static size_t sni_body(unsigned char *o, size_t cap, const char *sni) {
     size_t sni_len = strlen(sni);
     struct buf sb = { o, 0, cap };
@@ -287,7 +293,7 @@ static int chrome_body(struct buf *b, size_t *xl, const struct reality_cfg *cfg,
      * without this extension, exactly as Xray sends it with an empty `serverName`. An
      * extension with a zero-length name is something no browser or client builds, and the
      * server's check does not recognise it. Subscriptions do declare nodes without `sni`. */
-    if (cfg->sni[0]) {
+    if (sni_sendable(cfg->sni)) {
         px[pn].type = 0x0000; px[pn].body = b_sni; px[pn].n = sni_body(b_sni, sizeof(b_sni), cfg->sni); pn++;
     }
 
@@ -459,7 +465,7 @@ static int firefox_body(struct buf *b, size_t *xl, const struct reality_cfg *cfg
     *xl = b->len;
     put16(b, 0);
 
-    if (cfg->sni[0]) ext(b, 0x0000, sni, sni_body(sni, sizeof sni, cfg->sni));
+    if (sni_sendable(cfg->sni)) ext(b, 0x0000, sni, sni_body(sni, sizeof sni, cfg->sni));
     ext(b, 0x0017, NULL, 0);
     ext(b, 0xFF01, "\x00", 1);
     {

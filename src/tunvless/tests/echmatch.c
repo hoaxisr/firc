@@ -314,6 +314,25 @@ int main(void) {
           fw == 0 && memmem(fwo, fon, "secret.example", 14) == NULL &&
           memmem(fes.inner, fes.inner_n, "secret.example", 14) != NULL);
 
+    static const char *const FPS[] = { "chrome", "firefox" };
+    static const char *const SNIS[] = { "203.0.113.5", "2001:db8::1", "a.example" };
+    for (int f = 0; f < 2; f++) {
+        for (int k = 0; k < 3; k++) {
+            struct reality_cfg scfg = { .sni = SNIS[k], .plain = 1, .fp = FPS[f] };
+            static unsigned char sh[2560];
+            size_t shn = 0;
+            const uint8_t *sd;
+            size_t sdn;
+            int built = reality_build_hello(&scfg, &rst, sh, sizeof sh, &shn) == 0;
+            int has = built && find_ext(sh + 9, shn - 9, 0x0000, &sd, &sdn);
+            char what[96];
+            snprintf(what, sizeof what, "%s Hello: server_name %s for %s", FPS[f], k < 2 ? "absent" : "present",
+                     SNIS[k]);
+            /* catches: an IP literal sent as SNI, or a host name dropped with it */
+            check(what, built && has == (k == 2));
+        }
+    }
+
     printf(g_fail ? "echmatch: %d FAILED\n" : "echmatch: all checks passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
