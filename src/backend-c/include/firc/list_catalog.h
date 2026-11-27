@@ -10,7 +10,7 @@
 
 #define FIRC_LIST_CATALOG_URL "https://raw.githubusercontent.com/hoaxisr/rulesets/master/catalog.json"
 #define FIRC_LIST_CATALOG_MAX_BYTES ((size_t)1024 * 1024)
-/* Provider catalogs kept at once beside the index; a request for one more is refused. */
+/* Provider catalogs kept at once beside the index, including in-flight fetches. */
 #define FIRC_LIST_CATALOG_PROVIDERS_MAX 16
 
 /* Checks a rule-set index and copies {"generated","sources"} into *out (caller deletes). INVAL: why names the first offence.

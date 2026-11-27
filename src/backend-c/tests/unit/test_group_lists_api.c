@@ -178,7 +178,8 @@ static const char catalog_body[] =
     "\"names\":[\"youtube\",\"youtube@cn\"]},"
     "{\"id\":\"hoaxisr\",\"url\":\"https://raw.githubusercontent.com/hoaxisr/rulesets/master/srs/{}.srs\","
     "\"names\":[\"discord\"]}],"
-    "\"providers\":[{\"id\":\"sagernet\",\"name\":\"SagerNet\"},{\"id\":\"demo\",\"name\":\"Demo\"}]}";
+    "\"providers\":[{\"id\":\"sagernet\",\"name\":\"SagerNet\"},{\"id\":\"demo\",\"name\":\"Demo\"},"
+    "{\"id\":\"spoof\",\"name\":\"Spoof\"}]}";
 
 static atomic_int g_provider_hits;
 
@@ -208,6 +209,20 @@ static void h_stub_catalog(firc_http_req_t *req, firc_http_res_t *res, void *ud)
     (void)ud;
     atomic_fetch_add(&g_catalog_hits, 1);
     firc_http_res_write(res, 200, "application/json", (const uint8_t *)catalog_body, sizeof(catalog_body) - 1);
+}
+
+static void h_stub_catalog_many(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    (void)req;
+    (void)ud;
+    atomic_fetch_add(&g_catalog_hits, 1);
+    char body[2048];
+    size_t len = (size_t)snprintf(body, sizeof body,
+                                  "{\"sources\":[],\"providers\":[{\"id\":\"demo\",\"name\":\"Demo\"}");
+    for (int i = 0; i < FIRC_LIST_CATALOG_PROVIDERS_MAX; i++) {
+        len += (size_t)snprintf(body + len, sizeof body - len, ",{\"id\":\"absent%d\",\"name\":\"Absent\"}", i);
+    }
+    len += (size_t)snprintf(body + len, sizeof body - len, "]}");
+    firc_http_res_write(res, 200, "application/json", (const uint8_t *)body, len);
 }
 
 static void h_stub_catalog_slow(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
@@ -342,6 +357,7 @@ static harness_t *harness_start_ex(bool with_worker, bool with_config) {
     firc_httpd_route(h->stub, "GET", "/slow404", h_stub_slow_404, NULL);
     firc_httpd_route(h->stub, "GET", "/gate", h_stub_gate, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog", h_stub_catalog, NULL);
+    firc_httpd_route(h->stub, "GET", "/catalog-many", h_stub_catalog_many, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-slow", h_stub_catalog_slow, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-gate", h_stub_catalog_gate, NULL);
     firc_httpd_route(h->stub, "GET", "/catalog-404", h_stub_catalog_404, NULL);
@@ -1487,7 +1503,7 @@ TEST catalog_passes_its_providers_on(void) {
     cJSON *out = NULL;
     ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, &out));
     cJSON *ps = jobj(out, "providers");
-    ASSERT_EQ(2, cJSON_GetArraySize(ps));
+    ASSERT_EQ(3, cJSON_GetArraySize(ps));
     ASSERT_STR_EQ("Demo", jstr(cJSON_GetArrayItem(ps, 1), "name"));
     cJSON_Delete(out);
     harness_stop(h);
@@ -1507,7 +1523,7 @@ TEST provider_catalog_is_fetched_beside_the_index_and_kept_apart(void) {
     cJSON_Delete(out);
     ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
     ASSERT_EQ(1, atomic_load(&g_provider_hits));
-    ASSERT_EQ(0, atomic_load(&g_catalog_hits));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
     out = NULL;
     ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, &out));
     ASSERT_STR_EQ("sagernet", jstr(cJSON_GetArrayItem(jobj(out, "sources"), 0), "id"));
@@ -1533,6 +1549,8 @@ TEST provider_catalog_refuses_a_bad_id(void) {
         ASSERT_STR_EQ("provider is not a catalog id", jstr(out, "error"));
         cJSON_Delete(out);
     }
+    ASSERT_EQ(400, do_request("GET", CATALOG_PATH "?provider=demo%00x", NULL, NULL));
+    ASSERT_EQ(0, atomic_load(&g_catalog_hits));
     ASSERT_EQ(0, atomic_load(&g_provider_hits));
     harness_stop(h);
     PASS();
@@ -1550,22 +1568,37 @@ TEST provider_catalog_refuses_another_providers_sources(void) {
     PASS();
 }
 
-/* Catches: provider slots growing without bound, or the cap shutting out the index. */
-TEST provider_catalogs_are_capped(void) {
+/* An unknown ID must not allocate a slot or start a provider fetch. */
+TEST provider_catalog_requires_an_index_entry(void) {
     harness_t *h = catalog_harness("/catalog");
     ASSERT(h != NULL);
+    cJSON *out = NULL;
+    ASSERT_EQ(404, do_request("GET", CATALOG_PATH "?provider=unknown", NULL, &out));
+    ASSERT_STR_EQ("provider is not in the catalog", jstr(out, "error"));
+    cJSON_Delete(out);
+    ASSERT_EQ(404, do_request("GET", CATALOG_PATH "?provider=sagernet", NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
+    ASSERT_EQ(0, atomic_load(&g_provider_hits));
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_provider_hits));
+    harness_stop(h);
+    PASS();
+}
+
+/* Sequential requests can recycle idle slots while the index remains independently cached. */
+TEST provider_catalogs_recycle_idle_slots(void) {
+    harness_t *h = catalog_harness("/catalog-many");
+    ASSERT(h != NULL);
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
     for (int i = 0; i < FIRC_LIST_CATALOG_PROVIDERS_MAX; i++) {
         char path[128];
-        snprintf(path, sizeof path, CATALOG_PATH "?provider=gone%d", i);
+        snprintf(path, sizeof path, CATALOG_PATH "?provider=absent%d", i);
         ASSERT_EQ(502, do_request("GET", path, NULL, NULL));
     }
-    cJSON *out = NULL;
-    ASSERT_EQ(503, do_request("GET", CATALOG_PATH "?provider=onemore", NULL, &out));
-    ASSERT_STR_EQ("too many provider catalogs at once", jstr(out, "error"));
-    cJSON_Delete(out);
-    /* a provider already kept still answers (its failure, remembered); only a new one is refused */
-    ASSERT_EQ(502, do_request("GET", CATALOG_PATH "?provider=gone0", NULL, NULL));
+    ASSERT_EQ(200, do_request("GET", CATALOG_PATH "?provider=demo", NULL, NULL));
+    ASSERT_EQ(2, atomic_load(&g_provider_hits));
     ASSERT_EQ(200, do_request("GET", CATALOG_PATH, NULL, NULL));
+    ASSERT_EQ(1, atomic_load(&g_catalog_hits));
     harness_stop(h);
     PASS();
 }
@@ -3383,7 +3416,8 @@ int main(int argc, char **argv) {
     RUN_TEST(provider_catalog_is_fetched_beside_the_index_and_kept_apart);
     RUN_TEST(provider_catalog_refuses_a_bad_id);
     RUN_TEST(provider_catalog_refuses_another_providers_sources);
-    RUN_TEST(provider_catalogs_are_capped);
+    RUN_TEST(provider_catalog_requires_an_index_entry);
+    RUN_TEST(provider_catalogs_recycle_idle_slots);
     RUN_TEST(catalog_requests_share_one_fetch);
     RUN_TEST(catalog_refetches_after_six_hours);
     RUN_TEST(catalog_failure_is_remembered_for_a_minute);

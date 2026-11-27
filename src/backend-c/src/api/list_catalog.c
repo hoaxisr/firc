@@ -201,6 +201,7 @@ firc_err_t firc_list_catalog_parse(const char *body, size_t len, const char *pro
 }
 
 bool firc_list_catalog_provider_url(const char *base, const char *provider, char *buf, size_t cap) {
+    if (!firc_list_catalog_id_ok(provider)) { return false; }
     const char *scheme = strstr(base, "://");
     const char *slash = strrchr(base, '/');
     if (scheme == NULL || slash == NULL || slash < scheme + 3) { return false; }
@@ -220,6 +221,7 @@ struct catalog_waiter {
     list_catalog_t *cat;
     catalog_waiter_t *next;
     firc_http_deferred_t *d;
+    char provider[ID_MAX + 1]; /* provider to serve once the index is available */
 };
 
 struct catalog_fetch {
@@ -242,6 +244,7 @@ struct list_catalog {
     list_catalog_t *next;
     char provider[ID_MAX + 1];
     cJSON *copy;
+    uint64_t used_ms;
     uint64_t fetched_ms;
     double fetched_at;
     bool failed;
@@ -348,14 +351,22 @@ static uint8_t *catalog_answer(const list_catalog_t *cat, int *status, size_t *l
     return (uint8_t *)dump;
 }
 
+static void catalog_serve(firc_groups_ctx_t *ctx, const char *provider, firc_loop_t *loop,
+                          firc_http_res_t *res, catalog_waiter_t *w);
+
+static void finish_waiter(catalog_waiter_t *w, int status, uint8_t *body, size_t len) {
+    firc_http_deferred_finish(w->d, status, "application/json; charset=utf-8", body, len);
+    free(w);
+}
+
 static void fetch_done(firc_loop_t *loop, void *ud) {
-    (void)loop;
     catalog_fetch_t *f = ud;
     pthread_join(f->thread, NULL);
     f->joined = true;
     list_catalog_t *cat = f->cat;
     cat->fetch = NULL;
     uint64_t now = catalog_now(cat->ctx);
+    cat->used_ms = now;
     if (f->err == FIRC_OK) {
         cJSON_Delete(cat->copy);
         cat->copy = f->parsed;
@@ -374,11 +385,14 @@ static void fetch_done(firc_loop_t *loop, void *ud) {
     cat->waiters = NULL;
     while (w != NULL) {
         catalog_waiter_t *next = w->next;
-        int status;
-        size_t len;
-        uint8_t *body = catalog_answer(cat, &status, &len);
-        firc_http_deferred_finish(w->d, status, "application/json; charset=utf-8", body, len);
-        free(w);
+        if (w->provider[0] != '\0' && cat->copy != NULL) {
+            catalog_serve(cat->ctx, w->provider, loop, NULL, w);
+        } else {
+            int status;
+            size_t len;
+            uint8_t *body = catalog_answer(cat, &status, &len);
+            finish_waiter(w, status, body, len);
+        }
         w = next;
     }
 }
@@ -419,17 +433,72 @@ static bool fetch_start(list_catalog_t *cat, firc_loop_t *loop) {
     return true;
 }
 
-/* The slot for provider ("" for the index), made on first use; NULL with *full set past the providers cap. */
-static list_catalog_t *catalog_slot(firc_groups_ctx_t *ctx, const char *provider, bool *full) {
-    *full = false;
-    int providers = 0;
+static void catalog_free(list_catalog_t *cat) {
+    cJSON_Delete(cat->copy);
+    free(cat);
+}
+
+static list_catalog_t *find_catalog(const firc_groups_ctx_t *ctx, const char *provider) {
     for (list_catalog_t *c = ctx->catalog; c != NULL; c = c->next) {
         if (strcmp(c->provider, provider) == 0) { return c; }
-        if (c->provider[0] != '\0') { providers++; }
+    }
+    return NULL;
+}
+
+/* No upstream request or slot is needed for an id the index did not advertise. */
+static bool provider_listed(const cJSON *index, const char *id) {
+    const cJSON *source;
+    cJSON_ArrayForEach(source, cJSON_GetObjectItemCaseSensitive(index, "sources")) {
+        if (strcmp(get_string(source, "id"), id) == 0) { return false; }
+    }
+    const cJSON *provider;
+    cJSON_ArrayForEach(provider, cJSON_GetObjectItemCaseSensitive(index, "providers")) {
+        if (strcmp(get_string(provider, "id"), id) == 0) { return true; }
+    }
+    return false;
+}
+
+static void sweep_catalogs(firc_loop_t *loop, void *ud) {
+    firc_groups_ctx_t *ctx = ud;
+    uint64_t now = catalog_now(ctx);
+    bool has_providers = false;
+    for (list_catalog_t **link = &ctx->catalog; *link != NULL;) {
+        list_catalog_t *c = *link;
+        bool optional = c->provider[0] != '\0';
+        uint64_t ttl = c->copy != NULL ? CATALOG_FRESH_MS : CATALOG_FAILED_MS;
+        if (optional && c->fetch == NULL && now - c->used_ms >= ttl) {
+            *link = c->next;
+            catalog_free(c);
+        } else {
+            has_providers |= optional;
+            link = &c->next;
+        }
+    }
+    if (!has_providers) {
+        firc_loop_del_timer(loop, ctx->catalog_timer);
+        ctx->catalog_loop = NULL;
+    }
+}
+
+/* Reuse an idle slot at capacity. Only overlapping downloads can exhaust all slots. */
+static list_catalog_t *catalog_slot(firc_groups_ctx_t *ctx, const char *provider, bool *full) {
+    list_catalog_t **oldest = NULL;
+    int providers = 0;
+    for (list_catalog_t **link = &ctx->catalog; *link != NULL; link = &(*link)->next) {
+        list_catalog_t *c = *link;
+        if (strcmp(c->provider, provider) == 0) { return c; }
+        if (c->provider[0] == '\0') { continue; }
+        providers++;
+        if (c->fetch == NULL && (oldest == NULL || c->used_ms <= (*oldest)->used_ms)) { oldest = link; }
     }
     if (provider[0] != '\0' && providers >= FIRC_LIST_CATALOG_PROVIDERS_MAX) {
-        *full = true;
-        return NULL;
+        if (oldest == NULL) {
+            *full = true;
+            return NULL;
+        }
+        list_catalog_t *evicted = *oldest;
+        *oldest = evicted->next;
+        catalog_free(evicted);
     }
     list_catalog_t *cat = calloc(1, sizeof(*cat));
     if (cat == NULL) { return NULL; }
@@ -440,52 +509,82 @@ static list_catalog_t *catalog_slot(firc_groups_ctx_t *ctx, const char *provider
     return cat;
 }
 
-static void handle_catalog(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
-    firc_groups_ctx_t *ctx = ud;
-    const char *provider = firc_http_req_query(req, "provider");
-    if (provider != NULL && !firc_list_catalog_id_ok(provider)) {
-        firc_http_res_write_error(res, 400, "provider is not a catalog id");
+static void catalog_error(firc_http_res_t *res, catalog_waiter_t *w, int status, const char *why) {
+    if (w == NULL) {
+        firc_http_res_write_error(res, status, why);
         return;
+    }
+    cJSON *obj = firc_json_error(why);
+    char *body = obj != NULL ? firc_json_dump(obj) : NULL;
+    cJSON_Delete(obj);
+    finish_waiter(w, status, (uint8_t *)body, body != NULL ? strlen(body) : 0);
+}
+
+static void catalog_serve(firc_groups_ctx_t *ctx, const char *provider, firc_loop_t *loop,
+                          firc_http_res_t *res, catalog_waiter_t *w) {
+    const char *after_index = "";
+    if (provider[0] != '\0') {
+        const list_catalog_t *index = find_catalog(ctx, "");
+        if (index == NULL || index->copy == NULL) {
+            after_index = provider;
+            provider = "";
+        } else if (!provider_listed(index->copy, provider)) {
+            catalog_error(res, w, 404, "provider is not in the catalog");
+            return;
+        }
     }
     bool full = false;
-    list_catalog_t *cat = catalog_slot(ctx, provider != NULL ? provider : "", &full);
+    list_catalog_t *cat = catalog_slot(ctx, provider, &full);
     if (cat == NULL) {
-        if (full) {
-            firc_http_res_write_error(res, 503, "too many provider catalogs at once");
-        } else {
-            firc_http_res_write_error(res, 500, "out of memory");
-        }
+        catalog_error(res, w, full ? 503 : 500, full ? "too many provider catalogs at once" : "out of memory");
         return;
     }
+    if (provider[0] != '\0' && ctx->catalog_loop == NULL &&
+        firc_loop_add_timer(loop, CATALOG_FAILED_MS, CATALOG_FAILED_MS, sweep_catalogs, ctx,
+                            &ctx->catalog_timer) == FIRC_OK) {
+        ctx->catalog_loop = loop;
+    }
     uint64_t now = catalog_now(ctx);
+    cat->used_ms = now;
     bool fresh = cat->copy != NULL && now - cat->fetched_ms < CATALOG_FRESH_MS;
     bool resting = cat->failed && now - cat->failed_ms < CATALOG_FAILED_MS;
     if (cat->fetch == NULL && (fresh || resting)) {
         int status;
         size_t len;
         uint8_t *body = catalog_answer(cat, &status, &len);
-        firc_http_res_take(res, status, "application/json; charset=utf-8", body, len);
+        if (w != NULL) {
+            finish_waiter(w, status, body, len);
+        } else {
+            firc_http_res_take(res, status, "application/json; charset=utf-8", body, len);
+        }
         return;
     }
-    catalog_waiter_t *w = calloc(1, sizeof(*w));
+    if (cat->fetch == NULL && !fetch_start(cat, loop)) {
+        catalog_error(res, w, 500, "failed to start the catalog fetch");
+        return;
+    }
     if (w == NULL) {
-        firc_http_res_write_error(res, 500, "out of memory");
-        return;
+        w = calloc(1, sizeof(*w));
+        if (w != NULL) { w->d = firc_http_res_defer(res, waiter_left, w); }
+        if (w == NULL || w->d == NULL) {
+            free(w);
+            catalog_error(res, NULL, 500, "out of memory");
+            return;
+        }
     }
-    if (cat->fetch == NULL && !fetch_start(cat, firc_http_res_loop(res))) {
-        free(w);
-        firc_http_res_write_error(res, 500, "failed to start the catalog fetch");
-        return;
-    }
+    snprintf(w->provider, sizeof w->provider, "%s", after_index);
     w->cat = cat;
-    w->d = firc_http_res_defer(res, waiter_left, w);
-    if (w->d == NULL) {
-        free(w);
-        firc_http_res_write_error(res, 500, "out of memory");
-        return;
-    }
     w->next = cat->waiters;
     cat->waiters = w;
+}
+
+static void handle_catalog(firc_http_req_t *req, firc_http_res_t *res, void *ud) {
+    const char *provider = firc_http_req_query(req, "provider");
+    if (provider != NULL && !firc_list_catalog_id_ok(provider)) {
+        firc_http_res_write_error(res, 400, "provider is not a catalog id");
+        return;
+    }
+    catalog_serve(ud, provider != NULL ? provider : "", firc_http_res_loop(res), res, NULL);
 }
 
 void firc_list_catalog_register_routes(firc_httpd_t *h, firc_groups_ctx_t *ctx) {
@@ -506,11 +605,14 @@ static void catalog_close_one(list_catalog_t *cat) {
         firc_http_deferred_drop(w->d);
         free(w);
     }
-    cJSON_Delete(cat->copy);
-    free(cat);
+    catalog_free(cat);
 }
 
 void firc_list_catalog_close(firc_groups_ctx_t *ctx) {
+    if (ctx->catalog_loop != NULL) {
+        firc_loop_del_timer(ctx->catalog_loop, ctx->catalog_timer);
+        ctx->catalog_loop = NULL;
+    }
     list_catalog_t *cat = ctx->catalog;
     ctx->catalog = NULL;
     while (cat != NULL) {

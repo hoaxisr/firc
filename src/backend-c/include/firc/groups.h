@@ -20,6 +20,8 @@ typedef struct firc_groups_ctx {
     const char *catalog_url;
     uint64_t (*catalog_now_ms)(void);
     list_catalog_t *catalog;
+    firc_loop_t *catalog_loop; /* set while the optional caches have a sweep timer */
+    int catalog_timer;
 } firc_groups_ctx_t;
 
 void firc_groups_register_routes(firc_httpd_t *h, firc_groups_ctx_t *ctx);

@@ -127,6 +127,7 @@ test("turning a provider on shows all its catalogs, survives a reload, and turni
   await openSettings(page, (r) => r.fulfill({ json: answer() }));
   await toggle(page, "Loyalsoldier").click();
   await expect(toggle(page, "Loyalsoldier")).toHaveAttribute("aria-checked", "true");
+  expect(seen.asked).toEqual(["index"]);
   let dialog = await searchInDialog(page, "google");
   await expect(badges(dialog)).toHaveText([
     "sagernet",

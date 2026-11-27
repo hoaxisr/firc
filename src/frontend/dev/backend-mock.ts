@@ -889,8 +889,13 @@ const providerCatalogs: Record<string, { id: string; url: string; names: string[
 app.get(`${API_BASE}/groups/list/catalog`, (c) => {
   const provider = c.req.query("provider");
   if (provider !== undefined) {
+    if (provider.length === 0 || provider.length > 32 || /[^a-z0-9-]/.test(provider)) {
+      return c.json({ error: "provider is not a catalog id" }, 400);
+    }
+    if (!Object.hasOwn(providerCatalogs, provider)) {
+      return c.json({ error: "provider is not in the catalog" }, 404);
+    }
     const sources = providerCatalogs[provider];
-    if (!sources) return c.json({ error: "the server answered 404" }, 502);
     return c.json({
       generated: "2026-11-27T00:00:00Z",
       fetchedAt: Math.floor(Date.now() / 1000),

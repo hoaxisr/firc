@@ -106,7 +106,7 @@
   let failedNames = $derived(
     catalog
       ? presetProviders(catalog)
-          .filter((p) => providerFailed[p.id] !== undefined && providerOn(presetChoices(), p))
+          .filter((p) => Object.hasOwn(providerFailed, p.id) && providerOn(presetChoices(), p))
           .map((p) => p.name)
       : [],
   );
@@ -160,13 +160,14 @@
 
   function askProviders(index: Catalog) {
     for (const p of wantedFiles(index, presetChoices())) {
-      if (providerFiles[p.id] || providerPending.includes(p.id)) continue;
+      if (Object.hasOwn(providerFiles, p.id) || providerPending.includes(p.id)) continue;
       providerPending = [...providerPending, p.id];
       providerFailed = Object.fromEntries(
         Object.entries(providerFailed).filter(([id]) => id !== p.id),
       );
       void loadProvider(p.id).then((r) => {
         providerPending = providerPending.filter((id) => id !== p.id);
+        if (!open || !providerOn(presetChoices(), p)) return;
         if (r.ok) providerFiles = { ...providerFiles, [p.id]: r.data };
         else providerFailed = { ...providerFailed, [p.id]: r.error };
       });
@@ -182,7 +183,7 @@
       catalogLoading = false;
       if (r.ok) {
         catalog = r.data;
-        askProviders(r.data);
+        if (open && catalogShown) askProviders(r.data);
       } else catalogError = r.error;
     });
   }
@@ -244,6 +245,8 @@
   $effect(() => {
     if (!open) {
       seededFor = null;
+      providerFiles = {};
+      providerFailed = {};
       return;
     }
     const key = mode === "edit" ? (group?.id ?? "edit") : "create";

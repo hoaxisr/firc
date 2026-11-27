@@ -202,6 +202,19 @@ describe("preset providers", () => {
     );
   });
 
+  it("only trusts explicit booleans and handles provider ids inherited by ordinary objects", () => {
+    const indexWithExtraSources = index(
+      [...INDEX.sources, src("third-party", ["x"])],
+      [...INDEX.providers!, { id: "constructor", name: "Other provider" }],
+    );
+    const choices = JSON.parse('{"itdog":"false","sagernet":1}');
+    assert.deepStrictEqual(
+      visibleSources(indexWithExtraSources, {}, choices).map((s) => s.id),
+      ["sagernet", "hoaxisr"],
+    );
+    assert.deepStrictEqual(wantedFiles(indexWithExtraSources, choices), []);
+  });
+
   // Catches: the same tag of two providers collapsing into one row, or keeping one provider's URL.
   it("lists a name once per provider that has it", () => {
     const r = searchCatalog(

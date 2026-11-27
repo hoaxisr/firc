@@ -41,8 +41,12 @@ export function presetProviders(index: Catalog): PresetProvider[] {
   return out;
 }
 
-export const providerOn = (choices: PresetChoices, p: PresetProvider): boolean =>
-  choices[p.id] ?? p.builtin;
+export function providerOn(choices: PresetChoices, p: PresetProvider): boolean {
+  const choice = Object.hasOwn(choices, p.id) ? choices[p.id] : undefined;
+  return typeof choice === "boolean"
+    ? choice
+    : p.builtin && (p.id === "sagernet" || p.id === "hoaxisr");
+}
 
 /** The sources a search may show: the index's sources of providers that are on, then each loaded file of an
  * optional provider that is on. A provider turned off drops out before ranking and the cap. */
@@ -55,7 +59,9 @@ export function visibleSources(
   const on = new Set(providers.filter((p) => providerOn(choices, p)).map((p) => p.id));
   const out = index.sources.filter((s) => on.has(providerOf(s.id, providers) ?? s.id));
   for (const p of providers) {
-    if (!p.builtin && on.has(p.id) && files[p.id]) out.push(...files[p.id].sources);
+    if (!p.builtin && on.has(p.id) && Object.hasOwn(files, p.id)) {
+      out.push(...files[p.id].sources);
+    }
   }
   return out;
 }
@@ -99,23 +105,19 @@ async function fetchCatalog(path: string): Promise<CatalogResult> {
   }
 }
 
-const cached = new Map<string, Promise<CatalogResult>>();
+let indexRequest: Promise<CatalogResult> | null = null;
 
-/** One fetch per catalog for the page's life; a failed one is forgotten, so the next ask tries again. */
-function load(path: string): Promise<CatalogResult> {
-  let p = cached.get(path);
-  if (!p) {
-    const mine = fetchCatalog(path);
-    p = mine;
-    cached.set(path, mine);
-    mine.then((r) => {
-      if (!r.ok && cached.get(path) === mine) cached.delete(path);
+/** Keep the index for the page's life, retrying if it could not be loaded. */
+export function loadCatalog(): Promise<CatalogResult> {
+  if (!indexRequest) {
+    indexRequest = fetchCatalog("/groups/list/catalog");
+    void indexRequest.then((r) => {
+      if (!r.ok) indexRequest = null;
     });
   }
-  return p;
+  return indexRequest;
 }
 
-export const loadCatalog = (): Promise<CatalogResult> => load("/groups/list/catalog");
-
+// The search dialog owns optional data. The daemon handles caching between searches.
 export const loadProvider = (id: string): Promise<CatalogResult> =>
-  load(`/groups/list/catalog?provider=${encodeURIComponent(id)}`);
+  fetchCatalog(`/groups/list/catalog?provider=${encodeURIComponent(id)}`);
