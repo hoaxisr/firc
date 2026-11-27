@@ -841,16 +841,17 @@ static bool parse_headers(firc_http_conn_t *c, firc_http_req_t *req) {
             size_t pair_len = i - start;
             const char *eq = memchr(q + start, '=', pair_len);
             size_t name_raw_len = eq ? (size_t)(eq - (q + start)) : pair_len;
-            char *name = req->query[req->n_query].name;
-            char *value = req->query[req->n_query].value;
-            size_t decoded = percent_decode(q + start, name_raw_len, name, sizeof(req->query[0].name), true);
-            if (memchr(name, '\0', decoded) != NULL) { return false; }
-            value[0] = '\0';
+            size_t decoded = percent_decode(q + start, name_raw_len, req->query[req->n_query].name,
+                                            sizeof(req->query[0].name), true);
+            if (memchr(req->query[req->n_query].name, '\0', decoded) != NULL) { return false; }
             if (eq) {
                 size_t val_start = start + name_raw_len + 1;
                 size_t val_len = pair_len - name_raw_len - 1;
-                decoded = percent_decode(q + val_start, val_len, value, sizeof(req->query[0].value), true);
-                if (memchr(value, '\0', decoded) != NULL) { return false; }
+                decoded = percent_decode(q + val_start, val_len, req->query[req->n_query].value,
+                                         sizeof(req->query[0].value), true);
+                if (memchr(req->query[req->n_query].value, '\0', decoded) != NULL) { return false; }
+            } else {
+                req->query[req->n_query].value[0] = '\0';
             }
             req->n_query++;
             if (i < qlen) { i++; /* skip '&' */ }
