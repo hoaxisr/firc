@@ -375,7 +375,7 @@ static firc_dns_verdict_t answer_fakes(firc_dns_pipeline_t *p, firc_dns_msg_t *m
         }
     }
     if (capped) {
-        firc_lograte_say(&p->said_capped, 60000, FIRC_LOG_INFO, NULL, "%s: no free entry for some addresses of the answer (at most %d per family), left out",
+        firc_lograte_say(&p->said_capped, 60000, FIRC_LOG_DEBUG, NULL, "%s: extra addresses of the answer skipped, up to %d per family get a fake",
                          qname, FIRC_FAKEIP_MAX_ENTRIES);
     }
     if (n4 == 0) { fakes4[n4++] = fake4; }
